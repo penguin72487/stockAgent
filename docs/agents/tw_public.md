@@ -356,3 +356,17 @@ Use for Taiwan official downloaders, parsers, price precision, listing lifecycle
 - Panel cache validation fingerprints every source byte (including the external
   rule parquet), so a same-size replacement with preserved timestamps cannot
   silently reuse stale execution masks.
+- Canonical daily source builders may reuse exact encoded Parquet groups with
+  decoding metadata and a schema/code-bound, sealed parser projection. This
+  skips repeated row-local decoding, not full source receipts or lifecycle /
+  merge validation. Group-prefix session proofs rewind the complete boundary
+  day; changed layouts and invalid proofs remain conservative misses. Do not
+  turn a single-file source/output into a partition directory before all
+  readers, publishers and admission checks support the new manifest contract.
+  The official OHLCV owner also has an explicit `--incremental-merge-cache`
+  opt-in: certify the unchanged session prefix before parsing price history,
+  retain full lifecycle/reference checks and original source byte receipts,
+  and rebuild the earliest affected suffix on old revisions/deletions. Source
+  proof, boundary-partition writes and full historical output assembly remain
+  measured costs; fewer rebuilt rows alone do not establish a speed-up.
+  See [daily incremental implementation and measurements](../dashboard_daily_incremental_2026-10-20.md).

@@ -55,7 +55,7 @@ def scan_discovery_status(db, now):
 
 def profile_current_status(root, registry, repetitions=5, *, compare_discovery_summary=False,
                            compare_bulk_error_summary=False, compare_discovery_transactional=False,
-                           compare_scope_cache=False):
+                           compare_scope_cache=False, verify_body_states=False):
     """Replay the canonical whole heartbeat without an owner or source writes.
 
     The only publisher is replaced with exact JSON serialization in this
@@ -87,6 +87,32 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
         view._original_url_started = time.monotonic() - 120
         view._original_url_start_count = 0
         serialized = []
+        body_state_verification = None
+        if verify_body_states:
+            # One independent source scan, not one scan per heartbeat/trial.
+            # Before owner adoption, only a TEMP relation may supply the new
+            # derived column. Never migrate or repair a live writer's schema.
+            wall, cpu = time.perf_counter(), time.process_time()
+            oracle = [tuple(row) for row in db.execute('''SELECT provider,state,count(*),
+                coalesce(sum(body_bytes),0),sum(body_sha256 IS NOT NULL) FROM articles
+                GROUP BY provider,state ORDER BY provider,state''')]
+            scan = {'wall_seconds': time.perf_counter() - wall, 'cpu_seconds': time.process_time() - cpu}
+            native = 'stored_body_urls' in {row[1] for row in db.execute('PRAGMA main.table_info(state_metrics)')}
+            if not native:
+                db.execute('''CREATE TEMP TABLE state_metrics(provider TEXT,state TEXT,articles INTEGER,
+                    body_bytes INTEGER,stored_body_urls INTEGER,PRIMARY KEY(provider,state)) WITHOUT ROWID''')
+                db.executemany('INSERT INTO temp.state_metrics VALUES (?,?,?,?,?)', oracle)
+            actual = [tuple(row) for row in db.execute('''SELECT provider,state,articles,body_bytes,stored_body_urls
+                FROM state_metrics WHERE articles>0 ORDER BY provider,state''')]
+            if actual != oracle:
+                raise ValueError('article_body_state_counters_disagree_with_source_snapshot')
+            body_state_verification = {'contract_version': 1, 'accepted': True, 'source_scan': scan,
+                'source_scans': 1, 'provider_state_groups': len(oracle),
+                'known_url_heads': sum(row[2] for row in oracle),
+                'stored_body_url_heads': sum(row[4] for row in oracle),
+                'source_projection_sha256': hashlib.sha256(json.dumps(oracle, ensure_ascii=False).encode()).hexdigest(),
+                'seeded_in_temporary_table': not native, 'live_transactional_counters_verified': native,
+                'source_table_mutations': 0, 'schema_migrated': False}
 
         def serialize_without_publication(path, result, *, durable=False, compact=False):
             if path != root / 'status.json' or durable:
@@ -198,13 +224,14 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
         medians = {name: {unit: statistics.median(m[unit] for m in samples)
                          for unit in ('wall_seconds', 'cpu_seconds')} for name, samples in measurements.items()}
         digests = set().union(*identities.values())
-        return {'contract_version': 5, 'accepted': len(digests) == 1,
+        return {'contract_version': 6 if verify_body_states else 5, 'accepted': len(digests) == 1,
                 'observed_at_utc': observed, 'owner_id': owner[0],
                 'input_status_sha256': hashlib.sha256(payload).hexdigest(),
                 'serialized_status_bytes': sizes,
                 'deterministic_projection_sha256': {name: sorted(values) for name, values in identities.items()},
                 'measurements': measurements, 'repetitions': repetitions,
                 'medians': medians,
+                **({'body_state_verification': body_state_verification} if verify_body_states else {}),
                 'profiler_time_basis': 'explicit process CPU clock; profiled run excluded from timing medians',
                 'speedups': {unit: medians['legacy'][unit] / medians['summary'][unit]
                              for unit in ('wall_seconds', 'cpu_seconds')}
@@ -306,11 +333,14 @@ def main(argv=None):
     parser.add_argument('--compare-bulk-error-summary', action='store_true')
     parser.add_argument('--compare-discovery-transactional', action='store_true')
     parser.add_argument('--compare-scope-cache', action='store_true')
+    parser.add_argument('--verify-body-states', action='store_true')
     args = parser.parse_args(argv)
     if not 3 <= args.repeat <= 15:
         parser.error("bounded repetition count required")
     if (args.compare_discovery_summary or args.compare_bulk_error_summary or args.compare_discovery_transactional or args.compare_scope_cache) and not args.profile_current_status:
         parser.error('projection comparison requires --profile-current-status')
+    if args.verify_body_states and not args.profile_current_status:
+        parser.error('body-state verification requires --profile-current-status')
     if sum((args.compare_discovery_summary,args.compare_bulk_error_summary,args.compare_discovery_transactional,
             args.compare_scope_cache)) > 1:
         parser.error('select one projection comparison')
@@ -319,7 +349,8 @@ def main(argv=None):
                                     compare_discovery_summary=args.compare_discovery_summary,
                                     compare_bulk_error_summary=args.compare_bulk_error_summary,
                                     compare_discovery_transactional=args.compare_discovery_transactional,
-                                    compare_scope_cache=args.compare_scope_cache)
+                                    compare_scope_cache=args.compare_scope_cache,
+                                    verify_body_states=args.verify_body_states)
               if args.profile_current_status else benchmark(repo / config["root"], registry, args.repeat))
     result["implementation_sha256"] = {str(path): sha256_file(path) for path in (Path(__file__), Path("downloader/news_fulltext_queue.py"), Path('downloader/news_fulltext_status.py'), Path('downloader/news_fulltext_cnyes_history.py'))}
     atomic_write_json(args.output, result)

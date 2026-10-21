@@ -164,11 +164,34 @@ process_tree_rss_kib() {
 }
 
 monitor_pid=""
-run_snapshot_monitor() {
+snapshot_monitor_rc=0
+start_snapshot_monitor() {
+  # One bounded read-only audit at a time; never block the minute watchdog.
+  [[ -z "$monitor_pid" ]] || return 1
   timeout --signal=TERM --kill-after=30s "${full_monitor_timeout}s" \
     "$python_bin" scripts/monitor_openbb_archive.py \
     --output-dir "$output_dir" --write-snapshot --append-history --no-progress &
   monitor_pid=$!
+}
+
+poll_snapshot_monitor() {
+  [[ -n "$monitor_pid" ]] || return 1
+  if kill -0 "$monitor_pid" 2>/dev/null; then
+    return 1
+  fi
+  snapshot_monitor_rc=0
+  wait "$monitor_pid" || snapshot_monitor_rc=$?
+  monitor_pid=""
+}
+
+run_snapshot_monitor() {
+  # Terminal admission still requires a NEW audit after the downloader exits.
+  # A background audit may have captured its SQLite snapshot before that exit.
+  if [[ -n "$monitor_pid" ]]; then
+    wait "$monitor_pid" || true
+    monitor_pid=""
+  fi
+  start_snapshot_monitor
   local monitor_rc=0
   wait "$monitor_pid" || monitor_rc=$?
   monitor_pid=""
@@ -384,10 +407,9 @@ while true; do
         && "$scheduler_wait_until_epoch" -gt "$now_epoch" ]]; then
         effective_full_monitor_interval="$idle_full_monitor_interval"
       fi
-      if ((last_full_monitor_epoch == 0 \
-        || now_epoch - last_full_monitor_epoch >= effective_full_monitor_interval)); then
+      if poll_snapshot_monitor; then
         monitor_ok=0
-        if run_snapshot_monitor; then
+        if [[ "$snapshot_monitor_rc" == "0" ]]; then
           monitor_ok=1
         else
           echo "[openbb-supervisor] full monitor snapshot failed or exceeded ${full_monitor_timeout}s; lightweight stall watchdog remains active" >&2
@@ -412,6 +434,12 @@ while true; do
             last_progress_epoch="$now_epoch"
           fi
         fi
+      fi
+      if [[ -z "$monitor_pid" ]] && ((last_full_monitor_epoch == 0 \
+        || now_epoch - last_full_monitor_epoch >= effective_full_monitor_interval)); then
+        start_snapshot_monitor
+        last_full_monitor_epoch="$now_epoch"
+        echo "[openbb-supervisor] background full monitor started pid=$monitor_pid; lightweight watchdog remains active"
       fi
 
       if [[ "$has_cooldown" == "1" && "$pending_eligible" == "0" \

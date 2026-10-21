@@ -149,7 +149,7 @@ def owned_config():
     config.pop('provider_catalog', None)
     source = deepcopy(config['providers'][0])
     source.update(id='publisher', domains=list(HOSTS[:2]), interval_seconds=.001,
-                  feeds=[], sitemaps=[], wordpress_apis=[], fulltext_feeds=[], index_pages=[],
+                  feeds=[], sitemaps=[], wordpress_apis=[], fulltext_feeds=[], historical_fulltext_feeds=[], index_pages=[],
                   index_path_pattern='', article_path_pattern='', article_selectors=['.story'],
                   require_configured_container=False, require_author_attribution=False,
                   title_selector='', author_selectors=[], required_license_url_prefix='', exclude_selectors=[],

@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from stockagent.data.tw_public_research_features import (  # noqa: E402
     build_tw_public_research_features,
 )
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending  # noqa: E402
 
 
 @contextmanager
@@ -27,7 +28,7 @@ def _source_lock(input_dir: Path):
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise RuntimeError("canonical Taiwan public source writer is active") from exc
+            raise TWPublicSourceUpdatePending(input_dir.resolve(), path) from exc
         try:
             yield
         finally:

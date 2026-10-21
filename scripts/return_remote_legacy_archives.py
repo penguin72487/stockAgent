@@ -48,8 +48,13 @@ def private_control_prefix() -> str:
     # Send exact locally read code through authenticated SSH stdin, never
     # execute synced code or modify the conflicted remote checkout.
     canonical_archive = (ROOT / "stockagent/data_sync/legacy_artifact_archive.py").read_text()
-    code = "import sys, types\n"
-    for name, relative in (("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
+    code = "import sys, types\nimport stockagent.data_sync\n"
+    # Archive/control code and its packed reader must travel together. The
+    # ephemeral checkout can predate the current verified-inventory API; using
+    # its reader would make even a read-only inventory fail before admission.
+    for name, relative in (("stockagent.data_sync.packed_metadata", "stockagent/data_sync/packed_metadata.py"),
+                           ("stockagent.data_sync.packed_snapshots", "stockagent/data_sync/packed_snapshots.py"),
+                           ("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
                            ("stockagent.data_sync.testing_disposition", "stockagent/data_sync/testing_disposition.py"),
                            ("stockagent.data_sync.artifact_consumers", "stockagent/data_sync/artifact_consumers.py"),
                            ("stockagent.data_sync.training_return", "stockagent/data_sync/training_return.py")):

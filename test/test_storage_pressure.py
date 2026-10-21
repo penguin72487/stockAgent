@@ -28,6 +28,37 @@ def test_pressure_uses_writer_available_space_including_reserved_blocks(
     assert usage["unavailable_bytes"] == 900
 
 
+def test_compiler_reference_scan_rejects_lost_fd_visibility(monkeypatch, tmp_path):
+    import stockagent.data_sync.storage_pressure as pressure
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    process = tmp_path / "proc" / "99999999"
+    process.mkdir(parents=True)
+    monkeypatch.setattr(pressure, "_process_directories", lambda: [process])
+    original = Path.iterdir
+    def unreadable(path):
+        if path == process / "fd":
+            raise PermissionError(13, "permission denied")
+        return original(path)
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+    with pytest.raises(SnapshotError, match="incomplete process-reference scan"):
+        pressure._open_cache_files()
+
+
+def test_compiler_protected_process_scan_rejects_unreadable_live_command(monkeypatch, tmp_path):
+    import stockagent.data_sync.storage_pressure as pressure
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    process = tmp_path / "proc" / "99999999"
+    process.mkdir(parents=True)
+    original = Path.read_bytes
+    def unreadable(path):
+        if path == process / "cmdline":
+            raise PermissionError(13, "permission denied")
+        return original(path)
+    monkeypatch.setattr(Path, "read_bytes", unreadable)
+    with pytest.raises(SnapshotError, match="incomplete process-reference scan"):
+        pressure.protected_processes(proc_root=process.parent)
+
+
 def _age(path: Path, *, now_ns: int, days: float) -> None:
     timestamp = now_ns - int(days * 86_400 * 1_000_000_000)
     os.utime(path, ns=(timestamp, timestamp))

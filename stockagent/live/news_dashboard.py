@@ -23,6 +23,10 @@ from stockagent.data.news_source_catalog import (
 
 
 MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
+# The 937-source canonical heartbeat already exceeds 4 MiB with valid bounded
+# per-endpoint telemetry. Keep a finite input ceiling without dropping every
+# discovered source when the owner crosses the old auxiliary-file limit.
+MAX_STATUS_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_AGE_SECONDS = 180
 _ID = re.compile(r"^(?:[a-z][a-z0-9_]{0,63}|unregistered:[a-z0-9.-]{1,253})$")
 _STATES = NEWS_OUTCOME_STATES
@@ -75,6 +79,82 @@ def _metadata_feed_progress(value, *, now):
 
 def _object(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
+
+
+def _fulltext_feed_inventory(settings: Mapping[str, Any], counts: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Registered feed scopes and current-owner counters, not history coverage.
+
+    Read only the existing configuration/heartbeat. Response pages can overlap
+    or fail validation; only the durable RSS workload counter proves new bodies.
+    No endpoint URL, article, XML or arbitrary configuration text is exported.
+    """
+    def scopes(key):
+        values = settings.get(key)
+        return {value for value in values if isinstance(value, str) and value} if isinstance(values, list) else set()
+
+    historical = scopes('historical_fulltext_feeds')
+    roots = scopes('fulltext_feeds') - historical
+    if not roots and not historical:
+        return None
+    months = []
+    for scope in historical:
+        try:
+            match = re.fullmatch(r'/([1-9][0-9]{3})/(0[1-9]|1[0-2])/feed/?', urlsplit(scope).path)
+        except ValueError:
+            match = None
+        if match:
+            months.append('-'.join(match.groups()))
+    return {
+        'contract_version': 1,
+        'registered_root_feeds': len(roots),
+        'registered_historical_feeds': len(historical),
+        'registered_monthly_feeds': len(months),
+        'registered_other_historical_feeds': len(historical) - len(months),
+        'first_registered_month': min(months) if months else None,
+        'last_registered_month': max(months) if months else None,
+        'owner_terminal_requests': _count(counts.get('http_endpoint_rss_fulltext_terminal_requests')),
+        'owner_200_pages': _count(counts.get('http_endpoint_rss_fulltext_terminal_status_200')),
+        'owner_304_pages': _count(counts.get('http_endpoint_rss_fulltext_terminal_status_304')),
+        'owner_new_stored_url_heads': _count(counts.get('durable_workload_rss_fulltext_new_heads')),
+        'registration_proves_history_complete': False,
+        'response_pages_prove_accepted_bodies': False,
+    }
+
+
+def _body_state_coverage(value: Any, counts: Mapping[str, int], stored: int | None,
+                         *, registered: bool, body_enabled: bool) -> dict[str, Any] | None:
+    """Validate the joint state/body grain, never infer it from marginal totals.
+
+    A retained body can have any subsequent check state. Legacy snapshots lack
+    the joint counts; two independent totals cannot reconstruct that table.
+    Unknown/private state names use the same finite public vocabulary as the
+    original state projection, without leaking source errors or article data.
+    """
+    if (not isinstance(value, Mapping) or set(value) != {'missing', 'stored'} or stored is None):
+        return None
+    parts = {}
+    for key in ('missing', 'stored'):
+        raw = value[key]
+        if (not isinstance(raw, Mapping) or any(not isinstance(state, str) or len(state) > 160
+                or _count(number) is None for state, number in raw.items())):
+            return None
+        parts[key] = {state: number for state, number in _states(raw).items() if number}
+    combined = Counter(parts['missing'])
+    combined.update(parts['stored'])
+    if (dict(combined) != {state: number for state, number in counts.items() if number}
+            or sum(parts['stored'].values()) != stored):
+        return None
+    missing = sum(parts['missing'].values())
+    outcomes = {name: classify_news_outcomes(parts[part], registered=registered, body_enabled=body_enabled)
+                for name, part in (('missing_body_outcomes', 'missing'), ('retained_body_outcomes', 'stored'))}
+    return {'contract_version': 1, 'missing_body_urls': missing, 'stored_body_urls': stored,
+        'queued_missing_body_urls': sum(parts['missing'].get(state, 0) for state in _READY_STATES),
+        'queued_stored_body_recheck_urls': sum(parts['stored'].get(state, 0) for state in _READY_STATES),
+        'retained_body_noncomplete_urls': stored - parts['stored'].get('complete', 0),
+        'missing_body_states': parts['missing'], 'retained_body_states': parts['stored'],
+        **{key: {'categories': item['categories'], 'known_urls': item['known_urls']} for key, item in outcomes.items()},
+        'grain': 'disjoint URL heads by retained body presence and latest check state',
+        'retained_bodies_are_not_missing': True, 'all_history_complete': False}
 
 
 def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
@@ -293,20 +373,66 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
             'finish_eta_utc': None, 'progress_ratio': None}
 
 
-def _read(path: Path) -> dict[str, Any]:
-    try:
-        with path.open("rb") as stream:
-            raw = stream.read(MAX_SNAPSHOT_BYTES + 1)
-        if len(raw) > MAX_SNAPSHOT_BYTES:
-            return {}
-        value = json.loads(raw)
-    except (OSError, UnicodeError, ValueError):
-        return {}
+def _read(path: Path, *, max_bytes: int = MAX_SNAPSHOT_BYTES) -> dict[str, Any]:
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    value = read_json_snapshot(path, max_bytes=max_bytes)
     return value if isinstance(value, dict) else {}
+
+
+def _read_news_status(path: Path) -> tuple[dict[str, Any], int]:
+    """Retry one proven file-generation race, not malformed/stale telemetry.
+
+    The shared reader correctly refuses bytes whose descriptor/path metadata
+    changed during decode. A canonical atomic heartbeat replacement can cause
+    that refusal even though both generations were complete. Retry the latest
+    generation once only when our own metadata fences prove a change. Never
+    return the previously cached generation or weaken size/clock validation.
+    Auxiliary reads and other dashboards retain the shared reader contract.
+    """
+    from stockagent.live.dashboard_updates import metadata_signature
+    try:
+        before = metadata_signature(path.stat())
+    except OSError:
+        return _read(path, max_bytes=MAX_STATUS_SNAPSHOT_BYTES), 1
+    value = _read(path, max_bytes=MAX_STATUS_SNAPSHOT_BYTES)
+    if value:
+        return value, 1
+    try:
+        changed = before != metadata_signature(path.stat())
+    except OSError:
+        changed = False
+    if changed:
+        return _read(path, max_bytes=MAX_STATUS_SNAPSHOT_BYTES), 2
+    return value, 1
 
 
 def _count(value: Any) -> int | None:
     return value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+
+
+def _routing_work(value: Any) -> dict[str, Any] | None:
+    """Host-plan progress is not metadata decoding, link or body coverage."""
+    raw = _object(value)
+    if type(raw.get('contract_version')) is not int or raw['contract_version'] != 1:
+        return None
+    result = {'contract_version': 1, 'snapshot_consistent': False, 'state': 'unavailable',
+              'known_hosts': None, 'completed_hosts': None, 'pending_hosts': None,
+              'host_progress_ratio': None, 'completion_proven': False,
+              'conditional_eta_seconds': None, 'publisher_requests': 0, 'body_completion_claimed': False}
+    total, completed, pending = (_count(raw.get(k)) for k in ('known_hosts', 'completed_hosts', 'pending_hosts'))
+    if (raw.get('snapshot_consistent') is not True or any(v is None for v in (total, completed, pending))
+            or completed + pending != total or type(raw.get('publisher_requests')) is not int
+            or raw['publisher_requests'] != 0
+            or raw.get('body_completion_claimed') is not False):
+        return result
+    done = pending == 0
+    expected = ('empty' if not total else 'complete') if done else 'pending'
+    if raw.get('state') != expected or raw.get('completion_proven') is not done:
+        return result
+    result.update(snapshot_consistent=True, state=expected, known_hosts=total, completed_hosts=completed,
+                  pending_hosts=pending, host_progress_ratio=completed / total if total else None,
+                  completion_proven=done)
+    return result
 
 
 def _number(value: Any) -> float | None:
@@ -361,8 +487,15 @@ def _completion_forecast(metrics: Mapping[str, Any], calibration: Mapping[str, A
     owner_start = end_limit - elapsed
     if owner_start < 0:
         return result
-    history = calibration.get('history')
-    latest = calibration.get('last_window')
+    observation_version = calibration.get('completion_observation_contract_version')
+    if observation_version is None:
+        observation = calibration  # Older owners: retain explicitly bounded legacy evidence.
+    elif type(observation_version) is int and observation_version == 1:
+        observation = _object(calibration.get('completion_observation'))
+    else:
+        return result  # A malformed new contract cannot fall back to old fast samples.
+    history = observation.get('history')
+    latest = observation.get('last_window')
     if not isinstance(history, list) or len(history) > 128:
         return result
     result.update(state='collecting_recent_samples', sample_count=0,
@@ -534,7 +667,15 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     if now.tzinfo is None:
         raise ValueError("news dashboard clock requires a timezone")
     now = now.astimezone(UTC)
-    status = _read(repo_root / "data_news_fulltext/status.json")
+    status_path = repo_root / "data_news_fulltext/status.json"
+    status, snapshot_read_attempts = _read_news_status(status_path)
+    snapshot_read_state = 'loaded' if status else 'unavailable_or_invalid'
+    if not status:
+        try:
+            if status_path.stat().st_size > MAX_STATUS_SNAPSHOT_BYTES:
+                snapshot_read_state = 'too_large'
+        except OSError:
+            pass
     try:
         config = load_news_configuration(repo_root / "configs/news_fulltext.json")
     except (OSError, ValueError, KeyError, TypeError):
@@ -577,6 +718,10 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
               else "stopped" if activity == "stopped" else activity)
     if initializing or lifecycle_stopped:
         health = activity
+    if snapshot_read_state == 'too_large':
+        # An alive owner plus unreadable telemetry is not a new worker starting
+        # up, zero known URLs, or evidence that acquisition has stopped.
+        health = 'unavailable'
     configured: dict[str, Mapping[str, Any]] = {}
     for source in config.get("providers", []) if isinstance(config.get("providers"), list) else []:
         source = _object(source)
@@ -596,6 +741,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     calibration = _object(_object(capacity.get("calibration")).get("providers"))
     calibration_version = _object(capacity.get('calibration')).get('measurement_contract_version')
     completion_owner_version = _object(capacity.get('calibration')).get('completion_window_owner_contract_version')
+    completion_observation_version = _object(capacity.get('calibration')).get('completion_observation_contract_version')
     endpoint_circuits = {}
     for circuit in status.get("bulk_endpoint_cooldowns", []) if isinstance(status.get("bulk_endpoint_cooldowns"), list) else []:
         circuit = _object(circuit)
@@ -607,6 +753,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     stored_counter_declared = 'provider_stored_body_counter_contract_version' in status
     stored_counter_version = status.get('provider_stored_body_counter_contract_version')
     stored_counter_supported = type(stored_counter_version) is int and stored_counter_version == 1
+    body_state_declared = 'provider_body_state_counter_contract_version' in status
+    body_state_version = status.get('provider_body_state_counter_contract_version')
+    body_state_supported = type(body_state_version) is int and body_state_version == 1 and stored_counter_supported
     for identifier in sorted(set(configured) | set(raw_providers)):
         if not isinstance(identifier, str) or not _ID.fullmatch(identifier):
             continue
@@ -669,6 +818,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         enabled = raw.get("automatic_collection_enabled") is True
         metadata_feed = _metadata_feed_progress(raw.get('metadata_feed_progress'), now=now) if valid else None
         body_enabled = enabled and raw.get('automatic_fulltext_allowed', True) is True
+        body_coverage = (_body_state_coverage(raw.get('body_state_counts') if raw else {'missing': {}, 'stored': {}},
+            counts, stored_urls, registered=identifier in configured, body_enabled=body_enabled)
+            if valid and body_state_supported else None)
         outcome_progress = classify_news_outcomes(dict(counts), registered=identifier in configured,
                                                   body_enabled=body_enabled) if valid else None
         detail = _object(metric_providers.get(identifier))
@@ -681,13 +833,17 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         rate = forecast_count / elapsed if live and forecast_count is not None and forecast_count >= 10 and elapsed and elapsed >= 60 else None
         measured_capacity = _object(calibration.get(identifier))
         forecast = (_completion_forecast(metrics, {**measured_capacity, 'measurement_contract_version': calibration_version,
-                                         'completion_window_owner_contract_version': completion_owner_version},
+                                         'completion_window_owner_contract_version': completion_owner_version,
+                                         'completion_observation_contract_version': completion_observation_version},
                                          heads, observed, now, live, current_owner=status.get('owner_id')) if body_enabled else None)
         eta_rate = forecast['new_url_heads_per_second'] if forecast is not None else rate
         cooldown = _stamp(cooldowns.get(identifier))
         cooling = bool(cooldown and cooldown > now)
-        eta = (ready / eta_rate if body_enabled and ready and eta_rate and not cooling else
-               0.0 if body_enabled and ready == 0 and live else None)
+        eta_remaining = body_coverage['queued_missing_body_urls'] if body_coverage else ready
+        eta = (eta_remaining / eta_rate if body_enabled and eta_remaining and eta_rate and not cooling else
+               0.0 if body_enabled and eta_remaining == 0 and live else None)
+        if body_coverage and eta_remaining == 0 and body_coverage['missing_body_urls']:
+            eta = None  # Missing but blocked/unreviewed bodies are not completed work.
         if mode == 'finite' and ready == 0 and (
                 not cohort or not cohort['all_cohort_bodies_stored']
                 or supplement and not supplement['all_supplement_bodies_stored']
@@ -699,7 +855,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         finish = None
         if eta is not None and observed and eta <= 3650 * 86400:
             finish = (observed + timedelta(seconds=eta)).isoformat()
-            if ready and observed + timedelta(seconds=eta) <= now:
+            if eta_remaining and observed + timedelta(seconds=eta) <= now:
                 eta = finish = None  # Old projection elapsed without proof of completion.
         state = (activity if initializing and enabled else "unavailable" if not valid else "not_enabled" if not enabled else
                  "stale" if not fresh else activity if not live else
@@ -707,6 +863,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                  ("attention" if metadata_feed['feeds_with_errors'] else "metadata_polling")
                      if metadata_feed and not body_enabled else
                  "running" if counts.get("inflight", 0) else
+                 "rechecking" if ready and body_coverage and not eta_remaining else
                  "backfilling" if ready else "attention" if blocked else
                  "waiting_cohort" if growth_waiting else
                  "finite_complete" if cohort and cohort['all_cohort_bodies_stored'] else "known_queue_clear")
@@ -753,6 +910,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "known_urls": known, "complete_urls": complete, "remaining_urls": ready,
             "stored_body_urls": stored_urls, "stored_body_progress_ratio": stored_ratio,
             "stored_body_counter_available": stored_counter_supported,
+            "body_coverage": body_coverage,
             "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": _body_work_progress(raw.get('body_work_progress'), ready) if identifier == 'cnyes' else None,
@@ -773,6 +931,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "completion_forecast_rate_basis": (forecast['basis'] if forecast is not None else
                                                'owner_new_stored_url_heads' if heads is not None else 'legacy_owner_version_proxy'),
             "conditional_eta_seconds": eta, "conditional_finish_at_utc": finish,
+            "conditional_eta_scope": 'queued_missing_body_urls' if body_coverage else 'legacy_active_url_states',
             "next_attempt_at_utc": cooldown.isoformat() if cooldown and cooling else None,
             "robots_origin_policy_pause": _robots_origin_pause(control, metrics, now, live),
             "client_min_interval_seconds": interval,
@@ -787,6 +946,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "capacity_stable_samples": _count(measured_capacity.get("stable_samples")),
             "runtime_capacity_observed": bool(control), "source_maximum_verified": False,
             "registered_bulk_endpoints": len(settings.get("cnyes_apis", [])) if isinstance(settings.get("cnyes_apis"), list) else 0,
+            "fulltext_feed_inventory": _fulltext_feed_inventory(settings, http_counts),
             "temporarily_blocked_bulk_endpoints": endpoint_circuits.get(identifier, 0),
             "observed_bulk_rows_per_request_cap": 30 if identifier == "cnyes" and settings.get("cnyes_apis") else None,
             "capacity_workload_family": sample.get("workload_family") if isinstance(sample.get("workload_family"), str) and sample.get("workload_family") in {
@@ -796,7 +956,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "transport_errors": _count(http_counts.get("transport_errors")), "http_errors": http_errors,
             "official_hourly_quota": None, "official_daily_quota": None,
         })
-    rank = {"running": 0, "backfilling": 1, "known_queue_clear": 2, 'finite_complete': 2, 'waiting_cohort': 2,
+    rank = {"running": 0, "backfilling": 1, 'rechecking': 2, "known_queue_clear": 2, 'finite_complete': 2, 'waiting_cohort': 2,
             "cooldown": 3, "attention": 4}
     providers.sort(key=lambda source: (not source["configured"], rank.get(source["state"], 5), -int(source["known_urls"] or 0), source["id"]))
     counts = _states(status.get("states")) if valid else {}
@@ -810,13 +970,36 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         consistency = consistency and stored_counter_supported and all(
             source['stored_body_urls'] is not None for source in providers) and stored == sum(
                 source['stored_body_urls'] or 0 for source in providers)
+    if body_state_declared:
+        consistency = consistency and body_state_supported and all(source['body_coverage'] is not None for source in providers)
+    body_coverage = None
+    if valid and body_state_supported and all(source['body_coverage'] is not None for source in providers):
+        # Counts are disjoint across providers and body-presence partitions.
+        # Classification stays provider-specific (registered/enabled scope).
+        fields = ('missing_body_urls', 'stored_body_urls', 'queued_missing_body_urls',
+                  'queued_stored_body_recheck_urls', 'retained_body_noncomplete_urls')
+        body_coverage = {'contract_version': 1, **{key: sum(source['body_coverage'][key] for source in providers) for key in fields},
+            'retained_bodies_are_not_missing': True, 'all_history_complete': False,
+            'grain': 'disjoint URL heads by retained body presence and latest check state'}
+        for key in ('missing_body_outcomes', 'retained_body_outcomes'):
+            categories = Counter()
+            for source in providers:
+                categories.update(source['body_coverage'][key]['categories'])
+            body_coverage[key] = {'categories': dict(categories), 'known_urls': sum(categories.values())}
+        for key in ('missing_body_states', 'retained_body_states'):
+            states = Counter()
+            for source in providers:
+                states.update(source['body_coverage'][key])
+            body_coverage[key] = dict(states)
     if valid and not consistency:
         health = "degraded"
         ratio = None
         for source in providers:
             source["conditional_eta_seconds"] = source["conditional_finish_at_utc"] = None
             source['stored_body_progress_ratio'] = None
-    eligible = [source for source in providers if source["enabled"] and source["remaining_urls"]]
+        body_coverage = None
+    eligible = [source for source in providers if source['automatic_fulltext_allowed'] and (
+        source['body_coverage']['queued_missing_body_urls'] if source['body_coverage'] else source['remaining_urls'])]
     etas = [source["conditional_eta_seconds"] for source in eligible]
     eligible_eta = max(etas) if consistency and live and etas and all(eta is not None for eta in etas) else None
     outcome_totals = Counter()
@@ -864,6 +1047,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                 and 256 <= owner_examined <= examined and owner_elapsed is not None and owner_elapsed >= 60 else None)
         remaining = total - examined if reconciled else None
         resolution = {'contract_version': 1, 'snapshot_consistent': reconciled,
+                      'routing_work': _routing_work(raw_resolution.get('routing_work')),
                       'known_redirect_urls': total, 'examined_urls': examined, 'remaining_urls': remaining,
                       'literal_original_links': outcome_counts['literal_original'], 'opaque_links': outcome_counts['opaque_original'],
                       'unresolved_links': outcome_counts['unresolved'], 'links_to_queued_targets': linked,
@@ -873,10 +1057,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                       'publisher_requests': 0}
     return {
         "schema_version": 1, "nonbody_source_outcome_progress_contract_version": 1,
-        "worker_lifecycle_projection_contract_version": 1,
+        "snapshot_reader_contract_version": 3, "snapshot_read_state": snapshot_read_state,
+        "snapshot_read_attempts": snapshot_read_attempts,
+        "worker_lifecycle_projection_contract_version": 2,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         "outcome_progress": outcome_progress,
         "provider_stored_body_counter_contract_version": 1 if stored_counter_supported else None,
+        "provider_body_state_counter_contract_version": 1 if body_state_supported else None,
+        "body_coverage": body_coverage,
         "cnyes_list_progress_projection_contract_version": 1,
         "cnyes_manifest_phase_projection_contract_version": 1,
         "original_source_inventory_contract_version": 1,
@@ -920,7 +1108,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                   "publisher_calls_on_page_view": False, "estimated_total_download_bytes": None,
                   "progress_basis": "stored bodies / discovered unique URLs; not all publisher history",
                   "rate_basis": "owner rate: new stored URL heads / owner wall time; completion ETA: consecutive current-owner completed windows including failures/waits when supported; explicit legacy owner fallback otherwise",
-                  "eta_basis": "conditional per-source remaining frontier / owner rate; future discovery and blocked URLs excluded",
+                  "eta_basis": "queued missing bodies / current-owner new URL-head rate when joint body/state counts are available; explicitly labeled legacy active-state fallback otherwise; future discovery, blocked URLs and retained-body rechecks excluded from the new estimate",
                   "stage_wall_time_basis": "worker durations can overlap; not additive end-to-end wall time",
                   "traffic_basis": "HTTP requests and response bytes since current owner start; not rolling-hour usage",
                   "metadata_basis": "accepted local FinLab/FinMind metadata plus publisher discovery; stock associations are not unique articles"},

@@ -920,6 +920,64 @@ def test_deferred_scan_requires_explicit_owner_and_commit_receipt(args, monkeypa
     assert module.main([*args, "--defer-scan"]) == 2
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_deferred_single_publish_can_acquire_original_owner_without_inherited_fd(
+    tmp_path, monkeypatch, capsys, native,
+):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = _source(tmp_path, "2026-10-19")
+    lock_entry = {"dataset": "prices", "source_coordination_lock": "original-stage.lock"}
+    entry = {**_entry(source), "loose_threshold_mib": 8, "pack_buckets": 2,
+             **({} if native else lock_entry)}
+    if native:
+        monkeypatch.setattr(module, "_native_source_lock_entries", lambda _entry: [lock_entry])
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [entry])
+    monkeypatch.setattr(module, "_running_commands", lambda: [])
+    from stockagent.data_sync import syncthing_scan
+    cold = tmp_path / "cold"
+    cold.mkdir()
+    (cold / syncthing_scan.D_PRIMARY_MARKER).touch()
+    monkeypatch.setattr(syncthing_scan, "CANONICAL_ROOT", cold)
+    monkeypatch.setattr(syncthing_scan, "_scan_pending",
+                        lambda *a, **kw: pytest.fail("network scan during source transaction"))
+    original_publish = module.publish_packed_snapshot
+    observed_owners = []
+
+    def publish(*args, **kwargs):
+        with (tmp_path / "original-stage.lock").open("a+") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed_owners.append(True)
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(module, "publish_packed_snapshot", publish)
+    result_path = tmp_path / "commits/one.json"
+    assert module.main(["publish", "prices", "--sync-root", str(cold), "--node-id", "test-node",
+                        "--defer-scan", "--result-receipt", str(result_path)]) == 0
+    assert observed_owners == [True]
+    result = json.loads(result_path.read_text())
+    assert result == json.loads(capsys.readouterr().out)
+    assert result["published"][0]["scan_policy"] == "durably_queued"
+    assert (cold / ".local-state/scan-pending/prices.json").is_file()
+    with (tmp_path / "original-stage.lock").open("a+") as probe:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    release = packed_snapshots.resolve_latest_packed(cold, "prices")
+    assert packed_snapshots.verify_packed_snapshot(cold, release)["snapshot_id"] == result["published"][0]["snapshot_id"]
+
+
+def test_deferred_single_receipt_does_not_replace_missing_original_source_owner(tmp_path, monkeypatch, capsys):
+    module = _module()
+    source = _source(tmp_path, "2026-10-19")
+    monkeypatch.setattr(module, "_load_catalog", lambda *_: [_entry(source)])
+    monkeypatch.setattr(module, "publish_packed_snapshot", lambda *a, **kw: pytest.fail("unlocked publish"))
+    receipt = tmp_path / "commit.json"
+    assert module.main(["publish", "prices", "--sync-root", str(tmp_path / "cold"),
+                        "--defer-scan", "--result-receipt", str(receipt)]) == 2
+    assert "held catalog/native source lock" in capsys.readouterr().err
+    assert not receipt.exists()
+
+
 def test_result_receipt_failure_can_follow_committed_publication(tmp_path, monkeypatch, capsys):
     module = _module()
     source = _source(tmp_path, "2026-08-18")

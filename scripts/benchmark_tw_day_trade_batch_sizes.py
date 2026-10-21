@@ -264,6 +264,25 @@ def _host_memory_summary(path: Path) -> dict[str, Any]:
             "min_headroom_gib": min(limit-used for used, limit in samples) / 1024**3}
 
 
+def _model_forward_passes(training: dict[str, Any]) -> int:
+    """Count actual full-data passes, including capture and sharpness replay."""
+    from stockagent.training.return_adjoint import RETURN_ADJOINT_OBJECTIVES, return_adjoint_contract
+    from stockagent.training.optimizer_config import normalized_sharpness_options
+    objective = training.get("loss_type", "log_utility")
+    passes = 1
+    if objective in RETURN_ADJOINT_OBJECTIVES:
+        contract = return_adjoint_contract(objective)
+        passes = contract.get("model_forward_passes",
+            1 if contract.get("engine") == "single_pass_account_compound_gradient_rescale_v1" else 2)
+    options = normalized_sharpness_options(training.get("sharpness_mode", "none"),
+        training.get("sharpness_radius", 0.), training.get("sharpness_alpha", 1.))
+    if options["mode"] != "none":
+        if objective not in {"log_utility", "trajectory_mgda_l2_parameter"}:
+            raise ValueError("sharpness benchmark supports annual log or unit parameter MGDA")
+        passes *= 2
+    return passes
+
+
 def _score_curve(
     rows: list[dict[str, Any]],
     *,
@@ -280,7 +299,15 @@ def _score_curve(
     require_explicit_carry_graph: bool = False,
     model_forward_passes: int = 1,
     objective: str = "log_utility",
+    sharpness_options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from stockagent.training.optimizer_config import normalized_sharpness_options
+    sharpness = normalized_sharpness_options(**(sharpness_options or dict(mode="none", radius=0., alpha=1.)))
+    if sharpness["mode"] != "none":
+        expected_passes = _model_forward_passes(dict(loss_type=objective,
+            **{f"sharpness_{k}":v for k,v in sharpness.items()}))
+        if model_forward_passes != expected_passes:
+            raise ValueError("sharpness pass count disagrees with the objective contract")
     steady = [row for row in rows if int(row.get("epoch", 0) or 0) > skip_epochs]
     reasons: list[str] = []
     if len(steady) < minimum_steady_epochs:
@@ -314,15 +341,25 @@ def _score_curve(
         # Pure MDD has a valid zero-loss/zero-gradient cash optimum. Report it
         # as such instead of diagnosing a broken gradient or adding return.
         zero_mdd_optimum = objective == "trajectory_mdd" and _finite_float(row.get("train_loss")) == 0.
-        from stockagent.training.multiobjective import MULTIOBJECTIVE_OBJECTIVES
+        from stockagent.training.multiobjective import MULTIOBJECTIVE_OBJECTIVES, TASK_NAMES
         zero_surgery_direction = (objective in MULTIOBJECTIVE_OBJECTIVES
             and _finite_float(row.get("train_multiobjective_combined_norm")) == 0.
             and all(_finite_float(row.get(f"train_multiobjective_loss_{name}")) is not None
-                    for name in ("sharpe", "log_return", "sortino", "mdd"))
+                    for name in TASK_NAMES)
             and ("mgda" not in objective or
                  (_finite_float(row.get("train_multiobjective_mgda_kkt_margin")) is not None
                   and float(row["train_multiobjective_mgda_kkt_margin"]) >= -1e-9)))
         zero_direction_allowed = zero_mdd_optimum or zero_surgery_direction
+        if sharpness["mode"] != "none":
+            prefix = "train_multiobjective_sharpness_"
+            base_vjps = 4. if objective == "trajectory_mgda_l2_parameter" else 1.
+            expected = {"radius":sharpness["radius"], "alpha":sharpness["alpha"],
+                        "base_vjp_passes":base_vjps, "total_vjp_passes":2*base_vjps}
+            if (any(_finite_float(row.get(prefix+k)) != v for k,v in expected.items())
+                    or row.get("train_optimizer_steps") != 1
+                    or any(_finite_float(row.get(prefix+k)) is None for k in (
+                        "base_loss", "perturbed_loss", "displacement_l2"))):
+                reasons.append(f"epoch {epoch} lacks complete two-pass sharpness and single-update evidence")
         if int(row.get("train_zero_grad_batches", 0) or 0) != 0 and not zero_direction_allowed:
             reasons.append(f"epoch {epoch} contains zero-gradient optimizer batches")
         grad_norm = _finite_float(row.get("train_grad_norm_before_clip_mean"))
@@ -383,8 +420,8 @@ def _score_curve(
                 train_rows=train_rows, global_batch_rows=global_batch_size, world_size=world_size)
         except (ValueError, TypeError, KeyError) as exc:
             return {"ok": False, "reasons": [str(exc)], "memory": memory}
-    if model_forward_passes not in {1, 2, 5}:
-        raise ValueError("benchmark supports one physical, two return-space, or five parameter-space passes")
+    if model_forward_passes not in {1, 2, 5, 10}:
+        raise ValueError("benchmark supports physical/return/parameter passes and two complete sharpness passes")
     batches_per_pass = (ownership_validation["reporting_rank_batches"] if ownership_validation
                         else math.ceil(train_rows / global_batch_size))
     expected_batches = batches_per_pass * model_forward_passes
@@ -871,13 +908,12 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
             annual_ownership = None
             if base.get("training", {}).get("day_trade_annual_episode_sharding", False):
                 annual_ownership = json.loads((curve_path.parent / "annual_episode_ownership.json").read_text())
-            from stockagent.training.return_adjoint import RETURN_ADJOINT_OBJECTIVES, return_adjoint_contract
             objective = base.get("training", {}).get("loss_type")
-            passes = 1
-            if objective in RETURN_ADJOINT_OBJECTIVES:
-                contract = return_adjoint_contract(objective)
-                passes = contract.get("model_forward_passes",
-                    1 if contract.get("engine") == "single_pass_account_compound_gradient_rescale_v1" else 2)
+            passes = _model_forward_passes(base.get("training", {}))
+            from stockagent.training.optimizer_config import normalized_sharpness_options
+            t = base.get("training", {})
+            sharpness = normalized_sharpness_options(t.get("sharpness_mode", "none"),
+                t.get("sharpness_radius", 0.), t.get("sharpness_alpha", 1.))
             score = _score_curve(
                 rows,
                 skip_epochs=args.skip_epochs,
@@ -894,6 +930,7 @@ def _run_candidate(args: argparse.Namespace, base: dict[str, Any], batch_size: i
                 annual_ownership=annual_ownership,
                 model_forward_passes=passes,
                 objective=objective,
+                sharpness_options=sharpness,
                 require_explicit_carry_graph=(
                     env.get("STOCKAGENT_DAY_TRADE_EXPLICIT_GRAPH", "0") == "1"
                 ),

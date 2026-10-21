@@ -613,10 +613,24 @@ def _publish_entry(
         entry, inherited_fd=getattr(args, "source_lock_fd", None),
         **({"wait_seconds": 0} if getattr(args, "all_ready", False) else {}),
     ) as source_owners:
+        # A standalone producer may let this canonical publisher acquire the
+        # original owner instead of passing an inherited descriptor. Deferred
+        # notification still requires both a real held source lock and the
+        # caller's unique commit receipt; it never makes an unlocked source
+        # publishable or turns queued scans into delivery acceptance.
+        if (getattr(args, "defer_scan", False) and getattr(args, "dataset", None)
+                and source_owners["primary_fd"] is None
+                and not source_owners["native_lock_fds"]):
+            raise SnapshotError("single deferred publication requires a held catalog/native source lock")
         status = _status(entry, _running_commands(), sync_root=sync_root,
                          held_native_lock_fds=source_owners["native_lock_fds"])
         if not status["publish_ready"]:
             return status, None
+        from stockagent.data_sync.parquet_publication import ParquetPublicationSnapshot
+        parquet_proof = ParquetPublicationSnapshot(_source_path(entry),
+            dataset=entry["dataset"],
+            excluded=entry.get("excluded_subtrees", ()),
+            included_root_files=entry.get("included_root_files"))
         forward_proof = None
         forward_pin = None
         validation = None
@@ -647,10 +661,11 @@ def _publish_entry(
                                        "snapshot_id": existing.manifest["snapshot_id"]}
                 return status, existing
         previous_guard = source_guard
-        if validation_guard is not None or forward_proof is not None or freshness_guard is not None:
+        if validation_guard is not None or forward_proof is not None or freshness_guard is not None or parquet_proof.applicable:
             def source_guard():
                 if previous_guard is not None:
                     previous_guard()
+                parquet_proof.guard()
                 if validation_guard is not None:
                     validation_guard()
                 if freshness_guard is not None:
@@ -673,6 +688,7 @@ def _publish_entry(
             metadata={
                 "role": str(entry["role"]),
                 "catalog_schema": "1",
+                **parquet_proof.metadata,
                 **(forward_proof.metadata if forward_proof is not None else {}),
                 **({'source_validation_contract': str(validation['contract']),
                     'source_validation_identity': str(validation['identity']),
@@ -747,7 +763,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Existing retention owner configuration for a completed-forward fixed pin.")
     parser.add_argument(
         "--defer-scan", action="store_true",
-        help="Durably queue scans; requires a guarded single-source receipt or an all-ready batch progress receipt. The existing drain owns synchronization.",
+        help="Durably queue scans; requires a held catalog/native source lock and unique single-source receipt, or an all-ready batch progress receipt. The existing drain owns synchronization.",
     )
     parser.add_argument(
         "--source-lock-fd", type=int,
@@ -811,14 +827,14 @@ def main(argv: list[str] | None = None) -> int:
             _check_packed_read_authority(args.sync_root.absolute())
         single_deferred_owner = (
             args.command == "publish" and args.dataset and not args.all_ready
-            and args.source_lock_fd is not None and args.result_receipt is not None
+            and args.result_receipt is not None
         )
         batch_deferred_owner = (
             args.command == "publish" and args.all_ready and not args.dataset
             and args.batch_progress_receipt is not None
         )
         if args.defer_scan and not (single_deferred_owner or batch_deferred_owner):
-            raise SnapshotError("--defer-scan requires one publication with inherited source lock and unique result receipt, or an all-ready batch progress receipt")
+            raise SnapshotError("--defer-scan requires one guarded publication with a unique result receipt, or an all-ready batch progress receipt")
         if args.batch_progress_receipt is not None:
             if args.command != "publish" or not args.all_ready or args.dataset:
                 raise SnapshotError("--batch-progress-receipt requires publish --all-ready")

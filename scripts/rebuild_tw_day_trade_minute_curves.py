@@ -33,6 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.live.tw_day_trade_simulation import (
     TAIPEI,
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     position_net_liquidation_pnl,
     minute_curve_write_lock,
 )
@@ -395,6 +396,7 @@ class MinutePriceStore:
         replay_symbol_sources: Mapping[
             tuple[str, str], Iterable[str | Path]
         ] | None = None,
+        finmind_root: Path | None = None,
     ) -> None:
         def unique_paths(value: Path | Sequence[Path]) -> tuple[Path, ...]:
             candidates = (
@@ -439,6 +441,84 @@ class MinutePriceStore:
         self._verified_replay_source_signatures: dict[
             Path, tuple[int, int, int, str]
         ] = {}
+        self.finmind_root = Path(finmind_root).resolve() if finmind_root is not None else None
+        self._finmind_prices: dict[tuple[str, str], dict[str, float]] = {}
+        self._finmind_loaded: dict[str, set[str]] = defaultdict(set)
+        self.finmind_source_records: dict[str, dict[str, Any]] = {}
+        self._verified_finmind_signatures: dict[Path, tuple[int, int, int]] = {}
+
+    def _prepare_finmind(self, pairs: Sequence[tuple[str, str]]) -> None:
+        """Read only receipt-pinned local backup prices, never execution capacity.
+
+        A current replay's exact symbol/source pins remain authoritative. The
+        backup is for ordinary valuation and additive ledgers, which otherwise
+        unnecessarily lose locally retained prices of now-delisted contracts.
+        """
+        if not pairs or self.finmind_root is None or self._replay_pair_pins_enforced:
+            return
+        from downloader.finmind_storage_objects import validate_parquet
+        from stockagent.data.tw_minute_sources import normalize_finmind
+
+        by_day: dict[str, set[str]] = defaultdict(set)
+        for symbol, day in pairs:
+            if symbol not in self._finmind_loaded[day]:
+                by_day[day].add(symbol)
+        for day, symbols in by_day.items():
+            receipt_path = self.finmind_root / "receipts/TaiwanStockKBar/all" / f"{day}.json"
+            if not receipt_path.is_file():
+                self._finmind_loaded[day].update(symbols)
+                continue
+            def signature(path):
+                stat = path.stat()
+                return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+            receipt_signature = signature(receipt_path)
+            receipt = _read_json(receipt_path)
+            if (receipt.get("status") != "complete"
+                    or receipt.get("dataset") != "TaiwanStockKBar"
+                    or receipt.get("data_id") != ""
+                    or receipt.get("partition") != day):
+                raise RuntimeError(f"invalid FinMind minute receipt identity: {receipt_path}")
+            relative = Path(str(receipt.get("parquet_path") or ""))
+            path = (self.finmind_root / relative).resolve()
+            if (relative.is_absolute() or ".." in relative.parts
+                    or not path.is_relative_to(self.finmind_root) or not path.is_file()):
+                raise RuntimeError(f"unavailable or unsafe FinMind minute object: {path}")
+            source_signature = signature(path)
+            if (source_signature[0] != receipt.get("parquet_size_bytes")
+                    or _sha256(path) != receipt.get("sha256")):
+                raise RuntimeError(f"FinMind minute source hash mismatch: {path}")
+            validation = validate_parquet(path, "TaiwanStockKBar", day)
+            if validation["rows"] != receipt.get("rows"):
+                raise RuntimeError(f"FinMind minute row count mismatch: {path}")
+            raw = pl.scan_parquet(path).filter(pl.col("stock_id").is_in(sorted(symbols))).collect()
+            if raw.select(pl.struct("stock_id", "date", "minute").is_duplicated().any()).item():
+                raise RuntimeError(f"ambiguous duplicate FinMind minute observations: {path}")
+            normalized = normalize_finmind(raw).with_columns(
+                raw["volume"].cast(pl.Float64).alias("Volume"))
+            normalized = normalized.filter(
+                (pl.col("_invalid_reason") == "")
+                & pl.col("phase").is_in(["regular", "closing_auction"])
+            ).with_columns(pl.col("ts").dt.date().alias("date"))
+            # A closing-auction observation supersedes the regular bar sharing
+            # its right label. Delayed/after-hours auctions are not 13:30 marks.
+            normalized = normalized.sort("ts", pl.col("phase") == "closing_auction")
+            for symbol in symbols:
+                selected = normalized.filter(pl.col("symbol") == symbol)
+                self._finmind_prices[(symbol, day)] = self._frame_prices(selected, day)
+            for source, expected in ((receipt_path, receipt_signature), (path, source_signature)):
+                if signature(source) != expected:
+                    raise RuntimeError(f"FinMind minute source changed during read: {source}")
+                previous = self._verified_finmind_signatures.setdefault(source, expected)
+                if previous != expected:
+                    raise RuntimeError(f"FinMind minute source changed during reconstruction: {source}")
+            self.finmind_source_records[day] = {
+                "session_date": day, "path": str(path), "sha256": receipt["sha256"],
+                "receipt": str(receipt_path), "receipt_sha256": _sha256(receipt_path),
+                "clock_normalization": "tw_raw_minute_provider_union_v2_dated_units",
+                "native_volume_use": "positive_trade_observation_only_not_shares_or_liquidity",
+                "execution_capacity_claimed": False,
+            }
+            self._finmind_loaded[day].update(symbols)
 
     def _verified_replay_source(self, path: Path, session_date: str) -> bool:
         """Verify one exact source file pinned by the execution replay receipt."""
@@ -518,6 +598,10 @@ class MinutePriceStore:
 
     def assert_sources_unchanged(self) -> None:
         """Reject a price/receipt replacement between verification and publish."""
+        for path, expected in self._verified_finmind_signatures.items():
+            stat = path.stat()
+            if (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != expected:
+                raise RuntimeError(f"FinMind minute source changed during reconstruction: {path}")
         for path, expected in self._verified_replay_source_signatures.items():
             try:
                 stat = path.stat()
@@ -554,6 +638,21 @@ class MinutePriceStore:
         )
         if "Volume" in selected.columns:
             selected = selected.filter(pl.col("Volume").is_finite() & (pl.col("Volume") > 0))
+        stamp_type = selected.schema.get("ts")
+        price_type = selected.schema.get("Close")
+        if (isinstance(stamp_type, pl.Datetime) and price_type is not None
+                and price_type.is_numeric() and selected["Close"].null_count() == 0):
+            stamp = pl.col("ts")
+            stamp = (stamp.dt.replace_time_zone("Asia/Taipei") if stamp_type.time_zone is None
+                     else stamp.dt.convert_time_zone("Asia/Taipei"))
+            # Same minute keys, FP64 values and last-row-wins behavior as the
+            # legacy loop, without constructing a Python datetime per trade bar.
+            prices = selected.select(
+                stamp.dt.strftime("%Y-%m-%dT%H:%M%:z").alias("minute"),
+                pl.col("Close").cast(pl.Float64),
+            ).filter(pl.col("minute").is_not_null() & pl.col("Close").is_finite()
+                     & (pl.col("Close") > 0))
+            return dict(prices.iter_rows())
         output: dict[str, float] = {}
         for row in selected.select("ts", "Close").iter_rows(named=True):
             stamp = row["ts"]
@@ -716,6 +815,7 @@ class MinutePriceStore:
             pairs = [pair for pair in pairs if not staged[pair]]
             if not pairs:
                 break
+        self._prepare_finmind(pairs)
 
     def prices(self, symbol: str, session_date: str) -> dict[str, float]:
         key = (str(symbol), str(session_date))
@@ -729,6 +829,11 @@ class MinutePriceStore:
             if output:
                 source = f"local_kbar:{root.resolve()}"
                 break
+        if not output and self.finmind_root is not None:
+            self._prepare_finmind([key])
+            output = dict(self._finmind_prices.get(key, {}))
+            if output:
+                source = f"local_finmind_kbar:{self.finmind_root}"
         if not output and not self.require_receipts:
             for tick_root in self.tick_minute_roots:
                 tick_path = tick_root / key[0] / f"{key[1]}.parquet"
@@ -1014,8 +1119,8 @@ def rebuild_strategy_marks(
     Existing audited replay marks are authoritative observations of the
     bracket/EOD-aware paper engine. Missing minutes, and optionally existing
     interior minutes without auditable price provenance, are reconstructed
-    from the retained one-minute trade tape and append-only exit-fill ledger.
-    The fill ledger preserves real stop, take-profit, and partial-exit state;
+    from the retained one-minute tape and append-only inventory fill ledger.
+    Clocked entries, completions and exits determine the inventory and basis;
     Entry/exit fills and the accepted 13:30 endpoint remain untouched.
     Explicit opening repair values 09:01 at its completed source bar Close,
     using the same net-liquidation accounting as every following minute.
@@ -1060,19 +1165,21 @@ def rebuild_strategy_marks(
     opening_revaluations: list[dict[str, Any]] = []
     changed_equity_rows = 0
     maximum_equity_change_twd = 0.0
+    opening_full_target_price_carries = 0
     fills_by_position: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(
         list
     )
+    session_fills: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for raw_fill in fill_rows:
-        if (
-            not isinstance(raw_fill, Mapping)
-            or _is_entry_inventory_fill(raw_fill)
-        ):
+        if not isinstance(raw_fill, Mapping):
             continue
         session_date = str(raw_fill.get("session_date") or "")
         market = str(raw_fill.get("market") or "")
         position_id = str(raw_fill.get("position_id") or "")
         if not session_date or not market or not position_id:
+            continue
+        session_fills[(session_date, market)].append(dict(raw_fill))
+        if _is_entry_inventory_fill(raw_fill):
             continue
         fills_by_position[(session_date, market, position_id)].append(dict(raw_fill))
     for rows in fills_by_position.values():
@@ -1097,12 +1204,25 @@ def rebuild_strategy_marks(
                 )
             mode_positions = list((positions.get(session_date) or {}).get(market) or ())
             expected_open = int(opening.get("open_position_count") or 0)
-            if expected_open != len(mode_positions):
+            events = session_fills.get((session_date, market), [])
+            inventory = None
+            if any(_is_entry_inventory_fill(event) for event in events):
+                inventory = _ImmutableMinuteInventory(
+                    {str(p["position_id"]): p for p in mode_positions},
+                    [dict(event, clock=str(event.get("fill_at") or event.get("recorded_at") or ""))
+                     for event in events],
+                    market=market,
+                )
+            # Exit-only legacy books have no entry clocks. Full append-only
+            # books must prove the opening count from fills, not the final
+            # all-day position archive (which may include later entries).
+            if inventory is None and expected_open != len(mode_positions):
                 raise RuntimeError(
                     f"position count mismatch for {session_date}:{market}: "
                     f"accepted={expected_open} reconstructed={len(mode_positions)}"
                 )
             current_prices: dict[str, float] = {}
+            price_times: dict[str, str] = {}
             minute_prices: dict[str, dict[str, float]] = {}
             for position in mode_positions:
                 symbol = str(position["symbol"])
@@ -1116,9 +1236,11 @@ def rebuild_strategy_marks(
                     raise RuntimeError(
                         f"missing official opening price for {session_date}:{market}:{symbol}"
                     )
-                current_prices[symbol] = initial
+                if inventory is None:
+                    current_prices[symbol] = initial
                 minute_prices[symbol] = store.prices(symbol, session_date)
 
+            realized_baseline = float(opening.get("cumulative_realized_net_pnl_twd") or 0.0)
             for minute in _session_minutes(day):
                 clock = minute.strftime("%H:%M")
                 if clock == "09:00":
@@ -1127,11 +1249,34 @@ def rebuild_strategy_marks(
                     continue
                 minute_key = minute.isoformat(timespec="minutes")
                 existing = by_key.get((session_date, market, minute_key))
+                if inventory is not None:
+                    cutoff = minute.isoformat(timespec="seconds")
+                    if existing is not None and clock in {"09:01", "13:30"}:
+                        cutoff = max(cutoff, str(existing.get("recorded_at") or cutoff))
+                    inventory.advance(cutoff, current_prices, price_times)
+                    if clock == "09:01":
+                        actual_open = len(inventory.positions)
+                        if expected_open != actual_open:
+                            raise RuntimeError(
+                                f"position count mismatch for {session_date}:{market}: "
+                                f"accepted={expected_open} reconstructed={actual_open}"
+                            )
+                        # A subrange can begin after prior realized gains;
+                        # exits already included in its opening endpoint must
+                        # not be counted twice.
+                        realized_baseline -= inventory.realized
+                    if clock == "13:30":
+                        if (len(inventory.positions) != int(closing.get("open_position_count") or 0)
+                            or not math.isclose(realized_baseline + inventory.realized,
+                                                float(closing.get("cumulative_realized_net_pnl_twd") or 0.0),
+                                                rel_tol=1e-12, abs_tol=1e-6)):
+                            raise RuntimeError(f"closing fill-book accounting disagrees: {session_date}:{market}")
                 fresh_symbols: set[str] = set()
                 for symbol, prices in minute_prices.items():
                     value = prices.get(minute_key)
                     if value is not None:
                         current_prices[symbol] = value
+                        price_times[symbol] = minute.isoformat(timespec="seconds")
                         fresh_symbols.add(symbol)
                 preserve_existing = bool(
                     existing is not None
@@ -1149,59 +1294,66 @@ def rebuild_strategy_marks(
                     preserved_rows += 1
                     continue
                 if clock == "09:01" and revalue_opening_marks:
-                    missing_open = set(minute_prices) - fresh_symbols
-                    if missing_open:
+                    held_symbols = ({p["symbol"] for p in inventory.positions.values()}
+                                    if inventory is not None else set(minute_prices))
+                    missing_open = held_symbols - fresh_symbols
+                    # The explicitly authorized no-liquidity-claim scenario
+                    # can enter from a source-published 09:01 price with no new
+                    # valuation print in the selected minute tape. Carry that
+                    # cohort's immutable paper price, marked stale; never call
+                    # it a fresh market print or relax ordinary replay/live
+                    # source requirements. All cohorts of the symbol qualify.
+                    authorized_carry = {
+                        symbol for symbol in missing_open
+                        if inventory is not None and all(
+                            p["position_id"] in inventory.full_0901_price_entries
+                            for p in inventory.positions.values() if p["symbol"] == symbol
+                        )
+                    }
+                    if missing_open - authorized_carry:
                         raise RuntimeError(
                             f"missing completed 09:01 valuation bar for "
-                            f"{session_date}:{market}:{sorted(missing_open)}"
+                            f"{session_date}:{market}:{sorted(missing_open - authorized_carry)}"
                         )
+                    opening_full_target_price_carries += len(authorized_carry)
                 if existing is not None:
                     replaced_unverified_rows += 1
                 open_net = 0.0
                 total_notional = 0.0
                 fresh_notional = 0.0
-                realized_this_session = 0.0
+                realized_this_session = inventory.realized if inventory is not None else 0.0
                 open_positions = 0
                 fresh_open_positions = 0
-                for position in mode_positions:
+                valued_positions = inventory.positions.values() if inventory is not None else mode_positions
+                for position in valued_positions:
                     symbol = str(position["symbol"])
-                    quantity = _filled_quantity(position)
-                    position_id = str(position.get("position_id") or symbol)
-                    exited_quantity = 0
-                    allocated_entry_fee = 0.0
-                    for fill in fills_by_position.get(
-                        (session_date, market, position_id), ()
-                    ):
-                        fill_at = str(
-                            fill.get("fill_at") or fill.get("recorded_at") or ""
-                        )
-                        if not fill_at or fill_at > minute.isoformat(
-                            timespec="seconds"
-                        ):
-                            break
-                        exited_quantity += int(fill.get("quantity") or 0)
-                        allocated_entry_fee += float(
-                            fill.get("entry_fee_allocated_twd") or 0.0
-                        )
-                        realized_this_session += float(fill.get("net_pnl_twd") or 0.0)
-                    remaining = quantity - exited_quantity
-                    if remaining < 0:
-                        raise RuntimeError(
-                            "exit quantity exceeds entry for "
-                            f"{session_date}:{market}:{position_id}"
-                        )
-                    if remaining == 0:
-                        continue
+                    if inventory is not None:
+                        remaining = abs(int(position["signed_shares"]))
+                        signed = int(position["signed_shares"])
+                        remaining_entry_fee = float(position["remaining_entry_fee_twd"])
+                        price = inventory.mark_price(position, current_prices, price_times)
+                    else:
+                        position_id = str(position.get("position_id") or symbol)
+                        exited_quantity, allocated_entry_fee = 0, 0.0
+                        for fill in fills_by_position.get((session_date, market, position_id), ()):
+                            fill_at = str(fill.get("fill_at") or fill.get("recorded_at") or "")
+                            if not fill_at or fill_at > minute.isoformat(timespec="seconds"):
+                                break
+                            exited_quantity += int(fill.get("quantity") or 0)
+                            allocated_entry_fee += float(fill.get("entry_fee_allocated_twd") or 0.0)
+                            realized_this_session += float(fill.get("net_pnl_twd") or 0.0)
+                        remaining = _filled_quantity(position) - exited_quantity
+                        if remaining < 0:
+                            raise RuntimeError(
+                                f"exit quantity exceeds entry for {session_date}:{market}:{position_id}"
+                            )
+                        if remaining == 0:
+                            continue
+                        signed = remaining if str(position.get("side")) == "long" else -remaining
+                        price = current_prices[symbol]
+                        remaining_entry_fee = max(0.0, float(position.get("entry_fee_twd") or 0.0)
+                                                  - allocated_entry_fee)
                     open_positions += 1
-                    signed = (
-                        remaining if str(position.get("side")) == "long" else -remaining
-                    )
-                    price = current_prices[symbol]
-                    remaining_entry_fee = max(
-                        0.0,
-                        float(position.get("entry_fee_twd") or 0.0)
-                        - allocated_entry_fee,
-                    )
                     open_net += position_net_liquidation_pnl(
                         position,
                         price,
@@ -1220,8 +1372,7 @@ def rebuild_strategy_marks(
                 carried_rows += int(carried > 0)
                 fresh_ratios.append(coverage)
                 cumulative = (
-                    float(opening.get("cumulative_realized_net_pnl_twd") or 0.0)
-                    + realized_this_session
+                    realized_baseline + realized_this_session
                 )
                 initial_capital = float(opening.get("initial_capital_twd") or 0.0)
                 generated.append(
@@ -1281,6 +1432,7 @@ def rebuild_strategy_marks(
         "opening_revaluations": opening_revaluations,
         "changed_equity_rows": changed_equity_rows,
         "maximum_equity_change_twd": maximum_equity_change_twd,
+        "opening_full_target_fill_price_carried_symbol_days": opening_full_target_price_carries,
         "rows_with_carried_prices": carried_rows,
         "minimum_fresh_trade_notional_coverage_ratio": min(fresh_ratios, default=1.0),
         "mean_fresh_trade_notional_coverage_ratio": (
@@ -1353,6 +1505,114 @@ def _validated_legacy_paper_entry_retries(
     return frozenset(legacy_orders)
 
 
+class _ImmutableMinuteInventory:
+    """Replay retained inventory clocks for flat and carried valuation alike.
+
+    This is a read model, not an execution engine: fills, quantities, fees and
+    realized PnL are immutable inputs. Final archived average cost must never
+    leak into minutes preceding a late entry or entry completion.
+    """
+
+    def __init__(self, metadata, events, *, market):
+        self.metadata = metadata
+        self.events = sorted(events, key=lambda event: event["clock"])
+        if any(not event["clock"] for event in self.events):
+            raise RuntimeError(f"minute inventory fill has no clock: {market}")
+        self.legacy_orders = _validated_legacy_paper_entry_retries(
+            self.events, metadata, market=market
+        )
+        self.positions: dict[str, dict[str, Any]] = {}
+        self.entry_fallbacks: dict[str, tuple[float, str]] = {}
+        self.full_0901_price_entries = frozenset(
+            event["position_id"] for event in self.events
+            if event.get("purpose") == "entry"
+            and event.get("fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            and event.get("fill_at") == f"{event.get('session_date')}T09:01:00+08:00"
+            and event.get("simulation_only") is True
+            and event.get("simulation_replay") is True
+            and event.get("counterfactual_0901_price_fill") is True
+            and event.get("synthetic_fill") is False
+            and event.get("entry_price_method") in {"minute_vwap", "minute_close"}
+            and bool(event.get("entry_price_source"))
+            and math.isfinite(float(event.get("price") or 0))
+            and float(event.get("price") or 0) > 0
+        )
+        self.seen_entries: set[str] = set()
+        self.cursor = 0
+        self.realized = 0.0
+
+    def advance(self, cutoff, prices, price_times, new_entries=None):
+        while self.cursor < len(self.events) and self.events[self.cursor]["clock"] <= cutoff:
+            event = self.events[self.cursor]
+            identity = event["position_id"]
+            if event.get("share_action"):
+                p = self.positions[identity]
+                if p["signed_shares"] != event["old_signed_shares"]:
+                    raise RuntimeError("minute share replacement disagrees with retained inventory")
+                p["signed_shares"] = int(event["new_signed_shares"])
+                p["inventory_basis_price"] = float(event["new_entry_price"])
+                symbol = p["symbol"]
+                if symbol in prices and price_times.get(symbol, "") < event["clock"][:10]:
+                    prices[symbol] = (prices[symbol] - event["cash_per_old_share"]) / event["ratio"]
+                    price_times[symbol] = event["clock"]
+                if identity in self.entry_fallbacks:
+                    fallback, started = self.entry_fallbacks[identity]
+                    self.entry_fallbacks[identity] = (
+                        (fallback - event["cash_per_old_share"]) / event["ratio"], started
+                    )
+            elif event["purpose"] == "entry" and event.get("order_id") not in self.legacy_orders:
+                if identity in self.seen_entries or identity not in self.metadata:
+                    raise RuntimeError("minute entry identity is duplicate or has no accepted position")
+                self.seen_entries.add(identity)
+                if new_entries is not None:
+                    new_entries.add(identity)
+                p = dict(self.metadata[identity])
+                sign = 1 if p["side"] == "long" else -1
+                p.update(signed_shares=sign * int(event["quantity"]),
+                         inventory_basis_price=float(event["price"]),
+                         remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
+                self.positions[identity] = p
+                self.entry_fallbacks[identity] = (float(event["price"]), event["clock"])
+            elif event["purpose"] == "entry_completion" or event.get("order_id") in self.legacy_orders:
+                if identity not in self.seen_entries or identity not in self.positions:
+                    raise RuntimeError("minute entry completion has no accepted original entry")
+                p = self.positions[identity]
+                old_quantity = abs(int(p["signed_shares"]))
+                quantity = int(event["quantity"])
+                if quantity <= 0:
+                    raise RuntimeError("minute entry completion has invalid quantity")
+                sign = 1 if p["side"] == "long" else -1
+                p["signed_shares"] += sign * quantity
+                p["inventory_basis_price"] = (
+                    float(p["inventory_basis_price"]) * old_quantity
+                    + float(event["price"]) * quantity
+                ) / (old_quantity + quantity)
+                p["remaining_entry_fee_twd"] += float(event["fee_and_tax_twd"])
+                self.entry_fallbacks[identity] = (p["inventory_basis_price"], event["clock"])
+            else:
+                p = self.positions[identity]
+                quantity = int(event["quantity"])
+                if quantity <= 0 or quantity > abs(p["signed_shares"]):
+                    raise RuntimeError("minute exit exceeds retained inventory or has invalid quantity")
+                p["signed_shares"] -= quantity * (1 if p["signed_shares"] > 0 else -1)
+                p["remaining_entry_fee_twd"] -= float(event["entry_fee_allocated_twd"])
+                self.realized += float(event["net_pnl_twd"])
+                if not p["signed_shares"]:
+                    del self.positions[identity]
+                    self.entry_fallbacks.pop(identity, None)
+            self.cursor += 1
+
+    def mark_price(self, position, prices, price_times):
+        symbol = position["symbol"]
+        fallback = self.entry_fallbacks.get(position["position_id"])
+        if fallback and price_times.get(symbol, "") < fallback[1]:
+            return fallback[0]
+        price = prices.get(symbol)
+        if price is None:
+            raise RuntimeError("inventory valuation has no prior observed price")
+        return price
+
+
 def rebuild_carried_strategy_marks(
     source_rows,
     positions,
@@ -1388,14 +1648,12 @@ def rebuild_carried_strategy_marks(
         events = sorted([*(f | {"clock": str(f.get("fill_at") or f["recorded_at"])} for f in fills),
                          *(a | {"clock": a["recorded_at"], "share_action": True}
                            for a in mode.get("share_replacement_ledger", []))], key=lambda e: e["clock"])
-        legacy_orders = _validated_legacy_paper_entry_retries(events, metadata, market=market)
-        legacy_retry_rows += len(legacy_orders)
-        book, prices, price_times, seen_entries = {}, {}, {}, set()
+        inventory = _ImmutableMinuteInventory(metadata, events, market=market)
+        legacy_retry_rows += len(inventory.legacy_orders)
+        book, prices, price_times = inventory.positions, {}, {}
         # A new paper entry is a price for that cohort, not a market-wide
         # trade. Until a sourced minute print arrives, older carried cohorts
         # retain their own last observed mark.
-        entry_fallbacks: dict[str, tuple[float, str]] = {}
-        cursor, realized = 0, 0.
         for day in days:
             new_entries_this_day = set()
             symbols = {p["symbol"] for p in positions.get(day, {}).get(market, [])}
@@ -1414,63 +1672,7 @@ def rebuild_carried_strategy_marks(
                 cutoff = clock
                 if existing and key[11:16] in {"09:01", "13:30"}:
                     cutoff = max(clock, str(existing.get("recorded_at") or clock))
-                while cursor < len(events) and events[cursor]["clock"] <= cutoff:
-                    event = events[cursor]
-                    identity = event["position_id"]
-                    if event.get("share_action"):
-                        p = book[identity]
-                        if p["signed_shares"] != event["old_signed_shares"]:
-                            raise RuntimeError("minute share replacement disagrees with retained inventory")
-                        p["signed_shares"] = int(event["new_signed_shares"])
-                        p["inventory_basis_price"] = float(event["new_entry_price"])
-                        symbol = p["symbol"]
-                        if symbol in prices and price_times.get(symbol, "") < day:
-                            prices[symbol] = (prices[symbol] - event["cash_per_old_share"]) / event["ratio"]
-                            price_times[symbol] = event["clock"]
-                        if identity in entry_fallbacks:
-                            fallback, started = entry_fallbacks[identity]
-                            entry_fallbacks[identity] = (
-                                (fallback - event["cash_per_old_share"]) / event["ratio"], started
-                            )
-                    elif event["purpose"] == "entry" and event.get("order_id") not in legacy_orders:
-                        if identity in seen_entries or identity not in metadata:
-                            raise RuntimeError("minute entry identity is duplicate or has no accepted position")
-                        seen_entries.add(identity)
-                        new_entries_this_day.add(identity)
-                        p = dict(metadata[identity])
-                        sign = 1 if p["side"] == "long" else -1
-                        p.update(signed_shares=sign * int(event["quantity"]), inventory_basis_price=float(event["price"]),
-                                 remaining_entry_fee_twd=float(event["fee_and_tax_twd"]))
-                        book[identity] = p
-                        entry_fallbacks[identity] = (float(event["price"]), event["clock"])
-                    elif event["purpose"] == "entry_completion" or event.get("order_id") in legacy_orders:
-                        if identity not in seen_entries or identity not in book:
-                            raise RuntimeError("minute entry completion has no accepted original entry")
-                        p = book[identity]
-                        old_quantity = abs(int(p["signed_shares"]))
-                        quantity = int(event["quantity"])
-                        if quantity <= 0:
-                            raise RuntimeError("minute entry completion has invalid quantity")
-                        sign = 1 if p["side"] == "long" else -1
-                        p["signed_shares"] += sign * quantity
-                        p["inventory_basis_price"] = (
-                            float(p["inventory_basis_price"]) * old_quantity
-                            + float(event["price"]) * quantity
-                        ) / (old_quantity + quantity)
-                        p["remaining_entry_fee_twd"] += float(event["fee_and_tax_twd"])
-                        entry_fallbacks[identity] = (p["inventory_basis_price"], event["clock"])
-                    else:
-                        p = book[identity]
-                        quantity = int(event["quantity"])
-                        if quantity > abs(p["signed_shares"]):
-                            raise RuntimeError("minute exit exceeds retained carried inventory")
-                        p["signed_shares"] -= quantity * (1 if p["signed_shares"] > 0 else -1)
-                        p["remaining_entry_fee_twd"] -= float(event["entry_fee_allocated_twd"])
-                        realized += float(event["net_pnl_twd"])
-                        if not p["signed_shares"]:
-                            del book[identity]
-                            entry_fallbacks.pop(identity, None)
-                    cursor += 1
+                inventory.advance(cutoff, prices, price_times, new_entries_this_day)
                 fresh = set()
                 if key[11:16] == "09:01" and not revalue_opening_marks:
                     # Mirror _mark_mode exactly: only an explicitly retained
@@ -1492,13 +1694,7 @@ def rebuild_carried_strategy_marks(
                     if not p["signed_shares"]:
                         continue
                     symbol = p["symbol"]
-                    fallback = entry_fallbacks.get(p["position_id"])
-                    if fallback and price_times.get(symbol, "") < fallback[1]:
-                        mark_price = fallback[0]
-                    else:
-                        mark_price = prices.get(symbol)
-                    if mark_price is None:
-                        raise RuntimeError("carried valuation has no prior observed price")
+                    mark_price = inventory.mark_price(p, prices, price_times)
                     valuation = dict(p)
                     if str(p.get("margin_converted_at") or "9999") > clock:
                         valuation.pop("margin_carry_contract", None)
@@ -1512,8 +1708,8 @@ def rebuild_carried_strategy_marks(
                 cost = charges + (terminal_charges if key[11:16] == "13:30" else 0.)
                 initial = float(mode["initial_capital_twd"])
                 row = {"recorded_at": clock, "minute": key, "session_date": day, "market": market,
-                       "initial_capital_twd": initial, "cumulative_realized_net_pnl_twd": realized,
-                       "open_net_liquidation_pnl_twd": net, "total_equity_twd": initial + realized + net + earned - cost,
+                       "initial_capital_twd": initial, "cumulative_realized_net_pnl_twd": inventory.realized,
+                       "open_net_liquidation_pnl_twd": net, "total_equity_twd": initial + inventory.realized + net + earned - cost,
                        "cumulative_carry_cost_twd": cost, "cumulative_corporate_action_net_twd": earned,
                        "corporate_action_cash_net_twd": paid,
                        "corporate_action_receivable_twd": sum(max(0., float(c["amount_twd"])) for c in claims if c["payment_date"] > day),
@@ -2015,6 +2211,10 @@ def parse_args() -> argparse.Namespace:
             "KBar/research root misses. Repeatable."
         ),
     )
+    parser.add_argument(
+        "--finmind-minute-root", type=Path, default=Path("data_finmind/complement"),
+        help="Receipt-verified local TaiwanStockKBar backup; valuation only, never executable capacity.",
+    )
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument(
@@ -2384,6 +2584,7 @@ def main() -> None:
         require_receipts=has_margin_carry,
         replay_source_hashes=replay_source_hashes,
         replay_symbol_sources=replay_symbol_sources,
+        finmind_root=getattr(args, "finmind_minute_root", None),
     )
     missing_endpoints = missing_accepted_endpoints(source_marks, start=start, end=end)
     if missing_endpoints:
@@ -2605,6 +2806,7 @@ def main() -> None:
             "ordered local KBar and research partitions first; canonical "
             "Shioaji KBar collector only for remaining symbol-date gaps"
         ),
+        "finmind_valuation_sources": list(store.finmind_source_records.values()),
         "local_minute_sources": [
             {
                 "root": str(root.resolve()),

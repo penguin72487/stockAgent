@@ -456,9 +456,17 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   durable publication/copy intents and canonical locks; no arbitrary received
   code, provider queries, GPU jobs or broker orders are dispatched.
   The same worker also owns the catalog-backed dataset-version rollout. It
-  advances one fully recovered source per activity from a durable all-source
-  journal, retries busy owners without holding their locks, and checks again
+  attempts at most one source per activity from a durable all-source journal,
+  including failed/busy attempts, so failure chains cannot monopolize the
+  publication handoff. A single source's full recovery may still take hours;
+  the attempt bound is not a wall-time deadline or permission to interrupt it.
+  It retries busy owners without holding their locks, and checks again
   on the configured daily cycle after the baseline. Restricted sources stay
+  private. Each busy/failed source retains its own retry deadline. New activity
+  results advance immediately to other eligible work instead of imposing a
+  blanket 30-second timer; when all remaining sources wait, sleep only to the
+  earliest bounded retry. Old recorded results retain their original timer
+  during deterministic Temporal replay. These sources remain
   under the ignored host-private history boundary; their database states use
   native SQLite backup and their append-only observation cohorts remain
   explicitly non-atomic. For live WAL sources, pin a native read transaction
@@ -472,7 +480,13 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   the operational `.sync.lock` bytes, and the specifically named Shioaji
   `shioaji/download_report.csv` / `shioaji_1m/download_report.csv` control reports
   (including either named source root) are captured from stable open descriptors
-  before packing. v6 upgrades completed v3/v4/v5 preparations through named-path
+  before packing. v7 additionally captures only canonical CEX grain-root
+  `.download.lock` / `download_report.csv`, direct
+  `data_tw_futures/shioaji_history/<contract>/download.lock` (and the index-futures
+  counterpart), and the closed atomically replaced
+  `data_tw_public/features/tw_public_stock_daily.parquet`. These are captured
+  observations, never unlink/replacement of live lock inodes or authorization
+  to copy unknown changing source payloads. v7 upgrades completed v3/v4/v5/v6 preparations through named-path
   probes, not another recursive census or repeated database backup. It also
   recognizes the existing rule-only `data_taifex_public_history/rules` source;
   the whole-root and rule-only catalogs must freeze the same normalized
@@ -481,8 +495,92 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   `robots/*.json` caches are also named mutable controls, not immutable article
   JSON. Preserve their first captured bytes across retries, the size/JSON/FD
   checks and exclusions; do not recursively admit arbitrary JSON as mutable.
-  The same
-  private cohort may freeze precisely known atomically published CEX hot tails,
+  v8 additionally recognizes the canonical FinLab `receipts`, `attempts`,
+  `intraday/{receipts,attempts}` and `intraday/derived_minute/receipts` trees;
+  FinMind's root/complement/sponsor `receipts` trees; keyed crypto
+  `state/{providers,datasets}` trees; and direct TEJ `progress/*.json`.
+  These are producer-owned controls, not a basename exemption for raw JSON or
+  immutable `receipt_history`. Observe these named JSON files directly from
+  bounded stable descriptors during ordinary ZIP packing, validate complete
+  JSON and SHA, and retain their original bytes under the existing durable
+  cold installation and full reconstruction gates. Do not create millions of
+  loose frozen copies or repeat native SQLite backups. Record their aggregate
+  count/digest and the original portable fingerprint from sealed sizes in a
+  bounded metadata-only pass; preserve the original census order even after
+  spilling to SQLite. These observations have separate clocks, not a global
+  atomic snapshot. Earlier prepared captures remain fixed. Completed v3-v7
+  preparations only probe the named legacy controls, not raw payloads again.
+  Large legacy capture mappings stay in their exact SHA-bound preparation
+  receipt instead of being embedded repeatedly in progress/attempt documents.
+  Scratch retirement reads and verifies that complete receipt; its compact
+  progress summary never replaces the full per-file retirement evidence.
+  v9 also captures the canonical `data_tw_public/metadata` catalog JSON and
+  its direct `*_versions.jsonl` provenance journals. These are the existing
+  collector's Data.gov metadata/version outputs, not arbitrary raw observations.
+  Require complete JSONL records including the final newline; reject malformed
+  or partial rows without truncation, and durably install new captures. Named
+  probes upgrade v3-v8 preparations without replacing prior observations or
+  repeating database backups. Unrelated metadata/raw directories stay strict.
+  v10 extends only FinLab's canonical `raw_receipts` JSON tree and the exact
+  FinMind root/complement/sponsor `json_pipeline_last.json` and OpenBB
+  `_state/public_priority_{cursors,queue_event,plan}.json` producer heads.
+  Keep `receipt_history`, arbitrary raw JSON and unrelated `_state` files
+  strict. The inline selection marker is `named_stable_fd_json_v2`; v9
+  preparations receive named delta probes without another tree walk or SQLite
+  backup. Full original-byte/SHA recovery still gates retirement. The owned
+  scratch verifier/process-reference/unlink phases report separate, bounded
+  progress on the existing attempt journal; 100% object verification is not
+  scratch-retirement or dataset acceptance.
+  v11 additionally freezes only the canonical public collector's direct
+  `data_tw_public/state/journals/*.jsonl` query receipts and OpenBB's exact
+  `_state/l1_compaction_attempt_latest.json` / `l1_compaction_latest.json`
+  operational heads. Journal captures require stable descriptors, complete JSON
+  rows including the final newline and the existing 64 MiB bound. Never trim a
+  partial record or admit similarly named raw/foreign paths. Upgrade v10 through
+  named probes, retain earlier observations, and keep current producer files intact.
+  v12 adds only FinLab `runs/latest.json` and the public builders' exact
+  `features/tw_public_stock_daily.summary.json`,
+  `tw_public_research_wide_2014_v1.research.json` and research Parquet output.
+  Upgrade v11 through named probes without another raw-tree census or SQLite
+  backup. Each capture has its own observation clock; a Parquet and its summary
+  are not thereby an atomic pair or an accepted training release.
+  Control scope v13 (engineering rollout v14) completes the reviewed operational
+  producers: FinLab `catalog/discovery.json`, OpenBB's exact scheduler/monitor/
+  audit heads, supervisor epoch/PID controls and named closed catalog projections
+  declared in `dataset_migration.py`. OpenBB's four named supervisor logs and
+  `_state/monitor{,_dashboard}_history.jsonl` use bounded-memory whole-file
+  stable-FD captures, even above 64 MiB. JSONL is validated record by record with
+  a final newline and a 64 MiB per-record bound. A file growing/truncating during
+  capture retries before packing, rather than accepting an append prefix or
+  invalidating hours of completed work. Retain the first installed observation,
+  disk reserve, complete SHA and independent original-byte recovery. Source logs
+  are never truncated or removed. v12 upgrades probe only these named locations,
+  without another raw census or native DB backup. Regular control opens are
+  nonblocking/no-follow so a substituted FIFO cannot hang the owner. The explicit
+  `openbb_operational_atomic_sibling_v1` rule omits only the supervisor's exact
+  uncommitted rotation/epoch siblings and reviewed catalog projection siblings;
+  final logs, arbitrary temporary names and unknown changing observations stay
+  selected and strict. No public-export or globally atomic workspace claim changes.
+  Ordinary packed-source reads may fuse the first pathname stat with a
+  no-follow, nonblocking open and descriptor stat. Check regular-file type and
+  all five original signature fields before reading, close descriptors on all
+  outcomes and recheck the original pathname after reading. Atomic replacement,
+  in-place mutation, symlinks and substituted FIFOs must still reject; this is
+  neither permission to follow a new source nor a weaker original-byte/SHA gate.
+  During full original recovery, a chunk-only blob's full SHA may share the same
+  read as the original-file SHA. Direct-blob proofs and every ZIP member/CRC remain.
+  Count each unique object only after its complete extent SHA/length passes;
+  require all objects/files/bytes and unchanged before/after chunk signatures
+  before accepting. This removes a redundant cold read, not a verification gate
+  or independent-recovery requirement. Selected-path and ordinary object-only
+  verification retain their established coverage.
+  FinLab research refresh reconciles the original wide -> TAIFEX -> union
+  builders in dependency order. The wide writer uses the original exclusive
+  public-source lease, then the overlay uses the shared read lease; a busy
+  source is not permission to bypass either. Preflight all annual date/symbol
+  keys before feature joins/writes, preserving duplicate/missing-key rejection,
+  source hashes, old accepted outputs and the separate research eligibility ABI.
+  The private cohort may freeze precisely known atomically published CEX hot tails,
   TAIFEX normalized rule tables and OpenBB closed validated catalog/status outputs.
   These use bounded 8 MiB streaming, full stat/SHA fences, a 5 GiB scratch reserve,
   fsync and atomic no-replace installation; an OpenBB catalog with a WAL requires
@@ -566,6 +664,20 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   Stale or differently pinned progress is historical evidence, not current
   completion. This is not shared-publication, training or deletion
   acceptance. It adds no collector, service, database or transport owner.
+  Native chunk reconstruction may stream at most 16 ordered members (8 GiB
+  per member, 16 GiB per batch) through one fixed Windows process. Exact length
+  and full chunk SHA remain per extent, including repeats; the parent retains
+  whole-original SHA. Before/after mount and member signature guards enclose
+  each batch; no TTL authority cache, partial-read retry, skipped bytes or early
+  verified-extent callback is allowed. A failed batch cannot seal a recovery or
+  materialization. Only an empty recognized interop startup failure may retry.
+  Migration enables this separately through `d_primary_native_chunk_reads`,
+  only on the canonical public D root and for originals at least 64 MiB; small
+  files and private roots keep their previous reader. Do not infer native blob
+  activation from the independent pack-read option. Complete new verification
+  owns its one presence/size pass: resolvers may omit duplicate presence only
+  immediately before it, while cached recovery receipts still require current
+  presence. Manifest identity/schema and full byte checks are never omitted.
   A code-only worker rollout waits for the existing dataset/source/catalog
   owner locks (with a declared bounded deadline), rejects candidate code drift
   during the wait, then verifies the actually loaded code and persistent chain
@@ -933,10 +1045,22 @@ catalog credentials or hard-code an interpreter path.
   shared benchmark implementation and canonical source plan as well as the CLI;
   bypassing the outer inventory command must not admit unknown/unfinished work.
   This is producer-declared completion, not a fresh numerical benchmark oracle.
+  The canonical OpenBB selector producer has distinct fixture and comparison
+  ABIs (`openbb_private_full_manifest_source_selector_v1` and
+  `openbb_full_manifest_unassigned_source_abba_v1`). Recognize only that exact
+  pair with all four original ABBA sidecars, matching fixture/code/full ordered
+  source hashes, task/limit counts and zero-write/call evidence. Unknown pairs,
+  missing or modified sidecars and uncompleted comparisons remain blocked;
+  do not rewrite old receipts to make their contract names match.
   Large mutable SQLite work copies
   cannot share immutable-input hardlinks. A cold publication or copied report
   alone still cannot retire them; all original recovery, consumer, transport
   and quarantine gates remain mandatory.
+  Ancestor-process checks may pool at most 4096 bounded path resolutions within
+  one scan and must recheck reused names before acceptance. No result survives
+  the scan. A newly relevant alias, changed cwd or lost visibility still defers;
+  rotation between two unrelated paths is not a consumer of the selected root.
+  Do not add a lexical-prefix filter that misses aliases outside the scope.
   Historical simulations require the separate
   `manual-wsl-offline-simulation-preservation-v1` contract and one explicit
   child with a reviewed `official-close-settlement-`, `account-addition-`,
@@ -1282,25 +1406,54 @@ catalog credentials or hard-code an interpreter path.
   consumer remain durable. Persist a cold proof only after complete recovery;
   failed scratch stays for diagnosis. The real complete-release check and
   measured scratch comparison are in the linked Vast cleanup report.
+  When complete-tree scratch does not fit, the same verifier may reuse ONLY
+  the exact real `spec.stage_root/spec.dataset/archive` encoding retained by
+  its original publisher. Independently reconstruct EVERY cold encoded file,
+  with complete object SHA/CRC/member/count/byte proofs; verify the retained
+  encoding against that fixed inventory before AND after original decoding.
+  Bind its manifest SHA to cold metadata, check every original decoded SHA and
+  size, and record `independent_cold_reconstruction_and_exact_encoding_decode_v1`
+  with `verification_scratch_created=false`. The existing stage alone is never
+  evidence. No arbitrary donor, weakened space reserve, new full-copy scratch,
+  implicit source deletion or bypass of final consumer/transport gates follows.
   The local offline retirement owner records `recovery-progress.json` and
   emits bounded progress for full cold hashing, private materialization,
   original decoding and independent cold reconstruction. Counts/bytes refer
   only to the named stage, not the total transaction. This telemetry is marked
   `acceptance_proof: false`; interrupted/failed attempts preserve that state
   and never authorize unlink or replace final retirement/prune receipts.
+  Legacy verification may compute encoded SHA/length and decoded original
+  SHA/length from the same complete input stream. Retain gzip multi-member
+  validation, the zstd decoder's exit status and feeder errors, regular-file
+  no-follow descriptors, and before/after FD/path generation fences. A raw
+  encoding has identical original bytes and needs one SHA reduction, not two.
+  Bound decoder buffers and drain/close its one feeder on every outcome. This
+  removes a duplicate read within one verification only: publication, current
+  source comparison, independent fixed-D recovery and retirement/prune gates
+  still obtain their own proofs; no cross-transaction SHA cache is introduced.
 - Archive encoding scratch is not a cold authority. The four manual legacy
   roots enrolled on 2026-10-03 may use the bounded
   `/var/lib/stockagent-legacy-archive-stage` C-side work area to avoid DrvFs
   per-small-file I/O. Require the D guard even before preparing this scratch,
   budget the full source size plus a 32 GiB C reserve, and publish only to the
-  canonical D store. Preserve all interrupted D staging as audit evidence until
+  canonical D store. An explicit `retire_local_offline_artifacts.py inventory
+  --guarded-d-scratch` may instead freeze `completed-benchmark-d-scratch-v1`
+  for one new, completed `benchmarks/<suite>/<case>` only. This uses the separate
+  fixed `/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch`, full
+  source-size admission plus the unchanged 32 GiB reserve on D, durable encoding
+  and the same guarded canonical publication. Existing enrolled archives, other
+  physical source roles and arbitrary stage overrides cannot use this profile.
+  Preserve all interrupted ordinary D staging as audit evidence until
   separately verified redundant. After exact hot retirement, the explicit
   `prune-stage-plan` / `prune-stage-apply` transaction may remove only that
   dataset's C scratch: require its matching cold-only state, all original and
   encoded hashes, every cold member's independent reconstruction, exact control
   receipts, no unknown/symlink files, pin/process gates and unchanged dry-run
   signatures; rename to private quarantine and repeat the D/recovery/signature
-  gates immediately before unlink. Never use this tool for D staging or objects.
+  gates immediately before unlink. The separate completed-benchmark D scratch
+  may use this exact prune transaction only after its own hot retirement and
+  independent cold proof. Ordinary legacy D staging, incomplete work and cold
+  objects remain excluded; this exception never admits their deletion.
   `verify --cold-only` without a retained scratch uses a bounded, private
   canonical fetch for verification only; remove it after successful original
   decode plus cold verification, and retain any failure for diagnosis. It must
@@ -1368,6 +1521,48 @@ catalog credentials or hard-code an interpreter path.
   Automatic or manual eviction must refuse an active reference, pin, incomplete
   cold release, missing object, or mismatched `READY` proof.  `evict` may bypass
   lease age only; it may not bypass those safety proofs.
+  Presence/size alone is not recovery proof: independently reconstruct all
+  original files, verify the hot tree against that exact inventory, then repeat
+  pin/process and hot stability gates at retirement. Index-only edge controllers
+  retain their validated durable-peer proof but must still verify local hot
+  bytes from the fixed inventory. Unknown/malformed pin schemas fail closed.
+- New managed full/subtree materializations and canonical artifact/public-service
+  Panel writes use `configs/data_sync/cache_capacity.json` admission through
+  `cache_capacity.reserve_cache_write`, reusing the existing kernel-reservation
+  primitive. Default filesystem reserve is 25 GiB, materialized budget 256 GiB,
+  each Panel namespace 64 GiB. Only explicitly enrolled nodes (currently
+  penguin) receive these defaults; a shared checkout update must not silently
+  cap a remote training experiment with the service host's budget.
+  Count physical allocations and unknown entries;
+  incomplete bounded census, exhausted capacity or a different filesystem for
+  controls defers writing without deleting payloads or weakening a cold gate.
+  WSL admission additionally uses the existing actual-distribution/backing-volume
+  capacity proof; virtual ext4 free bytes alone cannot authorize VHDX growth.
+  Accepted cache reads bypass new-allocation admission. Per-user/per-filesystem
+  controls live outside PrivateTmp so cooperating service processes see the
+  same leases. These are cooperating-writer guards, not OS hard quotas, source
+  retention, universal artifact GC, or permission to preempt seven-day leases.
+  Panel post-commit retirement preserves malformed variant metadata and active
+  mmap/FD generations, including the current process; failed process visibility
+  retains the previous data while leaving the new durable commit readable.
+- Factorized prepared generations join the same filesystem/backing-volume
+  admission through the `prepared` family. Their separate strict
+  `configs/data_sync/prepared_capacity.json` keeps still-running v1 cache-policy
+  readers compatible. Defaults are 128 GiB per prepared namespace and a 16 GiB
+  whole-attempt write allowance, in addition to the shared 25 GiB free floor.
+  Hold the kernel reservation from before BASE construction through generation
+  publication. `GenerationWriteBudget` checks every new generation payload
+  before writing, including normalized events, streaming Parquet footers,
+  compressed state, dictionaries, progress and final manifests. Cumulative
+  rounded writes overcount replaced receipts; immutable hardlinks charge
+  namespace overhead, not the donor's payload again. Preserve typed capacity
+  deferral across native serializer exception wrapping. Accepted generation
+  reads bypass this new-allocation admission; unrelated BASE/annual caches keep
+  their own owners and are not charged as prepared payloads. Exhaustion retains
+  the last good pointer, failed attempts and old generations, with no blind
+  in-process rebuild retry or automatic early eviction. These remain
+  cooperating-writer safeguards, not an OS quota or an accepted retention/GC
+  policy. See [daily incremental evidence](../dashboard_daily_incremental_2026-10-20.md).
 - Cache GC may delete only managed materialized versions.  It must never delete
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
   an unmanaged directory. It must never act as cold-object GC. Former C cold

@@ -26,19 +26,25 @@ def contract_sources_digest(contracts: list[dict]) -> str:
 
 
 def validate_kbar_completion(item: dict, *, product: str | None = None,
-                             asset_class: str = "stock_future") -> None:
+                             asset_class: str = "stock_future", through: date | None = None) -> None:
     start, end = date.fromisoformat(item["start"]), date.fromisoformat(item["end"])
     finished = datetime.fromisoformat(item["finished_at_utc"].replace("Z", "+00:00"))
     if start > end or finished.tzinfo is None:
         raise ValueError("invalid KBar query interval or completion timezone")
+    # A long collector query may extend beyond the reviewed rule horizon.
+    # A consumer of an earlier subset proves that subset's close, without
+    # claiming either the query end or unreviewed product rules are complete.
+    selected_end = end if through is None else through
+    if not start <= selected_end <= end:
+        raise ValueError("selected KBar completion date outside query interval")
     end_minute = 825
     if product is not None:
         from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
         _, end_minute = taifex_futures_day_session_minutes(
-            end, product_code=product, asset_class=asset_class,
+            selected_end, product_code=product, asset_class=asset_class,
         )
     close = time(*divmod(end_minute, 60))
-    if finished.astimezone(ZoneInfo("Asia/Taipei")) < datetime.combine(end, close, ZoneInfo("Asia/Taipei")):
+    if finished.astimezone(ZoneInfo("Asia/Taipei")) < datetime.combine(selected_end, close, ZoneInfo("Asia/Taipei")):
         raise ValueError("KBar query finished before the completed day session")
 
 
@@ -144,7 +150,9 @@ def normalize_futures_kbars(frame: pl.DataFrame, *, code: str,
 
 def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                              expected_dates: list[date], *,
-                             all_futures: bool = False) -> tuple[pl.DataFrame, list[dict], list[dict]]:
+                             all_futures: bool = False,
+                             full_session: bool = False,
+                             invalid_source_days: list[dict] | None = None) -> tuple[pl.DataFrame, list[dict], list[dict]]:
     """Use the existing collector's inventory/chunks; missing != zero volume."""
     from downloader.download_shioaji_historical_market_data import load_inventory, _valid_receipt
 
@@ -155,9 +163,29 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
     physical_by_alias = defaultdict(set)
     if all_futures:
         for item in needed.values():
-            month = item["physical_contract"].rsplit(":", 1)[-1]
+            # A canonical lifetime can include expiry/generation suffixes.
+            # Use the explicitly dated delivery field when supplied, never
+            # parse those identity suffixes as a broker delivery month.
+            month = str(item.get("contract") or item["physical_contract"].rsplit(":", 1)[-1])
             for alias in {item["product"], *str(item.get("shioaji_roots") or item["product"]).split(",")}:
                 physical_by_alias[(alias.strip(), month)].add(item["physical_contract"])
+        for alias, physicals in physical_by_alias.items():
+            by_day = {}
+            for physical in physicals:
+                for day in wanted_by_contract[physical]:
+                    if day in by_day and by_day[day] != physical:
+                        raise ValueError(f"ambiguous dated physical KBar root: {day} {alias}")
+                    by_day[day] = physical
+
+    def inventory_targets(rows):
+        for row in rows:
+            if (row.collection != "exact_futures" or row.security_type != "FUT"
+                    or row.code.endswith(("R1", "R2")) or not re.fullmatch(r"\d{6}", row.delivery_month)):
+                continue
+            physicals = (physical_by_alias.get((row.root, row.delivery_month), set()) if all_futures
+                         else {f"{row.root}:{row.delivery_month}"})
+            for physical in sorted(physicals):
+                yield row, physical
     covered: dict[tuple[str, str], dict] = {}
     observed_days: dict[tuple[str, str], pl.DataFrame] = {}
     frames = []
@@ -167,20 +195,7 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
         manifest = json.loads(inventory.with_name("manifest.json").read_text())
         if manifest.get("source") != "shioaji_contract_v2" or manifest.get("contracts_sha256") != digest:
             raise ValueError("KBar physical-contract inventory SHA mismatch")
-        for row in load_inventory(root):
-            if row.collection != "exact_futures" or row.security_type != "FUT":
-                continue
-            # A current R1/R2 target is not a historical physical-contract map.
-            if row.code.endswith(("R1", "R2")) or not re.fullmatch(r"\d{6}", row.delivery_month):
-                continue
-            physical = f"{row.root}:{row.delivery_month}"
-            if all_futures:
-                matches = physical_by_alias.get((row.root, row.delivery_month), set())
-                if len(matches) > 1:
-                    raise ValueError(f"ambiguous dated physical KBar root: {row.root}:{row.delivery_month}")
-                if not matches:
-                    continue
-                physical = next(iter(matches))
+        for row, physical in inventory_targets(load_inventory(root)):
             wanted = wanted_by_contract[physical]
             if not wanted:
                 continue
@@ -201,6 +216,7 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                 validate_kbar_completion(
                     receipt, product=metadata["product"] if all_futures else None,
                     asset_class=metadata.get("asset_class", "stock_future"),
+                    through=date.fromisoformat(dates[-1]) if all_futures else None,
                 )
                 receipt_sha = sha256_file(receipt_path)
                 chunk_sha = receipt.get("sha256") if receipt["status"] == "complete" else receipt_sha
@@ -208,12 +224,32 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                 if raw.height != receipt.get("rows"):
                     raise ValueError(f"KBar receipt row count mismatch: {receipt_path}")
                 if raw.height:
-                    bars = normalize_futures_kbars(
-                        (raw.filter(pl.col("trading_date").cast(pl.String).is_in(dates)) if all_futures else raw),
-                        code=row.code, physical_contract=physical, source_sha256=chunk_sha,
-                        product=metadata["product"] if all_futures else None,
-                        asset_class=metadata.get("asset_class", "stock_future"),
-                    )
+                    def normalize(frame):
+                        return normalize_futures_kbars(frame, code=row.code, physical_contract=physical,
+                            source_sha256=chunk_sha, product=metadata["product"] if all_futures else None,
+                            asset_class=metadata.get("asset_class", "stock_future"), full_session=full_session)
+                    selected_raw = raw.filter(pl.col("trading_date").cast(pl.String).is_in(dates)) if all_futures else raw
+                    try:
+                        bars = normalize(selected_raw)
+                    except ValueError:
+                        if invalid_source_days is None:
+                            raise
+                        # Preserve invalid source days as explicit repair work.
+                        # The default reader still rejects invalid observations.
+                        valid_dates, valid_bars = [], []
+                        for day in dates:
+                            try:
+                                daily_bars = normalize(raw.filter(pl.col("trading_date").cast(pl.String) == day))
+                            except ValueError as exc:
+                                invalid_source_days.append({"date": day, "physical_contract": physical,
+                                    "query_contract": row.code, "path": str(data_path), "sha256": chunk_sha,
+                                    "receipt_path": str(receipt_path), "receipt_sha256": receipt_sha,
+                                    "error": str(exc), "status": "rejected_source_day"})
+                            else:
+                                valid_dates.append(day)
+                                valid_bars.append(daily_bars)
+                        dates = valid_dates
+                        bars = pl.concat(valid_bars, how="vertical_relaxed") if valid_bars else empty_minute_bars()
                     raw_dates = set(map(str, raw["trading_date"].unique()))
                     if raw_dates != set(receipt["observed_trading_dates"]):
                         raise ValueError(f"KBar chunk dates disagree with receipt: {receipt_path}")
@@ -231,7 +267,8 @@ def read_futures_kbar_sources(root: Path, selected: pl.DataFrame,
                             )
                             limits.append({"trading_date": date.fromisoformat(wanted_date),
                                            "_session_start": start_minute + 1, "_session_end": end_minute})
-                        volume_source = raw.join(pl.DataFrame(limits), on="trading_date", how="inner")
+                        volume_source = raw.join(pl.DataFrame(limits, schema={"trading_date": pl.Date,
+                            "_session_start": pl.Int32, "_session_end": pl.Int32}), on="trading_date", how="inner")
                         session_minutes = minute.is_between(pl.col("_session_start"), pl.col("_session_end"))
                     else:
                         volume_source, session_minutes = raw, minute.is_between(526, 825)

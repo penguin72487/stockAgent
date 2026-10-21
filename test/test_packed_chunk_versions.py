@@ -84,6 +84,210 @@ def test_recovery_progress_separates_objects_from_complete_original_files(tmp_pa
     assert result['independently_reconstructed_files'] == 2
 
 
+@pytest.mark.parametrize('memory_rows', [1, 10000])
+def test_full_recovery_fuses_chunk_hash_and_original_hash_without_pre_read(
+        tmp_path, monkeypatch, memory_rows):
+    from collections import Counter
+    from pathlib import Path
+    monkeypatch.setattr(packed, 'METADATA_MEMORY_ROWS', memory_rows)
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'first.bin').write_bytes(b'a' * 16 + b'b' * 16 + b'c' * 16)
+    (source / 'second.bin').write_bytes(b'b' * 32)
+    cold = tmp_path / 'cold'
+    release = publish(cold, source)
+    blobs = {cold / item['relpath'] for item in release.manifest['archive']['objects']}
+    native_open, reads = Path.open, Counter()
+    def observed_open(path, mode='r', *args, **options):
+        if path in blobs and mode == 'rb':
+            reads[path] += 1
+        return native_open(path, mode, *args, **options)
+    monkeypatch.setattr(Path, 'open', observed_open)
+    observations = []
+    result = verify_packed_snapshot(cold, release, reconstruct_all=True, progress=observations.append)
+    assert sum(reads.values()) == 5  # Each original extent; no redundant 3-object hash pass.
+    assert result['independently_reconstructed_files'] == 2
+    assert result['independently_reconstructed_bytes'] == 80
+    assert result['verified_object_bytes'] == 48
+    assert result['chunk_object_hash_fusion']['objects'] == 3
+    assert result['chunk_object_hash_fusion']['redundant_cold_read_bytes_avoided'] == 48
+    original_events = [row for row in observations if row['stage'] == 'reconstruct-original-files']
+    assert original_events[0]['completed_items'] == 0
+    assert observations[-1]['completed_items'] == observations[-1]['total_items'] == 3
+    assert original_events[-1]['completed_items'] == original_events[-1]['total_items'] == 2
+    assert original_events[-1]['verified_objects'] == 3
+
+
+def test_fused_recovery_keeps_direct_blob_proof_when_chunk_and_v1_blob_share_object(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'legacy.bin').write_bytes(b'a' * 16)
+    cold = tmp_path / 'cold'
+    publish_packed_snapshot(cold, 'provider', source, node_id='test', loose_file_threshold_bytes=16)
+    (source / 'chunked.bin').write_bytes(b'a' * 16 + b'b' * 16)
+    release = publish(cold, source)
+    result = verify_packed_snapshot(cold, release, reconstruct_all=True)
+    assert result['independently_reconstructed_files'] == 2
+    assert result['independently_reconstructed_bytes'] == 48
+    assert result['verified_object_bytes'] == 32
+    assert result['chunk_object_hash_fusion']['objects'] == 1
+    assert result['chunk_object_hash_fusion']['redundant_cold_read_bytes_avoided'] == 16
+
+
+@pytest.mark.parametrize('legacy_blob', [False, True])
+def test_fused_native_verifier_hashes_only_non_deferred_blobs(tmp_path, monkeypatch, legacy_blob):
+    from contextlib import contextmanager
+    from stockagent.data_sync import windows_cold_io as native
+    from stockagent.data_sync.desync_snapshots import sha256_file
+
+    source = tmp_path / 'source'
+    source.mkdir()
+    cold = tmp_path / 'cold'
+    if legacy_blob:
+        (source / 'legacy.bin').write_bytes(b'a' * 16)
+        publish_packed_snapshot(cold, 'provider', source, node_id='test', loose_file_threshold_bytes=16)
+    (source / 'chunked.bin').write_bytes(b'a' * 16 + b'b' * 16)
+    release = publish(cold, source)
+    batched, streamed = [], []
+
+    def hash_many(paths):
+        batched.extend(paths)
+        return {path: sha256_file(path) for path in paths}
+
+    @contextmanager
+    def reader(path):
+        streamed.append(path)
+        with path.open('rb') as stream:
+            yield stream
+
+    monkeypatch.setattr(native, 'hash_many', hash_many)
+    monkeypatch.setattr(native, 'binary_reader', reader)
+    # Exercise the native branch on an isolated fixture. The public entrypoint's
+    # canonical-D authority guard has its own tests and is not relaxed here.
+    with packed._open_inventory(cold, release.manifest) as entries:
+        result = packed._verify_packed_inventory(cold, release, entries,
+            materialized_path=None, reconstruct_paths=None, reconstruct_all=True,
+            d_primary_native_blob_reads=True, d_primary_native_pack_reads=False, progress=None)
+    assert len(batched) == int(legacy_blob)
+    assert len(streamed) == 2
+    assert result['independently_reconstructed_files'] == 1 + int(legacy_blob)
+    assert result['independently_reconstructed_bytes'] == 32 + 16 * int(legacy_blob)
+    assert result['verified_object_bytes'] == 32
+    assert result['chunk_object_hash_fusion']['objects'] == 2 - int(legacy_blob)
+
+
+@pytest.mark.parametrize('fault', [None, 'corrupt', 'truncated', 'excess', 'reordered', 'late_guard'])
+def test_native_chunk_stream_batches_are_bounded_ordered_and_accepted_only_after_guard(tmp_path, monkeypatch, fault):
+    from contextlib import contextmanager
+    import hashlib
+    import io
+    from stockagent.data_sync import windows_cold_io as native
+
+    cold = tmp_path / 'cold'
+    cold.mkdir()
+    values = [bytes([i]) * 4 for i in range(20)]
+    # Deliberately repeat an extent across batches; it remains part of the file.
+    values.append(values[0])
+    objects, chunks = {}, []
+    for value in values:
+        digest = hashlib.sha256(value).hexdigest()
+        path = cold / digest
+        path.write_bytes(value)
+        objects[digest] = {'relpath': digest}
+        chunks.append({'object_sha256': digest, 'bytes': len(value)})
+    row = {'size': sum(map(len, values)), 'storage': {'kind': 'chunks', 'chunks': chunks}}
+    batches, accepted = [], []
+    @contextmanager
+    def reader(members):
+        batches.append(members)
+        payloads = [path.read_bytes() for path, _ in members]
+        if fault == 'reordered':payloads.reverse()
+        data = b''.join(payloads)
+        if fault == 'corrupt':data = b'!' + data[1:]
+        if fault == 'truncated':data = data[:-1]
+        if fault == 'excess':data += b'!'
+        with io.BytesIO(data) as stream:
+            yield stream
+            if fault == 'late_guard':raise SnapshotError('authority unavailable after read')
+    monkeypatch.setattr(native, 'windows_path', lambda path: 'D:\\stockagent-cold-primary\\fixture')
+    monkeypatch.setattr(native, 'binary_reader_many', reader)
+    iterator = packed._iter_chunked_file(cold, objects, row, native=True, verified_extent=accepted.append)
+    if fault:
+        with pytest.raises(SnapshotError):b''.join(iterator)
+        assert not accepted
+    else:
+        assert b''.join(iterator) == b''.join(values)
+        assert [len(batch) for batch in batches] == [16, 5]
+        assert accepted == [chunk['object_sha256'] for chunk in chunks]
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_explicit_native_chunk_policy_only_selects_large_files_and_keeps_complete_proof(tmp_path, monkeypatch, enabled):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'small.bin').write_bytes(b'a' * 31)
+    (source / 'large.bin').write_bytes(b'b' * 32)
+    cold = tmp_path / 'cold'
+    release = publish(cold, source)
+    selected, events = {}, []
+    original = packed._iter_chunked_file
+    def observed(root, objects, row, **options):
+        selected[row['path']] = options['native']
+        yield from original(root, objects, row, **options)
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_STREAM_BYTES', 32)
+    monkeypatch.setattr(packed, '_iter_chunked_file', observed)
+    with packed._open_inventory(cold, release.manifest) as entries:
+        proof = packed._verify_packed_inventory(cold, release, entries,
+            materialized_path=None, reconstruct_paths=None, reconstruct_all=True,
+            d_primary_native_blob_reads=False, d_primary_native_pack_reads=False,
+            d_primary_native_chunk_reads=enabled, progress=events.append)
+    assert selected == {'large.bin': enabled, 'small.bin': False}
+    assert proof['independently_reconstructed_files'] == 2
+    assert proof['independently_reconstructed_bytes'] == 63
+    assert any(row.get('native_chunk_batch_reads') for row in events) is enabled
+
+
+@pytest.mark.parametrize('enabled', [True, 1, 'true'])
+def test_new_native_chunk_policy_cannot_bypass_type_or_original_D_authority(tmp_path, enabled):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'bytes').write_bytes(b'exact')
+    cold = tmp_path / 'cold'
+    release = publish(cold, source)
+    with pytest.raises(SnapshotError, match='canonical D|explicit boolean'):
+        verify_packed_snapshot(cold, release, reconstruct_all=True,
+                               d_primary_native_chunk_reads=enabled)
+
+
+@pytest.mark.parametrize('fault', ['corrupt', 'truncated', 'grown', 'late_mutation', 'missing_extent_proof'])
+def test_fused_reconstruction_rejects_bad_chunks_and_late_changes(tmp_path, monkeypatch, fault):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'file.bin').write_bytes(b'a' * 16 + b'b' * 16)
+    cold = tmp_path / 'cold'
+    release = publish(cold, source)
+    item = release.manifest['archive']['objects'][0]
+    path = cold / item['relpath']
+    original = packed._iter_chunked_file
+    if fault in {'corrupt', 'truncated', 'grown'}:
+        raw = path.read_bytes()
+        path.write_bytes(b'!' * len(raw) if fault == 'corrupt' else
+                         raw[:-1] if fault == 'truncated' else raw + b'!')
+    else:
+        def changed(root, objects, row, **options):
+            if fault == 'missing_extent_proof':
+                options.pop('verified_extent')
+            yield from original(root, objects, row, **options)
+            if fault == 'late_mutation':
+                path.write_bytes(path.read_bytes())  # Identical bytes still changed this generation.
+        monkeypatch.setattr(packed, '_iter_chunked_file', changed)
+    observations = []
+    with pytest.raises(SnapshotError):
+        verify_packed_snapshot(cold, release, reconstruct_all=True, progress=observations.append)
+    assert not any(row['stage'] == 'verify-cold-objects'
+                   and row['completed_items'] == row['total_items'] for row in observations)
+
+
 def test_repeated_extents_multiple_providers_and_deleted_files_share_only_bytes(tmp_path):
     cold = tmp_path / "cold"
     for provider in ("finlab", "finmind", "tej", "weather"):
@@ -228,7 +432,9 @@ def test_chunk_bounds_fail_before_creating_store(tmp_path, bad):
 
 
 @pytest.mark.parametrize("damage", ["full_hash", "order"])
-def test_default_cold_verifier_checks_complete_chunk_order_and_file_hash(tmp_path, monkeypatch, damage):
+@pytest.mark.parametrize('reconstruct_all', [False, True])
+def test_default_cold_verifier_checks_complete_chunk_order_and_file_hash(
+        tmp_path, monkeypatch, damage, reconstruct_all):
     source = tmp_path / "source"
     source.mkdir()
     (source / "data.bin").write_bytes(b"a" * 16 + b"b" * 16)
@@ -246,7 +452,7 @@ def test_default_cold_verifier_checks_complete_chunk_order_and_file_hash(tmp_pat
 
     monkeypatch.setattr(packed, "_iter_inventory", damaged)
     with pytest.raises(SnapshotError, match="exact cold chunk reconstruction"):
-        verify_packed_snapshot(cold, release)
+        verify_packed_snapshot(cold, release, reconstruct_all=reconstruct_all)
 
 
 def test_chunk_install_failure_keeps_head_and_retry_reuses_only_complete_objects(tmp_path, monkeypatch):

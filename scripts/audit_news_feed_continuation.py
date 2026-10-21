@@ -15,7 +15,8 @@ import sqlite3
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import discovery_fingerprint, load_config
 from downloader.news_fulltext_bulk import BULK_RESTRICTED_ITEM_ERRORS, wordpress_base
-from downloader.news_fulltext_feed import feed_page, feed_url
+from downloader.news_fulltext_feed import FEED_BODY_PROVENANCE_FIELDS, feed_page, feed_url, replay_feed_body_version
+from downloader.news_fulltext_policy import NewsError
 from downloader.news_fulltext_queue import utc_now
 from scripts.audit_news_selected_articles import audit as audit_bodies
 
@@ -120,8 +121,14 @@ def audit(root, registry, diagnostic_path, capture_path):
             continue
         if _clock(article['captured_at_utc']) >= _clock(capture['observed_at_utc']):
             probe, job = candidate['probe'], candidate['job']
+            try:
+                replay_feed_body_version(article, registry.require(url))
+                valid_contract = True
+            except NewsError:
+                valid_contract = False
             if (article['source_request_url'] != job['url'] or article['response_sha256'] != job['response_sha256']
-                    or article['extraction_method'] != 'rss_content_encoded_v1'
+                    or not valid_contract or article['extraction_method'] != probe.get('extraction_method', 'rss_content_encoded_v1')
+                    or any(article.get(k) != probe.get(k) for k in FEED_BODY_PROVENANCE_FIELDS)
                     or any(article[k] != probe[k] for k in ('body_sha256', 'published_at_raw'))
                     or json.loads(article['authors_json']) != json.loads(probe['authors_json'])):
                 errors.append({'url': url, 'error': 'new_rss_body_source_identity_author_or_clock_mismatch'})
@@ -129,7 +136,7 @@ def audit(root, registry, diagnostic_path, capture_path):
     for job in capture['jobs']:
         if newly_committed.get(job['url'], 0) != job['accepted_bodies']:
             errors.append({'url': job['url'], 'error': 'native_accepted_count_not_verified'})
-    return {'contract_version': 1, 'verified_at_utc': utc_now(), 'page_snapshot_at_utc': snapshot_at,
+    return {'contract_version': 2, 'verified_at_utc': utc_now(), 'page_snapshot_at_utc': snapshot_at,
             'accepted': not errors, 'errors': errors, 'pages': pages,
             'selected_durable_body_heads': len(articles), 'newly_committed_body_heads': sum(newly_committed.values()),
             'preexisting_body_heads_preserved': len(articles) - sum(newly_committed.values()),

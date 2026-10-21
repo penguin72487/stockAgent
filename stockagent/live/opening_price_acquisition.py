@@ -26,6 +26,7 @@ Progress = Callable[[list[str], quotes.PriceSnapshot], None]
 Provider = Callable[[list[str], np.ndarray, Progress], quotes.PriceSnapshot]
 TAIPEI = ZoneInfo("Asia/Taipei")
 _TELEMETRY_LOCK = threading.Lock()
+_TELEMETRY_START_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tw-opening-start-log")
 
 
 def _snapshot_poll_interval(name: str, observed: datetime) -> float | None:
@@ -47,7 +48,8 @@ def _snapshot_poll_interval(name: str, observed: datetime) -> float | None:
 
 
 def _source_failure_retry(metric: dict, *, status: int | None = None,
-                          endpoint_unavailable: bool = False) -> None:
+                          endpoint_unavailable: bool = False,
+                          allow_transport_probe: bool = False) -> None:
     """Provider-local failure isolation; accepted rows and other sources continue."""
     failures = int(metric.get("consecutive_source_failures", 0)) + 1
     metric["consecutive_source_failures"] = failures
@@ -59,6 +61,17 @@ def _source_failure_retry(metric: dict, *, status: int | None = None,
     metric["retry_delay_seconds"] = delay
     metric["retry_after_monotonic"] = time.monotonic() + delay
     metric["retry_reason"] = "source_endpoint_unavailable" if endpoint_unavailable else "source_failure"
+    metric.pop("transport_probe_after_monotonic", None)
+    metric.pop("transport_probe_delay_seconds", None)
+    metric.pop("transport_recovery_resume", None)
+    if endpoint_unavailable and allow_transport_probe and status not in {401, 402, 403, 429}:
+        # A transport timeout proves neither a permission refusal nor a fixed
+        # 15-second outage. Keep the full-sweep circuit open, but admit ONE
+        # real requested symbol at an exponentially backed-off half-open clock.
+        # This is not another quote owner/session or a full-market retry burst.
+        probe_delay = min(15.0, 0.5 * 2 ** min(failures - 1, 5))
+        metric["transport_probe_after_monotonic"] = time.monotonic() + probe_delay
+        metric["transport_probe_delay_seconds"] = probe_delay
 
 
 def _source_no_progress_retry(metric: dict) -> None:
@@ -69,6 +82,9 @@ def _source_no_progress_retry(metric: dict) -> None:
     """
     attempts = int(metric.get("consecutive_source_no_progress", 0)) + 1
     metric["consecutive_source_failures"] = 0
+    metric.pop("transport_probe_after_monotonic", None)
+    metric.pop("transport_probe_delay_seconds", None)
+    metric.pop("transport_recovery_resume", None)
     metric["consecutive_source_no_progress"] = attempts
     # A responding source is a short-lived data wait, not an outage. Keep its
     # next opportunity within one second; transport failures use the separate
@@ -216,7 +232,8 @@ class OpeningPriceFanIn:
         resolve_no_prints: bool = True, force_refresh: bool = False,
         poll_opening_snapshots: bool = False,
     ) -> quotes.PriceSnapshot:
-        if not symbols or len(set(symbols)) != len(symbols):
+        requested_set = frozenset(symbols)
+        if not symbols or len(requested_set) != len(symbols):
             raise ValueError("opening universe must be nonempty and unique")
         fallback = np.asarray(fallback, dtype=np.float64)
         if fallback.shape != (len(symbols),) or not 0 <= minimum_coverage <= 1:
@@ -272,9 +289,17 @@ class OpeningPriceFanIn:
                 if names is not None and name not in names:
                     continue
                 previous = session.metrics.get(name, {})
-                if time.monotonic() < previous.get("retry_after_monotonic", 0):
+                clock = time.monotonic()
+                cooling_down = clock < previous.get("retry_after_monotonic", 0)
+                recovery_probe = bool(name == "official_mis" and cooling_down
+                    and previous.get("retry_reason") == "source_endpoint_unavailable"
+                    and "transport_probe_after_monotonic" in previous
+                    and clock >= previous["transport_probe_after_monotonic"])
+                if cooling_down and not recovery_probe:
                     continue
                 active = session.inflight.setdefault(name, set())
+                if recovery_probe and active:
+                    continue
                 # These endpoints fetch a whole market even for a one-symbol
                 # consumer delta. Per-symbol single-flight alone allowed five
                 # modes to send overlapping full-market HTTP requests.
@@ -283,26 +308,30 @@ class OpeningPriceFanIn:
                 indices = [i for i, symbol in enumerate(symbols) if symbol not in active and (name not in session.metrics or not resolved[i])]
                 if not indices:
                     continue
+                if recovery_probe:
+                    indices = indices[:1]
                 requested = [symbols[i] for i in indices]
                 active.update(requested)
                 metric = session.metrics.setdefault(name, {"attempts": 0, "requested_count": 0, "state": "pending"})
                 metric["attempts"] += 1
                 metric["requested_count"] += len(requested)
                 metric["state"] = "running"
+                if not recovery_probe:
+                    metric.pop("transport_recovery_resume", None)
                 scope = session.provider_symbols.setdefault(name, {key: set() for key in ("requested", "responded", "valid", "no_print")})
                 scope["requested"].update(requested)
                 metric["unique_requested_count"] = len(scope["requested"])
                 job_id = f"{name}:{metric['attempts']}:{self._owner_id}"
-                jobs.append((name, provider, requested, fallback[indices].copy(), job_id))
+                jobs.append((name, provider, requested, fallback[indices].copy(), job_id, recovery_probe))
             # Enqueue all sources under a short lock. Workers perform no I/O
             # until the lock is released; a fast winner cannot cancel a loser.
-            for name, provider, requested, values, job_id in jobs:
-                self._pool.submit(self._run, session, generation, key, name, provider, requested, values, started, job_id, time.perf_counter())
+            for name, provider, requested, values, job_id, recovery_probe in jobs:
+                self._pool.submit(self._run, session, generation, key, name, provider, requested, values, started, job_id, time.perf_counter(), recovery_probe)
         with session.condition:
             generation = session.generation
             dispatch(cache_reader(), now)
         deadline = time.monotonic() + max(0.01, timeout_seconds)
-        poll_names = {name for name in providers if name.startswith("finmind")}
+        snapshot_poll_names = {name for name in providers if name.startswith("finmind")}
         while True:
             with session.condition:
                 if session.generation != generation or self._closed:
@@ -312,12 +341,17 @@ class OpeningPriceFanIn:
                 resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text) if resolve_no_prints else False)
                 ready = int(resolved.sum()) >= required
                 clock = time.monotonic()
+                mis_metric = session.metrics.get("official_mis", {})
+                poll_names = snapshot_poll_names | ({"official_mis"} if "official_mis" in providers
+                    and ("transport_probe_after_monotonic" in mis_metric
+                         or mis_metric.get("transport_recovery_resume")) else set())
                 can_poll = not ready and clock < min(deadline, polling_until) and bool(poll_names)
                 if can_poll:
                     dispatch(observed, datetime.now(TAIPEI), names=poll_names)
-                pending = any(set(symbols).intersection(values) for values in session.inflight.values())
+                pending = any(not requested_set.isdisjoint(values) for values in session.inflight.values())
                 remaining = deadline - clock
-                next_poll = min((session.metrics[name].get("retry_after_monotonic", clock)
+                next_poll = min((session.metrics[name].get("transport_probe_after_monotonic",
+                                    session.metrics[name].get("retry_after_monotonic", clock))
                                  for name in poll_names if not session.inflight.get(name)), default=None) if can_poll else None
                 scheduled_poll = next_poll is not None and next_poll < min(deadline, polling_until)
                 if ready or (not pending and not scheduled_poll) or remaining <= 0:
@@ -348,13 +382,14 @@ class OpeningPriceFanIn:
         observed.transport_timing["opening_telemetry_recorded"] = _record_source_event(key, "merged", "quorum" if ready else "waiting_source", {"requested_count": len(symbols), "valid_open_count": int(opens.sum()), "resolved_count": int(resolved.sum()), "required_count": required, "elapsed_ms": observed.transport_timing["opening_quorum_wait_ms"], "background_pending": pending, "input_flush": flush_timing, "providers": metrics})
         return observed
 
-    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id, enqueued_at=None):
+    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id, enqueued_at=None, recovery_probe=False):
         started = time.perf_counter()
         source_call_started = time.monotonic()
         poll_interval = _snapshot_poll_interval(name, datetime.now(TAIPEI))
         # Per-request facts must not alias the provider aggregate: a one-symbol
         # delta used to overwrite the simultaneous 2,293-symbol batch receipt.
         metric = {"job_id": job_id, "requested_count": len(symbols), "state": "running",
+                  "transport_recovery_probe": recovery_probe,
                   "requested_symbols_sha256": hashlib.sha256("\n".join(symbols).encode()).hexdigest(),
                   "requested_scope_sha256": hashlib.sha256("\n".join(sorted(symbols)).encode()).hexdigest(),
                   "measurement_clock": "provider_job_perf_counter_v1"}
@@ -370,10 +405,28 @@ class OpeningPriceFanIn:
                 metric["poll_clock_basis"] = "request_start_not_completion"
             aggregate.pop("error_type", None)
             aggregate.pop("http_status", None)
-        _record_source_event(key, name, "started", {"job_id": job_id, "requested_count": len(symbols), "requested_symbols_sha256": metric["requested_symbols_sha256"], "requested_scope_sha256": metric["requested_scope_sha256"], "dispatch_ms": metric["last_dispatch_ms"], "worker_queue_ms": metric["worker_queue_ms"]})
+        # Dispatch metadata is observation telemetry, not an input durability
+        # gate. Journal it alongside the external request instead of making
+        # every provider wait behind all earlier providers' fsyncs. Its actual
+        # original clock is frozen here, not when the writer gets CPU time.
+        # Each job joins this write BEFORE any of its progress/finished events;
+        # the source and model-input barriers below remain synchronous.
+        dispatch_receipt = _TELEMETRY_START_POOL.submit(_record_source_event, key, name, "started", {
+            "job_id": job_id, "requested_count": len(symbols),
+            "requested_symbols_sha256": metric["requested_symbols_sha256"],
+            "requested_scope_sha256": metric["requested_scope_sha256"],
+            "dispatch_ms": metric["last_dispatch_ms"], "worker_queue_ms": metric["worker_queue_ms"],
+            "observed_at_taipei": metric["last_started_at_taipei"]})
+        metric["dispatch_journal_policy"] = "request_overlaps_start_receipt_join_before_progress_v1"
         last_progress = [None]
         requested_set = set(symbols)
         job_valid, job_no_print, job_responded = set(), set(), set()
+
+        def join_dispatch_receipt():
+            if "dispatch_telemetry_recorded" not in metric:
+                waiting = time.perf_counter()
+                metric["dispatch_telemetry_recorded"] = dispatch_receipt.result()
+                metric["dispatch_telemetry_wait_ms"] = round((time.perf_counter() - waiting) * 1000, 3)
 
         def progress(requested, snapshot):
             validation_started = time.perf_counter()
@@ -441,6 +494,7 @@ class OpeningPriceFanIn:
                     metric.setdefault("first_valid_open_at_taipei", datetime.now(TAIPEI).isoformat(timespec="microseconds"))
                     aggregate.setdefault("first_valid_open_ms", metric["first_valid_open_ms"])
                     aggregate.setdefault("first_valid_open_at_taipei", metric["first_valid_open_at_taipei"])
+                validated_at = datetime.now(TAIPEI).isoformat(timespec="microseconds")
                 session.condition.notify_all()
             events = []
             if is_first:
@@ -454,13 +508,16 @@ class OpeningPriceFanIn:
                 # Piggyback the existing durable event bundle: no extra fsync.
                 events.append(("coverage_progress", coverage_event))
             if events:
-                metric["observation_telemetry_recorded"] = _record_source_events(key, name, events)
+                join_dispatch_receipt()
+                metric["observation_telemetry_recorded"] = _record_source_events(key, name, [
+                    (event, {"observed_at_taipei": validated_at, **details}) for event, details in events])
         try:
             # Transport cadence starts at the actual provider call, not before
             # durable dispatch telemetry. Slow journal I/O must not silently
             # shorten the interval between two real external requests.
             source_call_started = time.monotonic()
             metric["provider_call_offset_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            metric["provider_invocation_at_taipei"] = datetime.now(TAIPEI).isoformat(timespec="microseconds")
             snapshot = provider(symbols, fallback, progress)
             if last_progress[0] is not snapshot:
                 progress(symbols, snapshot)
@@ -485,7 +542,8 @@ class OpeningPriceFanIn:
                 state = "complete" if valid_opens or no_prints else "waiting_source"
                 if responses == 0:
                     state = "failed" if int(transport.get("mis_failed_request_count", 0)) else "waiting_source"
-                endpoint_unavailable = bool(transport.get("mis_dispatch_stopped"))
+                endpoint_unavailable = bool(transport.get("mis_dispatch_stopped")
+                    or (recovery_probe and responses == 0))
                 if endpoint_unavailable and responses:
                     state = "degraded"
                 metric.update(state=state, valid_open_count=valid_opens,
@@ -498,13 +556,22 @@ class OpeningPriceFanIn:
                     statuses = transport.get("mis_http_error_statuses", [])
                     limited = next((code for code in statuses if code in {401, 402, 403, 429}), None)
                     _source_failure_retry(aggregate, status=limited,
-                                          endpoint_unavailable=endpoint_unavailable)
-                elif valid_opens or no_prints:
+                                          endpoint_unavailable=endpoint_unavailable,
+                                          allow_transport_probe=name == "official_mis" and endpoint_unavailable)
+                elif valid_opens or no_prints or (recovery_probe and responses):
                     aggregate["consecutive_source_failures"] = 0
                     aggregate["consecutive_source_no_progress"] = 0
                     aggregate.pop("retry_after_monotonic", None)
                     aggregate.pop("retry_delay_seconds", None)
                     aggregate.pop("retry_reason", None)
+                    aggregate.pop("transport_probe_after_monotonic", None)
+                    aggregate.pop("transport_probe_delay_seconds", None)
+                    if recovery_probe:
+                        # A parsed requested row restores transport admission,
+                        # not opening-price validity. Original source/date/volume
+                        # validation still decides whether any input is ready.
+                        metric["transport_health_recovered"] = True
+                        aggregate["transport_recovery_resume"] = True
                 elif poll_interval is not None:
                     # A valid HTTP/schema response with only yesterday's rows
                     # is a data wait, not an accumulating transport outage.
@@ -530,6 +597,10 @@ class OpeningPriceFanIn:
                     aggregate["http_status"] = int(status)
                 _source_failure_retry(aggregate, status=403 if isinstance(exc, PermissionError) else status)
         finally:
+            # An exception or empty response still retains the started event
+            # and its failure result. Do not leave writes running after the
+            # provider job completes or turn an I/O failure into a good receipt.
+            join_dispatch_receipt()
             with session.condition:
                 metric["last_total_ms"] = round((time.perf_counter() - started) * 1000, 3)
                 if poll_interval is not None:
@@ -842,7 +913,11 @@ def optional_opening_providers() -> dict[str, Provider]:
     if os.getenv("FINMIND_TOKEN", "").strip():
         providers["finmind_snapshot"] = fetch_finmind_opening_prices
     if os.getenv("FUGLE_API_KEY", "").strip():
-        for market in ("TSE", "OTC", "TIB"):
+        # The canonical regular-stock/ETF universe contains TSE and OTC, not
+        # the separate innovation board. Do not spend a full-market request /
+        # prewarm on a route that cannot contribute to any requested symbol.
+        # The explicit TIB adapter remains available for a future scoped model.
+        for market in ("TSE", "OTC"):
             providers["fugle_" + market.lower()] = fugle_market_provider(market)
     return providers
 

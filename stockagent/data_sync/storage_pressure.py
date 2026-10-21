@@ -11,6 +11,11 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from stockagent.data_sync.materialized_cache import (
+    _process_directories,
+    _reference_read_error,
+)
+
 
 DEFAULT_PROTECTED_PROCESS_SUBSTRINGS = (
     "train.py",
@@ -79,16 +84,22 @@ def _open_cache_files() -> set[Path]:
 
     result: set[Path] = set()
     own_pid = os.getpid()
-    for process in Path("/proc").glob("[0-9]*"):
+    for process in _process_directories():
         try:
             if int(process.name) == own_pid:
                 continue
         except ValueError:
             continue
-        for descriptor in (process / "fd").glob("*"):
+        try:
+            descriptors = list((process / "fd").iterdir())
+        except OSError as error:
+            _reference_read_error(process / "fd", error)
+            continue
+        for descriptor in descriptors:
             try:
                 target = Path(os.readlink(descriptor))
-            except OSError:
+            except OSError as error:
+                _reference_read_error(descriptor, error)
                 continue
             if target.is_absolute():
                 result.add(Path(str(target).removesuffix(" (deleted)")))
@@ -96,7 +107,8 @@ def _open_cache_files() -> set[Path]:
             lines = (process / "maps").read_text(
                 encoding="utf-8", errors="replace"
             ).splitlines()
-        except OSError:
+        except OSError as error:
+            _reference_read_error(process / "maps", error)
             continue
         for line in lines:
             fields = line.split(maxsplit=5)
@@ -117,7 +129,14 @@ def protected_processes(
         return []
     result: list[dict[str, str | int]] = []
     own_pid = os.getpid()
-    for process in sorted(proc_root.glob("[0-9]*"), key=lambda path: int(path.name)):
+    try:
+        processes = sorted((path for path in proc_root.iterdir() if path.name.isdecimal()),
+                           key=lambda path: int(path.name))
+    except OSError as error:
+        _reference_read_error(proc_root, error)
+        # A missing /proc root is not an individually exited process.
+        raise ValueError("process root unavailable") from error
+    for process in processes:
         try:
             pid = int(process.name)
         except ValueError:
@@ -126,7 +145,8 @@ def protected_processes(
             continue
         try:
             raw = (process / "cmdline").read_bytes()
-        except OSError:
+        except OSError as error:
+            _reference_read_error(process / "cmdline", error)
             continue
         command = raw.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
         if not command:

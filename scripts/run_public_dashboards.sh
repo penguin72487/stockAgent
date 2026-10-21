@@ -21,4 +21,5 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
 exec "$selected_python" scripts/serve_public_dashboards.py \
   --host "${STOCKAGENT_PUBLIC_DASHBOARD_HOST:-127.0.0.1}" \
   --port "${STOCKAGENT_PUBLIC_DASHBOARD_PORT:-8770}" \
-  --owner-port "${STOCKAGENT_OWNER_DASHBOARD_PORT:-8771}"
+  --owner-port "${STOCKAGENT_OWNER_DASHBOARD_PORT:-8771}" \
+  --member-port "${STOCKAGENT_MEMBER_DASHBOARD_PORT:-8772}"

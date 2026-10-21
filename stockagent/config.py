@@ -112,6 +112,9 @@ _ANNUAL_TRAJECTORY_OBJECTIVES = frozenset({
     "trajectory_calmar",
     "trajectory_pcgrad_return", "trajectory_mgda_return",
     "trajectory_pcgrad_parameter", "trajectory_mgda_parameter",
+    "trajectory_mgda_l2_parameter",
+    "trajectory_config_l2_parameter", "trajectory_dibs_l2_1_parameter", "trajectory_dibs_l2_5_parameter",
+    "trajectory_upgrad_log_l2_parameter",
 })
 _TW_INDEX_FUTURES_MODEL_NAMES = frozenset(
     {
@@ -1908,6 +1911,12 @@ class TradingConfig:
     # Explicit account policy; intraday uses receipt-backed 08:46..13:30 bars.
     tw_futures_portfolio_holding_policy: str = "carry"
     tw_futures_portfolio_minute_data_path: str | None = None
+    # Opt-in carrying-account clock. None retains the historical daily OPEN ABI.
+    tw_futures_portfolio_decision_time: str | None = None
+    tw_futures_portfolio_entry_clock_path: str | None = None
+    # Model reference only: observed session OPEN, else the last known real
+    # trade. This source must be pinned separately from executable entries.
+    tw_futures_portfolio_opening_reference_path: str | None = None
     tw_futures_portfolio_capital_basis: str = "notional"
     # Explicit comparator ABI; the historical default preserves old runs.
     tw_futures_portfolio_benchmark_mode: str = "legacy_front_holding_return"
@@ -2797,6 +2806,9 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     optimizer_name: str = "adamw"
     optimizer_options: dict[str, Any] = field(default_factory=dict)
+    sharpness_mode: str = "none"
+    sharpness_radius: float = 0.0
+    sharpness_alpha: float = 1.0
     enable_lr_scheduler: bool = True
     lr_scheduler: str = "none"  # "none", "cosine", "step", "plateau"
     lr_scheduler_t_max: int = 0
@@ -2992,12 +3004,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     )
 
     training = raw.setdefault("training", {})
-    from stockagent.training.optimizer_config import normalized_optimizer_options
+    from stockagent.training.optimizer_config import normalized_optimizer_options, normalized_sharpness_options
     optimizer_name = str(training.get("optimizer_name", "adamw")).strip().lower()
     optimizer_options = training.get("optimizer_options", {})
     normalized_optimizer_options(optimizer_name, optimizer_options)
     training["optimizer_name"] = optimizer_name
     training["optimizer_options"] = optimizer_options
+    sharpness = normalized_sharpness_options(
+        training.get("sharpness_mode", "none"), training.get("sharpness_radius", 0.),
+        training.get("sharpness_alpha", 1.))
+    training.update({f"sharpness_{key}": value for key, value in sharpness.items()})
     if "eval_backtest_engine" in training:
         raise ValueError(
             "training.eval_backtest_engine has been removed; "
@@ -4126,6 +4142,11 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         if (
             expected_first_year is not None
             and int(expected_first_year) != parsed_panel_start_date.year
+            # The opt-in carry clock first builds the immutable full
+            # factorized source ABI, then crops to its receipt's common
+            # minute horizon. train.py checks the effective year after
+            # that adapter; the source start remains explicit here.
+            and trading.get("tw_futures_portfolio_decision_time") is None
         ):
             raise ValueError(
                 "walk_forward.expected_first_year must match the year of "
@@ -4559,6 +4580,27 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         concentration_weight=training["multitask_loss"]["concentration_weight"],
     )
     holding_policy = trading["tw_futures_portfolio_holding_policy"]
+    decision_time = trading["tw_futures_portfolio_decision_time"]
+    entry_clock_path = trading["tw_futures_portfolio_entry_clock_path"]
+    opening_reference_path = trading["tw_futures_portfolio_opening_reference_path"]
+    if opening_reference_path is not None and (
+            not isinstance(opening_reference_path, str) or not opening_reference_path.strip()
+            or decision_time not in {"08:45", "09:00"}
+            or not phase_model_config["futures_causal_account_policy"]
+            or training["model_name"] not in {"financial_transformer", "financial_transformer_model",
+                                               "financial_token_transformer", "financial_tokenized_transformer"}):
+        raise ValueError("opening reference requires a pinned source and a causal margin account decision clock")
+    if decision_time is not None or entry_clock_path is not None:
+        if (decision_time not in {"08:45", "09:00"}
+                or not isinstance(entry_clock_path, str) or not entry_clock_path.strip()
+                or trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+                or holding_policy != "carry"
+                or trading["tw_futures_portfolio_capital_basis"] != "initial_margin"
+                or not trading["tw_futures_portfolio_integer_contracts"]
+                or data["tw_futures_current_open_feature"]
+                or "next_session_open_gap_logret" not in data["feature_zero_fill"]):
+            raise ValueError("futures decision clock requires 08:45/09:00, a receipt-bound entry path, "
+                             "whole-contract margin carry and prior-only zero-gap stock features")
     if training["futures_funding_compile"] and (
         not training["futures_cuda_graph"] or training["backtest_compile"]
     ):
@@ -5124,9 +5166,29 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                     "concentration_weight", "net_exposure_weight"))):
             raise ValueError("whole-account return adjoints require annual physical trajectory DDP without auxiliary losses")
         if (training["loss_type"] in {"trajectory_pcgrad_return", "trajectory_mgda_return",
-                                      "trajectory_pcgrad_parameter", "trajectory_mgda_parameter"}
+                                      "trajectory_pcgrad_parameter", "trajectory_mgda_parameter",
+                                      "trajectory_mgda_l2_parameter", "trajectory_config_l2_parameter",
+                                      "trajectory_dibs_l2_1_parameter", "trajectory_dibs_l2_5_parameter",
+                                      "trajectory_upgrad_log_l2_parameter"}
                 and str(environment.get("amp_dtype", "bf16")).lower() in {"fp16", "float16", "half"}):
             raise ValueError("multiobjective gradient surgery requires unscaled BF16/FP32 gradients")
+    if training["sharpness_mode"] != "none":
+        if (not training["day_trade_training_annual_episodes"]
+                or not training["day_trade_optimizer_step_per_trajectory"]
+                or not training["day_trade_annual_episode_sharding"]
+                or training["multi_gpu_strategy"] != "distributed_data_parallel"
+                or training["ddp_trajectory_gradient_sync"] != "trajectory"
+                or training["loss_type"] not in {"log_utility", "trajectory_mgda_l2_parameter"}
+                or training["futures_training_max_drawdown"] is not None
+                or str(environment.get("amp_dtype", "bf16")).lower() in {"fp16", "float16", "half"}
+                or evaluation["gamma_turnover"] != 0.0
+                or any(evaluation[name] != 0.0 for name in (
+                    "log_utility_risk_aversion", "log_utility_downside_aversion",
+                    "log_utility_benchmark_shortfall_aversion"))
+                or any(training["multitask_loss"][name] != 0.0 for name in (
+                    "return_rank_ic_weight", "direction_weight", "volatility_regime_weight",
+                    "concentration_weight", "net_exposure_weight"))):
+            raise ValueError("sharpness requires unscaled complete annual log or unit-parameter-MGDA DDP without auxiliary losses or policy-step rollback")
     if bool(training["day_trade_optimizer_step_per_trajectory"]):
         if trading["execution_mode"] != "tw_day_trade":
             raise ValueError(
@@ -6022,6 +6084,9 @@ def load_config(
             learning_rate=training_raw["learning_rate"],
             optimizer_name=training_raw["optimizer_name"],
             optimizer_options=training_raw["optimizer_options"],
+            sharpness_mode=training_raw["sharpness_mode"],
+            sharpness_radius=training_raw["sharpness_radius"],
+            sharpness_alpha=training_raw["sharpness_alpha"],
             enable_lr_scheduler=training_raw["enable_lr_scheduler"],
             lr_scheduler=training_raw["lr_scheduler"],
             lr_scheduler_t_max=training_raw["lr_scheduler_t_max"],

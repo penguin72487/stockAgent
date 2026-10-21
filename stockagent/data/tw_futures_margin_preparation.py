@@ -31,6 +31,25 @@ ROC_DATE = r"(\d{2,3})年(\d{1,2})月(\d{1,2})日"
 CORPORATE_TERMS_DERIVATION_VERSION = 2
 
 
+def stock_futures_preparation_scope(universe: pl.DataFrame) -> pl.DataFrame:
+    """Select the source-declared stock scope, retaining adjusted identities.
+
+    This is product scope, not lifetime, liquidity, margin or PIT admission.
+    Every selected physical history still passes the ordinary compiler.
+    """
+    if {'product', 'asset_class', 'underlying_symbol'} - set(universe.columns):
+        raise ValueError('stock-futures scope requires source product/underlying identity')
+    if universe['product'].null_count() or universe['product'].is_duplicated().any():
+        raise ValueError('stock-futures scope has duplicate/null product identities')
+    selected = universe.filter(pl.col('asset_class') == 'stock_future')
+    if selected.is_empty():
+        raise ValueError('source universe contains no stock futures')
+    if (selected['underlying_symbol'].null_count()
+            or selected['underlying_symbol'].str.strip_chars().eq('').any()):
+        raise ValueError('stock futures require an explicit underlying stock mapping')
+    return selected
+
+
 def align_product_margin_intervals(days: pl.DataFrame, intervals: pl.DataFrame) -> pl.DataFrame:
     """Bind product-relative rules at both regular-session account phases.
 

@@ -200,6 +200,16 @@ try {
     $listHandle=[TejListFixture]::Labels.Handle.ToInt64()
     $indices=[TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,[string[]]@('First','first','台灣 café'),$PID,'StockAgent owned list fixture')
     Check 'batch_search_keeps_ordinal_unicode_and_request_order' (($indices -join ',') -ceq '1,0,2')
+    $rejected=$false;try{[void][TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,
+        [string[]]@('Missing A','First','Missing B','台灣 café'),$PID,'StockAgent owned list fixture')}catch{$rejected=$true}
+    Check 'complete_missing_batch_preserves_all_absent_positions' ($rejected -and
+        ([TejBridgeNative]::LastAbsentLabelPositions -join ',') -ceq '0,2' -and [TejBridgeNative]::LastLookupListCount -eq 3)
+    Check 'missing_batch_does_not_select_or_activate' ([TejListFixture]::SelectClicks -eq 0 -and
+        [TejBridgeNative]::GetForegroundWindow() -eq $foreground)
+    $rejected=$false;try{[void][TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,
+        [string[]]@('First'),($PID+1),'StockAgent owned list fixture')}catch{$rejected=$true}
+    Check 'foreign_owner_clears_previous_absence_evidence' ($rejected -and
+        [TejBridgeNative]::LastAbsentLabelPositions.Length -eq 0 -and [TejBridgeNative]::LastLookupListCount -eq -1)
     $rejected=$false;try{[void][TejBridgeNative]::ExactListIndices($rootHandle,$listHandle,[string[]]@('First','First'),$PID,'StockAgent owned list fixture')}catch{$rejected=$true}
     Check 'batch_search_duplicate_request_refused_without_selection' ($rejected -and [TejListFixture]::SelectClicks -eq 0)
     [TejListFixture]::BatchReset($false)

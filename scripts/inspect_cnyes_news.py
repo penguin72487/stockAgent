@@ -7,6 +7,7 @@ cooldowns; they never create another frontier owner or invent API permissions.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from datetime import datetime
 import hashlib
 import html
@@ -26,6 +27,77 @@ from downloader.news_fulltext import fetch_article, load_config
 from downloader.news_fulltext_http import NewsHTTP, ACCESS_DIAGNOSTIC_HEADERS
 from downloader.news_fulltext_policy import NewsError, _objects, _plain_text, _plain_text_node, extract_article, normalize_url
 from downloader.news_fulltext_queue import utc_now
+
+
+def cnyes_literal_route_hint(url):
+    """Classify literal URL syntax, never article identity or source absence.
+
+    Do not decode, normalize or generate a replacement URL. In particular,
+    an old shtml path is still an unresolved article *candidate*, while a
+    twstock route is a market-endpoint *candidate*, not downloaded news.
+    """
+    if not isinstance(url, str) or len(url) > 8192:
+        return 'invalid_or_oversized_url'
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return 'invalid_or_oversized_url'
+    if parts.scheme not in {'http', 'https'} or not parts.netloc or parts.username or parts.password:
+        return 'invalid_or_oversized_url'
+    # Exact netlocs intentionally reject ports, lookalikes and transformed
+    # identities. These hints confer no request, redirect or alias permission.
+    if parts.netloc == 'www.cnyes.com' and parts.path.startswith('/twstock/'):
+        return 'market_endpoint_route_candidate'
+    if parts.netloc in {'news.cnyes.com', 'm.cnyes.com', 'amp-news.cnyes.com'}:
+        if re.fullmatch(r'/news/id/[0-9]+/?', parts.path):
+            return 'current_article_route_candidate'
+        if re.fullmatch(r'(?:/(?:Content|content))?/[0-9]{8}/[A-Za-z0-9]+\.shtml', parts.path):
+            return 'legacy_shtml_article_route_candidate'
+        return 'other_news_host_route_unreviewed'
+    if parts.netloc in {'www.cnyes.com', 'hao.cnyes.com', 'fund.cnyes.com', 'invest.cnyes.com'}:
+        return 'other_cnyes_route_unreviewed'
+    return 'foreign_origin_unreviewed'
+
+
+def cnyes_unsupported_path_inventory(db, *, head_limit=4096):
+    """One indexed, bounded read of unfinished heads; no completed-body scan.
+
+    Keep URL-head counts and body presence separate. A syntax hint must not
+    remove a head from any denominator, change a queue outcome or turn source
+    content/rights/identity into a verified fact. Overflow remains explicit.
+    """
+    if type(head_limit) is not int or not 1 <= head_limit <= 4096:
+        raise ValueError('unsupported path head limit must be 1..4096')
+    rows = db.execute(
+        "SELECT url,body_sha256 FROM articles INDEXED BY dispatch "
+        "WHERE provider='cnyes' AND state='unsupported_article_path' "
+        "ORDER BY due LIMIT ?", (head_limit + 1,)).fetchall()
+    overflow = len(rows) > head_limit
+    groups = defaultdict(lambda: {'url_heads': 0, 'missing_body_heads': 0,
+                                  'stored_body_heads': 0, 'literal_url_samples': []})
+    for url, body_sha256 in rows[:head_limit]:
+        hint = cnyes_literal_route_hint(url)
+        group = groups[hint]
+        group['url_heads'] += 1
+        group['stored_body_heads' if body_sha256 is not None else 'missing_body_heads'] += 1
+        if len(group['literal_url_samples']) < 3:
+            # This is the existing private inspection output, not a browser
+            # projection. Do not retain oversized input or source prose.
+            group['literal_url_samples'].append(url if hint not in {
+                'invalid_or_oversized_url', 'foreign_origin_unreviewed'} else None)
+    return {
+        'contract_version': 1, 'provider': 'cnyes',
+        'state': 'unsupported_article_path', 'scope': 'literal_unfinished_url_head_syntax_only',
+        'head_limit': head_limit, 'heads_examined': min(len(rows), head_limit),
+        'head_limit_reached': overflow, 'all_current_unsupported_heads_included': not overflow,
+        'total_unsupported_url_heads': len(rows) if not overflow else None,
+        'route_hint_counts': dict(sorted(groups.items())),
+        'article_count_inferred': False, 'body_acceptance_granted': False,
+        'source_absence_or_permission_inferred': False,
+        'completion_denominator_changed': False, 'publisher_requests': 0,
+        'production_queue_writes': 0, 'completed_body_rows_scanned': 0,
+        'raw_or_body_payloads_read': 0,
+    }
 
 
 def headline_comparison_metadata(visible, current):
@@ -249,17 +321,35 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probe", action="append", default=[])
     parser.add_argument("--canonical-fetch", action="store_true", help="Probe the actual article entrypoint with its existing queue row; retain its received response, no queue writes")
+    parser.add_argument("--unsupported-paths-only", action="store_true", help="Read only bounded unfinished Cnyes URL syntax; no status/service scan, HTTP or source-content determination")
+    parser.add_argument("--unsupported-head-limit", type=int, default=4096, help="Maximum unfinished route heads to inspect (1..4096); overflow is unknown, not complete")
     args = parser.parse_args(argv)
     if len(args.probe) > 8:
         parser.error("at most eight explicitly selected probes; no saturation test")
+    if not 1 <= args.unsupported_head_limit <= 4096:
+        parser.error("unsupported head limit must be 1..4096")
+    if args.unsupported_paths_only and (args.probe or args.canonical_fetch):
+        parser.error("unsupported paths only cannot request publisher probes")
     config, registry, repo = load_config(args.config)
     root = repo / config["root"]
     args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if args.unsupported_paths_only:
+        db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
+        try:
+            result = cnyes_unsupported_path_inventory(db, head_limit=args.unsupported_head_limit)
+        finally:
+            db.close()
+        result['observed_at_utc'] = utc_now()
+        atomic_write_json(args.output, result)
+        print(json.dumps({'output': str(args.output), 'heads_examined': result['heads_examined'],
+                          'head_limit_reached': result['head_limit_reached'], 'publisher_requests': 0}))
+        return 0
     status = json.loads((root / "status.json").read_text())
     db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
         states = [dict(r) for r in db.execute("SELECT * FROM state_metrics WHERE provider='cnyes'")]
+        unsupported_paths = cnyes_unsupported_path_inventory(db, head_limit=args.unsupported_head_limit)
         failures = {state: [dict(r) for r in db.execute(
             "SELECT url,attempts,due,error_code,metadata_date_raw FROM articles WHERE provider='cnyes' AND state=? LIMIT 12", (state,))]
             for state in ("unsupported_article_path", "body_not_found", "retry", "retry_cooldown", "article_attribution_not_verified")}
@@ -274,6 +364,7 @@ def main(argv=None):
         fields = subprocess.check_output(["systemctl", "show", unit, "-p", "MainPID", "-p", "ActiveState", "-p", "ExecMainStartTimestampMonotonic"], text=True)
         services[unit] = dict(line.split("=", 1) for line in fields.splitlines())
     result = {"observed_at_utc": utc_now(), "services": services, "status": status, "states": states,
+              "unsupported_path_inventory": unsupported_paths,
               "failure_samples": failures, "probes": [], "official_numeric_rate_limit": None, "all_history_complete": False,
               "canonical_fetch_entrypoint_used": args.canonical_fetch}
     atomic_write_json(args.output, result)

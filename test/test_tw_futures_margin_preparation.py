@@ -23,6 +23,33 @@ TX
 '''
 
 
+def test_stock_futures_scope_keeps_adjusted_family_and_excludes_other_assets():
+    from stockagent.data.tw_futures_margin_preparation import stock_futures_preparation_scope
+    source = pl.DataFrame(dict(product=['CAF', 'CA1', 'TX', 'ETF'],
+        asset_class=['stock_future', 'stock_future', 'index_future', 'etf_future'],
+        underlying_symbol=['1303', '1303', None, '0050'],
+        needs_dated_deliverables=[False, True, False, False]))
+    selected = stock_futures_preparation_scope(source)
+    assert selected.equals(source.head(2))
+    assert source.height == 4
+
+
+@pytest.mark.parametrize('defect', ['missing_mapping', 'empty_mapping', 'duplicate', 'no_stocks'])
+def test_stock_futures_scope_rejects_ambiguous_sources(defect):
+    from stockagent.data.tw_futures_margin_preparation import stock_futures_preparation_scope
+    source = pl.DataFrame(dict(product=['CAF'], asset_class=['stock_future'], underlying_symbol=['1303']))
+    if defect == 'missing_mapping':
+        source = source.with_columns(pl.lit(None, dtype=pl.String).alias('underlying_symbol'))
+    elif defect == 'empty_mapping':
+        source = source.with_columns(pl.lit(' ').alias('underlying_symbol'))
+    elif defect == 'duplicate':
+        source = pl.concat([source, source])
+    else:
+        source = source.with_columns(pl.lit('index_future').alias('asset_class'))
+    with pytest.raises(ValueError):
+        stock_futures_preparation_scope(source)
+
+
 def test_margin_requires_product_local_currency_and_order():
     assert margin_pdf_values(PDF, 'TX') == (184000, 141000, 136000, 167000, 128000, 123000)
     for text in [PDF.replace('新臺幣', '美元'), PDF.replace('TX\n', 'MTX\n'),

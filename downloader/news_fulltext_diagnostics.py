@@ -200,6 +200,33 @@ def retain_identity_metadata(queue, row, error, context):
                                            for selector in source.selectors[:16]]}
         if error.code == 'article_license_not_verified':
             facts['native_article_license_validation'] = article_license_validation_metadata(soup, source)
+        if provider == 'maxfinanciallife':
+            # Reuse this already-received envelope and the existing budget.
+            # Native clock drift should not require another publisher fetch;
+            # absent tags and hidden theme clocks are observations, not repairs.
+            from downloader.news_fulltext_max import max_native_clock_metadata
+            facts['max_native_clock_metadata'] = max_native_clock_metadata(soup, source)
+        if provider == 'watchmedia':
+            from downloader.news_fulltext_watchmedia import watchmedia_validation_metadata
+            facts['watchmedia_native_validation'] = watchmedia_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'pinview':
+            from downloader.news_fulltext_pinview import pinview_validation_metadata
+            facts['pinview_native_validation'] = pinview_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'peoplemedia':
+            from downloader.news_fulltext_peoplemedia import peoplemedia_validation_metadata
+            facts['peoplemedia_native_validation'] = peoplemedia_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'mitrade':
+            from downloader.news_fulltext_mitrade import mitrade_validation_metadata
+            facts['mitrade_native_validation'] = mitrade_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'idn':
+            from downloader.news_fulltext_idn import idn_validation_metadata
+            facts['idn_native_validation'] = idn_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'videoland':
+            from downloader.news_fulltext_videoland import videoland_validation_metadata
+            facts['videoland_native_validation'] = videoland_validation_metadata(soup, page_url=context.response.url)
+        if provider == 'pocket':
+            from downloader.news_fulltext_pocket import pocket_identity_metadata
+            facts['pocket_native_validation'] = pocket_identity_metadata(soup, page_url=context.response.url)
         if provider == 'taiwanhot':
             from downloader.news_fulltext_public_originals import taiwanhot_request_ids
             facts['requested_admission_candidates'] = sorted(taiwanhot_request_ids(row['url']))

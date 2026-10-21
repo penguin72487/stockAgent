@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.data_sync.desync_snapshots import SnapshotError  # noqa: E402
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred  # noqa: E402
 from stockagent.data_sync.materialized_cache import (  # noqa: E402
     DEFAULT_CACHE_TTL_DAYS,
     evict_materialized_snapshots,
@@ -54,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     automation = subparsers.add_parser("automation-status", help="read-only scheduler, receipt and optional live transport status")
     automation.add_argument("--human", action="store_true")
     automation.add_argument("--live", action="store_true", help="also check current paired cold-index convergence")
+
+    capacity = subparsers.add_parser("capacity", help="bounded local cache allocation/budget observation; never deletes")
+    capacity.add_argument("--panel-cache", type=Path,
+                          help="one enrolled artifacts/cache/*/panel_cache_v2 namespace")
 
     use = subparsers.add_parser("use", help="materialize and renew a hot lease")
     use.add_argument("dataset")
@@ -167,6 +172,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     edge_mode = edge_state.is_file()
     try:
+        if args.command == "capacity":
+            from stockagent.data_sync.cache_capacity import cache_capacity_status
+            _print(cache_capacity_status(args.panel_cache or args.materialized_root,
+                                        family="panel" if args.panel_cache else "materialized"))
+            return 0
         if args.command == "automation-status":
             from stockagent.data_sync.storage_automation import automation_status, print_human_status
             result = automation_status(REPO_ROOT, args.sync_root, live=args.live)
@@ -240,6 +250,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
+    except CapacityDeferred as exc:
+        print(json.dumps({"state": "deferred", **exc.details}, sort_keys=True), file=sys.stderr)
+        return 75
     except (OSError, SnapshotError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

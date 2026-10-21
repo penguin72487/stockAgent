@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from stockagent.data_sync.desync_snapshots import atomic_write_bytes, atomic_write_json  # noqa: E402
+from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_bytes, atomic_write_json  # noqa: E402
 from stockagent.data_sync.storage_pressure import (  # noqa: E402
     DEFAULT_PROTECTED_PROCESS_SUBSTRINGS,
     maintain_rebuildable_caches,
@@ -286,7 +286,7 @@ def main() -> int:
                 ),
             ) for _label, allowed, roots in scopes]
             result = combine_results(results)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, SnapshotError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
     completed = datetime.now(UTC)

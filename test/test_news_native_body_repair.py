@@ -112,10 +112,28 @@ def old_registry(provider, base):
     source = new.sources[provider]
     # Recreate the attested exact prior capture; this is a queue-state fixture,
     # not an alternative current authorization/parser policy.
-    new.sources[provider] = replace(source, data_fingerprint=source.http_capacity_source_fingerprint,
-        parser_repair_capture_fingerprint=source.http_capacity_source_fingerprint,
+    new.sources[provider] = replace(source, data_fingerprint=source.parser_repair_prior_capture_fingerprint,
+        parser_repair_capture_fingerprint=source.parser_repair_prior_capture_fingerprint,
         parser_repair_fingerprint='a' * 64, http_capacity_source_fingerprint='')
     return new
+
+
+def test_cmnews_short_table_repair_attests_prior_capture_not_legacy_http_capacity(tmp_path):
+    new = registry('cmnews', tmp_path)
+    source = new.sources['cmnews']
+    assert source.parser_repair_prior_capture_fingerprint != source.http_capacity_source_fingerprint
+    old = old_registry('cmnews', tmp_path)
+    old.sources['cmnews'] = replace(old.sources['cmnews'],
+        data_fingerprint=source.http_capacity_source_fingerprint,
+        parser_repair_capture_fingerprint=source.http_capacity_source_fingerprint)
+    with closing(NewsQueue(tmp_path, old)) as queue:
+        queue.add_articles([{'url': cm.URL}])
+        queue.db.execute("UPDATE articles SET state='body_not_found',error_code='body_not_found',"
+            'attempts=4,due=9000000000,last_checked_at_utc=? WHERE url=?', (utc_now(), cm.URL))
+        queue.db.commit()
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (cm.URL,)).fetchone())
+    with closing(NewsQueue(tmp_path, new)) as queue:
+        assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (cm.URL,)).fetchone()) == before
 
 
 @pytest.mark.parametrize('provider', ['ettoday', 'cmnews'])

@@ -91,6 +91,107 @@ def test_sibling_or_generic_server_root_does_not_block_the_selected_run(tmp_path
         process.wait(timeout=5)
 
 
+def _fake_argument_process(tmp_path, monkeypatch, arguments):
+    process = tmp_path / 'proc/999999999'
+    process.mkdir(parents=True)
+    (process / 'cmdline').write_bytes(b'\0'.join(os.fsencode(value) for value in arguments) + b'\0')
+    (process / 'cwd').symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(maintenance, '_process_directories', lambda: [process])
+    return process
+
+
+def test_ancestor_resolution_shares_repeated_paths_but_rechecks_before_acceptance(tmp_path, monkeypatch):
+    scope = tmp_path / 'artifacts/markets'
+    source = scope / 'suite/run'
+    source.mkdir(parents=True)
+    process = _fake_argument_process(tmp_path, monkeypatch, ['unrelated'] * 100)
+    calls = {}
+    original = Path.resolve
+    def tracked(path, **options):
+        calls[path] = calls.get(path, 0) + 1
+        return original(path, **options)
+    monkeypatch.setattr(Path, 'resolve', tracked)
+    assert maintenance._ancestor_process_references((source,), scope, []) == []
+    assert calls[process / 'cwd'] == 2
+    assert calls[tmp_path / 'unrelated'] == 2
+    # A second guard is always fresh, never a cached no-use lease.
+    assert maintenance._ancestor_process_references((source,), scope, []) == []
+    assert calls[process / 'cwd'] == calls[tmp_path / 'unrelated'] == 4
+
+
+def test_ancestor_resolution_still_protects_external_alias_and_option_paths(tmp_path, monkeypatch):
+    scope = tmp_path / 'artifacts/markets'
+    source = scope / 'suite/run'
+    source.mkdir(parents=True)
+    alias = tmp_path / 'external-alias'
+    alias.symlink_to(scope / 'suite', target_is_directory=True)
+    process = _fake_argument_process(tmp_path, monkeypatch, ['--root=external-alias'] * 4)
+    references = maintenance._ancestor_process_references((source,), scope, [])
+    assert references == [f'pid={process.name}:cmdline:{scope / "suite"}']
+
+
+@pytest.mark.parametrize('problem', ['redirected_alias', 'changed_cwd', 'permission_lost', 'symlink_loop'])
+def test_reused_argument_changes_deny_retirement_instead_of_using_negative_cache(tmp_path, monkeypatch, problem):
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    scope = tmp_path / 'artifacts/markets'
+    source = scope / 'suite/run'
+    source.mkdir(parents=True)
+    process = _fake_argument_process(tmp_path, monkeypatch, ['unrelated'] * 4)
+    original = Path.resolve
+    candidate = process / 'cwd' if problem == 'changed_cwd' else tmp_path / 'unrelated'
+    calls = 0
+    def changed(path, **options):
+        nonlocal calls
+        if path == candidate:
+            calls += 1
+            if calls > 1:
+                if problem == 'permission_lost':
+                    raise PermissionError(13, 'lost visibility')
+                if problem == 'symlink_loop':
+                    raise OSError(40, 'new loop')
+                return scope / 'suite'
+        return original(path, **options)
+    monkeypatch.setattr(Path, 'resolve', changed)
+    with pytest.raises(SnapshotError, match='process argument'):
+        maintenance._ancestor_process_references((source,), scope, [])
+
+
+def test_exited_process_during_cwd_recheck_keeps_original_disappearance_rule(tmp_path, monkeypatch):
+    scope = tmp_path / 'artifacts/markets'
+    source = scope / 'suite/run'
+    source.mkdir(parents=True)
+    process = _fake_argument_process(tmp_path, monkeypatch, ['unrelated'] * 4)
+    original = Path.resolve
+    calls = 0
+    def exited(path, **options):
+        nonlocal calls
+        if path == process / 'cwd':
+            calls += 1
+            if calls > 1:
+                raise FileNotFoundError(2, 'exited')
+        return original(path, **options)
+    monkeypatch.setattr(Path, 'resolve', exited)
+    assert maintenance._ancestor_process_references((source,), scope, []) == []
+
+
+def test_unrelated_alias_rotation_is_not_misclassified_as_a_cleanup_consumer(tmp_path, monkeypatch):
+    scope = tmp_path / 'artifacts/markets'
+    source = scope / 'suite/run'
+    source.mkdir(parents=True)
+    _fake_argument_process(tmp_path, monkeypatch, ['unrelated'] * 4)
+    original = Path.resolve
+    calls = 0
+    def rotate(path, **options):
+        nonlocal calls
+        if path == tmp_path / 'unrelated':
+            calls += 1
+            if calls > 1:
+                return tmp_path / 'other-job/new-version'
+        return original(path, **options)
+    monkeypatch.setattr(Path, 'resolve', rotate)
+    assert maintenance._ancestor_process_references((source,), scope, []) == []
+
+
 class _Resolved:
     manifest = {"snapshot_id": "snapshot-one"}
     manifest_sha256 = "a" * 64

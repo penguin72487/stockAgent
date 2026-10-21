@@ -31,6 +31,7 @@
   "dataset_version_lifecycle": {
     "enabled": true,
     "completed_source_budget_per_activity": 1,
+    "attempted_source_budget_per_activity": 1,
     "completed_cycle_interval_seconds": 86400,
     "busy_retry_seconds": 60,
     "state_directory": "dataset-versions"

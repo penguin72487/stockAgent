@@ -1794,6 +1794,47 @@ def test_source_lineage_requires_explicit_applied_repair_and_preserves_decision_
     assert pins[("2026-10-06", "mode_a")]["weights_sha256"] == replay._sha256(weights)
 
 
+@pytest.mark.parametrize("invalid", [None, "same_day", "unmarked", "different_identity"])
+def test_missing_completed_session_lineage_cannot_replace_a_previous_session(tmp_path, invalid):
+    source, path, payload, events, canonical, _ = _applied_repair_lineage_fixture(tmp_path, preserve_original=False)
+    payload.update(contract="missing_completed_session_append_only_minute_repair_v1",
+                   append_missing_session=True, anchor={"session_date": "2026-10-05"})
+    payload["sessions"][0]["original"] = {
+        "signal_id": canonical, "summary_path": payload["sessions"][0]["summary_path"],
+        "weights_path": str(Path(payload["sessions"][0]["summary_path"]).with_name("target_weights.parquet"))}
+    events = [{**events[-1], "replay_basis": payload["contract"]}]
+    if invalid == "same_day":
+        payload["anchor"]["session_date"] = "2026-10-06"
+    elif invalid == "unmarked":
+        payload["append_missing_session"] = False
+    elif invalid == "different_identity":
+        payload["sessions"][0]["original"]["signal_id"] = "different"
+    path.write_text(json.dumps(payload))
+    (source / "events.jsonl").write_text("".join(json.dumps(row)+"\n" for row in events))
+    kwargs = dict(start_date=date(2026, 10, 6), end_date=date(2026, 10, 6), accepted_repair_manifests=(path,))
+    if invalid:
+        with pytest.raises(ValueError, match="incomplete applied repair identity"):
+            replay._source_ledger_signal_ids(source, **kwargs)
+    else:
+        ids, _ = replay._source_ledger_signal_ids(source, **kwargs)
+        assert ids == {("2026-10-06", "mode_a"): canonical}
+
+
+def test_scoped_official_close_quotes_do_not_inspect_unselected_accounts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import stockagent.live.tw_share_replacement as shares
+
+    monkeypatch.setattr(shares, "halted_symbols", lambda *_: set())
+    engine = SimpleNamespace(state={"modes": {
+        "target": {"session_date": "2026-10-19", "positions": {}},
+        "unrelated": {"session_date": "2026-10-19", "positions": {"foreign": {"signed_shares": 1000}}}}})
+    spec = SimpleNamespace(terminal_liquidation_unlimited_capacity=False, margin_corporate_action_reference_path=None)
+    quotes, proof = replay._close_quotes(engine, {"target": spec}, trading_date=date(2026, 10, 19),
+        quote_at=datetime(2026, 10, 19, 13, 30, tzinfo=replay.TAIPEI),
+        twse_daily_ohlcv_path=tmp_path / "twse.parquet", tpex_daily_ohlcv_path=tmp_path / "tpex.parquet")
+    assert not quotes and proof["position_symbols"] == 0
+
+
 @pytest.mark.parametrize("invalid", ["candidate", "changed_weights", "third_signal", "uncommitted", "wrong_ledger", "unmarked_repair"])
 def test_source_lineage_rejects_unapproved_or_changed_repair(tmp_path, invalid):
     source, manifest, payload, events, _canonical, weights = _applied_repair_lineage_fixture(

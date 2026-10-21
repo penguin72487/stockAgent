@@ -169,10 +169,165 @@ def test_canonical_base_refresh_reuses_original_builder_and_rejects_custom_input
     calls = []
     monkeypatch.setattr(builder.subprocess, "run", lambda *a, **kw: calls.append((a, kw)))
     builder.refresh_canonical_base(builder.CANONICAL_BASE)
-    assert len(calls) == 1 and calls[0][1]["check"] is True
-    command = calls[0][0][0]
+    assert len(calls) == 3 and all(call[1]["check"] is True for call in calls)
+    assert calls[0][0][0][1:] == [
+        str(builder.ROOT / "scripts/build_tw_public_research_features.py"),
+        "--source-update-lock-held",
+    ]
+    assert calls[1][0][0][1:] == [str(builder.ROOT / "scripts/build_tw_public_research_taifex.py")]
+    command = calls[2][0][0]
     assert command[1] == str(builder.ROOT / "scripts/build_tw_public_research_all_features.py")
     assert command[command.index("--output-path") + 1] == str(builder.CANONICAL_BASE)
     with pytest.raises(ValueError, match="custom research input"):
         builder.refresh_canonical_base(tmp_path / "custom.parquet")
-    assert len(calls) == 1
+    assert len(calls) == 3
+
+
+def test_canonical_base_dependency_failure_cannot_run_downstream_union(monkeypatch):
+    from scripts import build_finlab_research_overlay as builder
+    import subprocess
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 2:
+            raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(builder.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        builder.refresh_canonical_base(builder.CANONICAL_BASE)
+    assert len(calls) == 2
+
+
+def test_finlab_dependency_refresh_uses_exclusive_then_shared_public_lease(tmp_path, monkeypatch):
+    from scripts import build_finlab_research_overlay as builder
+    import sys
+    monkeypatch.setattr(builder, "ROOT", tmp_path)
+    public = tmp_path / "data_tw_public"
+    public.mkdir()
+    (public / "twse_daily_ohlcv.parquet").touch()
+    lock = tmp_path / ".locks/tw-public-refresh.lock"
+    calls = []
+
+    def refresh(base):
+        with lock.open("a+") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        calls.append("exclusive_refresh")
+
+    def overlay(**kwargs):
+        with lock.open("a+") as probe:
+            fcntl.flock(probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            fcntl.flock(probe, fcntl.LOCK_UN)
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        calls.append("shared_overlay")
+        return {"rows": 1, "feature_columns": [], "inputs": {"sources": []},
+                "reused": False, "output_path": "test.parquet"}
+
+    monkeypatch.setattr(builder, "refresh_canonical_base", refresh)
+    monkeypatch.setattr(builder, "build_finlab_research_overlay", overlay)
+    monkeypatch.setattr(sys, "argv", ["build_finlab_research_overlay.py", "--refresh-canonical-base"])
+    assert builder.main() == 0
+    assert calls == ["exclusive_refresh", "shared_overlay"]
+
+
+def test_finlab_busy_dependency_returns_retryable_without_overlay(tmp_path, monkeypatch, capsys):
+    from scripts import build_finlab_research_overlay as builder
+    import sys
+    monkeypatch.setattr(builder, "ROOT", tmp_path)
+    public = tmp_path / "data_tw_public"
+    public.mkdir()
+    lock = tmp_path / ".locks/tw-public-refresh.lock"
+    lock.parent.mkdir()
+    monkeypatch.setattr(builder, "refresh_canonical_base", lambda _base: pytest.fail("busy writer bypassed"))
+    monkeypatch.setattr(builder, "build_finlab_research_overlay", lambda **_kw: pytest.fail("busy input consumed"))
+    monkeypatch.setattr(sys, "argv", ["build_finlab_research_overlay.py", "--refresh-canonical-base"])
+    with lock.open("a+") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert builder.main() == 75
+    assert json.loads(capsys.readouterr().out) == {
+        "event": "finlab_research_deferred", "reason": "public_source_writer_busy", "retryable": True,
+    }
+    assert not list((tmp_path / "artifacts").rglob("*.parquet"))
+
+
+def test_finlab_unexpected_builder_error_is_not_dependency_deferral(tmp_path, monkeypatch):
+    from scripts import build_finlab_research_overlay as builder
+    import sys
+    monkeypatch.setattr(builder, "ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["build_finlab_research_overlay.py"])
+
+    def fail(**_kwargs):
+        raise RuntimeError("canonical Taiwan public source writer is active")
+
+    monkeypatch.setattr(builder, "build_finlab_research_overlay", fail)
+    with pytest.raises(RuntimeError, match="writer is active"):
+        builder.main()
+
+
+def test_finlab_stage_busy_dependency_does_not_hash_or_seal(tmp_path, monkeypatch, capsys):
+    from scripts import stage_tw_public_finlab_research_release as stage
+    public = tmp_path / "live/data_tw_public"
+    public.mkdir(parents=True)
+    (public / "twse_daily_ohlcv.parquet").touch()
+    lock = public.parent / ".locks/tw-public-refresh.lock"
+    lock.parent.mkdir()
+    monkeypatch.setattr(stage, "catalog_readiness", lambda *_a, **_kw: pytest.fail("busy staging continued"))
+    staged = public.with_name("staged")
+    with lock.open("a+") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert stage.main(["--live-root", str(public), "--staged-root", str(staged)]) == 75
+    assert not staged.exists()
+    assert json.loads(capsys.readouterr().out)["event"] == "finlab_research_stage_deferred"
+
+
+@pytest.mark.parametrize("build_exit,stage_exit,expected_exit,minute_runs", [
+    (75, 0, 0, True), (0, 75, 0, True), (1, 0, 1, False), (0, 1, 1, False),
+])
+def test_real_finlab_wrapper_keeps_independent_minutes_after_expected_deferral(
+    tmp_path, build_exit, stage_exit, expected_exit, minute_runs,
+):
+    """Exercise actual set -e/function/command-substitution behavior, no API."""
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    base = tmp_path / "artifacts/research_features/tw_public_research_all_2014_v3.parquet"
+    base.parent.mkdir(parents=True)
+    base.touch()
+    state = tmp_path / "data_finlab/runs/latest.json"
+    _write(state, {"state": "pass_complete"})
+    (scripts / "runtime_env.sh").write_text(f'''
+resolve_fintech_python() {{ printf '%s\\n' '{sys.executable}'; }}
+date() {{ if [[ "$*" == "+%H%M%S" ]]; then printf '120000\\n'; else /bin/date "$@"; fi; }}
+run_fintech_python() {{
+  case "$1" in
+    */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":1,"processing_threads":1,"tick_partitions_per_pass":1}}';;
+    */finlab_release_gate.py) return 0;;
+    */build_finlab_research_overlay.py) return {build_exit};;
+    */stage_tw_public_finlab_research_release.py) return {stage_exit};;
+    */check_finlab_refresh_due.py) return 0;;
+    */download_finlab_history.py) printf '%s\\n' '{{"minute_residual_allowed":true,"scheduled_reserve_mb":50}}';;
+    *) '{sys.executable}' "$@";;
+  esac
+}}
+stockagent-data() {{ printf 'unexpected_publication\\n' >> unexpected.log; return 1; }}
+''')
+    (scripts / "download_finlab_history.py").write_text("# Fixture sweep: pass_complete already sealed locally.\n")
+    (scripts / "download_finlab_market_intraday.py").write_text('''
+import json
+from pathlib import Path
+Path("minute-called").touch()
+state = Path("data_finlab/intraday/market_status.json")
+state.parent.mkdir(exist_ok=True)
+state.write_text(json.dumps({"state":"waiting_older_publication", "active_kind":"tw_minute",
+                           "minute_priority":{"tick_residual_allowed":False}}))
+''')
+    result = subprocess.run(["bash", str(root / "scripts/run_finlab_refresh.sh")],
+                            cwd=tmp_path, env={**os.environ, "FINLAB_REPO_ROOT": str(tmp_path)},
+                            capture_output=True, text=True, timeout=20)
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert (tmp_path / "minute-called").exists() is minute_runs
+    assert not (tmp_path / "unexpected.log").exists()

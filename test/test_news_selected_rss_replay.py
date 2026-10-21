@@ -47,7 +47,7 @@ def test_selected_original_rss_shared_envelope_is_replayed_once_without_http_or_
         monkeypatch.setattr(http, 'get', lambda *args, **kwargs: pytest.fail('audit may not fetch a publisher'))
         proof = audit(tmp_path, urls, registry=http.registry)
         assert proof['accepted']
-        assert proof['contract_version'] == 8
+        assert proof['contract_version'] == 10
         assert len(calls) == 1
         assert len(proof['articles']) == proof['batch_proof']['body_versions'] == 2
         assert all(r['current_source_replay_verified'] and r['capture_contract_matches_current_source']

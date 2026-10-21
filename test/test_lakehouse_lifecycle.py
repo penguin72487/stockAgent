@@ -18,6 +18,25 @@ from stockagent.data_sync.immutable_replication import ACK, digest, seal
 from stockagent.runtime_identity import identity_sha256
 
 
+@pytest.mark.parametrize('phase,expected', [
+    ({'state': 'processing'}, 30),  # Existing persistent histories keep this timer.
+    ({'state': 'processing', 'next_poll_seconds': 0}, 0),
+    ({'state': 'processing', 'next_poll_seconds': 60}, 60),
+    ({'state': 'verified', 'next_poll_seconds': 0}, 0),
+    ({'state': 'waiting_next_daily_cycle'}, 600),
+])
+def test_version_poll_delay_preserves_old_histories_and_removes_ready_work_waits(phase, expected):
+    from stockagent.control.storage_workflow import dataset_version_poll_seconds
+    assert dataset_version_poll_seconds(phase) == expected
+
+
+@pytest.mark.parametrize('delay', [-1, 301, True, 0.5])
+def test_version_poll_delay_rejects_unbounded_or_ambiguous_results(delay):
+    from stockagent.control.storage_workflow import dataset_version_poll_seconds
+    with pytest.raises(ValueError, match='polling delay'):
+        dataset_version_poll_seconds({'state': 'processing', 'next_poll_seconds': delay})
+
+
 def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(monkeypatch):
     from scripts import manage_lakehouse as worker
     seen, changed = set(), {}
@@ -28,6 +47,7 @@ def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(mon
     monkeypatch.setattr(worker, "digest", source_digest)
     baseline = worker.worker_code_identity()
     for relative in ("stockagent/data_sync/packed_snapshots.py",
+                     "stockagent/data_sync/syncthing_scan.py",
                      "stockagent/data_sync/packed_metadata.py",
                      "stockagent/data_sync/packing_checkpoint.py",
                      "stockagent/data_sync/packed_backup.py",

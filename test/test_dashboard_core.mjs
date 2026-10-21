@@ -89,6 +89,13 @@ test("public and missing audience show only the three permitted navigation entri
   assert.equal(core.NAV_ITEMS.length, 12);
 });
 
+test("member navigation exposes all pages without owner quote capability", () => {
+  const {core} = loadCore({audience: "member"});
+  assert.equal(core.canViewAllPages(), true);
+  assert.equal(core.isOwnerView(), false);
+  assert.equal(core.NAV_ITEMS.length, 12);
+});
+
 test("deferred rendering keeps only the latest hidden snapshot and flushes on reveal without fetching", async () => {
   let closed = true;
   let top = 20;

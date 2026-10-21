@@ -331,6 +331,7 @@ class WindowedSplitTensors:
                 MARGIN_AMOUNT_FEATURE_COLUMNS,
             )
             from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_OBSERVATION_COLUMNS
+            from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
 
             expected_rows = int(self.features.size(0))
             expected_context_prefix = (
@@ -348,6 +349,10 @@ class WindowedSplitTensors:
                 len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
                 + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
                 + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS),
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
+                + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+                + len(OPENING_REFERENCE_FEATURES),
             }
             if (
                 self.derivative_candidate_features is None

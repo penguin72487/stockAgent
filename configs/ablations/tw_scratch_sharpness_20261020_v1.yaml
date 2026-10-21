@@ -1,0 +1,59 @@
+# Whole-year, from-scratch robustness experiments. No old weights or teacher.
+# Controls and financial semantics inherit the measured SGD recipe.
+base_spec: tw_scratch_sgd_validation_20261019_v1.yaml
+output_root: artifacts/markets/tw_scratch_sharpness_20261020_v1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: sharpness
+      enabled: true
+      variants:
+        - name: unit_mgda_control
+          description: 單位梯度MGDA控制 / Unit-gradient parameter MGDA control.
+          overrides: {}
+        - name: simple_log_control
+          description: 單一對數效用控制 / Single log utility control.
+          overrides:
+            training:
+              loss_type: log_utility
+        - name: sam_log_r001
+          description: 對數效用鄰域穩健訓練 / SAM log utility, global L2 radius 0.01.
+          overrides:
+            training:
+              loss_type: log_utility
+              sharpness_mode: sam
+              sharpness_radius: 0.01
+        - name: sam_log_r005
+          description: 對數效用鄰域穩健訓練 / SAM log utility, global L2 radius 0.05.
+          overrides:
+            training:
+              loss_type: log_utility
+              sharpness_mode: sam
+              sharpness_radius: 0.05
+        - name: asam_log_r005
+          description: 自適應鄰域穩健訓練 / ASAM log utility, adaptive radius 0.05.
+          overrides:
+            training:
+              loss_type: log_utility
+              sharpness_mode: asam
+              sharpness_radius: 0.05
+        - name: xsam_log_r005_a15
+          description: 固定係數顯式鄰域穩健訓練 / Fixed-alpha XSAM log utility, radius 0.05, alpha 1.5.
+          overrides:
+            training:
+              loss_type: log_utility
+              sharpness_mode: xsam
+              sharpness_radius: 0.05
+              sharpness_alpha: 1.5
+        - name: sam_mgda_r001
+          description: MGDA鄰域穩健方向 / SAM around combined unit-MGDA direction, L2 radius 0.01.
+          overrides:
+            training:
+              sharpness_mode: sam
+              sharpness_radius: 0.01
+        - name: sam_mgda_r005
+          description: MGDA鄰域穩健方向 / SAM around combined unit-MGDA direction, L2 radius 0.05.
+          overrides:
+            training:
+              sharpness_mode: sam
+              sharpness_radius: 0.05

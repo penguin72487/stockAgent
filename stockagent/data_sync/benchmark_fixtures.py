@@ -31,6 +31,64 @@ MAX_METADATA_BYTES = 8 * 1024**2
 MAX_DONOR_ROOTS = 1024
 
 
+def _completed_comparison(fixture: dict, accepted: dict, objects: dict) -> bool:
+    """Recognize producer receipts, not an assumed equality of contract names.
+
+    The canonical OpenBB selector benchmark deliberately uses a fixture ABI and
+    a different comparison ABI. Bind that exact pair to its original sidecars;
+    do not admit arbitrary mismatched contracts or infer raw-payload validity.
+    """
+    fixture_contract = "openbb_private_full_manifest_source_selector_v1"
+    comparison_contract = "openbb_full_manifest_unassigned_source_abba_v1"
+    if (fixture.get("contract") != fixture_contract
+            and accepted.get("contract") != comparison_contract):
+        return (isinstance(accepted.get("state"), str)
+                and accepted["state"].startswith("accepted_")
+                and isinstance(fixture.get("contract"), str) and bool(fixture["contract"])
+                and accepted.get("contract") == fixture["contract"]
+                and isinstance(accepted.get("trials"), list) and bool(accepted["trials"])
+                and all(isinstance(row, dict) and row.get("state") == "completed_trial"
+                        for row in accepted["trials"]))
+
+    def sha256(value):
+        return (isinstance(value, str) and len(value) == 64
+                and all(character in "0123456789abcdef" for character in value))
+
+    if (fixture.get("contract") != fixture_contract
+            or accepted.get("contract") != comparison_contract
+            or accepted.get("state") != "accepted_bounded_phase_comparison"
+            or not all(sha256(fixture.get(name))
+                       for name in ("manifest_sha256", "selector_sha256", "module_sha256"))
+            or type(fixture.get("tasks")) is not int or fixture["tasks"] <= 0
+            or type(accepted.get("tasks")) is not int or accepted["tasks"] != fixture["tasks"]
+            or accepted.get("fixture_manifest_sha256") != fixture["manifest_sha256"]
+            or accepted.get("exact_full_ordered_source_parity") is not True
+            or any(type(row.get("provider_calls")) is not int or row["provider_calls"] != 0
+                   or row.get("production_writes") is not False for row in (fixture, accepted))):
+        return False
+    names = ("01-original.json", "02-candidate.json", "03-candidate.json", "04-original.json")
+    variants = ("original", "candidate", "candidate", "original")
+    trials = accepted.get("trials")
+    if not isinstance(trials, list) or len(trials) != len(names):
+        return False
+    parity = set()
+    for name, variant, row in zip(names, variants, trials, strict=True):
+        if (not isinstance(row, dict) or row.get("name") != name
+                or {key: value for key, value in row.items() if key != "name"} != objects.get(name)
+                or row.get("state") != "completed_trial" or row.get("variant") != variant
+                or type(row.get("limit")) is not int or row["limit"] != 32768
+                or row.get("fixture_manifest_sha256") != fixture["manifest_sha256"]
+                or row.get("shared_code_sha256") != fixture["module_sha256"]
+                or type(row.get("provider_calls")) is not int or row["provider_calls"] != 0
+                or row.get("production_writes") is not False
+                or row.get("model_runtime_imported") is not False
+                or type(row.get("selected_files")) is not int or row["selected_files"] < 0
+                or not sha256(row.get("full_ordered_source_contract_sha256"))):
+            return False
+        parity.add((row["selected_files"], row["full_ordered_source_contract_sha256"]))
+    return len(parity) == 1
+
+
 def completed_benchmark_evidence(source: Path, *, destination: Path | None = None) -> dict:
     """Bounded exact receipts for a completed case, never a numerical oracle.
 
@@ -77,12 +135,7 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         contents[path.name] = raw
         records.append({'path': path.name, 'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
     fixture, accepted = objects.get('fixture.json', {}), objects.get('abba-receipt.json', {})
-    if (not isinstance(accepted.get('state'), str) or not accepted['state'].startswith('accepted_')
-            or not isinstance(fixture.get('contract'), str) or not fixture['contract']
-            or accepted.get('contract') != fixture['contract']
-            or not isinstance(accepted.get('trials'), list) or not accepted['trials']
-            or any(not isinstance(row, dict) or row.get('state') != 'completed_trial'
-                   for row in accepted['trials'])):
+    if not _completed_comparison(fixture, accepted, objects):
         raise SnapshotError('benchmark has no supported completed producer comparison receipt')
     if destination is not None:
         if destination.resolve(strict=False) != destination.absolute():

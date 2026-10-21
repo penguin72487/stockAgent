@@ -18,7 +18,8 @@ import uuid
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json
 
 CONTRACT = 'owned_interactive_tej_desktop_startup_v1'
-ORPHAN_CONTRACT = 'exact_expired_dead_tej_worker_unknown_v1'
+ORPHAN_CONTRACT = 'exact_dead_tej_worker_unknown_v2'
+LEGACY_ORPHAN_CONTRACT = 'exact_expired_dead_tej_worker_unknown_v1'
 SESSION_KEYS = {'TejProcessId', 'ExpectedWindow', 'ExpectedTitle', 'ExpectedWorkbook', 'ExpectedExcelWindow'}
 
 
@@ -60,10 +61,16 @@ def _read(path: Path, limit: int = 16384) -> dict:
 
 
 def owner_alive(worker: dict) -> bool:
-    """PID existence alone is insufficient: compare Linux process birth ticks."""
+    """PID/birth ticks can repeat after boot; new claims bind the boot too."""
     pid = worker.get('owner_pid'); ticks = worker.get('owner_start_ticks')
     if type(pid) is not int or pid <= 0 or not isinstance(ticks, str) or not ticks.isdecimal():
         raise ValueError('Exact original worker process identity required')
+    boot=worker.get('linux_boot_id')
+    if boot is not None:
+        if not isinstance(boot,str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',boot):
+            raise ValueError('Exact original Linux boot identity required')
+        if boot!=Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+            return False
     try:
         stat = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
     except FileNotFoundError:
@@ -76,6 +83,9 @@ def retire_expired_worker(root: Path, *, now: datetime | None = None) -> bool:
 
     A dead Linux relay does not prove a Windows query was never submitted.
     Keep original artifacts/traffic and classify UNKNOWN; never reset pending.
+    A boot-pinned owner from an earlier Linux boot is already irrecoverably
+    dead: classification need not wait for its obsolete 900-second deadline.
+    This does NOT retire a surviving Windows query or authorize resubmission.
     """
     from downloader.tej_history import connect, task_request
     from downloader.tej_desktop_attempts import prepared_request_matches
@@ -83,6 +93,9 @@ def retire_expired_worker(root: Path, *, now: datetime | None = None) -> bool:
     worker = _read(root / 'worker_status.json')
     if worker.get('state') != 'running' or owner_alive(worker):
         return False
+    current_boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    previous_boot=worker.get('linux_boot_id')
+    previous_boot_dead=previous_boot is not None and previous_boot!=current_boot
     with closing(connect(root)) as con, con:
         rows = con.execute("SELECT * FROM tasks WHERE state='running'").fetchall()
         if len(rows) != 1:
@@ -97,7 +110,8 @@ def retire_expired_worker(root: Path, *, now: datetime | None = None) -> bool:
         deadline = datetime.fromisoformat(worker['deadline_at_utc'])
         if (now.tzinfo is None or started.tzinfo is None or deadline.tzinfo is None
                 or worker.get('observed_at_utc') != task['attempted_at_utc']
-                or not 0 < (deadline-started).total_seconds() <= 900 or now < deadline):
+                or not 0 < (deadline-started).total_seconds() <= 900 or now < started
+                or now < deadline and not previous_boot_dead):
             return False
         raw = root / 'raw' / (attempt + '.json')
         if raw.exists() or raw.with_suffix('.json.outcome.json').exists() or task['receipt_path']:
@@ -116,7 +130,8 @@ def retire_expired_worker(root: Path, *, now: datetime | None = None) -> bool:
                  'observed_at_utc': now.isoformat(), 'worker': worker,
                  'desktop_session': _read(root/'desktop_session.json'),
                  'prepared_request_sha256': hashlib.sha256(prepared.read_bytes()).hexdigest(),
-                 'linux_boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                 'linux_boot_id': current_boot,
+                 'retirement_basis': ('previous_linux_boot_dead_owner' if previous_boot_dead else 'expired_dead_owner'),
                  'original_outcome': 'unknown_not_proven_unsent', 'provider_queries_sent': 0,
                  'task_requeued': False, 'raw_sources_preserved': True}
         atomic_write_json(root / 'orphaned_attempts' / (attempt + '.json'), audit, durable=True)
@@ -132,8 +147,8 @@ def retire_expired_worker(root: Path, *, now: datetime | None = None) -> bool:
     return True
 
 
-def orphan_desktop_loss_proof(root: Path, task: dict, request: dict, prepared: Path) -> Path:
-    """Verify exact dead-worker UNKNOWN + retired desktop, not bare missing data."""
+def orphan_worker_loss_proof(root: Path, task: dict, request: dict, prepared: Path) -> Path:
+    """Verify a retired exact Linux worker; Windows submission stays UNKNOWN."""
     from downloader.tej_history import connect
     from downloader.tej_desktop_attempts import prepared_request_matches
     attempt = task.get('active_attempt_id')
@@ -141,7 +156,23 @@ def orphan_desktop_loss_proof(root: Path, task: dict, request: dict, prepared: P
         raise ValueError('Exact abandoned prepared request required')
     audit_path = root/'orphaned_attempts'/(attempt+'.json')
     audit = _read(audit_path); original = _read(prepared, 2*1024**2)
-    if (audit.get('contract') != ORPHAN_CONTRACT or audit.get('attempt_id') != attempt
+    if audit.get('contract')==ORPHAN_CONTRACT:
+        owner=audit.get('worker',{});basis=audit.get('retirement_basis')
+        started=datetime.fromisoformat(owner['observed_at_utc'])
+        deadline=datetime.fromisoformat(owner['deadline_at_utc'])
+        retired=datetime.fromisoformat(audit['observed_at_utc'])
+        uuid_pattern=r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
+        if (any(clock.tzinfo is None for clock in (started,deadline,retired))
+                or not 0<(deadline-started).total_seconds()<=900 or retired<started
+                or owner.get('task_id')!=task['task_id'] or owner.get('bridge_attempt_id')!=attempt
+                or basis not in ('expired_dead_owner','previous_linux_boot_dead_owner')
+                or basis=='expired_dead_owner' and retired<deadline
+                or basis=='previous_linux_boot_dead_owner' and (
+                    not re.fullmatch(uuid_pattern,str(owner.get('linux_boot_id','')))
+                    or not re.fullmatch(uuid_pattern,str(audit.get('linux_boot_id','')))
+                    or owner['linux_boot_id']==audit['linux_boot_id'])):
+            raise ValueError('Exact dead-owner retirement basis required')
+    if (audit.get('contract') not in (ORPHAN_CONTRACT,LEGACY_ORPHAN_CONTRACT) or audit.get('attempt_id') != attempt
             or audit.get('task_id') != task['task_id'] or audit.get('task_requeued') is not False
             or audit.get('original_outcome') != 'unknown_not_proven_unsent'
             or audit.get('prepared_request_sha256') != hashlib.sha256(prepared.read_bytes()).hexdigest()
@@ -152,6 +183,33 @@ def orphan_desktop_loss_proof(root: Path, task: dict, request: dict, prepared: P
         row = con.execute('SELECT * FROM desktop_attempts WHERE attempt_id=?', (attempt,)).fetchone()
     if row is None or row['state'] != 'unknown_outcome' or row['task_id'] != task['task_id']:
         raise ValueError('Registered abandoned UNKNOWN required')
+    return audit_path
+
+
+def surviving_desktop_worker_loss_proof(root: Path, task: dict, request: dict, prepared: Path) -> Path:
+    """WSL can restart while the ORIGINAL Windows desktop survives.
+
+    This is not unsent proof and does not authorize a query by itself. The
+    canonical replay still needs the standing grant, its rolling budget and a
+    fresh native idle/no-retained-values inspection. A saved stage/result must
+    take the existing reconciliation path instead.
+    """
+    path = orphan_worker_loss_proof(root, task, request, prepared)
+    audit = _read(path)
+    raw = root/'raw'/(task['active_attempt_id']+'.json')
+    original = audit.get('desktop_session')
+    if (not valid_session(original) or _read(root/'desktop_session.json') != original
+            or not desktop_ready(root)
+            or any(p.exists() or p.is_symlink() for p in
+                   (raw, raw.with_suffix('.json.stage.json'), raw.with_suffix('.json.outcome.json')))):
+        raise ValueError('Original surviving desktop and unstaged unknown worker required')
+    return path
+
+
+def orphan_desktop_loss_proof(root: Path, task: dict, request: dict, prepared: Path) -> Path:
+    """Verify exact dead-worker UNKNOWN + retired desktop, not bare missing data."""
+    audit_path = orphan_worker_loss_proof(root, task, request, prepared)
+    audit = _read(audit_path)
     status = _read(root/'desktop_startup_status.json')
     evidence = root/status.get('private_evidence_path', '')
     if (status.get('contract') != CONTRACT or status.get('state') != 'desktop_ready'

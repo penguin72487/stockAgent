@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import io
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
@@ -268,6 +270,76 @@ def test_budget_and_unknown_scope_never_silently_expand(tmp_path):
     assert calls == ["census"]
 
 
+def test_shared_budget_is_atomic_and_attributes_retries_to_provider():
+    budget = mod.RequestBudget(17)
+
+    def claim(index):
+        try:
+            budget.claim(f"provider-{index % 3}")
+            return 1
+        except mod.CatalogError as exc:
+            assert str(exc) == "request_budget_exhausted"
+            return 0
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        assert sum(pool.map(claim, range(200))) == 17
+    assert budget.used == sum(budget.used_for(f"provider-{i}") for i in range(3)) == 17
+
+
+def test_parallel_catalogs_preserve_order_and_provider_call_counts(tmp_path):
+    barrier = threading.Barrier(2)
+    base_factory = factory_for([])
+
+    class ConcurrentTransport(base_factory):
+        def fetch(self, url, headers):
+            barrier.wait(timeout=5)
+            self.budget.claim(self.spec.provider)
+            if self.spec.provider == "bea":
+                self.budget.claim(self.spec.provider)  # simulated explicit retry
+            return payload(self.spec.provider)
+
+    specs = [mod.SPEC_BY_PROVIDER[name] for name in ("census", "bea")]
+    result = mod.execute(tmp_path, specs, CREDS, max_requests=3, workers=2,
+                         maximum_bytes=4096, minimum_free_bytes=0,
+                         transport_factory=ConcurrentTransport)
+    assert result["effective_workers"] == 2
+    assert result["requests"] == 3
+    assert [r["provider"] for r in result["providers"]] == ["census", "bea"]
+    assert [r["requests_this_run"] for r in result["providers"]] == [1, 2]
+    for row in result["providers"]:
+        receipt = json.loads((tmp_path / "receipts" / f'{row["provider"]}.json').read_text())
+        assert receipt["requests_this_run"] == row["requests_this_run"]
+
+
+def test_real_transport_budget_uses_catalog_provider_not_limiter_profile():
+    spec = mod.SPEC_BY_PROVIDER["census"]
+    budget = mod.RequestBudget(1)
+    client = mod.SafeCatalogTransport(spec, budget, maximum_bytes=4096, secrets=(),
+        opener=lambda *args, **kwargs: Response(payload("census")), limiter=Limiter())
+    assert client.fetch(*mod.request_for(spec, "")) == payload("census")
+    assert budget.used_for("census") == budget.used == 1
+    assert budget.used_for("census_public") == 0
+
+
+@pytest.mark.parametrize("maximum_bytes, expected", [(16 * 1024**2, 2), (64 * 1024**2, 1)])
+def test_catalog_parallelism_is_bounded_by_response_memory(tmp_path, maximum_bytes, expected):
+    result = mod.execute(tmp_path, list(mod.SPECS), {}, max_requests=0,
+                         maximum_bytes=maximum_bytes, minimum_free_bytes=0, workers=8)
+    assert result["effective_workers"] == 1  # zero HTTP budget requires no parallel network work
+    result = mod.execute(tmp_path, list(mod.SPECS[1:3]), {}, max_requests=4,
+                         maximum_bytes=maximum_bytes, minimum_free_bytes=0, workers=8,
+                         transport_factory=factory_for([]))
+    assert result["effective_workers"] == expected
+
+
+def test_catalog_rejects_duplicate_receipt_owners_before_writes(tmp_path):
+    spec = mod.SPEC_BY_PROVIDER["census"]
+    root = tmp_path / "uncreated"
+    with pytest.raises(ValueError, match="one catalog/snapshot per provider"):
+        mod.execute(root, [spec, spec], {})
+    assert not root.exists()
+
+
 def test_planned_non_work_is_not_a_failed_download_or_historical_complete_claim(tmp_path):
     specs = [mod.SPEC_BY_PROVIDER[name] for name in ["census", "airnow", "api_data_gov"]]
     result = mod.execute(tmp_path, specs, CREDS, minimum_free_bytes=0, maximum_bytes=4096,
@@ -412,7 +484,11 @@ def test_bea_application_throttle_preserves_retry_and_continues_other_provider(t
     assert [row["status"] for row in result["providers"]] == ["provider_throttled", "acquired"]
     assert "retry_at_utc" in result["providers"][0]
     assert SECRET not in json.dumps(result)
-    assert calls == ["bea", "census"]
+    # Independent providers may dispatch in either order; result/source order
+    # above stays stable, and each provider still makes exactly one request.
+    assert sorted(calls) == ["bea", "census"]
+    assert result["requests"] == 2
+    assert [row["requests_this_run"] for row in result["providers"]] == [1, 1]
 
 
 @pytest.mark.parametrize("code,reason", [("1", "credential_rejected"), ("4", "credential_activation_required")])
@@ -500,3 +576,16 @@ def test_cache_rejects_future_stale_unsafe_or_hash_mismatch(tmp_path, mutate):
     mutate(receipt)
     receipt_path.write_text(json.dumps(receipt))
     assert mod._cached(tmp_path, spec, now=datetime.now(UTC), maximum_bytes=4096) is None
+
+
+def test_catalog_workflow_benchmark_preserves_source_bytes_and_avoids_cache_calls(tmp_path):
+    from scripts.benchmark_downloader_http import run_catalog_benchmark
+
+    result = run_catalog_benchmark(tmp_path, delay_seconds=0)
+    assert result["byte_and_value_parity"] is True
+    assert result["internet_speed_claim"] is False
+    assert result["all_provider_acceptance"] is False
+    assert [trial["mode"] for trial in result["trials"]] == ["serial", "parallel", "parallel", "serial"]
+    assert all(trial["requests"] == trial["providers"] == 7 for trial in result["trials"])
+    assert all(trial["cache_requests"] == 0 for trial in result["trials"])
+    assert (tmp_path / "result.json").exists()

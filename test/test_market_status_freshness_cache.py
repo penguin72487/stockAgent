@@ -210,3 +210,87 @@ def test_empty_inventory_is_invalidated_when_first_feature_appears(tmp_path):
     first = tmp_path / "2330_features.parquet"
     first.write_text("feature")
     assert status._feature_files(tmp_path) == (first,)
+
+
+@pytest.fixture
+def partitioned_feature(tmp_path, monkeypatch):
+    from datetime import date
+    from stockagent.data import partitioned_parquet as parts
+    from stockagent.data_sync import cache_capacity
+    controls = tmp_path / "controls"
+    controls.mkdir()
+    monkeypatch.setattr(cache_capacity, "CONTROL_ROOT", controls)
+    monkeypatch.setattr(cache_capacity, "_admit_backing_volume", lambda *_: {})
+    path = tmp_path / "stocks/2330_features.parquet"
+    table = pl.DataFrame({"date": [date(2024, 1, 2), date(2025, 1, 2)], "value": [-0.0, None]}).to_arrow()
+    parts.write_partitioned_table(table, path, source_identity={"fixture": "original"})
+    return path, table
+
+
+def test_manifest_is_one_logical_feature_and_reads_complete_dates(partitioned_feature):
+    from stockagent.data import partitioned_parquet as parts
+    path, _ = partitioned_feature
+    pointer = parts.manifest_path(path)
+    assert status._feature_files(path.parent) == (pointer,)
+    assert status._feature_path(path.parent, "2330") == pointer
+    assert status._max_date_from_parquet(path) == "2025-01-02"
+    assert status._max_date_from_parquet(pointer) == "2025-01-02"
+    assert status._max_date_from_parquet(pointer, date_only=False) == "2025-01-02"
+
+
+@pytest.mark.parametrize("failure", ["missing_old_member", "corrupt_old_same_size_mtime", "mixed_abi"])
+def test_manifest_freshness_hit_cannot_hide_invalid_old_history(partitioned_feature, failure):
+    import pyarrow.parquet as pq
+    from stockagent.data import partitioned_parquet as parts
+    path, table = partitioned_feature
+    assert status._max_date_from_parquet(path) == "2025-01-02"
+    with parts.ParquetSource(path) as snapshot:
+        member = snapshot.members[0]
+    if failure == "missing_old_member":
+        member.rename(member.with_suffix(".offline"))
+    elif failure == "mixed_abi":
+        pq.write_table(table, path)
+        with pytest.raises(OSError):
+            status._feature_files(path.parent)
+    else:
+        before = member.stat()
+        raw = bytearray(member.read_bytes())
+        raw[len(raw)//2] ^= 1
+        member.chmod(0o600)
+        member.write_bytes(raw)
+        member.chmod(0o444)
+        os.utime(member, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert status._max_date_from_parquet(path) is None
+
+
+def test_new_manifest_generation_during_read_is_retried_not_cached(partitioned_feature, monkeypatch):
+    from datetime import date
+    from stockagent.data import partitioned_parquet as parts
+    path, table = partitioned_feature
+    reader = status._max_date_from_parquet_cached
+    changed = False
+    def read(*args, **kwargs):
+        nonlocal changed
+        result = reader(*args, **kwargs)
+        if not changed:
+            changed = True
+            revised = pl.DataFrame({"date": [date(2024, 1, 2), date(2026, 1, 2)],
+                                    "value": [-0.0, None]}).to_arrow()
+            parts.write_partitioned_table(revised, path, source_identity={"fixture": "revised"})
+        return result
+    monkeypatch.setattr(status, "_max_date_from_parquet_cached", read)
+    assert status._max_date_from_parquet(path) == "2026-01-02"
+
+
+def test_partitioned_benchmark_cannot_report_fresh_when_old_member_missing(partitioned_feature, monkeypatch):
+    from stockagent.data import partitioned_parquet as parts
+    path, _ = partitioned_feature
+    monkeypatch.setattr(status, "_validated_data_locator", lambda *_: (path.parent, "2330"))
+    monkeypatch.setattr(status, "expected_latest_data_date", lambda *_a, **_kw: "2025-01-02")
+    cfg = status.LiveMarketConfig(market="tw", label="test", config_path="fixture.yaml", market_type="tw")
+    fresh = status.data_freshness(cfg)
+    assert fresh.fresh and fresh.total_files == 1 and fresh.benchmark_date == "2025-01-02"
+    with parts.ParquetSource(path) as snapshot:
+        member = snapshot.members[0]
+    member.rename(member.with_suffix(".offline"))
+    assert status.data_freshness(cfg).fresh is False

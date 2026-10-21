@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Read-only browser acceptance for public/owner dashboard readers.
+"""Read-only browser acceptance for public/member/owner dashboard readers.
 
-Use the two canonical loopback readers or an already authenticated proxy path.
+Use canonical loopback readers or an already authenticated proxy path.
 No private identity is injected through headers/cookies by this verifier.
 """
 from __future__ import annotations
@@ -18,14 +18,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--public-url', default='http://127.0.0.1:8770')
     parser.add_argument('--owner-url', default='http://127.0.0.1:8771')
+    parser.add_argument('--member-url', default='http://127.0.0.1:8772')
     parser.add_argument('--output-dir', type=Path, required=True)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    result = {'pass': False, 'cases': [], 'scope': 'real Chromium, two server-owned audiences; no real iPhone or remote VPN client'}
+    result = {'pass': False, 'cases': [], 'scope': 'real Chromium, three server-owned audiences; no real iPhone or remote VPN client'}
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            for audience, base in [('public', args.public_url.rstrip('/')), ('owner', args.owner_url.rstrip('/'))]:
+            for audience, base in [('public', args.public_url.rstrip('/')), ('member', args.member_url.rstrip('/')),
+                                   ('owner', args.owner_url.rstrip('/'))]:
                 for width in [1280, 390]:
                     context = browser.new_context(viewport={'width': width, 'height': 900}, device_scale_factor=1)
                     page = context.new_page()
@@ -48,6 +50,7 @@ def main() -> int:
                         assert len(links) == 12 and len(cards) == 11
                     access_response = context.request.get(base + '/api/access')
                     assert access_response.status == 200 and access_response.json()['audience'] == audience
+                    assert access_response.json()['private_prices'] is (audience == 'owner')
                     overview_response = context.request.get(base + '/api/overview', timeout=45000)
                     assert overview_response.status == 200
                     overview = overview_response.json()

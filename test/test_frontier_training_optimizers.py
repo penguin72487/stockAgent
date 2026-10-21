@@ -44,7 +44,7 @@ def test_partition_selects_hidden_module_roles_and_covers_each_parameter_once():
     assert id(model.latent_queries) in {id(p) for p in aux}
 
 
-@pytest.mark.parametrize('name', ['muon', 'soap', 'ademamix', 'normuon', 'dion3'])
+@pytest.mark.parametrize('name', ['sgd', 'muon', 'soap', 'ademamix', 'normuon', 'dion3'])
 def test_optimizer_resume_and_scheduler_continue_the_same_trajectory(name, tmp_path):
     if name in {'normuon', 'dion3'}:
         pytest.importorskip('dion')
@@ -103,9 +103,31 @@ def test_legacy_adamw_fingerprint_and_new_optimizer_identities():
     assert optimizer_checkpoint_fields(settings('muon', {'matrix_lr_scale': 2.})) != optimizer_checkpoint_fields(settings('muon'))
     mix = optimizer_checkpoint_fields(settings('muon', {'aux_optimizer': 'ademamix'}))
     assert 'apple-aiml-research/ml-ademamix' in mix['implementation_revisions']
+    sgd = optimizer_checkpoint_fields(settings('sgd'))
+    assert sgd['parameter_partition'] == 'all_trainable'
+    assert sgd != optimizer_checkpoint_fields(settings('adamw'))
+    assert sgd != optimizer_checkpoint_fields(settings('sgd', {'momentum': .9}))
 
 
-@pytest.mark.parametrize('name,options', [('fake', {}), ('muon', {'ns_steps': 0}), ('soap', {'precondition_frequency': False}), ('muon', {'matrix_lr_scale': float('nan')}), ('adamw', {'ignored_key': 3}), ('dion3', {'fraction': 0.}), ('normuon', {'aux_optimizer': 'ademamix'})])
+@pytest.mark.parametrize('device_name', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='requires CUDA'))])
+def test_sgd_covers_models_without_hidden_partition_and_matches_native_updates(device_name):
+    device = torch.device(device_name)
+    model = nn.Linear(3, 2).to(device)
+    oracle = deepcopy(model)
+    config = settings('sgd', {'momentum': .9})
+    actual = create_frontier_optimizer(model, config, device)
+    expected = torch.optim.SGD(oracle.parameters(), lr=config.learning_rate,
+                              weight_decay=config.weight_decay, momentum=.9, foreach=True)
+    x = torch.tensor([[.2, .3, -.1]], device=device)
+    for _ in range(3):
+        update(model, actual, x)
+        update(oracle, expected, x)
+    for p, q in zip(model.parameters(), oracle.parameters()):
+        torch.testing.assert_close(p, q, rtol=1e-6, atol=1e-8)
+
+
+@pytest.mark.parametrize('name,options', [('fake', {}), ('muon', {'ns_steps': 0}), ('soap', {'precondition_frequency': False}), ('muon', {'matrix_lr_scale': float('nan')}), ('adamw', {'ignored_key': 3}), ('dion3', {'fraction': 0.}), ('normuon', {'aux_optimizer': 'ademamix'}), ('sgd', {'nesterov': True}), ('sgd', {'dampening': -1.})])
 def test_invalid_optimizer_configuration_fails_closed(name, options):
     with pytest.raises(ValueError):
         normalized_optimizer_options(name, options)

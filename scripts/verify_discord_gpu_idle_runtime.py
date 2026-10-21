@@ -243,4 +243,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from stockagent.live.service_code_release import run_cli_against_active_source
+    pinned = run_cli_against_active_source(ROOT, Path(__file__), sys.argv[1:])
+    if pinned is None:
+        main()
+    else:
+        raise SystemExit(pinned)

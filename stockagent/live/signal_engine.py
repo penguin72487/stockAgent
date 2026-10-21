@@ -156,7 +156,6 @@ LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
 _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
 _LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
-_LIVE_PANEL_SOURCE_KEY_CACHE: dict[str, str] = {}
 _LIVE_PANEL_CACHE_LOCK = threading.Lock()
 _LIVE_PANEL_CACHE_EPOCH = 0
 
@@ -272,7 +271,6 @@ def clear_live_panel_memory_cache() -> None:
     with _LIVE_PANEL_CACHE_LOCK:
         _LIVE_PANEL_CACHE_EPOCH += 1
         _LIVE_PANEL_CACHE.clear()
-        _LIVE_PANEL_SOURCE_KEY_CACHE.clear()
         _LIVE_FACTORIZED_PANEL_CACHE.clear()
         _LIVE_ALIGNED_PANEL_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
@@ -300,7 +298,7 @@ def clear_live_inference_memory_cache() -> None:
 def _live_inference_cpu_cache_retained() -> bool:
     """Inspect existing references only; never allocate a cache or probe CUDA."""
     with _LIVE_PANEL_CACHE_LOCK:
-        if (_LIVE_PANEL_CACHE or _LIVE_PANEL_SOURCE_KEY_CACHE
+        if (_LIVE_PANEL_CACHE
                 or _LIVE_FACTORIZED_PANEL_CACHE or _LIVE_ALIGNED_PANEL_CACHE):
             return True
     with _LIVE_CHECKPOINT_CACHE_LOCK:
@@ -485,8 +483,12 @@ def _live_panel_cache_key(
     live_tail_rows: int,
     panel_kwargs: dict[str, Any],
 ) -> str:
+    from stockagent.data import partitioned_parquet
+    from stockagent.live.completed_inference_cache import _parquet_source_generations
+
     digest = hashlib.sha256()
-    digest.update(str(Path(config.data.parquet_root).resolve()).encode("utf-8"))
+    root = Path(config.data.parquet_root).resolve()
+    digest.update(str(root).encode("utf-8"))
     digest.update(str(int(live_tail_rows)).encode("ascii"))
     # Worker count changes only throughput. The configured start boundary is
     # applied canonically after loading the shared unsliced live tail, so two
@@ -497,18 +499,18 @@ def _live_panel_cache_key(
         if key not in {"panel_load_workers", "panel_start_date", "panel_cache_root"}
     }
     digest.update(repr(sorted(semantic_panel_kwargs.items())).encode("utf-8"))
-    root = Path(config.data.parquet_root)
-    # Refresh workflows explicitly call clear_live_panel_memory_cache(). Keep
-    # three cheap sentinels as defense in depth, but do not resolve/stat all
-    # ~2,700 symbol parquets merely to prove that a RAM cache entry exists.
-    sentinel_paths = [root, root / "symbols.csv", root / "_hot_tail"]
+    # Directory mtimes cannot detect an in-place repair, nor a replacement
+    # inside an immutable partition namespace. Enumerate consumed members;
+    # do not invalidate a correct panel for unrelated status-file churn.
+    sentinel_paths = [root / "symbols.csv"]
     external_path = panel_kwargs.get("external_feature_path")
     if external_path:
         resolved_external = Path(str(external_path))
+        logical = resolved_external.with_name(partitioned_parquet.logical_name(resolved_external))
         sentinel_paths.extend(
             [
                 resolved_external,
-                resolved_external.with_suffix(".summary.json"),
+                logical.with_suffix(".summary.json"),
             ]
         )
         for directory in (resolved_external.parent, resolved_external.parent.parent):
@@ -520,36 +522,14 @@ def _live_panel_cache_key(
                     directory / "tw_corporate_action_entitlements.summary.json",
                 ]
             )
-    for path in sentinel_paths:
-        if not path.exists():
+    for path, generation in _parquet_source_generations(
+            sentinel_paths, feature_roots=(root, root / "_hot_tail")):
+        digest.update(str(path).encode("utf-8"))
+        if generation is None:
+            digest.update(b":missing")
             continue
-        stat = path.stat()
-        digest.update(str(path.resolve()).encode("utf-8"))
-        digest.update(
-            f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
-        )
-    source_identity = digest.hexdigest()
-    with _LIVE_PANEL_CACHE_LOCK:
-        cached_key = _LIVE_PANEL_SOURCE_KEY_CACHE.get(source_identity)
-        if cached_key is not None:
-            return cached_key
-
-    source_digest = hashlib.sha256(source_identity.encode("ascii"))
-    source_paths = list(root.glob("*_features.parquet"))
-    hot_tail_root = root / "_hot_tail"
-    if hot_tail_root.is_dir():
-        source_paths.extend(hot_tail_root.glob("*_features.parquet"))
-    source_paths.extend(path for path in sentinel_paths[1:] if path.is_file())
-    for path in sorted(set(source_paths)):
-        stat = path.stat()
-        source_digest.update(str(path.resolve()).encode("utf-8"))
-        source_digest.update(
-            f":{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}".encode("ascii")
-        )
-    resolved = source_digest.hexdigest()
-    with _LIVE_PANEL_CACHE_LOCK:
-        _LIVE_PANEL_SOURCE_KEY_CACHE[source_identity] = resolved
-    return resolved
+        digest.update(repr(generation).encode("ascii"))
+    return digest.hexdigest()
 
 
 def _live_panel_disk_backend_key(
@@ -848,6 +828,7 @@ def _build_panel(
     config: ExperimentConfig,
     *,
     live_tail: bool = False,
+    panel_end_date: str | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> tuple[PanelData, bool, str]:
     # Training-only factorized inputs must not become a six-column live panel,
@@ -860,6 +841,13 @@ def _build_panel(
         panel, hit, tier = _build_panel_from_stable_source(
             config, live_tail=live_tail, progress_callback=progress_callback
         )
+        if panel_end_date is not None:
+            # Historical opening inference needs only t-1. A newer daily base
+            # publication must not require a not-yet-built t feature projection.
+            # Slice before factorized attachment; never relax its coverage gate.
+            from stockagent.data.panel import slice_panel_end
+
+            panel = slice_panel_end(panel, panel_end_date)
         if config.data.factorized_feature_manifest:
             panel = _cached_factorized_live_panel(panel, config, progress_callback)
         return panel, hit, tier
@@ -883,8 +871,11 @@ def _cached_factorized_live_panel(panel, config, progress_callback=None):
             panel, path, host_cache_bytes=config.data.factorized_host_cache_bytes,
             progress_callback=progress,
         )
-        if _factorized_member_signatures(path) != signatures:
-            raise RuntimeError("factorized members changed during live attachment")
+        after = _factorized_member_signatures(path)
+        if after != signatures:
+            changed = [(before[0], before[1:], current[1:])
+                       for before, current in zip(signatures, after) if before != current]
+            raise RuntimeError(f"factorized members changed during live attachment: {changed[:3]}")
         progress("factorized_attachment", 1, 1)
         return (panel, attached), False, "attached"
 

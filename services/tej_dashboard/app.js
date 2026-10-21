@@ -12,6 +12,9 @@ const stageLabels={awaiting_progress:"工作執行中 · 等待步驟回報",pre
 errors.source_validation_failed_deferred="來源結果驗證未過 · 此表隔離，其他表可續抓；原始檔保留";
 labels.waiting_local_retry="此表等待重試 · 其他表可續抓";
 order.waiting_local_retry=2;
+labels.backfilling_with_deferred_companies="其餘公司續抓 · 部分公司待補";
+order.backfilling_with_deferred_companies=1;
+errors.source_company_labels_absent_fragment="部分公司標籤不在目前選單 · 保留範圍重試，其餘公司續抓";
 errors.prequery_failure_deferred="已證明未送查詢 · 此表排定重試";
 errors.metadata_preparation_requires_recovery="目錄準備失敗 · 正在自動核對介面，未送資料查詢";
 errors.metadata_retry_scheduled="目錄故障已核對 · 此表排定重試，其他表繼續下載";
@@ -54,13 +57,16 @@ function renderActivity(data){
   const blockers=a.blocked_tasks||[],body=$("blocker-list");body.replaceChildren();
   const deferred=a.deferred_tasks||[],deferredCount=a.deferred_tasks_total||0;
   $("activity-blockers").hidden=!(a.blocked_tasks_total>0||deferredCount>0||scheduler.paused_reason);
-  text("blocker-summary",`${count(a.blocked_tasks_total)} 個工作需檢查 · ${count(deferredCount)} 個逐表重試${scheduler.paused_reason?" · 排程已安全暫停":""}`);
+  const retryLabel=deferred.some(t=>t.retry_scope==="company_fragment")?"個待重試工作（含局部公司）":"個逐表重試";
+  text("blocker-summary",`${count(a.blocked_tasks_total)} 個工作需檢查 · ${count(deferredCount)} ${retryLabel}${scheduler.paused_reason?" · 排程已安全暫停":""}`);
   for(const task of blockers){const li=el("li",task.table_name);li.append(el("small",`${errors[task.last_error_code]||"需要核對的來源／本機狀態"}${task.last_error_code===scheduler.paused_reason?" · 目前阻擋新查詢":""} · 最後嘗試 ${time(task.attempted_at_utc)}`));body.append(li);}
   if(a.blocked_tasks_total>blockers.length)body.append(el("li",`另有 ${count(a.blocked_tasks_total-blockers.length)} 個工作；請至逐表清單查看。`));
   for(const task of deferred){const li=el("li",task.table_name),seconds=num(task.retry_after_seconds);
     const waiting=seconds===0?"已到期，等待桌面與先行工作":`${count(seconds===null?null:Math.ceil(seconds))} 秒後`;
-    li.append(el("small",`${errors[task.error_code]||"查詢前本機失敗"} · 第 ${count(task.consecutive_failures)} 次退避 · 下次嘗試最早 ${time(task.next_attempt_at_utc)}（${waiting}）；不是已下載完成，其他表可續抓。`));body.append(li);}
-  if(deferredCount>deferred.length)body.append(el("li",`另有 ${count(deferredCount-deferred.length)} 個逐表重試；請至逐表清單查看。`));
+    const scope=task.retry_scope==="company_fragment"?` · ${count(task.deferred_tasks)} 個局部公司工作；同表其餘範圍續抓`:"";
+    li.append(el("small",`${errors[task.error_code]||"查詢前本機失敗"}${scope} · 第 ${count(task.consecutive_failures)} 次退避 · 下次嘗試最早 ${time(task.next_attempt_at_utc)}（${waiting}）；不是已下載完成，其他表可續抓。`));body.append(li);}
+  const shownDeferred=deferred.reduce((total,t)=>total+(num(t.deferred_tasks)??1),0);
+  if(deferredCount>shownDeferred)body.append(el("li",`另有 ${count(deferredCount-shownDeferred)} 個待重試工作；請至逐表清單查看。`));
   if(!available){text("active-task","等待可驗證的本機工作狀態；不將未知當作停止或完成");text("active-stage","未知");}
 }
 function volumeProgress(id,labelId,actual,remaining,format,label){

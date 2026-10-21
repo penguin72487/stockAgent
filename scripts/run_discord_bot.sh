@@ -26,4 +26,9 @@ fi
 # connectivity cannot become an execution-start dependency.
 
 source scripts/runtime_env.sh
+if [[ -n "${STOCKAGENT_SERVICE_CODE_RELEASE:-}" ]]; then
+  # A reboot must verify the pinned bytes and actual read-only mount view,
+  # not silently admit corrupted/escaped source as a fresh implementation.
+  run_fintech_python -c 'from pathlib import Path; from stockagent.live.service_code_release import verify_startup_namespace; proof = verify_startup_namespace(Path.cwd()); print("[discord-code-release] verified", proof["source_sha256"], proof["native_file_count"], flush=True)'
+fi
 run_fintech_python services/discord_bot/bot.py

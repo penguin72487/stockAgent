@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -34,7 +35,8 @@ from stockagent.data_sync.packed_metadata import MetadataRows
 
 CONTRACT = "all_catalog_incremental_migration_v1"
 PRIVATE_RELATIVE = ".local-state/private-history"
-CONTROL_SCOPE = "recursive_mutable_controls_v7"
+CONTROL_SCOPE = "recursive_mutable_controls_v13"
+FROZEN_CONTROLS_INLINE_LIMIT = 4096
 
 
 def _identity(document):
@@ -371,17 +373,26 @@ def _mutable_published_locations(source: Path) -> dict[str, tuple[str, ...] | No
         # root complement. Both refer to the same original atomic publisher.
         return {'normalized': None}
     if source.name == 'data_openBB':
-        return {'.': ('openbb_l1.duckdb',), 'catalog': ('l1_compaction_status.parquet',)}
+        # Reviewed catalog/monitor writers publish closed outputs. Arbitrary
+        # raw/provider Parquet files do not inherit their mutable semantics.
+        return {'.': ('openbb_l1.duckdb',), 'catalog': (
+            'l1_compaction_status.parquet', 'l1_compaction_audit.parquet',
+            'provider_eta.parquet', 'category_eta.parquet', 'provider_endpoint_eta.parquet',
+            'coverage.parquet', 'equity_universe.parquet', 'currency_universe.parquet',
+            'configured_credentials.parquet', 'provider_rate_limits.parquet',
+            'completeness_contract_audit.parquet', 'compaction_summary.parquet',
+            'compaction_audit.parquet')}
     if source.name == 'data_tw_public':
         # build_tw_public_training_features closes its temporary table and
         # checks source identities before os.replace. This is not permission
         # to copy arbitrary feature/raw Parquet files that change in place.
-        return {'features': ('tw_public_stock_daily.parquet',)}
+        return {'features': ('tw_public_stock_daily.parquet',
+                             'tw_public_research_wide_2014_v1.parquet')}
     return {}
 
 
 def _mutable_control_file_locations(source: Path) -> dict[str, tuple[str, ...]]:
-    """Exact non-JSON operational names owned by the existing collectors.
+    """Exact operational filenames owned by the existing collectors.
 
     Lock *contents* can hold a changing storage epoch; capturing those bytes
     never replaces/unlinks the live lock inode or claims a source read lease.
@@ -399,7 +410,59 @@ def _mutable_control_file_locations(source: Path) -> dict[str, tuple[str, ...]]:
             for contract in sorted(history.iterdir()):
                 if not contract.is_symlink() and contract.is_dir():
                     locations['shioaji_history/' + contract.name] = ('download.lock',)
+    if source.name == 'data_tw_public':
+        # Both original builders atomically publish these exact companions.
+        # They are separate fixed observations, not a globally atomic pair.
+        locations['features'] = ('tw_public_stock_daily.summary.json',
+                                 'tw_public_research_wide_2014_v1.research.json')
+        metadata = source / 'metadata'
+        if metadata.is_dir() and not metadata.is_symlink():
+            locations['metadata'] = tuple(member.name for member in metadata.iterdir()
+                                          if member.name.endswith('_versions.jsonl'))
+        journals = source / 'state/journals'
+        if journals.is_dir() and not journals.is_symlink():
+            # download_tw_public_data and download_tw_taiex_ohlc append these
+            # exact per-dataset query receipts. Capture a complete stable file,
+            # not a moving path or a truncated-to-last-newline prefix.
+            locations['state/journals'] = tuple(member.name for member in journals.iterdir()
+                                                if member.name.endswith('.jsonl'))
+    if source.name == 'data_finlab':
+        # download_finlab_history publishes this control before each API key.
+        # Dated/raw response records must not inherit its mutable semantics.
+        locations['runs'] = ('latest.json',)
+        locations['catalog'] = ('discovery.json',)
+    if source.name == 'data_finmind':
+        # finmind_json_pipeline.run_cycle atomically replaces this bounded
+        # summary after a batch. It is not one of the raw response records.
+        locations.update({root: ('json_pipeline_last.json',)
+                          for root in ('.', 'complement', 'sponsor')})
+    if source.name == 'data_openBB':
+        # The priority queue and L1 compactor own these atomic control heads.
+        # Probe exact names on retry instead of rescanning millions of shards.
+        locations['_state'] = ('public_priority_cursors.json',
+                               'public_priority_queue_event.json', 'public_priority_plan.json',
+                               'l1_compaction_attempt_latest.json', 'l1_compaction_latest.json',
+                               'last_run_summary.json', 'downloader_phase.json',
+                               'catalog_followup_repair_latest.json', 'provider_scheduler.json',
+                               'provider_cooldowns.json', 'monitor_latest.json', 'audit_latest.json',
+                               'archive_end_date.txt', 'supervisor.pid', 'supervisor.lock',
+                               'openbb_l1_compaction.lock', 'public_priority.lock')
+        locations['catalog'] = ('completeness_contract_summary.json',)
     return locations
+
+
+def _mutable_streamed_control_locations(source: Path) -> dict[str, tuple[str, ...]]:
+    """Reviewed producer logs may exceed the small JSON control size bound.
+
+    These are whole stable observations, not permissive append prefixes. An
+    append/truncate during the bounded copy must retry before packing. Source
+    logs remain intact and full original-byte recovery still gates acceptance.
+    """
+    if source.name == 'data_openBB':
+        return {'logs': ('supervisor.log', 'supervisor.log.1',
+                         'supervisor_launcher.log', 'supervisor-launch.log'),
+                '_state': ('monitor_history.jsonl', 'monitor_dashboard_history.jsonl')}
+    return {}
 
 
 def _mutable_json_control_locations(source: Path) -> frozenset[str]:
@@ -409,11 +472,30 @@ def _mutable_json_control_locations(source: Path) -> frozenset[str]:
     policy caches under these directories. Their arbitrary provider/hash
     names cannot be recognized by generic status/progress filename suffixes.
     """
-    return frozenset({'cooldowns', 'robots'}) if source.name == 'data_news_fulltext' else frozenset()
+    if source.name == 'data_news_fulltext':
+        return frozenset({'cooldowns', 'robots'})
+    if source.name == 'data_tw_public':
+        # The canonical collector atomically writes Data.gov catalog metadata
+        # here; financial observations/raw responses are separate payloads.
+        return frozenset({'metadata'})
+    return frozenset()
 
 
-def _freeze_published_payload(original: Path, target: Path, logical: str) -> dict:
-    """One bounded-memory copy of a known atomic output, with exact FD fences."""
+def _validate_frozen_control(raw: bytes, *, json_control: bool, json_lines: bool) -> None:
+    if json_control:
+        json.loads(raw)
+    elif json_lines:
+        # Preserve the complete selected journal, never truncate a partial row
+        # or substitute values. The collector appends complete JSON + newline.
+        if raw and not raw.endswith(b'\n'):
+            raise SnapshotError('public source journal has an incomplete final record')
+        for line in raw.splitlines():
+            json.loads(line)
+
+
+def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
+                                 capture_kind='closed_atomic_published_payload', json_lines=False) -> dict:
+    """One bounded-memory stable-FD copy of a reviewed output or operational log."""
     from stockagent.data_sync.desync_snapshots import _fsync_directory, rename_without_overwrite
     from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash
 
@@ -423,12 +505,12 @@ def _freeze_published_payload(original: Path, target: Path, logical: str) -> dic
         # today's new catalog/tail over it.
         info = payload_info(target)
         return {'path': str(target), 'sha256': stable_payload_hash(target, info),
-                'bytes': info['size'], 'capture_kind': 'closed_atomic_published_payload'}
+                'bytes': info['size'], 'capture_kind': capture_kind}
     signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
     for attempt in range(3):
         temporary = target.with_name('.capture-' + uuid.uuid4().hex + '.partial')
         try:
-            descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
             with os.fdopen(descriptor, 'rb') as source:
                 before = os.fstat(source.fileno())
                 if not stat.S_ISREG(before.st_mode):
@@ -440,10 +522,15 @@ def _freeze_published_payload(original: Path, target: Path, logical: str) -> dic
                 digest, copied, oversized = hashlib.sha256(), 0, False
                 output_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
                 with os.fdopen(output_fd, 'wb') as output:
-                    while block := source.read(min(8 * 1024**2, before.st_size - copied + 1)):
+                    while block := (source.readline(64 * 1024**2 + 1) if json_lines else
+                                    source.read(min(8 * 1024**2, before.st_size - copied + 1))):
                         if copied + len(block) > before.st_size:
                             oversized = True
                             break  # A growing in-place writer cannot make this copy unbounded.
+                        if json_lines:
+                            if len(block) > 64 * 1024**2 or not block.endswith(b'\n'):
+                                raise SnapshotError(f'operational journal has an incomplete or oversized record: {logical}')
+                            json.loads(block)
                         digest.update(block)
                         output.write(block)
                         copied += len(block)
@@ -459,7 +546,7 @@ def _freeze_published_payload(original: Path, target: Path, logical: str) -> dic
             rename_without_overwrite(temporary, target)
             _fsync_directory(target.parent)
             return {'path': str(target), 'sha256': digest.hexdigest(), 'bytes': copied,
-                    'capture_kind': 'closed_atomic_published_payload'}
+                    'capture_kind': capture_kind}
         finally:
             temporary.unlink(missing_ok=True)  # This call's exact owned work file, never a source.
     raise AssertionError('bounded published capture did not return or reject')
@@ -484,7 +571,10 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                 {**intent, "contract": version} for version in
                 (CONTROL_SCOPE, "recursive_mutable_controls_v2", "recursive_mutable_controls_v3",
                  "recursive_mutable_controls_v4", "recursive_mutable_controls_v5",
-                 "recursive_mutable_controls_v6")):
+                 "recursive_mutable_controls_v6", "recursive_mutable_controls_v7",
+                 "recursive_mutable_controls_v8", "recursive_mutable_controls_v9",
+                 "recursive_mutable_controls_v10", "recursive_mutable_controls_v11",
+                 "recursive_mutable_controls_v12")):
             raise SnapshotError("control freeze intent changed")
         if previous_intent != intent:
             # Expand the named control scope without replacing retained
@@ -514,33 +604,49 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                      "status.json", "progress.json", "history.json", "active_run.json", ".sync.lock"}
     published_locations = _mutable_published_locations(source)
     control_file_locations = _mutable_control_file_locations(source)
+    streamed_control_locations = _mutable_streamed_control_locations(source)
     json_control_locations = _mutable_json_control_locations(source)
     def walk_error(error):
         raise error
     if upgrade_from in {'recursive_mutable_controls_v3', 'recursive_mutable_controls_v4',
-                        'recursive_mutable_controls_v5', 'recursive_mutable_controls_v6'}:
+                        'recursive_mutable_controls_v5', 'recursive_mutable_controls_v6',
+                        'recursive_mutable_controls_v7', 'recursive_mutable_controls_v8',
+                        'recursive_mutable_controls_v9', 'recursive_mutable_controls_v10',
+                        'recursive_mutable_controls_v11', 'recursive_mutable_controls_v12', CONTROL_SCOPE}:
         # Completed recursive censuses only need named delta probes. v4 added
         # reports/atomic outputs; v5 added rule-only TAIFEX, v6 news controls.
-        # v7 adds native CEX reports/lock epochs and the official feature table.
+        # v7 adds native CEX reports/lock epochs and the official feature table;
+        # v8 repeats ONLY these named probes on retry; v9 adds the canonical
+        # public catalog metadata/version journal directory; v10 adds exact
+        # FinMind batch summaries and OpenBB public-priority queue controls;
+        # v11 adds direct public query journals and OpenBB compactor heads.
+        # v12 adds the FinLab run head and exact public feature companions.
+        # v13 completes reviewed FinLab discovery/OpenBB operational producers.
+        # Large receipt
+        # trees are observed directly into cold packs, never millions of copies.
         # Never rewalk millions of raw files or replace retained observations.
         locations = [source / name for name in control_file_locations]
         locations.extend(source / name for name in published_locations)
+        locations.extend(source / name for name in streamed_control_locations)
         locations.extend(source / name for name in sorted(json_control_locations))
-        walks = []
-        for directory in dict.fromkeys(locations):
-            location = directory.relative_to(source).as_posix()
-            if (directory.resolve() != directory or not directory.is_dir()
-                    or any(location == name or location.startswith(name + '/') for name in excluded)):
-                continue
-            files = {name for name in control_file_locations.get(location, ())
-                     if (directory / name).exists()}
-            if location in published_locations:
-                named = published_locations[location]
-                files.update((member.name for member in directory.iterdir() if member.name.endswith('.parquet'))
-                             if named is None else (name for name in named if (directory / name).exists()))
-            if location in json_control_locations:
-                files.update(member.name for member in directory.iterdir() if member.name.endswith('.json'))
-            walks.append((directory, [], sorted(files)))
+        def delta_walks():
+            for directory in dict.fromkeys(locations):
+                location = directory.relative_to(source).as_posix()
+                if (directory.resolve() != directory or not directory.is_dir()
+                        or any(location == name or location.startswith(name + '/') for name in excluded)):
+                    continue
+                files = {name for name in control_file_locations.get(location, ())
+                         if (directory / name).exists()}
+                files.update(name for name in streamed_control_locations.get(location, ())
+                             if (directory / name).exists())
+                if location in published_locations:
+                    named = published_locations[location]
+                    files.update((member.name for member in directory.iterdir() if member.name.endswith('.parquet'))
+                                 if named is None else (name for name in named if (directory / name).exists()))
+                if location in json_control_locations:
+                    files.update(member.name for member in directory.iterdir() if member.name.endswith('.json'))
+                yield directory, [], sorted(files)
+        walks = delta_walks()
     else:
         walks = os.walk(source, followlinks=False, onerror=walk_error)
     for directory, names, files in walks:
@@ -558,11 +664,15 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
             json_control = name.lower().endswith(".json")
             location = relative.as_posix()
             named_file_control = name in control_file_locations.get(location, ())
+            streamed_control = name in streamed_control_locations.get(location, ())
+            json_lines = (source.name == 'data_tw_public' and (
+                (location == 'metadata' and name.endswith('_versions.jsonl'))
+                or (location == 'state/journals' and name.endswith('.jsonl'))))
             published_payload = (location in published_locations and (
                 name in published_locations[location] if published_locations[location] is not None
                 else name.endswith('.parquet')))
             declared_json_control = json_control and location in json_control_locations
-            if not (published_payload or named_file_control or declared_json_control) and (
+            if not (published_payload or streamed_control or named_file_control or declared_json_control) and (
                     (not json_control and name != ".sync.lock")
                     or (relative.parts and "latest" not in relative.parts and name not in control_names
                         and not name.endswith(("_status.json", "_progress.json", "_state.json")))):
@@ -572,16 +682,21 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                 continue
             original = Path(directory) / name
             before = original.lstat()
-            if not stat.S_ISREG(before.st_mode) or (not published_payload and before.st_size > 64 * 1024**2):
-                if published_payload:
+            if not stat.S_ISREG(before.st_mode) or (not (published_payload or streamed_control)
+                                                   and before.st_size > 64 * 1024**2):
+                if published_payload or streamed_control:
                     raise SnapshotError(f'published mutable payload exceeds its bounded capture: {logical}')
                 continue
             target = staging / logical
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             if target.resolve() != target or target.is_symlink():
                 raise SnapshotError("control freeze target is redirected")
-            if published_payload:
-                frozen[logical] = _freeze_published_payload(original, target, logical)
+            if published_payload or streamed_control:
+                streamed_jsonl = streamed_control and name.endswith('.jsonl')
+                frozen[logical] = _freeze_streamed_observation(original, target, logical,
+                    capture_kind=('stable_operational_jsonl' if streamed_jsonl else 'stable_operational_log')
+                        if streamed_control else 'closed_atomic_published_payload',
+                    json_lines=streamed_jsonl)
                 captured_bytes += frozen[logical]['bytes']
                 continue
             if target.exists():
@@ -590,11 +705,10 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                 raw = target.read_bytes()
                 if len(raw) > 64 * 1024**2:
                     raise SnapshotError("retained control capture is oversized")
-                if json_control:
-                    json.loads(raw)
+                _validate_frozen_control(raw, json_control=json_control, json_lines=json_lines)
             else:
                 for attempt in range(3):
-                    descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
                     with os.fdopen(descriptor, "rb") as src:
                         first = os.fstat(src.fileno())
                         if not stat.S_ISREG(first.st_mode) or first.st_size > 64 * 1024**2:
@@ -605,12 +719,11 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                     # In-place writes still fail the size/mtime/content fences.
                     signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
                     if signature(first) == signature(last) and len(raw) == first.st_size:
-                        if json_control:
-                            json.loads(raw)
+                        _validate_frozen_control(raw, json_control=json_control, json_lines=json_lines)
                         break
                     if attempt == 2:
                         raise SnapshotError(f"control file changed during bounded freeze: {logical}")
-                atomic_write_bytes(target, raw, mode=0o600)
+                atomic_write_bytes(target, raw, mode=0o600, durable=True)
             frozen[logical] = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest(),
                                "bytes": len(raw)}
             captured_bytes += len(raw)
@@ -671,7 +784,9 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
             atomic_write_json(path, prepared)
         prepared.update(state="prepared", prepared_at_utc=_now())
         atomic_write_json(path, prepared)
-    if prepared.get("control_scope") != CONTROL_SCOPE:
+    # Repeat bounded named control probes, not the initial raw/database census.
+    # Keep old captures; only controls first appearing since preparation append.
+    if prepared.get("state") == "prepared":
         for row in prepared["sqlite_states"]:
             relative = row["source_relative"]
             excluded.extend((relative, relative + "-wal", relative + "-shm", relative + "-journal"))
@@ -723,6 +838,14 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
         excluded = list(entry.get("excluded_subtrees", []))
         excluded.extend(binding["name"] for binding in source_links)
         prepared = _private_preparation(entry, args, source, cold, policy)
+        # Mutable operational controls may be frozen, but the new readonly
+        # Parquet head and immutable members stay under the packed publisher's
+        # whole-tree before/after fences. Do not resurrect a retained legacy
+        # override after a format cutover.
+        from stockagent.data_sync.parquet_publication import ParquetPublicationSnapshot
+        parquet_proof = ParquetPublicationSnapshot(source, excluded=excluded,
+            dataset=entry["dataset"],
+            file_overrides=prepared["controls"])
         snapshots = prepared["sqlite_states"]
         for row in snapshots:
             relative = row["source_relative"]
@@ -735,9 +858,15 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             staging_rules.append("finmind_parquet_promote_v1")
         if source == (repo / 'data_openBB').resolve():
             staging_rules.append('openbb_l1_atomic_sibling_v1')
+            staging_rules.append('openbb_operational_atomic_sibling_v1')
         from stockagent.data_sync.packing_checkpoint import SealedPackHints
         hints = SealedPackHints(args.migration_state.absolute() / 'sealed-pack-checkpoints' / str(entry['dataset']),
                                cold, source, str(entry['dataset']))
+        def source_guard():
+            parquet_proof.guard()
+            if source_links:
+                guard_source_links(source, source_links)
+
         saved = publish_packed_snapshot(cold, str(entry["dataset"]), source, node_id=args.node_id,
             loose_file_threshold_bytes=(_loose_threshold_bytes(entry)
                                        if entry.get("loose_threshold_bytes") or entry.get("loose_threshold_mib") else 8 * 1024**2),
@@ -746,12 +875,15 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             batch_directory_fsync=True, publication_lock_nonblocking=True,
             bootstrap_file_storage=inherited_files, bootstrap_objects=inherited_objects,
             private_observation_cohort=True,
+            private_atomic_json_controls=source.name in {
+                'data_finlab', 'data_finmind', 'data_crypto_reference', 'data_tej'},
             private_staging_file_rules=staging_rules,
             sealed_pack_hints=hints,
             file_overrides={name: Path(row["path"]) for name, row in prepared["controls"].items()},
-            **({"source_guard": lambda: guard_source_links(source, source_links)} if source_links else {}),
+            **({"source_guard": source_guard} if source_links or parquet_proof.applicable else {}),
             progress=getattr(args, "publication_progress", None),
             metadata={"role": str(entry["role"]), "shared_export": "false", "nas_export": "false",
+                      **parquet_proof.metadata,
                       "consistent_sqlite_bindings": json.dumps(bindings, sort_keys=True),
                       "version_dependencies_sha256": _identity(bindings if not source_links else
                           {"sqlite_states": bindings, "source_links": source_links}),
@@ -759,9 +891,13 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
                       "public_bootstrap_releases": json.dumps(inherited_proofs, sort_keys=True)})
         # The compound source keeps exact link provenance and immutable target
         # dependencies, not unsafe absolute links in a portable file inventory.
+        control_evidence = ({'frozen_control_files': prepared['controls']} if len(prepared['controls']) <= FROZEN_CONTROLS_INLINE_LIMIT else
+            {'frozen_controls_receipt': {'path': str(_preparation_path(args, entry['dataset'])),
+                'sha256': sha256_file(_preparation_path(args, entry['dataset'])),
+                'files': len(prepared['controls'])}})
         return saved, {"state": "published", "sqlite_states": snapshots, "shared_export": False,
                        "source_status": status, "consistency": "fixed_observed_files_not_atomic_workspace",
-                       "frozen_control_files": prepared["controls"],
+                       **control_evidence,
                        "sealed_pack_hint_files": list(hints.receipts.values()),
                        "sealed_pack_hints": dict(hints.statistics),
                        "source_links": source_links,
@@ -770,8 +906,12 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
 
 def _recover(cold: Path, dataset: str, snapshot: str, receipt: Path, progress_path: Path,
              *, attempt_id: str | None = None) -> dict:
-    selected = resolve_packed_snapshot_id(cold, dataset, snapshot)
-    if receipt.exists():
+    retained = receipt.exists()
+    # A new full verifier performs its own complete presence/size pass. Do not
+    # stat every cold object once in each resolver and then a third time in
+    # verification. Reusing a completed proof STILL checks current presence.
+    selected = resolve_packed_snapshot_id(cold, dataset, snapshot, require_objects=retained)
+    if retained:
         proof = json.loads(receipt.read_text())
         if (proof.get("manifest_sha256") != selected.manifest_sha256
                 or proof.get("full_original_file_reconstruction_verified") is not True):
@@ -789,7 +929,8 @@ def _recover(cold: Path, dataset: str, snapshot: str, receipt: Path, progress_pa
     primary = Path('/srv/stockagent-packed')
     native_pack_reads = cold in (primary, primary / '.local-state/private-history')
     proof = verify_packed_snapshot(cold, selected, reconstruct_all=True, progress=progress,
-                                  d_primary_native_pack_reads=native_pack_reads)
+                                  d_primary_native_pack_reads=native_pack_reads,
+                                  d_primary_native_chunk_reads=(cold == primary))
     proof.update(contract=CONTRACT, dataset=dataset, snapshot_id=snapshot,
                  manifest_sha256=selected.manifest_sha256,
                  full_original_file_reconstruction_verified=True, source_files=int(selected.manifest["source"]["files"]),
@@ -799,7 +940,7 @@ def _recover(cold: Path, dataset: str, snapshot: str, receipt: Path, progress_pa
     return proof
 
 
-def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> dict:
+def _retire_owned_scratch(directory: Path, dataset: str, publication: dict, *, progress=None) -> dict:
     """Unlink only our reproducible freeze copies after all cold proofs passed.
 
     This never targets a data_* source, authoritative object, NAS file or an
@@ -809,7 +950,18 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> d
     from stockagent.data_sync.materialized_cache import process_references_many
     receipt = directory / "scratch-retirement" / (dataset + ".json")
     previous = json.loads(receipt.read_text()) if receipt.exists() else {}
-    targets = {row["path"]: row["sha256"] for row in publication.get("frozen_control_files", {}).values()}
+    controls = publication.get('frozen_control_files', {})
+    if 'frozen_controls_receipt' in publication:
+        binding = publication['frozen_controls_receipt']
+        path = directory / 'preparations' / (dataset + '.json')
+        if (binding['path'] != str(path) or path.is_symlink() or path.resolve() != path
+                or sha256_file(path) != binding['sha256']):
+            raise SnapshotError('frozen control receipt no longer matches its exact preparation')
+        prepared = json.loads(path.read_bytes())
+        if prepared['dataset'] != dataset or len(prepared['controls']) != binding['files']:
+            raise SnapshotError('frozen control receipt dataset/count changed')
+        controls = prepared['controls']
+    targets = {row["path"]: row["sha256"] for row in controls.values()}
     for row in publication.get("sqlite_states", []):
         targets[str(Path(row["retained_snapshot_staging"]) / "snapshot.sqlite3")] = row["consistent_state"]["snapshot_sha256"]
     hints_root = directory / 'sealed-pack-checkpoints' / dataset
@@ -822,9 +974,20 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> d
               "files": previous.get("files", {})}
     permitted = (directory / "controls", directory / "sqlite-snapshots", hints_root)
     pending = []
+    last_report = 0.0
+    def report(stage, completed=0, *, force=False):
+        nonlocal last_report
+        if progress is not None and (force or time.monotonic() - last_report >= 5):
+            last_report = time.monotonic()
+            progress({'stage': stage, 'completed_items': completed, 'total_items': len(targets),
+                      'completed_bytes': None, 'total_bytes': None, 'acceptance': False,
+                      'source_files_deleted': 0, 'cold_objects_deleted': 0, 'nas_files_deleted': 0})
+    report('verify-owned-preparation-scratch', force=True)
     signature = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
                               info.st_ctime_ns, info.st_nlink)
-    for name, expected_sha in targets.items():
+    for index, (name, expected_sha) in enumerate(targets.items()):
+        if index % 128 == 0:
+            report('verify-owned-preparation-scratch', index)
         path = Path(name)
         if path.resolve() != path or not any(path.is_relative_to(root) for root in permitted):
             raise SnapshotError("owned scratch retirement target escapes its operation")
@@ -845,6 +1008,7 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> d
     # not a complete process scan plus an O(N) journal rewrite per small hint.
     # A positive reference conservatively holds the entire batch. The original
     # operation lock and per-file final identity fences remain mandatory.
+    report('check-owned-scratch-process-references', len(targets), force=True)
     references = process_references_many([path for path, _, _ in pending]) if pending else []
     for path, expected_sha, _ in pending:
         result["files"][str(path)] = {"state": "waiting_process_reference" if references else "unlink_planned",
@@ -853,9 +1017,12 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> d
     if pending:
         atomic_write_json(receipt, result)
     changed_directories = set()
+    report('unlink-owned-preparation-scratch', len(targets) - len(pending), force=True)
     try:
         if not references:
-            for path, _, before in pending:
+            for index, (path, _, before) in enumerate(pending):
+                if index % 128 == 0:
+                    report('unlink-owned-preparation-scratch', len(targets) - len(pending) + index)
                 if path.resolve() != path or signature(before) != signature(path.lstat()):
                     raise SnapshotError("owned scratch changed during final retirement check")
                 path.unlink()
@@ -874,6 +1041,8 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict) -> d
                   allocated_bytes_reclaimed=sum(row["allocated_bytes_reclaimed"] for row in result["files"].values()),
                   observed_at_utc=_now())
     atomic_write_json(receipt, result)
+    report('owned-preparation-scratch-' + result['state'], len(targets) if result['state'] == 'retired'
+           else len(targets) - len(pending), force=True)
     return result
 
 
@@ -886,6 +1055,9 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     budget = getattr(args, "maximum_completed_sources", None)
     if budget is not None and (type(budget) is not int or budget < 1):
         raise SnapshotError("migration completion budget must be positive")
+    attempt_budget = getattr(args, "maximum_attempted_sources", None)
+    if attempt_budget is not None and (type(attempt_budget) is not int or attempt_budget < 1):
+        raise SnapshotError("migration attempt budget must be positive")
     parent, directory = args.sync_root.absolute(), args.migration_state.absolute()
     _check_packed_read_authority(parent)
     if (directory.is_relative_to(parent) or any(directory.is_relative_to(_source_path(e).resolve())
@@ -940,6 +1112,7 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
             atomic_write_json(state_path, result)
         save()
         completed_this_call = 0
+        attempted_this_call = 0
         for pass_number in range(args.maximum_passes):
             # Resume committed releases first, then untouched work. A repeatedly
             # changing multi-million-file source must not starve every pending
@@ -952,8 +1125,11 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                 row = result["datasets"][entry["dataset"]]
                 if row["state"] == "verified":
                     continue
-                if row["state"] == "waiting_retry" and row.get("retry_at_unix", 0) > time.time():
+                if row.get("retry_at_unix", 0) > time.time():
                     continue
+                if attempt_budget is not None and attempted_this_call >= attempt_budget:
+                    return result
+                attempted_this_call += 1
                 if row.get("error"):
                     row["last_failure"] = {key: row[key] for key in
                         ("error", "error_type", "attempts", "attempt_id", "started_at_utc") if key in row}
@@ -976,7 +1152,8 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     # An interrupted publish might have committed. Keep its exact
                     # selected binding; never infer a failed/missing receipt meant no write.
                     if "snapshot_id" in row:
-                        saved = resolve_packed_snapshot_id(cold, entry["dataset"], row["snapshot_id"])
+                        saved = resolve_packed_snapshot_id(cold, entry["dataset"], row["snapshot_id"],
+                                                          require_objects=False)
                         extra = row.get("publication", {})
                     elif entry["publish"]:
                         status, saved = _publish_entry(entry, run_args, parent)
@@ -984,7 +1161,8 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     else:
                         saved, extra = _private_publish(repo, entry, run_args, parent, policy, catalog)
                     if saved is None:
-                        row.update(state="waiting_source_owner", publication=extra)
+                        row.update(state="waiting_source_owner", publication=extra,
+                                   retry_at_unix=time.time() + args.retry_seconds)
                         save()
                         continue
                     if saved.manifest["schema_version"] != 2:
@@ -1001,7 +1179,8 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     from stockagent.data_sync.private_source_links import manifest_source_links, source_link_dependencies
                     source_links = manifest_source_links(saved)
                     for link in source_link_dependencies(source_links):
-                        dependency = resolve_packed_snapshot_id(cold, link["dataset"], link["snapshot_id"])
+                        dependency = resolve_packed_snapshot_id(cold, link["dataset"], link["snapshot_id"],
+                                                               require_objects=False)
                         if dependency.manifest_sha256 != link["manifest_sha256"]:
                             raise SnapshotError("fixed source link dependency identity changed")
                         linkproof = directory / "recovery" / (link["dataset"] + ".json")
@@ -1020,10 +1199,18 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                         _recover(cold, database["dataset"], database["snapshot_id"], dbproof,
                                  dbproof.with_suffix(".progress.json"), attempt_id=row["attempt_id"])
                     if getattr(args, "retire_staging", False) and not entry["publish"]:
-                        scratch = _retire_owned_scratch(directory, entry["dataset"], extra)
-                        row["owned_scratch_retirement"] = scratch
+                        def scratch_progress(document):
+                            atomic_write_json(proof.with_suffix('.progress.json'),
+                                {**document, 'updated_at_utc': _now(), 'snapshot_id': row['snapshot_id'],
+                                 'attempt_id': row['attempt_id']}, durable=False)
+                        scratch = _retire_owned_scratch(directory, entry["dataset"], extra,
+                                                       progress=scratch_progress)
+                        row['owned_scratch_retirement'] = {k: v for k, v in scratch.items() if k != 'files'}
+                        row['owned_scratch_retirement'].update(files_checked=len(scratch['files']),
+                            receipt=str(directory / 'scratch-retirement' / (entry['dataset'] + '.json')))
                         if scratch["state"] != "retired":
-                            row["state"] = "verified_scratch_retirement_pending"
+                            row.update(state="verified_scratch_retirement_pending",
+                                       retry_at_unix=time.time() + args.retry_seconds)
                             save()
                             continue
                     row.update(state="verified", recovery_receipt=str(proof), verified_at_utc=_now())
@@ -1064,6 +1251,7 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
     if (type(interval) is not int or not 3600 <= interval <= 7 * 86400
             or type(retry) is not int or not 10 <= retry <= 300
             or settings.get("completed_source_budget_per_activity") != 1
+            or settings.get("attempted_source_budget_per_activity") != 1
             or settings.get("state_directory") != "dataset-versions"):
         raise SnapshotError("invalid dataset version lifecycle bounds")
     cold = Path(configuration["cold_root"]).absolute()
@@ -1088,6 +1276,7 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
         args = SimpleNamespace(sync_root=cold, migration_state=Path(current["operation_directory"]),
             node_id=None, retry_seconds=retry, maximum_passes=1, watch=False,
             maximum_completed_sources=1, retire_staging=True,
+            maximum_attempted_sources=1,
             recover_missing_base_objects=False, source_lock_fd=None)
         result = migrate_catalog(repo, args, catalog)
         current.update(state=result["state"], verified_datasets=result["verified_datasets"],
@@ -1097,4 +1286,12 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
         atomic_write_json(current_path, current)
         # Host paths and licensed source metadata stay in the local journal,
         # not in Temporal history or a public dashboard.
-        return {key: current[key] for key in ("state", "source_count", "verified_datasets", "plan_sha256")}
+        # Hand off immediately when another source is eligible. Busy sources
+        # have individual deadlines; never hot-poll them to remove a blanket
+        # 30-second delay, or hold the operation lock while sleeping.
+        pending = [row for row in result['datasets'].values() if row['state'] != 'verified']
+        poll_clock = time.time()
+        remaining = min((row.get('retry_at_unix', 0) - poll_clock for row in pending), default=0)
+        delay = min(retry, max(0, math.ceil(remaining)))
+        return {**{key: current[key] for key in ("state", "source_count", "verified_datasets", "plan_sha256")},
+                'next_poll_seconds': delay}

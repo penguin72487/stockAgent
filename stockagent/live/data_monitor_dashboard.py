@@ -781,10 +781,8 @@ _REFRESH_SERVICE_SNAPSHOT_MAX_AGE_SECONDS: Final[int] = 180
 
 
 def _read_json(path: Path, default: Any = None) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-        return default
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    return read_json_snapshot(path, default)
 
 
 def _systemd_time(value: Any) -> datetime | None:

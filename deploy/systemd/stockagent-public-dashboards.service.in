@@ -48,6 +48,9 @@ ProtectHome=read-only
 InaccessiblePaths=-/root/.ssh -/root/.codex -__REPO_ROOT__/.env -__REPO_ROOT__/.env.trade -__REPO_ROOT__/.env.futures
 ProtectProc=invisible
 ProcSubset=pid
+# Keep the kernel tree hidden, but verify worker boot identity without a
+# wall-clock-derived boot epoch (which shifts during WSL/NTP resynchronization).
+BindReadOnlyPaths=/proc/sys/kernel/random/boot_id:/run/stockagent-process-boot-id
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

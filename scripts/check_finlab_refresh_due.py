@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import UTC, datetime, timedelta
+import fcntl
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import stat
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
-    TAIPEI, WORKLOAD_CONTRACT_VERSION, quota_cycle_start, utc_time,
+    INTRADAY_MINIMUM_FREE_GB, TAIPEI, WORKLOAD_CONTRACT_VERSION, quota_cycle_start, utc_time,
 )
 from stockagent.data.finlab_quota_policy import load_policy, quota_admission  # noqa: E402
 
@@ -32,6 +36,34 @@ def read(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def research_owner_busy(root: Path) -> bool | None:
+    """Probe the existing writer lease, never create/unlink/release its owner.
+
+    An unknown or redirected inode is not evidence of an idle/blocked producer.
+    The actual builder still acquires this lease again before touching inputs.
+    """
+    try:
+        public = (root / "data_tw_public").resolve(strict=True)
+        lock = public.parent / ".locks/tw-public-refresh.lock"
+        if lock.resolve(strict=True) != lock:
+            return None
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        finally:
+            os.close(fd)
+    except (OSError, RuntimeError):
+        return None
 
 
 def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
@@ -64,6 +96,17 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
             retry = utc_time(row.get("retry_at_utc"))
             if retry is None or retry <= now:
                 return True, "general_work_due"
+    market = read(root / "data_finlab/intraday/market_status.json")
+    if market.get("state") == "disk_reserve_reached":
+        try:
+            disk_ready = intraday_disk_admission(root)["allowed"]
+        except OSError:
+            disk_ready = True  # Unknown evidence falls through to the original worker.
+        if not disk_ready and research_owner_busy(root) is True:
+            # Both independent branches are currently excluded by their real
+            # resources. Recheck statvfs/flock next minute; no fixed cooldown,
+            # provider call, SDK import, partition scan or false completion.
+            return False, "intraday_disk_full_research_owner_busy"
     # A provider's shared cooldown applies to intraday work, not unrelated
     # general releases. Avoid starting an idle process pool every timer tick.
     retry = utc_time(read(root / "data_finlab/intraday/source_backoff.json").get("retry_at_utc"))
@@ -80,7 +123,6 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     reserve = core.get("scheduled_reserve_mb", 500)
     if isinstance(reserve, bool) or not isinstance(reserve, (int, float)) or not math.isfinite(reserve):
         reserve = 500
-    market = read(root / "data_finlab/intraday/market_status.json")
     kinds = market.get("by_kind")
     tick = kinds.get("tw_tick", {}) if isinstance(kinds, dict) else {}
     tick = tick if isinstance(tick, dict) else {}
@@ -119,10 +161,34 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     return False, "nothing_actionable_now"
 
 
-def main() -> int:
+def intraday_disk_admission(root: Path) -> dict:
+    """One statvfs, no inventory/SDK; collector still checks every boundary.
+
+    This preflight belongs after general/research work, not in the overall
+    ExecCondition: low intraday headroom must not suppress an independently
+    recoverable general download or a pending verified research publication.
+    """
+    available = shutil.disk_usage(root / "data_finlab").free
+    required = int(INTRADAY_MINIMUM_FREE_GB * 1024**3)
+    allowed = available >= required
+    return {"allowed": allowed, "reason": "intraday_disk_ready" if allowed else "disk_reserve_reached",
+            "free_bytes": available, "minimum_free_bytes": required, "provider_calls": 0}
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
-    args = parser.parse_args()
+    parser.add_argument("--intraday-disk-only", action="store_true",
+                        help="preflight only the shared intraday disk floor, after independent research work")
+    args = parser.parse_args(argv)
+    if args.intraday_disk_only:
+        try:
+            admission = intraday_disk_admission(args.root)
+        except OSError:
+            print(json.dumps({"allowed": False, "reason": "intraday_disk_probe_failed", "provider_calls": 0}))
+            return 2
+        print(json.dumps(admission))
+        return 0 if admission["allowed"] else 1
     allowed, reason = refresh_due(args.root, now=datetime.now(UTC))
     print(json.dumps({"allowed": allowed, "reason": reason, "provider_calls": 0}))
     return 0 if allowed else 1  # systemd ExecCondition skips, not fails.

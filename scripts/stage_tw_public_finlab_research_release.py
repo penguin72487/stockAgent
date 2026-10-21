@@ -8,7 +8,7 @@ This is a current-revision research table, never a historical PIT or live model.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import UTC, datetime
 import json
 from pathlib import Path
@@ -22,14 +22,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.stage_tw_public_research_release import (  # noqa: E402
-    LIVE_ROOT, _required_formal_members, _stage_copy,
+    LIVE_ROOT, _required_formal_members, _stage_copy, _action_members,
 )
+from stockagent.data.parquet_lineage import ParquetLineage, assert_receipt, receipt_fields  # noqa: E402
 from scripts.finlab_release_gate import CONTRACT as CATALOG_SCOPE, catalog_readiness  # noqa: E402
 from scripts.download_finlab_history import safe_stem  # noqa: E402
 from scripts.publish_data_releases import _source_coordination_lock  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import FINLAB_RESEARCH_STAGE_LOCK  # noqa: E402
 from stockagent.data_sync.desync_snapshots import atomic_write_json, sha256_file  # noqa: E402
-from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard  # noqa: E402
+from stockagent.live.tw_public_source_guard import (  # noqa: E402
+    TWPublicSourceUpdatePending, live_tw_public_source_read_guard,
+)
 
 SOURCE = ROOT / "artifacts/research_features/tw_public_research_finlab_2014_v4.parquet"
 BASE = ROOT / "artifacts/research_features/tw_public_research_all_2014_v3.parquet"
@@ -91,7 +94,7 @@ def refresh_unchanged_completion(path: Path, previous: dict, readiness: dict) ->
     return True
 
 
-def validated_source(source: Path, base: Path, live_root: Path) -> tuple[dict, dict, str, int, int, int, str]:
+def validated_source(source: Path, base: Path, live_root: Path, *, formal=None) -> tuple[dict, dict, str, int, int, int, str]:
     receipt = json.loads(source.with_suffix(".finlab_research.json").read_text(encoding="utf-8"))
     base_receipt = json.loads(base.with_suffix(".all_features.json").read_text(encoding="utf-8"))
     if receipt.get("research_only") is not True or receipt.get("historical_point_in_time") is not False:
@@ -102,9 +105,8 @@ def validated_source(source: Path, base: Path, live_root: Path) -> tuple[dict, d
     base_hash = sha256_file(base)
     if base_hash != base_receipt.get("output_sha256") or base_hash != receipt.get("inputs", {}).get("base_sha256"):
         raise RuntimeError("FinLab overlay/all-observed base lineage mismatch")
-    formal_hash = sha256_file(live_root / "features/tw_public_stock_daily.parquet")
-    if formal_hash != base_receipt.get("inputs", {}).get("official", {}).get("sha256"):
-        raise RuntimeError("formal TW feature source changed since research overlay build")
+    formal = formal or ParquetLineage(live_root / "features/tw_public_stock_daily.parquet")
+    assert_receipt(formal.identity, base_receipt.get("inputs", {}).get("official"))
     schema = pq.read_schema(source)
     public = [name for name in schema.names if name.startswith("twpub_")]
     finlab = [name for name in schema.names if name.startswith("twfl_")]
@@ -118,6 +120,7 @@ def validated_source(source: Path, base: Path, live_root: Path) -> tuple[dict, d
     if not {"date", "symbol"}.issubset(schema.names):
         raise RuntimeError("research table lacks date/symbol keys")
     end_date = str(pc.max(pq.read_table(source, columns=["date"])["date"]).as_py())
+    formal.verify()
     return receipt, base_receipt, source_hash, len(public), len(finlab), metadata.num_rows, end_date
 
 
@@ -129,7 +132,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--staged-root", type=Path, default=STAGED_ROOT)
     parser.add_argument("--finlab-root", type=Path, default=ROOT / "data_finlab")
     args = parser.parse_args(argv)
-    with stage_source_guards(args.staged_root, args.live_root):
+    with ExitStack() as guards:
+        try:
+            guards.enter_context(stage_source_guards(args.staged_root, args.live_root))
+        except TWPublicSourceUpdatePending:
+            print(json.dumps({"event": "finlab_research_stage_deferred",
+                              "reason": "public_source_writer_busy", "retryable": True}), flush=True)
+            return 75
         readiness = catalog_readiness(args.finlab_root, verify_hashes=True)
         if not readiness["ready"]:
             raise RuntimeError(
@@ -137,9 +146,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"(missing={readiness['missing']}, stale={readiness['stale']}, "
                 f"invalid={readiness['invalid']}, catalog_fresh={readiness['catalog_fresh']})"
             )
+        formal = ParquetLineage(args.live_root / "features/tw_public_stock_daily.parquet")
         source_receipt, base_receipt, source_hash, public_count, finlab_count, rows, end_date = validated_source(
-            args.source, args.base, args.live_root
+            args.source, args.base, args.live_root, formal=formal
         )
+        assert_receipt(formal.identity, base_receipt.get("inputs", {}).get("official"))
+        base_fields = receipt_fields(formal.identity, hash_key="base_feature_sha256", source_key="base_feature_source")
         for key, source in (source_receipt.get("inputs", {}).get("sources") or {}).items():
             current_path = args.finlab_root / "receipts" / f"{safe_stem(key)}.json"
             try:
@@ -151,8 +163,8 @@ def main(argv: list[str] | None = None) -> int:
         entitlement_summary = json.loads(
             (args.live_root / "tw_corporate_action_entitlements.summary.json").read_text(encoding="utf-8")
         )
-        required = _required_formal_members(entitlement_summary, args.live_root)
-        action_hashes = {member: sha256_file(args.live_root / member) for member in required[1:]}
+        required = _required_formal_members(entitlement_summary, args.live_root, feature_identity=formal.identity)
+        action_hashes = {member: sha256_file(args.live_root / member) for member in _action_members(required, formal.identity)}
         relative_feature = Path("features") / args.source.name
         relative_receipt = Path("features") / args.source.with_suffix(".finlab_research.json").name
         receipt_hash = sha256_file(args.source.with_suffix(".finlab_research.json"))
@@ -170,7 +182,8 @@ def main(argv: list[str] | None = None) -> int:
                 relative_receipt.as_posix(): receipt_hash,
             }
             and previous.get("formal_action_members_sha256") == action_hashes
-            and previous.get("base_feature_sha256") == base_receipt["inputs"]["official"]["sha256"]
+            and all(previous.get(key) == value for key, value in base_fields.items())
+            and not (({"base_feature_sha256", "base_feature_source"} - base_fields.keys()) & previous.keys())
             and previous.get("source_receipts_sha256") == readiness["source_receipts_sha256"]
             and (args.staged_root / relative_feature).is_file()
             and (args.staged_root / relative_receipt).is_file()
@@ -179,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             and sha256_file(args.staged_root / relative_receipt) == receipt_hash
             and all(sha256_file(args.staged_root / member) == expected for member, expected in action_hashes.items())
         ):
+            formal.verify()
             refreshed = refresh_unchanged_completion(previous_path, previous, readiness)
             print(json.dumps({"event": "finlab_research_stage_unchanged", "rows": rows,
                               "channels": previous["model_channels"], "completion_proof_refreshed": refreshed}))
@@ -195,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             original = args.live_root / member
             _stage_copy(original, args.staged_root / member, expected)
         release = {
-            "schema_version": 1,
+            "schema_version": 1 if formal.identity["kind"] == "file" else 2,
             "status": "complete",
             "research_only": True,
             "historical_point_in_time": False,
@@ -203,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             "private_personal_research": True,
             "end_date": end_date,
             "base_dataset": "tw-public",
-            "base_feature_sha256": base_receipt["inputs"]["official"]["sha256"],
+            **base_fields,
             "base_research_sha256": source_receipt["inputs"]["base_sha256"],
             "feature_rows": rows,
             "public_value_channels": public_count,
@@ -217,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             "use_restriction": "owner_private_noncommercial_research_only_no_public_raw_delivery",
         }
         target = args.staged_root / "release_receipt.json"
+        formal.verify()
         target.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_json(target, release)
         print(json.dumps({"event": "finlab_research_staged", "rows": rows, "channels": release["model_channels"], "end_date": end_date}))

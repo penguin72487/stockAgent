@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import importlib
 import json
 import os
 import stat
+import struct
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -80,6 +83,63 @@ def test_every_provider_starts_and_slow_loser_does_not_delay_quorum(owner, tmp_p
         release.set()
 
 
+def test_provider_request_overlaps_slow_dispatch_journal_without_losing_order(owner, tmp_path, monkeypatch):
+    journal_entered, request_started, release = (threading.Event() for _ in range(3))
+    original = acquisition._record_source_event
+    recorded = []
+
+    def journal(key, provider, event, details):
+        if event == "started":
+            journal_entered.set()
+            assert release.wait(5)
+        result = original(key, provider, event, details)
+        recorded.append(event)
+        return result
+
+    def provider(names, values, progress):
+        request_started.set()
+        return snapshot([100.])
+
+    monkeypatch.setattr(acquisition, "_record_source_event", journal)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(fetch, owner, tmp_path, ["A"], {"source": provider})
+        try:
+            assert journal_entered.wait(2)
+            assert request_started.wait(1), "metadata fsync must not delay the external request"
+        finally:
+            release.set()
+        assert quotes.tw_session_open_observed_mask(result.result(timeout=2)).all()
+    owner.close()
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    source_events = [row for row in events if row["provider"] == "source"]
+    assert source_events[0]["event"] == "started" and source_events[-1]["event"] == "finished"
+    assert recorded.index("started") < recorded.index("finished")
+    metric = source_events[-1]
+    assert metric["dispatch_telemetry_recorded"] is True
+    assert metric["dispatch_telemetry_wait_ms"] >= 0
+    assert metric["dispatch_journal_policy"] == "request_overlaps_start_receipt_join_before_progress_v1"
+    assert source_events[0]["observed_at_taipei"] == metric["last_started_at_taipei"]
+    assert json.loads(path.read_text())["valid_open_count"] == 1
+
+
+def test_failed_dispatch_telemetry_does_not_cancel_provider_or_erase_failure(owner, tmp_path, monkeypatch):
+    original = acquisition._record_source_event
+
+    def journal(key, provider, event, details):
+        return False if event == "started" else original(key, provider, event, details)
+
+    monkeypatch.setattr(acquisition, "_record_source_event", journal)
+    result = fetch(owner, tmp_path, ["A"], {"source": lambda *args: snapshot([100.])})
+    assert quotes.tw_session_open_observed_mask(result).all()
+    owner.close()
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    metric = next(row for row in events if row["provider"] == "source" and row["event"] == "finished")
+    assert metric["dispatch_telemetry_recorded"] is False
+    assert metric["input_flush"]["captured_row_count"] == 1
+
+
 def test_repeated_full_scope_jobs_retain_independent_coverage_without_duplicate_prices(owner, tmp_path):
     def provider(names, values, progress):
         return snapshot([100.] * len(names))
@@ -144,6 +204,7 @@ def test_quorum_retains_flush_measurements_in_transport_and_daily_evidence(owner
         "total_ms", "writer_queue_ms", "snapshot_capture_ms", "scope_check_ms",
         "durable_write_ms", "commit_ack_ms",
     ))
+    written = [flush] if flush["receipt_written"] else []
     assert result.transport_timing["opening_telemetry_recorded"]
     path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
     events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
@@ -160,11 +221,22 @@ def test_quorum_retains_flush_measurements_in_transport_and_daily_evidence(owner
     assert hot_flush["captured_revision"] == flush["captured_revision"]
     assert hot_flush["captured_row_count"] == 1
     assert hot_flush["durable_write_ms"] == 0.0
+    assert hot_flush["receipt_stages"] == {}, "a hot barrier must not replay a previous write's timings"
     owner.close()
     events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
     finished = [event for event in events if event["provider"] == "source" and event["event"] == "finished"]
     assert len(finished) == 1
     assert finished[0]["input_flush"]["contract"] == flush["contract"]
+    written += [row["input_flush"] for row in finished if row["input_flush"]["receipt_written"]]
+    assert written
+    for item in written:
+        stages = item["receipt_stages"]
+        assert stages["contract"] == "opening_receipt_write_stages_v1"
+        assert stages["row_count"] == stages["reused_numeric_row_count"] == 1
+        assert stages["defensively_converted_row_count"] == 0 and stages["encoded_bytes"] > 0
+        assert all(stages[name] >= 0 for name in (
+            "total_ms", "row_projection_ms", "previous_receipt_read_ms", "official_scope_and_archive_ms",
+            "payload_assembly_ms", "json_encode_ms", "atomic_write_fsync_ms", "metadata_publish_ms"))
     assert finished[0]["source_and_persistence_ms"] >= finished[0]["last_total_ms"]
 
 
@@ -357,6 +429,125 @@ def test_partial_mis_peer_refusal_keeps_inputs_and_uses_endpoint_backoff(owner, 
         "winner": lambda names, *_: snapshot([102.] * len(names)),
     })
     assert result.open_prices.tolist() == [101., 102.]
+
+
+def _mis_transport_outage(size, *, status=None):
+    result = snapshot([np.nan] * size)
+    result.available_count = 0
+    result.available_mask[:] = False
+    result.transport_timing = {"mis_failed_request_count": 4,
+        "mis_dispatch_stopped": True, "mis_http_error_statuses": [status] if status else []}
+    return result
+
+
+def test_mis_half_open_probe_restores_only_unresolved_delta_without_full_sweep_burst(owner, tmp_path):
+    calls = []
+    def mis(names, *_args):
+        calls.append(list(names))
+        return _mis_transport_outage(len(names)) if len(calls) == 1 else snapshot([101.] * len(names))
+    fetch(owner, tmp_path, ["A", "B", "C"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+    assert metric["retry_delay_seconds"] == 15.
+    assert metric["transport_probe_delay_seconds"] == .5
+    metric["transport_probe_after_monotonic"] = 0.
+    fetch(owner, tmp_path, ["A", "B", "C"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert metric["last_completed_job"]["transport_recovery_probe"]
+    assert metric["last_completed_job"]["transport_health_recovered"]
+    result = fetch(owner, tmp_path, ["A", "B", "C"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [["A", "B", "C"], ["A"], ["B", "C"]]
+    assert result.open_prices.tolist() == [101., 101., 101.]
+    assert metric["consecutive_source_failures"] == 0
+    assert "transport_probe_after_monotonic" not in metric
+
+
+def test_mis_failed_half_open_probe_exponentially_backs_off_without_expanding_scope(owner, tmp_path):
+    calls = []
+    def mis(names, *_args):
+        calls.append(list(names))
+        return _mis_transport_outage(len(names))
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+    metric["transport_probe_after_monotonic"] = 0.
+    result = fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [["A", "B"], ["A"]]
+    assert metric["transport_probe_delay_seconds"] == 1.
+    assert metric["retry_delay_seconds"] == 15.
+    assert not quotes.tw_session_open_observed_mask(result).any()
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert calls == [["A", "B"], ["A"]]
+
+
+@pytest.mark.parametrize("status", [401, 402, 403, 429])
+def test_mis_half_open_never_bypasses_permission_or_quota_refusal(owner, tmp_path, status):
+    fetch(owner, tmp_path, ["A", "B"], {
+        "official_mis": lambda names, *_: _mis_transport_outage(len(names), status=status)})
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+    assert metric["retry_delay_seconds"] == 60.
+    assert "transport_probe_after_monotonic" not in metric
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": lambda *_: pytest.fail("refusal cooldown")})
+
+
+def test_mis_half_open_old_row_is_health_only_not_new_opening_input(owner, tmp_path):
+    calls = []
+    def mis(names, *_args):
+        calls.append(list(names))
+        return _mis_transport_outage(len(names)) if len(calls) == 1 else snapshot([101.] * len(names), stale=True)
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+    metric["transport_probe_after_monotonic"] = 0.
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert metric["last_completed_job"]["transport_health_recovered"]
+    result = fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis})
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [["A", "B"], ["A"], ["A", "B"]]
+    assert not quotes.tw_session_open_observed_mask(result).any()
+    assert not quotes.tw_session_no_open_print_mask(result).any()
+    assert "transport_probe_after_monotonic" not in metric
+
+
+def test_mis_half_open_is_single_flight_across_consumers(owner, tmp_path):
+    fetch(owner, tmp_path, ["A", "B"], {"official_mis": lambda names, *_: _mis_transport_outage(len(names))})
+    assert owner.wait_idle(timeout_seconds=1)
+    metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+    metric["transport_probe_after_monotonic"] = 0.
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    def mis(names, *_args):
+        calls.append(list(names))
+        entered.set()
+        assert release.wait(2)
+        return snapshot([101.] * len(names))
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        future = pool.submit(fetch, owner, tmp_path, ["A", "B"], {"official_mis": mis})
+        assert entered.wait(1)
+        try:
+            others = [pool.submit(fetch, owner, tmp_path, ["B", "A"], {"official_mis": mis}, timeout_seconds=.01) for _ in range(4)]
+            for other in others:
+                other.result(timeout=1)
+            assert calls == [["A"]]
+        finally:
+            release.set()
+        future.result(timeout=1)
+
+
+def test_mis_half_open_and_resumed_sweep_progress_inside_one_bounded_wait(owner, tmp_path):
+    calls = []
+    def mis(names, *_args):
+        calls.append(list(names))
+        return _mis_transport_outage(len(names)) if len(calls) == 1 else snapshot([101.] * len(names))
+    result = fetch(owner, tmp_path, ["A", "B"], {"official_mis": mis},
+        poll_opening_snapshots=True, timeout_seconds=2)
+    assert owner.wait_idle(timeout_seconds=1)
+    assert calls == [["A", "B"], ["A"], ["B"]]
+    assert quotes.tw_session_open_observed_mask(result).all()
 
 
 def test_overlapping_models_only_request_universe_delta(owner, tmp_path):
@@ -617,6 +808,47 @@ def test_source_flush_does_not_hold_the_quote_merge_or_read_lock(owner, tmp_path
     assert not quotes._TW_MIS_OPENING_DIRTY
 
 
+def test_durable_projection_reuses_normalized_values_but_retains_legacy_validation(owner, tmp_path, monkeypatch):
+    value = snapshot([100.12345678901235, np.nan])
+    value.volumes = np.array([0., 1000.])
+    quotes.seed_tw_opening_snapshot_cache(["A", "B"], value, parquet_root=tmp_path, persist=False)
+    original = quotes._snapshot_field_or_none
+    conversions = []
+
+    def convert(field, value):
+        conversions.append((field, value))
+        return original(field, value)
+
+    monkeypatch.setattr(quotes, "_snapshot_field_or_none", convert)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    path = quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day)
+    assert not conversions, "a durable barrier must not parse normalized numeric columns again"
+    wire = json.loads(path.read_bytes())
+    assert wire["rows"]["A"]["open_prices"] == value.open_prices[0]
+    assert wire["rows"]["A"]["volumes"] == 0.
+    assert wire["rows"]["B"]["open_prices"] is None
+    assert wire["valid_open_count"] == 1 and wire["missing_open_symbols"] == ["B"]
+    # Marker stays private. A restored receipt validates every column once,
+    # then subsequent snapshots/flushes may reuse those exact parsed numbers.
+    restored = quotes._load_tw_mis_opening_receipt(parquet_root=str(tmp_path.resolve()), session_date=day)
+    assert len(conversions) == 2 * len(quotes._PRICE_SNAPSHOT_ARRAY_FIELDS)
+    assert all(type(row) is quotes._NormalizedOpeningRow for _, row in restored.values())
+    conversions.clear()
+    # An unmarked mapping remains defensive, including zero-vs-unknown units
+    # and malformed/off-session values. It cannot gain trust through a merge.
+    stamp, raw = quotes._TW_MIS_OPENING_CACHE["A"]
+    legacy = {**raw, "price": "1,234.5", "volumes": True, "bid_volumes": "0", "open_prices": "100.25"}
+    quotes._TW_MIS_OPENING_CACHE["A"] = (stamp, legacy)
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.25]), parquet_root=tmp_path, persist=False)
+    assert type(quotes._TW_MIS_OPENING_CACHE["A"][1]) is dict
+    quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day)
+    assert len(conversions) == len(quotes._PRICE_SNAPSHOT_ARRAY_FIELDS)
+    wire = json.loads(path.read_bytes())
+    assert wire["rows"]["A"]["volumes"] is None
+    assert wire["rows"]["A"]["bid_volumes"] == 0.
+    assert wire["rows"]["A"]["open_prices"] == 100.25
+
+
 def test_source_flushes_serialize_without_losing_later_facts(owner, tmp_path, monkeypatch):
     quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path, persist=False)
     entered, release, merged = threading.Event(), threading.Event(), threading.Event()
@@ -659,6 +891,100 @@ def test_source_flushes_serialize_without_losing_later_facts(owner, tmp_path, mo
     assert writes == [{"A"}, {"A", "B"}]
     assert set(json.loads(path.read_text())["rows"]) == {"A", "B"}
     assert not quotes._TW_MIS_OPENING_DIRTY
+
+
+def test_receipt_metadata_reuses_only_exact_bytes_and_never_supplies_price_rows(owner, tmp_path, monkeypatch):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([100.]), parquet_root=tmp_path)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    path = quotes._tw_mis_opening_receipt_path(day)
+    original = quotes.private_json.loads
+    decoded = []
+
+    def loads(body):
+        decoded.append(body)
+        return original(body)
+
+    monkeypatch.setattr(quotes.private_json, "loads", loads)
+    quotes._opening_receipt_scope_fingerprint.cache_clear()
+
+    def fingerprint():
+        info = path.stat()
+        return quotes._opening_receipt_scope_fingerprint(str(path.resolve()), info.st_mtime_ns,
+            info.st_size, info.st_ctime_ns, info.st_ino, info.st_dev)
+
+    assert fingerprint() is None and not decoded
+    # Rebuild prices still uses the complete validated receipt, even when its
+    # metadata is known. Header knowledge cannot replace restore/data evidence.
+    restored = quotes._load_tw_mis_opening_receipt(parquet_root=str(tmp_path.resolve()), session_date=day)
+    assert restored["A"][1]["open_prices"] == 100. and len(decoded) == 1
+    metadata = json.loads(path.read_bytes())
+    metadata["official_trading_universe"] = {"fingerprint": "version_A"}
+    path.write_text(json.dumps(metadata))
+    assert fingerprint() == "version_A" and len(decoded) == 2
+    old_info = path.stat()
+    replacement = path.with_suffix(".replacement")
+    replacement.write_text(path.read_text().replace("version_A", "version_B"))
+    assert replacement.stat().st_size == old_info.st_size
+    os.utime(replacement, ns=(old_info.st_atime_ns, old_info.st_mtime_ns))
+    os.replace(replacement, path)
+    # Old mtime+size keys would return version_A for this different inode.
+    assert fingerprint() == "version_B" and len(decoded) == 3
+    # A matching wire body at a DIFFERENT path cannot borrow writer metadata.
+    other = tmp_path / "other.json"
+    known_body = quotes._TW_OPENING_RECEIPT_METADATA[1]
+    other.write_bytes(known_body)
+    quotes._opening_receipt_metadata(other, known_body)
+    assert len(decoded) == 4
+
+
+@pytest.mark.parametrize("native_available", [True, False])
+def test_scoped_receipt_encoder_keeps_finite_bits_and_strict_metadata(owner, tmp_path, monkeypatch, native_available):
+    try:
+        importlib.import_module("msgspec")
+    except ImportError:
+        if native_available:
+            pytest.skip("optional native encoder unavailable")
+    if not native_available:
+        monkeypatch.setitem(sys.modules, "msgspec", None)
+    day = acquisition.datetime.now(TAIPEI).date().isoformat()
+    numbers = [np.nextafter(0., 1.), 100.12345678901235, np.finfo(np.float64).max]
+    value = snapshot(numbers)
+    value.volumes = np.array([0., -0., float(2 ** 53 + 2)])
+    quotes.seed_tw_opening_snapshot_cache(list("ABC"), value, parquet_root=tmp_path, persist=False)
+    timing = {}
+    path = quotes.persist_tw_opening_snapshot_cache(parquet_root=tmp_path, session_date=day, timings=timing)
+    payload = json.loads(path.read_bytes())
+    assert timing["receipt_stages"]["json_encoder"] == (
+        "schema_checked_native_json_v1" if native_available else "strict_stdlib_json")
+    for index, symbol in enumerate("ABC"):
+        for field, wanted in (("open_prices", numbers[index]), ("volumes", value.volumes[index])):
+            assert struct.pack("!d", payload["rows"][symbol][field]) == struct.pack("!d", wanted)
+    # The native fast path must preserve numeric types too, not merely Python
+    # numeric equality. Unknown metadata keeps the exact legacy/error path.
+    payload["official_trading_universe"] = {"fingerprint": "test", "nested": [2 ** 53 + 1, True, None, -0.]}
+    for normalized in (True, False):
+        wire, _ = quotes._encode_tw_opening_receipt(payload, normalized_rows=normalized)
+        actual = json.loads(wire)
+        assert actual == payload
+        assert type(actual["official_trading_universe"]["nested"][0]) is int
+    before = path.read_bytes()
+    for invalid in (float("nan"), float("inf"), -float("inf"), b"not-a-json-string", datetime.now(TAIPEI)):
+        payload["rows"]["A"]["opening_conflicts"] = [{"value": invalid}]
+        with pytest.raises((ValueError, TypeError)):
+            quotes._encode_tw_opening_receipt(payload, normalized_rows=True)
+        assert path.read_bytes() == before
+    payload["rows"]["A"]["opening_conflicts"] = [{"counter": 2 ** 128}]
+    wire, policy = quotes._encode_tw_opening_receipt(payload, normalized_rows=True)
+    assert policy == "strict_stdlib_json" and json.loads(wire) == payload
+    payload["rows"]["A"]["opening_conflicts"] = []
+    payload["source_artifact"] = "\ud800"
+    with pytest.raises(UnicodeEncodeError):
+        quotes._encode_tw_opening_receipt(payload, normalized_rows=True)
+    loop = []
+    loop.append(loop)
+    payload["source_artifact"] = loop
+    with pytest.raises(ValueError, match="Circular"):
+        quotes._encode_tw_opening_receipt(payload, normalized_rows=True)
 
 
 @pytest.mark.parametrize("return_to_original_root", [False, True])

@@ -5,16 +5,121 @@ from __future__ import annotations
 import ctypes
 from collections import OrderedDict
 import hashlib
+import json
+import marshal
 import os
 from pathlib import Path
 import select
 import stat as stat_module
+import sys
 import threading
 from typing import Collection, Mapping
 
 _SIGNATURE_CACHE: OrderedDict[Path, tuple[tuple[int, ...], bytes]] = OrderedDict()
 _SIGNATURE_CACHE_LOCK = threading.Lock()
 _MAX_SIGNATURES = 512
+
+# Independent of response TTLs: each source invalidates only its own decoded
+# snapshot. A heartbeat must not force decoding every unchanged receipt. This
+# is a disposable read optimization, never a source SHA/acceptance receipt.
+_JSON_SNAPSHOTS: OrderedDict[Path, tuple[tuple[int, ...], object, int]] = OrderedDict()
+_JSON_SNAPSHOT_LOCK = threading.Lock()
+_JSON_SOURCE_LOCKS = tuple(threading.Lock() for _ in range(32))
+_JSON_MAX_RESIDENT_BYTES = 32 * 1024**2
+_JSON_MAX_ENTRIES = 512
+_JSON_RESIDENT_BYTES = 0
+_JSON_COUNTS = {"hits": 0, "decodes": 0, "decoded_bytes": 0, "rejected_races": 0}
+
+
+def _json_resident_charge(packet):
+    # Only the owned immutable packet is resident, not a second mutable tree.
+    # Account for it directly, plus the bounded LRU/path/metadata envelope.
+    return 512 + sys.getsizeof(packet)
+
+
+def json_snapshot_metrics() -> dict[str, int]:
+    """Aggregate engineering telemetry; never expose private source paths."""
+    with _JSON_SNAPSHOT_LOCK:
+        return {**_JSON_COUNTS, "entries": len(_JSON_SNAPSHOTS),
+                "resident_charge_bytes": _JSON_RESIDENT_BYTES}
+
+
+def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None):
+    """Decode only changed sources and return a mutation-isolated JSON value.
+
+    Full dev/inode/size/mtime/ctime fences cover append, truncation, in-place
+    corrections, atomic replacement and symlink rotation. A partial/malformed
+    write never installs a cache entry or returns an older snapshot as current.
+    Same-source reads are single-flight; independent sources need no global
+    I/O lock. Callers keep their original type, size and freshness policies.
+    """
+    global _JSON_RESIDENT_BYTES
+    source = Path(path).absolute()
+    if max_bytes is not None and max_bytes < 0:
+        raise ValueError("JSON snapshot size limit must be nonnegative")
+    with _JSON_SOURCE_LOCKS[hash(source) % len(_JSON_SOURCE_LOCKS)]:
+        try:
+            before = source.stat()
+            signature = metadata_signature(before)
+            if not stat_module.S_ISREG(before.st_mode) or (
+                max_bytes is not None and before.st_size > max_bytes
+            ):
+                return default
+            with _JSON_SNAPSHOT_LOCK:
+                cached = _JSON_SNAPSHOTS.get(source)
+                if cached is not None and cached[0] == signature:
+                    _JSON_SNAPSHOTS.move_to_end(source)
+                    _JSON_COUNTS["hits"] += 1
+                    value = cached[1]
+                else:
+                    value = None
+            if cached is not None and cached[0] == signature:
+                # Never hand a shared mutable dict/list to a projection builder.
+                # NEVER deserialize caller/file-supplied marshal bytes. This
+                # ephemeral packet was generated here from json.loads-only
+                # primitives, in this process/Python version. C-level cloning
+                # preserves isolation without slower generic deep copying.
+                result = marshal.loads(value)
+                if signature == metadata_signature(source.stat()):
+                    return result
+                with _JSON_SNAPSHOT_LOCK:
+                    _JSON_COUNTS["rejected_races"] += 1
+                return default
+            with source.open("rb") as stream:
+                if signature != metadata_signature(os.fstat(stream.fileno())):
+                    return default
+                raw = stream.read() if max_bytes is None else stream.read(max_bytes + 1)
+                finished = metadata_signature(os.fstat(stream.fileno()))
+            if max_bytes is not None and len(raw) > max_bytes:
+                return default
+            value = json.loads(raw.decode("utf-8"))
+            with _JSON_SNAPSHOT_LOCK:
+                _JSON_COUNTS["decodes"] += 1
+                _JSON_COUNTS["decoded_bytes"] += len(raw)
+            if signature != finished or signature != metadata_signature(source.stat()):
+                with _JSON_SNAPSHOT_LOCK:
+                    _JSON_COUNTS["rejected_races"] += 1
+                return default
+            packet = marshal.dumps(value, 4)
+            charge = _json_resident_charge(packet)
+            if charge <= _JSON_MAX_RESIDENT_BYTES:
+                with _JSON_SNAPSHOT_LOCK:
+                    previous = _JSON_SNAPSHOTS.pop(source, None)
+                    if previous is not None:
+                        _JSON_RESIDENT_BYTES -= previous[2]
+                    while _JSON_SNAPSHOTS and (
+                        len(_JSON_SNAPSHOTS) >= _JSON_MAX_ENTRIES
+                        or _JSON_RESIDENT_BYTES + charge > _JSON_MAX_RESIDENT_BYTES
+                    ):
+                        _, removed = _JSON_SNAPSHOTS.popitem(last=False)
+                        _JSON_RESIDENT_BYTES -= removed[2]
+                    _JSON_SNAPSHOTS[source] = (signature, packet, charge)
+                    _JSON_RESIDENT_BYTES += charge
+            # The caller owns the parse tree; the cache owns only immutable
+            # bytes. Neither a hit nor a miss shares mutable dicts/lists.
+            return value
+        except (OSError, UnicodeError, ValueError):
+            return default
 
 
 def metadata_signature(metadata: os.stat_result) -> tuple[int, ...]:

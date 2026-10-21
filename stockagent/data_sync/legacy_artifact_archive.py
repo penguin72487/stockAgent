@@ -8,6 +8,7 @@ SHA-256 so recovery can be independently checked without a giant tarball.
 from __future__ import annotations
 
 import gzip
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 import hashlib
 import json
@@ -20,6 +21,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -35,6 +37,8 @@ from stockagent.data_sync.desync_snapshots import (
 )
 from stockagent.data_sync.packed_snapshots import (
     _load_inventory,
+    _verified_packed_inventory,
+    _verify_materialized,
     fetch_packed_snapshot,
     publish_packed_snapshot,
     resolve_latest_packed,
@@ -54,6 +58,7 @@ COMPRESSION_PROFILES = {DEFAULT_COMPRESSION_PROFILE, ADAPTIVE_COMPRESSION_PROFIL
                         ZSTD_COMPRESSION_PROFILE, ZSTD3_COMPRESSION_PROFILE}
 CODEC_SUFFIXES = {"raw": "raw", "gzip": "gz", "zstd": "zst"}
 C_TEMP_STAGE_ROOT = Path("/var/lib/stockagent-legacy-archive-stage")
+D_BENCHMARK_STAGE_ROOT = Path("/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch")
 MANUAL_WSL_CAPTURE_CONTRACT = "manual-wsl-artifact-preservation-v1"
 MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations", "benchmarks"}
 MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
@@ -259,11 +264,13 @@ def source_plan(
 
 
 def _paths(spec: LegacyArchiveSpec, artifact_root: Path) -> tuple[Path, Path, Path]:
+    if spec.stage_root == D_BENCHMARK_STAGE_ROOT and not _prunable_stage(spec):
+        raise SnapshotError('guarded D benchmark scratch requires its explicit completed-case scope')
     source = artifact_root / spec.relative_root
     stage = spec.stage_root / spec.dataset
     archive = stage / "archive"
     if (spec.stage_root.is_relative_to(Path("/srv/stockagent-d-volume"))
-        or spec.stage_root == C_TEMP_STAGE_ROOT):
+        or spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT)):
         from stockagent.data_sync.cold_primary import _check_d_primary_mount
 
         _check_d_primary_mount(Path("/srv/stockagent-packed"))
@@ -337,6 +344,108 @@ def _decode_hash(path: Path, codec: str) -> tuple[str, int]:
             digest.update(chunk)
             size += len(chunk)
     return digest.hexdigest(), size
+
+
+class _HashingReader:
+    """Observe every encoded byte consumed by the decoder, in bounded blocks."""
+
+    def __init__(self, source):
+        self.source = source
+        self.digest = hashlib.sha256()
+        self.size = 0
+
+    def read(self, size=COPY_CHUNK):
+        # gzip uses bounded reads, but do not allow a caller to allocate an
+        # entire multi-GB encoding through this verification adapter.
+        block = self.source.read(COPY_CHUNK if size < 0 else min(size, COPY_CHUNK))
+        self.digest.update(block)
+        self.size += len(block)
+        return block
+
+
+def _encoded_original_hashes(path: Path, codec: str) -> tuple[str, int, str, int]:
+    """Hash the complete encoding and decoded original in one input pass.
+
+    This does not share a proof across publication/recovery transactions. Each
+    invocation rereads the exact file and retains both hashes and size checks.
+    The zstd CLI still validates the complete stream and its exit status; one
+    bounded feeder overlaps input hashing with decoding without buffering the
+    encoding in memory or permitting a pipe-fill deadlock.
+    """
+    if codec not in CODEC_SUFFIXES:
+        raise SnapshotError(f"unsupported legacy codec: {codec}")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SnapshotError("legacy encoded payload is not a regular file")
+        signature = _source_signature(opened)
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            encoded = _HashingReader(source)
+            original = hashlib.sha256()
+            size = 0
+
+            def consume(stream):
+                nonlocal size
+                while block := stream.read(COPY_CHUNK):
+                    original.update(block)
+                    size += len(block)
+
+            if codec == "raw":
+                # Encoding and original are exactly the same byte sequence.
+                while encoded.read():
+                    pass
+                decoded_digest, size = encoded.digest.hexdigest(), encoded.size
+            elif codec == "gzip":
+                with gzip.GzipFile(fileobj=encoded, mode="rb") as stream:
+                    consume(stream)
+                decoded_digest = original.hexdigest()
+            else:
+                with tempfile.TemporaryFile() as errors:
+                    try:
+                        process = subprocess.Popen(["zstd", "-d", "-q", "-c"],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+                    except OSError as error:
+                        raise SnapshotError("zstd runtime is unavailable") from error
+
+                    def feed():
+                        with process.stdin:
+                            while block := encoded.read():
+                                process.stdin.write(block)
+
+                    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="legacy-decode-input") as pool:
+                        feeding = pool.submit(feed)
+                        try:
+                            consume(process.stdout)
+                            if process.wait() != 0:
+                                raise SnapshotError("legacy zstd decode failed")
+                            # A feeder read/write failure can otherwise look
+                            # like a successfully decoded, shorter stream.
+                            feeding.result()
+                        finally:
+                            process.stdout.close()
+                            if process.poll() is None:
+                                process.terminate()
+                                process.wait()
+                            # Wait for the one writer before closing its input
+                            # descriptor, including decoder/consumer failures.
+                            # A terminated child unblocks a pending pipe write.
+                    decoded_digest = original.hexdigest()
+            # Include any remaining encoded bytes. gzip validates concatenated
+            # members/trailers, zstd consumes stdin to EOF; this explicit drain
+            # also prevents an early-returning adapter from omitting the tail.
+            while encoded.read():
+                pass
+            after = path.lstat()
+            if (_source_signature(os.fstat(fd)) != signature
+                    or not stat.S_ISREG(after.st_mode)
+                    or _source_signature(after) != signature):
+                raise SnapshotError("legacy encoded payload changed during verification")
+            return encoded.digest.hexdigest(), encoded.size, decoded_digest, size
+    except (EOFError, gzip.BadGzipFile, zlib.error) as error:
+        raise SnapshotError("legacy encoded payload decode failed") from error
+    finally:
+        os.close(fd)
 
 
 @contextmanager
@@ -431,15 +540,17 @@ def prepare_archive(
     if not spec.durable_staging and not manual_capture:
         raise SnapshotError('rebuildable staging requires explicit manual capture; cold publication remains durable')
     source, stage, archive = _paths(spec, artifact_root)
-    if spec.stage_root == C_TEMP_STAGE_ROOT:
+    if spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT):
         available = shutil.disk_usage(spec.stage_root.parent).free
         planned_bytes = sum(row["source"]["size"] for row in source_plan(source, spec, manual_capture=manual_capture))
         if available < planned_bytes + 32 * 1024**3:
-            raise SnapshotError("C archive scratch lacks source-size budget plus 32 GiB reserve")
+            volume = "C" if spec.stage_root == C_TEMP_STAGE_ROOT else "guarded D benchmark"
+            raise SnapshotError(f"{volume} archive scratch lacks source-size budget plus 32 GiB reserve")
         # WSL's virtual ext4 free space is not the Windows backing volume's
         # free space. Budget both before a new scratch wave can grow its VHDX.
         windows_c = Path("/mnt/c")
-        if os.path.ismount(windows_c) and shutil.disk_usage(windows_c).free < planned_bytes + 32 * 1024**3:
+        if (spec.stage_root == C_TEMP_STAGE_ROOT and os.path.ismount(windows_c)
+                and shutil.disk_usage(windows_c).free < planned_bytes + 32 * 1024**3):
             raise SnapshotError("Windows C backing volume lacks scratch budget plus 32 GiB reserve")
     references = artifact_process_references(source, legacy_process_scope(spec, artifact_root))
     if references:
@@ -649,9 +760,11 @@ def verify_archive_directory(
             or archive.resolve() not in encoded_file.resolve().parents
         ):
             raise SnapshotError(f"legacy encoded file missing: {encoded}")
-        if encoded_file.stat().st_size != row["encoded_size"] or sha256_file(encoded_file) != row["encoded_sha256"]:
+        if encoded_file.stat().st_size != row["encoded_size"]:
             raise SnapshotError(f"legacy encoded file differs: {encoded}")
-        digest, size = _decode_hash(encoded_file, row["codec"])
+        encoded_digest, encoded_size, digest, size = _encoded_original_hashes(encoded_file, row["codec"])
+        if encoded_size != row["encoded_size"] or encoded_digest != row["encoded_sha256"]:
+            raise SnapshotError(f"legacy encoded file differs: {encoded}")
         if digest != row["original_sha256"] or size != row["source"]["size"]:
             raise SnapshotError(f"legacy decode proof differs: {relative}")
         if source is not None:
@@ -713,8 +826,9 @@ def publish_archive(
         raise SnapshotError('unknown legacy compression profile')
     if not spec.durable_staging and not manual_capture:
         raise SnapshotError('rebuildable staging requires explicit manual capture; cold publication remains durable')
-    if spec.stage_root == C_TEMP_STAGE_ROOT and sync_root.resolve() != Path("/srv/stockagent-packed"):
-        raise SnapshotError("C scratch may publish only into the guarded D canonical cold store")
+    if (spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT)
+            and sync_root.resolve() != Path("/srv/stockagent-packed")):
+        raise SnapshotError("temporary scratch may publish only into the guarded D canonical cold store")
     source, _stage, archive = _paths(spec, artifact_root.resolve())
     if not (archive / 'legacy_archive_manifest.json').exists():
         prepare_archive(spec, artifact_root, manual_capture=manual_capture, repo_root=repo_root)
@@ -762,6 +876,7 @@ def publish_archive(
 
 def verify_cold_archive(
     spec: LegacyArchiveSpec, sync_root: Path, *, verification_root: Path | None = None,
+    reuse_encoded_archive: Path | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Explicit full recovery check without retaining a second cold copy on C.
@@ -777,6 +892,11 @@ def verify_cold_archive(
         or metadata.get("deployable") != "false"
         or metadata.get("source_relative_root") != spec.relative_root):
         raise SnapshotError("cold release is not the allowlisted legacy archive")
+    if reuse_encoded_archive is not None:
+        if verification_root is not None:
+            raise SnapshotError("choose existing encoded bytes or private recovery scratch, not both")
+        return _verify_cold_using_existing_encoding(
+            spec, sync_root, resolved, reuse_encoded_archive, progress=progress)
     needed = int(resolved.manifest["source"]["logical_bytes"])
     admission = None
     if verification_root is None:
@@ -821,6 +941,48 @@ def verify_cold_archive(
     return proof
 
 
+def _verify_cold_using_existing_encoding(spec, sync_root, resolved, archive, *, progress):
+    """Recover/hash every cold file, then decode the EXACT same encoded bytes.
+
+    The publisher's already retained encoding is not a recovery proof. It is
+    merely a byte-for-byte checked decode workspace, avoiding another full
+    encoded-tree allocation. Cold object SHA, all ZIP CRC/member SHA, every
+    independently reconstructed encoded file, original decoded SHA/size/count
+    and fresh local full-tree verification remain mandatory.
+    """
+    archive = Path(archive).absolute()
+    expected = (spec.stage_root / spec.dataset / "archive").absolute()
+    cold = sync_root.resolve()
+    if (archive != expected or archive.resolve() != archive or not archive.is_dir()
+            or archive == cold or cold in archive.parents or archive in cold.parents):
+        raise SnapshotError("existing recovery encoding must be the exact real publisher stage outside cold")
+    metadata = resolved.manifest["metadata"]
+    manifest_path = archive / "legacy_archive_manifest.json"
+    expected_manifest_sha = metadata.get("legacy_manifest_sha256")
+    if sha256_file(manifest_path) != expected_manifest_sha:
+        raise SnapshotError("existing recovery manifest differs from fixed cold metadata")
+    def report(step):
+        return None if progress is None else lambda value: progress({"recovery_step": step, **value})
+    with _verified_packed_inventory(
+            sync_root, resolved, materialized_path=archive, reconstruct_all=True,
+            **_native_read_options(sync_root),
+            progress=report("independent-cold-reconstruction")) as (entries, cold_proof):
+        proof = verify_archive_directory(archive, spec=spec, progress=report("decode-originals"))
+        # A producer may have changed an earlier file while a later original
+        # was decoding. Recheck the complete local tree, not only its manifest.
+        _verify_materialized(archive, resolved.manifest, entries)
+        if sha256_file(manifest_path) != expected_manifest_sha:
+            raise SnapshotError("existing recovery manifest changed during decode")
+    proof.update(snapshot_id=resolved.manifest["snapshot_id"],
+                 manifest_sha256=resolved.manifest_sha256, cold_verified=True,
+                 decoded_originals_verified=True, verification_scratch_removed=True,
+                 verification_only_reconstruction=True, verified_at_epoch=time.time(),
+                 verification_mode="independent_cold_reconstruction_and_exact_encoding_decode_v1",
+                 verification_scratch_created=False, reused_encoded_archive=str(archive),
+                 cold_reconstruction=cold_proof)
+    return proof
+
+
 def _stage_cold_generation(sync_root: Path, spec: LegacyArchiveSpec) -> dict[str, Any]:
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     objects = []
@@ -829,18 +991,33 @@ def _stage_cold_generation(sync_root: Path, spec: LegacyArchiveSpec) -> dict[str
         observed = path.lstat()
         if (path.resolve() != path or not stat.S_ISREG(observed.st_mode)
                 or observed.st_size != item["bytes"]):
-            raise SnapshotError("C stage cold object generation is unavailable")
+            raise SnapshotError("encoding stage cold object generation is unavailable")
         objects.append({"relative": item["relpath"], "signature": _source_signature(observed)})
     return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
             "manifest_sha256": resolved.manifest_sha256, "objects": objects}
 
 
+def _prunable_stage(spec: LegacyArchiveSpec) -> bool:
+    if spec.stage_root == C_TEMP_STAGE_ROOT:
+        return True
+    return (spec.stage_root == D_BENCHMARK_STAGE_ROOT
+            and spec.capture_contract == MANUAL_WSL_CAPTURE_CONTRACT
+            and spec.relative_root.startswith("benchmarks/")
+            and reviewed_wsl_artifact_root(spec.relative_root)
+            and spec.manual_capture_min_stable_hours is not None
+            and spec.manual_capture_min_stable_hours >= 12)
+
+
 def plan_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path
 ) -> dict[str, Any]:
-    """Audit only the bounded C encoding scratch after exact hot retirement."""
-    if spec.stage_root != C_TEMP_STAGE_ROOT:
-        raise SnapshotError("stage pruning is restricted to the catalog's bounded C temporary root")
+    """Audit bounded temporary encoding only after exact hot retirement.
+
+    Existing D legacy stages/objects remain excluded. Only the separate explicit
+    completed-benchmark scratch may share these full recovery/quarantine gates.
+    """
+    if not _prunable_stage(spec):
+        raise SnapshotError("stage pruning is restricted to the reviewed temporary roots")
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     from stockagent.data_sync.materialized_cache import process_references, _pinned_snapshot_ids
     from stockagent.data_sync.artifact_retirement import _reclaimable_file_bytes
@@ -848,18 +1025,18 @@ def plan_archive_stage_prune(
     _check_d_primary_mount(sync_root)
     source = artifact_root.resolve() / spec.relative_root
     if source.exists() or source.is_symlink():
-        raise SnapshotError("C stage pruning requires completed hot-source retirement")
+        raise SnapshotError("encoding stage pruning requires completed hot-source retirement")
     stage = spec.stage_root / spec.dataset
     if stage.is_symlink() or stage.resolve() != stage or not stage.is_dir():
-        raise SnapshotError("C stage is missing or redirected")
+        raise SnapshotError("encoding stage is missing or redirected")
     state = json.loads((state_root / "retirements" / f"{spec.dataset}.json").read_text())
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     if (state.get("state") != "cold-only" or state.get("dataset") != spec.dataset
         or state.get("relative_root") != spec.relative_root
         or state.get("snapshot_id") != resolved.manifest["snapshot_id"]):
-        raise SnapshotError("C stage retirement state differs from the selected cold release")
+        raise SnapshotError("encoding stage retirement state differs from the selected cold release")
     if str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized")):
-        raise SnapshotError("C stage release is pinned")
+        raise SnapshotError("encoding stage release is pinned")
     generation = _stage_cold_generation(sync_root, spec)
     identity_before = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
                        "manifest_sha256": resolved.manifest_sha256}
@@ -867,7 +1044,7 @@ def plan_archive_stage_prune(
     archive = stage / "archive"
     proof = verify_archive_directory(archive, spec=spec)
     if sha256_file(archive / "legacy_archive_manifest.json") != resolved.manifest.get("metadata", {}).get("legacy_manifest_sha256"):
-        raise SnapshotError("C stage manifest differs from the cold release")
+        raise SnapshotError("encoding stage manifest differs from the cold release")
     inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
                            reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
@@ -876,23 +1053,23 @@ def plan_archive_stage_prune(
     if json.loads((stage / "source_plan.json").read_text()) != [
         {"path": row["path"], "source": row["source"]} for row in rows
     ]:
-        raise SnapshotError("C stage source-plan control file differs")
+        raise SnapshotError("encoding stage source-plan control file differs")
     expected = {"source_plan.json", "archive/legacy_archive_manifest.json"}
     for row in rows:
         expected.add("archive/" + row["encoded_path"])
         key = hashlib.sha256(row["path"].encode()).hexdigest()
         name = "receipts/" + key + ".json"
         if json.loads((stage / name).read_text()) != row:
-            raise SnapshotError("C stage per-file receipt differs")
+            raise SnapshotError("encoding stage per-file receipt differs")
         expected.add(name)
     signatures = []
     for parent, dirs, files in os.walk(stage, followlinks=False):
         if any((Path(parent) / name).is_symlink() for name in dirs):
-            raise SnapshotError("C stage contains a symlink directory")
+            raise SnapshotError("encoding stage contains a symlink directory")
         for name in files:
             path = Path(parent) / name
             if not stat.S_ISREG(path.lstat().st_mode):
-                raise SnapshotError("C stage contains a non-regular file")
+                raise SnapshotError("encoding stage contains a non-regular file")
             signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(path.lstat())})
     signatures.sort(key=lambda row: row["path"])
     observed_paths = {row["path"] for row in signatures}
@@ -904,19 +1081,19 @@ def plan_archive_stage_prune(
         if (canonical not in expected or path.stat().st_size > 65536
                 or path.stat().st_size != (stage/canonical).stat().st_size
                 or sha256_file(path) != sha256_file(stage/canonical)):
-            raise SnapshotError("C stage has unknown or missing files; preserve for audit")
+            raise SnapshotError("encoding stage has unknown or missing files; preserve for audit")
         # This is an exact duplicate of a control receipt already checked
         # against the fixed original manifest, never an unclassified payload.
         duplicates.append({"path":extra,"canonical_receipt":canonical,"sha256":sha256_file(path)})
     if observed_paths != expected | {r["path"] for r in duplicates}:
-        raise SnapshotError("C stage has unknown or missing files; preserve for audit")
+        raise SnapshotError("encoding stage has unknown or missing files; preserve for audit")
     if process_references(stage):
-        raise SnapshotError("C stage has live process references")
+        raise SnapshotError("encoding stage has live process references")
     identity = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
                 "manifest_sha256": resolved.manifest_sha256, "signatures": signatures}
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     if stage_before != fingerprint or _stage_cold_generation(sync_root, spec) != generation:
-        raise SnapshotError("C stage or cold generation changed during full verification")
+        raise SnapshotError("encoding stage or cold generation changed during full verification")
     return {"dataset": spec.dataset, "stage": str(stage), "snapshot_id": resolved.manifest["snapshot_id"],
             "manifest_sha256": resolved.manifest_sha256, "apply_ready": True,
             "stage_fingerprint": fingerprint,
@@ -931,11 +1108,11 @@ def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any]) -> str:
     signatures = []
     for parent, dirs, files in os.walk(stage, followlinks=False):
         if any((Path(parent) / name).is_symlink() for name in dirs):
-            raise SnapshotError("C stage contains a symlink directory")
+            raise SnapshotError("encoding stage contains a symlink directory")
         for name in files:
             path = Path(parent) / name
             if not stat.S_ISREG(path.lstat().st_mode):
-                raise SnapshotError("C stage contains a non-regular file")
+                raise SnapshotError("encoding stage contains a non-regular file")
             signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(path.lstat())})
     signatures.sort(key=lambda row: row["path"])
     identity = {"dataset": plan["dataset"], "snapshot_id": plan["snapshot_id"],
@@ -958,7 +1135,7 @@ def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, ex
     from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids
     _check_d_primary_mount(sync_root)
     proof = plan.get("full_verification", {})
-    if (spec.stage_root != C_TEMP_STAGE_ROOT or plan.get("dataset") != spec.dataset
+    if (not _prunable_stage(spec) or plan.get("dataset") != spec.dataset
             or plan.get("stage") != str(spec.stage_root / spec.dataset)
             or plan.get("stage_fingerprint") != expected_fingerprint or plan.get("apply_ready") is not True
             or proof.get("contract") != "owned-archive-stage-verification-v1"
@@ -966,7 +1143,7 @@ def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, ex
             or proof.get("artifact_root") != str(artifact_root.resolve())
             or proof.get("state_root") != str(state_root.resolve())
             or proof.get("cold_generation") != _stage_cold_generation(sync_root, spec)):
-        raise SnapshotError("owned C stage full verification expired or its generation changed")
+        raise SnapshotError("owned encoding stage full verification expired or its generation changed")
     state = json.loads((state_root / "retirements" / f"{spec.dataset}.json").read_text())
     source = artifact_root.resolve() / spec.relative_root
     if (state.get("state") != "cold-only" or state.get("dataset") != spec.dataset
@@ -976,7 +1153,7 @@ def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, ex
             or proof["cold_generation"]["snapshot_id"] != plan["snapshot_id"]
             or source.exists() or source.is_symlink()
             or plan["snapshot_id"] in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))):
-        raise SnapshotError("owned C stage retirement, source or pin gate changed")
+        raise SnapshotError("owned encoding stage retirement, source or pin gate changed")
 
 
 def _apply_archive_stage_prune(
@@ -993,18 +1170,18 @@ def _apply_archive_stage_prune(
         _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
         stage = Path(plan["stage"])
         if stage.is_symlink() or stage.resolve() != stage or not stage.is_dir():
-            raise SnapshotError("C stage is missing or redirected")
+            raise SnapshotError("encoding stage is missing or redirected")
         if _stage_prune_fingerprint(Path(plan["stage"]), plan) != expected_fingerprint:
-            raise SnapshotError("C stage changed after dry run")
+            raise SnapshotError("encoding stage changed after dry run")
     if plan["stage_fingerprint"] != expected_fingerprint:
-        raise SnapshotError("C stage changed after dry run")
+        raise SnapshotError("encoding stage changed after dry run")
     stage = Path(plan["stage"])
     quarantine = stage.with_name(f".{spec.dataset}.pruning-{os.getpid()}")
     if quarantine.exists() or quarantine.is_symlink():
-        raise SnapshotError("unfinished C stage quarantine requires audit")
+        raise SnapshotError("unfinished encoding stage quarantine requires audit")
     os.replace(stage, quarantine)
     if _stage_prune_fingerprint(quarantine, plan) != expected_fingerprint:
-        raise SnapshotError("C stage changed during rename; quarantine retained")
+        raise SnapshotError("encoding stage changed during rename; quarantine retained")
     verify_archive_directory(quarantine / "archive", spec=spec)
     _check_d_primary_mount(sync_root)
     resolved = resolve_latest_packed(sync_root, spec.dataset)
@@ -1015,7 +1192,7 @@ def _apply_archive_stage_prune(
                                **_native_read_options(sync_root))
     else:
         # The same CLI owner just decoded every fixed D member outside this
-        # mutation. Retain the full post-rename C decode and fresh generation,
+        # mutation. Retain the full post-rename encoding decode and fresh generation,
         # source, state, pin, process and quarantine checks; never extend proof.
         _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
     source = artifact_root.resolve() / spec.relative_root
@@ -1023,7 +1200,7 @@ def _apply_archive_stage_prune(
         or process_references(stage) or source.exists() or source.is_symlink()
         or str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))
         or _stage_prune_fingerprint(quarantine, plan) != expected_fingerprint):
-        raise SnapshotError("C stage final gates changed; quarantine retained")
+        raise SnapshotError("encoding stage final gates changed; quarantine retained")
     shutil.rmtree(quarantine)
     return {**plan, "pruned": True, "reclaimed_allocated_file_bytes": plan["reclaimable_allocated_file_bytes"]}
 

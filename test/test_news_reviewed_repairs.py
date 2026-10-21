@@ -132,6 +132,150 @@ def test_only_explicit_parser_outcomes_are_admitted(queue, state):
     assert head(queue) == dict(before, state="retry")
 
 
+def test_original_abi1_semantic_request_still_resumes(queue):
+    before = failure(queue)
+    result = submit(queue)
+    path = Path(result["request_path"])
+    request = json.loads(path.read_bytes())
+    request["contract_version"] = 1
+    rewrite(path, request)
+    assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
+    assert head(queue) == dict(before, state="retry")
+
+
+def test_abi2_scope_state_cannot_override_another_publishers_rights(queue):
+    failure(queue)
+    result = submit(queue)
+    path = Path(result["request_path"])
+    request = json.loads(path.read_bytes())
+    before = failure(queue, state="article_rights_or_scope_excluded", error_code="article_rights_or_scope_excluded")
+    request["targets"] = [repair._head(before)]
+    rewrite(path, request)
+    assert repair.consume_repairs(queue)["outcomes"] == {"not_semantic_parser_failure": 1}
+    assert head(queue) == before
+
+
+@pytest.fixture
+def mitrade_queue(tmp_path):
+    from downloader.news_fulltext import load_config
+    settings, _, repo = load_config(Path("configs/news_fulltext.json"))
+    settings = deepcopy(settings)
+    settings["providers"] = [entry for entry in settings["providers"] if entry["id"] == "mitrade"]
+    owner = NewsQueue(tmp_path, PolicyRegistry(settings, base=repo))
+    yield owner, settings, repo
+    owner.close()
+
+
+MITRADE_URL = "https://www.mitrade.com/zh/insights/shares-analysis/more/20250919S05"
+
+
+def legacy_scope_failure(queue, url=MITRADE_URL, **changes):
+    values = {"state": "article_rights_or_scope_excluded", "error_code": "article_rights_or_scope_excluded",
+              "last_checked_at_utc": "2026-10-20T23:07:06.765225+00:00"}
+    values.update(changes)
+    return failure(queue, url, **values)
+
+
+def test_reviewed_v7_legacy_scope_retry_reuses_live_owner_without_scope_or_budget_reset(mitrade_queue, monkeypatch):
+    queue, _, _ = mitrade_queue
+    before = legacy_scope_failure(queue)
+    with queue.db:
+        queue.db.execute("INSERT INTO queue_settings VALUES ('failure_validation_metadata_attempts:v1:mitrade:article_rights_or_scope_excluded:20261020','2')")
+    settings_before = dict(queue.db.execute("SELECT key,value FROM queue_settings"))
+    owner, changes = queue.owner, queue.db.total_changes
+    monkeypatch.setattr("downloader.news_fulltext_http.NewsHTTP.__init__", lambda *a, **k: pytest.fail("no HTTP during repair"))
+    result = submit(queue, (MITRADE_URL,))
+    assert result["submitted_targets"] == 1 and result["publisher_requests"] == 0
+    assert not result["queue_mutations"] and head(queue, MITRADE_URL) == before
+    assert queue.owner == owner and queue.db.total_changes == changes
+    request = repair._load(Path(result["request_path"]))
+    assert request["contract_version"] == 2
+    assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
+    assert head(queue, MITRADE_URL) == dict(before, state="retry")
+    assert dict(queue.db.execute("SELECT key,value FROM queue_settings")) == settings_before
+    assert queue.owner == owner and repair.consume_repairs(queue)["processed"] == 0
+
+
+@pytest.mark.parametrize("changes", [
+    {"body_sha256": "a" * 64}, {"parquet_path": "saved.parquet"}, {"body_bytes": 1},
+    {"captured_at_utc": "2026-01-01T00:00:00+00:00"}, {"lease_owner": "live"}, {"lease_until": 1},
+    {"due": time.time() + 86400}, {"attempts": -1}, {"error_code": "http_403"},
+    {"last_checked_at_utc": None}, {"last_checked_at_utc": "2026-01-01"},
+    {"last_checked_at_utc": repair._MITRADE_PRIOR_SCOPE_CUTOFF},
+    {"last_checked_at_utc": "2026-10-20T23:46:59+00:00"},
+    {"last_checked_at_utc": "2099-01-01T00:00:00+00:00"},
+    {"state": "http_429", "error_code": "http_429"},
+    {"state": "robots_disallowed", "error_code": "robots_disallowed"},
+])
+def test_legacy_scope_retry_never_touches_current_failures_deadlines_leases_or_refusals(mitrade_queue, changes):
+    queue, _, _ = mitrade_queue
+    before = legacy_scope_failure(queue, **changes)
+    result = submit(queue, (MITRADE_URL,))
+    assert not result["submitted"] and head(queue, MITRADE_URL) == before
+
+
+@pytest.mark.parametrize("field,value", [("embedded_article_layout", "mitrade_visible_article_v6"),
+    ("note", "Changed capture contract"), ("enabled", False)])
+def test_legacy_scope_retry_requires_the_entire_pinned_reviewed_capture(mitrade_queue, field, value):
+    queue, settings, repo = mitrade_queue
+    before = legacy_scope_failure(queue)
+    settings["providers"][0][field] = value
+    queue.registry = PolicyRegistry(settings, base=repo)
+    assert not submit(queue, (MITRADE_URL,))["submitted"]
+    assert head(queue, MITRADE_URL) == before
+
+
+def test_legacy_scope_repair_never_admits_regional_path_or_refreshes_completed_body(mitrade_queue):
+    queue, _, _ = mitrade_queue
+    regional = MITRADE_URL.replace("/zh/", "/zh-au/")
+    native = legacy_scope_failure(queue)
+    region = legacy_scope_failure(queue, regional)
+    saved = legacy_scope_failure(queue, MITRADE_URL+"-saved", body_sha256="b" * 64)
+    result = submit(queue, (MITRADE_URL, regional, MITRADE_URL+"-saved"))
+    assert result["submitted_targets"] == 1 and len(result["excluded"]) == 2
+    assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
+    assert head(queue, MITRADE_URL) == dict(native, state="retry")
+    assert head(queue, regional) == region and head(queue, MITRADE_URL+"-saved") == saved
+
+
+def test_legacy_scope_request_rechecks_head_and_source_on_admission(mitrade_queue):
+    queue, settings, repo = mitrade_queue
+    legacy_scope_failure(queue)
+    assert submit(queue, (MITRADE_URL,))["submitted"]
+    settings["providers"][0]["authorization"]["scope"] += " Unreviewed later change."
+    queue.registry = PolicyRegistry(settings, base=repo)
+    before = head(queue, MITRADE_URL)
+    assert repair.consume_repairs(queue)["outcomes"] == {"not_semantic_parser_failure": 1}
+    assert head(queue, MITRADE_URL) == before
+
+
+def test_legacy_scope_retry_does_not_rearm_after_unknown_byline_or_duplicate_review(mitrade_queue):
+    queue, _, _ = mitrade_queue
+    legacy_scope_failure(queue)
+    assert submit(queue, (MITRADE_URL,))["submitted"]
+    assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
+    # Even a replay of the old observation cannot bypass the once-per-parser marker.
+    before = legacy_scope_failure(queue, attempts=8)
+    assert submit(queue, (MITRADE_URL,))["excluded"][0]["reason"] == "already_admitted_for_parser"
+    assert head(queue, MITRADE_URL) == before
+    # A real v7 response with an unreviewed byline remains excluded, not retried.
+    current = legacy_scope_failure(queue, attempts=8, last_checked_at_utc="2026-10-20T23:47:01+00:00")
+    assert not submit(queue, (MITRADE_URL,))["submitted"]
+    assert head(queue, MITRADE_URL) == current
+
+
+def test_original_abi1_cannot_be_used_to_submit_new_scope_failure(mitrade_queue):
+    queue, _, _ = mitrade_queue
+    before = legacy_scope_failure(queue)
+    result = submit(queue, (MITRADE_URL,))
+    path = Path(result["request_path"])
+    request = json.loads(path.read_bytes())
+    request["contract_version"] = 1
+    rewrite(path, request)
+    assert repair.consume_repairs(queue)["outcomes"] == {"invalid_request": 1}
+    assert head(queue, MITRADE_URL) == before
+
+
 @pytest.mark.parametrize("changes,expected", [
     ({"attempts": 8}, "head_changed_since_review"),
     ({"due": 1}, "head_changed_since_review"),

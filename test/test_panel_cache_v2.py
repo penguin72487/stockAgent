@@ -28,6 +28,34 @@ def _namespace_test_panel():
     )
 
 
+@pytest.mark.parametrize("protection", ["invalid_metadata", "active_mmap", "incomplete_scan"])
+def test_panel_cleanup_retains_unknown_or_actively_read_old_generations(tmp_path, monkeypatch, protection):
+    import stockagent.data_sync.materialized_cache as cache_refs
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    panel = _namespace_test_panel()
+    save_panel_cache_v2(tmp_path, panel, source_hash="old", backend_key="b", version=123)
+    root = panel_cache.panel_cache_v2_dir(tmp_path)
+    old = panel_cache.read_panel_cache_v2_meta(tmp_path)
+    old_path = root / old["arrays"]["features"]["file"]
+    old_meta = panel_cache_v2_variant_meta_path(tmp_path, source_hash="old", backend_key="b", version=123)
+    held = None
+    if protection == "invalid_metadata":
+        (root / "variants/unknown.json").write_text('{"generation":')
+    elif protection == "active_mmap":
+        held = np.load(old_path, mmap_mode="r", allow_pickle=False)
+    else:
+        def incomplete(*args, **kwargs):
+            raise SnapshotError("incomplete process-reference scan")
+        monkeypatch.setattr(cache_refs, "process_references_many", incomplete)
+    panel.features.fill(9)
+    save_panel_cache_v2(tmp_path, panel, source_hash="new", backend_key="b", version=123)
+    assert old_path.exists() and old_meta.exists()
+    assert np.load(old_path).tobytes() == _namespace_test_panel().features.tobytes()
+    assert load_panel_cache_v2(tmp_path)["features"].tobytes() == panel.features.tobytes()
+    if held is not None:
+        assert held.tobytes() == _namespace_test_panel().features.tobytes()
+
+
 def test_private_generation_batches_namespace_not_payload_durability(tmp_path, monkeypatch):
     synced_files, barriers = [], []
     fsync, sync_directory, write_json = os.fsync, panel_cache._fsync_directory, panel_cache._write_json

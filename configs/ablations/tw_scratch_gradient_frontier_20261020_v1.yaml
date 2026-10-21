@@ -1,0 +1,44 @@
+# Direction-only experiments from fresh parameters; no old policy or teacher.
+# All model, financial, split and convergence controls inherit the measured recipe.
+base_spec: tw_scratch_sgd_validation_20261019_v1.yaml
+output_root: artifacts/markets/tw_scratch_gradient_frontier_20261020_v1
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: frontier
+      enabled: true
+      variants:
+        - name: unit_mgda_control
+          description: 單位梯度MGDA控制組 / Unit-gradient MGDA control, fresh SGD.
+          overrides: {}
+        - name: simple_log_control
+          description: 單一對數效用控制組 / Single log utility control, fresh SGD.
+          overrides:
+            training:
+              loss_type: log_utility
+        - name: log_anchor_projection
+          description: 對數成長優先共降投影 / Log-preferred UPGrad projection with MGDA gradient length.
+          overrides:
+            training:
+              loss_type: trajectory_upgrad_log_l2_parameter
+        - name: config_matched_length
+          description: 等對齊梯度 / ConFIG direction with contemporaneous MGDA gradient length.
+          overrides:
+            training:
+              loss_type: trajectory_config_l2_parameter
+        - name: config_half_step
+          description: 等對齊梯度半步長 / ConFIG direction, MGDA length and half scalar step.
+          overrides:
+            training:
+              loss_type: trajectory_config_l2_parameter
+              learning_rate: 0.05
+        - name: dibs_one_step
+          description: 單步方向議價 / One-step DiBS direction with MGDA gradient length.
+          overrides:
+            training:
+              loss_type: trajectory_dibs_l2_1_parameter
+        - name: dibs_five_steps
+          description: 五步方向議價 / Five-step DiBS direction with MGDA gradient length.
+          overrides:
+            training:
+              loss_type: trajectory_dibs_l2_5_parameter

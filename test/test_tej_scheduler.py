@@ -21,6 +21,40 @@ def test_start_interval_counts_complete_query_time_without_fixed_finish_sleep(qu
     assert json.loads((root/'scheduler_status.json').read_text())['query_interval_contract']==config['query_interval_contract']
 
 
+@pytest.mark.parametrize('state', ['api_scope_repartitioned', 'selector_scope_repartitioned'])
+@pytest.mark.parametrize('contract', ['minimum_completion_gap_v1', 'minimum_query_start_interval_v1'])
+def test_local_scope_partition_does_not_pay_a_source_query_gap(queue, monkeypatch, state, contract):
+    from types import SimpleNamespace
+    root, config = queue
+    config = {**config, 'query_interval_contract': contract}
+    readings = iter([100, 100.1])
+    monkeypatch.setattr('downloader.tej_scheduler.time', SimpleNamespace(monotonic=lambda: next(readings)))
+    stop = InstantWait()
+    watch_queue(root, None, config, stop=stop, runner=lambda *_: state, max_cycles=1, emit=emit)
+    assert stop.waits == []
+    status = json.loads((root/'scheduler_status.json').read_text())
+    assert status['cycles'] == 1 and status['completed_tasks'] == 0
+
+
+@pytest.mark.parametrize('contract,expected', [
+    ('minimum_completion_gap_v1', [2, 2]),
+    ('minimum_query_start_interval_v1', [1.5, 1.5]),
+])
+def test_local_partitions_preserve_both_real_source_query_gaps(queue, monkeypatch, contract, expected):
+    from types import SimpleNamespace
+    root, config = queue
+    config = {**config, 'query_interval_contract': contract}
+    # A sub-interval real query, two local transitions, then another real query.
+    # The local work neither resets nor forgives either required query gap.
+    readings = iter([100, 100.5, 102, 102.1, 102.1, 102.2, 102.2, 102.7])
+    monkeypatch.setattr('downloader.tej_scheduler.time', SimpleNamespace(monotonic=lambda: next(readings)))
+    replies = iter(['completed_task', 'selector_scope_repartitioned', 'api_scope_repartitioned', 'completed_task'])
+    stop = InstantWait()
+    watch_queue(root, None, config, stop=stop, runner=lambda *_: next(replies), max_cycles=4, emit=emit)
+    assert stop.waits == expected
+    assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks'] == 2
+
+
 @pytest.mark.parametrize('field,value',[('query_interval_contract','unreviewed'),
     ('minimum_export_interval_seconds',True),('minimum_export_interval_seconds',float('nan')),
     ('minimum_export_interval_seconds',-2)])
@@ -120,6 +154,36 @@ def test_restored_interactive_relay_wakes_wait_without_another_source_probe(queu
     watch_queue(root,None,config,stop=stop,runner=lambda *_:calls.append('source') or 'completed_task',max_cycles=1,emit=emit)
     assert calls==['source'] and stop.waits==[5,2]
     assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks']==1
+
+
+def test_repaired_desktop_wakes_recovery_locally_within_five_seconds(queue,monkeypatch):
+    from downloader.tej_startup import CONTRACT as STARTUP_CONTRACT
+    from downloader.artifact_io import atomic_write_json
+    root,config = queue
+    config['automation']['desktop_startup'] = dict(enabled=True,contract=STARTUP_CONTRACT,
+        authorization_basis='explicit_user_request_automatic_tej_restart_after_boot',
+        owned_workbook_windows='%LOCALAPPDATA%\\StockAgent\\TEJSmartWizard\\StockAgent-TEJ-Acquisition.xlsx')
+    add_task(root,error='unknown_outcome_no_auto_retry')
+    atomic_write_json(root/'desktop_session.json',{'test_identity':1})
+    atomic_write_json(root/'desktop_startup_status.json',{'private_evidence_sha256':'old'})
+    monkeypatch.setattr('downloader.tej_scheduler.recover_complete_local_response',lambda *_:False)
+    monkeypatch.setattr('downloader.tej_scheduler.recover_retained_desktop_response',lambda *_:False)
+    monkeypatch.setattr('downloader.tej_startup.desktop_ready',lambda *a,**k:True)
+    calls = []
+
+    class RepairDuringWait(InstantWait):
+        def wait(self,timeout=None):
+            result = super().wait(timeout)
+            if len(self.waits) == 1:
+                atomic_write_json(root/'desktop_startup_status.json',{'private_evidence_sha256':'repaired'})
+                with closing(connect(root)) as con,con:
+                    con.execute("DELETE FROM tasks WHERE last_error_code='unknown_outcome_no_auto_retry'")
+            return result
+
+    stop = RepairDuringWait()
+    watch_queue(root,None,config,stop=stop,runner=lambda *_:calls.append('source') or 'completed_task',
+                max_cycles=1,emit=emit)
+    assert calls == ['source'] and stop.waits == [5,2]
 
 
 def test_metadata_contention_waits_locally_and_never_resets_unknown_source_action(queue):

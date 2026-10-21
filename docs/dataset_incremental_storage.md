@@ -1,10 +1,26 @@
 # 全資料集增量版本架構
 
-最新固定觀測：**2026-10-19 00:01（台北）41／60 項**已完成固定 D 版本的全原檔還原。
-原 owner 已驗收期交所完整根目錄、續跑期貨；OpenBB 中斷的原件工作保留 sealed packs 待續跑，
-都尚未計入完成。這輪修正與測量見末節「控制檔漏判、精確位元打包與實際工作時鐘」。
-即時進度仍讀原狀態工具，
-不能從這段固定觀測推定後續服務已載入或完成。
+2026-10-20 的[容量與精確回收修正](storage_capacity_recovery_2026-10-20.md)補上共同
+fetch／Panel 寫入預算、完整熱冷核驗與既有編碼重用；不是另一套發布／冷庫架構，
+也不表示以下待完成的來源遷移或同步已驗收。
+
+最新固定觀測：**2026-10-21 10:58（台北）55／60 項**已完成固定 D 版本的全原檔還原。
+相較前次 54 項，新增 `local-tw-public`，204,651 原檔／75,657,681,203 bytes
+通過完整冷還原；另回收其已驗收的 **2,042,556,416 allocated bytes** 己方暫存，
+原始來源、D 冷物件、NAS 歷史均未刪除。此前公開 `tw-futures` 與私有期貨根的
+三個跨根固定依賴也已獨立驗收，不能把兩個期貨根混作同一項。
+FinLab 及 OpenBB 分別因目錄清冊、運作日誌更新退回重試；舊 sealed packs 保留，
+不把失敗前 83.79／106.07 GB 或 5,446,168／8,010,483 檔樣本當成現在活動。
+這輪已修復持續變動的運作檔案捕捉邊界；10:41 正式服務實載新版，55 組固定版本
+及三條持久鏈均保留，FinLab 已由原 owner 續跑。10:58 再次讀回核對，不把測試
+通過或服務存活當作剩餘五項已完成。
+此前約 **19.73 GB** 測試副本與 **4.07 GB** 臨時編碼已通過回收及刪後讀回，
+是前一批，不再算作 10:58 新增回收；原值冷庫與六份小型測試證據仍保留。
+此前已回收的 62,330,454,016 與 28,611,452,928 allocated bytes 是不同舊批次，
+不重算為本輪新增回收；D／NAS 歷史未刪除。
+最新觀測、剩餘五項、修正邊界與依工作負載分開報告的完整 ABBA 實測記錄於末節，
+不因此宣稱全庫／NAS／遠端訓練已完成。
+即時進度仍讀原狀態工具；來源追新、60 項遷移、NAS 全歷史驗收是不同分母。
 
 ## 核心：版本是視圖，不是另一份全庫
 
@@ -1381,3 +1397,1029 @@ focused suite **39 passed**；與前述 702 組回歸互有重疊，不把兩數
 OpenBB 大庫、FinLab 官方 base 版本對齊／遠端 READY，與 NAS 全歷史驗收。
 舊錯誤不代表新版重犯，反過來，測試通過、來源可發布或單個固定版本完整讀回，
 也不能替代這些尚未完成的驗收。尚未證明只剩硬體計算／傳輸限制。
+
+## 2026-10-19：重開機續跑、原生控制範圍與拒絕未證明加速的方案
+
+### 原佇列存活，舊錯誤與當次工作分開
+
+本機 00:52 重開機後，原 `stockagent-storage-lifecycle.service` 自動恢復；
+01:23 的[當次 attempt 投影](../artifacts/operations/migration-v7-live-progress-20261019T0125.json)
+為 **41 verified、15 waiting_retry、3 waiting_source_owner、1 processing**。
+當次 `bybit` 的 owner／boot／PID start／鎖均吻合，已處理
+22,911,389,592／22,911,414,661 logical bytes，正在 `packing_changed_small_files`。
+主 transition journal 尚停在前次來源切換，不代表這個工作未前進。
+來源進度及 bytes 僅描述該 attempt 的發布工作，不能作為全域百分比。
+
+`last_failure` 可能是 10/17 的舊錯誤；本輪確實新失敗的是私有整庫的三個精確位置：
+
+| 來源 | 真正變動的位置 | 修正 |
+| --- | --- | --- |
+| `local-tw-futures` | `shioaji_history/FT1R1/download.lock` 等 contract 控制鎖內容 | 固定鎖內容觀測；絕不更換／刪除活鎖 inode |
+| `local-bybit` | `1m/download_report.csv` | 只固定三種 canonical grain 的控制報告與 `.download.lock` |
+| `local-tw-public` | `features/tw_public_stock_daily.parquet` | 已確認原 builder 關檔、驗證來源後才原子替換；有界串流固定這張表 |
+
+`recursive_mutable_controls_v7` 只擴充上述命名範圍；v3–v6 舊準備狀態以 named
+probes 升級，不重新遍歷數百萬原件、不重做 SQLite backup、不更新舊固定控制值。
+任意原始 CSV／lock／Parquet 仍不能被套用例外。不是把下載中的資料假裝成原子整庫。
+
+[原機獨立預檢](../artifacts/operations/migration-v7-native-controls-proof-20261019.json)
+確認期貨新增 **772 個鎖觀測／89,552 bytes**，Bybit 新增 **4 個控制觀測／180,700
+bytes**，TW public 新增 **1,336,536,215-byte** 官方特徵表。
+全部新增 bytes 均完成 SHA 核對，舊準備收據不變，SQLite backup 重做為零；
+試跑自己的 scratch 已刪除。這不是三個完整來源已通過遷移的收據。
+
+分鐘原 collector 正常重用完整 audit，並在持有 FD 9 的同一原生 runner 裡呼叫
+原 publisher 的 `--source-lock-fd 9`，依序處理 `tw-minute-source-cold`／
+`tw-minute-train`。其他工作等待該 runner 是正常排他，不得拆鎖、刪鎖或繞過驗證。
+FinLab 原排程在 01:07 發布新的 research 固定版本，但對應官方 base 的
+`base_cold_feature_match=false` 仍是真實缺口。01:09 喚醒原 cold-publish service
+得到 `canonical_refresh_lock_busy`，保留 defer；不是把缺少證據改成完成。
+
+### Native chunk 雜湊實驗：位元正確不代表值得採用
+
+唯讀 stack sample 找到已存在 CAS 區塊仍經 WSL 完整雜湊的熱點，因此測試原生
+Windows 批次 SHA：每批最多 16 個、有 byte bound，保留完整 hash、D guard、
+來源／冷檔世代 fence 與失敗保留舊 head。不是用 metadata cache 免驗。
+
+[同資源 D 槽 ABBA](../artifacts/benchmarks/chunk_reuse_native_20261019/native-d-abba.json)
+每輪含 64 MiB fixture 的既有 CAS 發布、完整冷還原、durable materialization／獨立
+讀回、no-op、增量修訂、完整新舊版本還原及自有 fixture 清理。四輪原值、inventory
+與歷史版本一致；沒有寫 production sources 或 production CAS。
+
+| 平均 wall，秒 | 原方案 | 原生批次候選 |
+| --- | ---: | ---: |
+| 第一次發布 | 4.066 | 5.441 |
+| 增量發布 | 1.680 | 1.549 |
+| 兩次發布合計 | **5.746** | **6.990** |
+| 含全部還原的完整流程 | 80.191 | 51.155 |
+
+完整均值不能直接解讀成 36% 加速：第一輪原方案的增量還原耗時 70.045 秒，其他
+三輪同階段僅 16.492–17.459 秒，差異在未修改的還原路徑；候選要改善的兩次發布
+合計反而慢 **21.6%**。另外 Python process CPU 不包含原生子程序，不能把它變少
+解讀成整機 CPU 變少。**本輪拒絕部署這個候選**，production 保留原完整 SHA 路徑。
+凍結的 baseline／candidate 與收據保留在忽略的 benchmark artifacts；共同 benchmark
+支援指定兩份固定 SHA 的 writer，未採用程式不必留在 production hot path。
+
+### 驗證、換版與清理分開
+
+修正與候選並存時的共用回歸為 **795 passed、13 skipped**，其中一個 legacy 案例
+在鎖定 control role 缺 numpy，已在既有 fintech runtime 通過，未向 control role
+安裝數值套件。撤掉候選後的正式採用範圍 focused suite 為 **183 passed、8 skipped**，
+最終二十二組共用回歸為 **781 passed、13 skipped、1 deselected**，另維持原
+SHA／CRC／SQLite／來源突變等 gate。這些測試集合互有重疊，不能相加成獨立測試數。
+
+01:23 已排入原 `rollout_lakehouse_source_policy --reload-code-only`，等原 owner
+完成當次來源的安全邊界；沒有強制打斷已雜湊 22.9 GB 的來源，也未重啟 PG／Temporal。
+**排入不算實載成功**；要以新換版收據、`worker-ready` identity 及後續完整 workflow
+history replay 另行驗收。
+原管理入口也排入有時限的換版後只讀驗證；只在上述 accepted 收據出現後，才呼叫
+原 `verify_lakehouse_workflow_history --include-dataset-versions`，不重設／新開任何
+workflow。等待或排程收據不是 replay accepted 證據。
+
+本輪託管 cleanup dry run 是 **6 checked、0 would_evict、0 evicted**；pin／lease
+保護維持，來源、CAS、NAS／Restic 歷史刪除數均為零。清掉的是已核對、自有的預檢／
+benchmark fixtures，不能把這些測試空間申報成歷史資料回收，也不重複加總前輪回收。
+未知 provenance 的舊 metadata scratch 仍保留，不能只憑檔名與年齡刪除。
+
+01:21 配對 NAS 狀態仍為 ready／0 pending bytes／無 receipt errors；這證明當前
+transport 工作收斂，不證明 `full_history_backup_verified`，更不證明所有來源
+已完成原件還原。**全庫任務保持 active；未證明僅剩硬體上限。**
+
+01:32:45 的[原機獨立投影與只讀 stack sample](../artifacts/operations/migration-v7-final-observation-20261019.json)
+仍為 **41／60**，Bybit 已從 publication 推進 `recovery`，固定 snapshot 為
+`bybit-20261018T172446908213213Z-l0-penguin-09306704e4ae2cde`。
+冷物件 SHA 進度 **983／2,642 objects、7,553,572,285／24,927,559,190 bytes**，
+當次 sample 約五秒內；stack 也在完整物件 SHA，不是閒置卡住。此時 NAS 仍為
+ready／0 pending jobs，53 recovery plans 的 `full_history_backup_verified=false`。
+01:32:42 又喚醒原 `stockagent-tw-public-cold-publish.service`，本次已進入原
+source-stability／derived-receipt 檢查，不再只依 01:09 的 defer 推斷後續狀態。
+新發布收據尚未產生；不能提前把 official-base 缺口或遠端 READY 畫成通過。
+
+## 2026-10-19：v8 實際換版、數百萬控制檔串流與公平排程
+
+### 進度與真正的阻塞
+
+[09:17 原機讀回](../artifacts/operations/migration-v8-final-observation-20261019.json)
+是 **44 verified、13 waiting_retry、2 waiting_source_owner、1 processing**，
+仍是原 60 項計畫。原 OpenBB attempt 在換版前已處理約 48.7／92.5 GB、
+盤點 7,476,049 個檔案；重載後原 owner 取得原操作排他鎖，保存 interruption 收據，
+保留其準備狀態、封閉 pack hints 與所有來源，並讓其他可做來源接續。
+單一來源仍可能花數小時；「每 activity 一次嘗試」不是任意中斷期限。
+
+原先等 publication 邊界的 v7 換版一小時後逾時，依賴它的驗證也未執行成功。
+這兩份失敗證據保留，不改成成功。根因之一是舊 budget 只計成功來源，失敗鏈仍會
+在同一次 activity 內持有共用操作鎖。現改成成功、失敗、busy 都計入一次嘗試；
+其餘可做來源的 `next_poll_seconds=0`，全部等待時只睡到最早的有界重試期限。
+舊 Temporal 結果沒有這個欄位時仍重播原 30 秒 timer，不改寫既有歷史。
+
+[原 canonical code-only 換版](../artifacts/operations/migration-v8-native-rollout-20261019.json)
+已 accepted：worker PID **2263 → 1055923**，實載 identity 為
+`7f29774676c2202d77c73cf0c3062e7570c7251e91924bb62f2c1b5684383b22`。
+44 個固定驗收 binding 與三條 workflow first-run chain 保留，PG／Temporal server、
+下載器與交易服務未重啟。隨後的
+[SDK 完整歷史重播](../artifacts/operations/migration-v8-post-replay-20261019/acceptance.json)
+分別處理 2,424／216／495 個事件；沒有執行 activity、重設工作流或呼叫 provider。
+
+### 控制檔不再另造數百萬個暫存檔
+
+原機盤點發現 FinMind complement 有 **4,661,254** 份收據，sponsor 有 **256,524** 份；
+FinLab intraday receipts 有 **379,472** 份。把新範圍全部預先凍結成小檔，會新增數百萬
+次建檔／fsync，且 FinMind 舊準備收據本身已約 30.8 MB，不能反覆塞進進度文件。
+因此停止只寫自有 scratch 的 eager-copy 預檢，清掉該預檢自有暫存，改沿用原 ZIP 路徑。
+
+v8 只對 canonical FinLab／FinMind 收據樹、crypto provider/dataset states 與 TEJ
+直接 progress JSON 啟用 stable-FD inline observation：完整 JSON、64 MiB 上限、
+有界三次嘗試、完整 SHA 與原始 bytes 直接進 pack。原冷物件 fsync／SHA／ZIP CRC／
+逐原檔獨立還原都保留；不把 raw JSON、任意 `receipts` basename 或共享來源套入例外。
+觀測分屬不同時刻，不宣稱全庫原子快照。舊準備 capture 與 SQLite native backup 保留。
+metadata 即使溢出到 SQLite，仍按原 census order 重建相同 portable fingerprint ABI，
+並用實際封閉後的大小修正 bytes 進度，不能讓進度超過分母或令原 reader 無法還原。
+
+超過 4,096 項的舊 capture mapping 改由 exact preparation 路徑／SHA／項數引用；
+退休仍讀完整證據逐檔驗證，進度只保存摘要，不省略驗收。
+[四個真實失敗檔案的原機驗證](../artifacts/operations/migration-v8-native-inline-proof-20261019.json)
+通過完整 JSON／CRC／SHA 讀回，原準備日誌不變，沒有新增 loose control copies。
+這不是這四個整庫已完成的證據。
+
+### 完整流程實測、回歸與剩餘界線
+
+[D 槽四輪 A/B/B/A](../artifacts/benchmarks/migration_v8_native_inline_abba_20261019.json)
+使用 256 份生成收據，包含發布、完整冷驗證、materialization／讀回、no-op、增量、
+舊版完整還原與 fixture 清理。eager-copy 設計參考平均 **25.909 秒**，inline 平均
+**6.172 秒**；四輪 inventory 完全一致，inline 的額外 loose copies 為零。
+參考方案的兩輪有波動；這是兩個安全設計的有界比較，不是失敗的舊 production
+已完成同一工作的倍率，更不是全庫或 NAS 的加速倍數。
+重現：
+
+```bash
+bash scripts/run_lakehouse_control.sh python -m scripts.benchmark_dataset_version_pipeline \
+  --native-inline-controls --output artifacts/benchmarks/NEW_RESULT.json
+```
+
+二十二組共用回歸 **818 passed、13 skipped、1 deselected**；另在 fintech role
+通過被 deselect 的四 bucket 全原件還原案例。最終 inline／metadata 檢查
+**180 passed、8 skipped**，新增 benchmark 驗證 **10 passed**。集合重疊，不相加。
+測試涵蓋突變時間點、大小變化、磁碟 spill、raw 突變拒絕、FD 關閉、超大／不完整
+JSON、共享發布拒絕、準備收據遭改動時禁止退休，以及原 source lock／SQLite 邊界。
+
+09:17 `tw-public` 與 `tw-futures` 的輕量發布條件當時可通過，但不能等同實際發布，
+仍由原 owner 再取得鎖並執行稽核。期貨跨根三介面沿用
+[固定 index-futures 連結驗證](../artifacts/operations/migration-futures-source-link-fresh-20261018T1546.json)，
+不接受任意絕對連結；整個 futures 根還須原 queue 的完整還原。
+FinLab general-history gate 當時為 **873 verified、476 stale、1 missing、0 invalid**；
+原 local-refresh 正在追新，過期 release proof 不能藉延長日期變成完成。
+官方 base 冷版本對齊與 remote READY 仍另驗。
+
+配對 NAS 的來源傳輸狀態是 **0 pending bytes、0 retained transport bytes、無 receipt
+errors**；這不是所有歷史都已驗收。managed cache dry run 仍 **6 checked、0 would_evict、
+0 evicted**；只清自有預檢／benchmark fixtures，來源、CAS 與 NAS 歷史刪除數為零。
+兩筆 transport retirement defer 另外沿 exact journal 診斷，不跳過恢復或程序引用驗證。
+未知 provenance 的舊 scratch 不刪。**全庫任務保持 active；未證明只剩硬體限制。**
+
+### v9：續跑發現的公開目錄 metadata，而非放寬所有 raw
+
+v8 真正續跑後，`local-tw-public` 遇到新的當次錯誤：
+`metadata/mof_customs_trade.json` 在打包期間被原下載器原子替換。
+沿 canonical writer 查證，這是 Data.gov 官方目錄描述，不是金融數值；同目錄
+`*_versions.jsonl` 是其 append-only provenance。v9 僅擴充這個來源專屬目錄：
+完整 FD／JSON／SHA fence、64 MiB 上限，以及 JSONL 的完整末行／逐行解析；
+不截斷、不補值、不更換任何 source lock，也不放寬 raw payload mutation。
+新增 capture 在原子安裝前完成 fsync，既有 captures 與 SQLite bindings 不變。
+
+[原機補強驗證](../artifacts/operations/migration-v9-public-metadata-native-20261019.json)
+新增 **15 項／1,968,371 bytes**，保留原 16 項觀測、原 preparation 完全不變；
+約 0.297 秒，沒有 source／cold object writes、沒有重做 SQLite backups，試跑自有
+scratch 已移除。共用回歸為 **830 passed、13 skipped、1 deselected**，另保留前述
+fintech 四 bucket 驗證。這仍不代表整個 public 根已完成。
+
+[v9 實載收據](../artifacts/operations/migration-v9-native-rollout-20261019.json)
+已 accepted，worker PID 為 **1079228**，identity 為
+`4a4e5c2c1ddab1898db28b414763fb9d409e31af2d5252e5b8b76f3e0975c8bf`，
+44 個固定驗收 binding 保留。
+[三條最新完整歷史重播](../artifacts/operations/migration-v9-post-replay-20261019/acceptance.json)
+處理 2,424／216／501 個事件並全部通過，無 activity 執行或 workflow reset。
+
+09:23 嘗試喚醒原 public cold publisher 時，既有
+`run_outside_tw_opening_resource_window --minimum-runway-minutes 180 --protected-until 13:30`
+ExecCondition 正常略過，沒有繞過盤中保護。FinLab 09:23 gate 為 **1,005 verified、
+344 stale、1 missing、0 invalid**；那 1 項是
+`management_change_events:變更交易開始日`，其 retained raw SHA 證據有效，來源
+147 列的 `raw_non_null_values=0`，但重查期限已到。這是待重查的來源全空，不是
+可以補成零的可用觀測；由原 local-refresh 繼續處理。
+
+### 09:28 最終獨立讀回與實際回收
+
+[固定觀測收據](../artifacts/operations/migration-v9-final-observation-20261019.json)
+確認原 worker PID **1079228** 仍 active，實載 code identity 與當前程式相符；
+原 60 項狀態為 **44 verified、13 waiting_retry、2 waiting_source_owner、1 processing**。
+處理中是 `local-tw-futures`，當次 census 仍有新進度，不能把跨根連結預檢當成整根完成。
+FinLab 當時已推進 **1,121 verified、228 stale、1 missing、0 invalid**，
+general-history gate 尚未 ready。來源追新與固定版本還原仍分開驗收。
+最後補上的公開 metadata／JSONL 完整遷移、fetch／原件比對測試，相關三組合計
+**196 passed、8 skipped**；與上述 830 組回歸重疊，不加總。
+
+[兩筆精確 transport 回收收據](../artifacts/operations/migration-v8-deferred-transport-cleanup-20261019.json)
+已 complete，原 journal 均為 `retired`。操作持有原 transport GC owner lock，
+重新通過固定 D／配對 NAS 還原與程序引用檢查後，分別清除
+**216,900,372／217,609,741 logical transport bytes**，合計 **434,510,113 bytes**。
+這是可精確恢復的傳輸暫存副本，不是 deduplicated 實體磁碟釋放量測；
+來源原件、CAS／固定 D 版本與 NAS 歷史刪除數均為零。
+原 source replication 當時為 0 pending bytes／0 retained transport bytes、無 receipt errors；
+仍不等於全 NAS 歷史驗收。全庫任務保持 active，未宣稱已達硬體速度上限。
+
+### 10/19 盤後續修：49／60、v10 與來源依賴鏈
+
+[18:01 原機觀測](../artifacts/operations/migration-v10-adopted-observation-20261019.json)
+為 **49 verified、9 waiting_retry、1 waiting_source_owner、1 processing**。
+下列為前次 44 項後，原 queue 新增的固定版本完整還原；不是所有來源歷史已追至今日。
+
+| 來源 | 原檔數 | 邏輯 bytes |
+| --- | ---: | ---: |
+| `local-tw-futures` | 1,995,553 | 21,229,494,659 |
+| `local-bybit` | 4,765 | 22,910,647,570 |
+| `tw-minute-source-cold` | 564,735 | 6,084,251,258 |
+| `crypto-reference` | 58,174 | 543,470,633 |
+| `tej-research` | 1,050,816 | 3,907,437,533 |
+
+**期貨跨根已不只是預檢。** 原 operation 的
+`recovery/local-tw-futures.json` 已驗完整 1,995,553 原檔，
+`local-tw-futures.source-links.json` 的 `all_fixed_dependencies_recovered=true`；
+`margin_sources`／`margin_repair_pending`／`margin_repair_inputs` 分別還原
+55,853／1,208／171 檔，綁定原 index-futures 固定 snapshot／manifest 與 SQLite 備份。
+沒有將任意絕對連結搬到訓練機。仍在 queue 的公開 `tw-futures` 是不同項，不混算完成。
+
+**v10 修正的是已查證的原子控制檔，不是放寬 raw。** FinLab 的 `raw_receipts/*.json`、
+FinMind root／complement／sponsor 的 `json_pipeline_last.json`、OpenBB `_state` 的
+`public_priority_cursors.json`／`public_priority_queue_event.json`／`public_priority_plan.json`
+均經原 producer 寫入路徑核對。保留 bounded stable FD、完整 JSON／SHA、既有固定 captures
+及完整原件還原；未宣告的 raw／`_state` 仍拒絕途中變更。inline selection marker 更新為
+`named_stable_fd_json_v2`，v9 preparation 只做具名 delta probes，不重掃整樹或重做 SQLite backup。
+自有 scratch 的 hash、程序引用、unlink 與退休結果另報在原 attempt 進度，不把 object 100%
+冒充已完成退休。相關回歸 **836 passed、13 skipped、1 deselected**；該四 bucket 測試另在
+fintech role 通過。與 focused **229 passed、8 skipped** 有重疊，不加總成覆蓋數。
+
+[v10 正式交接](../artifacts/operations/migration-v10-authorized-native-rollout-20261019.json)
+已 accepted：worker PID **2060898**，載入 identity
+`bcb6f570d30d95961cbbc16329c37660f103e4719fe784c842eeed5fea5c6dd5`。
+原自然交接等待超過 600 秒後，依使用者既有授權走 code-only restart；保留原逾時記錄、
+49 個完整 fixed bindings、所有 preparation／中斷日誌，不刪 source lock。
+PG／Temporal server 未重啟，三條原 workflow chain 保留。
+[換版後完整 history replay](../artifacts/operations/migration-v10-post-replay-20261019/acceptance.json)
+驗 132／308／561 個事件；沒有執行 activity 或 reset 工作鏈。不同 run 的事件數不可直接
+當總歷史進度。新 owner 已接手 `openbb-task-shards-local`，具當次持續 census 觀測。
+
+**FinLab 少完成證據的另一根因是依賴順序，不是缺值就補零。** 17:49／17:52 的原服務
+各重建到 2025 年後才在 2026 年遇到 `official table has keys absent from the research universe`；
+每輪約 104–120 秒、記憶體峰值 3.5 GB，接著又重試。現沿原 wide → TAIFEX → union
+依序更新：wide 使用 canonical EX lease，overlay 使用 SH lease，來源 busy 時不繞過。
+union 在 feature decode／write 前先驗所有年度 keys，仍拒絕重複／缺 key 並保留舊成功輸出；
+`build_strategy=bounded_annual_range_join_preflight_keys_v3` 綁定完整 source／output SHA。
+原一般目錄在 17:58 為 **1350／1350 verified、0 missing／stale／invalid**；其中明確來源
+全空項仍保留 NULL 證據。該 gate 不驗分鐘／tick，也不能延長到期時間充當 fresh。
+18:02:05 原機成功產出 **9,660,541 列、204 public features**，union 完整 build 61.657 秒，
+peak annual partition 540,330 列，輸出 SHA
+`404db2d6e3c97fd33791aad9aa2a58dcc84ffebc498c59e29f10840c03c070ca`。
+這是一次成功建置，不是與舊失敗迴圈公平 ABBA 的加速倍率，也不代表後續 overlay／stage／cold
+均已完成。FinLab 相關鎖定、依賴失敗、精確值與鍵檢查回歸 **38 passed**。
+
+**真正回收與沒有回收的東西分開。** 17:48:01 原 owner 在 TEJ 全原件還原後，依完整
+preparation／SHA／程序引用 gate 退休 136 個自有暫存項，實測回收 **5,627,162,624 allocated bytes**；
+原收據為 operation 的 `scratch-retirement/tej-research.json`。這不是前述 434,510,113 logical
+transport bytes 的重複加總。新的 managed cache dry run 是 **6 checked、0 would_evict**，
+保留原 pin／lease；來源、cold objects、NAS 歷史刪除數皆為零。未知 provenance 暫存不刪。
+
+剩下 11 項仍由原 queue 管理：Binance／OKX／分鐘訓練等候原 collector locks；
+FinLab／FinMind／OpenBB 控制檔與 public metadata 待具名修正後的實際重試還原；
+分鐘／大型 OpenBB 分片／公開期貨保留原中斷／準備 journal；FinLab 研究 release 待真正完成
+overlay／fresh catalog／stage 證據。舊 error 欄保留前次失敗，不冒充新版已再次失敗。
+
+[只讀 I/O 候選測試](../artifacts/benchmarks/migration_v10_native_chunk_read_screen_20261019.json)
+固定 TEJ 8 MiB object，完整 SHA／size fence、portable/native/native/portable：portable
+約 0.654／0.359 秒，native 約 2.268／2.115 秒；未採用較慢路徑，也未以此宣稱整段硬體上限。
+18:00 左右原 source replication 為 0 pending／retained transport bytes、無 receipt errors；
+配對 NAS 的 58 個 recovery plans 為 accepted，但 `full_history_backup_verified=false`。
+**遷移、來源追新、完整 NAS 歷史與遠端 runtime readiness 仍分開。全庫任務維持 active。**
+
+### 18:06–18:09 獨立讀回與研究封裝的真實邊界
+
+[當輪部分驗收收據](../artifacts/operations/migration-v10-partial-acceptance-20261019.json)
+再次確認實載 identity、原 49 個固定 bindings、期貨三介面及 TEJ 退休證據，
+狀態明列 `accepted_repairs_migration_incomplete`，沒有重跑全庫 payload 來冒充新驗收。
+[18:05 原進度](../artifacts/operations/migration-v10-final-observation-20261019.json)
+仍是 49／60；OpenBB 分片 census 已到 1,470,760 檔、20,953,353,757 logical bytes，
+總量尚未封存，不能從前次清冊猜一個精確百分比。原服務繼續執行，不因耗時而再重啟。
+
+18:06:14 FinLab overlay 亦實際完成 **9,660,541 列、104 特徵、16 個來源**，
+輸出 SHA `ae121b042e05a7fe07e259175e19f7cdbea267d0513061b8c38ff13f028848fb`。
+另一次持有原 SH lease 的完整 key anti-join 確認 **missing_rows=0**；這只證明來源鍵包含，
+不是所有 feature 數值齊全或歷史 PIT。首次完整依賴鏈／overlay 的服務耗時約 8 分 18 秒、
+記憶體峰值 8 GB，不能以單一 union 61.657 秒代表整條鏈路。
+
+18:06:16 stage 正確拒絕 **0 missing、40 stale、0 invalid**：來源時鐘在首次重建期間到期，
+不是來源壞值。已喚醒原 FinLab refresh，原紀錄 18:07:52 已處理 8 項、剩 32 項，
+0 provider errors／timeouts，持續追新；相同 inputs 可由原 builder 的完整 SHA gate 重用，
+不偽造新的日期或略過 fresh catalog／hash 驗證。這仍未算研究 release 發布完成。
+
+18:07:06 原 public cold publisher 回 `deferred: active_registered_writer`；核對到原 event
+monitor 的 `finalize_tw_public_completed_session.py` 及其真正持有 EX lease 的
+`build_tw_public_training_features.py`。未繞過來源 writer，未以 systemd exit 0 當成發布成功。
+後續沿原 publisher／timer 在一致來源完成後重試，不新增競爭 writer。
+
+### 23:22：完成發布與成功同步分開，磁碟阻塞不再連帶空轉
+
+[23:22 原機觀測](../artifacts/operations/migration-outbox-final-observation-20261019.json)
+仍為 **49 verified、9 waiting_retry、1 recovery、1 waiting_source_owner**。
+OpenBB 的 **7,476,049 檔、92,533,295,320 logical bytes** 已完成封裝；當次固定版本冷物件
+核驗到 **262／366、56,579,844,721／95,179,137,144 bytes**，約 59.4%。
+這只是 `verify-cold-objects` 階段，後續仍有完整原檔重建與自有 scratch 退休；不是整批 59.4%
+或已完成，未因耗時而重啟原 owner。私有期貨根與三個跨根固定依賴的既有驗收保留；
+公開 `tw-futures` 尚未完成，不能和私有期貨混算。
+
+**發布通知不是資料交易本身。** `publish_data_releases.py` 的單來源 deferred scan 現允許
+publisher 自行取得原 catalog／native owner，仍必須真的持有至少一個來源鎖、綁定唯一
+commit receipt，完整來源與 freshness/hash gate 不變。FinLab 原排程提交固定版本後，
+把通知留給既有 durable outbox／scan retry timer，不再因網路掃描 500 把研究建置與分鐘排程
+一併中止；沒有新增同步服務或放寬資料授權。
+23:00:49 的 `artifacts/live/finlab/training_delivery.json` 已記錄固定 research release
+`tw-public-research-finlab-2014-v4-20261019T145139739121034Z-l0-penguin-2876f80b681a15c8`，
+**cold_objects_verified=true、1,129,389,186 bytes、9,660,541 列、636 model channels**。
+原服務 23:01 正常結束。但 `base_cold_feature_match=false`、`remote_materialization=not_verified`；
+這不是原始 FinLab 全歷史、NAS 交付或遠端可訓練的證明。
+
+**正常來源競爭與真錯誤分開。** 原 EX／SH producer busy 現沿 typed exception 回傳 75；
+FinLab 只延期研究建置／stage，不發布未完成版本，仍讓獨立分鐘佇列執行。來源 hash、鍵、
+schema、權限及未知錯誤照常失敗。23:09 原服務已實際由 busy 進入分鐘工作，再正確回報
+`disk_reserve_reached`，不是卡死或假完成。
+
+**新根因是系統碟容量，不是 API 配額。** ext4 約剩 7 GiB，Syncthing 回覆
+`insufficient space on disk for database`（低於原 1% 門檻）；原分鐘 guard 為 **25 GiB**。
+現在 HTTP 500 只輸出 bounded/recognized 原因 `database_disk_reserve`，不洩漏回應內的
+私有路徑或認證內容，並關閉錯誤 response FD、保留所有 pending intents。
+FinLab 在一般資料與研究分支之後、SDK pool／分區掃描之前，先以同一份 25 GiB 常數檢查空間。
+若已有明確磁碟阻塞，而且原研究 writer lease 也真的忙碌，既有每分鐘 ExecCondition 只做
+當前 statvfs/flock 判斷便略過；一般追新、gap request、08:00 重置及不確定證據仍走原 recovery。
+不延長固定冷卻時間；任一資源恢復，下一分鐘重新判斷。
+
+相近的「0 一般鍵到期、public busy」原機空轉，23:09 為 **21.007 秒 wall／19.869 秒 CPU／
+319.3 MiB peak**；23:14 磁碟前置後為 **8.371／7.587 秒／100.2 MiB**。
+23:18 起雙重阻塞在入口略過，23:21 為 **0.989 秒 wall／1.019 秒 CPU／60.7 MiB**，
+沒有啟動資料下載程序。這是線上狀態觀察，不是公平 ABBA、完整下載加速倍率或硬體上限證明。
+
+**清理沒有越過恢復證據。**
+[精確離線清冊](../artifacts/operations/migration-offline-space-inventory-20261019T1514.json)
+找到 `openbb_full_source_contract_index_20261014`：17 檔、**23,537,680,384 allocated bytes**，
+完成收據與消費者預檢通過，但還沒取得該案例的完整冷回復／同步刪除前置。
+既有 C archive stage 另需 source size + 32 GiB，當前容量也不足，不能先複製到滿再說。
+另一個約 18.4 GiB 的 native-unassigned 案例缺受支援的 producer 完成收據，保留。
+compiler cache dry run 為 **0 eligible**；未知 provenance 的 metadata 暫存與仍開啟的 OpenBB
+驗證 index 不刪。本輪新增刪除量為 **0**，前輪 TEJ 的 5,627,162,624 bytes 不重複計算。
+已停止本輪自有、耗時的全 repo `du` 只讀盤點；用精確案例清冊接手，未中斷下載或原驗證。
+
+驗證：FinLab／公開研究／發布及通知原路徑完整 focused 集合 **346 passed**；
+共用儲存 **839 passed、13 skipped、1 deselected**；發布/outbox/載入閉包收尾
+**257 passed**；資源 admission 與 FinLab 原路徑 **173 passed**，集合有重疊，不能相加。
+[三條現存完整 workflow history 重播](../artifacts/operations/migration-outbox-pre-reload-replay-20261019/acceptance.json)
+通過 **1656／627／561 事件**，沒有執行 activity 或重設工作鏈。
+`syncthing_scan.py` 已納入 worker code identity；
+`migration-outbox-safe-reload-20261019T151955-13a1718b` 沿原交接工具等待安全 owner boundary，
+未使用 active-owner restart。實載仍是 v10，不能把 source tree candidate 當成已載入新版。
+配對 NAS 收據仍停在 10:46 UTC、`full_history_backup_verified=false`；需先解除容量問題，
+再核對交付與全歷史驗收。全庫任務保持 active，未宣稱只剩硬體速度或已全部完成。
+[本輪部分驗收與精確收據 SHA](../artifacts/operations/migration-outbox-partial-acceptance-20261019.json)
+另列候選／實載版本、清理零新增量、測試範圍與尚未成立的驗收；不是全庫完成宣告。
+
+## 2026-10-20：52／60、持續變動控制檔與完整區塊驗證
+
+08:57 的[原 owner 狀態讀回](../artifacts/operations/migration-status-20261020T0900.json)
+為 **52 verified、6 waiting_retry、1 recovery、1 waiting_source_owner**。新增完成項的
+固定 recovery receipts 亦逐一獨立讀回，不以 service active 代替：
+
+| 固定來源 | 完整重建原檔數 | 完整原檔 bytes | 已核驗 cold object bytes |
+| --- | ---: | ---: | ---: |
+| `openbb-task-shards-local` | 7,476,049 | 92,533,295,320 | 95,179,137,144 |
+| `local-tw-minute` | 572,951 | 20,182,707,190 | 19,907,030,382 |
+| `okx` | 2,050 | 37,977,834,544 | 37,708,276,445 |
+
+這些分母不同且有來源覆蓋重疊，不把 bytes 相加稱為全庫大小。私有 `local-tw-futures`
+的 **1,995,553 原檔、21,229,494,659 bytes** 及 `margin_sources`、
+`margin_repair_pending`、`margin_repair_inputs` 三個固定跨根依賴已完成驗收，
+`unsafe_absolute_links_materialized=false`。公開 `tw-futures` 尚未完成，沒有混算。
+
+### 精確修復與避免多餘工作
+
+- **公開來源追加式日誌。** 來源 producer 在 `state/journals/*.jsonl` 追加完整 JSON
+  加換行並 fsync；長批次期間路徑自然會更新，不能當成永久不可變原件。v11 只在
+  已知 `data_tw_public` 的這個直接目錄捕捉完整 stable-FD 觀測；64 MiB 上限、
+  全檔 JSONL 解析及最後換行皆須成立。部分列仍拒絕，不截斷、不補值、不宣稱全來源
+  同時點快照；金融 payload 的變動偵測不變。
+- **OpenBB compactor 原子收據。** 納入 `_state/l1_compaction_attempt_latest.json`
+  與 `l1_compaction_latest.json`，沿用原 producer 的固定控制檔捕捉。自 v10 升級時
+  只探測新增的明確路徑，保留既有 SQLite backup／原收據，不再掃幾百萬 raw shards。
+- **完整 SHA 不需要重讀相同區塊兩遍。** `reconstruct_all=True` 對僅作 chunk 的
+  immutable object，將區塊 SHA／長度與原檔 SHA 同一次串流核驗；同時作 legacy
+  direct blob 的 object 仍保留原直接驗證。每個 logical extent 仍完整讀取、每個原檔
+  核整檔 SHA，最後核唯一 object 數、bytes、前後檔案身分；缺 callback、損毀、增長、
+  截短、錯序或驗後變動均失敗。ZIP SHA／CRC 與新舊版本還原沒有移除。
+- **進度不先報完成。** 延後合併驗證的 object 不計入已核驗 bytes；只有完整 extent
+  驗證後才累加，全部原檔與最後身分檢查通過才送出 object 100%。實際恢復收據另記
+  `full_chunk_sha_and_original_sha_single_read_v1` 及省掉的重複冷讀 bytes，不把它當成
+  API 抓完、NAS 完成或實測速度倍率。
+
+### 證據、交接與清理邊界
+
+原生 owner 仍在驗證 Binance 固定版本，沒有因這輪修改而中斷。前次交接
+`migration-outbox-safe-reload-20261019T151955-13a1718b` 因等待時候選碼變動而拒絕，
+原 worker 繼續工作；新程式測試通過、排隊與真正載入仍分開記錄。
+
+[本輪三條完整持續工作流歷史重播](../artifacts/operations/migration-v11-full-history-replay-20261020/acceptance.json)
+在 09:06 通過 **1156／654／5 事件**；只重播各現存 pinned run 的完整 history，
+不是累計所有 Continue-as-New 歷史，未執行 activity、provider call、reset 或服務控制。
+初次共用測試在精簡 SDK 環境因 archive 依賴 NumPy 而 collection failed；archive／
+consumer 測試改用原 Fintech runtime，沒有往精簡常駐環境裝進訓練套件。
+
+精簡 SDK 共用回歸為 **993 passed、13 skipped、1 deselected（66.66 秒）**；
+這個唯一 deselection 是 archive 環境案例，另與 consumer／retirement 集合移至
+Fintech 執行，而非刪掉驗證。最後 benchmark 原件完整性／模式測試 **13 passed**。
+focused 25 項與這些集合有重疊，不相加成測試總數。
+Fintech 的完整封存／consumer／retirement／cache-capacity 集合已在 09:35 結束，
+**179 passed（1657.95 秒）**。這包含前述唯一 archive 環境案例；此集合真的核對
+程序引用與原冷庫還原，未因耗時而移除安全驗證。
+
+[34,136,441 bytes 的兩版真實 FinLab Parquet 完整 ABBA](../artifacts/benchmarks/full_chunk_recovery_abba_20261020.json)
+保留輸入副本核 SHA、baseline、incremental、semantic no-op、全原檔核驗、durable
+新舊版本解封與讀回、fixture 清理。參考／新方案的完整 inventory SHA 亦完全一致。
+完整 cold 核驗均值 **0.18485 → 0.10880 秒**，但完整流程均值
+**3.60853 → 3.66059 秒（0.9858 倍）**，**沒有證明整體加速**。
+兩個 warm SSD 小檔案例中的每次完整核驗，確實分別省去 17,070,154／17,066,287 bytes
+的重複冷讀；不能把這個階段改善外推為生產 D／NAS 或全來源的加速倍率。
+
+候選 worker identity 固定為
+`90209da1cf4760d3d78dc7db3b1908dab20c033a2e97744ed7ff23812a6f0dc9`。
+`migration-v11-safe-handoff-20261020T011119-85f9d2af` 已沿原工具排隊等待 owner 邊界，
+未使用 `--restart-active-owner`。真正驗收必須讀回
+`artifacts/operations/migration-v11-safe-handoff-20261020.json` 的 accepted、實載 SHA／PID、
+既有 fixed-release bindings 與三條 first-run 工作鏈；排隊不是載入完成。
+
+兩份舊分鐘衍生根及編碼暫存的 **62,330,454,016 allocated bytes** 精確回收，見
+[容量維護紀錄](storage_capacity_recovery_2026-10-20.md)。這是先前 continuation 已完成的
+累計結果，不當成這輪新增刪除量；D／NAS 歷史未刪除。
+另對已完成的單一 OpenBB benchmark 案例重新清點：17 檔、
+**23,537,680,384 allocated bytes**，producer 完成收據與 consumer 預檢通過。
+這只授予進入原冷封存／全還原／最終引用、pin、transport、quarantine gates 的資格，
+不是已可直接刪除；沒有完成收據的另一案例與 provenance 不明暫存保留。
+新案例沿原 authority wrapper 以固定清冊在 09:10 進入低優先序封存，原操作收據位於
+`artifacts/operations/migration-v11-offline-retirement-20261020/`；在 `acceptance.json`
+與 stage-pruned／刪後讀回成立前，新增回收量仍記為零。
+本次 17 個原檔 **23,536,261,280 bytes** 已編成 **5,073,657,131 bytes**，
+其中大型 SQLite 原件採既有 adaptive zstd-1；未換算法、丟欄位或修改原值。
+09:19 的固定 D 版本
+`legacy-wsl-offline-bbe60254dd68fec65226e-20261020T011934302852990Z-l0-penguin-00e5a71d86002f8b`，
+manifest SHA `63b5cc446653bdd715cdd790a0e345f48d1d2a0d259632194db27f5952c87f4d`，
+09:22 已進入獨立 D 恢復核驗；這仍不是原檔已刪除。
+09:25 獨立 D 解碼／原檔 SHA 核驗通過 **17／17、23,536,261,280 bytes**。
+09:30 原來源已通過當前引用、冷庫、同步、quarantine 與刪後讀回 gates，
+`retirement.json` 的 `deleted=true`；精確來源目錄已不存在，實際新增回收
+**23,537,680,384 allocated bytes**。6 份小型 benchmark 證據保留，固定 D 原件可恢復。
+編碼暫存仍在原 `prune-verified-encoding-stage` 流程，暫不把它估算為額外已回收量；
+`backup_verified=false` 亦保留，沒有把本機 D 完整恢復冒稱為 NAS 全歷史備份。
+09:33 原封存／退休作業已完成，09:35 另以獨立 readback 確認原目錄與 encoding stage
+均不存在、6 份／36,487 bytes 小型證據未變，固定 D manifest／物件身分仍相符。
+本輪**實際新增回收 28,611,452,928 allocated bytes（28.61 GB／26.65 GiB）**，
+其中 source 23,537,680,384、stage 5,073,772,544；D object／NAS snapshot 刪除均為 0。
+完成收據：
+`artifacts/operations/migration-v11-offline-retirement-20261020/legacy-wsl-offline-bbe60254dd68fec65226e7da/acceptance.json`；
+獨立驗收 run：`migration-v11-cleanup-readback-20261020T013515-0b9044d5`。
+
+09:12 本機 Syncthing 回到 idle／本機檢查通過，但配對 NAS 09:11 的 relay 仍有
+5 筆 `transport_incomplete`，要求 `wait_for_Syncthing`；這不是已證明物件毀損，不能
+強制改成 ACK 或反覆建立相同 redelivery。當前 NAS 去重覆蓋 **93.33%**、仍缺
+約 **103.49 GB**，15 批待驗收；本機 idle 不能取代接收端完整檔案／NAS 獨立還原證據。
+09:35 的接收端新收據仍為 degraded，但 `transport_incomplete` 已由 5 筆降至 4 筆。
+來源端最新完整批次收據停在 09:17，覆蓋 1,448,412,432,691／1,549,747,082,053 bytes，
+不是把它回填成 09:35 的即時全庫驗收。
+
+09:35 [再次讀回原 owner](../artifacts/operations/migration-status-20261020T013535Z.json)
+仍是 **52／60**，FD 為 24／1024、原程序身分與 lock 持有者一致。
+Binance 當下是 cold-object SHA 階段 **102,505,866,383／142,188,772,591 bytes（72.09%）**；
+後面仍有全原檔重建，不能把這一階段百分比說成全來源或全庫完成進度。
+kernel lock 讀回確認交接 `flock` PID 3936505 在等原 worker PID 2060898；
+真正 loaded SHA 仍是 v10，候選 v11 尚未載入，未為了更新顯示而中止原恢復。
+
+所有驗收仍以原操作 journal、固定 recovery receipt 與新增實測收據為準；
+目前不宣稱全 60 項、NAS 全歷史、遠端可訓練或「只剩硬體瓶頸」已達成。
+[本輪分界清楚的部分驗收與收據 SHA](../artifacts/operations/migration-v11-partial-acceptance-20261020.json)
+另記候選／實載、重播、完整流程實測及尚未完成的項目；不是全庫完成收據。
+
+### 11:50 後續：原生二進位串流批次化，完整 D 流程加速
+
+[11:49:56 的狀態讀回](../artifacts/operations/migration-status-20261020T0350Z.json)
+仍為 **52／60**。`py-spy` 定點讀取確認 Binance 原 owner 正在全原檔重建，
+並非等待死鎖；11:52:50 已核對 **23,511,768,502／143,926,679,414 bytes**。
+前面的 cold-object 全 SHA 已結束，但不是原檔或全庫完成。**原生** chunk reader
+每個 8 MiB extent 都各自啟動 PowerShell 並重跑掛載檢查，是可消除的軟體開銷；
+後續接線核對發現 migration 原本僅啟用 native pack、不啟用 native blob，因此
+不能從原 stack 的 `_iter_chunked_file` 一行推斷生產正在使用逐塊 PowerShell。
+
+既有 `windows_cold_io` 與共用 chunk reader 現改為最多 16 個有序 extent 一次
+binary stream，不另開服務或下載管線。單 member 8 GiB／batch 16 GiB 上限，
+原生端逐 member 檢查精確長度；父程序保留逐 chunk 及整檔 SHA。重複 extent
+仍逐次讀取。每個 batch 前後重驗實際 D authority 與每個檔案身分，沒有 TTL 掛載
+快取；全部通過後才計入 extent 完成。部分失敗不重播串流，僅空輸出的已知 WSL
+startup timeout 有界重試。portable／單 member reader 維持原精確 EOF 檢查。
+
+[完整 D 槽 ABBA 收據](../artifacts/benchmarks/native_stream_complete_abba_20261020.json)
+使用前述兩版真實 FinLab Parquet，在既有 worker 相同 quota／affinity／priority 的
+獨立 D fixture 執行。每次均包含輸入副本 SHA、baseline、incremental、no-op、
+全原檔核驗、durable 新版及舊版還原、獨立原檔讀回、fixture 清理。四次的完整
+inventory SHA 相同，讀取 member 都是 **24 個**，Windows 讀取程序 **24 → 8**。
+
+| 完整流程方案 | ABBA 兩次秒數 | 平均秒數 |
+| --- | --- | ---: |
+| 原逐 extent 原生 reader | 97.04350、72.16195 | 84.60272 |
+| 有界原生批次 stream | 41.93318、49.98180 | 45.95749 |
+
+完整流程均值 **1.8409 倍**，約省 **45.68% wall time**。這不是先前 warm SSD
+融合核 SHA 的 0.9858 倍結果，兩者不得混用。此測試仍與生產 I/O 共用 D 槽，
+不能外推為所有資料量／NAS 速度、全歷史完成時間或硬體極限。
+尤其這是 **native 逐塊 → native batch** 的比較，不是既有 portable migration
+的加速證明。另用兩版約 83 MB 真實 Parquet 對照實際 portable 路徑的完整 ABBA；
+通過且確有改善前不更改遷移的 blob reader 選擇。
+
+本次精簡 SDK 共用回歸 **1053 passed、13 skipped、1 deselected（67.50 秒）**，
+唯一 archive 環境案例已在前述 Fintech 179 項集合通過，本次沒有冒稱重跑該集合。
+針對性 **144 passed（12.78 秒）** 與共用集合重疊，不相加。
+[三條現存 pinned run 的完整歷史重播](../artifacts/operations/native-stream-history-replay-20261020/acceptance.json)
+通過 **3107／137／5 事件**；沒有 activity／provider call／reset。
+
+舊 `migration-v11-safe-handoff-20261020T011119-85f9d2af` 仍只等待鎖，候選碼已
+被本次修正取代，11:51:57 只取消這個工程等待 run；原 worker PID 2060898
+繼續 active，未刪原鎖或資料。完整 ABBA 通過後，依先前明確換版／重排授權，
+沿原 `rollout_lakehouse_source_policy.py --reload-code-only --restart-active-owner`
+保存 52 個 fixed-release bindings 與 Binance inflight intent，再有界交接。
+最終須讀回 [交接收據](../artifacts/operations/native-stream-authorized-handoff-20261020.json)
+以及 journal owner 的實際接手，不能把啟動換版當成完成。
+11:55 交接已 accepted，PID **2060898 → 106389**，實載
+`a40901a9abbc6fb227d9fbfc933d827c9b3b13a68b4a52883f2de9c6abbab5a1`；
+52 個原固定版本與三條 first-run 鏈完整保留，PG／Temporal 沒有重啟。
+舊服務日誌是 graceful shutdown，非強制 SIGKILL。Binance journal owner
+11:55:07 記錄原 attempt `0ffa7906168f4b62b7eee86ff0906c9b` 中斷，沿同一固定
+snapshot 重排為 `5ff5cb276b8f470e9e1958b93916cb30`，沒有手改狀態或重抓 API。
+[載入後完整歷史重播](../artifacts/operations/native-stream-loaded-history-replay-20261020/acceptance.json)
+再通過 **3219／137／5 事件**。這次先載入 v11 控制檔及合併 SHA；原生 blob
+批次仍須上述 portable 比較，不能以載入共用函式當作該分支已在生產啟用。
+
+11:58 定點 stack 又證實，原恢復每次依序做兩次 resolver 的全物件 presence，
+再由 full verifier 做第三次。候選修正只在即將做完整核驗時省去 resolver 重複
+stat；manifest SHA／schema 仍核對，full verifier 的完整 presence／size／SHA
+不變。沿用既有成功 receipt 的路徑仍必須重新檢查物件 presence；缺 object 的
+cached receipt 仍拒絕。這是減少重複 metadata 工作，不降低資料驗證。
+新修正的針對性集合為 **321 passed（29.75 秒）**；精簡 SDK 共用集合再跑為
+**1056 passed、13 skipped、1 deselected（83.53 秒）**，archive 環境案例仍沿
+前述 Fintech 專屬集合，不混報新增執行。新測試用真的固定 release 核對完整重建
+只做一次 presence，沿用 receipt 仍重查，並刪除隔離 fixture 的物件驗證拒絕；
+沒有刪除任何生產 cold object。
+
+[較大真實 Parquet 的 portable／native 完整 ABBA](../artifacts/benchmarks/portable_vs_native_stream_large_abba_20261020.json)
+在 12:03 完成。兩版輸入合計 **167,345,228 bytes**；完整流程平均
+**portable 95.23792 → native batch 82.74688 秒**，速率約 **1.1510 倍**、
+wall time 減少 **13.12%**，新舊版全原檔及所有 inventory SHA 相同。
+這才是對實際原 chunk reader 的對比；仍是共享 D 槽的固定 fixture，不能
+宣稱整個 migration／NAS 的實際提速或硬體極限。
+
+依這個範圍採用獨立、明確的 `d_primary_native_chunk_reads` 接線：只在 canonical
+公開 D root 的 **至少 64 MiB** 原檔啟用 native batch；小檔保留 portable，私有根
+保留原 reader；不改舊的 native pack/blob 選項含義。64 MiB 是本次大型檔工作集的
+保守啟用門檻，不是各種硬體的普遍最優值。逐 chunk、整檔 SHA、每批前後 authority
+及 signature 全保留，進度另記實際 `native_chunk_batch_reads`，以便驗證接線
+是否真的執行；只是函式存在或 worker ready 不算該分支運行證據。
+
+最終接線、scope／型別拒絕、大／小檔分流、metadata 去重與既有儲存共同契約
+回歸為 **1061 passed、13 skipped、1 deselected（77.21 秒）**。候選碼固定
+`bdfc9ce9bf165ca58a5417dc7691d984caf06a007ebde7817a70e4a503bc5ec3`；
+[此候選完整歷史重播](../artifacts/operations/native-chunk-wiring-history-20261020/acceptance.json)
+通過 **3406／137／5 事件**。這些 counts 不與前面的重疊測試相加。
+12:06 沿相同已授權的有界 code-only 路徑交接，最終以
+[新交接收據](../artifacts/operations/native-chunk-wiring-handoff-20261020.json)、
+原 journal 的 interruption／new attempt、同 snapshot 與實際 progress 欄位分別證明。
+
+12:06:55 這次交接已 **accepted**，PID **106389 → 134355**，candidate 與
+loaded SHA 均為上述 `bdfc9ce9…`。52 個固定版本、三條原 run／first-run 鏈及私有
+設定 SHA 均保留，PG／Temporal 未重啟。12:07:14 原 journal 自行記錄前次 attempt
+`5ff5cb276b8f470e9e1958b93916cb30` 中斷，重排為
+`5e86cfe5aaeb4042a731d9f2ae80c365`；Binance snapshot 仍為
+`binance-20261019T222646248705359Z-l0-penguin-ad445d2d0057a9a1`，沒有重新呼叫來源 API。
+[12:08 載入後完整歷史重播](../artifacts/operations/native-chunk-final-loaded-history-20261020/acceptance.json)
+通過 **3463／137／5 事件**，核對當前 PID／實載碼；沒有執行 activity、reset、
+provider call 或服務控制。
+
+[12:08:28 的獨立狀態讀回](../artifacts/operations/migration-status-final-native-20261020.json)
+仍為 **52／60**，原 operation owner 的 PID／鎖身分相符，FD **84／1024**。
+Binance 是同 fixed snapshot 的新 attempt，當時在唯一完整 presence／size pass，
+尚無新版原生 chunk 的實際讀取樣本；不能沿用換版前的 3.94 GB 作新版進度。
+12:10:05 同 attempt 的 cold-object 進度已為 **3／17,352、204,451,044／
+142,188,772,591 bytes**；定點 stack 也已由 presence／signature 清點前進到
+`_native_pack_source` 讀取。因此不是僅有 ready／heartbeat，但這個 pack 分支仍
+不是新增 chunk-batch 分支的執行證據，也不是全部 143.93 GB 原檔已完成。
+其餘七項仍循原工作鏈重試，不能把載入修正或歷史重播當成它們已完成：
+
+| 尚未取得本輪完成證據的來源 | 原 journal 狀態／剩餘驗收 |
+| --- | --- |
+| `finlab-research`、`finmind-free` | 舊 attempt 的變動控制檔錯誤；v11 已載入，仍待原排程重試並完成固定還原 |
+| `local-openbb`、`local-tw-public` | 舊 attempt 的 compactor receipt／追加日誌變動；修正已載入，尚未重試完成 |
+| 公開 `tw-futures` | `waiting_retry`；不可沿用私有期貨的完成證據 |
+| `tw-minute-train` | 舊 attempt 等 `shioaji_minute_full/runner.lock` 逾時，須等真正 owner 邊界，不刪鎖 |
+| `tw-public-research-finlab-2014-v4` | `waiting_source_owner`，尚無本輪來源完成證據 |
+
+11:50 NAS relay 有 5 批 `transport_incomplete`；本機唯讀 API 核對接收端仍連線、
+未 pause、remote state valid，但 completion **54.7351%**，還缺 **32,435,865,163
+bytes／7,039 items**，另有 4,207 個待同步刪除。這是傳輸仍在進行，不強發 ACK、
+不反覆重建相同批次。私有期貨三組 fixed dependencies 再讀回仍全部完整，
+公開 `tw-futures` 仍要自己的完成證據。
+12:08:46 再次唯讀取樣的 paired peer completion 為 **56.3786%**，
+`remoteState=valid`，尚缺 **30,333,359,591 bytes／6,829 items**，另有
+4,467 個待同步刪除。這是當次傳輸佇列，不是 NAS 全歷史接受率；工作集合會變動，
+不能用兩次樣本的百分比直接外推全庫 ETA 或把同步刪除算成已清理 cold history。
+
+先前 **28,611,452,928 allocated bytes** 清理的 exact cold recovery／刪後證據保留，
+本段不重算為新增回收。未取得 producer 完成與獨立還原／引用 gates 的來源、
+未知暫存、D objects 與 NAS 歷史均未刪除。
+
+## 2026-10-21 00:01：54／60、v12 候選與精確測試副本回收
+
+[本輪狀態讀回](../artifacts/operations/migration-status-20261020T1602Z.json)
+為 54 verified、4 waiting_retry、1 processing、1 waiting_source_owner；這是
+60 個遷移處理項的分母，不是所有金融觀測筆數、原下載器歷史覆蓋或 NAS 全庫比例。
+原 `stockagent-storage-lifecycle.service` 的 PID 134355／鎖身分一致，
+當次 FD 為 93／1024，OpenBB 進度距取樣不到三秒，沒有停住或換另一個 owner 重做。
+
+本輪新增兩份獨立完整原檔還原證據；兩份 `materialized_verified` 都仍為 false，
+不能把可恢復性當作已永久展開或遠端訓練就緒：
+
+| 固定來源 | 原檔數 | 原檔 bytes | 完成時間（台北） |
+| --- | ---: | ---: | --- |
+| `binance` | 2,392 | 143,926,679,414 | 2026-10-20 14:18 |
+| 公開 `tw-futures` | 1,929,933 | 16,180,735,682 | 2026-10-20 19:42 |
+
+原證據位於原 operation 的 `recovery/binance.json`、`recovery/tw-futures.json`；
+公開期貨的還原進度也留下 `native_chunk_batch_reads: true` 的實際執行證據。
+私有 `local-tw-futures.source-links.json` 再讀回仍為
+`all_fixed_dependencies_recovered: true`、`source_files_deleted: 0`、
+`unsafe_absolute_links_materialized: false`，其三個固定依賴不是仍待解決的跨根連結。
+
+### 剩餘工作：按根因處理，不降低完成判準
+
+| 來源 | 本次觀測／下一個原工作鏈動作 |
+| --- | --- |
+| `finlab-research` | `runs/latest.json` 在打包時被原 writer 原子更新；v12 對這個已核對的控制檔留固定觀測，待安全換版後原 owner 重試 |
+| `finmind-free` | 舊中斷 attempt 已由原 owner 對帳為待重試；沒有新 error 不等於已完成 |
+| `local-openbb` | 原封裝仍前進，已重用 1,252,994 個原檔的 sealed-pack hints；不為載入新碼犧牲已花時間的八百萬檔清點 |
+| `local-tw-public` | 已核對原 builder 原子產生的 summary／research companion 在打包時變動；v12 精確捕捉，原始資料與同名 lookalike 仍嚴格核對 |
+| `tw-minute-train` | 原分鐘資料 owner 的協調鎖曾逾時；繼續原鎖協議，不能刪鎖或繞過活躍 writer |
+| `tw-public-research-finlab-2014-v4` | 來源未提供當前 `catalog_latest_verified`／`source_hashes_verified` 完成證據；須由 FinLab 原 producer 完成後重建研究 overlay，不能補寫 true 或回溯日期 |
+
+00:07 以原 `scripts/finlab_release_gate.py` 做不讀 payload 的即時診斷：目錄仍新鮮，
+一般歷史 1,350 項中 verified 1,142、stale 207、missing 1、invalid 0，
+另兩項是原分鐘／tick 分區 capability。故 `ready: false` 有當前來源依據，
+不是只有 9 月舊 receipt 缺布林欄位；此次 physical_files_hashed／hash_bytes_read
+都是 0，沒有為查狀態多讀整批原件或呼叫 API。
+
+v12 的準備檔升級僅探測具名控制檔，沿用舊 SQLite backup／已捕捉原件，
+不為補這幾個控制檔重新遍歷全部來源。每個原子檔有自己的觀測時鐘，
+不聲稱 Parquet 與 summary 是跨檔同時提交，更不將這種獨立觀測當訓練發布。
+[候選歷史重播](../artifacts/operations/migration-v12-history-replay-20261020/acceptance.json)
+已通過 1511／11／29 個事件，沒有執行 activity、reset、API 呼叫或服務控制。
+候選身分 `723da1c349aa3fc96d0bc3c4c74ffabdf0d53cc377a5393ac0ced3aa44734c07`
+尚未取代實載 v11 身分 `bdfc9ce9bf165ca58a5417dc7691d984caf06a007ebde7817a70e4a503bc5ec3`；
+安全換版正在等待原活動邊界，不能把排隊當載入成功。
+
+### 減少浪費的修正與實測邊界
+
+* 共用來源讀取以 `O_NOFOLLOW`／`O_NONBLOCK` 開 FD，在建立 stream 前用
+  `fstat` 拒絕非普通檔與來源簽章變動，結束保留路徑核對；FIFO／目錄／symlink
+  不會成為阻塞或無聲換源。這是健壯性修正，不是已證實吞吐加速。
+* 回收前的 process／argv 路徑解析改為**單次掃描內有上限的共用結果**；離開掃描
+  前重查重用名稱。測試中 100 個重複 argv 的解析由 200 次降為 4 次；外部 alias
+  指向待刪來源仍阻擋，未知權限仍保守延期。無關 alias 的變動不再誤擋整個回收，
+  沒有跨輪 TTL，也沒有用字串前綴排除真正引用。
+* 已完成 OpenBB 測試的 fixture／comparison 本來使用不同 ABI，現按原 producer
+  的精確對應驗證四組 ABBA sidecar、完整有序來源 SHA、零來源 API／零來源寫入。
+  不再因要求兩個不同角色的 contract 字串相同而永久擋住已完成副本的回收；
+  缺少或篡改任一證據仍拒絕，原六份小型 JSON 留作刪後獨立讀回。
+
+[4,096 檔完整版本生命週期 ABBA](../artifacts/benchmarks/packed_descriptor_complete_abba_v2_20261020.json)
+包含 baseline／incremental／no-op、舊新版本完整原檔恢復、durable materialization
+及 fixture 清理，不只計讀取 loop。retained 平均 116.205 秒，FD 候選 120.098 秒，
+含子程序完整牆鐘分別為 121.347／125.493 秒，**沒有證明變快**；因此不宣稱已到
+硬體極限。保留 FD 改動的理由是拒絕非普通檔與避免阻塞，不是拿小段 syscall 減少
+冒充完整鏈路吞吐量提升。
+
+[固定工程觀測](../artifacts/operations/migration-v12-engineering-acceptance-20261021.json)
+保留原失敗及對應修正後驗收：來源／packed／版本生命週期組 474 passed、8 skipped，
+共用 lifecycle／Windows I/O／同步／還原組 243 passed，Fintech fixture 組
+26 passed；路徑引用與 D 容量／scope 的 focused 測試另有 22／12 passed。
+各組有重疊，不把它們加總為獨立測試數。00:18 最終六檔 storage regression 已通過
+**300 tests／1335.12 秒**；舊 CLI 選項相容性另獨立通過 1 test／1.06 秒。
+不把此前不同環境缺少 NumPy／Polars／tqdm 的 collection error 當成來源損壞，
+也不在最小 lakehouse SDK 隨意安裝一套訓練依賴來掩蓋執行環境選錯。
+
+回歸定點 stack 另發現 `test_legacy_archive_stage_prune.py` 的每個 unit case
+都會走正式 `/srv/stockagent-packed-materialized` 的遞迴 pin 掃描。測試 fixture
+現改成在自己的臨時 materialization 根呼叫**原 pin reader**，不是固定回傳空集合。
+新增 C／具名 D 兩種 scope 的真實 pin 檔測試：有效 pin 阻擋、損壞 pin 保守拒絕、
+刪掉測試 pin 後才可規劃；正式服務的 pin／process／generation gate 沒有改動。
+這是隔離單元測試與線上資料的額外成本，不拿它當正式回收吞吐的 ABBA 證據。
+00:25 這組完整 stage-prune 回歸為 **55 passed／829.23 秒**，包含新增真實 pin
+與既有 C／D、引用、冷物件、隔離改名後變動等判準。
+
+00:27 再修正回收進度的巢狀階段：內層 publication owner 結束後，外層仍會
+核對原檔，原先卻只留下子階段 `completed`。新進度契約
+`manual-retirement-phase-progress-v2` 保存 `phase_stack`／`phase_depth`，子階段
+結束恢復**同一個進程中、同一個目標**真正活躍的父階段及原開始時鐘，保留
+`last_subphase` 結果；不從磁碟上舊的 running 紀錄復活父階段，也不跨目標恢復。
+失敗傳播、被父階段處理的失敗、跨目標與舊狀態等 **10 tests passed／26.32 秒**。
+本輪已在執行的手動回收進程先於此修正載入，仍用 v1；沒有為換顯示重啟重算。
+因此當下子階段 completed 不能替代 `progress.json` 的 `all_selected_retired`
+及最終 acceptance，v2 從後續原入口執行生效，不是新 timer／新回收管線。
+
+### 回收目前進行中；先解決工作區位置，不降低容量或恢復要求
+
+精確目標僅 `artifacts/benchmarks/running_services_20261013/`
+`openbb_native_unassigned_batch_20261014` 的 10 個已完成測試檔，
+logical bytes 19,732,024,819、allocated bytes 19,733,061,632。
+C 碟無法同時容納原檔大小與 32 GiB 預留，原回收正確拒絕，沒有先刪來源騰空間。
+現由原 inventory 凍結 `completed-benchmark-d-scratch-v1`，僅這一個已完成
+benchmark 使用 `/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch`；
+仍經原 archive → D immutable publication → independent original reconstruction
+→ process／pin／lease／transport／generation → quarantine → unlink → stage prune。
+普通 D legacy staging、CAS objects 與 NAS 歷史不在新可清理範圍。
+
+[回收進度](../artifacts/operations/migration-v12-selector-d-retirement-20261020/progress.json)
+當次仍為 prepare-exact-source-archive，`all_selected_retired: false`、實際回收 0。
+這份當次觀測不預支刪除成功；原六份 JSON 已保留，約 19.7 GB payload 尚未刪除。
+00:08 已前進至 publish-to-D，00:15 定點 stack 在發布前獨立解碼核對原 SHA，
+不是 owner 死鎖或來源 API 重試。D 編碼檔的逐次完整 SHA／解壓仍走檔案讀取，
+不以「在算」推論已達 SSD 極限；後續原生 I/O／單次讀取融合仍需完整對照實測，
+不能直接省掉獨立還原或把已算過的 hash 無條件跨輪當成新證據。
+00:19 主回歸完成後，原回收仍在 `publish-under-shared-owner`，沒有宣稱已 unlink。
+[00:19 最新狀態](../artifacts/operations/migration-status-20261020T1620Z.json)仍為
+54／60、原 owner 鎖／PID 身分一致、FD 30／1024；同一個 OpenBB attempt 已前進到
+4,237,757／8,009,414 檔、61,222,288,023／110,138,611,533 bytes、phase 24／55。
+[00:28 再讀回](../artifacts/operations/migration-status-20261020T1629Z.json)仍為 54／60，
+同一個 attempt 已到 4,414,676 檔／63,666,418,968 bytes、phase 26／55，
+FD 27／1024、進度距取樣約一秒；未用無變動 heartbeat 充作封裝前進。
+同輪預設 14 日 cache dry run 為 inventory complete、eligible 0、deleted 0、errors 空；
+不為清理量而放寬預設保留期或把未知 `/var/tmp`、活躍索引當垃圾。
+
+15:37 UTC 的原 source-replication 狀態為 monitoring_increments、pending_bytes 0、
+receipt_errors 空；lab203 relay 5 批 ready／accepted，明示 acceptance reused、
+NAS payload reverification false。這表示當次 transport 批次已接受，不是全 NAS 歷史
+重新驗證，不強發 ACK，也不因一個 ready 刪除 cold history。
+
+## 2026-10-21 02:05：重啟接手、完成回收與單次輸入驗證
+
+[獨立讀回](../artifacts/operations/migration-v12-postboot-and-retirement-readback-20261021.json)
+核對原 plan `c84f1b36…`、54 組先前已完成的 snapshot／manifest 身分、當前 owner
+PID／boot 身分與實載 SHA `723da1c3…`。WSL 在 01:20 與 01:28 重啟，舊手動
+handoff 還在等 owner，沒有換版完成收據；新 boot 的正式 service 自動載入相同
+v12。原 OpenBB／FinMind interrupted attempt 由原 owner 留下 interruption receipt
+並排回原佇列，沒有刪鎖、reset workflow 或開第二個 publisher。
+
+[重啟後完整持久歷史重播](../artifacts/operations/migration-v12-postboot-history-20261021/acceptance.json)
+通過 **1733／33／29 個事件**；三條 `first_run_id` 與重啟前相同，零 activity
+執行／reset／provider call／service control。這證明目前持久工作鏈和候選相容，
+不是所有歷史 continuation、實際完成全部來源或全機冷開機業務驗收。
+
+### 已完成的精確回收
+
+原 [acceptance](../artifacts/operations/migration-v12-selector-d-retirement-20261020/legacy-wsl-offline-94ab61dff3e5e5d8760c455a/acceptance.json)
+已核對 `all_selected_retired: true`、來源及臨時 encoding stage 均不在原位置、
+保留六份 JSON 的完整 SHA 集合與固定 D manifest／當前 object presence 一致。
+此次新增實際 allocated 回收是 **19,733,061,632 bytes（來源）**及
+**4,066,828,288 bytes（D 臨時編碼）**；兩個不同 volume 分列，不相加冒充 C 空間。
+原完整冷重建及解碼證據是 `cold_verified: true`、`decoded_originals_verified: true`、
+10 原檔／19,732,024,819 original bytes。本輪刪後讀回沒有再掃一遍 19.7 GB payload，
+不把 presence 核對描述成又一次完整 SHA 還原。
+
+可恢復的固定版本為
+`legacy-wsl-offline-94ab61dff3e5e5d8760c4-20261020T162437764330905Z-l0-penguin-c61ab7640d233447`，
+manifest SHA 為 `b0b8137b27873adc562c0859cc898c83f6f7195517f1eea1453b974eda5ffac4`。
+原 catalog、retirement、stage-pruned、完整 recovery 及保留證據都在同一 receipt
+目錄；D cold objects 與 NAS snapshots 刪除數均為 **0**。
+
+### 本輪根因與修正
+
+先前 legacy verifier 先讀整個壓縮檔驗 encoded SHA，再重讀一次解碼驗原值；
+raw 格式則對完全相同 bytes 做兩次 SHA。共同入口現融合成一次有界輸入讀取，
+同時保留 encoded／original 的完整 SHA 及長度。gzip 多 member、zstd 多 frame／
+完整 decoder exit status／輸入 thread 錯誤都須通過；FD 使用 no-follow／nonblocking，
+讀完核對原 FD 與原路徑 generation，未知 FIFO／symlink／目錄不會卡在讀取。
+zstd 只加一個 bounded feeder，使輸入寫 pipe 與輸出讀取同時前進，不先塞滿 pipe
+造成死鎖；失敗會終止 decoder、收回 feeder 後才關原 FD。
+
+此融合**沒有共用跨階段證據**。發布前／後來源比較、canonical cold object／ZIP
+完整核驗、獨立冷庫原值還原與真正 retirement／stage prune 都保持原流程。
+`scripts/benchmark_legacy_archive_workflow.py` 沿用原真實資料完整發布／冷解碼／
+restore／原 SHA・mode・mtime 讀回與私人 scratch 引用檢查；新增兩讀／單讀 ABBA，
+可把當次私人 encoding 放 D 模擬這次大檔回收，並記包含 D scratch 回收的總時間。
+不清 OS cache、不碰權威 head／既有來源、不省解碼或為速度刪除驗證。
+
+### 仍未完成的來源與排程
+
+* `finlab-research`：原 owner 正處理；02:05 為 962,568 檔、106.07 GB 分母，
+  本階段已處理 37.15 GB。這是 source packing，還有小檔封裝及完整冷還原。
+* `finmind-free`／`local-openbb`：boot 中斷後由原 owner 排回佇列；sealed packs
+  留存可重用，仍需重新核對當前 source bytes，不沿用舊進度宣稱完成。
+* `local-tw-public`：v12 已載入具名原子控制檔修正，仍等原 owner 實際重試驗收。
+* `tw-minute-train`：本輪已看不到該 lock 的 holder；舊 timeout 記錄保留，
+  由原佇列重新取得鎖，沒有刪鎖或繞過協調。
+* `tw-public-research-finlab-2014-v4`：一般目錄仍是 verified 1142、stale 207、
+  missing 1。stale 中 204 個最近嘗試回報 `vip_only`，3 個 `resource_deferred`；
+  唯一 missing 是保留的 source-empty 觀察到期，不能補零或補寫完成旗標。
+  當前官方 quota snapshot 為剩餘 0／5000 MB，不能推定是永久無權限或假裝已追新；
+  待原配額重置／來源檢查成功，才由原 builder 重建及全 SHA 封閉 overlay。
+
+02:05 source replication 的 pending bytes 為 0、receipt errors 空，paired relay
+為 ready；僅限該次封閉 transport 批次，不表示所有 NAS 歷史已重新完整還原。
+目前仍有可避免 I/O、首輪大清冊與來源 quota／freshness 邊界，**尚未完成全部遷移，
+也未證實只剩硬體上限**。以下是本輪最終對照，不用單純 syscall 數減少代替
+完整流程加速。
+
+### 02:27 完整實測及工程封閉
+
+[最終獨立讀回](../artifacts/operations/migration-v13-single-read-final-readback-20261021.json)
+分別綁定兩組原始 benchmark、當前遷移觀測、先前完整退休／刪後證據、測試及
+NAS 新批次。這個 `v13` 是獨立 archive 驗證優化的工程標籤，**不是**新 migration
+worker 版本；原 worker 仍實載 `723da1c3…`，沒有為此中斷正在前進的 FinLab。
+
+第一性原理的下界是：完整驗兩個 hash 至少要看過每個 encoded byte，並完整
+解碼原值。舊驗證在同一交易內讀兩次 encoded bytes；新驗證一次串流取得
+`H(encoded)`、`H(decoded)` 與兩個長度。複雜度仍是 **O(encoded + original bytes)**，
+不是變成常數時間；記憶體有界於 block／pipe。raw 的兩個 hash 相同可只算一次。
+不同發布／冷恢復交易仍各自讀回，不能把跨輪 cache 當成當前獨立驗證。
+
+兩組都使用真實來源、每組四輪 **A–B–B–A**，測完整 publish → independent cold
+decode → restore → 原 SHA／size／mode／mtime → 己方 D 暫存回收。來源保持不變，
+八輪均通過；只刪當輪私人測試 fixture。沒有清 OS cache、停其他服務、修改
+權威 head，或聲稱私人 D/9p 測試路徑等同 production canonical native reader。
+
+| 真實來源工作負載 | 完整耗時中位數（含 D 暫存回收） | 完整 CPU 中位數（含 child） | 可成立的結論 |
+| --- | --- | --- | --- |
+| 139.31 MB Feather → 約 8.57 MB zstd | 17.42 → 14.26 秒 | 5.92 → 5.74 秒 | 此樣本耗時縮短 18.13%、CPU 少 3.09% |
+| 486.62 MB 兩個 Parquet，adaptive 選 raw | 325.17 → 325.97 秒 | 42.80 → 39.88 秒 | 耗時持平（+0.25%），CPU 少 6.82%；**未證實大檔整鏈加速** |
+
+原始資料：[壓縮工作負載](../artifacts/benchmarks/legacy_single_read_zstd_complete_abba_20261021.json)、
+[原值大檔工作負載](../artifacts/benchmarks/legacy_single_read_complete_abba_20261021.json)。
+這是共享 WSL/ext4、D/9p 現場的有界量測，兩個樣本不是全系統最優值或統計顯著性證明。
+原值大檔的發布階段中位數少 10%，但 cold fetch／restore 波動抵銷，不能只挑該階段
+或第一組快樣本宣稱總流程加速。
+
+較廣 archive／retirement／stage-prune／maintenance／fixture 回歸為 **335 passed
+（470.62 秒）**；最終 archive 與完整比較兩檔為 **91 passed（31.35 秒）**，另有
+最終串流邊界 **28 passed（2.08 秒）**。這些測試重疊，不加總為獨立測試數。
+途中兩次工程失敗各有
+[根因及後續驗收處置](../artifacts/operations/migration-v13-engineering-repair-dispositions-20261021.json)：
+大型 pytest 參數造成環境長度 E2BIG，改用有界 ID／函式內 payload；D benchmark
+錯用 native mutable-state admission，改為保留 C 原 gate、D 按 mount guard 和真實
+容量預算。失敗 log／run 保留，沒有把原失敗改寫為成功。
+
+02:27 最新同一 `finlab-research` attempt 已核對 **104,756 檔**、路由 **946,920 檔**、
+處理 **52.86／106.07 GB**；仍是封裝階段，之後還要全原檔冷還原。原 54 組
+snapshot／manifest 都再次核對未回退，owner lock／process 身分一致，FD 為
+**27／1024**。其餘五項仍按前節依賴續跑，不取消來源鎖或 freshness gate。
+一般 FinLab quota 重置後由原排程重新確認 stale／empty 觀察，再讓原 builder
+產生完整、可驗 hash 的 overlay，不能填旗標代替取得資料。
+
+02:17 新封閉的 NAS wave `30d9466e…` 為 7 個 payload／1,052,963 bytes；先前等待
+的是原 Syncthing scan，不是 checksum 錯誤。paired ACK 的 02:21:55 獨立還原已驗
+全部 9 檔（含 manifest／READY）、1,056,162 bytes，source owner 再驗身分通過。
+02:26 狀態為 monitoring increments、pending bytes 0、receipt errors 空；最新 relay
+沿用已驗收收據，不是這次狀態讀取又做一次 NAS payload 全重驗。catalog semantic
+restore 仍分開，不能將此 wave 當成全 NAS 歷史驗收。
+
+[本輪 managed-cache dry run](../artifacts/operations/migration-v13-managed-cache-dryrun-20261021.json)
+是 **5 checked、0 would-evict、0 evicted**，全部有 pin 或有效 lease。除了上節已經
+完整還原驗收並刪後核對的 19.73 GB 來源副本與 4.07 GB D encoding，本輪沒有再
+刪冷庫、NAS snapshot、受引用視圖、未知 provenance 暫存或仍在使用的索引。
+
+下一個可量測的效能方向，是原值大檔 full cold fetch／restore 的 D I/O，而非再省
+驗證。當前 public native chunk 與 owner-private scope 不同；若擴充私有 batch
+reader，須先補 authority／0700／marker／ignored-export／每批 generation guard，
+再做完整新舊版本恢復 ABBA、工作歷史 replay 和安全交接。不在 productive attempt
+中途直接打開未驗證旗標，也不以「硬體上限」掩蓋未處理的軟體 I/O。
+
+## 2026-10-21 10:58：v14 運作檔案捕捉、實載及真實來源讀回
+
+[本輪固定驗收](../artifacts/operations/migration-v14-final-readback-20261021.json)
+及[完整狀態](../artifacts/operations/migration-v14-final-status-20261021.json)仍綁定
+原 task `all-dataset-incremental-layout-20261016`、同一 plan／operation；沒有新建
+publisher、私有匯出管線或第二個遷移 owner。整體任務仍是 **active，55／60**。
+
+### 根因、計畫與實作
+
+長跑失敗不是 API 沒有下載到資料，而是把會持續更新的運作檔案誤當成整輪
+不變的 payload。FinLab 上一輪在 83.79／106.07 GB 後遇到
+`catalog/discovery.json` 更新；OpenBB 在 5,446,168／8,010,483 檔時遇到
+`logs/supervisor.log` 變更。它們因此拒絕發布是正確的保護，不能關閉原 fence。
+只修這兩個 basename 還會輪到相同 producer 的其他 monitor／catalog／rotation 檔。
+
+因此先沿原 writer 盤點整個類別，再用原 frozen-control／packed 路徑修正：
+
+1. control scope 升為 `recursive_mutable_controls_v13`（本節工程標籤是 v14，
+   不是前節 archive single-read v13）。FinLab 加入精確的 `catalog/discovery.json`；
+   OpenBB 加入已核實 scheduler／monitor／audit／supervisor epoch 控制與目錄輸出。
+2. 四個具名 supervisor logs 及兩個監控 JSONL 以有界串流捕捉完整檔案，
+   不再因大於 64 MiB 被當成普通長跑 payload。一般拷貝為 8 MiB block；JSONL
+   逐列驗證、保留最後換行及 64 MiB 每列上限。拷貝中增長／截斷會先拒絕／重試，
+   不裁切半列、不接受 append prefix、不修改原日誌。
+3. v12 preparation 只探查具名路徑；保留先前觀測、SQLite 原生備份與 sealed packs，
+   不重走八百萬 raw 路徑來找幾個新控制檔，也不重備份既有 DB。普通 raw／
+   receipt_history／相似目錄、未知變動 payload 仍拒絕。no-follow/nonblocking
+   regular-file open 也避免 lstat 後被換成 FIFO 而卡住。
+4. 只省略原 writer 未提交的精確 rotation／epoch／catalog siblings，manifest
+   明列 `openbb_operational_atomic_sibling_v1`；不是通用 `.tmp` filter。正式
+   `.log`／`.log.1` 與原始資料仍收錄。私有 0700／marker／不匯出政策不變。
+5. 完整語義測試、ABBA、原持久歷史 replay 通過後，沿既有 code-only 交接入口
+   安裝；最後獨立讀回原 55 組固定身分、實際 owner、當前冷物件存在性及證據。
+
+### 正式交接與真實來源驗證
+
+[正式交接](../artifacts/operations/migration-v14-code-handoff-20261021.json)在 10:41
+通過。沿先前「直接換新版」授權使用原 code-only/restart-active-owner 路徑，先
+封閉 intent、保留舊 attempt／staging／55 組已驗收身分，再由原 journal 對帳及
+重排；沒有刪鎖或 reset workflow。實載 SHA `c6f29612…`，PID `2117 → 1202070`，
+PG／Temporal server 與私有設定 SHA 不變。FinMind 當時未封閉的 census 重排，
+不得再當成現在仍在工作；其已封閉 packs／六個原生 DB 固定版本仍保留。
+
+[換版後完整持久歷史 replay](../artifacts/operations/migration-v14-post-handoff-history-20261021/acceptance.json)
+通過 3241／293／47 個事件，三條 first-run ID 不變，零 activity／reset／來源
+呼叫。10:58 讀回實際 loaded code 等於候選，原 55 組 snapshot／manifest 未回退。
+
+另外用已知**真實來源控制檔**做只讀捕捉 → 隔離私域封裝 → 完整冷原值還原 →
+再次 fetch／SHA → 己方副本 reference gate／回收：
+
+| 來源與範圍 | 原檔數／bytes | 結果 |
+| --- | --- | --- |
+| [OpenBB 運作檔案](../artifacts/benchmarks/migration_v14_live_openbb_controls_20261021.json) | 35／774,293,464 | 全原檔讀回通過；原 logs 與 production cold 未改動 |
+| [FinLab 目錄／run head](../artifacts/benchmarks/migration_v14_live_finlab_controls_20261021.json) | 2／69,946 | 全原檔讀回通過；原目錄未改動 |
+
+測試只用 `/var/tmp` 己方私域，不把它當成 D/NAS 全庫驗收。首次工具因缺少
+private-history marker 被原 guard 正確拒絕，保留固定副本後沿同一 intent 續跑，
+沒有繞過保護或重新抓 API；已驗收的真實副本與兩份失敗 unit fixture 都安全清理。
+[工程失敗與修復處置](../artifacts/operations/migration-v14-engineering-repair-dispositions-20261021.json)
+綁定七個原 failed run 及後續成功驗收，沒有刪除或改寫原失敗證據。
+
+### 完整流程效率與驗證範圍
+
+固定 2048 個 raw 檔、具名 log／完整 JSONL／真正 Parquet 三個運作輸出，每輪包含
+原 preparation 升級、實際變動觸發、發布／必要重試、完整原值還原及己方 capture
+回收。兩組 A–B–B–A 的原 inventory SHA 完全一致，原方案每輪 2 次、新方案 1 次；
+sealed pack 已可重用，pack member writes 都是 2051，**不是 payload 寫入減半**。
+
+| 有界本機 SSD 工作負載 | 完整平均耗時 | 完整平均 CPU |
+| --- | --- | --- |
+| [第一次 ABBA](../artifacts/benchmarks/migration_v14_operational_controls_abba_20261021.json) | 13.37 → 11.97 秒（少 10.5%） | 5.25 → 4.28 秒（少 18.3%） |
+| [最終程式 ABBA](../artifacts/benchmarks/migration_v14_operational_controls_abba_final_20261021.json) | 23.94 → 10.01 秒（少 58.2%） | 6.83 → 4.94 秒（少 27.6%） |
+
+此時同機仍有其他工作；第二組 reference 尤其波動，不能把 58.2% 當成全庫速度
+或統計顯著的因果倍數。兩次都能重現的是：消除由該類檔案異動造成的整輪失敗，
+原值完全一致、少一個重試，以及這些樣本 CPU 較少。不是 D／NAS 量測，不省
+任一原 SHA／CRC／冷恢復驗證。完整驗證目前仍有 O(檔數 + bytes) 下界，
+**尚未證實已經只剩硬體限制**。
+
+控制角色完整儲存／生命週期回歸為 **722 passed、8 skipped（86.21 秒）**；
+8 項是該角色未裝的實驗性 fastcdc，已在一般角色 **422 passed（35.13 秒）**
+中全部涵蓋。測試互相重疊，不加總為獨立通過數，不為測試改動已鎖依賴。
+
+### 現在剩下什麼，以及實際清理
+
+* `finlab-research`：原 owner 活動中。新 attempt 的 census 是 963,599 檔／
+  109,731,427,349 bytes，10:56 樣本核對／路由 5,327,474,382 bytes；23 份
+  sealed-pack hints 納入 182,208 檔，missing/rejected 皆 0。這是來源核對，
+  不是 API 抓取百分比或已冷還原百分比；新下載也使分母較舊 106.07 GB 增加。
+* `local-openbb`：類別修正已實載且真實 35 檔完整還原通過；正式全根仍待原
+  佇列重試，舊 5.4M 檔不是 active。不是另起一個全根 publisher。
+* `finmind-free`：交接後由原佇列保留 interruption 證據及 packs 待續跑；舊
+  1.51M census 不能當目前 active 或完成數。
+* `tw-minute-train`：前次 coordination timeout 保留；本輪查不到該 lock holder，
+  仍須原 owner 成功重取鎖及完整發布驗收，未刪 lock、未繞過來源協調。
+* `tw-public-research-finlab-2014-v4`：一般目錄已 **1350 verified，stale／missing／
+  invalid 皆 0**，包含 1 個有原證據的 source-empty。這個便宜檢查沒有重讀全部
+  payload hashes，不代表已產生最新 overlay；原 builder／全 SHA gate 仍要完成。
+
+新增完成的 `local-tw-public` 是 204,651 檔／75.66 GB 全原檔冷還原；固定版本
+`local-tw-public-20261020T193905610461929Z-l0-penguin-f49f8e91cd9a-a7d993906b2ea83b`、
+manifest `5381454e8f4f89c4750eb13624581edf023847d992da1c0fb1d1ce33726d867e`。
+原完整 recovery 與 10:58 當前 D presence 再核對分開；這次狀態檢查沒有再重讀
+75.66 GB，也沒有冒稱又做一次完整 SHA。其 107 個已驗收己方暫存共回收
+**2,042,556,416 allocated bytes**；原來源／D cold／NAS 刪除皆 0。
+
+10:37 managed-cache dry run 檢查 5 項，0 可回收、0 刪除（pin 或 lease 保護）。
+此前 19.73 GB source／4.07 GB encoding 是前批，不重新算作新增空間。這輪測試
+副本回收是測試生命週期，不灌入正式資料集的 source-reclaim 數。
+
+NAS source projection 的 10:45 樣本仍有 12 批／126,825,139 bytes 待 ACK，
+receipt errors 與 catalog refresh error 空；10:57 只讀 Syncthing 為 ingress
+`scanning`、return `syncing`（尚需 23,049 bytes／10 items），本機 errors 皆 0。
+不能把 need=0／沒有錯誤當已送達，更不能拿既有 NAS bytes 當所有歷史獨立恢復。
+後續由既有 sender／paired ACK 收斂；全部來源完成、NAS 全歷史驗收與硬體極限
+證明都仍明列 **false**，不因這輪工程修復成功而結束整體任務。

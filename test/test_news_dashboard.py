@@ -316,6 +316,48 @@ def test_project_source_counts_not_metadata_versions_or_legal_completion(tmp_pat
         assert forbidden not in encoded
 
 
+def test_valid_full_source_snapshot_above_old_four_mib_keeps_exact_projection(tmp_path):
+    from stockagent.live.news_dashboard import MAX_SNAPSHOT_BYTES, MAX_STATUS_SNAPSHOT_BYTES
+    status = _seed(tmp_path)
+    status['providers']['unregistered:more-news.tw'] = {'states': {'awaiting_authorization': 89}}
+    status['states']['awaiting_authorization'] += 89
+    status['unique_articles'] += 89
+    _save(tmp_path, status)
+    baseline = build_news_public_status(tmp_path, now=NOW)
+    # Private, irrelevant telemetry must neither hide actual providers nor be
+    # exposed by increasing the status-only input budget.
+    status['private_unused_diagnostic'] = 'PRIVATE_PADDING' * (MAX_SNAPSHOT_BYTES // 14 + 1)
+    _save(tmp_path, status)
+    size = (tmp_path / 'data_news_fulltext/status.json').stat().st_size
+    assert MAX_SNAPSHOT_BYTES < size < MAX_STATUS_SNAPSHOT_BYTES
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result == baseline
+    assert result['snapshot_read_state'] == 'loaded' and result['snapshot_reader_contract_version'] == 3
+    row = next(r for r in result['providers'] if r['id'] == 'unregistered:more-news.tw')
+    assert row['known_urls'] == 89 and row['complete_urls'] == 0
+    assert 'PRIVATE_PADDING' not in json.dumps(result)
+
+
+def test_status_limit_remains_bounded_even_after_snapshot_is_cached(tmp_path, monkeypatch):
+    from stockagent.live import news_dashboard
+    status = _seed(tmp_path)
+    assert build_news_public_status(tmp_path, now=NOW)['snapshot_read_state'] == 'loaded'
+    limit = (tmp_path / 'data_news_fulltext/status.json').stat().st_size - 1
+    monkeypatch.setattr(news_dashboard, 'MAX_STATUS_SNAPSHOT_BYTES', limit)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['snapshot_read_state'] == 'too_large' and result['health'] == 'unavailable'
+    assert result['acquisition']['known_urls'] is None
+    assert result['acquisition']['all_sources_eta_seconds'] is None
+    assert result['snapshot_reader_contract_version'] == 3
+
+
+def test_auxiliary_json_keeps_original_four_mib_limit(tmp_path):
+    from stockagent.live.news_dashboard import _read, MAX_SNAPSHOT_BYTES
+    path = tmp_path / 'auxiliary.json'
+    atomic_write_json(path, {'private': 'x' * MAX_SNAPSHOT_BYTES})
+    assert _read(path) == {}
+
+
 @pytest.mark.parametrize('outcome', ['source_body_image_only', 'source_body_embedded_only', 'source_body_quote_only', 'source_article_empty_template'])
 def test_source_body_outcome_remains_distinct_from_unknown_failures(tmp_path, outcome):
     status = _seed(tmp_path)

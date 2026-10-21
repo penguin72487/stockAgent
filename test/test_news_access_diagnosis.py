@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import closing
 import json
 from pathlib import Path
 import time
@@ -159,6 +160,93 @@ def test_follow_redirects_requires_explicit_boolean(config, tmp_path, value):
         assert session.calls == []
     finally:
         http.close()
+
+
+@pytest.fixture
+def redirect_queue(config, tmp_path):
+    from downloader.news_fulltext_queue import NewsQueue, utc_now
+    with closing(NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))) as queue:
+        with queue.db:
+            queue.add_articles([{'url': 'https://publisher.test/article/1'}])
+            queue.db.execute("UPDATE articles SET state='redirect_not_article',error_code='redirect_not_article',"
+                             "due=0,last_checked_at_utc=?", (utc_now(),))
+        yield queue
+
+
+@pytest.mark.parametrize('flags', [
+    ['--failure-code', 'redirect_not_article'], ['--require-current-missing-body-failure'],
+    ['--failure-code', 'redirect_not_article', '--require-current-missing-body-failure'],
+])
+def test_current_redirect_cli_requires_matching_code_grant_and_no_follow_before_http(tmp_path, monkeypatch, flags):
+    from scripts import diagnose_news_access as access
+    monkeypatch.setattr(access, 'NewsHTTP', lambda *_a, **_kw: pytest.fail('invalid flags created HTTP owner'))
+    with pytest.raises(SystemExit):
+        access.main(['--probe', 'https://publisher.test/article/1', '--output', str(tmp_path / 'invalid.json'), *flags])
+    assert not (tmp_path / 'invalid.json').exists()
+
+
+@pytest.mark.parametrize('changes', [
+    {'state': 'complete'}, {'body_sha256': 'retained'}, {'due': 1e12}, {'lease_owner': 'other'},
+    {'lease_until': 1e12}, {'error_code': 'http_403'}, {'error_code': 'http_429'},
+    {'last_checked_at_utc': None},
+])
+def test_current_redirect_probe_skips_changed_head_without_http_or_requeue(redirect_queue, monkeypatch, changes):
+    from scripts import diagnose_news_access as access
+    queue = redirect_queue
+    with queue.db:
+        for key, value in changes.items():
+            queue.db.execute(f'UPDATE articles SET {key}=?', (value,))
+    previous = dict(queue.db.execute('SELECT * FROM articles').fetchone())
+    monkeypatch.setattr(access, 'load_config', lambda _p: ({'root': '.', 'workers': 1}, queue.registry, queue.root))
+    monkeypatch.setattr(access, 'NewsHTTP', lambda *_a, **_kw: pytest.fail('stale head created HTTP owner'))
+    output = queue.root / 'skipped.json'
+    assert access.main(['--probe', previous['url'], '--output', str(output), '--resolve-redirect-only',
+        '--require-current-missing-body-failure', '--failure-code', 'redirect_not_article']) == 0
+    result = json.loads(output.read_text())
+    assert result['state'] == 'skipped_no_longer_due_failed_missing_body' and result['publisher_requests'] == 0
+    assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == previous
+
+
+def test_current_redirect_cli_records_one_no_follow_response_without_body_or_queue_mutation(redirect_queue, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import diagnose_news_access as access
+    queue = redirect_queue
+    previous = dict(queue.db.execute('SELECT * FROM articles').fetchone())
+    calls, closed = [], []
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Response(url, 302, {'location': 'https://another-publisher.test/article/2'}, b'BODY_MUST_NOT_BE_RETAINED')
+    fake = SimpleNamespace(registry=queue.registry, provider_not_before={}, get=get,
+        metrics=SimpleNamespace(snapshot=lambda: {}), close=lambda: closed.append(True))
+    # Isolate queue storage without pretending that implementation files live
+    # in pytest's temporary data directory; provenance hashes the real source.
+    repo = Path(access.__file__).resolve().parents[1]
+    monkeypatch.setattr(access, 'load_config', lambda _p: (
+        {'root': str(queue.root), 'workers': 1}, queue.registry, repo))
+    monkeypatch.setattr(access, 'NewsHTTP', lambda *_a, **_kw: fake)
+    output = queue.root / 'redirect.json'
+    assert access.main(['--probe', previous['url'], '--output', str(output), '--resolve-redirect-only',
+        '--require-current-missing-body-failure', '--failure-code', 'redirect_not_article']) == 0
+    result = json.loads(output.read_text())
+    assert calls == [(previous['url'], {'follow_redirects': False})] and closed == [True]
+    assert result['failure_probe_code'] == 'redirect_not_article'
+    assert result['current_failed_missing_body_preflight'][0]['last_checked_at_utc'] == previous['last_checked_at_utc']
+    item = result['providers'][0]['probes'][0]
+    assert item['status'] == 302 and not item['destination_requested'] and not item['article_durably_accepted']
+    assert 'BODY_MUST_NOT' not in output.read_text() and not list(queue.root.rglob('*.parquet'))
+    assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == previous
+
+
+def test_access_cli_cannot_change_root_to_duplicate_enabled_publisher_budget(config, tmp_path, monkeypatch):
+    from scripts import diagnose_news_access as access
+    registry = PolicyRegistry(config, base=tmp_path)
+    configurations = iter([({'root': 'isolated', 'workers': 1}, registry, tmp_path),
+                           ({'root': 'production'}, registry, tmp_path)])
+    monkeypatch.setattr(access, 'load_config', lambda _p: next(configurations))
+    monkeypatch.setattr(access, 'NewsHTTP', lambda *_a, **_kw: pytest.fail('overlapping host created HTTP owner'))
+    with pytest.raises(ValueError, match='isolated_diagnostic_overlaps_enabled_production_host'):
+        access.main(['--probe', 'https://publisher.test/article/1', '--output', str(tmp_path / 'isolated.json')])
+    assert not (tmp_path / 'isolated.json').exists()
 
 
 def test_actual_missing_robots_and_body_are_distinct(config, tmp_path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,111 @@ from test_news_fulltext import article_html
 
 
 URL = 'https://news.cnyes.com/news/id/42'
+
+
+@pytest.mark.parametrize('url,hint', [
+    ('https://www.cnyes.com/twstock/2330', 'market_endpoint_route_candidate'),
+    ('http://www.cnyes.com/twstock/2330/company/--?q=literal&amp;x=1', 'market_endpoint_route_candidate'),
+    ('https://news.cnyes.com/Content/20110124/ABC12.shtml', 'legacy_shtml_article_route_candidate'),
+    ('https://news.cnyes.com/20090124/12345.shtml', 'legacy_shtml_article_route_candidate'),
+    ('https://news.cnyes.com/content/20110124/ABC12.shtml', 'legacy_shtml_article_route_candidate'),
+    ('https://amp-news.cnyes.com/news/id/42', 'current_article_route_candidate'),
+    ('https://news.cnyes.com/news/aigc/answer/abc', 'other_news_host_route_unreviewed'),
+    ('https://hao.cnyes.com/hot', 'other_cnyes_route_unreviewed'),
+    ('https://www.cnyes.com/company/profile', 'other_cnyes_route_unreviewed'),
+    ('https://www.cnyes.com/twstockish/2330', 'other_cnyes_route_unreviewed'),
+    ('https://www.cnyes.com:443/twstock/2330', 'foreign_origin_unreviewed'),
+    ('https://www.cnyes.com.invalid/twstock/2330', 'foreign_origin_unreviewed'),
+    ('https://news.cnyes.com/%43ontent/20110124/ABC12.shtml', 'other_news_host_route_unreviewed'),
+    ('https://user:secret@www.cnyes.com/twstock/2330', 'invalid_or_oversized_url'),
+    ('https://[invalid', 'invalid_or_oversized_url'),
+    ('javascript:alert(1)', 'invalid_or_oversized_url'),
+    ('x' * 8193, 'invalid_or_oversized_url'),
+    (None, 'invalid_or_oversized_url'),
+])
+def test_literal_route_hints_are_syntax_only_without_identity_rewrites(url, hint):
+    assert inspector.cnyes_literal_route_hint(url) == hint
+
+
+def route_database():
+    db = sqlite3.connect(':memory:')
+    db.executescript('''CREATE TABLE articles(url TEXT,provider TEXT,state TEXT,due REAL,body_sha256 TEXT);
+        CREATE INDEX dispatch ON articles(provider,state,due);''')
+    return db
+
+
+def test_unfinished_route_census_is_indexed_bounded_and_preserves_body_presence(monkeypatch):
+    db = route_database()
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?)', [
+        ('https://www.cnyes.com/twstock/2330', 'cnyes', 'unsupported_article_path', 1, None),
+        ('https://www.cnyes.com/twstock/2330/company/--', 'cnyes', 'unsupported_article_path', 2, 'retained'),
+        ('https://news.cnyes.com/20110124/12345.shtml', 'cnyes', 'unsupported_article_path', 3, None),
+        ('https://hao.cnyes.com/hot', 'cnyes', 'unsupported_article_path', 4, None),
+        ('https://news.cnyes.com/news/id/42', 'cnyes', 'body_not_found', 0, None),
+        ('https://www.cnyes.com/twstock/9999', 'other', 'unsupported_article_path', 0, None),
+    ])
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?)', [
+        (f'completed-must-not-be-inspected-{i}', 'cnyes', 'complete', 0, 'stored') for i in range(10000)])
+    db.commit()
+    before = db.total_changes
+    native_hint = inspector.cnyes_literal_route_hint
+    def no_healthy_body(url):
+        assert not url.startswith('completed-')
+        return native_hint(url)
+    monkeypatch.setattr(inspector, 'cnyes_literal_route_hint', no_healthy_body)
+    statements, steps = [], []
+    db.set_trace_callback(statements.append)
+    db.set_progress_handler(lambda: steps.append(1) or 0, 100)
+    result = inspector.cnyes_unsupported_path_inventory(db)
+    assert len(steps) < 5  # The 10k completed heads are outside the index range.
+    assert len(statements) == 1 and 'INDEXED BY dispatch' in statements[0]
+    assert "state='unsupported_article_path'" in statements[0] and 'LIMIT 4097' in statements[0]
+    assert db.total_changes == before
+    assert result['heads_examined'] == result['total_unsupported_url_heads'] == 4
+    assert result['all_current_unsupported_heads_included'] and not result['head_limit_reached']
+    groups = result['route_hint_counts']
+    assert groups['market_endpoint_route_candidate']['url_heads'] == 2
+    assert groups['market_endpoint_route_candidate']['missing_body_heads'] == 1
+    assert groups['market_endpoint_route_candidate']['stored_body_heads'] == 1
+    assert groups['legacy_shtml_article_route_candidate']['url_heads'] == 1
+    assert sum(group['url_heads'] for group in groups.values()) == 4
+    for key in ('article_count_inferred', 'body_acceptance_granted', 'source_absence_or_permission_inferred',
+                'completion_denominator_changed'):
+        assert result[key] is False
+    for key in ('publisher_requests', 'production_queue_writes', 'completed_body_rows_scanned', 'raw_or_body_payloads_read'):
+        assert result[key] == 0
+    db.close()
+
+
+def test_route_census_overflow_does_not_claim_an_exact_total_or_complete_scope():
+    db = route_database()
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?)', [
+        (f'https://www.cnyes.com/twstock/{i}', 'cnyes', 'unsupported_article_path', i, None) for i in range(10)])
+    result = inspector.cnyes_unsupported_path_inventory(db, head_limit=4)
+    assert result['heads_examined'] == 4 and result['head_limit_reached']
+    assert result['total_unsupported_url_heads'] is None
+    assert result['all_current_unsupported_heads_included'] is False
+    assert len(result['route_hint_counts']['market_endpoint_route_candidate']['literal_url_samples']) == 3
+    db.close()
+
+
+def test_invalid_or_foreign_route_samples_do_not_export_credentials():
+    db = route_database()
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?)', [
+        ('https://user:secret@www.cnyes.com/twstock/2330', 'cnyes', 'unsupported_article_path', 0, None),
+        ('https://foreign.invalid/token/secret', 'cnyes', 'unsupported_article_path', 1, None),
+    ])
+    result = inspector.cnyes_unsupported_path_inventory(db)
+    assert result['heads_examined'] == 2
+    assert 'secret' not in json.dumps(result)
+    assert all(group['literal_url_samples'] == [None] for group in result['route_hint_counts'].values())
+    db.close()
+
+
+@pytest.mark.parametrize('head_limit', [0, -1, 4097, True, 1.5])
+def test_route_census_rejects_unbounded_or_invalid_work(head_limit):
+    with pytest.raises(ValueError, match='1..4096'):
+        inspector.cnyes_unsupported_path_inventory(None, head_limit=head_limit)
 
 
 @pytest.mark.parametrize('visible,current,whitespace,entities', [
@@ -71,6 +177,32 @@ def test_readonly_inventory_does_not_construct_http_or_mutate_queue(cfg, tmp_pat
     assert json.loads(output.read_text())['probes'] == []
     assert db_path.read_bytes() == before
     assert not (tmp_path / 'store/cooldowns.json').exists()
+
+
+def test_path_only_mode_avoids_full_status_services_and_http(cfg, tmp_path, monkeypatch):
+    _, output = environment(cfg, tmp_path, monkeypatch)
+    db_path = tmp_path / 'store/queue.sqlite3'
+    before = db_path.read_bytes()
+    read_text = Path.read_text
+    def no_status(path, *args, **kwargs):
+        assert path != tmp_path / 'store/status.json'
+        return read_text(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'read_text', no_status)
+    monkeypatch.setattr(inspector, 'NewsHTTP', lambda *_a: pytest.fail('path census acquired HTTP'))
+    monkeypatch.setattr(inspector.subprocess, 'check_output', lambda *_a, **_k: pytest.fail('path census scanned services'))
+    assert inspector.main(['--unsupported-paths-only', '--output', str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result['total_unsupported_url_heads'] == 0 and result['publisher_requests'] == 0
+    assert 'status' not in result and 'services' not in result
+    assert db_path.read_bytes() == before
+
+
+@pytest.mark.parametrize('args', [['--probe', URL], ['--canonical-fetch'], ['--unsupported-head-limit', '4097']])
+def test_path_only_mode_rejects_probe_or_unbounded_work_before_loading_configuration(tmp_path, monkeypatch, args):
+    monkeypatch.setattr(inspector, 'load_config', lambda *_a: pytest.fail('invalid inspection loaded configuration'))
+    with pytest.raises(SystemExit) as result:
+        inspector.main(['--unsupported-paths-only', '--output', str(tmp_path / 'result.json'), *args])
+    assert result.value.code == 2
 
 
 @pytest.mark.parametrize('canonical,url', [

@@ -101,13 +101,24 @@ def pack_writer_reference(path, expected_sha, *, sequential=False):
 
 
 def trial(files, variant, memory_rows, *, pack_write_only=False, pack_buffer_only=False,
+          source_descriptor_only=False,
           reference=None, reference_sha=None,
           cold_parent=None, stored_member_bytes=0):
-    pack_scope = pack_write_only or pack_buffer_only
+    pack_scope = pack_write_only or pack_buffer_only or source_descriptor_only
     packed.METADATA_MEMORY_ROWS = (10**9 if variant == "retained" and not pack_scope else memory_rows)
     packed.MATERIALIZE_FSYNC_WORKERS = 0 if variant == "retained" and not pack_scope else 4
     write_pack = packed._write_pack
-    if pack_write_only:
+    if source_descriptor_only:
+        descriptor_reader = packed._open_source_entry
+        @contextmanager
+        def former_path_reader(source, entry):
+            path = packed._entry_read_path(source, entry)
+            packed._ensure_source_stat(path, entry)
+            with path.open('rb') as stream:
+                yield stream
+            packed._ensure_source_stat(path, entry)
+        packed._open_source_entry = former_path_reader if variant == 'retained' else descriptor_reader
+    elif pack_write_only:
         packed._write_pack = pack_writer_reference(reference, reference_sha, sequential=variant != "retained")
     elif pack_buffer_only:
         packed._write_pack = (pack_writer_reference(reference, reference_sha)
@@ -287,6 +298,8 @@ def main(argv=None):
                        help="compare only the preserved seekable and current sequential pack writer")
     scope.add_argument("--pack-buffer-only", action="store_true",
                        help="compare seekable buffering with the preserved writer; identical ZIP bytes")
+    scope.add_argument('--source-descriptor-only', action='store_true',
+                       help='compare the former two-path-stat reader with no-follow open/fstat; full lifecycle')
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--reference-sha256")
     parser.add_argument("--d-cold-fixture", action="store_true",
@@ -297,12 +310,13 @@ def main(argv=None):
     parser.add_argument("--trial", choices=("retained", "bounded"), help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     metadata_scope = args.metadata_only or args.bootstrap_only
-    pack_scope = args.pack_write_only or args.pack_buffer_only
+    preserved_writer_scope = args.pack_write_only or args.pack_buffer_only
+    pack_scope = preserved_writer_scope or args.source_descriptor_only
     if not 10 <= args.files <= (1000000 if metadata_scope else 200000):
         parser.error("choose a bounded 10..200000 file or 10..1000000 metadata fixture")
     if not 1 <= args.memory_rows <= packed.DEFAULT_METADATA_MEMORY_ROWS:
         parser.error("choose a bounded metadata row limit")
-    if bool(args.reference) != bool(args.reference_sha256) or pack_scope != bool(args.reference):
+    if bool(args.reference) != bool(args.reference_sha256) or preserved_writer_scope != bool(args.reference):
         parser.error("pack-write comparison requires the exact preserved source and SHA")
     if args.reference and (args.reference.is_symlink() or not args.reference.resolve().is_relative_to(
             (ROOT / "artifacts/benchmarks").resolve())):
@@ -323,6 +337,7 @@ def main(argv=None):
     if args.trial:
         measure = bootstrap_trial if args.bootstrap_only else metadata_trial if args.metadata_only else trial
         options = ({"pack_write_only": args.pack_write_only, "pack_buffer_only": args.pack_buffer_only,
+                    "source_descriptor_only": args.source_descriptor_only,
                     "reference": args.reference,
                     "reference_sha": args.reference_sha256, "cold_parent": cold_parent,
                     "stored_member_bytes": args.stored_member_bytes}
@@ -347,11 +362,16 @@ def main(argv=None):
         native_owner = owner_identity()
     results = []
     for variant in ("retained", "bounded", "bounded", "retained"):
+        complete_started = time.perf_counter()
         completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--files", str(args.files),
                                     "--memory-rows", str(args.memory_rows),
                                     "--trial", variant,
                                     *(["--bootstrap-only"] if args.bootstrap_only else
                                       ["--metadata-only"] if args.metadata_only else
+                                      ["--source-descriptor-only",
+                                       "--stored-member-bytes", str(args.stored_member_bytes),
+                                       *(["--d-cold-fixture"] if args.d_cold_fixture else [])]
+                                      if args.source_descriptor_only else
                                       ["--pack-write-only" if args.pack_write_only else "--pack-buffer-only",
                                        "--reference", str(args.reference),
                                        "--reference-sha256", args.reference_sha256,
@@ -360,11 +380,13 @@ def main(argv=None):
                                       if pack_scope else [])],
                                     capture_output=True, text=True, check=True)
         results.append(json.loads(completed.stdout))
+        results[-1]['subprocess_complete_wall_seconds'] = time.perf_counter() - complete_started
         print(json.dumps({"trial": len(results), "variant": variant,
                           "complete_wall_seconds": results[-1]["complete_wall_seconds"],
                           "peak_rss_bytes": results[-1]["peak_rss_bytes"]}), flush=True)
     means = {variant: {metric: statistics.mean(row[metric] for row in results if row["variant"] == variant)
-                      for metric in ("complete_wall_seconds", "complete_cpu_seconds", "peak_rss_bytes")}
+                      for metric in ("complete_wall_seconds", "subprocess_complete_wall_seconds",
+                                     "complete_cpu_seconds", "peak_rss_bytes")}
              for variant in ("retained", "bounded")}
     parity_field = "original_tree_sha256" if args.pack_write_only else "inventory_sha256"
     inventories = ([row["inventory_sha256"] for row in results] if metadata_scope else
@@ -376,7 +398,8 @@ def main(argv=None):
         from scripts.benchmark_lakehouse_source_signature import limits
         if resource_limits != limits() or native_owner != owner_identity():
             raise ValueError("native owner or benchmark resource limits changed")
-    result = {"contract": ("packed_seekable_buffer_complete_pipeline_abba_v1" if args.pack_buffer_only else
+    result = {"contract": ('packed_source_descriptor_complete_pipeline_abba_v1' if args.source_descriptor_only else
+                           "packed_seekable_buffer_complete_pipeline_abba_v1" if args.pack_buffer_only else
                            "packed_sequential_write_complete_pipeline_abba_v1" if args.pack_write_only else
                            "packed_bootstrap_metadata_abba_v1" if args.bootstrap_only else
                            "packed_metadata_index_abba_v1" if args.metadata_only else
@@ -384,7 +407,8 @@ def main(argv=None):
               "observed_at_utc": datetime.now(UTC).isoformat(), "fixture_items": args.files,
               "scope": ("bootstrap_metadata_only" if args.bootstrap_only else
                         "metadata_only" if args.metadata_only else "complete_publish_recover_materialize"),
-              "reference": ("preserved canonical seekable ZIP writer; identical remaining workflow" if pack_scope else
+              "reference": ('former path stat/open/read/path stat; same complete lifecycle and SHA/CRC' if args.source_descriptor_only else
+                            "preserved canonical seekable ZIP writer; identical remaining workflow" if pack_scope else
                             "retained donor list plus path dict (not old binary replay)" if args.bootstrap_only else
                             "retained metadata; serial fsync; new-small-file prehash (not old binary replay)"),
               "trials": results, "means": means, "code_sha256": code,

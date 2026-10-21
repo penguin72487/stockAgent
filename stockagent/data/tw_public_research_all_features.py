@@ -19,10 +19,11 @@ import polars as pl
 import pyarrow.parquet as pq
 
 from stockagent.data.tw_public_research_taifex import MARKET_SYMBOL
+from stockagent.data.parquet_lineage import ParquetLineage, receipt_fields
 
 
 CONTRACT_VERSION = 2
-BUILD_STRATEGY = "bounded_annual_range_join_global_market_transforms_v2"
+BUILD_STRATEGY = "bounded_annual_range_join_preflight_keys_stable_left_v4"
 DERIVED_SOURCES = {
     "twpub_dgbas_gdp_log": "twpub_dgbas_gdp_raw",
     "twpub_dgbas_cpi_log": "twpub_dgbas_cpi_raw",
@@ -128,11 +129,15 @@ def build_all_research_features(*, wide_path: Path, official_path: Path, output_
     wide_path, official_path, output_path = map(Path, (wide_path, official_path, output_path))
     if output_path.resolve() in {wide_path.resolve(), official_path.resolve()}:
         raise ValueError("research output must be distinct from its inputs")
+    formal = ParquetLineage(official_path)
+    if output_path.resolve() in formal.source.source_paths():
+        raise ValueError("research output must not overwrite a source member")
+    contract_version = CONTRACT_VERSION if formal.identity["kind"] == "file" else CONTRACT_VERSION + 1
     inputs = {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version,
         "build_strategy": BUILD_STRATEGY,
         "wide": {"path": str(wide_path.resolve()), "sha256": _sha256(wide_path)},
-        "official": {"path": str(official_path.resolve()), "sha256": _sha256(official_path)},
+        "official": {"path": str(official_path.resolve()), **receipt_fields(formal.identity)},
     }
     receipt_path = output_path.with_suffix(".all_features.json")
     if output_path.is_file() and receipt_path.is_file():
@@ -141,9 +146,10 @@ def build_all_research_features(*, wide_path: Path, official_path: Path, output_
         except (OSError, ValueError):
             prior = {}
         if prior.get("inputs") == inputs and prior.get("output_sha256") == _sha256(output_path):
+            formal.verify()
             return {**prior, "reused": True}
 
-    wide, official = pl.scan_parquet(wide_path), pl.scan_parquet(official_path)
+    wide, official = pl.scan_parquet(wide_path), formal.source.scan()
     wide_schema, official_schema = wide.collect_schema(), official.collect_schema()
     wide_names, official_names = set(wide_schema.names()), set(official_schema.names())
     if not set(DERIVED_SOURCES.values()) <= wide_names:
@@ -155,14 +161,35 @@ def build_all_research_features(*, wide_path: Path, official_path: Path, output_
         name for name in wide_names & official_names
         if name.startswith("twpub_") and name not in DERIVED_SOURCES
     )
-    # These formulas have observed-value lags across New Year. Compute them
-    # once on the entire small market time series BEFORE partitioning joins.
-    derived = _derived_market_values(wide)
     official_fallbacks = {name: f"_official_fallback__{name}" for name in overlapping_values}
     years = set()
     for source in (wide, official):
         years.update(source.select(pl.col("date").dt.year().unique()).collect()["date"].to_list())
     expected_rows = pq.ParquetFile(wide_path).metadata.num_rows
+    ordered_years = sorted(years, key=lambda value: (value is None, value or 0))
+    # Check the entire key contract BEFORE decoding/writing hundreds of
+    # feature columns. A new official session missing from a stale wide input
+    # must not waste every historical join before failing in the last year.
+    # Keep annual memory bounds and retain exactly the original key rules.
+    partition_rows = {}
+    for year in ordered_years:
+        wide_keys = (wide.filter(_year_predicate(year, wide_schema["date"]))
+                     .select("date", "symbol").collect(engine="streaming"))
+        official_keys = (official.filter(_year_predicate(year, official_schema["date"]))
+                         .select("date", "symbol").collect(engine="streaming"))
+        if wide_keys.n_unique() != wide_keys.height:
+            raise ValueError("wide research table has duplicate date/symbol keys")
+        if official_keys.join(wide_keys, on=["date", "symbol"], how="anti").height:
+            raise ValueError("official table has keys absent from the research universe")
+        if official_keys.n_unique() != official_keys.height:
+            raise ValueError("official table has duplicate keys")
+        partition_rows[year] = wide_keys.height
+        del wide_keys, official_keys
+    if sum(partition_rows.values()) != expected_rows:
+        raise ValueError("research key preflight changed the source row count")
+    # These formulas have observed-value lags across New Year. Compute them
+    # once on the entire small market time series BEFORE partitioning joins.
+    derived = _derived_market_values(wide)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     actual_rows = 0
@@ -171,31 +198,23 @@ def build_all_research_features(*, wide_path: Path, official_path: Path, output_
     try:
         with ExitStack() as stack:
             writer = None
-            for year in sorted(years, key=lambda value: (value is None, value or 0)):
+            for year in ordered_years:
                 predicate = _year_predicate(year, wide_schema["date"])
                 wide_part = wide.filter(predicate)
                 official_part = official.filter(_year_predicate(year, official_schema["date"]))
-                wide_keys = wide_part.select("date", "symbol").collect(engine="streaming")
-                official_keys = official_part.select("date", "symbol").collect(engine="streaming")
-                if wide_keys.n_unique() != wide_keys.height:
-                    raise ValueError("wide research table has duplicate date/symbol keys")
-                if official_keys.join(wide_keys, on=["date", "symbol"], how="anti").height:
-                    raise ValueError("official table has keys absent from the research universe")
-                if official_keys.n_unique() != official_keys.height:
-                    raise ValueError("official table has duplicate keys")
                 joined = (
                     wide_part.drop(*[name for name in DERIVED_SOURCES if name in wide_names])
                     .join(official_part.select(
                         "date", "symbol", *official_only,
                         *[pl.col(name).alias(alias) for name, alias in official_fallbacks.items()],
-                    ), on=["date", "symbol"], how="left")
+                    ), on=["date", "symbol"], how="left", maintain_order="left")
                     .with_columns([
                         pl.coalesce(pl.col(name), pl.col(alias)).alias(name)
                         for name, alias in official_fallbacks.items()
                     ]).drop(*official_fallbacks.values())
-                    .join(derived.lazy().filter(predicate), on=["date", "symbol"], how="left")
+                    .join(derived.lazy().filter(predicate), on=["date", "symbol"], how="left", maintain_order="left")
                 ).collect(engine="streaming")
-                if joined.height != wide_keys.height:
+                if joined.height != partition_rows[year]:
                     raise ValueError("research join changed a partition row count")
                 table = joined.to_arrow()
                 if writer is None:
@@ -207,18 +226,19 @@ def build_all_research_features(*, wide_path: Path, official_path: Path, output_
                 actual_rows += joined.height
                 peak_partition_rows = max(peak_partition_rows, joined.height)
                 print(f"[tw-public-research-all] year={year} rows={joined.height} total_rows={actual_rows}", flush=True)
-                del joined, table, wide_keys, official_keys
+                del joined, table
         if actual_rows != expected_rows:
             raise ValueError(f"research join changed row count: {expected_rows} -> {actual_rows}")
         if pq.ParquetFile(temporary).metadata.num_rows != actual_rows:
             raise ValueError("persisted research union row count differs")
-        if _sha256(wide_path) != inputs["wide"]["sha256"] or _sha256(official_path) != inputs["official"]["sha256"]:
+        formal.verify()
+        if _sha256(wide_path) != inputs["wide"]["sha256"]:
             raise RuntimeError("research inputs changed during build")
         os.replace(temporary, output_path)
     finally:
         temporary.unlink(missing_ok=True)
     summary = {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version,
         "inputs": inputs,
         "output_path": str(output_path.resolve()),
         "output_sha256": _sha256(output_path),

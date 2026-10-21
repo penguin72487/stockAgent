@@ -3,36 +3,46 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 restart_gateway=true
-if [[ "${1:-}" == "--no-restart" ]]; then
-    restart_gateway=false
-elif [[ -n "${1:-}" ]]; then
-    echo "Usage: sudo bash scripts/install_public_dashboards_service.sh [--no-restart]" >&2
-    exit 2
-fi
+gateway_only=false
+for argument in "$@"; do
+    case "$argument" in
+        "--no-restart") restart_gateway=false ;;
+        "--gateway-only") gateway_only=true ;;
+        *)
+            echo "Usage: sudo bash scripts/install_public_dashboards_service.sh [--no-restart] [--gateway-only]" >&2
+            exit 2
+            ;;
+    esac
+done
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 
 escaped_root="${repo_root//\\/\\\\}"
 escaped_root="${escaped_root//&/\\&}"
-units=(
-    stockagent-public-dashboards.service
-    stockagent-data-refresh-status-snapshot.service
-    stockagent-data-refresh-status-snapshot.timer
-)
+units=(stockagent-public-dashboards.service)
+if [[ "$gateway_only" != "true" ]]; then
+    units+=(stockagent-data-refresh-status-snapshot.service stockagent-data-refresh-status-snapshot.timer)
+fi
+unit_paths=()
 for unit in "${units[@]}"; do
     template="$repo_root/deploy/systemd/${unit}.in"
     sed "s&__REPO_ROOT__&$escaped_root&g" "$template" > "$temporary_dir/$unit"
+    unit_paths+=("$temporary_dir/$unit")
 done
-mkdir -p "$repo_root/artifacts/live/data_monitor"
-chmod 0755 \
-    "$repo_root/scripts/run_data_refresh_status_snapshot.sh" \
-    "$repo_root/scripts/snapshot_data_refresh_services.py" \
-    "$repo_root/scripts/wait_public_dashboard_ready.sh"
-systemd-analyze verify "$temporary_dir"/*.service "$temporary_dir"/*.timer
-install -m 0644 "$temporary_dir"/* /etc/systemd/system/
+chmod 0755 "$repo_root/scripts/wait_public_dashboard_ready.sh"
+if [[ "$gateway_only" != "true" ]]; then
+    mkdir -p "$repo_root/artifacts/live/data_monitor"
+    chmod 0755 \
+        "$repo_root/scripts/run_data_refresh_status_snapshot.sh" \
+        "$repo_root/scripts/snapshot_data_refresh_services.py"
+fi
+systemd-analyze verify "${unit_paths[@]}"
+install -m 0644 "${unit_paths[@]}" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now stockagent-data-refresh-status-snapshot.timer
-systemctl start stockagent-data-refresh-status-snapshot.service
+if [[ "$gateway_only" != "true" ]]; then
+    systemctl enable --now stockagent-data-refresh-status-snapshot.timer
+    systemctl start stockagent-data-refresh-status-snapshot.service
+fi
 systemctl enable stockagent-public-dashboards.service
 if [[ "$restart_gateway" == "true" ]]; then
     systemctl restart stockagent-public-dashboards.service

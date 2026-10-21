@@ -254,8 +254,61 @@ def _file_digest_at_generation(path: str, generation: tuple[int, ...]) -> str:
 
 
 def file_generation(path: Path) -> tuple[int, ...]:
-    stat = path.stat()
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+    return _generation_from_stat(path.stat())
+
+
+def _generation_from_stat(info: os.stat_result) -> tuple[int, ...]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+def _parquet_source_generations(paths=(), *, feature_roots=()):
+    """Generation-only cache key, with the canonical manifest proof intact.
+
+    One scandir/stat per legacy member avoids resolving every ancestor and
+    probing a nonexistent manifest twice for thousands of existing files.
+    The caller still owns the source read lease and canonical data acceptance.
+    Explicit manifests use ParquetSource's complete byte/schema/member checks;
+    neither directory mtime nor an old directory-key cache is a proof.
+    """
+    from stockagent.data import partitioned_parquet as parts
+
+    generations = {}
+
+    def add_manifest(path):
+        with parts.ParquetSource(path) as source:
+            for member, proof in zip([source.path, *source.members],
+                                     [source.before, *source.signatures], strict=True):
+                generations[str(member)] = tuple(proof[key] for key in
+                    ("device", "inode", "size", "mtime_ns", "ctime_ns"))
+
+    for directory in feature_roots:
+        directory = Path(directory).absolute()
+        try:
+            with os.scandir(directory) as entries:
+                selected = {entry.name: entry for entry in entries if entry.name.endswith(
+                    ("_features.parquet", "_features.parquet" + parts.MANIFEST_SUFFIX))}
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for name, entry in selected.items():
+            if name.endswith(parts.MANIFEST_SUFFIX):
+                if name.removesuffix(parts.MANIFEST_SUFFIX) in selected:
+                    raise ValueError(f"ambiguous legacy/partitioned source: {entry.path}")
+                add_manifest(Path(entry.path))
+            else:
+                # The generation identity needs bytes of the absolute name,
+                # not thousands of Path hash/ordering normalizations. Keep
+                # the scanner's spelling until an actual reader needs a Path.
+                generations[entry.path] = _generation_from_stat(entry.stat())
+    for path in paths:
+        path = parts.resolve_source(path).absolute()
+        if path.name.endswith(parts.MANIFEST_SUFFIX):
+            add_manifest(path)
+        else:
+            try:
+                generations[str(path)] = file_generation(path)
+            except FileNotFoundError:
+                generations[str(path)] = None
+    return sorted(generations.items())
 
 
 def file_identity(path: str | Path) -> dict[str, Any]:
@@ -273,20 +326,19 @@ def source_fingerprint(config: Any, *, rule_data_dir: str | Path | None = None) 
     """
     from stockagent.config import external_panel_data_kwargs
     from stockagent.data.factorized_panel import factorized_member_proofs
+    from stockagent.data import partitioned_parquet
 
     root = Path(config.data.parquet_root).resolve(strict=True)
     # Enumerate consumed members, not directory mtimes or every raw table in
     # the provider workspace. Adding an unrelated MOPS snapshot cannot change
     # an already published feature panel or its completed-session prices.
     paths = {root / "symbols.csv"}
-    paths.update(root.glob("*_features.parquet"))
-    if (root / "_hot_tail").is_dir():
-        paths.update((root / "_hot_tail").glob("*_features.parquet"))
     directories = set()
     external = external_panel_data_kwargs(config.data).get("external_feature_path")
     if external:
         target = Path(str(external)).resolve()
-        paths.update((target, target.with_suffix(".summary.json")))
+        logical = target.with_name(partitioned_parquet.logical_name(target))
+        paths.update((target, logical.with_suffix(".summary.json")))
         directories.update((target.parent, target.parent.parent))
     from stockagent.live.tw_day_trade_simulation import resolve_day_trade_rule_data_dir
 
@@ -307,8 +359,9 @@ def source_fingerprint(config: Any, *, rule_data_dir: str | Path | None = None) 
         paths.update(manifest_path.parent / proof["path"]
                      for proof in factorized_member_proofs(manifest))
     members = []
-    for path in sorted(paths):
-        members.append([str(path), list(file_generation(path)) if path.exists() else None])
+    for path, generation in _parquet_source_generations(
+            paths, feature_roots=(root, root / "_hot_tail")):
+        members.append([str(path), list(generation) if generation is not None else None])
     return identity_digest({"contract": CONTRACT, "members": members})
 
 

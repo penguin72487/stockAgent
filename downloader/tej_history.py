@@ -1981,6 +1981,7 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     isolation = (" AND NOT EXISTS (SELECT 1 FROM tasks AS blocked WHERE blocked.table_id=tasks.table_id "
                  "AND blocked.state='blocked' AND blocked.last_error_code='source_validation_failed_deferred')"
                  " AND NOT EXISTS (SELECT 1 FROM desktop_retry_windows AS retry WHERE retry.table_id=tasks.table_id "
+                 "AND retry.error_code<>'source_company_labels_absent_fragment' "
                  "AND (retry.next_attempt_at_utc>? OR retry.task_id<>tasks.task_id))")
     def candidate(selected: str):
         if table_id is not None:
@@ -2032,7 +2033,7 @@ def mark_metadata_busy(root: Path) -> None:
         if (worker.get('state') in {'running', 'waiting_metadata'}
                 and worker.get('owner_pid') == os.getpid() and worker.get('owner_start_ticks') == ticks):
             identity = {key: worker[key] for key in (
-                'task_id', 'kind', 'bridge_attempt_id', 'owner_pid', 'owner_start_ticks', 'deadline_at_utc'
+                'task_id', 'kind', 'bridge_attempt_id', 'owner_pid', 'owner_start_ticks', 'deadline_at_utc', 'linux_boot_id'
             ) if key in worker}
             identity['attempted_at_utc'] = worker.get('attempted_at_utc', worker.get('observed_at_utc'))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -2133,6 +2134,10 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
                 # or successful Wizard export. The next normal iteration runs
                 # only the exact remaining scope; all old receipts stay intact.
                 return 'api_scope_repartitioned'
+            if policy.get('prequery_failure_isolation') is True:
+                from downloader.tej_planning import defer_planned_company_hint
+                if defer_planned_company_hint(con,root,dict(row)):
+                    return 'selector_scope_repartitioned'
         task = dict(row)
         if replay is not None:
             con.execute('UPDATE desktop_replays SET consumed_at_utc=? WHERE authorization_id=?', (now,retry_authorization_id))
@@ -2153,6 +2158,7 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": "running",
                        "observed_at_utc": now, "task_id": task["task_id"], "kind": task["kind"],
                        "owner_pid": os.getpid(),
+                       "linux_boot_id": Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                        "owner_start_ticks": Path(f"/proc/{os.getpid()}/stat").read_text().rsplit(") ", 1)[1].split()[19],
                        "deadline_at_utc": (datetime.fromisoformat(now) + timedelta(seconds=900)).isoformat()})
     try:
@@ -2197,11 +2203,11 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
                 con.execute("UPDATE traffic SET completed_at_utc=?,state='failed_before_preview' WHERE event_id=?", (datetime.now(UTC).isoformat(), event))
             if policy.get('prequery_failure_isolation') is True:
                 from downloader.tej_desktop_attempts import EXHAUSTED_PREQUERY_ERRORS, defer_unsent_prequery
-                if state in EXHAUSTED_PREQUERY_ERRORS:
+                if state in EXHAUSTED_PREQUERY_ERRORS or state == 'prequery_retry_scheduled':
                     try:
                         state=defer_unsent_prequery(root,task['task_id'],bridge,
                             base_seconds=policy['prequery_retry_base_seconds'],
-                            max_seconds=policy['prequery_retry_max_seconds'])['state']
+                            max_seconds=policy['prequery_retry_max_seconds'],allow_company_partition=True)['state']
                     except (ValueError,OSError,RuntimeError,subprocess.SubprocessError):
                         pass  # No proof/interface acknowledgement means the existing barrier stays.
             atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": state,

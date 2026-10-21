@@ -24,6 +24,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stockagent.data_sync.desync_snapshots import sha256_file  # noqa: E402
+from stockagent.data_sync.desync_snapshots import _fsync_directory  # noqa: E402
+from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash  # noqa: E402
+from stockagent.data.parquet_lineage import (  # noqa: E402
+    ParquetLineage, assert_receipt, inventory_hashes, receipt_fields,
+)
 from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     resolve_latest_packed,
     resolve_packed_snapshot_id,
@@ -47,7 +52,7 @@ FORMAL_MEMBERS = (
 )
 
 
-def _required_formal_members(entitlement_summary: dict, live_root: Path) -> tuple[str, ...]:
+def _required_formal_members(entitlement_summary: dict, live_root: Path, *, feature_identity=None) -> tuple[str, ...]:
     manifest_receipt = entitlement_summary.get("raw_receipt_manifest")
     if not isinstance(manifest_receipt, dict):
         raise RuntimeError("formal entitlement raw manifest receipt is missing")
@@ -60,7 +65,19 @@ def _required_formal_members(entitlement_summary: dict, live_root: Path) -> tupl
     ):
         raise RuntimeError("invalid formal entitlement raw manifest path")
     manifest_member = manifest_source.relative_to(live_root.resolve()).as_posix()
-    return (*FORMAL_MEMBERS, manifest_member)
+    features = ((FORMAL_MEMBERS[0],) if feature_identity is None else
+                tuple(inventory_hashes(feature_identity, FORMAL_MEMBERS[0])))
+    return (*features, *FORMAL_MEMBERS[1:], manifest_member)
+
+
+def _action_members(required, feature_identity):
+    features = inventory_hashes(feature_identity, FORMAL_MEMBERS[0])
+    return tuple(name for name in required if name not in features)
+
+
+def _assert_formal_inventory(identity, hashes):
+    if any(hashes.get(name) != digest for name, digest in inventory_hashes(identity, FORMAL_MEMBERS[0]).items()):
+        raise RuntimeError("formal source lineage differs from exact cold inventory")
 
 
 def _formal_inventory_hashes(
@@ -88,15 +105,32 @@ def _formal_inventory_hashes(
     return hashes
 
 
-def _stage_copy(source: Path, target: Path, expected_hash: str) -> None:
+def _stage_copy(source: Path, target: Path, expected_hash: str) -> bool:
+    if source.resolve() == target.resolve():
+        raise RuntimeError("staging must not overwrite its source")
+    before = payload_info(source)
     target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        staged = payload_info(target)
+    except FileNotFoundError:
+        staged = None
+    if (staged is not None and staged["size"] == before["size"]
+            and staged["mode"] == 0o600 and staged["uid"] == os.geteuid()
+            and stable_payload_hash(target, staged) == expected_hash):
+        if stable_payload_hash(source, before) != expected_hash or payload_info(target) != staged:
+            raise RuntimeError(f"source/target changed while verifying unchanged stage: {source}")
+        return False
     temporary = target.with_name(target.name + ".tmp." + uuid.uuid4().hex)
     try:
         shutil.copyfile(source, temporary)
         os.chmod(temporary, 0o600)
-        if sha256_file(temporary) != expected_hash:
+        if stable_payload_hash(temporary, payload_info(temporary)) != expected_hash or payload_info(source) != before:
             raise RuntimeError(f"source changed while copying {source}")
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
+        return True
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -111,27 +145,20 @@ def main() -> int:
     with LOCK.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         receipt = json.loads(RESEARCH_RECEIPT.read_text(encoding="utf-8"))
-        if int(receipt.get("contract_version", -1)) != 5:
+        if int(receipt.get("contract_version", -1)) not in {5, 6}:
             raise RuntimeError("unexpected research table contract version")
         entitlement_summary = json.loads(
             (LIVE_ROOT / "tw_corporate_action_entitlements.summary.json").read_text(
                 encoding="utf-8"
             )
         )
-        required_members = _required_formal_members(entitlement_summary, LIVE_ROOT)
-        formal_hash = sha256_file(FORMAL_FEATURE)
+        formal = ParquetLineage(FORMAL_FEATURE)
+        required_members = _required_formal_members(entitlement_summary, LIVE_ROOT, feature_identity=formal.identity)
         inventory_hashes = _formal_inventory_hashes(
             args.base_snapshot_id, args.sync_root, required_members=required_members
         )
-        if not (
-            formal_hash
-            == inventory_hashes["features/tw_public_stock_daily.parquet"]
-            == receipt.get("base_sha256")
-        ):
-            raise RuntimeError(
-                "research/formal lineage mismatch: rebuild research from the "
-                "published formal base before staging"
-            )
+        _assert_formal_inventory(formal.identity, inventory_hashes)
+        assert_receipt(formal.identity, receipt, hash_key="base_sha256", source_key="base_source")
         research_hash = sha256_file(SOURCE)
         if research_hash != receipt.get("output_sha256"):
             raise RuntimeError("research receipt and feature table hash differ")
@@ -164,7 +191,7 @@ def main() -> int:
         receipt_hash = sha256_file(RESEARCH_RECEIPT)
         _stage_copy(RESEARCH_RECEIPT, args.staged_root / "features" / RESEARCH_RECEIPT.name, receipt_hash)
         action_hashes = {}
-        for name in required_members[1:]:
+        for name in _action_members(required_members, formal.identity):
             source = LIVE_ROOT / name
             expected = inventory_hashes[name]
             if sha256_file(source) != expected:
@@ -172,14 +199,14 @@ def main() -> int:
             _stage_copy(source, args.staged_root / name, expected)
             action_hashes[name] = expected
         staged = {
-            "schema_version": 1,
+            "schema_version": 1 if formal.identity["kind"] == "file" else 2,
             "status": "complete",
             "research_only": True,
             "historical_vintage_verified": False,
             "end_date": end_date,
             "base_dataset": "tw-public",
             "base_snapshot_id": args.base_snapshot_id,
-            "base_feature_sha256": formal_hash,
+            **receipt_fields(formal.identity, hash_key="base_feature_sha256", source_key="base_feature_source"),
             "feature_sha256": research_hash,
             "research_receipt_sha256": receipt_hash,
             "formal_action_members_sha256": action_hashes,
@@ -189,6 +216,7 @@ def main() -> int:
             "model_channels": len(selected) + len(availability),
         }
         target = args.staged_root / "release_receipt.json"
+        formal.verify()
         temporary = target.with_name(target.name + ".tmp." + uuid.uuid4().hex)
         try:
             temporary.write_text(json.dumps(staged, sort_keys=True, indent=2) + "\n", encoding="utf-8")

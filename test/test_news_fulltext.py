@@ -30,7 +30,8 @@ def config():
     config["retained_cnyes_failure_replay_enabled"] = False
     source = config["providers"][0]
     source.update({"id": "publisher", "domains": ["publisher.test"], "interval_seconds": 0.001,
-                   "feeds": [], "sitemaps": [], "wordpress_apis": [], "fulltext_feeds": [], "index_pages": [], "index_path_pattern": "",
+                   "feeds": [], "sitemaps": [], "wordpress_apis": [], "fulltext_feeds": [],
+                   "historical_fulltext_feeds": [], "index_pages": [], "index_path_pattern": "",
                    "article_path_pattern": "", "article_selectors": [".story"],
                    "require_configured_container": False, "require_author_attribution": False, "title_selector": "", "author_selectors": [],
                    "required_license_url_prefix": "", "exclude_selectors": []})
@@ -497,7 +498,7 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     expected = {
         "globalvoices", "fed_board", "cnyes", "cmoney", "cmnews", "einfo", "moneyweekly",
         "ftvnews", "nownews", "genetinfo", "pansci", "cmmedia", "abmedia", "peopo", "cnews", "tainan_gov", "kmdn", "macau_gov",
-        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "taichung_gov", "changhua_gov", "taiwanhot", "coolloud", "eventsinfocus"}
+        "voa_chinese", "voa_cantonese", "tfc_taiwan", "nccu", "nchu", "taichung_gov", "changhua_gov", "taiwanhot", "coolloud", "eventsinfocus"}
     # Closed installed set; FTNN may cross the tested configuration cutover
     # only under the reviewed native/private recipe, not arbitrary enablement.
     ftnn = registry.sources['ftnn']
@@ -553,6 +554,147 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert mnews.require_configured_container and mnews.require_author_attribution
         assert not mnews.feeds and not mnews.sitemaps and not mnews.wordpress_apis and not mnews.fulltext_feeds
         expected.add('mnews')
+    mcu = registry.sources.get('mcu_week')
+    if mcu is not None and mcu.allowed:
+        from downloader.news_fulltext_mcu import MCU_BODY_SELECTOR, MCU_PATH_PATTERN
+        assert mcu.acquisition_mode == 'finite' and not mcu.known_url_only
+        assert mcu.domains == ('www.week.mcu.edu.tw',)
+        assert mcu.embedded_article_layout == 'mcu_visible_news_v1'
+        assert mcu.article_path_pattern == MCU_PATH_PATTERN and mcu.selectors == (MCU_BODY_SELECTOR,)
+        assert mcu.authorization['kind'] == 'personal_research'
+        assert mcu.authorization['evidence_url'] == 'https://www.week.mcu.edu.tw/about'
+        assert mcu.require_configured_container and mcu.require_author_attribution
+        assert not mcu.feeds and not mcu.sitemaps and not mcu.wordpress_apis and not mcu.fulltext_feeds
+        expected.add('mcu_week')
+    max_post = registry.sources.get('maxfinanciallife')
+    if max_post is not None and max_post.allowed:
+        from downloader.news_fulltext_max import MAX_AUTHORS, MAX_BODY_SELECTOR, MAX_PATH_PATTERN, MAX_SITEMAP
+        assert max_post.acquisition_mode == 'continuous' and not max_post.known_url_only
+        assert max_post.domains == ('maxfinanciallife.com',)
+        assert max_post.embedded_article_layout in {'max_visible_post_v1', 'max_visible_post_v2', 'max_visible_post_v3', 'max_visible_post_v4', 'max_visible_post_v5', 'max_visible_post_v6', 'max_visible_post_v7', 'max_visible_post_v8', 'max_visible_post_v9'}
+        assert max_post.article_path_pattern == MAX_PATH_PATTERN and max_post.selectors == (MAX_BODY_SELECTOR,)
+        assert max_post.authorization['kind'] == 'personal_research'
+        assert max_post.authorization['evidence_url'] == 'https://maxfinanciallife.com/editorial-policy/'
+        assert max_post.permitted_author_names == MAX_AUTHORS and max_post.sitemaps == (MAX_SITEMAP,)
+        assert max_post.require_configured_container and max_post.require_author_attribution
+        assert not max_post.feeds and not max_post.wordpress_apis and not max_post.fulltext_feeds
+        expected.add('maxfinanciallife')
+    peoplemedia = registry.sources.get('peoplemedia')
+    if peoplemedia is not None and peoplemedia.allowed:
+        from downloader.news_fulltext_peoplemedia import PEOPLEMEDIA_BODY_SELECTOR, PEOPLEMEDIA_PATH_PATTERN
+        assert peoplemedia.acquisition_mode == 'continuous' and peoplemedia.known_url_only
+        assert peoplemedia.domains == ('www.peoplemedia.tw',)
+        assert peoplemedia.embedded_article_layout in {'peoplemedia_visible_article_v1', 'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3'}
+        assert peoplemedia.article_path_pattern == PEOPLEMEDIA_PATH_PATTERN
+        assert peoplemedia.selectors == (PEOPLEMEDIA_BODY_SELECTOR,)
+        assert peoplemedia.title_selector == 'h1' and not peoplemedia.exclude_selectors
+        assert peoplemedia.require_configured_container and peoplemedia.require_author_attribution
+        assert peoplemedia.authorization['kind'] == 'personal_research'
+        assert peoplemedia.authorization['evidence_url'] == 'https://www.peoplemedia.tw/copyright'
+        assert not any((peoplemedia.feeds, peoplemedia.sitemaps, peoplemedia.wordpress_apis,
+                        peoplemedia.fulltext_feeds, peoplemedia.index_pages, peoplemedia.cnyes_apis))
+        expected.add('peoplemedia')
+    pocket = registry.sources.get('pocket')
+    if pocket is not None and pocket.allowed:
+        from downloader.news_fulltext_pocket import POCKET_BODY_SELECTOR, POCKET_PATH_PATTERN
+        assert pocket.acquisition_mode == 'continuous' and pocket.known_url_only
+        assert pocket.domains == ('www.pocket.tw',)
+        assert pocket.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}
+        assert pocket.article_path_pattern == POCKET_PATH_PATTERN and pocket.selectors == (POCKET_BODY_SELECTOR,)
+        assert pocket.title_selector == 'h1' and not pocket.exclude_selectors
+        assert pocket.require_configured_container and pocket.require_author_attribution
+        assert pocket.authorization['kind'] == 'personal_research'
+        assert pocket.authorization['evidence_url'] == 'https://www.pocket.tw/main/disclaimer'
+        assert not pocket.feeds and not pocket.sitemaps and not pocket.wordpress_apis and not pocket.fulltext_feeds
+        expected.add('pocket')
+    watchmedia = registry.sources.get('watchmedia')
+    if watchmedia is not None and watchmedia.allowed:
+        from downloader.news_fulltext_watchmedia import WATCHMEDIA_BODY_SELECTOR, WATCHMEDIA_PATH_PATTERN
+        assert watchmedia.acquisition_mode == 'continuous' and watchmedia.known_url_only
+        assert watchmedia.domains == ('www.watchmedia01.com',)
+        assert watchmedia.embedded_article_layout in {'watchmedia_visible_article_v1', 'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}
+        assert watchmedia.article_path_pattern == WATCHMEDIA_PATH_PATTERN
+        assert watchmedia.selectors == (WATCHMEDIA_BODY_SELECTOR,)
+        assert watchmedia.title_selector == 'h1' and not watchmedia.exclude_selectors
+        assert watchmedia.require_configured_container and watchmedia.require_author_attribution
+        assert watchmedia.authorization['kind'] == 'personal_research'
+        assert watchmedia.authorization['evidence_url'] == 'https://www.watchmedia01.com/copyright'
+        assert not watchmedia.feeds and not watchmedia.sitemaps and not watchmedia.wordpress_apis and not watchmedia.fulltext_feeds
+        expected.add('watchmedia')
+    pinview = registry.sources.get('pinview')
+    if pinview is not None and pinview.allowed:
+        from downloader.news_fulltext_pinview import PINVIEW_BODY_SELECTOR, PINVIEW_PATH_PATTERN
+        assert pinview.acquisition_mode == 'continuous' and pinview.known_url_only
+        assert pinview.domains == ('www.pinview.com.tw',)
+        assert pinview.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2'}
+        assert pinview.article_path_pattern == PINVIEW_PATH_PATTERN
+        assert pinview.selectors == (PINVIEW_BODY_SELECTOR,)
+        assert pinview.title_selector == 'h1' and not pinview.exclude_selectors
+        assert pinview.require_configured_container and pinview.require_author_attribution
+        assert pinview.authorization['kind'] == 'personal_research'
+        assert pinview.authorization['evidence_url'] == 'https://www.pinview.com.tw/'
+        assert not pinview.feeds and not pinview.sitemaps and not pinview.wordpress_apis and not pinview.fulltext_feeds
+        expected.add('pinview')
+    mitrade = registry.sources.get('mitrade')
+    if mitrade is not None and mitrade.allowed:
+        from downloader.news_fulltext_mitrade import MITRADE_BODY_SELECTOR, MITRADE_PATH_PATTERN
+        assert mitrade.acquisition_mode == 'continuous' and mitrade.known_url_only
+        assert mitrade.domains == ('www.mitrade.com',)
+        assert mitrade.embedded_article_layout in {'mitrade_visible_article_v1', 'mitrade_visible_article_v2', 'mitrade_visible_article_v3', 'mitrade_visible_article_v4', 'mitrade_visible_article_v5', 'mitrade_visible_article_v6', 'mitrade_visible_article_v7'}
+        assert mitrade.article_path_pattern == MITRADE_PATH_PATTERN
+        assert mitrade.selectors == (MITRADE_BODY_SELECTOR,)
+        assert mitrade.title_selector == 'h1' and not mitrade.exclude_selectors
+        assert mitrade.require_configured_container and mitrade.require_author_attribution
+        assert mitrade.authorization['kind'] == 'personal_research'
+        assert mitrade.authorization['evidence_url'] == 'https://www.mitrade.com/zh'
+        assert not mitrade.feeds and not mitrade.sitemaps and not mitrade.wordpress_apis and not mitrade.fulltext_feeds
+        expected.add('mitrade')
+    idn = registry.sources.get('idn')
+    if idn is not None and idn.allowed:
+        from downloader.news_fulltext_idn import IDN_BODY_SELECTOR, IDN_PATH_PATTERN
+        assert idn.acquisition_mode == 'continuous' and idn.known_url_only
+        assert idn.domains == ('www.idn.com.tw',) and idn.embedded_article_layout in {'idn_visible_article_v1', 'idn_visible_article_v2', 'idn_visible_article_v3'}
+        assert idn.article_path_pattern == IDN_PATH_PATTERN and idn.selectors == (IDN_BODY_SELECTOR,)
+        assert idn.title_selector == 'h1' and not idn.exclude_selectors
+        assert idn.require_configured_container and idn.require_author_attribution
+        assert idn.authorization['kind'] == 'personal_research'
+        assert idn.authorization['evidence_url'] == 'https://www.idn.com.tw/'
+        assert not any((idn.feeds, idn.sitemaps, idn.wordpress_apis, idn.fulltext_feeds,
+                        idn.index_pages, idn.cnyes_apis))
+        expected.add('idn')
+    # Two accepted originals do not open a whole site or confer CMNews alias identity.
+    learning = registry.sources.get('cmoneylearning')
+    if learning is not None and learning.allowed:
+        from downloader.news_fulltext_cmoneylearning import (
+            CMONEY_LEARNING_BODY_SELECTOR, CMONEY_LEARNING_PATH_PATTERN,
+        )
+        assert learning.acquisition_mode == 'finite' and not learning.known_url_only
+        assert learning.domains == ('cmoneylearning.com.tw',)
+        assert learning.embedded_article_layout == 'cmoneylearning_visible_article_v1'
+        assert learning.article_path_pattern == CMONEY_LEARNING_PATH_PATTERN
+        assert learning.selectors == (CMONEY_LEARNING_BODY_SELECTOR,)
+        assert learning.title_selector == 'h1.articleContent__title' and not learning.exclude_selectors
+        assert learning.require_configured_container and learning.require_author_attribution
+        assert learning.authorization['kind'] == 'personal_research'
+        assert learning.authorization['evidence_url'] == 'https://www.cmoney.tw/member/tos.aspx'
+        assert not learning.feeds and not learning.sitemaps and not learning.wordpress_apis and not learning.fulltext_feeds
+        expected.add('cmoneylearning')
+    videoland = registry.sources.get('videoland')
+    if videoland and videoland.allowed:
+        from downloader.news_fulltext_videoland import (
+            VIDEOLAND_BODY_SELECTOR, VIDEOLAND_PATH_PATTERN, VIDEOLAND_POLICY_EVIDENCE_URL,
+        )
+        assert videoland.known_url_only and videoland.acquisition_mode == 'continuous'
+        assert videoland.domains == ('news.videoland.com.tw',)
+        assert videoland.embedded_article_layout in {'videoland_visible_article_v1', 'videoland_visible_article_v2', 'videoland_visible_article_v3'}
+        assert videoland.article_path_pattern == VIDEOLAND_PATH_PATTERN
+        assert videoland.selectors == (VIDEOLAND_BODY_SELECTOR,)
+        assert videoland.title_selector == 'h1' and not videoland.exclude_selectors
+        assert videoland.require_configured_container and videoland.require_author_attribution
+        assert videoland.authorization['kind'] == 'personal_research'
+        assert videoland.authorization['evidence_url'] == VIDEOLAND_POLICY_EVIDENCE_URL
+        assert not videoland.feeds and not videoland.sitemaps and not videoland.wordpress_apis and not videoland.fulltext_feeds
+        expected.add('videoland')
     assert {p.provider for p in registry.sources.values() if p.allowed} == expected
     events = registry.sources['eventsinfocus']
     assert events.acquisition_mode == 'finite'

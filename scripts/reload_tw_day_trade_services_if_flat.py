@@ -243,11 +243,15 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true", help="Otherwise inspect only; never restart")
     parser.add_argument("--code-admission-only", action="store_true",
                         help="Discord only: accept fresh loaded code/ACK, NOT GPU warmup readiness")
+    parser.add_argument("--source-release", type=Path,
+                        help="Discord code-only admission: pin this verified read-only source namespace")
     parser.add_argument("--output", type=Path, default=RECEIPT_PATH)
     parser.add_argument("--timeout-seconds", type=float, default=240)
     args = parser.parse_args()
     if args.code_admission_only and not args.discord_only:
         parser.error("--code-admission-only requires --discord-only")
+    if args.source_release and not (args.discord_only and args.code_admission_only):
+        parser.error("--source-release requires --discord-only --code-admission-only")
     if not 1 <= args.timeout_seconds <= 600:
         parser.error("timeout-seconds must be between 1 and 600")
     receipt = {"observed_at": datetime.now(TAIPEI).isoformat(), "status": "blocked",
@@ -266,6 +270,16 @@ def main() -> int:
             if any(owner(name).get("ActiveState") != "active" for name in plan["services"]):
                 raise ValueError("requested owner is not active; refuse to enable a stopped role")
             receipt.update(plan=plan, protected_before=before, status="planned")
+            from stockagent.live.service_code_release import (
+                configured_release, verify_frozen_source, namespace_identity,
+                frozen_generation, install_drop_in, verify_owner_namespace, DROP_IN,
+            )
+            # An engine-only reload also compares the unchanged Discord owner
+            # against its pinned source, never against development workspace.
+            release_path = args.source_release or configured_release(REPO_ROOT)
+            if release_path is not None:
+                release_path = release_path.absolute()
+                receipt["source_release"] = verify_frozen_source(release_path, REPO_ROOT)
             if args.apply:
                 selected_before = {name: owner(name) for name in plan["services"]}
                 from scripts.audit_tw_day_trade_restart import inventory, prefix_sha256, verify_prefix
@@ -277,8 +291,18 @@ def main() -> int:
                           for name in ("events.jsonl", "orders.jsonl", "fills.jsonl")}
                 for name, value in inputs.items():
                     value["sha256"] = prefix_sha256(STATE_PATH.parent / name, value["size_bytes"])
-                code = implementation_identity()
-                entrypoint = file_identity(REPO_ROOT / "services/discord_bot/bot.py")
+                if release_path is not None:
+                    namespace = namespace_identity(release_path, REPO_ROOT)
+                    code, entrypoint = namespace["code"], namespace["entrypoint"]
+                    source_generation = frozen_generation(release_path)
+                    def code_unchanged():
+                        return frozen_generation(release_path) == source_generation
+                else:
+                    code = implementation_identity()
+                    entrypoint = file_identity(REPO_ROOT / "services/discord_bot/bot.py")
+                    def code_unchanged():
+                        return (implementation_identity() == code
+                                and file_identity(REPO_ROOT / "services/discord_bot/bot.py") == entrypoint)
                 engine_code = [file_identity(REPO_ROOT / name) for name in (
                     "scripts/run_tw_day_trade_simulation.py", "stockagent/live/quote_provider.py",
                     "stockagent/live/tw_day_trade_simulation.py")]
@@ -306,16 +330,22 @@ def main() -> int:
                             current_bot, expected_code, entrypoint["sha256"]):
                         raise ValueError("unchanged Discord code admission differs; engine-only reload cannot adopt it")
                     before_inventory = inventory(read_object(STATE_PATH))
-                    if (implementation_identity() != code
-                            or file_identity(REPO_ROOT / "services/discord_bot/bot.py") != entrypoint
+                    if (not code_unchanged()
                             or any(file_identity(row["path"]) != row for row in engine_code)
                             or before != {name: owner(name) for name in protected}
                             or selected_before != {name: owner(name) for name in plan["services"]}):
                         raise RuntimeError("qualified code or owner changed before reload")
-                    receipt.update(status="reloading", restart_requested=True, plan=plan,
+                    receipt.update(status="reloading", plan=plan,
                                    ledger_inputs=inputs, expected_code_sha256=expected_code,
                                    expected_entrypoint_sha256=entrypoint["sha256"],
                                    engine_code=engine_code)
+                    atomic_write_json(args.output, receipt)
+                    if release_path is not None and not args.engine_only:
+                        receipt["previous_code_drop_in"] = DROP_IN.read_text() if DROP_IN.exists() else None
+                        atomic_write_json(args.output, receipt)
+                        receipt["parsed_unit_code_configuration"] = install_drop_in(release_path, REPO_ROOT)
+                        receipt["code_drop_in_installed"] = True
+                    receipt["restart_requested"] = True
                     atomic_write_json(args.output, receipt)
                     for service in plan["services"]:
                         subprocess.run(["systemctl", "restart", service], check=True, timeout=65)
@@ -324,8 +354,7 @@ def main() -> int:
                     # Waiting for GPU warmup cannot repair a different code
                     # generation. Report the race immediately, retain this
                     # invocation and never enter an automatic restart loop.
-                    if (implementation_identity() != code
-                            or file_identity(REPO_ROOT / "services/discord_bot/bot.py") != entrypoint
+                    if (not code_unchanged()
                             or any(file_identity(row["path"]) != row for row in engine_code)):
                         raise RuntimeError("qualified code changed during startup; wait for a stable generation before retrying reload")
                     try:
@@ -346,8 +375,7 @@ def main() -> int:
                         raise TimeoutError("reload occurred, but native Gateway/warmup/code/ACK acceptance is incomplete")
                     time.sleep(.5)
                 after = {name: owner(name) for name in protected}
-                if (before != after or implementation_identity() != code
-                        or file_identity(REPO_ROOT / "services/discord_bot/bot.py") != entrypoint
+                if (before != after or not code_unchanged()
                         or any(file_identity(row["path"]) != row for row in engine_code)):
                     raise RuntimeError("protected owner or qualified code changed during reload")
                 selected_after = {name: owner(name) for name in plan["services"]}
@@ -366,12 +394,14 @@ def main() -> int:
                         expected_entrypoint=entrypoint["sha256"])
                         or selected_after != {name: owner(name) for name in plan["services"]}
                         or before != {name: owner(name) for name in protected}
-                        or implementation_identity() != code
-                        or file_identity(REPO_ROOT / "services/discord_bot/bot.py") != entrypoint
+                        or not code_unchanged()
                         or any(file_identity(row["path"]) != row for row in engine_code)):
                     raise RuntimeError("native readiness, code or owner changed during final readback")
                 if not args.discord_only and inventory(read_object(STATE_PATH)) != before_inventory:
                     raise RuntimeError("engine reload changed persisted inventory, signals or accounting")
+                if release_path is not None:
+                    receipt["native_code_namespace"] = verify_owner_namespace(
+                        release_path, REPO_ROOT, int(bot["run_id"].split("-", 1)[0]))
                 receipt.update(status="accepted_code_admission_only" if args.code_admission_only else "accepted",
                                acceptance_scope="loaded_code_gateway_ack_not_gpu_readiness"
                                if args.code_admission_only else "native_warmup_code_gateway_ack",

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import replace
 import fcntl
 import hashlib
@@ -39,6 +40,7 @@ from stockagent.data_sync.legacy_artifact_archive import (
     MANUAL_MINUTE_DERIVED_VIEW_CONTRACT, reviewed_minute_derived_view_root,
     apply_archive_stage_prune, load_legacy_specs, plan_archive_stage_prune,
     prepare_archive, publish_archive, verify_archive_directory, verify_cold_archive,
+    C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT,
 )
 from stockagent.data_sync.legacy_artifact_retirement import (
     plan_legacy_retirement, apply_legacy_retirement, plan_legacy_quarantine_resume,
@@ -48,12 +50,14 @@ from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 from stockagent.data_sync.remote_legacy_return import active_configuration_references, active_configuration_references_many, metadata_tree, real
 
 COMMON_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock')
+_PHASE_STACK = ContextVar('manual_retirement_phase_stack', default=())
 SCOPES = MANUAL_WSL_SCOPES | {'markets', 'ablations', 'live', 'stockagent-transfer-quarantine', 'data_tw_minute'}
 EXISTING_CATALOG = ROOT / 'configs/data_sync/legacy_artifact_archives.json'
 HOT_ARTIFACT_ROOT = Path('/srv/stockagent-artifacts-hot')
 HOT_MIRROR_ORIGIN = 'retained-hot-mirror-preservation-v1'
 TRANSFER_QUARANTINE_ORIGIN = 'retained-transfer-quarantine-preservation-v1'
 MINUTE_DERIVED_VIEW_ORIGIN = 'retained-minute-derived-view-preservation-v1'
+D_BENCHMARK_STAGE_PROFILE = 'completed-benchmark-d-scratch-v1'
 MINUTE_VIEW_NAMES = {
     'developing-v5': 'data_tw_minute/research_dataset_developing_v5',
     'schema2-volume-bug': 'data_tw_minute/research_dataset_schema2_volume_bug_20260807',
@@ -107,9 +111,15 @@ def reusable_publication(target: Path, spec: LegacyArchiveSpec, sync_root: Path)
 def phase(target: Path, name: str):
     """Persist current work separately from completed retirement evidence."""
     path = target / 'phase.json'
+    key = path.absolute()
+    frames = _PHASE_STACK.get()
+    parents = [value for location, value in frames if location == key]
     started = time.monotonic()
-    value = {'phase': name, 'state': 'running', 'started_at_epoch': time.time()}
+    value = {'contract': 'manual-retirement-phase-progress-v2',
+             'phase': name, 'state': 'running', 'started_at_epoch': time.time(),
+             'phase_depth': len(parents), 'phase_stack': [parent['phase'] for parent in parents] + [name]}
     atomic_write_json(path, value)
+    token = _PHASE_STACK.set(frames + ((key, dict(value)),))
     try:
         yield
     except BaseException as error:
@@ -118,8 +128,13 @@ def phase(target: Path, name: str):
     else:
         value['state'] = 'completed'
     finally:
+        _PHASE_STACK.reset(token)
         value.update(finished_at_epoch=time.time(), elapsed_seconds=time.monotonic()-started)
-        atomic_write_json(path, value)
+        # The child can finish while its publisher still verifies originals.
+        # Restore only an actual parent in this process, never a stale running
+        # phase left on disk by an interrupted attempt or another target.
+        current = {**parents[-1], 'last_subphase': value} if parents else value
+        atomic_write_json(path, current)
 
 
 @contextmanager
@@ -203,11 +218,17 @@ def shared_link_observation_drift(before: dict, after: dict):
 
 def inventory(relatives: list[str], output: Path, existing_datasets: list[str] | None = None,
               *, hot_mirror: bool = False, transfer_quarantine: bool = False,
-              minute_derived_view: bool = False) -> dict:
+              minute_derived_view: bool = False, guarded_d_scratch: bool = False) -> dict:
     if sum((hot_mirror,transfer_quarantine,minute_derived_view))>1:
         raise SnapshotError('different physical source roles cannot share an inventory')
     if (hot_mirror or transfer_quarantine or minute_derived_view) and existing_datasets:
         raise SnapshotError('historical hot mirrors require their own new exact archive identity')
+    if guarded_d_scratch:
+        if (hot_mirror or transfer_quarantine or minute_derived_view or existing_datasets
+                or len(relatives) != 1 or not relatives[0].startswith('benchmarks/')
+                or not reviewed_wsl_artifact_root(relatives[0])):
+            raise SnapshotError('guarded D scratch requires one new completed benchmark case')
+        _check_d_primary_mount(Path('/srv/stockagent-packed'))
     retained = {}
     catalog_sha = None
     if existing_datasets:
@@ -255,8 +276,26 @@ def inventory(relatives: list[str], output: Path, existing_datasets: list[str] |
         result.update(source_origin=origin, artifact_root=str(artifact_root))
     if catalog_sha:
         result['existing_catalog_sha256'] = catalog_sha
+    if guarded_d_scratch:
+        result['staging_profile'] = D_BENCHMARK_STAGE_PROFILE
     atomic_write_json(output, result)
     return result
+
+
+def stage_profile(inventory: dict) -> tuple[Path, bool]:
+    """The frozen inventory chooses one fixed scratch, never an arbitrary path."""
+    profile = inventory.get('staging_profile')
+    if profile is None:
+        return C_TEMP_STAGE_ROOT, False
+    rows = inventory.get('items', [])
+    if (profile != D_BENCHMARK_STAGE_PROFILE or inventory.get('source_origin') is not None
+            or inventory.get('existing_catalog_sha256') is not None
+            or not isinstance(rows, list) or len(rows) != 1
+            or not isinstance(rows[0], dict) or rows[0].get('existing_dataset')
+            or not str(rows[0].get('relative_root', '')).startswith('benchmarks/')
+            or not reviewed_wsl_artifact_root(rows[0]['relative_root'])):
+        raise SnapshotError('unsupported frozen temporary staging profile or scope')
+    return D_BENCHMARK_STAGE_ROOT, True
 
 
 def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = False) -> dict:
@@ -268,16 +307,19 @@ def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = Fal
 
 
 def verify_for_retirement(spec, sync_root: Path, target: Path):
-    """Select enough private scratch without replacing physical admission."""
+    """Prefer exact existing encoding; otherwise retain physical admission."""
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     needed = int(resolved.manifest['source']['logical_bytes']) + 32 * 1024**3
     temporary_free = shutil.disk_usage(Path(tempfile.gettempdir())).free
-    workspace = None if temporary_free >= needed else target / 'verification-scratch'
+    encoding = spec.stage_root / spec.dataset / 'archive'
+    reuse_encoding = encoding.is_dir()
+    workspace = None if temporary_free >= needed or reuse_encoding else target / 'verification-scratch'
     atomic_write_json(target / 'recovery-workspace-plan.json', {
         'dataset': spec.dataset, 'snapshot_id': resolved.manifest['snapshot_id'],
         'manifest_sha256': resolved.manifest_sha256,
         'required_bytes_including_reserve': needed, 'temporary_free_bytes': temporary_free,
         'selected_workspace': str(workspace) if workspace is not None else None,
+        'reuse_encoded_archive': str(encoding) if reuse_encoding else None,
         'physical_admission_still_required': workspace is not None,
     })
     started = time.monotonic()
@@ -303,7 +345,8 @@ def verify_for_retirement(spec, sync_root: Path, target: Path):
         last_report, last_value = now, record
     report({'stage': 'resolve-and-verify-fixed-release'}, force=True)
     try:
-        proof = verify_cold_archive(spec, sync_root, verification_root=workspace, progress=report)
+        options = {'reuse_encoded_archive': encoding} if reuse_encoding else {'verification_root': workspace}
+        proof = verify_cold_archive(spec, sync_root, **options, progress=report)
         if (proof['snapshot_id'] != resolved.manifest['snapshot_id']
                 or proof['manifest_sha256'] != resolved.manifest_sha256):
             raise SnapshotError('fixed D release changed while selecting recovery workspace')
@@ -424,6 +467,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
     cfg = RetentionConfig.load(ROOT / 'configs/data_sync/packed_retention.json', repo_root=ROOT)
     cfg = replace(cfg, required_peer_names=load_retirement_peer_names(
         ROOT / 'configs/data_sync/artifact_retirement.json', authority_node_id='penguin'))
+    stage_root, durable_staging = stage_profile(inv)
     results = []
     for row in inv['items']:
         relative = row['relative_root']
@@ -457,8 +501,8 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             if origin!=MINUTE_DERIVED_VIEW_ORIGIN or not reviewed_minute_derived_view_root(relative):
                 raise SnapshotError('retired minute view capture requires its separate physical source role')
             capture_contract=MANUAL_MINUTE_DERIVED_VIEW_CONTRACT
-        spec = LegacyArchiveSpec(dataset, relative, 7, Path('/var/lib/stockagent-legacy-archive-stage'),
-                                 12, False, 'zstd-1-adaptive-over-8m', capture_contract)
+        spec = LegacyArchiveSpec(dataset, relative, 7, stage_root,
+                                 12, durable_staging, 'zstd-1-adaptive-over-8m', capture_contract)
         if row.get('existing_dataset'):
             if dataset not in existing_specs or existing_specs[dataset].relative_root != relative:
                 raise SnapshotError('existing archive identity differs from the frozen root')
@@ -539,7 +583,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                 atomic_write_json(target / 'retained-benchmark-evidence.json', retained)
             atomic_write_json(target / 'catalog.json', {'schema_version': 1, 'authority_node_id': 'penguin',
                 'archives': [{'dataset': dataset, 'relative_root': relative, 'minimum_stable_days': 7,
-                              'manual_capture_min_stable_hours': 12, 'durable_staging': False,
+                              'manual_capture_min_stable_hours': 12, 'durable_staging': spec.durable_staging,
                               'compression': spec.compression_profile, 'archive_only': True,
                               'stage_root': str(spec.stage_root), 'capture_contract': spec.capture_contract}]})
             # Admission, stable source hashes, every encoded byte and independent
@@ -612,6 +656,8 @@ def main():
                         help='Inventory only the two reviewed retired research minute views')
     parser.add_argument('--minute-view-name',action='append',choices=tuple(MINUTE_VIEW_NAMES),
                         help='Select a retired minute view without putting source path operands in an invoker argv')
+    parser.add_argument('--guarded-d-scratch', action='store_true',
+                        help='Freeze the separate guarded D temporary stage for one completed benchmark case')
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--receipt-dir', type=Path)
     parser.add_argument('--wait-for-owner', action='store_true',
@@ -631,12 +677,14 @@ def main():
             args.relative_root = [MINUTE_VIEW_NAMES[name] for name in (args.minute_view_name or MINUTE_VIEW_NAMES)]
         if not args.relative_root and not args.existing_dataset:
             parser.error('inventory needs explicit relative roots')
-        result = inventory(args.relative_root or [], args.inventory, args.existing_dataset,
-                           hot_mirror=args.hot_mirror,transfer_quarantine=args.transfer_quarantine,
-                           minute_derived_view=args.minute_derived_view)
+        options = dict(hot_mirror=args.hot_mirror, transfer_quarantine=args.transfer_quarantine,
+                       minute_derived_view=args.minute_derived_view)
+        if args.guarded_d_scratch:
+            options['guarded_d_scratch'] = True
+        result = inventory(args.relative_root or [], args.inventory, args.existing_dataset, **options)
         print(json.dumps({'items':len(result['items']), 'blocked':sum(bool(r['blockers']) for r in result['items'])}))
         return 0
-    if args.relative_root or args.existing_dataset or args.hot_mirror or args.transfer_quarantine or args.minute_derived_view or args.minute_view_name or not args.receipt_dir:
+    if args.relative_root or args.existing_dataset or args.hot_mirror or args.transfer_quarantine or args.minute_derived_view or args.minute_view_name or args.guarded_d_scratch or not args.receipt_dir:
         parser.error('apply needs the fixed inventory and receipt directory')
     frozen = hashlib.sha256(args.inventory.read_bytes()).hexdigest()
     for round_index in range(args.retry_rounds):

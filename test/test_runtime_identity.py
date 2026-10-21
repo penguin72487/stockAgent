@@ -148,12 +148,25 @@ def test_source_identity_includes_untracked_code_but_not_private_files(tmp_path)
     page = tmp_path / "services/public_dashboards/index.html"
     page.parent.mkdir(parents=True)
     page.write_text("<p>real public application</p>\n")
+    policy = tmp_path / "configs/data_sync/cache_capacity.json"
+    policy.parent.mkdir(parents=True)
+    policy.write_text('{"contract":"bounded_cache_writes_v1"}\n')
+    prepared = policy.with_name("prepared_capacity.json")
+    prepared.write_text('{"contract":"prepared_generation_admission_v1"}\n')
+    enrollment = tmp_path / "configs/training_rescue.json"
+    enrollment.write_text('{"private_node_state":"not a portable runtime policy"}\n')
     first = source_identity(tmp_path)
     assert set(first["files"]) == {
         "stockagent/nested/runner.py", "services/public_dashboards/index.html", "plot_epoch_curves.py", "scripts/tile.cu",
+        "configs/data_sync/cache_capacity.json", "configs/data_sync/prepared_capacity.json",
     }
     private.write_text("SECRET=changed\n")
+    enrollment.write_text('{"private_node_state":"changed"}\n')
     assert source_identity(tmp_path)["source_sha256"] == first["source_sha256"]
+    policy.write_text('{"contract":"bounded_cache_writes_v1","changed":true}\n')
+    assert source_identity(tmp_path)["files"][str(policy.relative_to(tmp_path))] != first["files"][str(policy.relative_to(tmp_path))]
+    prepared.write_text('{"contract":"prepared_generation_admission_v1","changed":true}\n')
+    assert source_identity(tmp_path)["files"][str(prepared.relative_to(tmp_path))] != first["files"][str(prepared.relative_to(tmp_path))]
     cuda.write_text("// compiled training dependency v2\n")
     assert source_identity(tmp_path)["files"]["scripts/tile.cu"] != first["files"]["scripts/tile.cu"]
     plotter.write_text("plotter_version = 2\n")

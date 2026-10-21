@@ -21,7 +21,7 @@ from pathlib import Path
 import re
 import stat
 import time
-from typing import Iterator
+from typing import Callable, Iterator
 import uuid
 
 from downloader.artifact_io import atomic_write_bytes
@@ -206,13 +206,17 @@ def capacity_status(root: Path, *, timeout_seconds: float = 2.0) -> dict:
 @contextmanager
 def reserve_capacity(root: Path, *, key: str, maximum_growth_bytes: int,
                      capacity_bytes: int, timeout_seconds: float = 2.0,
-                     minimum_free_bytes: int = 0) -> Iterator[dict]:
+                     minimum_free_bytes: int = 0,
+                     external_usage_bytes: Callable[[], int] | None = None) -> Iterator[dict]:
     """Reserve an upper bound BEFORE compute; release after durable publication.
 
     Existing hits do not need admission. Callers supply a proven upper bound
     for all their transaction's payload/temp/receipt/usage growth. We reserve
     extra control headroom. No directory recursion, payload hashing or eviction
-    occurs. All namespace writers must adopt this before enrolling a hard cap.
+    occurs by default. A separate cache owner can supply a bounded physical
+    inventory callback, evaluated INSIDE admission serialization, for payloads
+    outside this flat control directory. All writers must cooperate before a
+    namespace hard cap can be claimed. This does not authorize any eviction.
     """
     if not isinstance(key, str) or _KEY.fullmatch(key) is None:
         raise ValueError("invalid canonical forward key")
@@ -233,8 +237,11 @@ def reserve_capacity(root: Path, *, key: str, maximum_growth_bytes: int,
             if any(row["capacity_bytes"] != capacity_bytes for row in observed["active_reservations"]):
                 raise CapacityDeferred("capacity_policy_changed_while_busy",
                                        capacity_bytes=capacity_bytes)
+            external_bytes = 0 if external_usage_bytes is None else external_usage_bytes()
+            if type(external_bytes) is not int or not 0 <= external_bytes < 2**63:
+                raise ValueError("external capacity inventory must be a nonnegative byte count")
             required = (observed["namespace_allocated_bytes"] + observed["reserved_growth_bytes"]
-                        + maximum_growth_bytes + CONTROL_HEADROOM_BYTES)
+                        + external_bytes + maximum_growth_bytes + CONTROL_HEADROOM_BYTES)
             if minimum_free_bytes:
                 filesystem = os.statvfs(root)
                 available = filesystem.f_bavail * filesystem.f_frsize
@@ -247,6 +254,7 @@ def reserve_capacity(root: Path, *, key: str, maximum_growth_bytes: int,
                 raise CapacityDeferred("capacity_exhausted", capacity_bytes=capacity_bytes,
                                        maximum_growth_bytes=maximum_growth_bytes,
                                        namespace_allocated_bytes=observed["namespace_allocated_bytes"],
+                                       external_usage_bytes=external_bytes,
                                        reserved_growth_bytes=observed["reserved_growth_bytes"],
                                        required_bytes=required)
             record = {"contract": CONTRACT, "key": key, "token": token, "capacity_bytes": capacity_bytes,
@@ -266,6 +274,7 @@ def reserve_capacity(root: Path, *, key: str, maximum_growth_bytes: int,
                       "minimum_free_bytes": minimum_free_bytes,
                       "control_bytes": CONTROL_HEADROOM_BYTES, "required_bytes_at_admission": required,
                       "namespace_allocated_bytes_at_admission": observed["namespace_allocated_bytes"],
+                      "external_usage_bytes_at_admission": external_bytes,
                       "other_reserved_growth_bytes": observed["reserved_growth_bytes"],
                       "stale_reaped": observed["stale_reaped"], "data_paths_removed": 0}
         yield result

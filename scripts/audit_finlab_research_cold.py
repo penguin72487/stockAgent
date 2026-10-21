@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
 from scripts.snapshot_finlab_quota import _atomic_json  # noqa: E402
 from scripts.stage_tw_public_research_release import _formal_inventory_hashes  # noqa: E402
 from stockagent.data_sync.desync_snapshots import sha256_file  # noqa: E402
+from stockagent.data.parquet_lineage import release_inventory  # noqa: E402
 from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     SnapshotError, resolve_latest_packed, verify_packed_snapshot,
 )
@@ -37,20 +38,19 @@ def audit(sync_root: Path, staged_root: Path) -> dict:
     expected["release_receipt.json"] = None
     if any(inventory.get(path) != digest for path, digest in expected.items() if digest is not None):
         raise RuntimeError("verified cold inventory differs from staged research hashes")
-    if "release_receipt.json" not in inventory:
-        raise RuntimeError("cold release receipt missing from inventory")
+    if inventory.get("release_receipt.json") != sha256_file(staged_root / "release_receipt.json"):
+        raise RuntimeError("cold release receipt missing or differs from staged receipt")
     base_snapshot_id = None
     base_cold_feature_match = False
     try:
         base = resolve_latest_packed(sync_root, "tw-public", require_objects=False)
         base_snapshot_id = str(base.manifest["snapshot_id"])
+        expected_base = release_inventory(release)
         base_hashes = _formal_inventory_hashes(
             base_snapshot_id, sync_root,
-            required_members=("features/tw_public_stock_daily.parquet",),
+            required_members=tuple(expected_base),
         )
-        base_cold_feature_match = (
-            base_hashes["features/tw_public_stock_daily.parquet"] == release["base_feature_sha256"]
-        )
+        base_cold_feature_match = all(base_hashes.get(name) == digest for name, digest in expected_base.items())
     except (OSError, ValueError, RuntimeError, SnapshotError):
         # FinLab cold integrity and official-base synchronization are separate.
         # Never turn an unverified base into a green private release status.
@@ -66,7 +66,7 @@ def audit(sync_root: Path, staged_root: Path) -> dict:
         "verified_object_bytes": proof["verified_object_bytes"],
         "feature_rows": release["feature_rows"],
         "model_channels": release["model_channels"],
-        "base_feature_sha256": release["base_feature_sha256"],
+        **{key: release[key] for key in ("base_feature_sha256", "base_feature_source") if key in release},
         "staged_receipt_sha256": sha256_file(staged_root / "release_receipt.json"),
         "base_snapshot_id": base_snapshot_id,
         "base_cold_feature_match": base_cold_feature_match,

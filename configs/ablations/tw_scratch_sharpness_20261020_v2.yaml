@@ -1,0 +1,4 @@
+# v1 completed one four-epoch mechanism trial; its benchmark omitted pass2.
+# v2 fixes only shared engineering acceptance; financial/training math is unchanged.
+base_spec: tw_scratch_sharpness_20261020_v1.yaml
+output_root: artifacts/markets/tw_scratch_sharpness_20261020_v2

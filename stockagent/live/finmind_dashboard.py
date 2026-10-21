@@ -45,10 +45,8 @@ LABELS = {
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError):
-        return {}
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    value = read_json_snapshot(path)
     return value if isinstance(value, dict) else {}
 
 

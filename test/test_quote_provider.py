@@ -504,15 +504,11 @@ class _FakeMisResponse:
         return {"msgArray": self.rows}
 
 
-def test_warm_tw_mis_uses_quote_api_when_browser_frontend_fails(monkeypatch) -> None:
-    class FailedFrontendResponse:
-        status_code = 502
-
-        def raise_for_status(self) -> None:
-            raise RuntimeError("browser frontend unavailable")
-
+def test_warm_tw_mis_probes_api_directly_without_browser_dependency(monkeypatch) -> None:
     class HealthyApiResponse(_FakeMisResponse):
         status_code = 200
+
+    requested = []
 
     class FakeSession:
         def __init__(self) -> None:
@@ -520,8 +516,8 @@ def test_warm_tw_mis_uses_quote_api_when_browser_frontend_fails(monkeypatch) -> 
             self.cookies = requests.cookies.RequestsCookieJar()
 
         def get(self, url: str, *, timeout: int, params=None, **kwargs):
-            if params is None:
-                return FailedFrontendResponse()
+            assert params is not None, "browser frontend must not delay the actual quote API"
+            requested.append(params["ex_ch"])
             return HealthyApiResponse([{"c": "2330", "z": "100.0"}])
 
     monkeypatch.setattr(quote_provider.requests, "Session", FakeSession)
@@ -531,7 +527,12 @@ def test_warm_tw_mis_uses_quote_api_when_browser_frontend_fails(monkeypatch) -> 
     result = quote_provider.warm_tw_mis_quote_client(force=True)
 
     assert result["ready"] is True
-    assert result["frontend_http_status"] == 502
+    assert requested == ["tse_2330.tw"]
+    assert result["frontend_http_status"] is None
+    assert result["frontend_performed"] is False
+    assert result["api_http_status"] == 200
+    assert result["api_http_total_ms"] >= 0
+    assert result["readiness_contract"] == "quote_api_requested_row_validated_v2"
 
 
 @pytest.mark.parametrize("rows", [[], [{"c": "0050"}], [None]])
@@ -565,14 +566,17 @@ def test_optional_mis_warmup_never_holds_up_real_quote_workers(monkeypatch, tmp_
     import threading
 
     probe_started, release_probe = threading.Event(), threading.Event()
+    sessions = []
 
     class Session:
         def __init__(self):
             self.headers = {}
             self.cookies = requests.cookies.RequestsCookieJar()
+            self.is_probe = not sessions
+            sessions.append(self)
 
         def get(self, _url, params=None, **_kwargs):
-            if params is None:
+            if self.is_probe:
                 probe_started.set()
                 assert release_probe.wait(timeout=3)
             return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
@@ -594,6 +598,117 @@ def test_optional_mis_warmup_never_holds_up_real_quote_workers(monkeypatch, tmp_
         finally:
             release_probe.set()
         assert probe.result(timeout=2)["ready"]
+
+
+def test_mis_validated_probe_hands_connection_to_only_one_worker(monkeypatch, tmp_path, opening_clock):
+    sessions, calls, response_closes, session_closes = [], [], [], []
+    barrier = threading.Barrier(2)
+    guard = threading.Lock()
+    stamp = int(opening_clock.timestamp() * 1000)
+
+    class Session:
+        def __init__(self):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.headers = {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+            self.active = False
+
+        def get(self, _url, params, **_kwargs):
+            with guard:
+                assert not self.active, "requests.Session cannot have concurrent owners"
+                self.active = True
+                calls.append((self.index, params["ex_ch"]))
+            try:
+                if params["ex_ch"] != "tse_2330.tw":
+                    # Both real workers must be able to reach the transport at
+                    # once, but only one may use the warmed Session.
+                    barrier.wait(timeout=3)
+                else:
+                    assert not response_closes
+                code = params["ex_ch"].split("_")[1].split(".")[0]
+                return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                    json=lambda: {"msgArray": [{"c": code, "z": "101", "o": "100", "tlong": str(stamp)}]},
+                    close=lambda: response_closes.append(self.index))
+            finally:
+                with guard:
+                    self.active = False
+
+        def close(self):
+            session_closes.append(self.index)
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_BOOTSTRAP_SESSION", None)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda *_: {"A": "A.TW", "B": "B.TW"})
+    warm = quote_provider.warm_tw_mis_quote_client(force=True)
+    assert warm["connection_retained"] is True
+    assert response_closes == [0], "the probe response must be released before handing off its session"
+    result = fetch_tw_mis_last_prices(["A", "B"], np.full(2, np.nan), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=2, empty_chunk_retry_attempts=0, on_progress=lambda *_: None)
+    assert result.available_count == 2
+    assert len(sessions) == 2, "the probe socket must not be thrown away and recreated"
+    assert {index for index, _ in calls[1:]} == {0, 1}
+    assert {channel for _, channel in calls[1:]} == {"tse_A.tw", "tse_B.tw"}
+    assert session_closes == [], "the probe cannot close a successfully transferred connection"
+    assert quote_provider._TW_MIS_BOOTSTRAP_SESSION is None
+    origins = [row["http_session_origin"] for row in result.transport_timing["mis_requests"]]
+    assert sorted(origins) == ["new_worker_connection", "validated_prewarm_exclusive_handoff"]
+
+
+def test_mis_failed_forced_probe_closes_unclaimed_connection_and_failed_session(monkeypatch):
+    sessions, closed = [], []
+
+    class Session:
+        def __init__(self):
+            self.index = len(sessions)
+            sessions.append(self)
+            self.headers = {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def get(self, _url, **_kwargs):
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                json=lambda: {"msgArray": [{"c": "2330"}] if self.index == 0 else []})
+
+        def close(self):
+            closed.append(self.index)
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_BOOTSTRAP_SESSION", None)
+    quote_provider.warm_tw_mis_quote_client(force=True)
+    assert closed == []
+    with pytest.raises(RuntimeError, match="no requested probe row"):
+        quote_provider.warm_tw_mis_quote_client(force=True)
+    assert closed == [0, 1]
+    assert quote_provider._TW_MIS_BOOTSTRAP_SESSION is None
+    assert quote_provider._TW_MIS_BOOTSTRAP_AT == 0
+
+
+@pytest.mark.parametrize("wrong_owner", ["factory", "pid"])
+def test_mis_warm_connection_rejects_other_factory_or_process(monkeypatch, tmp_path, wrong_owner):
+    closed = []
+    class Session:
+        def __init__(self):
+            self.headers = {}
+            self.cookies = requests.cookies.RequestsCookieJar()
+
+        def get(self, _url, **_kwargs):
+            return SimpleNamespace(status_code=200, raise_for_status=lambda: None,
+                json=lambda: {"msgArray": [{"c": "2330", "z": "101", "o": "100"}]})
+
+        def close(self):
+            pass
+
+    import os
+    foreign = SimpleNamespace(close=lambda: closed.append(True))
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_BOOTSTRAP_SESSION",
+        (foreign, object() if wrong_owner == "factory" else Session, os.getpid() + (wrong_owner == "pid")))
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda *_: {"2330": "2330.TW"})
+    result = fetch_tw_mis_last_prices(["2330"], np.array([np.nan]), parquet_root=tmp_path,
+        empty_chunk_retry_attempts=0, on_progress=lambda *_: None)
+    assert result.available_count == 1
+    assert closed == [True]
+    assert result.transport_timing["mis_requests"][0]["http_session_origin"] == "new_worker_connection"
 
 
 def test_tw_mis_opening_snapshot_persists_same_session_observation(
@@ -798,8 +913,14 @@ def test_mis_stream_separates_body_failure_and_closes_response(monkeypatch, tmp_
         assert snapshot.available_count == 0 and "secret" not in str(row)
     else:
         assert row["body_read_ms"] >= 0 and row["json_decode_ms"] >= 0
+        assert row["row_decode_ms"] >= 0
+        assert row["request_to_decoded_rows_ms"] >= row["row_decode_ms"]
         assert row["body_bytes"] == len(BodyResponse().content)
         assert snapshot.available_count == 1 and snapshot.open_prices[0] == 100
+        stages = snapshot.transport_timing["mis_progress_spans"]
+        assert len(stages) == snapshot.transport_timing["mis_progress_batch_count"] == 1
+        assert stages[0]["row_count"] == stages[0]["cohort_count"] == 1
+        assert stages[0]["snapshot_assembly_ms"] >= 0 and stages[0]["callback_ms"] >= 0
 
 
 def test_fetch_tw_mis_retries_empty_chunks_without_using_last_as_open(monkeypatch, tmp_path) -> None:
@@ -936,6 +1057,44 @@ def test_tw_opening_snapshot_is_single_flight_and_shared_across_models(
     assert second.source.endswith("+cache_hit")
 
 
+@pytest.mark.parametrize("repeated", [False, True])
+@pytest.mark.parametrize("max_clocks", [False, True])
+def test_mis_bulk_column_copy_matches_ordered_scalar_values_and_integer_clocks(repeated, max_clocks):
+    rng = np.random.default_rng(2301)
+    indices = [4, 2, 0, 3, 1] + ([2, 4] if repeated else [])
+    rows, receipts = [], []
+    for index, destination in enumerate(indices):
+        values = rng.uniform(0.01, 200., len(quote_provider._PRICE_SNAPSHOT_ARRAY_FIELDS)).tolist()
+        values[index % len(values)] = None
+        values[3] = 0. if index % 2 else -0.
+        rows.append((destination, np.nextafter(100. + index, np.inf),
+            2 ** 53 + 17 + index if index % 2 else None, *values))
+        receipts.append(2 ** 53 + 99 + index)
+
+    def arrays():
+        return (np.full(6, -0.), tuple(np.full(6, np.nan) for _ in quote_provider._PRICE_SNAPSHOT_ARRAY_FIELDS),
+            np.arange(6, dtype=np.int64), np.arange(6, dtype=np.int64))
+
+    actual, expected = arrays(), arrays()
+    for row, receipt, destination in zip(rows, receipts, indices):
+        price, fields, stamps, market = expected
+        price[destination] = row[1]
+        stamp = int(row[2] or 0)
+        stamps[destination] = max(int(stamps[destination]), receipt) if max_clocks else receipt
+        market[destination] = max(int(market[destination]), stamp) if max_clocks else stamp
+        for target, value in zip(fields, row[3:]):
+            if value is not None:
+                target[destination] = value
+    quote_provider._assign_tw_mis_rows(rows, receipts, indices, *actual, max_clocks=max_clocks)
+    for received, wanted in zip((actual[0], *actual[1], *actual[2:]), (expected[0], *expected[1], *expected[2:])):
+        # Check raw bits: preserve signed zero, missingness and >2**53 clocks.
+        np.testing.assert_array_equal(received.view(np.uint64), wanted.view(np.uint64))
+    before = [value.copy() for value in (actual[0], *actual[1], *actual[2:])]
+    quote_provider._assign_tw_mis_rows([], [], [], *actual, max_clocks=max_clocks)
+    for received, wanted in zip((actual[0], *actual[1], *actual[2:]), before):
+        np.testing.assert_array_equal(received.view(np.uint64), wanted.view(np.uint64))
+
+
 def test_opening_row_projection_reuses_only_immutable_rows_and_still_checks_ttl(monkeypatch, tmp_path, opening_clock):
     day = opening_clock.date().isoformat()
     stamp = int(opening_clock.timestamp() * 1000)
@@ -1002,6 +1161,41 @@ def test_opening_columns_keep_axis_fallback_removal_and_generation_isolated(monk
     for i in range(12):
         read(["A", f"axis-{i}"])
     assert len(quote_provider._TW_MIS_OPENING_COLUMNS) <= 8
+
+
+def test_opening_column_block_updates_match_scalar_projection_bits(monkeypatch, opening_clock):
+    fields = quote_provider._PRICE_SNAPSHOT_ARRAY_FIELDS
+    stamp = int(opening_clock.timestamp() * 1000)
+    day = opening_clock.date().isoformat()
+    symbols = tuple(f"symbol-{i}" for i in range(37))
+    rows = {symbol: (float(i), {"available": bool(i % 2), "price": 100. + i,
+        "timestamp_ms": stamp, "open_timestamp_ms": stamp, "source": "shioaji:fixture",
+        **{field: (None if (i + j) % 4 == 0 else -0. if (i + j) % 4 == 1 else 3.141592653589793)
+           for j, field in enumerate(fields)}}) for i, symbol in enumerate(symbols)}
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_CACHE", rows)
+    monkeypatch.setattr(quote_provider, "_TW_MIS_OPENING_ROW_VIEWS", {})
+    columns = quote_provider._OpeningColumns(len(symbols))
+    for revision in range(2):
+        if revision:
+            rows[symbols[3]] = (99., {**rows[symbols[3]][1], "open_prices": 101., "price": None})
+            del rows[symbols[5]]
+        columns.refresh(symbols, day)
+        expected_fields = np.full_like(columns.fields, np.nan)
+        expected_timestamps = np.zeros_like(columns.timestamps)
+        expected_prices = np.full_like(columns.prices, np.nan)
+        for i, symbol in enumerate(symbols):
+            if symbol not in rows:
+                assert not columns.present[i]
+                continue
+            view = quote_provider._opening_row_view(symbol, rows[symbol][1], day)
+            expected_fields[:, i] = view[0]
+            expected_timestamps[:, i] = view[4:7]
+            expected_prices[i] = view[3] if view[3] is not None else np.nan
+            assert (columns.immutable[i], columns.available[i], columns.has_price[i]) == (
+                view[1], view[2], view[3] is not None)
+        for actual, expected in ((columns.fields, expected_fields), (columns.timestamps, expected_timestamps),
+                                 (columns.prices, expected_prices)):
+            assert actual.tobytes() == expected.tobytes(), "preserve NaNs, signed zero, clocks and row order"
 
 
 @pytest.mark.parametrize("field", ["open_prices", "volumes", "bid_volumes", "ask_volumes"])
@@ -1095,6 +1289,110 @@ def test_mis_ready_cohort_never_waits_for_unfinished_peer(monkeypatch, tmp_path,
     result = fetch_tw_mis_last_prices(["2330", "2317"], np.zeros(2), parquet_root=tmp_path,
         chunk_size=1, max_parallel_requests=2, empty_chunk_retry_attempts=0, on_progress=progress)
     assert result.available_count == 2 and batches == [["2330"], ["2317"]]
+
+
+def test_mis_refills_http_window_before_synchronous_progress(monkeypatch, tmp_path, opening_clock):
+    """Journal/validation work must overlap, not serialize, the next HTTP job."""
+    next_http = threading.Event()
+    progress_done = threading.Event()
+    calls, batches = [], []
+    class Session:
+        def __init__(self):
+            self.headers = {}
+        def get(self, _url, *, params, **_kwargs):
+            code = params["ex_ch"].split("_", 1)[1].split(".", 1)[0]
+            calls.append(code)
+            if code == "2317":
+                next_http.set()
+                assert progress_done.wait(2.), "next job must not delay publishing the ready cohort"
+            return _FakeMisResponse([{"c": code, "z": "101", "o": "100", "v": "1",
+                                      "tlong": str(int(opening_clock.timestamp() * 1000))}])
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda _: {"2330": "2330.TW", "2317": "2317.TW"})
+    def progress(names, snapshot):
+        batches.append(names)
+        if names == ["2330"]:
+            assert next_http.wait(2.), "synchronous progress left the next HTTP request idle"
+            assert snapshot.open_prices.tolist() == [100.]
+            progress_done.set()
+    result = fetch_tw_mis_last_prices(["2330", "2317"], np.zeros(2), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=1, empty_chunk_retry_attempts=0, on_progress=progress)
+    assert calls == ["2330", "2317"] and batches == [["2330"], ["2317"]]
+    assert result.available_count == 2
+    assert result.transport_timing["mis_http_workers"] == 1
+    assert result.transport_timing["mis_local_overlap_policy"] == "refill_bounded_http_before_synchronous_progress_v1"
+
+
+def test_mis_keeps_refilling_while_previous_progress_is_blocked(monkeypatch, tmp_path, opening_clock):
+    """A slow receipt must not idle the window after the next HTTP completes."""
+    progress_entered = threading.Event()
+    third_http = threading.Event()
+    calls, batches = [], []
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, _url, *, params, **_kwargs):
+            code = params["ex_ch"].split("_", 1)[1].split(".", 1)[0]
+            calls.append(code)
+            if code == "2317":
+                assert progress_entered.wait(2.), "first completed batch was not published"
+            if code == "2454":
+                third_http.set()
+            return _FakeMisResponse([{"c": code, "z": "101", "o": "100", "v": "1",
+                                      "tlong": str(int(opening_clock.timestamp() * 1000))}])
+
+    names = ["2330", "2317", "2454"]
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda _: {code: code + ".TW" for code in names})
+
+    def progress(scope, snapshot):
+        batches.extend(scope)
+        if scope == ["2330"]:
+            progress_entered.set()
+            assert third_http.wait(2.), "completed HTTP left its slot idle behind validation/journal"
+        assert snapshot.open_prices.tolist() == [100.] * len(scope)
+
+    result = fetch_tw_mis_last_prices(names, np.zeros(3), parquet_root=tmp_path,
+        chunk_size=1, max_parallel_requests=1, empty_chunk_retry_attempts=0, on_progress=progress)
+    assert calls == names and sorted(batches) == sorted(names)
+    assert result.available_count == 3
+    assert result.transport_timing["mis_http_workers"] == 1
+    assert result.transport_timing["mis_network_schedule_policy"] == "bounded_window_independent_of_progress_v2"
+
+
+def test_mis_progress_failure_drains_admitted_http_before_return(monkeypatch, tmp_path, opening_clock):
+    second_started, release, second_finished = (threading.Event() for _ in range(3))
+
+    class Session:
+        def __init__(self):
+            self.headers = {}
+
+        def get(self, _url, *, params, **_kwargs):
+            code = params["ex_ch"].split("_", 1)[1].split(".", 1)[0]
+            if code == "2330":
+                assert second_started.wait(2.)
+            else:
+                second_started.set()
+                assert release.wait(2.), "progress did not release the already admitted request"
+                second_finished.set()
+            return _FakeMisResponse([{"c": code, "z": "101", "o": "100", "v": "1",
+                                      "tlong": str(int(opening_clock.timestamp() * 1000))}])
+
+    monkeypatch.setattr(quote_provider.requests, "Session", Session)
+    monkeypatch.setattr(quote_provider, "load_symbol_yahoo_map", lambda _: {"2330": "2330.TW", "2317": "2317.TW"})
+
+    def failed_progress(*_args):
+        release.set()
+        raise OSError("receipt fsync failed")
+
+    with pytest.raises(OSError, match="receipt fsync failed"):
+        fetch_tw_mis_last_prices(["2330", "2317"], np.zeros(2), parquet_root=tmp_path,
+            chunk_size=1, max_parallel_requests=2, empty_chunk_retry_attempts=0, on_progress=failed_progress)
+    assert second_finished.is_set()
+    assert not any(thread.name == "tw-mis-window" for thread in threading.enumerate())
+    assert not quote_provider._TW_MIS_INFLIGHT
 
 
 def test_tw_opening_snapshot_does_not_cache_all_empty_preopen_observation(

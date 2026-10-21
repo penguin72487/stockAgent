@@ -110,6 +110,10 @@ def create_frontier_optimizer(model: nn.Module, training: Any, device: torch.dev
     name = training.optimizer_name
     opts = normalized_optimizer_options(name, training.optimizer_options)
     lr, wd = float(training.learning_rate), float(training.weight_decay)
+    if name == "sgd":
+        parameters = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.SGD(parameters, lr=lr, weight_decay=wd, **opts,
+                               **({"fused": True} if device.type == "cuda" else {"foreach": True}))
     if name == "ademamix":
         return _ademamix([p for p in model.parameters() if p.requires_grad], lr=lr, weight_decay=wd, options=opts)
     matrix, aux, manifest = partition_hidden_linear_parameters(model)

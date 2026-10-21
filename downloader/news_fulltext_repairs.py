@@ -27,13 +27,17 @@ from downloader.artifact_io import atomic_write_bytes
 from downloader.news_fulltext_policy import NewsError, normalize_url
 from downloader.news_fulltext_queue import parser_repair_identity, utc_now
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 MAX_TARGETS = 512
 MAX_PENDING = 64
 MAX_REQUEST_BYTES = 1 << 20
 PUMP_INTERVAL_SECONDS = 5
 REPAIRABLE = frozenset({"body_not_found", "article_identity_not_verified",
                        "article_attribution_not_verified", "article_title_not_verified"})
+_REVIEWED_SCOPE_FAILURE = "article_rights_or_scope_excluded"
+# The admitted v6 pen-name scope superseded these older parser observations.
+# A failure observed under v6/v7 must not get a second attempt via this repair.
+_MITRADE_PRIOR_SCOPE_CUTOFF = "2026-10-20T23:21:29.541919+00:00"
 HEAD_FIELDS = ("id", "url", "provider", "state", "error_code", "attempts", "due", "last_checked_at_utc")
 SOURCE_FIELDS = {"contract_version", "data_fingerprint", "parser_fingerprint", "authorization_fingerprint"}
 
@@ -56,14 +60,38 @@ def _head(row):
     return {key: bytes(row[key]).hex() if key == "id" else row[key] for key in HEAD_FIELDS}
 
 
-def _head_problem(row, now):
+def _reviewed_prior_scope_failure(row, registry):
+    """One explicit missing-only retry under the already reviewed v7 scope.
+
+    This is NOT a generic rights override. Only the complete pinned Mitrade
+    capture can reconsider an old native parser exclusion predating its
+    pen-name extension. Unknown authors still have to pass the normal parser;
+    nothing here grants body acceptance, new source scope or HTTP permission.
+    """
+    if registry is None or row["state"] != _REVIEWED_SCOPE_FAILURE:
+        return False
+    from downloader.news_fulltext_mitrade import MITRADE_V7_SCOPE_REPAIR_IDENTITY, mitrade_article_id
+    source = registry.sources.get(row["provider"])
+    if (source is None or source.provider != "mitrade" or not source.allowed or not source.known_url_only
+            or source.embedded_article_layout != "mitrade_visible_article_v7"
+            or source.data_fingerprint != MITRADE_V7_SCOPE_REPAIR_IDENTITY[1]
+            or mitrade_article_id(row["url"]) is None):
+        return False
+    try:
+        return _clock(row["last_checked_at_utc"]) < _clock(_MITRADE_PRIOR_SCOPE_CUTOFF)
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
+def _head_problem(row, now, *, registry=None):
     if row is None:
         return "unknown_url"
     if row["body_sha256"] is not None or row["parquet_path"] is not None or row["body_bytes"] != 0 or row["captured_at_utc"] is not None:
         return "stored_head_protected"
     if row["lease_owner"] is not None or row["lease_until"] is not None:
         return "leased_head_protected"
-    if row["state"] not in REPAIRABLE or row["error_code"] != row["state"]:
+    if (row["error_code"] != row["state"] or row["state"] not in REPAIRABLE
+            and not _reviewed_prior_scope_failure(row, registry)):
         return "not_semantic_parser_failure"
     if type(row["attempts"]) is not int or row["attempts"] < 0:
         return "invalid_attempts"
@@ -139,7 +167,7 @@ def submit_repairs(root, registry, urls, *, reason):
         has_markers = db.execute("SELECT 1 FROM sqlite_master WHERE name='reviewed_repair_items' AND type='table'").fetchone()
         for url in selected:
             row = db.execute("SELECT * FROM articles WHERE url=?", (url,)).fetchone()
-            problem = _head_problem(row, now)
+            problem = _head_problem(row, now, registry=registry)
             if problem is None:
                 try:
                     source, identity = _source(db, registry, url)
@@ -183,7 +211,8 @@ def _unique(pairs):
     return result
 
 
-def _load(path):
+def _read_private_request(path):
+    """Common bounded local mailbox reader; callers validate their own ABI."""
     with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)), "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_REQUEST_BYTES or info.st_mode & 0o077:
@@ -191,9 +220,13 @@ def _load(path):
         payload = stream.read(MAX_REQUEST_BYTES + 1)
     if len(payload) > MAX_REQUEST_BYTES or hashlib.sha256(payload).hexdigest() != path.stem:
         raise ValueError("repair_input_digest_mismatch")
-    request = json.loads(payload, object_pairs_hook=_unique)
+    return json.loads(payload, object_pairs_hook=_unique)
+
+
+def _load(path):
+    request = _read_private_request(path)
     if (not isinstance(request, dict) or set(request) != {"contract_version", "kind", "created_at_utc", "reason", "sources", "targets"}
-            or type(request["contract_version"]) is not int or request["contract_version"] != CONTRACT_VERSION
+            or type(request["contract_version"]) is not int or request["contract_version"] not in {1, CONTRACT_VERSION}
             or request["kind"] != "reviewed_missing_body_repair"
             or not isinstance(request["reason"], str) or not request["reason"].strip() or len(request["reason"]) > 240
             or _clock(request["created_at_utc"]) > time.time()
@@ -201,12 +234,14 @@ def _load(path):
             or not isinstance(request["sources"], dict)):
         raise ValueError("invalid_repair_request")
     seen = set()
+    # ABI 1 requests retain their original semantic-only state contract.
+    states = REPAIRABLE | ({_REVIEWED_SCOPE_FAILURE} if request["contract_version"] == 2 else set())
     for target in request["targets"]:
         if (not isinstance(target, dict) or set(target) != set(HEAD_FIELDS)
                 or not isinstance(target["url"], str) or normalize_url(target["url"]) != target["url"]
                 or target["id"] != hashlib.sha256(target["url"].encode()).hexdigest()
                 or target["id"] in seen or not isinstance(target["provider"], str)
-                or not isinstance(target["state"], str) or target["state"] not in REPAIRABLE
+                or not isinstance(target["state"], str) or target["state"] not in states
                 or target["error_code"] != target["state"]
                 or type(target["attempts"]) is not int or target["attempts"] < 0
                 or type(target["due"]) not in (int, float) or not math.isfinite(target["due"]) or target["due"] < 0
@@ -243,7 +278,7 @@ def _schema(queue):
 
 def _admit(queue, request, target):
     row = queue.db.execute("SELECT * FROM articles WHERE id=?", (bytes.fromhex(target["id"]),)).fetchone()
-    problem = _head_problem(row, time.time())
+    problem = _head_problem(row, time.time(), registry=queue.registry)
     if problem:
         return problem
     if _head(row) != target:

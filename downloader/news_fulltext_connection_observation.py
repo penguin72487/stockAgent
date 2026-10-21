@@ -1,8 +1,8 @@
-"""Observe the chosen connection without changing HTTP, TLS or retry behavior.
+"""Observe chosen connections, optionally retiring idle sockets before sending.
 
 Each news worker owns a serial Session and each origin adapter retains one
 pool. Hooks delegate to urllib3's original checkout and connect implementations;
-they do not select sockets, skip dropped-connection checks or resend requests.
+they do not skip dropped-connection checks, weaken TLS or resend requests.
 The small observation contains no URL, IP, credentials, headers or body.
 """
 
@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import ssl
 import time
+from urllib.parse import urlsplit
 
 import requests
 from urllib3.connection import HTTPConnection, HTTPSConnection
@@ -19,6 +21,11 @@ from urllib3.poolmanager import PoolManager
 
 
 CONNECTION_REUSE_OBSERVATION_CONTRACT_VERSION = 1
+IDLE_CONNECTION_EXPIRY_CONTRACT_VERSION = 1
+# Native failures repeatedly reused an apparently-open 58.5--58.9s idle
+# socket. Retire it before that observed failure band, not after a failed GET.
+# This is a client connection lifetime, NOT source pacing or a retry deadline.
+MAX_IDLE_CONNECTION_SECONDS = 45
 CONNECTION_OBSERVATION_FIELDS = frozenset({
     'contract_version', 'socket_open_at_checkout', 'previous_request_count',
     'idle_since_previous_terminal_seconds', 'connect_attempts',
@@ -137,6 +144,14 @@ class _ObserveCheckout:
     def _get_conn(self, timeout=None):
         # The native checkout has already checked for a dropped connection.
         connection = super()._get_conn(timeout=timeout)
+        limit = self._news_adapter.max_idle_seconds
+        terminal = connection._news_terminal_at
+        if (limit is not None and connection.sock is not None and terminal is not None
+                and time.monotonic() - terminal >= limit):
+            # Reconnect the same validated origin before sending anything.
+            # No replay, new request slot, cookie change or TLS override.
+            connection.close()
+            self._news_adapter._news_idle_expirations += 1
         self._news_adapter._news_checkout = _CheckoutObservation.checkout(connection)
         return connection
 
@@ -163,11 +178,44 @@ class _ObservationPoolManager(PoolManager):
 
 
 class ConnectionObservingAdapter(requests.adapters.HTTPAdapter):
-    """One serial origin adapter; no additional retries or transport settings."""
+    """One serial origin adapter; optional idle lifetime, no additional retry."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, max_idle_seconds=None, **kwargs):
+        if (max_idle_seconds is not None and (type(max_idle_seconds) not in {int, float}
+                or not math.isfinite(max_idle_seconds) or max_idle_seconds <= 0)):
+            raise ValueError('invalid_idle_connection_lifetime')
+        self.max_idle_seconds = max_idle_seconds
+        self._news_idle_expirations = 0
         self._news_checkout = None
+        self._news_tls_origin = None
+        self._news_tls_context = None
         super().__init__(*args, **kwargs)
+
+    def bind_verified_tls_context(self, origin, context):
+        """Bind before first use, without changing unrelated origin pools."""
+        if self._news_tls_origin is not None or len(self.poolmanager.pools):
+            raise ValueError('origin_tls_context_requires_unused_pool')
+        self._require_verified_tls_context(context)
+        self._news_tls_origin, self._news_tls_context = origin, context
+
+    @staticmethod
+    def _require_verified_tls_context(context):
+        if (not isinstance(context, ssl.SSLContext) or context.verify_mode != ssl.CERT_REQUIRED
+                or not context.check_hostname or context.verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN):
+            raise requests.exceptions.SSLError('origin_tls_requires_existing_root_and_hostname')
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        if self._news_tls_context is not None:
+            parts = urlsplit(request.url)
+            if (verify is not True or cert is not None
+                    or f'{parts.scheme}://{parts.netloc}' != self._news_tls_origin):
+                raise requests.exceptions.SSLError('reviewed_origin_tls_scope_mismatch')
+            self._require_verified_tls_context(self._news_tls_context)
+        host, options = super().build_connection_pool_key_attributes(request, verify, cert)
+        if self._news_tls_context is not None:
+            options['ssl_context'] = self._news_tls_context
+            options['cert_reqs'] = 'CERT_REQUIRED'
+        return host, options
 
     def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         self._pool_connections, self._pool_maxsize, self._pool_block = connections, maxsize, block
@@ -180,6 +228,10 @@ class ConnectionObservingAdapter(requests.adapters.HTTPAdapter):
 
     def finish_connection_observation(self):
         return self._news_checkout.finish() if self._news_checkout is not None else None
+
+    def take_idle_expirations(self):
+        value, self._news_idle_expirations = self._news_idle_expirations, 0
+        return value
 
     def close(self):
         self._news_checkout = None

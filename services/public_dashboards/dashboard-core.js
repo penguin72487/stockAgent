@@ -758,8 +758,13 @@
     return global.document?.querySelector?.('meta[name="stockagent-audience"]')?.getAttribute("content") === "owner";
   }
 
+  function canViewAllPages() {
+    const audience = global.document?.querySelector?.('meta[name="stockagent-audience"]')?.getAttribute("content");
+    return audience === "owner" || audience === "member";
+  }
+
   function navigationItems() {
-    return NAV_ITEMS.filter((item) => isOwnerView()
+    return NAV_ITEMS.filter((item) => canViewAllPages()
       || ["overview", "tw-day-trade", "tw-overnight"].includes(item.id));
   }
 
@@ -1019,6 +1024,7 @@
     PERFORMANCE_HISTORY_LIMIT,
     NAV_ITEMS: Object.freeze(navigationItems()),
     isOwnerView,
+    canViewAllPages,
     byId,
     finiteNumber,
     formatNumber,

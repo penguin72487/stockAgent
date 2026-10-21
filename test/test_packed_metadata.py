@@ -119,6 +119,21 @@ def record(path, **extra):
     return {"path": path, "kind": "file", "size": 7, **extra}
 
 
+@pytest.mark.parametrize('limit', [1, 100])
+def test_census_order_survives_spill_and_releases_early_closed_cursor(limit):
+    with MetadataRows(dict, dict, memory_rows=limit) as rows:
+        rows.extend([record('z', census_order=0), record('a', census_order=2),
+                     record('m', census_order=1)])
+        rows.sort(key=lambda row: row['path'])
+        assert [row['path'] for row in rows.in_census_order()] == ['z', 'm', 'a']
+        assert not rows._cursors
+        iterator = rows.in_census_order()
+        assert next(iterator)['path'] == 'z'
+        assert bool(rows._cursors) is rows.spilled
+        iterator.close()
+        assert not rows._cursors
+
+
 @pytest.mark.parametrize("limit", [1, 100])
 def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit):
     with MetadataRows(dict, dict, memory_rows=limit) as rows:
@@ -374,6 +389,75 @@ def test_pack_buffer_retains_exact_legacy_zip_bytes_and_member_crc(tmp_path, mon
             raw = (original / entry.path).read_bytes()
             assert archive.read(entry.path) == raw
             assert entry.sha256 == hashlib.sha256(raw).hexdigest()
+
+
+@pytest.mark.parametrize('operation', ['pack', 'hash'])
+def test_descriptor_source_read_uses_one_path_stat_and_preserves_full_hash(tmp_path, monkeypatch, operation):
+    root = tmp_path / 'source'
+    root.mkdir()
+    path = root / '原值.json'
+    raw = b'{"value":-7,"missing":null,"unit":"shares"}'
+    path.write_bytes(raw)
+    entries, _ = packed._collect_entries(root)
+    entry = next(row for row in entries if row.kind == 'file')
+    observed, original = [], Path.lstat
+    def counted(member, *args, **kwargs):
+        if member == path:
+            observed.append(member)
+        return original(member, *args, **kwargs)
+    monkeypatch.setattr(Path, 'lstat', counted)
+    if operation == 'hash':
+        assert packed._hash_source_entry(root, entry) == hashlib.sha256(raw).hexdigest()
+    else:
+        output = tmp_path / 'packed.zip'
+        packed._write_pack(root, [entry], output, compression_level=6)
+        with zipfile.ZipFile(output) as archive:
+            assert archive.read(entry.path) == raw and archive.testzip() is None
+        assert entry.sha256 == hashlib.sha256(raw).hexdigest()
+    assert observed == [path]
+
+
+@pytest.mark.parametrize('fault', ['missing', 'symlink', 'fifo', 'directory', 'changed'])
+def test_descriptor_source_read_rejects_post_census_substitution_without_hanging(tmp_path, fault):
+    root = tmp_path / 'source'
+    root.mkdir()
+    path = root / 'original'
+    path.write_bytes(b'original')
+    entries, _ = packed._collect_entries(root)
+    entry = next(row for row in entries if row.kind == 'file')
+    path.unlink()
+    if fault == 'symlink':
+        outside = tmp_path / 'outside'
+        outside.write_bytes(b'original')
+        path.symlink_to(outside)
+    elif fault == 'fifo':
+        os.mkfifo(path)
+    elif fault == 'directory':
+        path.mkdir()
+    elif fault == 'changed':
+        path.write_bytes(b'changed')
+    with pytest.raises(packed.SnapshotError, match='source (entry|file)'):
+        with packed._open_source_entry(root, entry):
+            pytest.fail('substituted source must not be yielded')
+
+
+@pytest.mark.parametrize('fault', ['in_place', 'atomic_replace'])
+def test_descriptor_source_read_rejects_mutation_after_open(tmp_path, fault):
+    root = tmp_path / 'source'
+    root.mkdir()
+    path = root / 'original'
+    path.write_bytes(b'original')
+    entries, _ = packed._collect_entries(root)
+    entry = next(row for row in entries if row.kind == 'file')
+    with pytest.raises(packed.SnapshotError, match='source file changed'):
+        with packed._open_source_entry(root, entry) as stream:
+            assert stream.read() == b'original'
+            if fault == 'in_place':
+                path.write_bytes(b'changed!')
+            else:
+                replacement = root / 'temporary'
+                replacement.write_bytes(b'original')
+                replacement.replace(path)
 
 
 @pytest.mark.parametrize("result", [0, None, "error"])

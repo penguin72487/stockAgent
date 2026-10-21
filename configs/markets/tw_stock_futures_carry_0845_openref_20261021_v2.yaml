@@ -1,0 +1,9 @@
+# The same prior-session stock features, plus a causally observed futures
+# session opening print or last known real trade. References never create fills.
+base_config: tw_stock_futures_carry_0845_20261021_v1.yaml
+experiment_name: tw-stock-futures-carry-0845-openref-20261021-v2
+trading:
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v2/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v2/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v2/clock__0845

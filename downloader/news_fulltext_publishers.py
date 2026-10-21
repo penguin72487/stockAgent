@@ -3708,6 +3708,83 @@ def cnyes_verified_quote_only_body(soup, source, article, body, *, page_url):
     return bool(scope and not scope[1].find(['img', 'video', 'audio', 'iframe', 'object', 'embed', 'table']))
 
 
+def _cmnews_short_table_announcement(scope, body, metadata, *, profile, visible_clock_verified):
+    """Prove the whole native announcement, not a short preview or image CTA.
+
+    Observed publisher-owned cmfaren announcements use two editor table rows:
+    the fixed announcement label, then complete paragraphs. The one optional
+    image is the witnessed template logo, never an unseen chart/attachment.
+    This does not relax another author's short prose or generic body floor.
+    """
+    from bs4.element import Comment, NavigableString
+    from downloader.news_fulltext_public_originals import _visible
+
+    if (profile != 'https://cmnews.com.tw/cmfaren' or not visible_clock_verified
+            or metadata.get('author') != [{'name': 'CM法人團隊'}]
+            or not re.fullmatch(r'\[資料公告\].+', metadata.get('headline', ''))):
+        return False
+    children = [n for n in body.children if not isinstance(n, NavigableString) or str(n).strip()]
+    if len(children) != 1 or children[0].name != 'div':
+        return False
+    wrapper = children[0]
+    parts = [n for n in wrapper.children if not isinstance(n, NavigableString) or str(n).strip()]
+    if len(parts) not in {1, 2}:
+        return False
+    figure = parts[-1]
+    if figure.name != 'figure' or set(figure.get('class', [])) != {'table'}:
+        return False
+    tables = figure.find_all('table', recursive=False)
+    if len(tables) != 1 or len(figure.find_all(recursive=False)) != 1:
+        return False
+    table = tables[0]
+    if table.find('table') is not None or len(table.find_all('tbody')) != 1:
+        return False
+    if len(parts) == 2:
+        logo = parts[0]
+        images = logo.find_all('img') if getattr(logo, 'name', None) == 'p' else []
+        if (logo.name != 'p' or logo.get_text(strip=True) or len(images) != 1
+                or len(logo.find_all()) != 1 or images[0].get('alt', '') != ''
+                or images[0].get('src') != 'https://fsv.cmoney.tw/cmstatic/notes/content/36746/20190620081239291.Jpeg'):
+            return False
+    allowed = {'table', 'tbody', 'tr', 'td', 'p', 'span', 'strong'}
+    nodes = table.find_all(limit=81)
+    if len(nodes) > 80 or any(node.name not in allowed for node in nodes):
+        return False
+    parents = {'tbody': {'table'}, 'tr': {'tbody'}, 'td': {'tr'}, 'p': {'td'},
+               'span': {'p', 'span', 'strong'}, 'strong': {'p', 'span', 'strong'}}
+    if any(node.parent.name not in parents[node.name] for node in nodes):
+        return False
+    rows = table.select(':scope > tbody > tr')
+    if len(rows) != 2 or len(table.find_all('tr')) != 2 or len(table.find_all('td')) != 2:
+        return False
+    cells = [row.find_all('td', recursive=False) for row in rows]
+    if any(len(group) != 1 for group in cells):
+        return False
+    label, prose = cells[0][0], cells[1][0]
+    paragraphs = prose.find_all('p', recursive=False)
+    texts = [node.get_text('', strip=True) for node in paragraphs]
+    if (label.get_text('', strip=True) != '資料公告' or not 2 <= len(paragraphs) <= 16
+            or len(paragraphs) != len(prose.find_all('p'))
+            or any(not text or not re.search(r'[\u3400-\u9fff]', text) for text in texts)
+            or not texts[-1].endswith('。')
+            or not any(text.endswith('。') for text in texts[:-1])):
+        return False
+    if any(isinstance(node, Comment) or isinstance(node, NavigableString)
+           and str(node).strip() and node.find_parent('p') is None for node in body.descendants):
+        return False
+    try:
+        for node in [scope, *scope.select('h1.articleContent__title, .articleContent__time, '
+                     '.articleContent__content--main > div:first-child > .flex.items-center > a[href]'),
+                     body, *body.find_all(limit=100)]:
+            _visible(node)
+            if any(set(n.get('class', [])) & {'hidden', 'invisible', 'd-none', 'sr-only'}
+                   for n in (node, *node.parents) if getattr(n, 'attrs', None)):
+                return False
+    except NewsError:
+        return False
+    return True
+
+
 def cmnews_visible_article(soup, *, page_url):
     """Match public SSR identity; hydration/related stories never supply text.
 
@@ -3868,6 +3945,8 @@ def cmnews_visible_article(soup, *, page_url):
             continue
     if len(set(matched)) == 1:
         result["datePublished"], result["dateModified"] = matched[0]
+    result['_cmnews_short_table_announcement_verified'] = _cmnews_short_table_announcement(
+        scope, bodies[0], result, profile=profile, visible_clock_verified=clock_parts is not None)
     # CMNews's editor wraps data tables in <figure class="table">. The
     # generic cleaner intentionally excludes image/byline figures, but that
     # default deleted the entire public announcement table. Unwrap only an

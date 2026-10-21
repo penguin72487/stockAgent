@@ -92,3 +92,30 @@ def test_legacy_heartbeat_does_not_infer_stored_bodies_from_complete_states(tmp_
     assert result['snapshot_consistent'] and result['provider_stored_body_counter_contract_version'] is None
     assert all(p['stored_body_urls'] is None and not p['stored_body_counter_available'] for p in result['providers'])
     assert all(secret not in json.dumps(result) for secret in ('PRIVATE_BODY', 'PRIVATE_TOKEN', str(tmp_path)))
+
+
+def test_redirect_failure_is_named_repair_work_not_unknown_missing_or_retained_body_loss(tmp_path):
+    status = _seed(tmp_path)
+    status['provider_stored_body_counter_contract_version'] = 1
+    status['provider_body_state_counter_contract_version'] = 1
+    source = status['providers']['cnyes']
+    source.update(states={'complete': 2, 'redirect_not_article': 4}, stored_body_urls=3,
+        body_state_counts={'missing': {'redirect_not_article': 3},
+                           'stored': {'complete': 2, 'redirect_not_article': 1}})
+    status['providers']['unregistered:example.org'].update(stored_body_urls=0,
+        body_state_counts={'missing': {'awaiting_authorization': 4}, 'stored': {}})
+    status.update(states={'complete': 2, 'redirect_not_article': 4, 'awaiting_authorization': 4},
+                  articles_with_stored_body=3)
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['snapshot_consistent']
+    assert result['outcome_progress']['contract_version'] == 3
+    row = next(item for item in result['providers'] if item['id'] == 'cnyes')
+    assert row['states'] == {'complete': 2, 'redirect_not_article': 4}
+    assert row['stored_body_urls'] == 3 and row['complete_urls'] == 2
+    coverage = row['body_coverage']
+    assert coverage['missing_body_urls'] == 3 and coverage['stored_body_urls'] == 3
+    assert coverage['missing_body_outcomes']['categories']['repair_required'] == 3
+    assert coverage['retained_body_outcomes']['categories']['repair_required'] == 1
+    assert result['outcome_progress']['categories']['unknown_outcome'] == 0
+    assert row['conditional_eta_seconds'] is None and not coverage['all_history_complete']

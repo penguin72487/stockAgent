@@ -1,0 +1,64 @@
+# Fresh policies isolate objective units from the actual optimizer direction.
+# Validation selects pure net log utility; 2026 remains retrospective diagnosis.
+base_spec: tw_scratch_strategy_20261017_v9.yaml
+output_root: artifacts/markets/tw_scratch_gradient_geometry_20261019_v1
+matrix:
+  include_baseline: false
+  base_overrides:
+    training:
+      financial_transformer:
+        portfolio_output_mode: score_entmax_scale_separated_cash_v2
+  dimensions:
+    - name: geometry
+      enabled: true
+      variants:
+        - name: unit_mgda_adamw
+          description: Unit global parameter-gradient norms remove objective-unit preference.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_l2_parameter
+        - name: raw_mgda_adamw
+          description: Matched raw-unit AdamW control, fresh initialization on the same source.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+        - name: raw_mgda_sgd
+          description: Plain SGD removes momentum and adaptive-coordinate rotation; zero decay.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_parameter
+              optimizer_name: sgd
+              optimizer_options: {momentum: 0.0, dampening: 0.0, nesterov: false}
+              learning_rate: 0.03
+              weight_decay: 0.0
+        - name: unit_mgda_sgd
+          description: Unit task directions plus plain SGD; compare all four raw directional derivatives.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_l2_parameter
+              optimizer_name: sgd
+              optimizer_options: {momentum: 0.0, dampening: 0.0, nesterov: false}
+              learning_rate: 0.03
+              weight_decay: 0.0
+        - name: unit_mgda_sgd_step
+          description: Larger scalar step without changing the combined direction.
+          overrides:
+            training:
+              loss_type: trajectory_mgda_l2_parameter
+              optimizer_name: sgd
+              optimizer_options: {momentum: 0.0, dampening: 0.0, nesterov: false}
+              learning_rate: 0.1
+              weight_decay: 0.0
+        - name: log_adamw_small_step
+          description: Single simple log utility, analytic entmax VJP, smaller adaptive step.
+          overrides:
+            training:
+              loss_type: log_utility
+              learning_rate: 0.00003
+        - name: recent4_unit_mgda
+          description: Test unit directions on the previously less divergent recent-four-year split.
+          overrides:
+            walk_forward:
+              split_start_year: 2021
+            training:
+              loss_type: trajectory_mgda_l2_parameter

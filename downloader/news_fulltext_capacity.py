@@ -44,6 +44,8 @@ DEFAULTS = {
 WORKLOADS = frozenset({"cnyes_bulk", "rss_fulltext", "wordpress_posts", "article_pdf", "article_html", "unclassified", "mixed", "metadata"})
 MEASUREMENT_CONTRACT_VERSION = 11
 TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION = 3
+COMPLETION_OBSERVATION_CONTRACT_VERSION = 1
+COMPLETION_OBSERVATION_SECONDS = 45
 
 
 def _valid_candidate(candidate, maximum):
@@ -210,6 +212,11 @@ class PublisherCapacity:
             focus_identity = {'private_failure_evidence_focus_contract': focus_version,
                               'private_failure_evidence_focus_manifest_sha256': fingerprint(config['failure_diagnostic_focus'])}
         self.states, self.baselines = {}, {}
+        # ETA observes completed work on a fixed clock, independently of rate
+        # experiments. A slow source/error-budget trial can take ten minutes;
+        # that must not suppress current progress or discard failure/wait time.
+        # Never restore these counters/windows into a different owner.
+        self.completion_baselines, self.completion_observations = {}, {}
         self.last_tick = -math.inf
         self.fingerprint = hashlib.sha256(json.dumps({
             "version": 1, "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION, "policy": self.policy,
@@ -222,12 +229,14 @@ class PublisherCapacity:
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "stored_body_retry_burst": config.get('stored_body_retry_burst', 8),
             "cnyes_unknown_body_recheck_contract_version": CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
-            "providers": {p: {"source": s.http_capacity_source_fingerprint or s.data_fingerprint, "authorization": s.authorization_fingerprint,
+            "providers": {p: {"source": s.http_capacity_source_fingerprint or s.data_fingerprint,
+                               "authorization": s.http_capacity_authorization_fingerprint or s.authorization_fingerprint,
                                "maximum_parallelism": http.maximum_parallelism[p]}
                           for p, s in http.registry.sources.items() if s.request_enabled},
         }, sort_keys=True).encode()).hexdigest()
         self.provider_fingerprints = {p: hashlib.sha256(json.dumps({"measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
-            "policy": self.policy, "source": s.http_capacity_source_fingerprint or s.data_fingerprint, "authorization": s.authorization_fingerprint,
+            "policy": self.policy, "source": s.http_capacity_source_fingerprint or s.data_fingerprint,
+            "authorization": s.http_capacity_authorization_fingerprint or s.authorization_fingerprint,
             "article_recheck_day_contract_version": ARTICLE_RECHECK_DAY_CONTRACT_VERSION,
             "article_dispatch_contract_version": ARTICLE_DISPATCH_CONTRACT_VERSION,
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
@@ -272,6 +281,7 @@ class PublisherCapacity:
                          "state": "warming", "history": [], "best": None, "plateaus": 0,
                          "stable_samples": 0, "next_search_epoch": 0}
             self.states[provider] = state
+            state.pop('completion_observation', None)  # Reporting windows are owner-local, never resumed.
             # A new owner has a new observation baseline. Never carry an
             # unverified partial recovery streak across that discontinuity.
             state["transport_stable_samples"] = 0
@@ -299,10 +309,18 @@ class PublisherCapacity:
                      if for_status else deepcopy(self.states))
         result = {"version": 1, "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION, "fingerprint": self.fingerprint,
                 "completion_window_owner_contract_version": 1,
+                "completion_observation_contract_version": COMPLETION_OBSERVATION_CONTRACT_VERSION,
                 "transport_resume_selection_contract_version": TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION,
                 "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
                 "clock_basis": "independent publisher windows, including validation/fsync and waits; no fabricated source quota",
                 "providers": providers, "official_maximum_claimed": False}
+        for provider, state in providers.items():
+            observation = self.completion_observations.get(provider, {'history': [], 'last_window': None})
+            state['completion_observation'] = {
+                'history': deepcopy(observation['history'][-CAPACITY_STATUS_HISTORY_LIMIT:]
+                                    if for_status else observation['history']),
+                'last_window': deepcopy(observation['last_window']),
+            }
         if for_status:
             result['heartbeat_projection'] = {
                 'contract_version': 1, 'history_limit': CAPACITY_STATUS_HISTORY_LIMIT,
@@ -312,6 +330,33 @@ class PublisherCapacity:
                                            for provider, state in self.states.items()},
             }
         return result
+
+    def _observe_completion(self, observations, now, owner):
+        """Fixed, consecutive owner-local counter deltas, not health samples.
+
+        Only independent durable URL heads count. Cached replay, revisions and
+        in-flight requests are not acquired heads; zero progress and all waits
+        remain in the denominator. Calibration resets never reset this clock.
+        """
+        ended = self.epoch()
+        for provider in self.states:
+            counts = observations.get(provider, {}).get('counts', {})
+            heads = max(0, counts.get('durably_accepted_new_url_heads', 0)
+                        - counts.get('durably_accepted_cached_new_url_heads', 0))
+            baseline = self.completion_baselines.get(provider)
+            if baseline is None or baseline[0] != owner or heads < baseline[2]:
+                self.completion_baselines[provider] = (owner, now, heads)
+                self.completion_observations[provider] = {'history': [], 'last_window': None}
+                continue
+            wall = now - baseline[1]
+            if wall < COMPLETION_OBSERVATION_SECONDS:
+                continue
+            sample = {'owner_id': owner, 'ended_at_epoch': ended, 'wall_seconds': wall,
+                      'new_stored_url_heads': heads - baseline[2]}
+            observation = self.completion_observations[provider]
+            observation['last_window'] = sample
+            observation['history'] = (observation['history'] + [sample])[-128:]
+            self.completion_baselines[provider] = (owner, now, heads)
 
     def _reset(self, provider, metrics, now):
         self.baselines[provider] = (now, deepcopy(metrics.get("counts", {})))
@@ -344,7 +389,11 @@ class PublisherCapacity:
         if not force and now - self.last_tick < 1:
             return
         self.last_tick = now
-        observations = self.http.metrics.snapshot().get("providers", {})
+        measured = self.http.metrics.snapshot()
+        observations = measured.get("providers", {})
+        self._observe_completion(observations, now, measured.get('owner_id'))
+        # Reporting is already persisted by the normal status heartbeat. It
+        # does not require an additional whole calibration-file write/fsync.
         changed = False
         for provider, item in self.states.items():
             observed = observations.get(provider, {})

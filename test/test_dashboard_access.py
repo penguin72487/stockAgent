@@ -6,8 +6,8 @@ import threading
 
 import pytest
 
-from stockagent.live.dashboard_access import permitted_path, project_html
-from stockagent.live.public_dashboards import sanitize_tw_positions, sanitize_tw_status
+from stockagent.live.dashboard_access import access_description, permitted_path, project_html
+from stockagent.live.public_dashboards import sanitize_member_dashboard_payload, sanitize_tw_positions, sanitize_tw_status
 from scripts import serve_public_dashboards as gateway
 
 
@@ -58,7 +58,40 @@ def test_html_projection_removes_private_cards_before_delivery_and_does_not_muta
         assert b'href="' + slug + b'"' in owner
     assert public.count(b'class="dashboard-card ') == 2
     assert owner.count(b'class="dashboard-card ') == 11
-    assert b'dashboard-core.js?v=access-v1' in public
+    assert b'dashboard-core.js?v=access-v2' in public
+
+
+def test_member_sees_all_page_shells_without_claiming_owner_prices():
+    html = (Path(__file__).resolve().parents[1] / "services/public_dashboards/index.html").read_bytes()
+    member = project_html(html, audience="member")
+    assert b'content="member"' in member
+    assert member.count(b'class="dashboard-card ') == 11
+    assert access_description(audience="member") == {
+        "schema_version": 1, "audience": "member", "pages": "all", "private_prices": False}
+    for path in ["/news/", "/tej/", "/finlab/api/status", "/traffic/app.js"]:
+        assert permitted_path(path, audience="member")
+
+
+@pytest.mark.parametrize("path", ["/news/", "/tej/", "/finlab/", "/finmind/", "/traffic/",
+                                  "/data-monitor/", "/shioaji/", "/taifex/", "/openbb/"])
+def test_member_can_read_all_registered_page_shells(path):
+    with listener("member") as (_, conn):
+        conn.request("GET", path)
+        response = conn.getresponse()
+        assert response.status == 200
+        assert response.getheader("X-StockAgent-Audience") == "member"
+        assert response.getheader("Cache-Control") == "private, no-store"
+        assert b'content="member"' in response.read()
+
+
+def test_member_provider_payload_keeps_metadata_but_drops_raw_quotes_and_secrets():
+    raw = {"summary": {"fields": 42}, "quote": {"symbol": "2330", "last_mark_price": 123.456789},
+           "api_key": "do-not-publish", "private_prices": True}
+    result = sanitize_member_dashboard_payload(raw)
+    assert result["summary"] == {"fields": 42}
+    assert result["quote"]["last_mark_price"] is None
+    assert "do-not-publish" not in json.dumps(result)
+    assert raw["quote"]["last_mark_price"] == 123.456789
 
 
 def test_private_quotes_require_server_argument_and_keep_credential_redaction_and_source_precision():
@@ -106,6 +139,37 @@ def test_both_http_audiences_separate_quotes_cache_validators_and_ignore_identit
         assert pub._cache is not own._cache
 
 
+def test_member_quotes_match_public_policy_and_cannot_validate_owner_cache(monkeypatch):
+    raw = {"simulation_only": True, "production_order_possible": False,
+           "rows": [{"symbol": "2330", "market": "paper", "last_mark_price": 123.456789}],
+           "offset": 0, "limit": 1, "returned": 1, "total": 1, "has_more": False}
+    monkeypatch.setattr(gateway, "build_dashboard_position_page", lambda **kwargs: raw)
+    with listener("owner") as (owner, oc), listener("member") as (member, mc), listener("public") as (public, pc):
+        for server in (owner, member, public):
+            server.content_token = lambda *args, **kwargs: "fixed-revision"
+        path = "/tw-day-trade/api/positions?limit=1"
+        bodies, etags = {}, {}
+        for audience, conn in [("owner", oc), ("member", mc), ("public", pc)]:
+            conn.request("GET", path, headers={"X-WireGuard-Role": "owner", "X-StockAgent-Audience": "owner"})
+            response = conn.getresponse()
+            assert response.status == 200
+            bodies[audience] = json.loads(response.read())
+            etags[audience] = response.getheader("ETag")
+        assert bodies["owner"]["rows"][0]["last_mark_price"] == 123.456789
+        assert bodies["member"] == bodies["public"]
+        assert bodies["member"]["rows"][0]["last_mark_price"] is None
+        assert len(set(etags.values())) == 3
+        mc.request("GET", path, headers={"If-None-Match": etags["owner"]})
+        response = mc.getresponse()
+        assert response.status == 200
+        assert response.getheader("Cache-Control") == "private, no-store"
+        assert json.loads(response.read())["rows"][0]["last_mark_price"] is None
+        mc.request("GET", "/api/access", headers={"X-WireGuard-Role": "owner"})
+        response = mc.getresponse()
+        assert json.loads(response.read())["private_prices"] is False
+        assert member._cache is not owner._cache and member._cache is not public._cache
+
+
 def test_public_overview_never_reads_private_provider_sources(monkeypatch):
     monkeypatch.setattr(gateway, 'build_compact_tw_overview_status',
                         lambda *args, **kwargs: {'health': 'active', 'modes': [], 'source_age_seconds': 1})
@@ -123,9 +187,10 @@ def test_public_overview_never_reads_private_provider_sources(monkeypatch):
         assert access['audience'] == 'public' and access['private_prices'] is False
 
 
-def test_owner_listener_refuses_public_bind_before_opening_socket():
+@pytest.mark.parametrize("audience", ["owner", "member"])
+def test_owner_listener_refuses_public_bind_before_opening_socket(audience):
     with pytest.raises(ValueError, match='loopback-only'):
-        gateway.PublicDashboardServer(('0.0.0.0', 0), audience='owner',
+        gateway.PublicDashboardServer(('0.0.0.0', 0), audience=audience,
             public_static_root=Path('.'), taifex_static_root=Path('.'), tw_static_root=Path('.'),
             shioaji_static_root=Path('.'), openbb_static_root=Path('.'),
             data_monitor_static_root=Path('.'), traffic_static_root=Path('.'), repo_root=Path('.'),

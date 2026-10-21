@@ -211,19 +211,20 @@ class HttpClient:
                     }
             except HTTPError as exc:
                 last_error = exc
-                if (
-                    exc.code in {408, 429, 500, 502, 503, 504}
-                    and attempt < self.max_retries
-                ):
-                    limiter.defer(
-                        retry_delay_seconds(
-                            attempt,
-                            base=self.retry_base,
-                            retry_after=exc.headers.get("Retry-After"),
+                try:
+                    if exc.code in {408, 429, 500, 502, 503, 504}:
+                        limiter.defer(
+                            retry_delay_seconds(
+                                attempt,
+                                base=self.retry_base,
+                                retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+                            )
                         )
-                    )
-                    continue
-                detail = exc.read().decode("utf-8", errors="replace")[:400]
+                        if attempt < self.max_retries:
+                            continue
+                    detail = exc.read(4096).decode("utf-8", errors="replace")[:400]
+                finally:
+                    exc.close()
                 raise HttpStatusError(exc.code, url, detail) from exc
             except (URLError, TimeoutError, RemoteDisconnected, ConnectionResetError) as exc:
                 last_error = exc

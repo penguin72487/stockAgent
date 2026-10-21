@@ -28,7 +28,8 @@ SCHEDULER_REASONS = frozenset({'desktop_interface_recovery_required', 'inflight_
     'source_capacity_requires_review',
     'list_selection_prequery_needs_review', 'query_activation_prequery_needs_review',
     'source_binding_prequery_needs_review', 'query_preparation_prequery_needs_review',
-    'metadata_preparation_requires_recovery','metadata_retry_scheduled'})
+    'metadata_preparation_requires_recovery','metadata_retry_scheduled',
+    'source_company_labels_absent_fragment'})
 METHOD = "Smart Wizard 查詢可能沿用最近一期。v4 另驗證公司／日期介面可用及無錯誤視窗；保存的是來源顯示字串，不是 Excel 底層精度、原生歷史或發布時點證明。舊範圍需重新驗證。"
 TABLE_COLUMNS = ("table_id", "smart_id", "name", "category", "phase", "frequency", "state",
                  "universe_count", "grid_dates", "grid_rows", "last_error_code",
@@ -48,13 +49,9 @@ def _read(root: Path) -> sqlite3.Connection:
 
 
 def _json(path: Path) -> dict:
-    try:
-        with path.open("rb") as stream:
-            body = stream.read(65537)
-        value = json.loads(body) if len(body) <= 65536 else {}
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    value = read_json_snapshot(path, max_bytes=65536)
+    return value if isinstance(value, dict) else {}
 
 
 def _stamp(value: Any) -> datetime | None:
@@ -304,17 +301,44 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
                 "k.kind,k.last_error_code,k.attempted_at_utc FROM tasks k JOIN tables t ON t.table_id=k.table_id "
                 "WHERE k.state='blocked'" + current_scope + " ORDER BY k.priority,k.task_id LIMIT 20")]
             retry_windows = {}
+            company_deferrals = {r['table_id']:dict(r) for r in con.execute(
+                "SELECT table_id,MIN(task_id) AS task_id,COUNT(*) AS tasks,MIN(next_attempt_at_utc) AS next_attempt_at_utc FROM tasks "
+                "WHERE kind='download' AND state='pending' AND last_error_code='source_company_labels_absent_fragment'"
+                +current_scope+" GROUP BY table_id")}
             if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='desktop_retry_windows'").fetchone():
                 for row in con.execute("SELECT r.table_id,r.task_id,t.name AS table_name,r.consecutive_failures,"
                         "r.next_attempt_at_utc,r.error_code,k.state AS task_state FROM desktop_retry_windows r "
                         "JOIN tasks k ON k.task_id=r.task_id JOIN tables t ON t.table_id=r.table_id "
                         "WHERE k.state IN ('pending','running') ORDER BY r.next_attempt_at_utc,r.table_id"):
                     record=dict(row)
+                    record['retry_scope']=('company_fragment' if
+                        record['error_code']=='source_company_labels_absent_fragment' else 'table')
+                    record['deferred_tasks']=(company_deferrals.get(record['table_id'],{}).get('tasks',0)
+                        if record['retry_scope']=='company_fragment' else int(record['task_state']=='pending'))
+                    if record['retry_scope']=='company_fragment' and record['deferred_tasks']:
+                        record['next_attempt_at_utc']=company_deferrals[record['table_id']]['next_attempt_at_utc']
                     if record['error_code'] not in SCHEDULER_REASONS:
                         record['error_code']='unclassified_requires_review'
                     due=_stamp(record['next_attempt_at_utc'])
                     record['retry_after_seconds']=max(0,(due-observed).total_seconds()) if due else None
                     retry_windows[record['table_id']]=record
+            # The legacy table window owns only its last retry fragment. Its
+            # completion must not make other still-pending company scopes
+            # disappear from the monitor. The queue, not a status file, owns
+            # their count and due time; no source values or audit files read.
+            table_names={t['table_id']:t['name'] for t in tables}
+            for identifier,deferred in company_deferrals.items():
+                if identifier in retry_windows:
+                    continue
+                due=_stamp(deferred['next_attempt_at_utc'])
+                retry_windows[identifier]={
+                    'table_id':identifier,'task_id':deferred['task_id'],
+                    'table_name':table_names[identifier],'consecutive_failures':None,
+                    'next_attempt_at_utc':deferred['next_attempt_at_utc'],
+                    'error_code':'source_company_labels_absent_fragment','task_state':'pending',
+                    'retry_scope':'company_fragment','deferred_tasks':deferred['tasks'],
+                    'retry_after_seconds':max(0,(due-observed).total_seconds()) if due else None,
+                }
     except (sqlite3.Error, OSError, ValueError):
         return {**base, "state": "metadata_unavailable", "catalog": {"tables": None, "fields": None}}
     grouped: dict[str, list[dict]] = {}
@@ -369,8 +393,10 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         table["blocked_tasks"] = sum(w["tasks"] for w in work if w["state"] == "blocked")
         table["running_tasks"] = sum(w["tasks"] for w in work if w["state"] == "running")
         table['local_retry_window']=retry_windows.get(identifier)
-        table['deferred_tasks']=int(bool(table['local_retry_window'] and
-                                       table['local_retry_window']['task_state']=='pending'))
+        table['deferred_tasks']=int(table['local_retry_window']['deferred_tasks'] if table['local_retry_window'] else 0)
+        partial_company_retry=bool(table['local_retry_window'] and
+            table['local_retry_window']['retry_scope']=='company_fragment' and
+            table['remaining_download_queries']>table['deferred_tasks'])
         table["active_work_kind"] = next((w['kind'] for w in work if w['state']=='running'),None)
         table["exported_rows"] = sum(w["exported_rows"] or 0 for w in downloads if w["state"] == "complete")
         table["resolved_grid_rows"] = sum(w["target_rows"] or 0 for w in downloads if w["state"] == "complete")
@@ -382,6 +408,7 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
         checked = bool(table["grid_rows"] and downloads and not unfinished and table["resolved_grid_rows"] == table["grid_rows"])
         table["state"] = ("needs_review" if table["blocked_tasks"] else "running" if table["running_tasks"] and alive else
                           "stalled_requires_recovery" if table["running_tasks"] else
+                          "backfilling_with_deferred_companies" if partial_company_retry else
                           "waiting_local_retry" if table['deferred_tasks'] else
                           "query_grid_exported" if checked and table["exported_rows"] == table["grid_rows"] else
                           "query_scope_checked" if checked else table["state"])
@@ -472,8 +499,8 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
                          'last_successful_download': latest,
                          'current_task': _current_task_public(root, current, worker, alive, observed),
                          'blocked_tasks': blocked, 'blocked_tasks_total': totals['blocked_tasks'],
-                         'deferred_tasks': [r for r in retry_windows.values() if r['task_state']=='pending'][:20],
-                         'deferred_tasks_total': sum(r['task_state']=='pending' for r in retry_windows.values()),
+                         'deferred_tasks': [r for r in retry_windows.values() if r['deferred_tasks']>0][:20],
+                         'deferred_tasks_total': sum(r['deferred_tasks'] for r in retry_windows.values()),
                          'completion_revision': f"{latest['task_id'] if latest else ''}:{completed_downloads}:"
                              f"{completed_discoveries}:{totals['exported_non_null_cells']}:{total_features}"},
             "catalog": {"tables": len(tables), "fields": total_features, "types_scanned": len(catalog_proof.get("types_verified_complete", [])) or None,

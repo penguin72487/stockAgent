@@ -4,6 +4,7 @@ import fcntl
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,60 @@ def test_supervisor_rejects_invalid_idle_monitor_interval_before_download() -> N
 
     assert result.returncode == 2
     assert "OPENBB_IDLE_FULL_MONITOR_INTERVAL_SECONDS" in result.stderr
+
+
+def _monitor_functions() -> str:
+    source = SUPERVISOR.read_text()
+    return source[source.index('monitor_pid=""'):source.index("refresh_watchdog_state()")]
+
+
+def test_background_full_monitor_does_not_block_or_duplicate_watchdog(tmp_path) -> None:
+    # Execute the maintained shell functions against a bounded local fixture;
+    # no real downloader, API, archive or systemd owner is started.
+    script = tmp_path / "scripts" / "monitor_openbb_archive.py"
+    script.parent.mkdir()
+    script.write_text("import time\ntime.sleep(0.6)\n")
+    command = _monitor_functions() + """
+start_snapshot_monitor
+first_pid="$monitor_pid"
+if start_snapshot_monitor; then exit 11; fi
+if poll_snapshot_monitor; then exit 12; fi
+[[ "$monitor_pid" == "$first_pid" ]] || exit 13
+printf 'watchdog-not-blocked\\n'
+wait "$monitor_pid" || exit 14
+poll_snapshot_monitor || exit 15
+[[ -z "$monitor_pid" && "$snapshot_monitor_rc" == 0 ]] || exit 16
+"""
+    env = os.environ | {"python_bin": sys.executable, "output_dir": str(tmp_path),
+                        "full_monitor_timeout": "5"}
+    result = subprocess.run(["bash", "-euc", command], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "watchdog-not-blocked" in result.stdout
+
+
+def test_background_monitor_timeout_is_reaped_and_terminal_check_is_fresh(tmp_path) -> None:
+    script = tmp_path / "scripts" / "monitor_openbb_archive.py"
+    script.parent.mkdir()
+    script.write_text("from pathlib import Path\nimport sys,time\n"
+                      "stamp=Path('invocations.txt')\n"
+                      "stamp.write_text(stamp.read_text()+'x' if stamp.exists() else 'x')\n"
+                      "time.sleep(2) if len(stamp.read_text()) == 1 else None\n")
+    command = _monitor_functions() + """
+start_snapshot_monitor
+wait "$monitor_pid" || true
+poll_snapshot_monitor || exit 11
+[[ "$snapshot_monitor_rc" == 124 && -z "$monitor_pid" ]] || exit 12
+# A post-exit gate must start a fresh invocation even after a background pass.
+run_snapshot_monitor || exit 13
+[[ -z "$monitor_pid" ]] || exit 14
+"""
+    env = os.environ | {"python_bin": sys.executable, "output_dir": str(tmp_path),
+                        "full_monitor_timeout": "1"}
+    result = subprocess.run(["bash", "-euc", command], cwd=tmp_path, env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "invocations.txt").read_text() == "xx"
 
 
 def test_user_entry_rejects_start_date_override() -> None:

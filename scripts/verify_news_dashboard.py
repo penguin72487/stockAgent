@@ -78,10 +78,51 @@ def original_source_inventory_check(status):
     return {'summary': summary, 'metadata_only_source_keys': len(metadata_only)}
 
 
+def routing_work_check(work):
+    """A separate host-unit baseline, never an article count or link ETA."""
+    assert work and work['contract_version'] == 1 and work['snapshot_consistent'] is True
+    total, completed, pending = (work[k] for k in ('known_hosts', 'completed_hosts', 'pending_hosts'))
+    assert all(type(v) is int and v >= 0 for v in (total, completed, pending))
+    assert completed + pending == total
+    assert work['completion_proven'] is (pending == 0)
+    assert work['state'] == (('empty' if not total else 'complete') if not pending else 'pending')
+    assert work['host_progress_ratio'] == (completed / total if total else None)
+    assert work['conditional_eta_seconds'] is None and work['body_completion_claimed'] is False
+    assert work['publisher_requests'] == 0
+    return work
+
+
+def body_state_inventory_check(status):
+    """Conserve every provider/state/body partition on one render generation."""
+    assert status['snapshot_consistent'] and status['provider_body_state_counter_contract_version'] == 1
+    total = status['body_coverage']
+    assert total and total['contract_version'] == 1
+    fields = ('missing_body_urls', 'stored_body_urls', 'queued_missing_body_urls',
+              'queued_stored_body_recheck_urls', 'retained_body_noncomplete_urls')
+    for source in status['providers']:
+        joint = source['body_coverage']
+        assert joint and joint['retained_bodies_are_not_missing'] and not joint['all_history_complete']
+        assert joint['missing_body_urls'] + joint['stored_body_urls'] == source['known_urls']
+        assert joint['stored_body_urls'] == source['stored_body_urls']
+        assert sum(joint['missing_body_states'].values()) == joint['missing_body_urls']
+        assert sum(joint['retained_body_states'].values()) == joint['stored_body_urls']
+        for state, count in source['states'].items():
+            assert joint['missing_body_states'].get(state, 0) + joint['retained_body_states'].get(state, 0) == count
+        for group, count in source['outcome_progress']['categories'].items():
+            assert joint['missing_body_outcomes']['categories'][group] + joint['retained_body_outcomes']['categories'][group] == count
+        assert source['conditional_eta_scope'] == 'queued_missing_body_urls'
+    assert total['missing_body_urls'] + total['stored_body_urls'] == status['acquisition']['known_urls']
+    for key in fields:
+        assert total[key] == sum(source['body_coverage'][key] for source in status['providers'])
+    return {'contract_version': 1, 'accepted': True, 'provider_keys': len(status['providers']),
+            **{key: total[key] for key in fields}, 'publisher_requests': 0}
+
+
 def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
            required_api_setup_providers: tuple[str, ...] = (), require_original_url_progress: bool = False,
+           require_original_routing_progress: bool = False,
            require_source_reviews: bool = False, require_original_source_inventory: bool = False,
-           require_cnyes_list_progress: bool = False) -> dict:
+           require_cnyes_list_progress: bool = False, require_body_state_partition: bool = False) -> dict:
     from playwright.sync_api import expect, sync_playwright
 
     output.mkdir(parents=True, exist_ok=True)
@@ -97,6 +138,8 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                 response = context.request.get(urljoin(url, "api/status"), timeout=30000)
                 assert response.status == 200
                 status = response.json()
+                if require_body_state_partition:
+                    body_state_inventory_check(status)
                 assert status["read_only"] is True
                 assert status["production_control_possible"] is False
                 assert status["scope"]["body_exported"] is False
@@ -108,6 +151,8 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                 assert status["acquisition"]["known_urls"] == sum(row["known_urls"] for row in status["providers"])
                 if require_original_source_inventory:
                     original_source_inventory_check(status)
+                if require_original_routing_progress:
+                    routing_work_check(status['original_url_resolution']['routing_work'])
                 if require_source_reviews:
                     assert status['source_policy_review_contract_version'] == 1
                     assert status['source_reviews_state'] == 'loaded'
@@ -149,7 +194,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     source_count: state.latest.providers.length,
                     known: state.latest.acquisition.known_urls,
                     stored: state.latest.acquisition.stored_body_articles,
-                    remaining: state.latest.acquisition.remaining_urls,
+                    remaining: state.latest.body_coverage?.queued_missing_body_urls ?? state.latest.acquisition.remaining_urls,
                     stored_label: document.querySelector('#body-count').textContent,
                     known_label: document.querySelector('#known-count').textContent,
                     remaining_label: document.querySelector('#remaining-count').textContent,
@@ -180,6 +225,9 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                         metadata: state.latest.original_url_resolution,
                         counts_label: document.querySelector('#original-url-count').textContent,
                         actual_progress: document.querySelector('#original-url-progress').getAttribute('value'),
+                        routing_count: document.querySelector('#original-routing-count').textContent,
+                        routing_state: document.querySelector('#original-routing-state').textContent,
+                        routing_progress: document.querySelector('#original-routing-progress').getAttribute('value'),
                         eta_label: document.querySelector('#original-url-eta').textContent,
                         document_width: document.documentElement.scrollWidth
                     })""")
@@ -192,6 +240,18 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     expected_counts = '{:,} / {:,} 筆連結'.format(metadata['examined_urls'], metadata['known_redirect_urls'])
                     assert original_checked['counts_label'] == expected_counts
                     assert abs(float(original_checked['actual_progress']) - metadata['progress_ratio']) < 1e-12
+                    routing = metadata.get('routing_work')
+                    if require_original_routing_progress or routing and routing['snapshot_consistent']:
+                        routing_work_check(routing)
+                        expected_count = '{:,} / {:,} 個主機'.format(routing['completed_hosts'], routing['known_hosts'])
+                        assert original_checked['routing_count'] == expected_count
+                        expected_state = {'pending': '基線尚未完成', 'complete': '目前基線已完成', 'empty': '無既有原站主機'}
+                        assert original_checked['routing_state'] == expected_state[routing['state']]
+                        expected = routing['host_progress_ratio']
+                        actual = original_checked['routing_progress']
+                        assert actual is None if expected is None else abs(float(actual) - expected) < 1e-12
+                        expect(page.locator('#original-routing-panel')).to_be_visible()
+                        expect(page.locator('#original-routing-panel')).to_contain_text('不是連結或正文完整率')
                     assert original_checked['document_width'] <= width
                     page.locator('#original-url-panel').screenshot(path=str(output / f'{name}-original-urls.png'), timeout=10000)
                     page.locator('#original-url-panel > summary').click(timeout=10000)
@@ -288,8 +348,23 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             source_quote_only: source.states.source_body_quote_only || 0,
                             quote_only_label_visible: card.textContent.includes('原站只提供行情片段，未取得新聞正文'),
                             body_work_progress: source.body_work_progress,
+                            fulltext_feed_inventory: source.fulltext_feed_inventory,
+                            displayed_feed_counts: Object.fromEntries([...card.querySelectorAll('[data-news-feed-count]')]
+                                .map(node => [node.dataset.newsFeedCount, node.textContent])),
+                            body_coverage: source.body_coverage,
+                            displayed_missing_body_urls: card.querySelector('[data-news-missing-body-urls]')?.textContent,
+                            displayed_queued_missing: card.querySelector('[data-news-queued-missing]')?.textContent,
+                            displayed_queued_retained: card.querySelector('[data-news-queued-retained]')?.textContent,
+                            displayed_retained_noncomplete: card.querySelector('[data-news-retained-noncomplete]')?.textContent,
                             robots_origin_policy_pause: source.robots_origin_policy_pause,
                             completion_forecast: source.completion_forecast,
+                            conditional_eta_seconds: source.conditional_eta_seconds ?? null,
+                            conditional_finish_at_utc: source.conditional_finish_at_utc ?? null,
+                            conditional_eta_scope: source.conditional_eta_scope ?? null,
+                            displayed_conditional_eta: [...card.querySelectorAll('.news-provider-note')]
+                                .find(node => node.textContent.startsWith('剩餘 '))?.textContent
+                                .split(' · ')[0].slice('剩餘 '.length),
+                            expected_conditional_eta: eta(source, state.latest),
                             displayed_forecast_rate: card.querySelector('[data-news-rate="completion"]')?.textContent,
                             expected_forecast_rate: decimal((source.completion_forecast
                                 ? source.completion_forecast.new_url_heads_per_second
@@ -305,7 +380,34 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     assert checked["displayed_counts"] == [checked["stored_heads"], checked["known_urls"]], checked
                     assert checked["displayed_ratio"] == checked["progress_ratio"], checked
                     checked['verification_role'] = role
+                    feed = checked.get('fulltext_feed_inventory')
+                    if feed is not None:
+                        assert feed['contract_version'] == 1
+                        assert feed['registration_proves_history_complete'] is False
+                        assert feed['response_pages_prove_accepted_bodies'] is False
+                        for label, key in (('roots', 'registered_root_feeds'),
+                            ('months', 'registered_monthly_feeds'), ('other', 'registered_other_historical_feeds'),
+                            ('requests', 'owner_terminal_requests'), ('pages', 'owner_200_pages'),
+                            ('unchanged', 'owner_304_pages'), ('new-bodies', 'owner_new_stored_url_heads')):
+                            value = checked['displayed_feed_counts'][label]
+                            assert (value == '—' if feed[key] is None else int(value.replace(',', '')) == feed[key])
+                        feed_detail = card.locator('[data-news-feed-provider]')
+                        feed_detail.locator('summary').click(timeout=10000)
+                        expect(feed_detail).to_have_attribute('open', '')
+                        expect(feed_detail).to_contain_text('不代表歷史已抓齊')
+                        checked['fulltext_feed_inventory_rendered'] = True
+                    if require_body_state_partition:
+                        joint = checked['body_coverage']
+                        assert joint
+                        for label, key in (('displayed_missing_body_urls', 'missing_body_urls'),
+                            ('displayed_queued_missing', 'queued_missing_body_urls'),
+                            ('displayed_queued_retained', 'queued_stored_body_recheck_urls'),
+                            ('displayed_retained_noncomplete', 'retained_body_noncomplete_urls')):
+                            assert int(checked[label].replace(',', '')) == joint[key]
                     assert checked['displayed_forecast_rate'] == checked['expected_forecast_rate'], checked
+                    # A recent measured rate can remain valid after the
+                    # dispatchable queue drains. It is not the gated ETA.
+                    assert checked['displayed_conditional_eta'] == checked['expected_conditional_eta'], checked
                     forecast = checked.get('completion_forecast')
                     if forecast:
                         assert forecast['contract_version'] == 1 and not forecast['all_history_complete']
@@ -467,9 +569,10 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                 page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card').length > 0")
                 assert page.evaluate("""() => {
                     const rows = state.latest.providers;
-                    const maximum = Math.max(...rows.map(row => row.remaining_urls || 0));
+                    const metric = row => row.body_coverage?.missing_body_urls ?? row.remaining_urls ?? 0;
+                    const maximum = Math.max(...rows.map(metric));
                     return document.querySelector('#pipeline-grid .pipeline-card small').textContent
-                        === rows.find(row => (row.remaining_urls || 0) === maximum).id;
+                        === rows.find(row => metric(row) === maximum).id;
                 }""")
                 page.locator("#source-sort").select_option("state")
                 # Exercise every page through its normal next button. This
@@ -479,6 +582,17 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     page.locator("#source-next").click(timeout=10000)
                     visited_pages += 1
                     assert visited_pages <= 500, "pagination did not converge"
+                # These tables deliberately defer rendering while collapsed.
+                # Open their existing navigation targets before inspecting
+                # rows; do not force eager rendering to satisfy the audit.
+                page.locator('a[href="#acq-quota"]').click(timeout=10000)
+                expect(page.locator('#traffic')).to_be_visible()
+                page.locator('a[href="#acq-progress"]').click(timeout=10000)
+                expect(page.locator('#capture')).to_be_visible()
+                page.wait_for_function("""() =>
+                    document.querySelectorAll('#traffic-rows tr').length === state.latest.providers.filter(s => s.configured).length
+                    && document.querySelectorAll('#stage-rows tr').length === Math.max(1, state.latest.stages.length)
+                """, timeout=10000)
                 catalog = page.evaluate("""() => ({
                     total: state.latest.providers.length,
                     page: state.page,
@@ -561,36 +675,45 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
         finally:
             browser.close()
     return {"schema_version": 1, "nontext_outcome_observation_contract_version": 1,
+            "original_routing_progress_observation_contract_version": 1,
             "state": "accepted", "generated_at_utc": datetime.now(UTC).isoformat(),
             "page": url, "browser_profile": "cpu-2d", "gpu_webgl_verified": False,
             "transport": transport, "viewports": observations,
+            **({'body_state_partition': body_state_inventory_check(status)} if require_body_state_partition else {}),
             "scope": "news read-only dashboard; not publisher history completeness or crawler repair"}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--base-url", default="https://www.penguin72487.dpdns.org/news/")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8771/news/",
+                        help="Existing loopback-only owner listener; public news access remains denied")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--require-provider", action="append", default=[], help="Enabled source ID whose displayed counts must reconcile")
     parser.add_argument("--require-api-setup-provider", action="append", default=[],
                         help="Configured, disabled API setup source; not accepted as an enabled body collector")
     parser.add_argument('--require-original-url-progress', action='store_true',
                         help='Require the separate metadata URL proof progress contract on every viewport')
+    parser.add_argument('--require-original-routing-progress', action='store_true',
+                        help='Require independent host routing counts and visible bar; never derive link or body completion')
     parser.add_argument('--require-source-reviews', action='store_true',
                         help='Verify separate review labels, clocks and native permission filter on every viewport')
     parser.add_argument('--require-original-source-inventory', action='store_true',
                         help='Reconcile all decoded original source keys and render metadata-only cards without 0/0 completion')
     parser.add_argument('--require-cnyes-list-progress', action='store_true',
                         help='Compare Anue metadata pages and historical scope counts with the same rendered source generation')
+    parser.add_argument('--require-body-state-partition', action='store_true',
+                        help='Reconcile missing bodies vs retained-body check states for every source and required rendered card')
     args = parser.parse_args()
     url = args.base_url.rstrip("/") + "/"
     try:
         result = verify(url, args.output_dir, required_providers=tuple(dict.fromkeys(args.require_provider)),
                         required_api_setup_providers=tuple(dict.fromkeys(args.require_api_setup_provider)),
                         require_original_url_progress=args.require_original_url_progress,
+                        require_original_routing_progress=args.require_original_routing_progress,
                         require_source_reviews=args.require_source_reviews,
                         require_original_source_inventory=args.require_original_source_inventory,
-                        require_cnyes_list_progress=args.require_cnyes_list_progress)
+                        require_cnyes_list_progress=args.require_cnyes_list_progress,
+                        require_body_state_partition=args.require_body_state_partition)
     except Exception as exc:
         result = {"schema_version": 1, "state": "failed", "generated_at_utc": datetime.now(UTC).isoformat(),
                   "page": url, "error_type": type(exc).__name__, "scope": "news dashboard acceptance"}

@@ -8,6 +8,7 @@ module neither copies associations nor admits features into training.
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import closing, nullcontext
 import hashlib
 import json
 import math
@@ -54,11 +55,8 @@ def routing_fingerprint(registry):
     can change target eligibility. Body selectors, pacing and API parsers cannot.
     New metadata revisions are still routed by their existing upsert path.
     """
-    inputs = [(source.provider, tuple(sorted(source.domains)), source.allowed,
-               source.authorization_fingerprint, source.article_path_pattern, source.acquisition_mode)
-              for source in sorted(registry.sources.values(), key=lambda source: source.provider)]
-    return hashlib.sha256(json.dumps(
-        [ORIGINAL_URL_ROUTING_CONTRACT_VERSION, _VERSION, inputs], separators=(',', ':')).encode()).hexdigest()
+    from downloader.news_fulltext_routing import input_fingerprint, source_inputs
+    return input_fingerprint(source_inputs(registry), _VERSION)
 
 
 def _routing_checkpoint(queue):
@@ -66,31 +64,36 @@ def _routing_checkpoint(queue):
     default = {'contract_version': ORIGINAL_URL_ROUTING_CONTRACT_VERSION,
                'routing_fingerprint': fingerprint, 'after': ''}
     progress = _read_checkpoint(queue, _ROUTING, default, _valid_routing)
-    if 'policy_fingerprint' in progress:
+    legacy = 'policy_fingerprint' in progress
+    if legacy:
         # Carry a legacy keyset position only if its entire original policy
         # is proven current. No guessed old catalog, fast-forward or "done".
         current = queue.db.execute("SELECT value FROM queue_settings WHERE key='policy_fingerprint'").fetchone()
         retained = current is not None and progress['policy_fingerprint'] == current[0]
         upgraded = {**default, 'after': progress['after'] if retained else ''}
-        with queue.db:
+    else:
+        upgraded = progress if progress['routing_fingerprint'] == fingerprint else default
+    from downloader.news_fulltext_routing import initialize_route_plan
+    with queue.db:
+        # Begin the transaction before installing/reconciling the host plan;
+        # its source inputs, cursors, migration evidence and marker are atomic.
+        queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
+                         (_ROUTING, json.dumps(upgraded, sort_keys=True)))
+        replacement = initialize_route_plan(queue, upgraded if legacy else progress, upgraded,
+                                           literal_version=_VERSION, read_checkpoint=_read_checkpoint)
+        if legacy:
             digest = hashlib.sha256(json.dumps(progress, sort_keys=True).encode()).hexdigest()
             queue.db.execute('INSERT OR IGNORE INTO queue_settings VALUES (?,?)', (
                 'original_url_routing_upgrade_v2:' + digest, json.dumps({
-                    'previous_checkpoint': progress, 'replacement_checkpoint': upgraded,
+                    'previous_checkpoint': progress, 'replacement_checkpoint': replacement,
                     'legacy_current_policy_matches': retained, 'publisher_requests': 0,
                     'article_states_deadlines_leases_or_bodies_changed': False}, sort_keys=True)))
-            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
-                             (_ROUTING, json.dumps(upgraded, sort_keys=True)))
-        return upgraded
-    if progress['routing_fingerprint'] != fingerprint:
-        progress = default
-    with queue.db:
         queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
-                         (_ROUTING, json.dumps(progress, sort_keys=True)))
-    return progress
+                         (_ROUTING, json.dumps(replacement, sort_keys=True)))
+    return replacement
 
 
-def _read_checkpoint(queue, key, default, validate):
+def _read_checkpoint(queue, key, default, validate, *, manage_transaction=True):
     """Repair only a malformed local cursor, with exact private evidence.
 
     Restarting a metadata seek reuses immutable id/version proofs. It does not
@@ -112,7 +115,7 @@ def _read_checkpoint(queue, key, default, validate):
     from downloader.news_fulltext_queue import utc_now
     encoded = raw.encode('utf-8') if isinstance(raw, str) else raw if isinstance(raw, bytes) else repr(raw).encode('utf-8')
     digest = hashlib.sha256(type(raw).__name__.encode() + b'\0' + encoded).hexdigest()
-    with queue.db:
+    with queue.db if manage_transaction else nullcontext():
         queue.db.execute('INSERT INTO original_url_checkpoint_recoveries VALUES (?,?,?,?,?,?,1) '
                          'ON CONFLICT(setting_key,original_value_sha256) DO UPDATE SET '
                          'last_recovered_at_utc=excluded.last_recovered_at_utc,recovery_events=recovery_events+1',
@@ -274,6 +277,69 @@ def _route_literal(queue, proof, metadata):
     return exists
 
 
+def seed_unfrozen_finite_originals(queue, source, *, maximum=2048):
+    """Admit a small, complete known-host snapshot before its first freeze.
+
+    A new finite publisher must not wait for a global million-alias keyset
+    pass, nor freeze after only the first alias arrives. The materialized host
+    summary selects at most ``maximum`` existing proofs using the host index;
+    native dedupe/namespace/rights/deadline rules still own every target upsert.
+    Call inside the same transaction that writes finite membership. Existing
+    immutable cohorts never call this function. No HTTP or global cursor move.
+
+    Large scopes wait for the ordinary coherent routing pass instead of
+    silently truncating membership. Missing summary tables retain fresh-queue
+    behavior; later metadata still uses its normal original-URL ingest path.
+    """
+    if type(maximum) is not int or not 1 <= maximum <= 2048:
+        raise ValueError('bounded_finite_original_seed_required')
+    if not source.allowed or source.acquisition_mode != 'finite':
+        return False
+    if queue.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='original_url_host_metrics'").fetchone() is None:
+        return True
+    hosts = []
+    for host, links in queue.db.execute('SELECT original_host,metadata_links FROM original_url_host_metrics '
+                                       'WHERE contract_version=? AND metadata_links>0', (_VERSION,)):
+        matched = queue.registry.match('https://' + host + '/')
+        if matched and matched.provider == source.provider:
+            hosts.append((host, links))
+    expected = sum(links for _, links in hosts)
+    if expected > maximum:
+        saved = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (_ROUTING,)).fetchone()
+        try:
+            progress = json.loads(saved[0]) if saved else None
+        except (ValueError, TypeError):
+            progress = None
+        return bool(_valid_routing(progress) and progress.get('routing_fingerprint') == routing_fingerprint(queue.registry)
+                    and progress['after'] == 'done')
+    proofs = []
+    for host, _ in hosts:
+        rows = queue.db.execute('SELECT r.*,a.title,a.metadata_date_raw FROM original_url_resolutions r '
+            'INDEXED BY original_url_host JOIN articles a ON a.id=r.alias_id '
+            'WHERE r.original_host=? AND r.original_host IS NOT NULL AND r.contract_version=? '
+            'AND r.outcome=\'literal_original\' ORDER BY r.alias_id LIMIT ?',
+            (host, _VERSION, maximum + 1)).fetchall()
+        proofs.extend(rows)
+        if len(proofs) > maximum:
+            raise ValueError('finite_original_seed_summary_mismatch')
+    if len(proofs) != expected:
+        raise ValueError('finite_original_seed_summary_mismatch')
+    for proof in sorted(proofs, key=lambda row: row['alias_id']):
+        _route_literal(queue, proof, {'title': proof['title'], 'metadata_date_raw': proof['metadata_date_raw']})
+    if proofs:
+        from downloader.news_fulltext_queue import utc_now
+        queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (
+            'finite_original_seed_v1:' + source.provider, json.dumps({
+                'contract_version': 1, 'observed_at_utc': utc_now(), 'provider': source.provider,
+                'source_data_fingerprint': source.data_fingerprint, 'literal_aliases': len(proofs),
+                'distinct_target_urls': len({p['original_id'] for p in proofs}),
+                'basis': 'complete_current_host_summary_and_indexed_literal_proofs_before_first_cohort_freeze',
+                'publisher_requests': 0, 'global_routing_cursor_changed': False,
+                'all_publisher_history_complete': False,
+            }, sort_keys=True)))
+    return True
+
+
 def resolve_original_metadata(queue, row):
     """One immutable metadata URL proof and routing, in the caller's transaction."""
     proof = queue.db.execute('SELECT * FROM original_url_resolutions WHERE contract_version=? AND alias_id=?',
@@ -347,36 +413,88 @@ def backfill_original_urls(queue, *, limit=256, max_seconds=0.04, stop=None):
 
 
 def sync_original_url_routes(queue, *, limit=256, max_seconds=0.04, stop=None):
-    """Re-evaluate retained literals only after a catalog/permission change."""
+    """Replay only host scopes whose exact routing inputs need examination."""
     _bounded_slice(limit, max_seconds)
+    if stop is not None and stop.is_set():
+        return 0
+    from downloader.news_fulltext_routing import (
+        DIRTY, FAIR_CURSOR, GEOMETRY, TABLE, advance_host, next_host, valid_host_turn,
+    )
     fingerprint = queue._original_url_routing_fingerprint
     default = {'contract_version': ORIGINAL_URL_ROUTING_CONTRACT_VERSION,
                'routing_fingerprint': fingerprint, 'after': ''}
     progress = _read_checkpoint(queue, _ROUTING, default, _valid_routing)
-    if progress.get('routing_fingerprint') != fingerprint:
+    settings = dict(queue.db.execute('SELECT key,value FROM queue_settings WHERE key IN (?,?)', (DIRTY, GEOMETRY)))
+    if (progress.get('routing_fingerprint') != fingerprint or settings.get(DIRTY) != '0'
+            or settings.get(GEOMETRY) not in {'global', 'hosts'}):
         progress = _routing_checkpoint(queue)
         queue._original_url_routing_fingerprint = progress['routing_fingerprint']
+        settings[GEOMETRY] = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (GEOMETRY,)).fetchone()[0]
     if progress['after'] == 'done':
         return 0
+    global_scan = settings[GEOMETRY] == 'global'
     started, examined = time.monotonic(), 0
-    rows = queue.db.execute('SELECT r.*,a.title,a.metadata_date_raw FROM original_url_resolutions r JOIN articles a ON a.id=r.alias_id '
-                            'WHERE r.contract_version=? AND r.alias_id>? AND r.outcome=\'literal_original\' ORDER BY r.alias_id LIMIT ?',
-                            (_VERSION, bytes.fromhex(progress['after']), limit)).fetchall()
     with queue.metrics.measure('original_url_routing'), queue.db:
+        turn = (_read_checkpoint(queue, FAIR_CURSOR, {'contract_version': 1, 'after_host': ''},
+                                 valid_host_turn, manage_transaction=False) if not global_scan else None)
+        turn_changed = False
         selected = []
-        for proof in rows:
-            if stop is not None and stop.is_set() or examined and time.monotonic() - started >= max_seconds:
+        while examined < limit:
+            if stop is not None and stop.is_set() or time.monotonic() - started >= max_seconds:
                 break
-            source = queue.registry.match(proof['original_url'])
-            if source and source.allowed:
-                # Preserve ordered per-alias metadata upserts, including
-                # duplicate targets' last nonempty title / maximum raw date.
-                # Only the redundant existence lookups are grouped.
-                queue.add_articles([{'url': proof['original_url'], 'title': proof['title'],
-                                     'date': proof['metadata_date_raw']}])
-            selected.append(proof)
-            progress['after'] = proof['alias_id'].hex()
-            examined += 1
+            count = limit - examined
+            if global_scan:
+                after = bytes.fromhex(progress['after'])
+                cursor = queue.db.execute('SELECT r.*,a.title,a.metadata_date_raw FROM original_url_resolutions r '
+                    'JOIN articles a ON a.id=r.alias_id WHERE r.contract_version=? AND r.alias_id>? '
+                    'AND r.outcome=\'literal_original\' ORDER BY r.alias_id LIMIT ?', (_VERSION, after, count))
+            else:
+                host = next_host(queue.db, _VERSION, after_host=turn['after_host'])
+                if host is None:
+                    progress['after'] = 'done'
+                    break
+                after = host['after']
+                cursor = queue.db.execute('SELECT r.*,a.title,a.metadata_date_raw FROM original_url_resolutions r '
+                    'INDEXED BY original_url_host JOIN articles a ON a.id=r.alias_id '
+                    'WHERE r.original_host=? AND r.original_host IS NOT NULL AND r.contract_version=? '
+                    'AND r.alias_id>? AND r.outcome=\'literal_original\' ORDER BY r.alias_id LIMIT ?',
+                    (host['original_host'], _VERSION, after, count))
+            consumed, exhausted = 0, False
+            # Do not materialize a whole cold join before checking the time
+            # budget. Otherwise an expensive fetchall repeatedly reads the
+            # same unconsumed suffix. Close before target updates or rollback.
+            with closing(cursor):
+                while consumed < count:
+                    if stop is not None and stop.is_set() or examined and time.monotonic() - started >= max_seconds:
+                        break
+                    proof = cursor.fetchone()
+                    if proof is None:
+                        exhausted = True
+                        break
+                    if stop is not None and stop.is_set():
+                        break
+                    source = queue.registry.match(proof['original_url'])
+                    if source and source.allowed:
+                        # Publisher targets cannot be redirector aliases. Keep
+                        # admission in alias order: last nonempty titles and
+                        # maximum metadata dates must not change with batching.
+                        queue.add_articles([{'url': proof['original_url'], 'title': proof['title'],
+                                             'date': proof['metadata_date_raw']}])
+                    selected.append(proof)
+                    after = proof['alias_id']
+                    examined += 1
+                    consumed += 1
+            if global_scan:
+                progress['after'] = 'done' if exhausted and not consumed else after.hex()
+                if exhausted and not consumed:
+                    queue.db.execute(f'UPDATE {TABLE} SET after=?,complete=1 WHERE contract_version=?', (b'', _VERSION))
+                    queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (GEOMETRY, 'hosts'))
+                break
+            elif consumed or exhausted:
+                advance_host(queue.db, _VERSION, host['original_host'], after,
+                             complete=exhausted)
+                turn['after_host'] = host['original_host']
+                turn_changed = True
         # At most 2,048 targets; stay below SQLite's conservative bind bound.
         # Missing/nonpermitted targets remain missing. This does not create
         # targets, accept bodies or copy redirect associations.
@@ -390,11 +508,47 @@ def sync_original_url_routes(queue, *, limit=256, max_seconds=0.04, stop=None):
                              'WHERE contract_version=? AND alias_id=? AND target_queued=0',
                              ((_VERSION, proof['alias_id']) for proof in selected
                               if not proof['target_queued'] and proof['original_id'] in exists))
-        if not rows:
+        if not global_scan and next_host(queue.db, _VERSION) is None:
             progress['after'] = 'done'
-        if examined or not rows:
-            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (_ROUTING, json.dumps(progress)))
+        if turn_changed:
+            # Commit turn, coverage, targets and literal associations together.
+            # A stale/corrupt turn only changes the next start position, never
+            # fast-forwards coverage or resets article/refusal/source state.
+            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
+                             (FAIR_CURSOR, json.dumps(turn, sort_keys=True)))
+        queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (_ROUTING, json.dumps(progress)))
     return examined
+
+
+def has_original_url_work(queue):
+    """Owner-only scheduling hint, not a source/body completion proof.
+
+    Decoding envelopes and applying their literal routing proofs are separate
+    passes. Do not enter a publisher/service sleep while either has work.
+    Read only small counters/markers here: the dashboard's full host-coverage
+    validation is unnecessary on every bounded metadata scheduling slice.
+    Unknown markers keep work runnable through the existing repair path.
+    """
+    total, examined = queue.db.execute(
+        "SELECT (SELECT coalesce(sum(articles),0) FROM state_metrics "
+        "WHERE provider='unregistered:news.google.com'),"
+        "(SELECT coalesce(sum(urls),0) FROM original_url_metrics WHERE contract_version=? AND urls>0)",
+        (_VERSION,)).fetchone()
+    if total > examined:
+        return True
+    from downloader.news_fulltext_routing import DIRTY, GEOMETRY
+
+    settings = dict(queue.db.execute('SELECT key,value FROM queue_settings WHERE key IN (?,?,?)',
+                                     (_ROUTING, DIRTY, GEOMETRY)))
+    try:
+        checkpoint = json.loads(settings.get(_ROUTING, 'null'))
+    except (ValueError, TypeError, UnicodeError):
+        return True
+    return not (_valid_routing(checkpoint)
+                and checkpoint.get('contract_version') == ORIGINAL_URL_ROUTING_CONTRACT_VERSION
+                and checkpoint.get('routing_fingerprint') == queue._original_url_routing_fingerprint
+                and checkpoint['after'] == 'done' and settings.get(DIRTY) == '0'
+                and settings.get(GEOMETRY) in {'global', 'hosts'})
 
 
 def original_url_progress(queue):
@@ -420,9 +574,12 @@ def original_url_progress(queue):
         checkpoint = None
     valid = _valid_routing(checkpoint)
     route_version = (checkpoint.get('contract_version', 1) if valid else None)
+    from downloader.news_fulltext_routing import route_plan_progress
+
     return {'contract_version': _VERSION, 'routing_contract_version': route_version,
             'routing_fingerprint': checkpoint.get('routing_fingerprint') if valid else None,
             'routing_checkpoint_valid': valid,
+            'routing_work': route_plan_progress(queue.db, checkpoint if valid else None, literal_version=_VERSION),
             'known_redirect_urls': total, 'examined_urls': examined,
             'remaining_urls': remaining, 'counts': dict(counts), 'errors': dict(errors),
             'literal_links_to_queued_targets': queued, 'progress_ratio': examined / total if total and examined <= total else None,

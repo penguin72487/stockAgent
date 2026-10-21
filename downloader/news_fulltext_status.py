@@ -11,8 +11,64 @@ STATUS_PROJECTION_CONTRACT_VERSION = 3
 STATUS_QUERY_TIMING_CONTRACT_VERSION = 1
 BULK_ERROR_COUNT_CONTRACT_VERSION = 1
 DISCOVERY_SUMMARY_CONTRACT_VERSION = 1
+ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION = 1
 CAPACITY_STATUS_HISTORY_LIMIT = 64
 BULK_GAP_STATUS_SAMPLE_LIMIT = 64
+
+
+def initialize_article_body_states(db):
+    """Extend the existing state counters, not a second frontier or hot scan.
+
+    A URL's latest check state and retained body are independent dimensions.
+    Seed their joint counts once under the canonical owner's lock. The column,
+    triggers, original state/byte totals and marker commit (or roll back)
+    together; later source mutations update both dimensions transactionally.
+    """
+    columns = {row[1] for row in db.execute('PRAGMA table_info(state_metrics)')}
+    marker = db.execute("SELECT value FROM queue_settings WHERE key='article_body_state_counter_version'").fetchone()
+    triggers = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' "
+        "AND name IN ('metrics_insert','metrics_update','metrics_delete')")}
+    if ('stored_body_urls' in columns and marker and marker[0] == str(ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION)
+            and triggers == {'metrics_insert', 'metrics_update', 'metrics_delete'}):
+        return
+    with db:
+        # sqlite3 does not implicitly BEGIN for DDL. A savepoint makes even a
+        # fresh connection's ALTER/trigger replacement/seed crash-atomic.
+        db.execute('SAVEPOINT news_body_state_migration')
+        if 'stored_body_urls' not in columns:
+            db.execute('ALTER TABLE state_metrics ADD COLUMN stored_body_urls INTEGER NOT NULL DEFAULT 0 '
+                       'CHECK(stored_body_urls>=0 AND stored_body_urls<=articles)')
+        for name in ('metrics_insert', 'metrics_update', 'metrics_delete'):
+            db.execute(f'DROP TRIGGER IF EXISTS {name}')
+        db.execute('''CREATE TRIGGER metrics_insert AFTER INSERT ON articles BEGIN
+            INSERT INTO state_metrics(provider,state,articles,body_bytes,stored_body_urls)
+                VALUES (NEW.provider,NEW.state,1,coalesce(NEW.body_bytes,0),NEW.body_sha256 IS NOT NULL)
+            ON CONFLICT(provider,state) DO UPDATE SET articles=articles+1,
+                body_bytes=body_bytes+excluded.body_bytes,stored_body_urls=stored_body_urls+excluded.stored_body_urls;
+            END''')
+        db.execute('''CREATE TRIGGER metrics_update AFTER UPDATE OF provider,state,body_bytes,body_sha256 ON articles
+            WHEN OLD.provider IS NOT NEW.provider OR OLD.state IS NOT NEW.state
+                OR OLD.body_bytes IS NOT NEW.body_bytes OR (OLD.body_sha256 IS NULL)!=(NEW.body_sha256 IS NULL) BEGIN
+            UPDATE state_metrics SET articles=articles-1,body_bytes=body_bytes-coalesce(OLD.body_bytes,0),
+                stored_body_urls=stored_body_urls-(OLD.body_sha256 IS NOT NULL)
+                WHERE provider=OLD.provider AND state=OLD.state;
+            INSERT INTO state_metrics(provider,state,articles,body_bytes,stored_body_urls)
+                VALUES (NEW.provider,NEW.state,1,coalesce(NEW.body_bytes,0),NEW.body_sha256 IS NOT NULL)
+            ON CONFLICT(provider,state) DO UPDATE SET articles=articles+1,
+                body_bytes=body_bytes+excluded.body_bytes,stored_body_urls=stored_body_urls+excluded.stored_body_urls;
+            END''')
+        db.execute('''CREATE TRIGGER metrics_delete AFTER DELETE ON articles BEGIN
+            UPDATE state_metrics SET articles=articles-1,body_bytes=body_bytes-coalesce(OLD.body_bytes,0),
+                stored_body_urls=stored_body_urls-(OLD.body_sha256 IS NOT NULL)
+                WHERE provider=OLD.provider AND state=OLD.state;
+            END''')
+        db.execute('DELETE FROM state_metrics')
+        db.execute('''INSERT INTO state_metrics(provider,state,articles,body_bytes,stored_body_urls)
+            SELECT provider,state,count(*),coalesce(sum(body_bytes),0),sum(body_sha256 IS NOT NULL)
+            FROM articles GROUP BY provider,state''')
+        db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_body_state_counter_version',?)",
+                   (str(ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION),))
+        db.execute('RELEASE news_body_state_migration')
 
 
 def initialize_discovery_summary(db):

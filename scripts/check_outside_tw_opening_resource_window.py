@@ -22,6 +22,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimum-runway-minutes", type=int, default=0)
     parser.add_argument("--protected-until", default="09:10")
     parser.add_argument("--official-calendar-root", type=Path, default=None)
+    parser.add_argument("--calendar-refresh", action="store_true",
+                        help="Defer redundant calendar writes during opening; allow required calendar bootstrap")
     parser.add_argument("--session-status", action="store_true",
                         help="Exit zero for a verified TW stock session; unknown weekdays are protected")
     return parser.parse_args()
@@ -95,11 +97,31 @@ def main() -> int:
         protected_until=datetime_time.fromisoformat(args.protected_until),
         official_calendar_root=args.official_calendar_root,
     )
+    if args.calendar_refresh:
+        if args.official_calendar_root is None or args.session_status:
+            raise ValueError("calendar-refresh requires its official calendar root and not session-status")
+        result = calendar_refresh_admission(result)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)
     if args.session_status:
         return 0 if result["stock_session"] else 1
     # ExecCondition exit 1 skips the service without marking the unit failed.
     return 0 if result["allowed"] else 1
+
+
+def calendar_refresh_admission(window: dict[str, object]) -> dict[str, object]:
+    """Calendar maintenance yields to opening, not missing-calendar recovery.
+
+    Keep the canonical writer lock and the official session verifier. This
+    admission is checked before AND after waiting for that lock, so a timer
+    queued before the critical window cannot become its writer at 09:00.
+    Unknown/corrupt calendars still need their original collector to bootstrap;
+    ordinary maintenance must not delay a source reader with a verified calendar.
+    """
+    verified = str(window["calendar_evidence"]).startswith("official TWSE schedule as-of")
+    bootstrap = bool(window["protected"] and not verified)
+    return {**window, "allowed": bool(window["allowed"] or bootstrap),
+            "calendar_bootstrap_required": bootstrap,
+            "policy": "verified_calendar_refresh_yields_to_opening_v1"}
 
 
 if __name__ == "__main__":

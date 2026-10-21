@@ -5,6 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from stockagent.data import partitioned_parquet as parquet_sources
 from stockagent.live.capital import CapitalScale, resolve_fold_capital_scale
 from stockagent.live.performance_contract import simple_return_frame
 
@@ -69,6 +70,8 @@ def _artifact_paths(fold_dir: str | Path, stems: list[str]) -> list[Path]:
 def _read_table(path: Path):
     import polars as pl
 
+    if path.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+        return pl.from_arrow(parquet_sources.read_table(path))
     if path.suffix.lower() == ".parquet":
         return pl.read_parquet(path)
     if path.suffix.lower() == ".csv":
@@ -83,6 +86,8 @@ def _price_history_path(price_root: str | Path | None, symbol: str) -> Path | No
     if not root.exists():
         return None
     normalized = normalize_symbol_query(symbol)
+    if not normalized:
+        return None
     candidates = []
     for value in dict.fromkeys([str(symbol or "").strip(), normalized, normalized.upper()]):
         if not value:
@@ -96,13 +101,42 @@ def _price_history_path(price_root: str | Path | None, symbol: str) -> Path | No
             ]
         )
     for path in candidates:
+        if path.suffix.lower() == ".parquet":
+            path = parquet_sources.resolve_source(path)
         if path.exists():
             return path
     for suffix in ("_features.parquet", ".parquet", "_features.csv", ".csv"):
-        matches = sorted(root.glob(f"{normalized}*{suffix}"))
+        matches = set(root.glob(f"{normalized}*{suffix}"))
+        if suffix.endswith(".parquet"):
+            matches.update(root.glob(f"{normalized}*{suffix}" + parquet_sources.MANIFEST_SUFFIX))
+        matches = sorted(parquet_sources.resolve_source(path) for path in matches)
         if matches:
             return matches[0]
     return None
+
+
+def _read_price_columns(path, candidates, *, first_only=False):
+    """One manifest snapshot for schema, projection and complete byte proof."""
+    import polars as pl
+    if path.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+        with parquet_sources.ParquetSource(path) as source:
+            available = [name for name in candidates if name in source.schema.names]
+            if first_only:
+                available = available[:1]
+            if "date" not in source.schema.names or not available:
+                return None, []
+            return pl.from_arrow(source.table(columns=["date", *available])), available
+    if path.suffix.lower() == ".parquet":
+        names = list(pl.scan_parquet(path).collect_schema().names())
+        available = [name for name in candidates if name in names]
+        if first_only:
+            available = available[:1]
+        return (pl.read_parquet(path, columns=["date", *available]), available) if "date" in names and available else (None, [])
+    frame = _read_table(path)
+    available = [name for name in candidates if name in frame.columns]
+    if first_only:
+        available = available[:1]
+    return (frame.select("date", *available), available) if "date" in frame.columns and available else (None, [])
 
 
 def _read_price_symbol_series(
@@ -118,29 +152,11 @@ def _read_price_symbol_series(
     path = _price_history_path(price_root, symbol)
     if path is None:
         return None, None, None
-    if path.suffix.lower() == ".parquet":
-        schema_names = list(pl.scan_parquet(path).collect_schema().names())
-    else:
-        schema_names = list(_read_table(path).columns)
-    if "date" not in schema_names:
+    frame, available = _read_price_columns(path,
+        [price_column] if price_column is not None else ["close", "adjclose"], first_only=True)
+    if frame is None:
         return None, None, path
-    if price_column is not None:
-        price_col = price_column if price_column in schema_names else None
-    else:
-        price_col = (
-            "close"
-            if "close" in schema_names
-            else "adjclose"
-            if "adjclose" in schema_names
-            else None
-        )
-    if price_col is None:
-        return None, None, path
-    frame = (
-        pl.read_parquet(path, columns=["date", price_col])
-        if path.suffix.lower() == ".parquet"
-        else _read_table(path).select(["date", price_col])
-    )
+    price_col = available[0]
     selected = frame.with_row_index(_ROW_INDEX_COL).select(
         [
             _date_string_expr(frequency),
@@ -148,7 +164,7 @@ def _read_price_symbol_series(
             pl.col(price_col).cast(pl.Float64, strict=False).alias(alias),
         ]
     )
-    resolved = normalize_symbol_query(path.name.removesuffix("_features.parquet").removesuffix("_features.csv").split(".")[0])
+    resolved = normalize_symbol_query(parquet_sources.logical_name(path).removesuffix("_features.parquet").removesuffix("_features.csv").split(".")[0])
     if is_bar_frequency(frequency):
         return selected.drop(_ROW_INDEX_COL), resolved or symbol, path
     return _last_daily_snapshot(selected, [alias]), resolved or symbol, path
@@ -181,25 +197,17 @@ def _read_price_history_maps_cached(
     mtime_ns: int,
     frequency: str,
     price_columns: tuple[str, ...],
+    revision: tuple = (),
 ) -> dict[str, dict[str, float]]:
     """Read several price columns once and cache only that immutable revision."""
 
-    del size, mtime_ns
+    del size, mtime_ns, revision
     import polars as pl
 
     path = Path(path_text)
-    if path.suffix.lower() == ".parquet":
-        schema_names = list(pl.scan_parquet(path).collect_schema().names())
-        available = [name for name in price_columns if name in schema_names]
-        if "date" not in schema_names or not available:
-            return {name: {} for name in price_columns}
-        frame = pl.read_parquet(path, columns=["date", *available])
-    else:
-        source = _read_table(path)
-        available = [name for name in price_columns if name in source.columns]
-        if "date" not in source.columns or not available:
-            return {name: {} for name in price_columns}
-        frame = source.select(["date", *available])
+    frame, available = _read_price_columns(path, price_columns)
+    if frame is None:
+        return {name: {} for name in price_columns}
     selected = frame.with_row_index(_ROW_INDEX_COL).select(
         [
             _date_string_expr(frequency),
@@ -235,17 +243,20 @@ def _read_price_history_maps(
     columns = tuple(dict.fromkeys(str(name) for name in price_columns if name))
     if path is None or not columns:
         return {name: {} for name in columns}, path
-    stat = path.stat()
-    return (
-        _read_price_history_maps_cached(
-            str(path.resolve()),
-            int(stat.st_size),
-            int(stat.st_mtime_ns),
-            str(frequency or "daily"),
-            columns,
-        ),
-        path,
-    )
+    from contextlib import nullcontext
+    snapshot = (parquet_sources.ParquetSource(path)
+        if path.name.endswith(parquet_sources.MANIFEST_SUFFIX) else None)
+    with snapshot if snapshot is not None else nullcontext():
+        stat = path.stat()
+        # A cached price map must not bypass proof of an immutable member.
+        revision = (tuple(snapshot.fingerprints()) if snapshot is not None else ())
+        value = _read_price_history_maps_cached(str(path.resolve()), stat.st_size, stat.st_mtime_ns,
+            str(frequency or "daily"), columns, (stat.st_dev, stat.st_ino, stat.st_ctime_ns, revision))
+        after = path.stat()
+        if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("price history changed while reading")
+        return value, path
 
 
 def _date_string_expr(frequency: str | None = "daily"):

@@ -11,6 +11,12 @@ from scripts import reload_tw_day_trade_services_if_flat as reload
 NOW = datetime(2026, 10, 15, 10, 15, tzinfo=ZoneInfo("Asia/Taipei"))
 
 
+@pytest.fixture(autouse=True)
+def no_host_deployment_state(monkeypatch):
+    from stockagent.live import service_code_release
+    monkeypatch.setattr(service_code_release, "configured_release", lambda _: None)
+
+
 def receipts():
     state = {"production_order_possible": False, "enabled_markets": ["tw_day_trade_100m"],
              "modes": {"tw_day_trade_100m": {
@@ -320,18 +326,22 @@ def test_cli_default_is_plan_not_restart(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("engine_only,code_only", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("failure", [None, "prefix_changed", "protected_changed", "not_ready", "accounting_changed",
                                     "preexisting_old_code", "preexisting_old_entrypoint", "malformed_admission",
                                     "reported_current_code", "journal_fatal", "journal_pending", "slow_prefix_check",
-                                    "code_changed_during_start"])
-def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only):
+                                    "code_changed_during_start", "pinned_changed_during_start", "pin_install_failed"])
+def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned):
     from contextlib import nullcontext
     from types import SimpleNamespace
     from scripts import audit_tw_day_trade_restart as audit
     from stockagent.live import completed_inference_cache as cache, market_config, tw_public_source_guard
     import stockagent.config as config_module
+    from stockagent.live import service_code_release
 
     state, bot, sync = receipts()
+    if pinned:
+        bot["run_id"] = bot["startup_inference_warmup"]["run_id"] = "100-old-bot"
     now = NOW.replace(hour=14) if engine_only else NOW
     if engine_only:
         state["modes"]["tw_day_trade_100m"]["positions"].clear()
@@ -355,6 +365,23 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     code_changed = [False]
     monkeypatch.setattr(cache, "implementation_identity", lambda: [{"qualified": "changed" if code_changed[0] else "implementation"}])
     expected = cache.identity_digest({"code": cache.implementation_identity()})
+    frozen_changed, installs = [False], []
+    if pinned:
+        pinned_code = cache.implementation_identity()
+        pinned_entry = cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")
+        path = tmp_path / "release.json"
+        monkeypatch.setattr(service_code_release, "DROP_IN", tmp_path / "code.conf")
+        monkeypatch.setattr(service_code_release, "configured_release", lambda _: path)
+        monkeypatch.setattr(service_code_release, "verify_frozen_source", lambda *_: {"receipt": str(path)})
+        monkeypatch.setattr(service_code_release, "namespace_identity", lambda *_: {
+            "code": pinned_code, "entrypoint": pinned_entry, "readonly_verified": True})
+        monkeypatch.setattr(service_code_release, "frozen_generation", lambda *_: (frozen_changed[0],))
+        monkeypatch.setattr(service_code_release, "verify_owner_namespace", lambda *_: {"readonly_mounts_verified": True})
+        def install(*args):
+            installs.append(args)
+            if failure == "pin_install_failed":
+                raise ValueError("invalid unit preview")
+        monkeypatch.setattr(service_code_release, "install_drop_in", install)
     bot["live_implementation_admission"] = {"code_sha256": expected,
         "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]}
     if code_only:
@@ -392,6 +419,8 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         restarts.append(command)
         if failure == "code_changed_during_start":
             code_changed[0] = True
+        if failure == "pinned_changed_during_start":
+            frozen_changed[0] = True
         bot["live_implementation_admission"] = {"code_sha256": expected,
             "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]}
         if failure != "not_ready":
@@ -399,7 +428,7 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
                 bot["engine_run_id"] = sync["engine_run_id"] = "new-engine"
                 paths[2].write_text(json.dumps(sync))
             else:
-                bot["run_id"] = bot["startup_inference_warmup"]["run_id"] = "new-bot"
+                bot["run_id"] = bot["startup_inference_warmup"]["run_id"] = "201-new-bot"
                 if code_only:
                     bot["startup_inference_warmup"].update(status="pending", markets=[])
             paths[1].write_text(json.dumps(bot))
@@ -434,16 +463,24 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     accepted = failure is None or ((failure == "accounting_changed" or preflight_mismatch) and not engine_only)
     accepted = accepted or (not code_only and failure in {"reported_current_code", "journal_fatal", "journal_pending"})
     accepted = accepted or failure == "slow_prefix_check"
+    accepted = accepted or (pinned and failure == "code_changed_during_start")
+    accepted = accepted or (not pinned and failure == "pinned_changed_during_start")
+    accepted = accepted or (failure == "pin_install_failed" and (not pinned or engine_only))
     assert reload.main() == (0 if accepted else 75)
     result = json.loads(output.read_bytes())
     if engine_only and preflight_mismatch or code_only and failure == "reported_current_code":
         assert not restarts and not result["restart_requested"]
         assert result["status"] == "blocked" and ("code admission" in result["error"] or "code drift" in result["error"])
         return
+    if pinned and not engine_only and failure == "pin_install_failed":
+        assert not restarts and not result["restart_requested"]
+        assert result["status"] == "blocked" and "unit preview" in result["error"]
+        return
     assert len(restarts) == 1 and result["restart_requested"]
     assert result["status"] == (("accepted_code_admission_only" if code_only else "accepted")
                                 if accepted else "failed_after_restart")
-    if failure == "code_changed_during_start":
+    if (failure == "code_changed_during_start" and not pinned
+            or failure == "pinned_changed_during_start" and pinned):
         assert result["error_type"] == "RuntimeError" and "code changed during startup" in result["error"]
     if accepted:
         if failure == "slow_prefix_check":
@@ -453,11 +490,14 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
             assert result["gpu_warmup_verified"] is False
             assert result["acceptance_scope"] == "loaded_code_gateway_ack_not_gpu_readiness"
         assert result["engine_restarted"] is engine_only
+        if pinned:
+            assert result["native_code_namespace"]["readonly_mounts_verified"]
+            assert len(installs) == int(not engine_only)
         assert result["inventory_restored_exactly"] is engine_only
         assert result["protected_before"] == result["protected_after"]
         if engine_only:
             assert reload.SERVICES[0] in result["protected_after"]
-            assert result["new_discord_run_id"] == "old-bot"
+            assert result["new_discord_run_id"] == ("100-old-bot" if pinned else "old-bot")
             assert result["native_warmup"]["model_cache_resident_ready"] is False
         assert audit.verify_prefix(tmp_path, {"inputs": result["ledger_inputs"]}) == result["ledger_prefixes"]
 

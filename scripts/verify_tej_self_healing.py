@@ -13,6 +13,7 @@ import sys
 from urllib.request import urlopen
 
 REPO = Path(__file__).resolve().parents[1]
+OWNER_STATUS_URL = 'http://127.0.0.1:8771/tej/api/status'
 sys.path.insert(0,str(REPO))
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT
@@ -26,6 +27,92 @@ from downloader.tej_desktop_attempts import (
     interrupted_stage_write_proof,
 )
 from scripts.audit_tej_history import audit
+
+
+def validate_boot_tasks(windows: dict, launcher_sha256: str) -> None:
+    """Registration and current relay proof are NOT a physical boot test."""
+    expected = {'StockAgent TEJ WSL Startup':('S4U',True,{'MSFT_TaskBootTrigger'}),
+                'StockAgent TEJ Desktop Recovery':('Interactive',False,{'MSFT_TaskLogonTrigger','MSFT_TaskTimeTrigger'})}
+    tasks = windows.get('tasks')
+    if not isinstance(tasks,list) or len(tasks) != len(expected):
+        raise ValueError('Both exact boot and interactive task readbacks required')
+    seen = set()
+    for task in tasks:
+        name = task.get('name')
+        if name not in expected or name in seen:
+            raise ValueError('Unique exact TEJ startup task required')
+        seen.add(name)
+        logon,service_only,triggers = expected[name]
+        actual = task.get('triggers',[])
+        if (task.get('enabled') is not True or task.get('logon_type') != logon
+                or task.get('service_only') is not service_only
+                or task.get('launcher_sha256') != launcher_sha256
+                or task.get('executor_verified') is not True
+                or task.get('multiple_instances') != 'IgnoreNew'
+                or task.get('restart_count') != 3 or task.get('restart_interval') != 'PT1M'
+                or len(actual) != len(triggers) or {t.get('type') for t in actual} != triggers
+                or any(t.get('enabled') is not True for t in actual)
+                or any(t.get('interval') != 'PT1M' for t in actual if t.get('type') == 'MSFT_TaskTimeTrigger')):
+            raise ValueError('Installed TEJ startup policy or pinned launcher differs')
+
+
+def boot_readback(root: Path) -> dict:
+    """No GUI, restart, credential or provider API access; bounded OS readback."""
+    import uuid
+    from downloader.tej_history import DesktopBridge
+    from downloader.tej_windows_transport import run_guarded_windows
+    from downloader.tej_operation_clock import source_operation_clock
+    relay = interactive_transport(root)
+    launcher_sha = digest(REPO/'scripts/start_windows_tej.ps1')
+    request = root/'requests'/('0'*24+'-'+uuid.uuid4().hex+'.json')
+    atomic_write_json(request,{'action':'readonly_tej_boot_registration_readback','provider_queries_sent':0})
+    command = r"""$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);
+$tasks=@(foreach($name in @('StockAgent TEJ WSL Startup','StockAgent TEJ Desktop Recovery')) {
+ $t=Get-ScheduledTask -TaskName $name -TaskPath '\' -ErrorAction Stop;
+ $info=Get-ScheduledTaskInfo -TaskName $name -TaskPath '\' -ErrorAction Stop;
+ if(@($t.Actions).Count -ne 1){throw 'Exact single startup action required'};
+ $taskArguments=[string]$t.Actions[0].Arguments;
+ $m=[regex]::Match($taskArguments,'(?:^| )-File "([^"]+)"');
+ if(-not $m.Success){throw 'Pinned startup launcher required'};
+ $p=[IO.Path]::GetFullPath($m.Groups[1].Value);
+ $base=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'StockAgent\TEJStartup';
+ if([IO.Path]::GetDirectoryName($p) -cne $base -or
+    [IO.Path]::GetFileName($p) -cnotmatch '^start-[0-9a-f]{64}\.ps1$'){throw 'Owned startup launcher path required'};
+ @{name=$name;state=[string]$t.State;enabled=[bool]$t.Settings.Enabled;
+   logon_type=[string]$t.Principal.LogonType;last_run_utc=$info.LastRunTime.ToUniversalTime().ToString('o');
+   last_task_result=[long]$info.LastTaskResult;restart_count=[int]$t.Settings.RestartCount;
+   restart_interval=[string]$t.Settings.RestartInterval;multiple_instances=[string]$t.Settings.MultipleInstances;
+   executor_verified=([IO.Path]::GetFullPath($t.Actions[0].Execute) -ieq (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'));
+   launcher_sha256=(Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant();service_only=($taskArguments -cmatch ' -StartServiceOnly$');
+   triggers=@($t.Triggers|ForEach-Object{@{type=$_.CimClass.CimClassName;enabled=[bool]$_.Enabled;interval=[string]$_.Repetition.Interval}})}
+});
+@{observed_at_utc=[DateTime]::UtcNow.ToString('o');windows_boot_at_utc=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');
+ windows_session_id=[Diagnostics.Process]::GetCurrentProcess().SessionId;tasks=$tasks}|ConvertTo-Json -Depth 6 -Compress
+"""
+    started = datetime.now(UTC)
+    result = run_guarded_windows(command,request=request,windows_path=DesktopBridge.windows_path,timeout=45,
+        windows_session_id=relay['windows_session_id'],interop_socket=relay['interop_socket'])
+    if result.returncode or len(result.stdout) > 16384:
+        raise ValueError('Bounded Windows boot task readback failed')
+    windows = json.loads(result.stdout.decode('utf-8-sig'))
+    source_operation_clock(windows.get('observed_at_utc'),started,datetime.now(UTC))
+    validate_boot_tasks(windows,launcher_sha)
+    if windows.get('windows_session_id') != relay['windows_session_id']:
+        raise ValueError('Original interactive relay session changed')
+    interactive_transport(root)
+    services = {}
+    for name in ('stockagent-tej-history.service','stockagent-tej-api-trial.timer'):
+        text = subprocess.check_output(['systemctl','show',name,'-p','ActiveState','-p','SubState','-p','UnitFileState'],text=True,timeout=10)
+        fields = dict(line.split('=',1) for line in text.splitlines() if '=' in line)
+        if fields.get('ActiveState') != 'active' or fields.get('UnitFileState') != 'enabled':
+            raise ValueError('Enabled active canonical boot owners required')
+        services[name] = fields
+    return {'contract':'tej_current_boot_registration_and_live_relay_readback_v1',
+        'observed_at_utc':datetime.now(UTC).isoformat(),'accepted':True,'mode':'boot_registration_readback',
+        'provider_queries_sent':0,'desktop_actions_sent':0,'physical_reboot_performed':False,
+        'current_code_cold_boot_verified':False,'linux_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        'windows':windows,'services':services,'interactive_relay_live':True,
+        'requires_windows_user_logon':True,'autologin_changed':False}
 
 
 def digest(path: Path) -> str:
@@ -52,6 +139,7 @@ def main(argv=None):
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--since',help='Require eight new full-lifecycle downloads STARTED after this UTC clock')
     mode.add_argument('--values-reference-task',help='Independently audit one retained nonempty receipt with the current validation code; not a new download')
+    mode.add_argument('--boot-readback',action='store_true',help='Verify exact installed boot/logon tasks and live relay; not a physical reboot')
     parser.add_argument('--baseline',type=Path,help='Preserved original source failure evidence to verify unchanged')
     parser.add_argument('--reference-values-acceptance',type=Path,
         help='For an entirely explicit-empty cohort, retain a prior nonempty value audit with IDENTICAL capture/ingest code')
@@ -59,6 +147,13 @@ def main(argv=None):
     output=args.output.resolve(); root=args.root.resolve()
     if output.exists():
         raise FileExistsError('Preserve original acceptance evidence')
+    if args.boot_readback:
+        if args.baseline is not None or args.reference_values_acceptance is not None:
+            raise ValueError('Boot registration readback is separate from acquisition acceptance')
+        result = boot_readback(root)
+        atomic_write_json(output,result,durable=True)
+        print(json.dumps({k:result[k] for k in ('mode','accepted','current_code_cold_boot_verified')}))
+        return 0
     with closing(sqlite3.connect(f'file:{root/"queue.sqlite3"}?mode=ro',uri=True,timeout=2)) as con:
         con.row_factory=sqlite3.Row
         blocked=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='blocked'")]
@@ -131,7 +226,8 @@ def main(argv=None):
                 REPO/'downloader/tej_history.py',REPO/'downloader/tej_scheduler.py',
                 REPO/'downloader/tej_metadata_recovery.py',REPO/'scripts/tej_smart_wizard_bridge.ps1',
                 REPO/'downloader/tej_operation_clock.py',REPO/'downloader/tej_desktop_attempts.py',
-                REPO/'downloader/tej_planning.py',
+                REPO/'downloader/tej_planning.py',REPO/'downloader/tej_startup.py',
+                REPO/'scripts/start_tej_desktop.ps1',
                 REPO/'configs/tej_history.json')},
             'latest_download':{k:recent[0][k] for k in ('task_id','completed_at_utc','actual_rows')} if recent else None}
     if args.values_reference_task:
@@ -172,17 +268,19 @@ def main(argv=None):
             raise ValueError('Original failed source proof required in baseline')
         for relative,expected in baseline['original_failure_artifacts'].items():
             path=root/relative
-            if path.resolve().parent not in {(root/name).resolve() for name in ('requests','raw','launches','diagnostics','progress')} or digest(path)!=expected:
+            if path.resolve().parent not in {(root/name).resolve() for name in ('requests','raw','launches','diagnostics','progress','orphaned_attempts')} or digest(path)!=expected:
                 raise ValueError('Original failure evidence changed')
         audited=audit(root,output.parent/(output.stem+'-receipts'),task_ids=[t['task_id'] for t in selected],verify_original_cells=True)
         if not audited['accepted'] or not empty_cohort and not audited['original_source_cells_verified']:
             raise ValueError('Canonical receipt and original-source-cell audit failed')
         if empty_cohort and audited['original_source_cells_checked']!=0:
             raise ValueError('Explicit-empty cohort cannot claim nonempty stored source values')
-        with urlopen('http://127.0.0.1:8770/tej/api/status',timeout=15) as response:
+        # Acquisition telemetry is owner-only. The public 8770 gateway may
+        # correctly deny this route; that is not a failed TEJ collector.
+        with urlopen(OWNER_STATUS_URL,timeout=15) as response:
             body=response.read(4*1024**2+1)
         if len(body)>4*1024**2:
-            raise ValueError('Bounded public status required')
+            raise ValueError('Bounded owner-only status required')
         status=json.loads(body)
         if (status.get('schema_version')!=16 or status.get('read_only') is not True
                 or status.get('raw_values_exposed') is not False or status['scheduler'].get('alive') is not True

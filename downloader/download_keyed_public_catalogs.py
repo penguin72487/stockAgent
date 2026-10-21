@@ -7,6 +7,7 @@ claim that the catalog's historical observations have been acquired.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,8 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import threading
+import time
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, build_opener
@@ -117,12 +120,27 @@ class CatalogError(RuntimeError):
 class RequestBudget:
     def __init__(self, maximum: int):
         self.maximum = maximum
-        self.used = 0
+        self._lock = threading.Lock()
+        self._used = 0
+        self._by_provider: dict[str, int] = {}
 
-    def claim(self, _provider: str) -> None:
-        if self.used >= self.maximum:
-            raise CatalogError("request_budget_exhausted")
-        self.used += 1
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    def used_for(self, provider: str) -> int:
+        with self._lock:
+            return self._by_provider.get(provider, 0)
+
+    def claim(self, provider: str) -> None:
+        # Retries and reviewed CDN delivery also pass this atomic boundary.
+        # A check outside this lock is only a scheduling hint, never admission.
+        with self._lock:
+            if self._used >= self.maximum:
+                raise CatalogError("request_budget_exhausted")
+            self._used += 1
+            self._by_provider[provider] = self._by_provider.get(provider, 0) + 1
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -214,7 +232,8 @@ class SafeCatalogTransport:
             HttpRequestPolicy(provider=f"{spec.provider}_public", timeout_seconds=45,
                               max_retries=2, retry_cap_seconds=60,
                               retryable_statuses=frozenset({408, 425, 500, 502, 503, 504})),
-            limiter=self.limiter, opener=self._bounded_open, on_attempt=budget.claim,
+            limiter=self.limiter, opener=self._bounded_open,
+            on_attempt=lambda _profile: budget.claim(spec.provider),
         )
 
     def _accept_redirect(self, source_url: str, location: str) -> None:
@@ -484,17 +503,24 @@ def plan(specs: list[CatalogSpec], credentials: dict[str, str], *, max_requests:
 def execute(root: Path, specs: list[CatalogSpec], credentials: dict[str, str], *,
             max_requests: int = 12, maximum_bytes: int = 16 * 1024**2,
             minimum_free_bytes: int = 2 * 1024**3, force: bool = False,
-            transport_factory=SafeCatalogTransport) -> dict:
-    if not 0 <= max_requests <= 100 or not 0 < maximum_bytes <= 64 * 1024**2 or minimum_free_bytes < 0:
+            transport_factory=SafeCatalogTransport, workers: int = 4) -> dict:
+    if (not 0 <= max_requests <= 100 or not 0 < maximum_bytes <= 64 * 1024**2
+            or minimum_free_bytes < 0 or not 1 <= workers <= 8):
         raise ValueError("invalid bounded request/storage budget")
+    if len({spec.provider for spec in specs}) != len(specs):
+        raise ValueError("one catalog/snapshot per provider receipt is required")
+    # Bound raw responses in flight as well as threads. JSON expansion and
+    # normalization still need headroom in the service's 512 MiB cgroup.
+    effective_workers = min(workers, max(1, len(specs)), max(1, max_requests),
+                            max(1, (32 * 1024**2) // maximum_bytes))
     root.mkdir(parents=True, exist_ok=True)
     budget = RequestBudget(max_requests)
-    results: list[dict] = []
     started = _now()
     secrets = tuple(value for value in credentials.values() if value)
     with (root / ".download.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for spec in specs:
+        def capture(spec: CatalogSpec) -> dict:
+            work_started = time.monotonic()
             checked = _now()
             row = {"provider": spec.provider, "dataset": spec.dataset,
                    "kind": spec.kind, "checked_at_utc": checked.isoformat(),
@@ -513,10 +539,10 @@ def execute(root: Path, specs: list[CatalogSpec], credentials: dict[str, str], *
                 row.update(status="provider_cooldown", retry_at_utc=retry_at)
             elif budget.used >= budget.maximum:
                 row["status"] = "request_budget_exhausted"
-            elif shutil.disk_usage(root).free < minimum_free_bytes + maximum_bytes * 2:
+            elif shutil.disk_usage(root).free < minimum_free_bytes + maximum_bytes * 2 * effective_workers:
                 row["status"] = "disk_reserve_reached"
             else:
-                requests_before = budget.used
+                requests_before = budget.used_for(spec.provider)
                 client = None
                 try:
                     url, headers = request_for(spec, credentials.get(spec.credential_name or "", ""))
@@ -546,33 +572,41 @@ def execute(root: Path, specs: list[CatalogSpec], credentials: dict[str, str], *
                                object_sha256=digest, object_bytes=len(encoded),
                                observed_at_utc=observed.isoformat(),
                                next_check_at_utc=_next_check(spec, observed).isoformat(),
-                               requests_this_run=budget.used - requests_before)
+                               requests_this_run=budget.used_for(spec.provider) - requests_before)
                     # A new receipt never discards the former version's capture clock.
                     atomic_write_json(root / "receipt_history" / spec.provider /
                                       f"{observed.strftime('%Y%m%dT%H%M%S%fZ')}.json", row)
                     atomic_write_json(root / "receipts" / f"{spec.provider}.json", row)
                 except CatalogError as exc:
                     row["status"] = str(exc)
-                    row["requests_this_run"] = budget.used - requests_before
+                    row["requests_this_run"] = budget.used_for(spec.provider) - requests_before
                     if str(exc) in {"http_429", "provider_throttled", "provider_cooldown"}:
                         delay = max(60.0, getattr(client, "retry_after_seconds", 0.0))
                         row["retry_at_utc"] = (_now() + timedelta(seconds=delay)).isoformat()
                     atomic_write_json(root / "attempts" / f"{spec.provider}.json", row)
                 except Exception:
                     row["status"] = "local_processing_failed"
-                    row["requests_this_run"] = budget.used - requests_before
+                    row["requests_this_run"] = budget.used_for(spec.provider) - requests_before
                     atomic_write_json(root / "attempts" / f"{spec.provider}.json", row)
-                row["requests_this_run"] = budget.used - requests_before
-            results.append(row)
+                row["requests_this_run"] = budget.used_for(spec.provider) - requests_before
+            return row | {"work_elapsed_seconds": time.monotonic() - work_started}
+
+        # Keep source/result order stable. Independent provider buckets do not
+        # wait for each other's network/parse/receipt work; the native dataset
+        # lock remains held until all workers have published durable evidence.
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            results = list(pool.map(capture, specs))
         implemented_providers = {spec.provider for spec in specs if spec.implementation == "implemented"}
         implemented = [row for row in results if row["provider"] in implemented_providers]
         implemented_complete = sum(
             row["status"] in {"acquired", "current_cached"}
             and (row["kind"] != "metadata_catalog" or row.get("catalog_complete") is True)
             for row in implemented)
-        summary = {"schema_version": 1, "mode": "bounded_catalog_or_snapshot",
+        summary = {"schema_version": 2, "mode": "bounded_catalog_or_snapshot",
                    "started_at_utc": started.isoformat(), "ended_at_utc": _now().isoformat(),
                    "requests": budget.used, "max_requests": max_requests,
+                   "requested_workers": workers, "effective_workers": effective_workers,
+                   "max_inflight_response_bytes": effective_workers * maximum_bytes,
                    "global_history_enabled": False, "history_complete": False,
                    "historical_coverage_state": "not_requested",
                    "implemented_adapters": len(implemented), "implemented_complete": implemented_complete,
@@ -596,6 +630,8 @@ def main(argv=None) -> int:
     parser.add_argument("--output-root", type=Path, default=ROOT / "data_keyed_public_catalogs")
     parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
     parser.add_argument("--max-requests", type=int, default=12)
+    parser.add_argument("--workers", type=int, choices=range(1, 9), default=4,
+                        help="Independent provider workers; also bounded by request and response-memory budgets")
     parser.add_argument("--max-response-mb", type=float, default=16)
     parser.add_argument("--min-free-gb", type=float, default=2)
     parser.add_argument("--force", action="store_true", help="Recheck selected bounded scope; budgets still apply")
@@ -615,7 +651,7 @@ def main(argv=None) -> int:
         try:
             result = execute(args.output_root, specs, credentials, max_requests=args.max_requests,
                              maximum_bytes=maximum_bytes, minimum_free_bytes=int(args.min_free_gb * 1024**3),
-                             force=args.force)
+                             force=args.force, workers=args.workers)
         except BlockingIOError:
             result = {"state": "worker_active", "requests": 0}
         except Exception:

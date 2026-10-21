@@ -18,7 +18,7 @@ SOURCE_REVIEW_DECISIONS = frozenset({
 # or original publisher. In particular, 404, a denied endpoint and a missing
 # parser are three different things. Keep this contract shared by the planner
 # and the read-only page; it never changes an article state or retries.
-NEWS_OUTCOME_CLASSIFICATION_VERSION = 2
+NEWS_OUTCOME_CLASSIFICATION_VERSION = 3
 NEWS_OUTCOME_GROUPS = {
     "queued_or_retry": frozenset({"pending", "inflight", "retry", "retry_cooldown"}),
     "waiting_cohort": frozenset({"waiting_cohort"}),
@@ -29,7 +29,7 @@ NEWS_OUTCOME_GROUPS = {
         "paywall", "paywall_or_login", "access_challenge", "robots_access_challenge",
     }),
     "repair_required": frozenset({
-        "unsupported_article_path", "body_not_found", "article_attribution_not_verified",
+        "unsupported_article_path", "redirect_not_article", "body_not_found", "article_attribution_not_verified",
         "article_title_not_verified", "article_identity_not_verified", "response_too_large",
         "robots_not_plain_rules", "robots_redirect_refused",
         "invalid_bulk_publication_clock",

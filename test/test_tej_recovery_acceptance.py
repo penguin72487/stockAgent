@@ -9,6 +9,41 @@ from test_tej_history import FakeBridge, empty_export, registry
 CODE={'scripts/tej_smart_wizard_bridge.ps1':'capture-sha','downloader/tej_history.py':'ingest-sha'}
 
 
+@pytest.mark.parametrize('fault',[None,'missing_task','duplicate_task','disabled','logon','launcher','executor',
+    'service_only','parallel','no_restart','interval','missing_trigger','disabled_trigger','watchdog_interval'])
+def test_boot_registration_readback_validates_both_actual_owners(fault):
+    from scripts.verify_tej_self_healing import validate_boot_tasks
+    tasks = [{'name':name,'enabled':True,'logon_type':logon,'service_only':service,
+              'launcher_sha256':'reviewed-launcher','executor_verified':True,
+              'multiple_instances':'IgnoreNew','restart_count':3,'restart_interval':'PT1M',
+              'triggers':[{'type':t,'enabled':True,'interval':'PT1M' if t=='MSFT_TaskTimeTrigger' else ''} for t in triggers]}
+             for name,logon,service,triggers in [
+                 ('StockAgent TEJ WSL Startup','S4U',True,['MSFT_TaskBootTrigger']),
+                 ('StockAgent TEJ Desktop Recovery','Interactive',False,['MSFT_TaskLogonTrigger','MSFT_TaskTimeTrigger'])]]
+    if fault == 'missing_task':tasks.pop()
+    elif fault == 'duplicate_task':tasks[1] = dict(tasks[0])
+    elif fault == 'disabled':tasks[0]['enabled'] = False
+    elif fault == 'logon':tasks[1]['logon_type'] = 'S4U'
+    elif fault == 'launcher':tasks[0]['launcher_sha256'] = 'unreviewed'
+    elif fault == 'executor':tasks[1]['executor_verified'] = False
+    elif fault == 'service_only':tasks[0]['service_only'] = False
+    elif fault == 'parallel':tasks[1]['multiple_instances'] = 'Parallel'
+    elif fault == 'no_restart':tasks[0]['restart_count'] = 0
+    elif fault == 'interval':tasks[1]['restart_interval'] = 'PT7H'
+    elif fault == 'missing_trigger':tasks[1]['triggers'].pop()
+    elif fault == 'disabled_trigger':tasks[0]['triggers'][0]['enabled'] = False
+    elif fault == 'watchdog_interval':tasks[1]['triggers'][1]['interval'] = 'PT1D'
+    if fault:
+        with pytest.raises(ValueError):validate_boot_tasks({'tasks':tasks},'reviewed-launcher')
+    else:
+        validate_boot_tasks({'tasks':tasks},'reviewed-launcher')
+
+
+def test_acceptance_uses_private_owner_status_not_the_public_gateway():
+    from scripts.verify_tej_self_healing import OWNER_STATUS_URL
+    assert OWNER_STATUS_URL == 'http://127.0.0.1:8771/tej/api/status'
+
+
 def test_empty_progress_reference_preserves_actual_value_evidence(tmp_path):
     path=tmp_path/'reference.json'
     path.write_text(json.dumps({'accepted':True,'source_rows':125,'original_cells_checked':3618,'code_sha256':CODE}))

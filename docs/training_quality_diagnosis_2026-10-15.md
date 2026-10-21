@@ -10,6 +10,269 @@
 `artifacts/operations/training-quality-audit-20261015/`，以下簡稱 `OP`。
 大型資料、模型、日誌與操作狀態不納入 Git。
 
+## 2026-10-20：41組收斂，保留風險取捨並接續七組梯度方向研究
+
+最新七組SGD研究均依100輪無改善收斂，1003檔案、28份checkpoint及14份獨立模型
+已完成本機SHA與CPU讀回。單一log-utility＋SGD報酬268.64%、Sharpe4.624、
+Sortino8.834、MDD11.13%；MGDA控制重跑為138.80%、5.444、14.047、3.81%。
+原`geometry__unit_mgda_sgd_step`的153.13%、5.933、17.091、6.83%仍是高風險調整
+績效的參考，沒有新組在181日與同帳戶149日兩個範圍都四項超越它。
+不能將對指定舊fold11的通過旗標誤稱為超越目前MGDA。
+
+已查核Kelly／直接金融政策訓練、MGDA／PCGrad／Nash、UPGrad、ConFIG與2026
+DiBS、XSAM、MOON、SIMS等原始研究。以229輪記錄Gram實測，log優先共降投影
+相對MGDA的log局部下降量中位數1.3575倍、無局部衝突；這不是交易報酬改善保證。
+依此排入七組從零的MGDA／log控制、log優先UPGrad、ConFIG兩步長、DiBS一／五步。
+維持d32/lookback32/global128與原金融機制、2025純log選模、100輪無改善停止。
+
+完整七組新舊數值、1998至2026研究脈絡、1956起點、工程拒絕修正與產物位置見
+[本次梯度前沿研究](training_gradient_frontier_2026-10-20.md)。
+41組清單：`OP/neural-experiment-results-20261020.{json,csv}`。
+遠端正式根目錄：`artifacts/markets/tw_scratch_gradient_frontier_20261020_v2/`；
+最新進度：`OP/scratch-gradient-frontier-v2-progress-current.json`。
+實驗與snapshot source只加入已審查的梯度組合及objective註冊三檔；不混入其他並行工作。
+
+## 2026-10-19 17:52：34組正式收斂，新策略在兩個固定範圍全面勝出
+
+`scratch-gradient-geometry-v1-20261019T005316-85c76c1c` 七組均依連續100輪
+validation無改善完成，17:42:48台北結束；17:48:34完成本機回收及同帳戶比較。
+`OP/scratch-gradient-geometry-v1-collection-status.json` 為 `preserved`：
+1,003檔案SHA、28份checkpoint及14份獨立model均通過CPU有限值讀回。
+主線累計34組正式收斂，另保留1組工程容量拒絕。
+
+本輪全部解析entmax導數、seed42獨立初始化、全網路訓練；沒有舊權重、teacher
+或蒸餾。四個目標是Sharpe、log return、Sortino、Calmar的參數梯度，沒有
+將四個scalar loss平均。下表為2026-01-02至10-02共181個觀察日的費後策略帳務；
+MDD列正的回撤幅度，benchmark為2330 adjusted-close含息buy-and-hold、未扣交易成本。
+
+| 方法 | 選中／停止epoch | 報酬 | Sharpe | Sortino | MDD |
+| --- | --- | --- | --- | --- | --- |
+| MGDA-L2＋AdamW | 281／381 | 88.99% | 2.499 | 4.079 | 11.07% |
+| raw MGDA＋AdamW | 377／477 | 4.88% | 0.169 | 0.232 | 17.55% |
+| raw MGDA＋純SGD，LR0.03 | 128／228 | 111.44% | 3.135 | 5.984 | 14.15% |
+| MGDA-L2＋純SGD，LR0.03 | 233／333 | 104.31% | 4.284 | 10.056 | 10.15% |
+| **MGDA-L2＋純SGD，LR0.1** | **128／228** | **153.13%** | **5.933** | **17.091** | **6.83%** |
+| 單一log＋AdamW，LR0.00003 | 385／485 | 21.82% | 1.083 | 1.696 | 11.98% |
+| 近四年MGDA-L2＋AdamW | 189／289 | 117.68% | 3.043 | 5.145 | 13.23% |
+| 指定舊fold11 | — | 95.93% | 3.662 | 6.353 | 9.57% |
+| 前輪最佳raw參數MGDA | 35／135 | 61.81% | 3.095 | 5.324 | 7.34% |
+| 2330 buy-and-hold | — | 62.73% | 2.014 | 3.359 | 13.04% |
+
+同一149日、固定各自模型動作、相同起始帳戶的canonical重播亦完成：
+
+| 方法 | 報酬 | Sharpe | Sortino | MDD |
+| --- | --- | --- | --- | --- |
+| **新MGDA-L2＋SGD0.1** | **125.76%** | **7.052** | **22.290** | **3.03%** |
+| 指定舊fold11 | 69.85% | 3.485 | 5.995 | 9.50% |
+
+因此 `geometry__unit_mgda_sgd_step` 通過既定181／149日雙範圍四指標全面
+勝出的研究驗收；不是將epoch0數值變動算成訓練進步。checkpoint依2025純費後
+log utility選在epoch128，100輪未改善後於228停止。2025validation報酬422.01%、
+Sharpe5.812、Sortino17.205、MDD5.74%。2026已反覆觀察，以上是回溯研究結果，
+不能改稱未觀察holdout、保證未來報酬或已完成部署。
+
+### 實際梯度與策略的診斷
+
+1. **目標單位與真正更新方向要同時處理。** 本輪raw MGDA＋AdamW有
+   101／477輪的 `actual_update_derivative_* > 1e-8`，表示至少一項原目標對
+   實際參數更新呈一階上升；MGDA-L2＋AdamW降至5／381。三組純SGD均為0，
+   最佳組為0／228。這是實測的surrogate局部幾何，不是有限步長的績效保證。
+2. **最佳組確實使用四個目標。** 選中epoch128的unit-gradient simplex係數為
+   Sharpe0.3240、log0.2077、Sortino0.1235、Calmar0.3448；原始梯度L2約
+   4.40、2.03、298.37、12,414.75。當輪合成梯度範數0.7868、LR0.09759，
+   四個實際更新方向導數均負。不是固定四等分，也不是偷偷只剩單一log。
+3. **策略動作已改變，仍有共同曝險特性。** 新舊入場請求的每日選股support
+   Jaccard均值0.0423、signed cosine0.0624，181日沒有一天所有請求權重完全相同。
+   平均非零請求檔數12.27對5.33，gross0.922對0.476；兩者這段期間的請求皆偏空。
+   所以改善不能只歸因於放大舊倉位，也不能當作已消除方向或市場狀態風險。
+   這些是成交前請求；收盤強制平倉快照均為零，不代表兩策略相同。
+4. **反傳與完整流程並未省略。** 七組逐輪均一次optimizer step、無zero-gradient，
+   多目標固定權重重播最大誤差低於2.5e-13，穩態無新增Dynamo graph。最佳組完整
+   MAX-rank epoch第3輪以後中位數9.396秒，包含validation／test、圖表與checkpoint；
+   單一log小步AdamW為4.431秒。這是依序執行的觀測，沒有用它宣稱配對加速倍率，
+   也沒有證明只剩硬體計算瓶頸。
+
+原值及輸入SHA：`OP/sgd-validation-v1/diagnosis.json`。
+正式雙範圍與行為比較：`OP/scratch-gradient-geometry-v1-comparison.json`。
+34組完整清單已刷新到 `OP/neural-experiment-results-20261019.{json,csv}`。
+
+傳統模型亦於本次查詢遠端讀回：Ridge同181日報酬0.47%、Sharpe0.033、
+Sortino0.049、MDD21.34%；LightGBM ranker產物顯示報酬1.21%、Sharpe5.165、
+Sortino17.116、MDD0.073%，平均turnover僅0.0113，尚未完成此次離機驗收，
+不能只憑高比率稱它全面超越。LightGBM regression的worker已被`Killed`，舊
+progress仍停在`running/setup`，不表示還在訓練；v2 queue已exit1。
+XGBoost及CatBoost分別因保留數值零的histogram下界約1.271TB、完整lag CSR
+約761.7GB超過171.8GB admission而拒絕，沒有正式策略結果，不是實際CUDA OOM。
+這些產物保留於`vastai1T:/root/stockAgent/artifacts/markets/tw_classical_full_window_20261018_v1/`；
+機制與既有Ridge本機保存證據見[傳統模型報告](tw_classical_baselines_2026-10-18.md)。
+這些傳統模型不計入前述34組神經網路正式收斂。
+
+### 下一輪七組：簡單loss、步長與跨年選模
+
+以成功機制作控制，不換seed搜尋；仍全部重新初始化，沒有用最佳checkpoint微調。
+設定：[`tw_scratch_sgd_validation_20261019_v1.yaml`](../configs/ablations/tw_scratch_sgd_validation_20261019_v1.yaml)。
+所有SGD皆momentum0／weight decay0，固定d32／lookback32、global128、warmup32、
+cosine1000、原費稅與整張帳務。最多1000輪，100輪無改善停止；工程四輪不算收斂。
+
+| 順序 | 方法／最高LR | 要排除的解釋 |
+| --- | --- | --- |
+| 1 | MGDA-L2＋SGD0.1，相同控制重現 | 是否只是一條脆弱的數值軌跡 |
+| 2 | 單一log＋SGD0.1 | 是否純SGD已足夠，可省去四目標VJP |
+| 3 | 單一log＋SGD0.03 | 單一log的梯度範數與MGDA不同，避免步幅誤判 |
+| 4 | MGDA-L2＋SGD0.05 | 減小有限更新步幅能否更穩定 |
+| 5 | MGDA-L2＋SGD0.2 | 更大純量步長能否改善而不改變合成方向 |
+| 6 | 近四年MGDA-L2＋SGD0.1 | 年代縮短與成功SGD的交互作用 |
+| 7 | 2024–2025兩年validation＋MGDA-L2＋SGD0.1 | 選模是否只適合2025單一狀態 |
+
+第7組2015–2023訓練、2024–2025選checkpoint，2024已移出訓練；這是明確的
+資料所有權實驗，不能描述成訓練期間完全匹配的控制。其餘全期組2015–2024訓練，
+第6組2021–2024訓練；皆以2026相同181日作回溯診斷，仍不依2026挑checkpoint。
+若單一log可維持品質，才以實測完整epoch／fold成本評估替代四次VJP，不能預先
+假定更簡單必然同樣好。所有失敗保存後繼續，只因confirmed CUDA OOM改batch。
+
+新run `scratch-sgd-validation-v1-20261019T095221-413cf013` 已於17:52:21台北
+排入vastai1T現有受管queue，strict CUDA通過，首組4輪完整工程已通過，現已
+重新初始化進入正式收斂流程。沒有改trainer或financial executor；重用已驗證
+的source `617941c0cdbf0ad67b4163d109e74a4cbe313f2a909846b3867ebfec32060401`、
+runtime `66926c5bcb2bdf743af48d7e9f646ae581f2497db26cbf8b8472235b5dd5eaf7`。
+新plan SHA `371001c6cc9b59034d5a13a5e05f6fad72fd7f983f8274c83e934e8017856e30`。
+七組effective config／年份／fold與contract均已核對；第1組training contract與
+已勝出的SGD0.1完全相同。portable YAML繼承解析亦確認只有這七組。
+
+17:58首組工程驗收：完整fold330.108秒、穩態第3／4輪完整MAX-rank epoch中位數
+11.029秒，global128／雙卡、最低顯存餘裕2.442GiB。四輪梯度皆非零、各一次更新，
+固定權重帳務重播最大誤差6.679e-16，穩態新graph為0，best／last checkpoint
+均已CPU有限值讀回；test181日中179日有非零報酬。不是正式收斂績效或加速倍率。
+和上一輪相同SGD0.1控制的前四輪相比，LR完全相同，但train loss、validation loss
+與梯度範數最大絕對差約4.72e-4、3.31e-3、2.85e-3；不能聲稱逐位元重現，
+因此保留正式控制重跑以檢查軌跡穩定性。證據：
+`OP/sgd-validation-v1/engineering-first-summary.json`。
+
+產物位置：
+
+- 新最佳遠端：`vastai1T:/root/stockAgent/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training/fold_10/`。
+- 新最佳本機：`OP/scratch-gradient-geometry-v1-retained/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training/fold_10/`，內有`checkpoint_best.pt`、績效／曲線／實際動作與帳務產物；來源、完整last checkpoint與optimizer狀態另隨retained樹保存。
+- 新七組正式：`vastai1T:/root/stockAgent/artifacts/markets/tw_scratch_sgd_validation_20261019_v1/`。
+- 新七組工程：`vastai1T:/root/stockAgent/artifacts/benchmarks/training_quality_20261015/scratch-sgd-validation-v1/`。
+- 逐組選中路徑由`_capacity/<case>/selection.json`記錄；全期為`fold_10`，近四年`fold_04`，兩年validation為`fold_09`。
+- 新排程／resolved config／strict CUDA：`OP/sgd-validation-v1/`、`OP/scratch-sgd-validation-v1-plan.json`、`OP/scratch-sgd-validation-v1-input/`。
+- 新進度：`OP/scratch-sgd-validation-v1-progress-current.json`；watcher `scratch-sgd-validation-v1-watch-20261019T095241-88f87562`。
+- 新完成回收目標：`OP/scratch-sgd-validation-v1-retained/`；collector `scratch-sgd-validation-v1-preser-20261019T095242-080d5d67`。目前尚無這一輪的正式收斂結果，不能把目標目錄當作已完成回收。
+
+## 2026-10-19 08:53：累計27組正式結果，接續梯度幾何七組
+
+`scratch-budget-recency-v1-20261018T150041-ddb6eb5f` 已成功結束，九組均
+達連續100回合validation無改善；不是工程四輪的結果。目前主線累計27組
+正式收斂，另有前輪1組工程容量拒絕。新九組尚未超越原參數空間MGDA。
+本機watcher／collector因原systemd worker已消失而停在舊快照，已保存
+inactive／MainPID0證據、reconcile原run，從既有入口恢復只讀收集，沒有重跑訓練。
+`OP/scratch-budget-recency-v1-collection-status.json` 現為 `preserved`；
+1,311檔案SHA、36份checkpoint及18份獨立model的CPU有限值讀回已通過，
+181日比較及共同149日固定動作、同起始帳戶重播亦完成。
+
+下表統一2026-01-02至10-02共181日、費後帳務；MDD列回撤幅度。
+
+| 方法 | 選中／停止epoch | 報酬 | Sharpe | Sortino | MDD |
+| --- | --- | --- | --- | --- | --- |
+| 原參數空間MGDA | 35／135 | 61.81% | 3.095 | 5.324 | 7.34% |
+| 單一風險預算＋log | 37／137 | 7.07% | 1.864 | 3.731 | 2.24% |
+| 本輪解析entmax MGDA控制 | 194／294 | 17.67% | 0.766 | 1.117 | 14.38% |
+| 單一風險預算＋MGDA | 40／140 | -0.58% | -0.128 | -0.188 | 7.40% |
+| 單一風險預算＋整張回饋 | 33／133 | -2.53% | -0.528 | -0.710 | 7.00% |
+| 近四年解析entmax MGDA | 143／243 | 25.93% | 1.517 | 2.500 | 8.45% |
+| 近兩年解析entmax MGDA | 138／238 | 28.73% | 1.464 | 2.498 | 14.46% |
+| 近四年單一預算＋log | 25／125 | -6.08% | -1.004 | -1.264 | 10.80% |
+| 近四年單一預算＋MGDA | 107／207 | -1.06% | -0.471 | -0.620 | 3.05% |
+| 編碼歷史＋單一預算＋log | 118／218 | -11.65% | -1.113 | -1.455 | 16.46% |
+| 指定舊fold11 | — | 95.93% | 3.662 | 6.353 | 9.57% |
+| 2330 adjusted-close buy-and-hold | — | 62.73% | 2.014 | 3.359 | 13.04% |
+
+完整比較：`OP/scratch-budget-recency-v1-comparison.json`。所有九組於181／149日
+雙範圍的四指標全面勝出名單均為空。不能將2026結果用作未觀察holdout或保證未來績效。
+累計27組的同口徑結果及原比較文件SHA，另存於
+`OP/neural-experiment-results-20261019.json`、`OP/neural-experiment-results-20261019.csv`；
+工程拒絕與未收斂項目分開列示，不填入正式策略數值。
+
+### 從實際梯度到更新的診斷
+
+* 低曝險不是唯一原因：新獨立輸出三個全期組的requested gross已從前輪
+  約4–6%提高至約50–51%，但MGDA及整張回饋組仍虧損。這是模型入場請求，
+  不等於成交後持倉；加大曝險或更多歷史編碼本身不會創造可泛化訊號。
+* 本輪解析MGDA控制在2025報酬109.22%，2026為17.67%；近四年控制為83.78%
+  對25.93%。訓練、驗證及跨期泛化仍應分開評估，較少歷史資料不是普遍解法。
+* raw MGDA有81/294輪完全採log-return；在選中epoch194，四個參數梯度L2
+  範數約16.55、3.80、2917.63、75514.02。不同指標的單位會影響最小範數凸組合。
+  新增明確的 `trajectory_mgda_l2_parameter`，先以各目標global參數梯度L2
+  標準化再解原四維QP，仍保留零梯度目標，不把四個scalar loss取平均。
+  只標準化4×4 Gram及最後係數，沒有額外複製四份完整參數梯度到CPU。
+  L2 normalization亦見[原MGDA研究程式](https://github.com/isl-org/MultiObjectiveOptimization/blob/master/multi_task/min_norm_solvers.py)。
+* 本輪有48/294輪的實際AdamW更新對至少一個原目標呈正的一階方向導數。
+  原合成梯度的共同下降性，不會自動延續到帶momentum、自適應座標縮放與decay
+  的實際更新。因此加上原生SGD對照，momentum及weight decay都為0，只作全域
+  clipping後的純量步長，逐輪保留四個 `actual_update_derivative_*`。
+  此為surrogate局部幾何，不能保證有限步長、離散整張成交或2026績效同步改善。
+  SGD數學及加速實作選項見[PyTorch官方文件](https://docs.pytorch.org/docs/stable/generated/torch.optim.SGD.html)。
+* 兩次解析MGDA控制的RMS收據SHA完全一致
+  `00c26ddb8b585408782b7e03c456cb99cea4400e95b0533192be450267ee87de`，
+  epoch1 train loss亦相同，但初始梯度有微小浮點差，更新後validation開始分岔；
+  最後2026報酬10.35%與17.67%。這是數值軌跡敏感性證據，尚不足以歸因給
+  某個kernel或新輸出。新輪保留同source同環境的raw控制，不以seed搜索取代機制實驗。
+
+診斷原值：`OP/gradient-geometry-v1/diagnosis.json`；前述梯度為完整年度帳戶
+經canonical分塊、截斷surrogate VJP的全域參數梯度，不是整數交易的經典導數。
+
+### 已排入現有遠端queue的七組
+
+設定：[`tw_scratch_gradient_geometry_20261019_v1.yaml`](../configs/ablations/tw_scratch_gradient_geometry_20261019_v1.yaml)。
+全部獨立seed42隨機初始化、全參數訓練；沒有匯入舊模型、teacher或蒸餾。
+同d32/L32、global128、原費稅與整張帳務；1000輪上限與0.1比例的patience100不變。
+前六組2015–2024訓練，最後一組2021–2024；均2025選checkpoint、2026回溯比較。
+
+| 順序 | 目標梯度 | Optimizer／最高LR | 目的 |
+| --- | --- | --- | --- |
+| 1 | 參數MGDA-L2 | AdamW／0.0001 | 隔離目標單位差 |
+| 2 | raw參數MGDA | AdamW／0.0001 | 同source匹配控制 |
+| 3 | raw參數MGDA | 純SGD／0.03 | 隔離更新方向，decay0 |
+| 4 | 參數MGDA-L2 | 純SGD／0.03 | 尺度與實際方向同時修正 |
+| 5 | 參數MGDA-L2 | 純SGD／0.1 | 檢查純量步長，decay0 |
+| 6 | 單一log utility | AdamW／0.00003 | 簡單loss與較小更新對照 |
+| 7 | 近四年參數MGDA-L2 | AdamW／0.0001 | 梯度幾何與年代交互作用 |
+
+共同warmup32及1000輪cosine排程保留。單一SGD步長與AdamW的座標步長不可
+直接按LR數字比較。所有組使用解析entmax VJP；保留舊MGDA作比較，但不重新採用
+已知錯誤的舊導數。新MGDA-L2 ABI為
+`annual_four_metric_calmar_unit_l2_gram_surgery_v1`；raw ABI保持不變。
+原生SGD接入既有optimizer factory、scheduler、checkpoint生命週期，CUDA選fused
+版本，CPU選foreach；沒有第二個trainer。
+
+遠端run：`scratch-gradient-geometry-v1-20261019T005316-85c76c1c`，08:53台北啟動。
+只封存5個reviewed梯度／optimizer／registry來源改動，排除並行的classical及inference
+變更；source SHA `617941c0cdbf0ad67b4163d109e74a4cbe313f2a909846b3867ebfec32060401`，
+1692來源檔與wheel已離機SHA保存。strict CUDA及42項physical梯度／雙卡帳務／
+optimizer oracle已通過；首組4輪完整工程通過，09:01已另行初始化並進入正式
+收斂setup，尚無正式epoch結果。
+每組失敗保存後繼續。本機相關測試96passed、6skipped；另以封存父版逐值核對
+16個FP32／FP64案例，原raw PCGrad／MGDA的梯度與diagnostics完全相同，
+4份歷史contract亦完全一致。證據：`OP/gradient-geometry-v1/physical-oracle-acceptance.json`、
+`raw-path-compatibility.json`；首組完整工程結果另記驗收收據。
+首組工程完整fold304.702秒，穩態第3／4輪完整MAX-rank epoch中位數9.117秒，
+global128／雙卡，最小VRAM餘裕2.271GiB；四輪均無zero-gradient、每輪一次更新，
+穩態無新增graph，固定權重帳務重播誤差通過1e-9門檻，best／last checkpoint
+已CPU有限值讀回。工程test181日中179日非零報酬。末輪unit-gradient simplex
+係數約Sharpe0.3103、log0.4250、Sortino0、Calmar0.2647；Sortino的零係數是
+QP選到的face，不是手動移除該任務。此為非空機制與完整工程證據，不是正式
+收斂績效或與前輪raw MGDA配對的加速結論。
+證據：`OP/gradient-geometry-v1/engineering-first-summary.json`。
+沿用既有resident CSR、QuACK、attention與帳務CUDA Graph、完整validation／test／
+圖表／checkpoint。不宣稱已消除所有軟體開銷或只剩硬體計算瓶頸。
+
+新正式產物：`vastai1T:/root/stockAgent/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/`。
+工程產物：`vastai1T:/root/stockAgent/artifacts/benchmarks/training_quality_20261015/scratch-gradient-geometry-v1/`。
+計畫／來源／診斷：`OP/scratch-gradient-geometry-v1-plan.json`、`OP/gradient-geometry-v1/`。
+本機即時進度：`OP/scratch-gradient-geometry-v1-progress-current.json`；完成回收目標：
+`OP/scratch-gradient-geometry-v1-retained/`，尚無完成驗收前不可稱已保存新訓練模型。
+上一輪九組已保存：`OP/scratch-budget-recency-v1-retained/`。
+
 ## 2026-10-18 23:00：上一輪五組正式完成，九組風險預算與年代實驗啟動
 
 遠端 run `scratch-autonomous-v2-20261018T100558-defc75fc` 已結束，

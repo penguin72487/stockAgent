@@ -9,6 +9,27 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_private_control_carries_packed_reader_with_archive_code():
+    """A compute checkout may lack the authority's new packed-reader API."""
+    import subprocess
+    import sys
+    from scripts.return_remote_legacy_archives import private_control_prefix
+
+    program = '''
+import stockagent.data_sync.packed_snapshots as old_reader
+del old_reader._verified_packed_inventory
+'''
+    program += private_control_prefix()
+    program += '''
+from stockagent.data_sync.legacy_artifact_archive import _verified_packed_inventory
+from stockagent.data_sync.packed_snapshots import _verified_packed_inventory as reader
+assert _verified_packed_inventory is reader
+'''
+    result = subprocess.run([sys.executable, '-'], input=program, text=True,
+                            capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+
+
 def test_local_cleanup_handoff_only_accepts_its_fixed_inventory_and_receipts():
     from scripts.handoff_remote_legacy_archive_worker import LOCAL_COHORTS, ROOT, validate_worker_argv
     for cohort, inventory in LOCAL_COHORTS.items():

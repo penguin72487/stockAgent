@@ -259,6 +259,40 @@ def test_confirmed_no_first_print_uses_previous_close_only_for_model_not_open_or
     assert not signal_engine.tw_session_no_open_print_mask(snapshot, session_date="2026-10-16")[1]
 
 
+def test_historical_opening_panel_slices_before_factorized_coverage_gate(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    panel = PanelData(
+        dates=np.array(["2026-10-15", "2026-10-16", "2026-10-19"], dtype="datetime64[D]"),
+        symbols=["2330"], feature_names=["base"],
+        features=np.array([[[1.]], [[2.]], [[3.]]], dtype=np.float32),
+        returns_1d=np.zeros((3, 1), dtype=np.float32),
+        tradable_mask=np.ones((3, 1), dtype=bool), alive_mask=np.ones((3, 1), dtype=bool),
+        benchmark_returns=np.zeros(3, dtype=np.float32),
+        close_prices=np.array([[100.], [101.], [102.]], dtype=np.float32))
+    config = SimpleNamespace(data=SimpleNamespace(parquet_root="unused", factorized_feature_manifest="manifest"))
+    monkeypatch.setattr(signal_engine, "require_live_feature_source", lambda *_: None)
+    monkeypatch.setattr(signal_engine, "live_tw_public_source_read_guard", lambda *_: nullcontext())
+    monkeypatch.setattr(signal_engine, "_build_panel_from_stable_source", lambda *a, **kw: (panel, True, "disk"))
+    seen = []
+
+    def attach(value, *_):
+        days = [str(day) for day in value.dates]
+        if "2026-10-19" in days:
+            raise ValueError("projection unavailable for the unneeded later session")
+        seen.extend(days)
+        return value
+
+    monkeypatch.setattr(signal_engine, "_cached_factorized_live_panel", attach)
+    result, hit, tier = signal_engine._build_panel(config, live_tail=True, panel_end_date="2026-10-16")
+    assert seen == ["2026-10-15", "2026-10-16"] and result.features[-1, 0, 0] == 2.
+    assert hit and tier == "disk"
+    assert len(panel.dates) == 3  # The shared base/cache remains unchanged.
+    with pytest.raises(ValueError, match="unneeded later session"):
+        signal_engine._build_panel(config, live_tail=True)
+
+
 def test_day_trade_quote_coverage_does_not_require_every_symbol_to_trade() -> None:
     snapshot = PriceSnapshot(
         prices=np.array([101.0, 50.5]),

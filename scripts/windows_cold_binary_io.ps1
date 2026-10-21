@@ -14,11 +14,13 @@ try {
     $buffer = New-Object byte[] (1MB)
     if ($config.mode -eq 'read') {
         $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
+        if ($null -ne $config.expected_bytes -and $stream.Length -ne [long]$config.expected_bytes) { throw 'Exact read member size differs' }
         $output = [Console]::OpenStandardOutput()
         while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $output.Write($buffer, 0, $count)
         }
         $output.Flush()
+        if ($null -ne $config.expected_bytes -and $stream.Position -ne [long]$config.expected_bytes) { throw 'Truncated exact read member' }
     } elseif ($config.mode -eq 'hash') {
         $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
         if ($stream.Length -ne [long]$config.expected_bytes) { throw 'Exact hash member size differs' }

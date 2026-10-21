@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "contract": "bounded_cache_writes_v1",
+  "nodes": ["penguin"],
+  "minimum_free_bytes": 26843545600,
+  "materialized_capacity_bytes": 274877906944,
+  "panel_family_capacity_bytes": 68719476736,
+  "maximum_inventory_entries": 200000,
+  "maximum_inventory_seconds": 5
+}

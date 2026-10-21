@@ -13,7 +13,9 @@ from dataclasses import asdict, replace
 from datetime import date, datetime, time, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -38,6 +40,7 @@ from stockagent.live.quote_provider import (
     fetch_shioaji_current_stock_minute_bars, load_local_stock_0901_vwaps,
 )
 from stockagent.live.day_trade_maintenance import control_lease
+from stockagent.live.market_status import short_file_fingerprint
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     SIMULATION_SCHEMA_VERSION, TwDayTradeSimulationEngine, _append_jsonl_many,
@@ -48,6 +51,7 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 SERVICE = "stockagent-tw-day-trade-simulation.service"
 CONTRACT = "never_filled_missing_open_append_only_minute_repair_v1"
 ORIGINAL_SIGNAL_CONTRACT = "never_filled_original_signal_append_only_minute_repair_v2"
+MISSING_SESSION_CONTRACT = "missing_completed_session_append_only_minute_repair_v1"
 ECONOMIC_KEYS = (
     "initial_capital_twd", "cumulative_realized_net_pnl_twd",
     "cumulative_commission_rebate_accrued_twd", "total_equity_twd",
@@ -165,6 +169,44 @@ def _has_live_fill(state_dir: Path, market: str, session: str) -> bool:
     return TwDayTradeSimulationEngine._session_has_fill(probe, market, session)
 
 
+def _require_missing_session_target(mode: dict, day: date) -> None:
+    """Append a new session, never rearm or replace a previously traded one."""
+    previous = str(mode.get("session_date") or "")
+    if not previous or date.fromisoformat(previous) >= day:
+        raise RuntimeError("missing-session append requires a strictly later session")
+    if mode.get("ledger_state_divergence") or any(
+        int(position.get("signed_shares") or 0) for position in (mode.get("positions") or {}).values()
+    ):
+        raise RuntimeError("missing-session append requires flat, reconciled prior inventory")
+    if any(not (order.get("status") == "filled" and type(order.get("remaining_shares")) is int
+                and order["remaining_shares"] == 0 and order.get("sizing_pending") is False)
+           for name in ("pending_entry_orders", "pending_reduction_orders")
+           for order in (mode.get(name) or {}).values()):
+        raise RuntimeError("missing-session append cannot bypass active or unknown pending orders")
+
+
+def _missing_session_proof(spec, day: date, summary_path: Path) -> dict:
+    summary = _object(summary_path)
+    weights_path = summary_path.with_name("target_weights.parquet")
+    proof = summary.get("counterfactual_artifact_proofs") or {}
+    if (summary.get("counterfactual_signal_regeneration") is not True
+            or summary.get("simulation_only") is not True
+            or summary.get("production_order_possible") is not False
+            or summary.get("live_session_open_feature_applied") is not True
+            or str(summary.get("replay_effective_signal_at") or "")[:10] != str(day)
+            or summary.get("config_fingerprint") != short_file_fingerprint(Path(spec.config_path))
+            or summary.get("checkpoint_fingerprint") != short_file_fingerprint(Path(spec.checkpoint_path))
+            or proof.get("weights_sha256") != _sha256(weights_path)):
+        raise RuntimeError("missing-session append requires a pinned selected-model counterfactual")
+    return {"session_date": str(day), "signal_id": summary["signal_id"],
+            "summary_path": str(summary_path.resolve()), "summary_sha256": _sha256(summary_path),
+            "weights_path": str(weights_path.resolve()), "weights_sha256": _sha256(weights_path),
+            "config_fingerprint": summary["config_fingerprint"],
+            "checkpoint_fingerprint": summary["checkpoint_fingerprint"],
+            "signal_started_at": summary.get("signal_started_at") or summary.get("generated_at"),
+            "generated_at": summary.get("generated_at"), "original_weights_preserved": False}
+
+
 def _spec(market: str, markets_dir: Path):
     specs, configs, errors = _mode_specs(markets_dir)
     if errors:
@@ -210,6 +252,7 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
     roots = tuple(Path(value) for value in manifest["minute_roots"])
     now = datetime.now(TAIPEI)
     preserve_original = manifest.get("preserve_original_signal") is True
+    append_missing = manifest.get("append_missing_session") is True
     for source in manifest["sessions"]:
         day = date.fromisoformat(source["session_date"])
         summary_path = Path(source["summary_path"])
@@ -242,8 +285,9 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
             raise RuntimeError(f"{day}: selected model legal price limits missing")
         # Keep every original model row, but do not fetch prices for targets
         # which cannot buy even one lot at the frozen session NAV.
-        if preserve_original:
-            nav = float(manifest["anchor"]["session_sizing_nav_twd"])
+        if preserve_original or append_missing:
+            nav = float(manifest["anchor"]["total_equity_twd"] if append_missing
+                        else manifest["anchor"]["session_sizing_nav_twd"])
             symbols = {str(row["symbol"]) for row in rows if abs(float(row.get("target_weight") or 0)) > 0 and whole_lot_target_shares(
                 float(row.get("target_weight") or 0), nav, opens[str(row["symbol"])], spec.lot_size
             ) > 0}
@@ -266,7 +310,7 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
         if fetch_current:
             source["minute_source_before"] = {"requested_symbols": sorted(symbols), "missing_symbols": sorted(missing),
                                                "source_files": bar_proof.get("source_files", [])}
-        if missing and preserve_original:
+        if missing and (preserve_original or append_missing):
             raise RuntimeError(f"{day}: use canonical download_shioaji_tw_minute_kbars.py for missing local paths: {sorted(missing)}")
         if day == now.date() and fetch_current and missing:
             fetched, fetch_proof = fetch_shioaji_current_stock_minute_bars(
@@ -372,8 +416,15 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
 def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, reason: str) -> list[dict]:
     market = spec.market
     completed_replay = reason == ORIGINAL_SIGNAL_CONTRACT and all(item["end_at"] == time(13, 30) for item in sessions)
-    engine.rearm_flat_session(market, now=datetime.now(TAIPEI), reason=reason,
-                             completed_session_replay=completed_replay)
+    if reason == MISSING_SESSION_CONTRACT:
+        if len(sessions) != 1 or sessions[0]["end_at"] != time(13, 30):
+            raise RuntimeError("missing-session append requires one completed session")
+        _require_missing_session_target(engine.state["modes"][market], sessions[0]["day"])
+        if engine._session_has_fill(market, str(sessions[0]["day"])):
+            raise RuntimeError("missing-session append found existing target fills")
+    else:
+        engine.rearm_flat_session(market, now=datetime.now(TAIPEI), reason=reason,
+                                 completed_session_replay=completed_replay)
     accepted = []
     for item in sessions:
         result = engine.register_signal(
@@ -411,7 +462,8 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
             return quotes
         _replay_historical_intraday(engine, markets=[market], bars=item["bars"],
             trading_date=item["day"], end_at=item["end_at"],
-            terminal_close_quote_provider=closing if item["day"] < datetime.now(TAIPEI).date() else None)
+            terminal_close_quote_provider=closing if (item["day"] < datetime.now(TAIPEI).date()
+                or reason == MISSING_SESSION_CONTRACT) else None)
         engine.flush_deferred_ledger_writes()
         engine._persist(datetime.combine(item["day"], item["end_at"], tzinfo=TAIPEI))
         mode = engine.state["modes"][market]
@@ -458,17 +510,27 @@ def prepare(args) -> dict:
     spec, live = _spec(args.market, args.markets_dir)
     mode = _object(args.live_dir / "state.json")["modes"][args.market]
     preserve_original = getattr(args, "preserve_original_signal", False)
-    _require_empty_target(mode, preserve_original_signal=preserve_original)
-    contract = ORIGINAL_SIGNAL_CONTRACT if preserve_original else CONTRACT
+    append_missing = getattr(args, "append_missing_session", False)
+    if append_missing and preserve_original:
+        raise ValueError("missing-session append cannot rearm an original signal")
+    paths = sorted(args.signal_summary, key=lambda path: _object(path)["asof_date"])
+    if append_missing:
+        if (len(paths) != 1 or str(_object(paths[0])["asof_date"])[:10] != str(datetime.now(TAIPEI).date())
+                or datetime.now(TAIPEI).time() < time(13, 31)):
+            raise RuntimeError("missing-session append is limited to today's completed session")
+        _require_missing_session_target(mode, datetime.now(TAIPEI).date())
+    else:
+        _require_empty_target(mode, preserve_original_signal=preserve_original)
+    contract = MISSING_SESSION_CONTRACT if append_missing else ORIGINAL_SIGNAL_CONTRACT if preserve_original else CONTRACT
     manifest = {"schema_version": 2 if preserve_original else 1, "contract": contract, "simulation_only": True,
                 "preserve_original_signal": preserve_original,
+                "append_missing_session": append_missing,
                 "spec_sha256": _spec_digest(spec),
                 "production_order_possible": False, "market": args.market,
                 "live_dir": str(args.live_dir.resolve()), "operation_root": str(root),
                 "created_at": datetime.now(TAIPEI).isoformat(), "anchor": _anchor(mode),
                 "minute_roots": [str(path.resolve()) for path in
                                  (*getattr(args, "minute_data_root", []), *DEFAULT_MINUTE_DATA_ROOTS)], "sessions": []}
-    paths = sorted(args.signal_summary, key=lambda path: _object(path)["asof_date"])
     if preserve_original and (len(paths) != 1 or str(mode["session_date"]) != str(datetime.now(TAIPEI).date())
                               or datetime.now(TAIPEI).time() < time(13, 31)):
         raise RuntimeError("original-signal repair is scoped to one completed current-session replay")
@@ -477,17 +539,21 @@ def prepare(args) -> dict:
         day = date.fromisoformat(str(summary["asof_date"])[:10])
         if _has_live_fill(args.live_dir, args.market, str(day)):
             raise RuntimeError(f"{day}: live target has existing fills")
-        if day == datetime.now(TAIPEI).date():
+        if append_missing:
+            original = _missing_session_proof(spec, day, path)
+            original_id = original["signal_id"]
+        elif day == datetime.now(TAIPEI).date():
             original_id = str(mode["signal_id"])
         else:
             original_id = str(_object(args.live_dir/"position_history"/str(day)/f"{args.market}.json")["signal_id"])
-        original = _source_block_proof(spec, day, original_id, preserve_original_signal=preserve_original)
+        if not append_missing:
+            original = _source_block_proof(spec, day, original_id, preserve_original_signal=preserve_original)
         if preserve_original and (day != datetime.now(TAIPEI).date() or path.resolve() != Path(original["summary_path"])):
             raise RuntimeError("original-signal repair must use the exact consumed original artifact")
         manifest["sessions"].append({"session_date": str(day), "summary_path": str(path.resolve()),
                                      "repair_signal_id": f"{original_id}:minute-repair:{uuid.uuid4().hex[:12]}",
                                      "original": original})
-    if not manifest["sessions"] or manifest["sessions"][-1]["session_date"] != mode["session_date"]:
+    if not manifest["sessions"] or (not append_missing and manifest["sessions"][-1]["session_date"] != mode["session_date"]):
         raise ValueError("repair must end at the current empty session")
     if len({row["session_date"] for row in manifest["sessions"]}) != len(manifest["sessions"]):
         raise ValueError("duplicate repair session")
@@ -507,7 +573,7 @@ def prepare(args) -> dict:
             pins.append({"path": source["path"], "sha256": source["sha256"]})
     for source in (args.markets_dir / f"{args.market}.yaml", Path(spec.config_path)):
         pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
-    if preserve_original:
+    if preserve_original or append_missing:
         for source in (Path(__file__), ROOT/"scripts/rebuild_tw_day_trade_open_price_replay.py",
                        ROOT/"stockagent/live/tw_day_trade_simulation.py", Path(spec.checkpoint_path)):
             pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
@@ -540,7 +606,9 @@ def _apply_locked(args) -> dict:
     _assert_source_pins(pins)
     cutoff = datetime.fromisoformat(manifest["current_capture"]["completed_through"])
     preserve_original = manifest.get("preserve_original_signal") is True
-    completed_replay = (preserve_original and manifest.get("contract") == ORIGINAL_SIGNAL_CONTRACT
+    append_missing = manifest.get("append_missing_session") is True
+    completed_replay = (((preserve_original and manifest.get("contract") == ORIGINAL_SIGNAL_CONTRACT)
+                         or (append_missing and manifest.get("contract") == MISSING_SESSION_CONTRACT))
                         and len(sessions) == 1 and sessions[0]["day"] == datetime.now(TAIPEI).date()
                         and cutoff == datetime.combine(sessions[0]["day"], time(13, 30), tzinfo=TAIPEI)
                         and sessions[0]["end_at"] == time(13, 30))
@@ -554,7 +622,10 @@ def _apply_locked(args) -> dict:
         lock = _acquire_engine_lock(args.live_dir)
         engine = TwDayTradeSimulationEngine(args.live_dir, publication_clock=lambda: datetime.now(TAIPEI))
         mode = engine.state["modes"][args.market]
-        _require_empty_target(mode, preserve_original_signal=preserve_original)
+        if append_missing:
+            _require_missing_session_target(mode, sessions[0]["day"])
+        else:
+            _require_empty_target(mode, preserve_original_signal=preserve_original)
         if _anchor(mode) != manifest["anchor"]:
             raise RuntimeError("target economic state advanced after candidate preparation")
         for item in sessions:
@@ -595,6 +666,116 @@ def _apply_locked(args) -> dict:
         if active:
             subprocess.run(["systemctl", "start", SERVICE], check=True)
     return {key: manifest[key] for key in ("status", "applied_at", "applied_sessions", "non_target_modes_unchanged")}
+
+
+def recover_interrupted(args) -> dict:
+    """Recover only this tool's interrupted append, via an isolated exchange.
+
+    No live journal is truncated or edited. The entire interrupted directory
+    survives as rollback evidence; pre-operation journal bytes are retained in
+    the reconstructed directory. Existing unrelated account economics must
+    still equal the saved pre-apply state.
+    """
+    from scripts.promote_tw_day_trade_replay import _exchange_directories
+    from scripts.verify_tw_day_trade_scoped_repair import prefix_sha256
+
+    root = args.operation_root.resolve()
+    path = root / "ledger_repair_manifest.json"
+    original = _object(path)
+    if (original.get("status") != "apply_interrupted_requires_audit"
+            or original.get("append_missing_session") is not True
+            or original.get("market") != args.market
+            or original.get("live_dir") != str(args.live_dir.resolve())
+            or (root / "interrupted_manifest.json").exists()):
+        raise RuntimeError("recovery requires one exact, previously unaudited interrupted missing-session append")
+    before = _object(root / "state_before_apply.json")
+    baseline = _object(root / "journal_prefix_baseline.json")
+    revised = deepcopy(original)
+    revisions = []
+    allowed_code = {Path(__file__).resolve(), (ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py").resolve()}
+    for pin in revised["source_pins"]:
+        source = Path(pin["path"])
+        current = _sha256(source)
+        if current != pin["sha256"]:
+            if source.resolve() not in allowed_code:
+                raise RuntimeError(f"interrupted recovery source changed: {source}")
+            revisions.append({"path": str(source), "previous_sha256": pin["sha256"], "sha256": current})
+            pin["sha256"] = current
+    _assert_source_pins(revised["source_pins"])
+    spec, live = _spec(args.market, args.markets_dir)
+    if _spec_digest(spec) != original["spec_sha256"]:
+        raise RuntimeError("interrupted recovery changed execution configuration")
+    sessions, pins = _prepared_sessions(revised, spec, live, fetch_current=False)
+    _assert_source_pins(pins)
+    candidate = args.live_dir.with_name(args.live_dir.name + f".recovery-{uuid.uuid4().hex}.candidate")
+    active = subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0
+    lock = None
+    with control_lease(owner=f"interrupted-minute-repair:{args.market}", timeout_seconds=0.0):
+        try:
+            if active:
+                subprocess.run(["systemctl", "stop", SERVICE], check=True)
+            lock = _acquire_engine_lock(args.live_dir)
+            state = _object(args.live_dir / "state.json")
+            for market, mode in state["modes"].items():
+                if mode.get("ledger_state_divergence") or any(int(p.get("signed_shares") or 0)
+                        for p in (mode.get("positions") or {}).values()):
+                    raise RuntimeError(f"recovery requires reconciled flat accounts: {market}")
+                if market != args.market and _anchor(mode) != _anchor(before["modes"][market]):
+                    raise RuntimeError(f"non-target account advanced after interrupted append: {market}")
+            if state["modes"][args.market].get("signal_id") != sessions[0]["summary"]["signal_id"]:
+                raise RuntimeError("interrupted target has a different accepted decision")
+            for name, proof in baseline["journals"].items():
+                if prefix_sha256(args.live_dir / name, proof["prefix_bytes"]) != proof["sha256"]:
+                    raise RuntimeError(f"original journal prefix changed before recovery: {name}")
+            needed = sum(p.stat().st_size for p in args.live_dir.rglob("*") if p.is_file())
+            if shutil.disk_usage(args.live_dir).free < needed + 1024**3:
+                raise RuntimeError("insufficient disk for a recoverable isolated ledger copy")
+            shutil.copytree(args.live_dir, candidate, ignore=lambda _dir, names: {
+                name for name in names if name.endswith(".lock") or name.endswith(".tmp")})
+            for name, proof in baseline["journals"].items():
+                # This is a new isolated projection, never a live source file.
+                with (candidate / name).open("r+b") as handle:
+                    handle.truncate(original["journal_prefix_bytes"][name])
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            # Root execution/recovery watermarks must match the same original
+            # journal prefix, not point into the retained failed transaction.
+            _atomic_json(candidate / "state.json", deepcopy(before))
+            history_before = _object(root / "position_history_before_apply.json")
+            for item in sessions:
+                history = candidate / "position_history" / str(item["day"]) / f"{args.market}.json"
+                if str(item["day"]) in history_before:
+                    _atomic_json(history, history_before[str(item["day"])])
+                elif history.exists():
+                    history.unlink()  # Generated failed-transaction projection; live original remains retained.
+            engine = TwDayTradeSimulationEngine(candidate, publication_clock=lambda: datetime.now(TAIPEI))
+            accepted = _execute(engine, spec, sessions, reason=MISSING_SESSION_CONTRACT)
+            if _outcome(engine.state["modes"][args.market]) != original["candidate_final_outcome"]:
+                raise RuntimeError("recovery differs from the original validated financial candidate")
+            for market, mode in engine.state["modes"].items():
+                if market != args.market and _anchor(mode) != _anchor(before["modes"][market]):
+                    raise RuntimeError(f"recovery changed non-target account economics: {market}")
+            _curve_proof(candidate / "marks.jsonl", args.market, sessions)
+            for name, proof in baseline["journals"].items():
+                if prefix_sha256(candidate / name, proof["prefix_bytes"]) != proof["sha256"]:
+                    raise RuntimeError(f"recovery did not preserve original journal prefix: {name}")
+            _assert_source_pins(revised["source_pins"])
+            _atomic_json(root / "interrupted_manifest.json", original)
+            _exchange_directories(args.live_dir, candidate)
+            revised.update(status="applied", applied_at=datetime.now(TAIPEI).isoformat(),
+                applied_sessions=accepted, non_target_modes_unchanged=True, original_journals_retained=True,
+                atomic_recovery={"rollback_directory": str(candidate.resolve()),
+                    "interrupted_manifest_path": str(root / "interrupted_manifest.json"),
+                    "interrupted_manifest_sha256": _sha256(root / "interrupted_manifest.json"),
+                    "implementation_revisions": revisions, "broker_orders": 0,
+                    "original_validated_outcome_preserved": True})
+            _atomic_json(path, revised)
+        finally:
+            if lock is not None:
+                lock.close()
+            if active:
+                subprocess.run(["systemctl", "start", SERVICE], check=True)
+    return {key: revised[key] for key in ("status", "applied_at", "applied_sessions", "atomic_recovery")}
 
 
 def bridge_marks(args) -> dict:
@@ -662,7 +843,7 @@ def bridge_marks(args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "apply", "bridge-marks", "status"))
+    parser.add_argument("action", choices=("prepare", "apply", "recover-interrupted", "bridge-marks", "status"))
     parser.add_argument("--market", default="tw_day_trade_multi_basis_22")
     parser.add_argument("--live-dir", type=Path, default=ROOT/"artifacts/live/tw_day_trade_simulation")
     parser.add_argument("--markets-dir", type=Path, default=ROOT/"services/discord_bot/markets")
@@ -672,8 +853,10 @@ def main() -> None:
                         help="Additional canonical collector roots, checked before default local sources.")
     parser.add_argument("--preserve-original-signal", action="store_true",
                         help="Repair a never-filled completed minute replay without model inference or weight changes.")
+    parser.add_argument("--append-missing-session", action="store_true",
+                        help="Append today's missing completed session after flat prior history; never replace existing fills.")
     args = parser.parse_args()
-    result = prepare(args) if args.action == "prepare" else apply(args) if args.action == "apply" else bridge_marks(args) if args.action == "bridge-marks" else _object(
+    result = prepare(args) if args.action == "prepare" else apply(args) if args.action == "apply" else recover_interrupted(args) if args.action == "recover-interrupted" else bridge_marks(args) if args.action == "bridge-marks" else _object(
         args.operation_root/"ledger_repair_manifest.json")
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 

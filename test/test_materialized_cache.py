@@ -61,6 +61,79 @@ def test_use_creates_verified_hot_lease_and_stable_link(tmp_path: Path) -> None:
     )["state"] == "hot"
 
 
+def test_expired_gc_requires_exact_cold_reconstruction_not_just_object_presence(tmp_path):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", now_ns=BASE_NS)
+    resolved = resolve_packed_snapshot_id(sync_root, "prices", snapshot_id)
+    item = resolved.manifest["archive"]["objects"][0]
+    cold = sync_root / item["relpath"]
+    damaged = bytearray(cold.read_bytes())
+    damaged[len(damaged) // 2] ^= 1
+    cold.write_bytes(damaged)
+    result = evict_materialized_snapshots(sync_root, hot_root, now_ns=BASE_NS + 8 * DAY_NS)
+    assert result["evicted"] == 0
+    assert result["results"][0]["reason"].startswith("cold-recovery-failed:")
+    assert Path(lease["target"]).is_dir()
+
+
+@pytest.mark.parametrize("change", ["content", "new_file"])
+def test_gc_never_discards_unique_hot_changes_even_with_valid_cold(tmp_path, change):
+    sync_root, _ = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", now_ns=BASE_NS)
+    target = Path(lease["target"])
+    changed = target / ("prices.csv" if change == "content" else "unique.csv")
+    changed.write_text("local source values")
+    result = evict_materialized_snapshots(sync_root, hot_root, now_ns=BASE_NS + 8 * DAY_NS)
+    assert result["evicted"] == 0
+    assert changed.read_text() == "local source values"
+    assert result["results"][0]["reason"].startswith("cold-recovery-failed:")
+
+
+def test_gc_observes_hot_mutation_after_recovery_before_unlink(tmp_path, monkeypatch):
+    sync_root, _ = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", now_ns=BASE_NS)
+    target = Path(lease["target"])
+    calls = 0
+    def observe(_target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            (target / "unique.csv").write_text("keep new observation")
+        return []
+    monkeypatch.setattr(materialized_cache_module, "process_references", observe)
+    result = evict_materialized_snapshots(sync_root, hot_root, now_ns=BASE_NS + 8 * DAY_NS)
+    assert result["evicted"] == 0
+    assert result["results"][0]["reason"] == "hot-tree-changed-during-recovery"
+    assert (target / "unique.csv").is_file()
+
+
+def test_invalid_pin_is_not_silently_ignored_during_gc(tmp_path):
+    sync_root, _ = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", now_ns=BASE_NS)
+    (hot_root / "protected.pin.json").write_text('{"manifest":')
+    with pytest.raises(SnapshotError, match="cannot read cache metadata"):
+        evict_materialized_snapshots(sync_root, hot_root, now_ns=BASE_NS + 8 * DAY_NS)
+    assert Path(lease["target"]).is_dir()
+
+
+def test_gc_rechecks_pin_after_slow_independent_recovery(tmp_path, monkeypatch):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot_root, "prices", now_ns=BASE_NS)
+    def recovery(*args, **kwargs):
+        assert kwargs["reconstruct_all"] is True
+        (hot_root / "late.pin.json").write_text(json.dumps({"manifest": {"snapshot_id": snapshot_id}}))
+        return {}
+    monkeypatch.setattr(materialized_cache_module, "verify_packed_snapshot", recovery)
+    result = evict_materialized_snapshots(sync_root, hot_root, now_ns=BASE_NS + 8 * DAY_NS)
+    assert result["results"][0]["reason"] == "pinned" and result["evicted"] == 0
+    assert Path(lease["target"]).is_dir()
+
+
 def test_reuse_renews_lease_without_rewriting_materialized_file(
     tmp_path: Path,
 ) -> None:

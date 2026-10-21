@@ -6,6 +6,7 @@ This module has no collector, credential, database or network imports.
 """
 from datetime import UTC, datetime
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -14,6 +15,7 @@ from stockagent.data.finlab_acquisition_contract import process_owner, process_o
 
 
 CONTRACT_VERSION = 1
+FIRST_SNAPSHOT_TIMING_CONTRACT_VERSION = 1
 MAX_BYTES = 4096
 PHASES = frozenset({'queue_initialization', 'acceptance_recovery', 'policy_reconciliation',
     'awaiting_first_snapshot', 'snapshot_published', 'closed', 'failed'})
@@ -25,10 +27,12 @@ class NewsWorkerLifecycle:
         self.record = None
         self.last_write = 0.
         self.write_errors = 0
+        self.started_monotonic = None
 
     def started(self, owner_id):
         # Called only AFTER flock succeeded. A rejected second owner must not
         # overwrite the real owner's initialization or shutdown evidence.
+        self.started_monotonic = time.monotonic()
         self.record = {'contract_version': CONTRACT_VERSION, 'owner_id': owner_id,
             'process_owner': process_owner(), 'started_at_utc': datetime.now(UTC).isoformat(),
             'state': 'initializing'}
@@ -56,6 +60,13 @@ class NewsWorkerLifecycle:
 
     def snapshot_written(self):
         if self.record is not None:
+            # Called after durable status publication. Preserve the FIRST
+            # snapshot, not a later observer's readback or recurring heartbeat.
+            if 'first_snapshot_at_utc' not in self.record:
+                self.record.update(
+                    first_snapshot_timing_contract_version=FIRST_SNAPSHOT_TIMING_CONTRACT_VERSION,
+                    first_snapshot_at_utc=datetime.now(UTC).isoformat(),
+                    initialization_wall_seconds=max(0., time.monotonic() - self.started_monotonic))
             self.record['state'] = 'ready'
             self.phase('snapshot_published')
 
@@ -63,6 +74,23 @@ class NewsWorkerLifecycle:
         if self.record is not None:
             self.record['state'] = 'failed' if failed else 'closed'
             self.phase('failed' if failed else 'closed')
+
+
+def _first_snapshot_timing(value, started, observed):
+    """Legacy/malformed timing is unknown; never infer it from a heartbeat."""
+    try:
+        version = value.get('first_snapshot_timing_contract_version')
+        seconds = value.get('initialization_wall_seconds')
+        if (type(version) is not int or version != FIRST_SNAPSHOT_TIMING_CONTRACT_VERSION
+                or value['state'] == 'initializing' or type(seconds) not in {int, float}
+                or not math.isfinite(seconds) or seconds < 0):
+            return None, None
+        first = datetime.fromisoformat(value['first_snapshot_at_utc'])
+        if first.tzinfo is None or not started <= first <= observed:
+            return None, None
+        return first.isoformat(), seconds
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return None, None
 
 
 def read_news_worker_lifecycle(root, *, snapshot_owner_id, snapshot_at, now):
@@ -92,11 +120,14 @@ def read_news_worker_lifecycle(root, *, snapshot_owner_id, snapshot_at, now):
         supersedes = bool(not matching and (snapshot_at is None or started >= snapshot_at))
         alive = process_owner_alive(value.get('process_owner'), started_at_utc=started.isoformat(), now=now)
         count = value.get('receipts_decoded')
+        first_snapshot, initialization = _first_snapshot_timing(value, started, observed)
         return {'contract_version': CONTRACT_VERSION, 'available': True,
             'process_alive': alive, 'state': value['state'], 'phase': value['phase'],
             'started_at_utc': started.isoformat(), 'observed_at_utc': observed.isoformat(),
             'age_seconds': max(0., (now - observed).total_seconds()),
             'elapsed_seconds': max(0., (now - started).total_seconds()),
+            'first_snapshot_at_utc': first_snapshot,
+            'initialization_wall_seconds': initialization,
             'snapshot_owner_matches': matching, 'supersedes_snapshot': supersedes,
             'receipts_decoded': count if type(count) is int and count >= 0 else None}
     except (OSError, ValueError, UnicodeError, KeyError, TypeError, OverflowError):

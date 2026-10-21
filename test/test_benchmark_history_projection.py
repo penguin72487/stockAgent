@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -256,3 +257,65 @@ def test_corrupt_benchmark_projection_fails_closed(tmp_path: Path) -> None:
     assert (
         load_benchmark_projection(state_dir=tmp_path, source_path=source) is None
     )
+
+
+@pytest.mark.parametrize("product", ["tw_day_trade", "tw_overnight"])
+def test_many_new_sessions_corrections_and_removals_never_rebuild_unchanged_days(
+    tmp_path, monkeypatch, product,
+):
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    state, cache = tmp_path / "state", tmp_path / "cache"
+    state.mkdir()
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    markets = [f"mode-{index}" for index in range(5)]
+    (state / "state.json").write_text(json.dumps({"product": product, "enabled_markets": markets}))
+    path = state / "marks.jsonl"
+    rows = [{"market": market, "session_date": (datetime(2026, 8, 3) + timedelta(days=day)).date().isoformat(),
+             "minute": (datetime(2026, 8, 3, 13, 30) + timedelta(days=day)).isoformat() + "+08:00",
+             "initial_capital_twd": 1000.0, "total_equity_twd": 1000.0 + day + index / 10}
+            for day in range(16) for index, market in enumerate(markets)]
+    arguments = dict(state_dir=state, range_key="all", resolution="1m",
+                     history_encoding="minute_columns_v2", use_memory_cache=False, use_persistent_cache=False)
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows[:5]))
+    build_dashboard_history_snapshot(**arguments)
+    old_head = dashboard._history_session_head(state)
+    old_entry = old_head["sessions"]["2026-08-03"]
+    with path.open("a") as stream:
+        stream.write("".join(json.dumps(row) + "\n" for row in rows[5:]))
+    incremental = build_dashboard_history_snapshot(**arguments)
+    work = dashboard.history_projection_work(state)
+    assert work["available_sessions"] == 16
+    assert work["reused_sessions"] == 1
+    assert len(work["rebuilt_sessions"]) == 15
+    assert dashboard._history_session_head(state)["sessions"]["2026-08-03"] == old_entry
+
+    assert incremental == build_dashboard_history_snapshot(**arguments, use_session_projection=False)
+
+    # Same byte spans after a correction must not resurrect old SHA digests.
+    rows[5]["total_equity_twd"] += 1
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    corrected = build_dashboard_history_snapshot(**arguments)
+    assert dashboard.history_projection_work(state)["rebuilt_sessions"] == ["2026-08-04"]
+    assert corrected == build_dashboard_history_snapshot(**arguments, use_session_projection=False)
+    retained = [row for row in rows if row["session_date"] != "2026-08-05"]
+    path.write_text("".join(json.dumps(row) + "\n" for row in retained))
+    removed = build_dashboard_history_snapshot(**arguments)
+    work = dashboard.history_projection_work(state)
+    assert work["removed_sessions"] == ["2026-08-05"]
+    assert work["rebuilt_sessions"] == []
+    assert removed == build_dashboard_history_snapshot(**arguments, use_session_projection=False)
+    assert dashboard._history_session_head(state)["sessions"]["2026-08-03"] == old_entry
+
+    # A repair may correct an old complete row and append on the SAME inode.
+    # Growth is not proof of an unchanged prefix, even with identical spans.
+    retained[5]["total_equity_twd"] += 2
+    extra = {**retained[-1], "session_date": "2026-08-20",
+             "minute": "2026-08-20T13:30:00+08:00"}
+    with path.open("r+") as stream:
+        stream.write("".join(json.dumps(row) + "\n" for row in [*retained, extra]))
+        stream.truncate()
+    repaired_and_extended = build_dashboard_history_snapshot(**arguments)
+    work = dashboard.history_projection_work(state)
+    assert work["rebuilt_sessions"] == ["2026-08-04", "2026-08-20"]
+    assert repaired_and_extended == build_dashboard_history_snapshot(**arguments, use_session_projection=False)

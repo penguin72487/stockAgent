@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import statistics
 from typing import Any, Mapping
+from stockagent.live.dashboard_updates import read_json_snapshot
 
 from scripts.finlab_release_gate import catalog_readiness
 from stockagent.data.finlab_acquisition_contract import (
@@ -158,10 +159,7 @@ def _public_quota_series(history: list[dict], now: datetime) -> list[dict]:
 
 
 def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeError):
-        return default
+    return read_json_snapshot(path, default)
 
 
 def _utc(value: object) -> datetime | None:

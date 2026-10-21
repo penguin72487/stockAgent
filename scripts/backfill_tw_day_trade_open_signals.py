@@ -325,8 +325,10 @@ def main() -> None:
     experiment.data.live_tail_panel_rows = max(
         int(experiment.data.live_tail_panel_rows or 0), requested_tail_rows
     )
+    required_panel_end = _previous_official_session_date(twse_path, tpex_path, end)
     panel, panel_cache_hit, panel_cache_tier = _with_source_wait(
-        lambda: _build_panel(experiment, live_tail=True), seconds=args.source_wait_seconds)
+        lambda: _build_panel(experiment, live_tail=True, panel_end_date=required_panel_end.isoformat()),
+        seconds=args.source_wait_seconds)
 
     input_root = args.input_root.resolve() / market_config.market
     receipt: dict[str, Any] = {
@@ -343,6 +345,7 @@ def main() -> None:
             "dates": int(panel.num_dates),
             "symbols": int(panel.num_symbols),
             "requested_live_tail_panel_rows": requested_tail_rows,
+            "required_panel_end_date": required_panel_end.isoformat(),
             "memory_cache_hit": bool(panel_cache_hit),
             "cache_tier": str(panel_cache_tier),
         },

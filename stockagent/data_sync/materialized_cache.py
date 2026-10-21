@@ -25,9 +25,13 @@ from stockagent.data_sync.desync_snapshots import (
     _paths_overlap,
     _utc_iso_from_ns,
     atomic_write_json,
+    scan_tree,
     validate_slug,
 )
 from stockagent.data_sync.packed_snapshots import (
+    _open_inventory,
+    _validate_inventory,
+    _verify_materialized,
     fetch_packed_snapshot,
     resolve_latest_packed,
     resolve_packed_snapshot_id,
@@ -323,12 +327,12 @@ def _pinned_snapshot_ids(materialized_root: Path) -> set[str]:
         try:
             value = _read_json(path)
             manifest = value.get("manifest", {})
-            if isinstance(manifest, Mapping):
-                snapshot_id = manifest.get("snapshot_id")
-                if snapshot_id:
-                    pinned.add(str(snapshot_id))
+            if not isinstance(manifest, Mapping) or not isinstance(manifest.get("snapshot_id"), str):
+                raise SnapshotError(f"cache pin has unknown protection schema: {path}")
+            pinned.add(validate_slug(manifest["snapshot_id"], "pinned snapshot"))
         except SnapshotError:
-            continue
+            # A broken pin is unknown protection, never evidence of no pin.
+            raise
     return pinned
 
 
@@ -843,6 +847,40 @@ def _evict_one(
             result["process_references"] = references
         return result
     if not force and int(lease.get("expires_ns", 0)) > now_ns:
+        return result
+    try:
+        before_recovery = scan_tree(target)["stability_fingerprint_sha256"]
+        if external_cold_proof is None:
+            native = (sync_root.resolve() == Path("/srv/stockagent-packed")
+                      and (sync_root / ".stockagent-d-primary").is_file()
+                      and bool(os.environ.get("WSL_DISTRO_NAME"))
+                      and shutil.which("powershell.exe") is not None)
+            verify_packed_snapshot(sync_root, resolved, reconstruct_all=True, materialized_path=target,
+                                   d_primary_native_blob_reads=native, d_primary_native_pack_reads=native)
+        else:
+            # Index-only edges retain their controller's durable-peer proof;
+            # they must ALSO prove that no unique hot edits would be removed.
+            with _open_inventory(sync_root, resolved.manifest) as entries:
+                _validate_inventory(resolved.manifest, entries)
+                _verify_materialized(target, resolved.manifest, entries)
+    except (OSError, SnapshotError) as exc:
+        result["reason"] = f"cold-recovery-failed: {exc}"
+        return result
+    # Cold I/O can take minutes. Recheck protection at the actual retirement
+    # boundary, not just before the independent reconstruction started.
+    if snapshot_id in _pinned_snapshot_ids(materialized_root):
+        result["reason"] = "pinned"
+        return result
+    references = process_references(target)
+    if references:
+        result.update(reason="in-use", process_references=references)
+        return result
+    try:
+        if scan_tree(target)["stability_fingerprint_sha256"] != before_recovery:
+            result["reason"] = "hot-tree-changed-during-recovery"
+            return result
+    except (OSError, SnapshotError) as exc:
+        result["reason"] = f"hot-stability-incomplete: {exc}"
         return result
     result["action"] = "would-evict" if dry_run else "evicted"
     result["reason"] = "forced" if force else "lease-expired"

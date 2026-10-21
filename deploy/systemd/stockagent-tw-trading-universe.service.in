@@ -16,7 +16,10 @@ ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_
 TimeoutStartSec=120
 Restart=on-failure
 RestartSec=30s
-RestartPreventExitStatus=65
+# 75 is a durable waiting_source/waiting_calendar receipt, not a crash.
+# The next calendar checkpoint retries it without a 30s restart storm.
+SuccessExitStatus=75
+RestartPreventExitStatus=65 75
 Nice=5
 CPUWeight=25
 IOWeight=25

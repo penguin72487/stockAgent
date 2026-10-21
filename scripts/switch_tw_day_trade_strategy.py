@@ -73,6 +73,7 @@ from stockagent.live.feature_source_contract import (  # noqa: E402
     require_live_feature_source,
 )
 from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
 )
 
@@ -279,6 +280,7 @@ def _current_deployment_evidence(
     end_date: date,
     session_count: int,
     expected_minute_rows: int,
+    required_replay_entry_contract: str = REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     try:
@@ -315,7 +317,7 @@ def _current_deployment_evidence(
     replay_entry_contract = str(
         (component_rebuild.get("replay_contract") or {}).get("entry") or ""
     )
-    if replay_entry_contract != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE:
+    if replay_entry_contract != required_replay_entry_contract:
         reasons.append("replay_entry_contract_version_mismatch")
     price_contract = (component_rebuild.get("replay_contract") or {}).get("order_price_contract_version")
     if type(price_contract) is not int or price_contract != TW_ORDER_PRICE_CONTRACT_VERSION:
@@ -363,7 +365,7 @@ def _current_deployment_evidence(
         "target_signal_summaries": summary_count,
         "target_checkpoint_fingerprints": sorted(observed_fingerprints),
         "replay_entry_contract": replay_entry_contract,
-        "required_replay_entry_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+        "required_replay_entry_contract": required_replay_entry_contract,
         "order_price_contract_version": price_contract,
         "required_order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
         "promoted_at": promotion.get("promoted_at"),
@@ -806,7 +808,10 @@ def _build_addition_plan(args, config, config_path, experiment_path, experiment,
         live_dir=live, market=config.market, live_output=_resolved(resolved_live_output_dir(config)),
         checkpoint_fingerprint=str(short_file_fingerprint(_resolved(Path(config.checkpoint_path)))),
         initial_capital_twd=capital, start_date=start, end_date=end, session_count=len(sessions),
-        expected_minute_rows=len(sessions)*len(expected)*270)
+        expected_minute_rows=len(sessions)*len(expected)*270,
+        required_replay_entry_contract=(REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            if getattr(args, "historical_full_fill_0901", False)
+            else REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE))
     if config.market in active and not current["matches"]:
         raise ValueError("addition cannot replace an already active market")
     resumed = getattr(args, "resume_addition_candidate", None)
@@ -835,7 +840,11 @@ def _build_addition_plan(args, config, config_path, experiment_path, experiment,
             "history": {"start_date": str(start), "end_date": str(end),
                 "latest_completed_session": str(latest), "session_count": len(sessions),
                 "points_per_session_mode": 270, "expected_strategy_minute_rows": len(sessions)*len(expected)*270,
-                "official_calendar_sha256": digest},
+                "official_calendar_sha256": digest,
+                **({"replay_entry_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                    "historical_entry_time": "09:01:00 Asia/Taipei",
+                    "liquidity_assumption": "full_legal_NAV_funded_target_no_liquidity_claim"}
+                   if getattr(args, "historical_full_fill_0901", False) else {})},
             "source_ledger": {"policy": "retain_existing_decision_and_execution_bytes_and_account_states"},
             "source_ledger_repairs": []}
 
@@ -1105,6 +1114,14 @@ def _ensure_discord_deployment_schedule(market: str, *, run_dir: Path, env_path:
     return receipt
 
 
+def _addition_replay_flags(args, *, market: str, live: Path) -> list[str]:
+    """An explicit retrospective scenario, never a live execution setting."""
+    if not getattr(args, "historical_full_fill_0901", False):
+        return []
+    return ["--historical-full-fill-0901", "--source-ledger-dir", str(live),
+            "--allow-unpinned-market", market]
+
+
 def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
     """Accept an independent replay, retain old accounts, then use the promoter."""
     from stockagent.live.day_trade_addition import merge_addition, preserve_aborted_activation, validate_aborted_activation
@@ -1194,7 +1211,8 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             "--start-date", history["start_date"], "--end-date", history["end_date"],
             "--benchmark-state-source", str(live / "state.json"),
             "--benchmark-history-source", str(live / "benchmark_history.json"),
-                "--replay-intraday-kbars"], run_dir=run))
+                "--replay-intraday-kbars",
+                *_addition_replay_flags(args, market=market, live=live)], run_dir=run))
         def curves(state_dir, stage):
             state = _object(state_dir / "state.json")
             carried = any(mode.get("margin_carry_contract") for mode in state["modes"].values())
@@ -1595,6 +1613,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepared-candidate", type=Path,
                         help="Fully rebuilt and minute-validated isolated history candidate; requires --history-extension.")
     parser.add_argument("--add-mode", action="store_true", help="Add an independent paper mode; retain all current accounts and execution bytes.")
+    parser.add_argument("--historical-full-fill-0901", action="store_true",
+                        help="Explicit addition-only historical scenario: a full legal NAV-funded target at sourced 09:01 prices; no liquidity or broker-fill claim. Keep this flag for verify.")
     parser.add_argument("--staged-signal-root", type=Path, help="Reuse an isolated signal root only after full checkpoint/session validation; addition only.")
     parser.add_argument("--resume-addition-candidate", type=Path,
                         help="Revalidate an exact failed, unpromoted additive candidate; preserve any provably unfunded aborted activation.")
@@ -1664,6 +1684,8 @@ def _recover_promoted_consumers(args, plan, previous_operation):
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.historical_full_fill_0901 and not args.add_mode:
+        raise ValueError("--historical-full-fill-0901 requires --add-mode; never changes live execution")
     if args.prepared_candidate and not args.history_extension:
         raise ValueError("--prepared-candidate requires --history-extension")
     if args.history_extension and (args.add_mode or args.candidate_preflight or args.staged_signal_root

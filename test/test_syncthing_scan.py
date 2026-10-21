@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from types import SimpleNamespace
 import urllib.parse
+import urllib.error
+import io
 import json
 
 import pytest
@@ -125,6 +127,35 @@ def test_scan_failure_keeps_both_original_and_concurrent_queue(
     assert json.loads(pending.read_text())["new_object_paths"] == [
         "objects/blobs/new.blob", "objects/blobs/old.blob",
     ]
+
+
+@pytest.mark.parametrize("body,reason", [
+    (b"insufficient space on disk for database (/private/db): current 0.37 % < required 1 %", "database_disk_reserve"),
+    (b"insufficient space on disk for folder", "folder_disk_reserve"),
+    (b"private authentication details must not be logged", "unclassified_http_error"),
+    (b"x" * 8192 + b"insufficient space on disk for database", "unclassified_http_error"),
+])
+def test_scan_http_error_is_bounded_classified_and_keeps_durable_intent(
+    queue_root, scan_api, monkeypatch, body, reason,
+):
+    streams = []
+    class BoundedBody(io.BytesIO):
+        def read(self, size=-1):
+            assert size == 8192
+            return super().read(size)
+
+    def unavailable(request, **kwargs):
+        stream = BoundedBody(body)
+        streams.append(stream)
+        raise urllib.error.HTTPError(request.full_url, 500, "Internal Server Error", {}, stream)
+
+    monkeypatch.setattr(scan.urllib.request, "urlopen", unavailable)
+    with pytest.raises(SnapshotError, match=reason) as error:
+        scan.scan_after_publish(queue_root, "dataset", new_object_paths=("objects/blobs/a.blob",))
+    assert streams and all(stream.closed for stream in streams)
+    assert "/private/db" not in str(error.value)
+    assert "authentication details" not in str(error.value)
+    assert (queue_root / ".local-state/scan-pending/dataset.json").is_file()
 
 
 @pytest.mark.parametrize("contents", ["{", "{}", json.dumps({

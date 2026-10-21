@@ -733,7 +733,7 @@ def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
     assert 'src="dashboard-core.js?v=15"' in html
-    assert 'src="public.js?v=16"' in html
+    assert 'src="public.js?v=17"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
     assert 'id="shioaji-health"' in html
@@ -2588,6 +2588,13 @@ def test_public_gateway_protocol_is_read_only_fail_closed_and_hardened() -> None
         assert traffic["cache"]["maximum_resident_bytes"] == 128 * 1024 * 1024
         assert "cache_resident_bytes" in traffic["definitions"]
         assert "cache_capacity" in traffic["definitions"]
+        incremental = traffic["daily_incremental"]
+        assert incremental["scope"] == "current_process_observations_not_live_readiness"
+        assert incremental["source_snapshots"]["decodes"] >= 0
+        assert incremental["source_snapshots"]["hits"] >= 0
+        assert set(incremental["history_projections"]) == {"tw-day-trade", "tw-overnight"}
+        assert str(server.repo_root) not in json.dumps(incremental)
+        assert "daily_incremental" in traffic["definitions"]
         assert response.getheader("Server-Timing") is not None
 
         connection.request("GET", "/traffic/api/history?range=24h")

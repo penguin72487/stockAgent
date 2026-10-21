@@ -16,9 +16,13 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
 import threading
 import time
 from urllib.parse import urlsplit
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bs4 import BeautifulSoup
 
@@ -142,13 +146,37 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resolve-redirect-only", action="store_true",
                         help="Inspect a reviewed public link's response headers; never follow its destination")
+    parser.add_argument('--require-current-missing-body-failure', action='store_true',
+                        help='Read-only exact failed-head preflight before taking the canonical HTTP lock')
+    parser.add_argument('--failure-code', choices=['redirect_not_article'],
+                        help='Explicit current missing-body redirect failure; requires no-follow diagnosis')
     args = parser.parse_args(argv)
     if len(args.probe) > 8:
         parser.error("at most eight explicitly selected access probes")
+    if (args.require_current_missing_body_failure != bool(args.failure_code)
+            or args.failure_code and not args.resolve_redirect_only):
+        parser.error('current redirect failure requires explicit code, exact-head preflight and no-follow diagnosis')
     config, registry, repo = load_config(args.config)
+    from scripts.probe_news_sources import require_diagnostic_owner_scope, require_current_missing_body_failures
+    canonical_config, canonical_registry, _ = load_config(repo / 'configs/news_fulltext.json')
+    require_diagnostic_owner_scope(config, registry, canonical_config, canonical_registry, repo)
     groups = defaultdict(list)
     for url in args.probe:
         groups[registry.require(url).provider].append(url)
+    failure_grant = None
+    if args.require_current_missing_body_failure:
+        try:
+            failure_grant = require_current_missing_body_failures(
+                repo / config['root'], args.probe, registry, failure_code=args.failure_code)
+        except ValueError as error:
+            if str(error) != 'probe_no_longer_a_due_failed_missing_body':
+                raise
+            args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            atomic_write_json(args.output, {'contract_version': 1, 'observed_at_utc': utc_now(),
+                'state': 'skipped_no_longer_due_failed_missing_body', 'probes': [],
+                'publisher_requests': 0, 'source_states_mutated': False, 'publish': False,
+                'all_sites_downloaded': False})
+            return 0
     trace = AccessTrace(registry)
     http = NewsHTTP(registry, config, repo / config["root"], access_observer=trace.observe)
     try:
@@ -165,6 +193,9 @@ def main(argv=None):
             "implementation_sha256": {str(p): sha256_file(p) for p in (
                 Path(__file__), repo / "downloader/news_fulltext_http.py")},
         }
+        if failure_grant is not None:
+            result['current_failed_missing_body_preflight'] = failure_grant
+            result['failure_probe_code'] = args.failure_code
         args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         atomic_write_json(args.output, result)
         print(json.dumps({k: v for k, v in result.items() if k not in {"performance", "implementation_sha256"}}, ensure_ascii=False))

@@ -37,6 +37,10 @@ PROGRESS_STATES = frozenset({
     "selector_scope_repartitioned",
     "metadata_retry_scheduled",
 })
+# These transitions commit a smaller, exact pending scope before claiming any
+# desktop attempt. The preceding real query already paid its configured gap;
+# local queue work must not add another source-rate-limit sleep.
+LOCAL_PLANNING_STATES = frozenset({"api_scope_repartitioned", "selector_scope_repartitioned"})
 SAFETY_STATES = frozenset({
     "desktop_interface_recovery_required", "inflight_requires_recovery",
     "unknown_outcome_no_auto_retry", "source_validation_failed", "local_storage_failed",
@@ -343,6 +347,27 @@ def recover_retained_desktop_response(root: Path, bridge, config: dict, *, befor
     return recovered
 
 
+def _replay_context_fingerprint(root: Path) -> str | None:
+    """Local ownership changes may wake a failed inspection, not reset quota.
+
+    Exclude the watchdog's observation clock, which changes every minute even
+    when nothing was repaired. Never publish private desktop identifiers.
+    """
+    import hashlib
+    try:
+        paths = [root/'desktop_session.json', root/'desktop_startup_status.json']
+        if any(p.is_symlink() or not p.is_file() or p.stat().st_size > 16384 for p in paths):
+            return None
+        session = paths[0].read_bytes()
+        status = json.loads(paths[1].read_text())
+        if not isinstance(status, dict):
+            return None
+        identity = [hashlib.sha256(session).hexdigest(), status.get('private_evidence_sha256')]
+        return hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
     """Use the canonical once-only replay ledger under a standing user grant.
 
@@ -386,22 +411,26 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
         pass
     if not isinstance(previous, dict):
         previous = {}
+    context = _replay_context_fingerprint(root)
+    context_changed = context is not None and previous.get('context_fingerprint') != context
     status = {'contract': AUTHORIZED_REPLAY_CONTRACT, 'task_id': task['task_id'],
               'query_attempt_id': attempt, 'observed_at_utc': now.isoformat(),
+              'context_fingerprint': context,
               'original_unknown_evidence_retained': True, 'possible_additional_provider_usage': True,
               'performed': False, **window}
     if not window['allowed']:
         status['state'] = window['reason']
         atomic_write_json(path, status)
         return status
-    if previous.get('contract') == AUTHORIZED_REPLAY_CONTRACT and previous.get('query_attempt_id') == attempt:
+    if (not context_changed and previous.get('contract') == AUTHORIZED_REPLAY_CONTRACT
+            and previous.get('query_attempt_id') == attempt):
         try:
             due = datetime.fromisoformat(previous['next_check_at_utc'])
             if due.tzinfo is not None and now < due <= now + timedelta(seconds=300):
                 return {**previous, 'performed': False}
         except (KeyError, ValueError, TypeError):
             pass
-    failures = previous.get('failures', 0) if previous.get('query_attempt_id') == attempt else 0
+    failures = previous.get('failures', 0) if not context_changed and previous.get('query_attempt_id') == attempt else 0
     failures = failures if type(failures) is int and 0 <= failures <= 100000 else 0
     cooldown = min(policy['cooldown_max_seconds'], policy['cooldown_base_seconds'] * 2**min(failures, 6))
     status.update(state='checking_authorized_replay', failures=failures + 1,
@@ -409,18 +438,25 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
     atomic_write_json(path, status)
     prepared = root / 'requests' / (attempt + '.json')
     raw = root / 'raw' / (attempt + '.json')
+    failure_phase = 'original_recovery_proof'
     try:
         if raw.exists():
             raise ValueError('Saved original result must be reconciled, never replayed')
         request = task_request(root, task)
-        interop = script_prepare = orphan_loss = interrupted_write = False
-        from downloader.tej_startup import orphan_desktop_loss_proof
+        interop = script_prepare = orphan_loss = worker_loss = interrupted_write = False
+        from downloader.tej_startup import orphan_desktop_loss_proof, surviving_desktop_worker_loss_proof
         try:
             orphan_desktop_loss_proof(root, task, request, prepared)
             orphan_loss = True
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        if orphan_loss:
+        if not orphan_loss:
+            try:
+                surviving_desktop_worker_loss_proof(root, task, request, prepared)
+                worker_loss = True
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        if orphan_loss or worker_loss:
             pass  # Original owner was independently proven lost, not unsent.
         elif raw.with_suffix('.json.stage.json').exists():
             try:
@@ -440,9 +476,11 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
             except ValueError:
                 unstaged_interop_diagnostic(root, task, request, prepared, script_preparation=True)
                 script_prepare = True
+        failure_phase = 'fresh_runtime_readback_and_replay'
         result = retry_unknown_download(root, task['task_id'], bridge, prepared,
             allow_unstaged_interop=interop, allow_unstaged_script_preparation=script_prepare,
             allow_orphaned_desktop_loss=orphan_loss,
+            allow_orphaned_worker_loss=worker_loss,
             allow_interrupted_stage_write=interrupted_write,
             standing_authorization=policy)
         status.update(state=result['state'], performed=True, failures=0,
@@ -457,9 +495,22 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
                 current = con.execute('SELECT * FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()
                 next_window = authorized_replay_window(con, dict(current), policy, observed)
                 status['next_check_at_utc'] = next_window['next_check_at_utc']
-    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, TypeError, KeyError, AttributeError):
+    except (ValueError, OSError, RuntimeError, subprocess.SubprocessError, TypeError, KeyError, AttributeError) as exc:
         if not status['performed']:
             status['state'] = 'authorized_replay_context_unverified'
+        # Exact private cause is retained once per bounded inspection, not
+        # swallowed into an opaque public state or copied into public logs.
+        import uuid
+        diagnostic = root/'diagnostics'/(attempt+'-replay-check-'+uuid.uuid4().hex+'.json')
+        from downloader.artifact_io import atomic_write_bytes
+        detail = {'contract':'exact_authorized_replay_failure_diagnostic_v1',
+            'task_id':task['task_id'], 'query_attempt_id':attempt,
+            'observed_at_utc':datetime.now(UTC).isoformat(), 'phase':failure_phase,
+            'exception_type':type(exc).__name__, 'private_diagnostic':str(exc)[:4096],
+            'original_unknown_evidence_retained':True, 'source_rows_adopted':False}
+        atomic_write_bytes(diagnostic, json.dumps(detail,ensure_ascii=False).encode(), mode=0o600)
+        status['failure_phase'] = failure_phase
+        status['failure_diagnostic_path'] = str(diagnostic.relative_to(root))
         status['next_check_at_utc'] = (datetime.now(UTC) + timedelta(seconds=cooldown)).isoformat()
     atomic_write_json(path, status)
     return status
@@ -551,10 +602,13 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
 
     def wait(state: str, seconds: float) -> None:
         remaining = seconds
+        desktop_watch = (state in {'waiting_desktop','waiting_recovery'}
+                         and config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True)
+        recovery_context = _replay_context_fingerprint(root) if desktop_watch and state == 'waiting_recovery' else None
         while remaining > 0 and not stop.is_set():
             publish(state, wait=remaining)
             step = min(remaining, policy.heartbeat_seconds)
-            if state == 'waiting_desktop' and config.get('automation', {}).get('desktop_startup', {}).get('enabled') is True:
+            if desktop_watch:
                 # Local readiness only: no API/GUI probes or new source claim.
                 # Keep telemetry on its original heartbeat, but wake within
                 # five seconds of the Interactive relay being restored.
@@ -563,7 +617,10 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                     tick = min(5, part)
                     stop.wait(tick)
                     part -= tick
-                    if not stop.is_set() and check_desktop_ready():
+                    changed = (state == 'waiting_desktop' or
+                               (current := _replay_context_fingerprint(root)) is not None
+                               and current != recovery_context)
+                    if not stop.is_set() and changed and check_desktop_ready():
                         return
             else:
                 stop.wait(step)
@@ -674,7 +731,9 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         query_started = time.monotonic()
                         last_result = runner(root, bridge)
                         ran_query = True
-                        delay = remaining_query_interval(config,time.monotonic()-query_started)
+                        elapsed = time.monotonic() - query_started
+                        delay = (0 if last_result in LOCAL_PLANNING_STATES
+                                 else remaining_query_interval(config, elapsed))
                     if ran_query:
                         if replay_result and replay_result.get('performed'):
                             last_result = replay_result['state']

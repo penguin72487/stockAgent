@@ -179,8 +179,20 @@ def verify(root: Path, api_bases: list[str]) -> dict:
     for name, proof in original["journals"].items():
         path = live / name
         stat = path.stat()
-        if ((stat.st_dev, stat.st_ino) != (proof["device"], proof["inode"])
-                or prefix_sha256(path, proof["prefix_bytes"]) != proof["sha256"]):
+        identity_matches = (stat.st_dev, stat.st_ino) == (proof["device"], proof["inode"])
+        if not identity_matches and manifest.get("atomic_recovery"):
+            recovery = manifest["atomic_recovery"]
+            failed_path = Path(recovery["interrupted_manifest_path"])
+            if repair._sha256(failed_path) != recovery["interrupted_manifest_sha256"]:
+                raise RuntimeError("interrupted recovery manifest changed")
+            rollback = Path(recovery["rollback_directory"]).resolve(strict=True)
+            if rollback == live.resolve() or rollback.parent != live.resolve().parent:
+                raise RuntimeError("recovery rollback is not a distinct same-parent directory")
+            old_path = rollback / name
+            old = old_path.stat()
+            identity_matches = ((old.st_dev, old.st_ino) == (proof["device"], proof["inode"])
+                and prefix_sha256(old_path, proof["prefix_bytes"]) == proof["sha256"])
+        if (not identity_matches or prefix_sha256(path, proof["prefix_bytes"]) != proof["sha256"]):
             raise RuntimeError(f"original journal prefix changed: {name}")
     state = repair._object(live / "state.json")
     mode = state["modes"][market]

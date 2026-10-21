@@ -1,4 +1,5 @@
 from datetime import date, datetime
+import json
 
 import polars as pl
 import pytest
@@ -39,6 +40,17 @@ def test_legacy_stock_and_domestic_index_completion_keep_1345_boundary():
     validate_kbar_completion(_completion(14), product="TX", asset_class="index_future")
     with pytest.raises(ValueError, match="before the completed"):
         validate_kbar_completion(dict(_completion(14), finished_at_utc="2026-09-03T05:44:59Z"))
+
+
+def test_selected_completed_kbar_subset_does_not_require_unreviewed_query_end_rules():
+    receipt=dict(_completion(14),end='2026-10-20',finished_at_utc='2026-10-21T00:00:00Z')
+    validate_kbar_completion(receipt,product='DDF',through=DAY)
+    with pytest.raises(ValueError,match='outside verified'):
+        validate_kbar_completion(receipt,product='DDF')
+    with pytest.raises(ValueError,match='outside query'):
+        validate_kbar_completion(receipt,product='DDF',through=date(2026,9,2))
+    with pytest.raises(ValueError,match='before the completed'):
+        validate_kbar_completion(dict(receipt,finished_at_utc='2026-09-03T05:44:59Z'),product='DDF',through=DAY)
 
 
 def _write_sources(root, *, product="OCF", kind="etf_future", extra_time=(16, 0),
@@ -96,6 +108,52 @@ def test_reader_rejects_extended_session_receipt_completed_at_1400(tmp_path):
     selected = _write_sources(tmp_path, overlap=False, finished="2026-09-03T06:00:00Z")
     with pytest.raises(ValueError, match="before the completed"):
         read_futures_kbar_sources(tmp_path, selected, [DAY], all_futures=True)
+
+
+def _add_second_fixture_day(root, *, bad_first=False):
+    for path in root.glob("contracts/*/*/kbars/*/data.parquet"):
+        raw = pl.read_parquet(path)
+        receipt_path = path.with_name("receipt.json")
+        receipt = json.loads(receipt_path.read_text())
+        if receipt["end"] == str(NEXT):
+            raw = pl.concat([raw, raw.with_columns(
+                (pl.col("ts") + 86_400_000_000_000).alias("ts"), pl.lit(NEXT).alias("trading_date"))])
+        if bad_first:
+            raw = raw.with_columns(pl.when(pl.col("trading_date") == DAY)
+                .then(pl.col("Amount") * 2000).otherwise(pl.col("Amount")).alias("Amount"))
+        atomic_write_parquet(path, raw)
+        receipt.update(sha256=sha256_file(path), rows=raw.height,
+            observed_trading_dates=sorted(map(str, raw["trading_date"].unique())))
+        atomic_write_json(receipt_path, receipt)
+
+
+def test_kbar_alias_maps_distinct_lifetimes_by_date_without_parsing_identity(tmp_path):
+    selected = _write_sources(tmp_path, conflict=False).with_columns(pl.lit("202609").alias("contract"))
+    _add_second_fixture_day(tmp_path)
+    selected = pl.concat([selected.with_columns(pl.lit("opaque-old").alias("physical_contract")),
+        selected.with_columns(pl.lit(NEXT).alias("date"), pl.lit("opaque-new").alias("physical_contract"))])
+    bars, _, missing = read_futures_kbar_sources(tmp_path, selected, [DAY,NEXT], all_futures=True)
+    assert not missing
+    assert bars.select("date","physical_contract").unique().sort("date").rows() == [
+        (DAY,"opaque-old"),(NEXT,"opaque-new")]
+    ambiguous = pl.concat([selected, selected.head(1).with_columns(pl.lit("other").alias("physical_contract"))])
+    with pytest.raises(ValueError,match="ambiguous dated"):
+        read_futures_kbar_sources(tmp_path, ambiguous, [DAY,NEXT], all_futures=True)
+
+
+def test_invalid_price_day_is_retained_as_gap_without_losing_valid_other_day(tmp_path):
+    selected = _write_sources(tmp_path, conflict=False)
+    _add_second_fixture_day(tmp_path, bad_first=True)
+    selected = pl.concat([selected, selected.with_columns(pl.lit(NEXT).alias("date"))])
+    with pytest.raises(ValueError,match="price scale mismatch"):
+        read_futures_kbar_sources(tmp_path, selected, [DAY,NEXT], all_futures=True)
+    rejected = []
+    bars, _, missing = read_futures_kbar_sources(tmp_path, selected, [DAY,NEXT],
+        all_futures=True, invalid_source_days=rejected)
+    assert missing == [{"date":str(DAY),"physical_contract":"OCF:202609"}]
+    assert bars["date"].unique().to_list() == [NEXT]
+    assert rejected and all(r["date"] == str(DAY) and r["status"] == "rejected_source_day" for r in rejected)
+    assert all(sha256_file(r["path"]) == r["sha256"] for r in rejected)
 
 
 def test_minute_validator_rechecks_product_proof_after_hash_valid_rewrite(tmp_path):

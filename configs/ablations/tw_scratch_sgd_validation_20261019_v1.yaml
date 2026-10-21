@@ -1,0 +1,52 @@
+# Fresh controls for the successful normalized parameter-MGDA / SGD mechanism.
+# Every checkpoint is validation-selected by pure net log utility.
+# The repeatedly observed 2026 interval remains retrospective research.
+base_spec: tw_scratch_gradient_geometry_20261019_v1.yaml
+output_root: artifacts/markets/tw_scratch_sgd_validation_20261019_v1
+matrix:
+  include_baseline: false
+  base_overrides:
+    training:
+      loss_type: trajectory_mgda_l2_parameter
+      optimizer_name: sgd
+      optimizer_options: {momentum: 0.0, dampening: 0.0, nesterov: false}
+      learning_rate: 0.1
+      weight_decay: 0.0
+  dimensions:
+    - name: sgd_validation
+      enabled: true
+      variants:
+        - name: unit_mgda_control
+          description: Repeat the successful configuration with identical seed, source and fresh initialization.
+          overrides: {}
+        - name: simple_log
+          description: One simple log-utility gradient tests whether multiobjective passes are necessary.
+          overrides:
+            training:
+              loss_type: log_utility
+        - name: simple_log_small_step
+          description: A smaller pure-SGD step controls for the different norm of the single-log gradient.
+          overrides:
+            training:
+              loss_type: log_utility
+              learning_rate: 0.03
+        - name: unit_mgda_half_step
+          description: Half scalar step brackets finite-step sensitivity without rotating the update.
+          overrides:
+            training:
+              learning_rate: 0.05
+        - name: unit_mgda_double_step
+          description: Double scalar step tests whether faster movement remains useful under exact validation.
+          overrides:
+            training:
+              learning_rate: 0.2
+        - name: recent4_unit_mgda
+          description: Match the winning SGD geometry while training only on 2021 through 2024.
+          overrides:
+            walk_forward:
+              split_start_year: 2021
+        - name: two_year_validation
+          description: Train through 2023 and select on both 2024 and 2025 rather than one market regime.
+          overrides:
+            walk_forward:
+              val_years: 2

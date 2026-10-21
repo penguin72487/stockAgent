@@ -454,15 +454,23 @@ def _slice_panel_start(panel: PanelData, panel_start_date: np.datetime64 | None)
     def sliced(values: np.ndarray | None) -> np.ndarray | None:
         return None if values is None else values[slc]
 
+    if getattr(panel.features, "_stockagent_factorized_features", False):
+        features = panel.features.slice_dates(start)
+        fingerprints = {**(panel.content_fingerprints or {}), "features": features.content_fingerprint}
+    else:
+        features, fingerprints = panel.features[slc], panel.content_fingerprints
+
     print(
         f"[panel] applied inclusive panel_start_date={panel_start_date}; "
         f"kept {panel.num_dates - start}/{panel.num_dates} dates"
     )
-    return PanelData(
+    return replace(
+        panel,
         dates=panel.dates[slc],
         symbols=panel.symbols,
         feature_names=panel.feature_names,
-        features=panel.features[slc],
+        features=features,
+        content_fingerprints=fingerprints,
         overnight_1325_available=sliced(panel.overnight_1325_available),
         overnight_1325_source=panel.overnight_1325_source,
         overnight_1325_close_fallback_mask=sliced(panel.overnight_1325_close_fallback_mask),
@@ -525,7 +533,7 @@ def slice_panel_end(panel: PanelData, panel_end_date: str | date | np.datetime64
     if stop == len(panel_dates):
         return panel
     row_fields = (
-        "dates", "features", "returns_1d", "tradable_mask", "alive_mask",
+        "dates", "returns_1d", "tradable_mask", "alive_mask",
         "benchmark_returns", "close_prices", "daily_volumes", "can_buy_mask",
         "can_sell_mask", "can_short_open_mask", "can_short_open_open_mask",
         "force_short_cover_mask", "force_exit_mask", "short_capacity_shares",
@@ -541,6 +549,12 @@ def slice_panel_end(panel: PanelData, panel_end_date: str | date | np.datetime64
         name: (None if (value := getattr(panel, name)) is None else value[:stop])
         for name in row_fields
     }
+    if getattr(panel.features, "_stockagent_factorized_features", False):
+        features = panel.features.prefix_dates(stop)
+        updates.update(features=features, content_fingerprints={
+            **(panel.content_fingerprints or {}), "features": features.content_fingerprint})
+    else:
+        updates.update(features=panel.features[:stop])
     print(f"[panel] applied inclusive verified panel_end_date={end_date}; kept {stop}/{len(panel_dates)} dates")
     return replace(panel, **updates)
 
@@ -681,7 +695,7 @@ class _CorporateActionReference:
 
 
 def _symbol_name_from_path(path: Path) -> str:
-    return path.name.removesuffix(FEATURE_FILE_SUFFIX)
+    return path.name.removesuffix(".manifest.json").removesuffix(FEATURE_FILE_SUFFIX)
 
 
 def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
@@ -692,7 +706,8 @@ def _normalize_external_feature_path(path: str | Path | None) -> Path | None:
         return None
     # Catalog-managed live/materialized aliases must have one cache identity.
     # Resolving here also binds a materialized symlink to its exact release.
-    return Path(text).resolve()
+    from stockagent.data.partitioned_parquet import resolve_source
+    return resolve_source(Path(text)).resolve()
 
 
 def _resolve_external_data_path(
@@ -1242,7 +1257,8 @@ def _resolve_external_feature_projection(
         return None, None
     if pq is None:
         raise RuntimeError("external TW public features require pyarrow")
-    columns = pq.read_schema(path).names
+    from stockagent.data.partitioned_parquet import read_schema
+    columns = read_schema(path).names
     missing = {"date", "symbol"} - set(columns)
     if missing:
         raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
@@ -1274,11 +1290,15 @@ def _load_external_feature_arrays(
 ) -> _ExternalFeatureArrays:
     if pl is None or pq is None:
         raise RuntimeError("external TW public features require polars and pyarrow")
+    from stockagent.data.partitioned_parquet import resolve_source
+    path = resolve_source(path)
     if not path.exists():
         raise FileNotFoundError(f"external feature parquet not found: {path}")
 
     required = {"date", "symbol"}
-    parquet_columns = list(pq.read_schema(path).names)
+    from stockagent.data.partitioned_parquet import ParquetSource
+    source = ParquetSource(path)
+    parquet_columns = list(source.schema.names)
     missing = required - set(parquet_columns)
     if missing:
         raise ValueError(f"{path} is missing required external feature columns: {sorted(missing)}")
@@ -1313,7 +1333,7 @@ def _load_external_feature_arrays(
     # Rules-only TW runs should not materialize millions of rows across every
     # public model feature. Arrow projection keeps I/O and peak RAM proportional
     # to the independently enabled column families.
-    date_type = pq.read_schema(path).field("date").type
+    date_type = source.schema.field("date").type
 
     def filter_value(value: date) -> date | datetime | str:
         if pa.types.is_string(date_type) or pa.types.is_large_string(date_type):
@@ -1328,11 +1348,9 @@ def _load_external_feature_arrays(
     if date_end is not None:
         filters.append(("date", "<=", filter_value(date_end)))
     frame = pl.from_arrow(
-        pq.read_table(
-            path,
+        source.table(
             columns=["date", "symbol", *value_columns],
             filters=filters or None,
-            memory_map=True,
         )
     )
     historical_rule_names = [
@@ -1350,11 +1368,12 @@ def _load_external_feature_arrays(
             ]
         )
         historical_rule_frame = (
-            pl.scan_parquet(path)
+            source.scan()
             .select(["date", "symbol", *historical_rule_names])
             .filter(event_predicate)
             .collect()
         )
+    source.verify()
     if not feature_names:
         if not rule_names:
             return _ExternalFeatureArrays(
@@ -1648,7 +1667,8 @@ def _tifrs_carry_cache_contract(
 ) -> str:
     if external_feature_path is None or pq is None:
         return ""
-    for name in pq.read_schema(external_feature_path).names:
+    from stockagent.data.partitioned_parquet import read_schema
+    for name in read_schema(external_feature_path).names:
         if not name.startswith("twpub_xbrl_tifrs_"):
             continue
         if feature_include and not any(fnmatch.fnmatchcase(name, pattern) for pattern in feature_include):
@@ -4159,7 +4179,8 @@ def build_tail_panel(
         feature_exclude=feature_exclude_patterns,
     )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
-    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    from stockagent.data.partitioned_parquet import discover_sources
+    parquet_paths = discover_sources(parquet_root)
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
 
@@ -4408,7 +4429,8 @@ def load_cached_panel(
         if feature_shift_next_session_patterns
         else ""
     )
-    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    from stockagent.data.partitioned_parquet import discover_sources
+    parquet_paths = discover_sources(parquet_root)
     if not parquet_paths:
         return None
     if usd_only_trading_pairs:
@@ -5088,7 +5110,13 @@ def _compute_source_hash(paths: list[Path]) -> str:
     practical.
     """
 
-    def file_fingerprint(path: Path) -> tuple[str, int, str]:
+    from stockagent.data.partitioned_parquet import MANIFEST_SUFFIX, ParquetSource, resolve_source
+
+    def file_fingerprint(path: Path) -> list[tuple[str, int, str]]:
+        path = resolve_source(path)
+        if path.name.endswith(MANIFEST_SUFFIX):
+            with ParquetSource(path) as source:
+                return source.fingerprints()
         for attempt in range(2):
             before = path.stat()
             digest = hashlib.sha256()
@@ -5102,7 +5130,7 @@ def _compute_source_hash(paths: list[Path]) -> str:
                 and int(before.st_ctime_ns) == int(after.st_ctime_ns)
             )
             if unchanged:
-                return str(path), int(after.st_size), digest.hexdigest()
+                return [(str(path), int(after.st_size), digest.hexdigest())]
             if attempt == 0:
                 continue
         raise RuntimeError(f"Panel source changed while fingerprinting: {path}")
@@ -5119,7 +5147,7 @@ def _compute_source_hash(paths: list[Path]) -> str:
         identities = [file_fingerprint(path) for path in ordered_paths]
 
     hasher = hashlib.sha256()
-    for identity in identities:
+    for identity in sorted(identity for group in identities for identity in group):
         for item in identity:
             encoded = str(item).encode("utf-8")
             hasher.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
@@ -5887,7 +5915,8 @@ def build_panel(
         if feature_shift_next_session_patterns
         else ""
     )
-    parquet_paths = sorted(parquet_root.glob(f"*{FEATURE_FILE_SUFFIX}"))
+    from stockagent.data.partitioned_parquet import discover_sources
+    parquet_paths = discover_sources(parquet_root)
     if not parquet_paths:
         raise FileNotFoundError(f"No parquet files found under {parquet_root}")
 

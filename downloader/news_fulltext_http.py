@@ -513,6 +513,7 @@ class NewsHTTP:
         status, outcome, error_type = None, "internal_error", None
         phase, headers_wall, size = 'awaiting_headers', None, 0
         connection_observation, session = None, None
+        idle_expirations_before = 0
         isolated_robots_origin = False
         host = urlsplit(url).hostname
         request_headers = {"User-Agent": self.config["user_agent"],
@@ -532,6 +533,8 @@ class NewsHTTP:
         request_headers.update(headers or {})
         try:
             session = self._session()
+            if isinstance(session, OriginConnectionSession):
+                idle_expirations_before = session.idle_connection_expirations
             with session.get(url, headers=request_headers, allow_redirects=False, stream=True,
                                      timeout=(10, self.config["request_timeout_seconds"])) as response:
                 headers_wall = time.monotonic() - started
@@ -640,6 +643,10 @@ class NewsHTTP:
         finally:
             if connection_observation is None and isinstance(session, OriginConnectionSession):
                 connection_observation = session.finish_connection_observation(url)
+            if isinstance(session, OriginConnectionSession):
+                expirations = session.idle_connection_expirations - idle_expirations_before
+                if expirations:
+                    self.metrics.count(source.provider, 'expired_idle_connections', expirations)
             self.metrics.request_finished(source.provider, endpoint, status, outcome,
                                           time.monotonic() - started, time.thread_time() - started_cpu,
                                           error_type=error_type, host=host, phase=phase,

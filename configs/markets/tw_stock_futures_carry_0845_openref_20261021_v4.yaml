@@ -1,0 +1,9 @@
+# Lossless transport only: reconstruct the full FP32 feature ABI on device.
+# Raw packet cache lives for one slab/checkpoint lifetime; learned values are
+# recomputed. Keep the v3 model, source pair, accounting and stopping policy.
+base_config: tw_stock_futures_carry_0845_openref_20261021_v3.yaml
+experiment_name: tw-stock-futures-carry-0845-openref-20261021-v4
+data:
+  factorized_transfer_mode: compact_cuda_cached
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v4/clock__0845

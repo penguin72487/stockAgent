@@ -38,6 +38,39 @@ def test_current_deployment_requires_product_aware_tick_receipt(tmp_path, versio
     assert result["reasons"] == ([] if expected else ["order_price_contract_version_mismatch"])
 
 
+@pytest.mark.parametrize("full,accepted", [(False, False), (True, True)])
+def test_explicit_full_0901_deployment_cannot_be_mistaken_for_volume_sweep(tmp_path, full, accepted):
+    day = date(2026, 2, 25)
+    summary = tmp_path / "summary.json"
+    summary.write_text(json.dumps({"checkpoint_fingerprint": "exact"}))
+    (tmp_path / "promotion_receipt.json").write_text(json.dumps({
+        "acceptance": {"session_dates": [str(day)], "minute_curve_validation": {"validated_rows": 270}}}))
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({
+        "source_signal_ledger": {"replacement_signal_markets": ["target"]},
+        "replay_contract": {"entry": strategy_switch.REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                            "order_price_contract_version": strategy_switch.TW_ORDER_PRICE_CONTRACT_VERSION},
+        "sessions": [{"modes": [{"market": "target", "summary_path": str(summary)}]}]}))
+    (tmp_path / "state.json").write_text(json.dumps({"modes": {"target": {"initial_capital_twd": 10000000}}}))
+    result = strategy_switch._current_deployment_evidence(live_dir=tmp_path, market="target",
+        live_output=tmp_path, checkpoint_fingerprint="exact", initial_capital_twd=10000000,
+        start_date=day, end_date=day, session_count=1, expected_minute_rows=270,
+        **({"required_replay_entry_contract": strategy_switch.REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL}
+           if full else {}))
+    assert result["matches"] is accepted
+
+
+def test_addition_full_0901_flag_is_explicit_and_scoped_to_new_mode(tmp_path, monkeypatch):
+    default = strategy_switch.build_parser().parse_args(["plan", "--add-mode"])
+    assert strategy_switch._addition_replay_flags(default, market="new", live=tmp_path) == []
+    full = strategy_switch.build_parser().parse_args(["apply", "--add-mode", "--historical-full-fill-0901"])
+    assert strategy_switch._addition_replay_flags(full, market="new", live=tmp_path) == [
+        "--historical-full-fill-0901", "--source-ledger-dir", str(tmp_path),
+        "--allow-unpinned-market", "new"]
+    monkeypatch.setattr("sys.argv", ["switch", "apply", "--historical-full-fill-0901"])
+    with pytest.raises(ValueError, match="requires --add-mode"):
+        strategy_switch.main()
+
+
 def test_requested_artifact_missing_never_uses_selected_other_model(tmp_path: Path) -> None:
     selected = tmp_path / "layernorm"
     selected.mkdir()

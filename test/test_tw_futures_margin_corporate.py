@@ -18,16 +18,22 @@ def corporate_tape(rows=1, slots=1):
 
 
 @pytest.mark.parametrize('width', [*m.MARGIN_EXECUTION_WIDTHS, 35])
-@pytest.mark.parametrize('slots',[1936,2560])
-def test_training_window_accepts_versioned_margin_tape_and_rejects_unknown_width(width,slots):
+@pytest.mark.parametrize('slots',[1936,2560,2816])
+@pytest.mark.parametrize('opening_reference', [False, True])
+def test_training_window_accepts_versioned_margin_tape_and_rejects_unknown_width(width,slots,opening_reference):
     from stockagent.training.windowed import WindowedSplitTensors
     from stockagent.data.tw_stock_context_futures_portfolio import TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+    from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
+    from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_OBSERVATION_COLUMNS
+    context_width = len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+    if opening_reference:
+        context_width += len(m.MARGIN_AMOUNT_FEATURE_COLUMNS) + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS) + len(OPENING_REFERENCE_FEATURES)
     kwargs=dict(features=torch.zeros(2,1,1), valid_indices=torch.tensor([1]),
         future_log_returns=torch.zeros(2,1), tradable_mask=torch.ones(2,1,dtype=torch.bool),
         can_buy_mask=torch.ones(2,1,dtype=torch.bool), can_sell_mask=torch.ones(2,1,dtype=torch.bool),
         benchmark=torch.zeros(2), lookback=1, execution_mode='tw_stock_context_futures_portfolio',
         overnight_log_returns=torch.zeros(2,slots,width),
-        derivative_candidate_features=torch.zeros(2,slots,len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)),
+        derivative_candidate_features=torch.zeros(2,slots,context_width),
         derivative_candidate_mask=torch.ones(2,slots,dtype=torch.bool))
     if width not in m.MARGIN_EXECUTION_WIDTHS:
         with pytest.raises(ValueError,match='execution tensor'):

@@ -238,6 +238,41 @@ def test_stale_readback_does_not_license_standing_replay(standing):
     assert bridge.calls == ['inspect_query_runtime']
 
 
+def test_repaired_desktop_wakes_inspection_backoff_but_watchdog_clock_does_not(standing):
+    root,_,_,config = standing
+    atomic_write_json(root/'desktop_session.json',{'fixture_identity':1})
+    status = {'observed_at_utc':datetime.now(UTC).isoformat(),'private_evidence_sha256':'old-proof'}
+    atomic_write_json(root/'desktop_startup_status.json',status)
+    bridge = FreshReplayBridge('button')
+    first = replay_authorized_unknown(root,bridge,config)
+    assert not first['performed'] and len(bridge.calls) == 1
+    status['observed_at_utc'] = datetime.now(UTC).isoformat()
+    atomic_write_json(root/'desktop_startup_status.json',status)
+    replay_authorized_unknown(root,bridge,config)
+    assert len(bridge.calls) == 1
+    status['private_evidence_sha256'] = 'fresh-proof-after-repair'
+    atomic_write_json(root/'desktop_startup_status.json',status)
+    repaired = replay_authorized_unknown(root,bridge,config)
+    assert len(bridge.calls) == 2 and repaired['failures'] == 1
+    assert first['context_fingerprint'] != repaired['context_fingerprint']
+    assert first['next_check_at_utc'] != repaired['next_check_at_utc']
+    with closing(connect(root)) as con:
+        assert not con.execute('SELECT 1 FROM desktop_replays').fetchone()
+
+
+def test_changed_desktop_context_cannot_reset_consumed_query_budget(standing):
+    root,task,_,config = standing
+    atomic_write_json(root/'desktop_session.json',{'fixture_identity':2})
+    atomic_write_json(root/'desktop_startup_status.json',{'private_evidence_sha256':'new-proof'})
+    now = datetime.now(UTC)
+    with closing(connect(root)) as con,con:
+        for i in range(2):add_consumed(con,task['task_id'],i,now-timedelta(minutes=10+i))
+    bridge = FreshReplayBridge()
+    result = replay_authorized_unknown(root,bridge,config)
+    assert not result['performed'] and result['state'] == 'authorized_replay_task_budget'
+    assert bridge.calls == []
+
+
 def test_snapshot_replay_does_not_require_or_invent_a_historical_date_axis(standing):
     from downloader.tej_history import task_request, PREVIEW_SUBMISSION_CONTRACT
     from test_tej_snapshot import snapshot_export, snapshot_proof

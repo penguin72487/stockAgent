@@ -22,6 +22,7 @@ UPSTREAM_CHECK_MODES = frozenset({"upstream_forced", "upstream_incremental"})
 QUOTA_POLICY_VERSION = 2
 WORKLOAD_CONTRACT_VERSION = 4
 INTRADAY_PROGRESS_VERSION = 1
+INTRADAY_MINIMUM_FREE_GB = 25.0
 DISPATCH_INTERVAL_SECONDS = 60
 FINLAB_RESEARCH_STAGE_LOCK = ".locks/tw-public-research-finlab-2014-v4.lock"
 # These adapters currently sign and stream whole objects, not SDK deltas.
@@ -30,6 +31,25 @@ WHOLE_TABLE_KEYS = frozenset({
     "inventory",
 })
 TAIPEI = ZoneInfo("Asia/Taipei")
+PROCESS_BOOT_ID_BIND = Path('/run/stockagent-process-boot-id')
+
+
+def _bound_process_boot_id() -> str | None:
+    """One read-only proc-file bind, not a persisted or user-supplied token.
+
+    The gateway keeps ProcSubset=pid. Its unit exposes only this non-secret
+    kernel identity; an ordinary /run file or symlink cannot prove this boot.
+    Avoid reconstructing the boot wall clock after NTP/WSL clock adjustments.
+    """
+    path = PROCESS_BOOT_ID_BIND
+    try:
+        if path.is_symlink() or not path.is_mount():
+            return None
+        with path.open('rb') as stream:
+            value = stream.read(38).decode('ascii').removesuffix('\n')
+        return value if re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value) else None
+    except (OSError, UnicodeError):
+        return None
 
 
 def read_receipt_bound_source(root: Path, key: str, receipt_path: Path) -> tuple[Path, dict]:
@@ -73,7 +93,7 @@ def process_owner(pid: int | None = None) -> dict | None:
         try:
             boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         except OSError:
-            boot_id = None
+            boot_id = _bound_process_boot_id()
         return {"pid": pid, "start_ticks": fields[19], "boot_id": boot_id}
     except (OSError, IndexError):
         return None
@@ -82,7 +102,8 @@ def process_owner(pid: int | None = None) -> dict | None:
 def process_owner_alive(owner: object, *, started_at_utc=None, now: datetime) -> bool:
     """Verify the PID generation without weakening the gateway's proc policy.
 
-    Prefer the kernel boot UUID. If a sandbox hides it, require the exact PID
+    Prefer the kernel boot UUID, including the gateway's single-file proc bind.
+    If a sandbox hides both paths, require the exact PID
     start ticks AND a recorded run start after the current boot. CLOCK_BOOTTIME
     is available without exposing kernel sysctls or host credentials; old
     receipts from a previous boot cannot establish current liveness.

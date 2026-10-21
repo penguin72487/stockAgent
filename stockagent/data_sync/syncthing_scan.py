@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -29,6 +30,27 @@ CONFIGS = (
     Path("/root/.local/state/syncthing/config.xml"),
     Path("/root/.config/syncthing/config.xml"),
 )
+
+
+def _http_error_reason(error: urllib.error.HTTPError) -> str:
+    """Expose only a recognized local-service failure, never its raw body.
+
+    HTTP 500 alone concealed a full database volume and repeatedly sent
+    operators back to the downloader. Bound diagnostic reads and preserve the
+    original pending intent for every error, including malformed responses.
+    """
+    try:
+        try:
+            body = error.read(8192).decode("utf-8", errors="replace").lower()
+        finally:
+            error.close()  # Retryable diagnostics must not retain a response FD.
+    except (OSError, ValueError, AttributeError):
+        return "unclassified_http_error"
+    if "insufficient space on disk for database" in body:
+        return "database_disk_reserve"
+    if "insufficient space on disk" in body:
+        return "folder_disk_reserve"
+    return "unclassified_http_error"
 
 
 def _pending_path(sync_root: Path, dataset: str) -> Path | None:
@@ -264,5 +286,10 @@ def _scan_pending(
                     raise SnapshotError(
                         f"Syncthing scan failed for {label}: HTTP {response.status}"
                     )
+        except urllib.error.HTTPError as exc:
+            reason = _http_error_reason(exc)
+            raise SnapshotError(
+                f"Syncthing scan failed for {label}: HTTP {exc.code} ({reason})"
+            ) from exc
         except (OSError, TimeoutError) as exc:
             raise SnapshotError(f"Syncthing scan failed for {label}: {exc}") from exc

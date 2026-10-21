@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -11,11 +10,9 @@ from types import SimpleNamespace
 import pytest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "benchmark_tw_day_trade_batch_sizes.py"
-SPEC = importlib.util.spec_from_file_location("benchmark_tw_day_trade_batch_sizes", SCRIPT)
-assert SPEC is not None and SPEC.loader is not None
-benchmark = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(benchmark)
+from scripts import benchmark_tw_day_trade_batch_sizes as benchmark
+
+SCRIPT = Path(benchmark.__file__).resolve()
 
 
 def test_default_python_preserves_private_venv_package_visibility(tmp_path):
@@ -91,13 +88,50 @@ def test_zero_mgda_direction_requires_its_four_task_and_kkt_evidence(certified):
     if certified:
         row['train_multiobjective_mgda_kkt_margin'] = 0.
         row.update({f'train_multiobjective_loss_{name}': 0.
-                    for name in ['sharpe', 'log_return', 'sortino', 'mdd']})
+                    for name in ['sharpe', 'log_return', 'sortino', 'calmar']})
     score = benchmark._score_curve([row], skip_epochs=2, minimum_steady_epochs=1,
         train_rows=90, global_batch_size=32, memory=_memory(), max_peak_fraction=.98,
         min_headroom_gib=.5, objective='trajectory_mgda_parameter', model_forward_passes=5)
     assert score['ok'] is certified
     if certified:
         assert score['train_batches'] == 15
+
+
+@pytest.mark.parametrize('objective,mode,expected', [
+    ('log_utility','none',1), ('trajectory_mgda_l2_parameter','none',5),
+    ('trajectory_sharpe','none',2), ('log_utility','sam',2),
+    ('log_utility','asam',2), ('log_utility','xsam',2),
+    ('trajectory_mgda_l2_parameter','sam',10),
+])
+def test_complete_model_passes_include_capture_and_two_sharpness_passes(objective,mode,expected):
+    assert benchmark._model_forward_passes(dict(loss_type=objective,sharpness_mode=mode,
+        sharpness_radius=0. if mode=='none' else .01,sharpness_alpha=1.)) == expected
+
+
+@pytest.mark.parametrize('objective,passes,vjps', [
+    ('log_utility',2,1), ('trajectory_mgda_l2_parameter',10,4)])
+@pytest.mark.parametrize('damage', [None,'batches','double_update','missing_vjp','nan_loss'])
+def test_sharpness_requires_full_work_coverage_and_one_update(objective,passes,vjps,damage):
+    row = _epoch(3,wall=4.,train=3.)
+    row.update(train_batches=3*passes,train_optimizer_steps=1,
+        train_multiobjective_sharpness_radius=.01,train_multiobjective_sharpness_alpha=1.,
+        train_multiobjective_sharpness_base_vjp_passes=float(vjps),
+        train_multiobjective_sharpness_total_vjp_passes=float(2*vjps),
+        train_multiobjective_sharpness_base_loss=-1.,train_multiobjective_sharpness_perturbed_loss=-.9,
+        train_multiobjective_sharpness_displacement_l2=.01)
+    if damage=='batches':row['train_batches']=3
+    if damage=='double_update':row['train_optimizer_steps']=2
+    if damage=='missing_vjp':row.pop('train_multiobjective_sharpness_total_vjp_passes')
+    if damage=='nan_loss':row['train_multiobjective_sharpness_perturbed_loss']=float('nan')
+    score = benchmark._score_curve([row],skip_epochs=2,minimum_steady_epochs=1,
+        train_rows=90,global_batch_size=32,memory=_memory(),max_peak_fraction=.98,
+        min_headroom_gib=.5,objective=objective,model_forward_passes=passes,
+        sharpness_options=dict(mode='sam',radius=.01,alpha=1.))
+    assert score['ok'] is (damage is None)
+    if damage is None:
+        assert score['model_forward_passes']==passes
+        assert score['complete_epoch_real_rows_per_s']==22.5
+        assert score['model_forward_slots']==96*passes
 
 
 def test_frozen_project_root_owns_config_resolution(tmp_path, monkeypatch) -> None:

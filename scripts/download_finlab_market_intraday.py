@@ -46,7 +46,7 @@ from scripts.download_finlab_intraday import (  # noqa: E402
 )
 from scripts.derive_finlab_minute import derive_partition  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
-    INTRADAY_PROGRESS_VERSION, process_owner,
+    INTRADAY_PROGRESS_VERSION, INTRADAY_MINIMUM_FREE_GB, process_owner,
 )
 from stockagent.data.finlab_progress import estimate_attempt_batch  # noqa: E402
 from stockagent.data.finlab_tick_eta import (  # noqa: E402
@@ -1784,7 +1784,7 @@ def main() -> int:
                         help="Shared manifest/signing concurrency, separate from data workers (1..32)")
     parser.add_argument("--reserve-mb", type=float, default=None,
                         help="Local floor override; defaults to the shared per-family quota policy")
-    parser.add_argument("--minimum-free-gb", type=float, default=25.0)
+    parser.add_argument("--minimum-free-gb", type=float, default=INTRADAY_MINIMUM_FREE_GB)
     parser.add_argument("--sync-lock-fd", type=int, default=None,
                         help="Existing parent .sync.lock descriptor; otherwise acquire the account lock")
     parser.add_argument("--max-run-seconds", type=float, default=None,

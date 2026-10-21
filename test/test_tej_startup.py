@@ -62,6 +62,16 @@ def current_task(root, task):
         return dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone())
 
 
+def test_pid_and_birth_tick_reuse_after_reboot_is_not_the_old_owner():
+    ticks=Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ',1)[1].split()[19]
+    worker={'owner_pid':os.getpid(),'owner_start_ticks':ticks,
+            'linux_boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+    assert owner_alive(worker)
+    assert not owner_alive({**worker,'linux_boot_id':'00000000-0000-0000-0000-000000000000'})
+    with pytest.raises(ValueError):owner_alive({**worker,'linux_boot_id':'unverified-boot'})
+    assert owner_alive({k:v for k,v in worker.items() if k!='linux_boot_id'})  # Retained legacy claims.
+
+
 def test_expired_dead_worker_is_unknown_not_pending_and_original_request_is_retained(abandoned):
     root, task, attempt, prepared, now = abandoned; before=prepared.read_bytes()
     assert retire_expired_worker(root, now=now)
@@ -73,6 +83,64 @@ def test_expired_dead_worker_is_unknown_not_pending_and_original_request_is_reta
         assert con.execute('SELECT count(*) FROM desktop_replays').fetchone()[0]==0
     assert prepared.read_bytes()==before
     assert not retire_expired_worker(root, now=now)
+
+
+def test_previous_boot_owner_retires_as_unknown_without_waiting_an_obsolete_deadline(abandoned):
+    root,task,attempt,prepared,now=abandoned
+    worker=json.loads((root/'worker_status.json').read_text())
+    worker['linux_boot_id']='00000000-0000-0000-0000-000000000000'
+    atomic_write_json(root/'worker_status.json',worker)
+    before=prepared.read_bytes()
+    assert retire_expired_worker(root,now=now-timedelta(seconds=100))
+    saved=current_task(root,task)
+    assert saved['state']=='blocked' and saved['last_error_code']=='unknown_outcome_no_auto_retry'
+    assert saved['actual_rows'] is None and prepared.read_bytes()==before
+    audit=json.loads((root/'orphaned_attempts'/(attempt+'.json')).read_text())
+    assert audit['retirement_basis']=='previous_linux_boot_dead_owner'
+    assert audit['original_outcome']=='unknown_not_proven_unsent' and audit['task_requeued'] is False
+    replacement(root)
+    assert orphan_desktop_loss_proof(root,saved,task_request(root,saved),prepared).is_file()
+    with closing(connect(root)) as con:
+        assert not con.execute('SELECT 1 FROM desktop_replays').fetchone()
+
+
+def test_current_boot_or_legacy_owner_keeps_the_original_unexpired_deadline(abandoned):
+    root,task,attempt,prepared,now=abandoned
+    worker=json.loads((root/'worker_status.json').read_text())
+    worker['linux_boot_id']=Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    atomic_write_json(root/'worker_status.json',worker)
+    assert not retire_expired_worker(root,now=now-timedelta(seconds=100))
+    assert current_task(root,task)['state']=='running'
+
+
+def test_existing_v1_orphan_audit_remains_compatible_without_resetting_unknown(abandoned):
+    root,task,attempt,prepared,now=abandoned
+    assert retire_expired_worker(root,now=now)
+    path=root/'orphaned_attempts'/(attempt+'.json');audit=json.loads(path.read_text())
+    audit['contract']='exact_expired_dead_tej_worker_unknown_v1';audit.pop('retirement_basis')
+    atomic_write_json(path,audit)
+    replacement(root);saved=current_task(root,task)
+    assert orphan_desktop_loss_proof(root,saved,task_request(root,saved),prepared)==path
+    assert saved['state']=='blocked'
+
+
+@pytest.mark.parametrize('fault',['basis','same_boot','missing_boot','foreign_owner','unexpired_legacy_basis'])
+def test_early_retirement_proof_never_turns_an_unverified_boot_into_replay_permission(abandoned,fault):
+    root,task,attempt,prepared,now=abandoned
+    worker=json.loads((root/'worker_status.json').read_text())
+    worker['linux_boot_id']='00000000-0000-0000-0000-000000000000'
+    atomic_write_json(root/'worker_status.json',worker)
+    assert retire_expired_worker(root,now=now-timedelta(seconds=100))
+    path=root/'orphaned_attempts'/(attempt+'.json');audit=json.loads(path.read_text())
+    if fault=='basis':audit['retirement_basis']='unverified_restart'
+    elif fault=='same_boot':audit['linux_boot_id']=worker['linux_boot_id']
+    elif fault=='missing_boot':audit['worker'].pop('linux_boot_id')
+    elif fault=='foreign_owner':audit['worker']['task_id']='foreign'
+    else:audit['retirement_basis']='expired_dead_owner'
+    atomic_write_json(path,audit)
+    replacement(root);saved=current_task(root,task)
+    with pytest.raises(ValueError):orphan_desktop_loss_proof(root,saved,task_request(root,saved),prepared)
+    assert saved['state']=='blocked'
 
 
 @pytest.mark.parametrize('gate', ['live_owner','future_deadline','foreign_attempt','changed_scope','saved_result','prequery_proof','missing_pid','pid_reuse'])
@@ -225,6 +293,126 @@ def test_lost_boot_worker_uses_existing_bounded_replay_and_new_source_receipt(ab
     assert audit['possible_additional_provider_usage'] is True
     assert current['state']=='complete' and current['actual_rows']==4 and current['receipt_path']
     assert prepared.read_bytes()==before
+
+
+def surviving_desktop(root):
+    """Only the WSL worker died: the original Windows form is still owned."""
+    original = json.loads((root/'desktop_session.json').read_text())
+    atomic_write_json(root/'desktop_startup_status.json', {
+        'contract':CONTRACT, 'state':'desktop_ready',
+        'observed_at_utc':datetime.now(UTC).isoformat(),
+        'session_sha256':hashlib.sha256((root/'desktop_session.json').read_bytes()).hexdigest()})
+    return original
+
+
+def test_wsl_loss_with_original_idle_desktop_replays_without_destroying_windows(abandoned):
+    from downloader.tej_history import configure_runtime_policy
+    from downloader.tej_scheduler import replay_authorized_unknown
+    from test_tej_authorized_replay import grant_config, FreshReplayBridge, age_original
+    root,task,attempt,prepared,now = abandoned
+    retire_expired_worker(root,now=now); age_original(root,attempt)
+    original = surviving_desktop(root); before = prepared.read_bytes()
+    config = grant_config(); configure_runtime_policy(root,config)
+
+    class SurvivingBridge(FreshReplayBridge):
+        def execute(self,root,task):
+            payload,output,seconds = super().execute(root,task)
+            if payload.get('action') == 'inspect_query_runtime':
+                payload['current_preview_grids'] = [{'native_shape':[1,6]}]
+                payload['owned_desktop_process_start_utc'] = (now-timedelta(days=1)).isoformat()
+                atomic_write_json(output,payload)
+            return payload,output,seconds
+
+    bridge = SurvivingBridge('fields')  # Loss could precede selecting the requested axes.
+    result = replay_authorized_unknown(root,bridge,config)
+    assert result['performed'] and result['state'] == 'completed_task'
+    assert bridge.calls == ['inspect_query_runtime','download']
+    assert json.loads((root/'desktop_session.json').read_text()) == original
+    assert prepared.read_bytes() == before
+    with closing(connect(root)) as con:
+        old = con.execute('SELECT state FROM desktop_attempts WHERE attempt_id=?',(attempt,)).fetchone()[0]
+        replay = dict(con.execute('SELECT * FROM desktop_replays').fetchone())
+        current = dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone())
+    audit = json.loads((root/replay['audit_path']).read_text())
+    assert old == 'unknown_outcome' and current['actual_rows'] == 4 and current['receipt_path']
+    assert audit['surviving_desktop_dead_worker_replay_authorized'] is True
+    assert audit['orphaned_desktop_loss_replay_authorized'] is False
+    assert audit['original_outcome'] == 'unknown_retained_not_claimed_unsent'
+
+
+@pytest.mark.parametrize('fault',['raw','stage','outcome','stale_desktop','foreign_desktop','live_worker'])
+def test_surviving_desktop_loss_requires_exact_dead_owner_and_no_saved_response(abandoned,fault):
+    from downloader.tej_startup import surviving_desktop_worker_loss_proof
+    root,task,attempt,prepared,now = abandoned
+    retire_expired_worker(root,now=now); surviving_desktop(root)
+    if fault in ('raw','stage','outcome'):
+        suffix = {'raw':'.json','stage':'.json.stage.json','outcome':'.json.outcome.json'}[fault]
+        atomic_write_json(root/'raw'/(attempt+suffix),{'must_be_preserved':True})
+    elif fault == 'stale_desktop':
+        p = root/'desktop_startup_status.json'; d = json.loads(p.read_text())
+        d['observed_at_utc'] = (now-timedelta(minutes=4)).isoformat(); atomic_write_json(p,d)
+    elif fault == 'foreign_desktop':
+        atomic_write_json(root/'desktop_session.json',session(42)); surviving_desktop(root)
+    else:
+        p = root/'orphaned_attempts'/(attempt+'.json'); d = json.loads(p.read_text())
+        d['worker'].update(owner_pid=os.getpid(),owner_start_ticks=
+            Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(') ',1)[1].split()[19])
+        atomic_write_json(p,d)
+    current = current_task(root,task)
+    with pytest.raises(ValueError):
+        surviving_desktop_worker_loss_proof(root,current,task_request(root,current),prepared)
+    assert current_task(root,task)['state'] == 'blocked'
+
+
+@pytest.mark.parametrize('grids',[None,{},[{'native_shape':[2,6]}],[{'native_shape':[-1,6]}],
+    [{'native_shape':[True,6]}],[{'native_shape':[1]}],[{}]])
+def test_surviving_desktop_never_overwrites_unbound_or_unverified_preview(abandoned,grids):
+    from downloader.tej_history import configure_runtime_policy
+    from downloader.tej_scheduler import replay_authorized_unknown
+    from test_tej_authorized_replay import grant_config, FreshReplayBridge, age_original
+    root,task,attempt,prepared,now = abandoned
+    retire_expired_worker(root,now=now); surviving_desktop(root); age_original(root,attempt)
+    config = grant_config(); configure_runtime_policy(root,config)
+
+    class UnboundPreview(FreshReplayBridge):
+        def execute(self,root,task):
+            payload,output,seconds = super().execute(root,task)
+            payload['current_preview_grids'] = grids
+            payload['owned_desktop_process_start_utc'] = (now-timedelta(days=1)).isoformat()
+            atomic_write_json(output,payload)
+            return payload,output,seconds
+
+    bridge = UnboundPreview(); result = replay_authorized_unknown(root,bridge,config)
+    assert not result['performed'] and bridge.calls == ['inspect_query_runtime']
+    assert result['failure_phase'] == 'fresh_runtime_readback_and_replay'
+    diagnostic = root/result['failure_diagnostic_path']
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert 'Preview requires reconciliation' in json.loads(diagnostic.read_text())['private_diagnostic']
+    assert current_task(root,task)['state'] == 'blocked'
+    with closing(connect(root)) as con:
+        assert not con.execute('SELECT 1 FROM desktop_replays').fetchone()
+
+
+@pytest.mark.parametrize('clock',[None,'invalid','2026-01-01T00:00:00','2999-01-01T00:00:00Z'])
+def test_surviving_desktop_rejects_reused_pid_or_unverified_process_birth(abandoned,clock):
+    from downloader.tej_history import configure_runtime_policy
+    from downloader.tej_scheduler import replay_authorized_unknown
+    from test_tej_authorized_replay import grant_config, FreshReplayBridge, age_original
+    root,task,attempt,prepared,now = abandoned
+    retire_expired_worker(root,now=now); surviving_desktop(root); age_original(root,attempt)
+    config = grant_config(); configure_runtime_policy(root,config)
+
+    class ReusedDesktop(FreshReplayBridge):
+        def execute(self,root,task):
+            payload,output,seconds = super().execute(root,task)
+            payload['current_preview_grids'] = []
+            payload['owned_desktop_process_start_utc'] = clock
+            atomic_write_json(output,payload)
+            return payload,output,seconds
+
+    bridge = ReusedDesktop(); result = replay_authorized_unknown(root,bridge,config)
+    assert not result['performed'] and bridge.calls == ['inspect_query_runtime']
+    assert current_task(root,task)['state'] == 'blocked'
 
 
 def test_boot_policy_is_exact_and_does_not_accept_arbitrary_user_workbooks():

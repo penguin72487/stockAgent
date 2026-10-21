@@ -254,6 +254,9 @@ def test_company_reuse_requires_fresh_binding_selected_list_and_full_all_source_
 
 
 def test_header_shape_sample_and_value_fallback_release_their_exact_com_acquisitions():
+    state = BRIDGE.split('public static int[] AccessibleState(',1)[1].split('public static string AccessibleDefaultAction',1)[0]
+    assert state.count('AccessibleObjectFromWindow(') == 1
+    assert 'finally {ReleaseAccessible(a);}' in state
     for name,following in [('PreviewHeader','PreviewShape'),('PreviewShape','PreviewRowLowerBound')]:
         part=BRIDGE.split('public static '+('string[] ' if name=='PreviewHeader' else 'int[] ')+name+'(',1)[1].split(
             'public static '+('int[] ' if following=='PreviewShape' else 'int ')+following+'(',1)[0]

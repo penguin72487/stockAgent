@@ -64,6 +64,94 @@ def test_minute_curve_and_replay_defaults_share_one_lightweight_declaration() ->
     assert DEFAULT_LOCAL_MINUTE_CACHE_ROOTS is paths.DEFAULT_LOCAL_MINUTE_CACHE_ROOTS
 
 
+def _finmind_valuation_fixture(root, *, rows=None):
+    day = "2026-01-02"
+    rows = rows or [
+        {"date": day, "minute": "09:00:00", "stock_id": "00883B", "open": 10.,
+         "high": 11., "low": 10., "close": 11., "volume": 3.},
+        {"date": day, "minute": "09:01:00", "stock_id": "00883B", "open": 12.,
+         "high": 12., "low": 12., "close": 12., "volume": 0.},
+        {"date": day, "minute": "13:30:00", "stock_id": "00883B", "open": 13.,
+         "high": 13., "low": 13., "close": 13., "volume": 1.},
+    ]
+    obj = root / "parquet/TaiwanStockKBar/all/2026-01-02/object.parquet"
+    obj.parent.mkdir(parents=True)
+    pl.DataFrame(rows).write_parquet(obj)
+    receipt = root / "receipts/TaiwanStockKBar/all/2026-01-02.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"status": "complete", "dataset": "TaiwanStockKBar",
+        "data_id": "", "partition": day, "rows": len(rows),
+        "parquet_path": str(obj.relative_to(root)), "parquet_size_bytes": obj.stat().st_size,
+        "sha256": hashlib.sha256(obj.read_bytes()).hexdigest()}))
+    return obj, receipt
+
+
+@pytest.mark.parametrize("zone", [None, "UTC", "America/New_York"])
+def test_vector_minute_keys_equal_legacy_datetime_conversion(zone):
+    import math
+    base = datetime(2026, 1, 2, 1, 1, 59, 123456, tzinfo=ZoneInfo("UTC"))
+    stamps = [base, base, None, base + timedelta(minutes=1), base + timedelta(minutes=2)]
+    stamps = [(s.replace(tzinfo=None) if zone is None else s.astimezone(ZoneInfo(zone)))
+              if s is not None else None for s in stamps]
+    frame = pl.DataFrame({"date": [date(2026, 1, 2)] * 5,
+        "ts": pl.Series(stamps, dtype=pl.Datetime("ns", zone)),
+        "Close": [1., 2., 3., math.nan, 9.], "Volume": [1., 1., 1., 1., 0.]})
+    expected = {}
+    for row in frame.iter_rows(named=True):
+        stamp, price = row["ts"], float(row["Close"])
+        if row["Volume"] > 0 and isinstance(stamp, datetime) and math.isfinite(price) and price > 0:
+            stamp = stamp.replace(tzinfo=TAIPEI) if stamp.tzinfo is None else stamp.astimezone(TAIPEI)
+            expected[stamp.isoformat(timespec="minutes")] = price
+    assert MinutePriceStore._frame_prices(frame, "2026-01-02") == expected
+
+
+def test_vector_minute_keys_do_not_silently_accept_null_prices():
+    frame = pl.DataFrame({"ts": [datetime(2026, 1, 2, 9, 1)],
+                          "Close": pl.Series([None], dtype=pl.Float64)})
+    with pytest.raises(TypeError):
+        MinutePriceStore._frame_prices(frame, "2026-01-02")
+
+
+def test_local_finmind_valuation_fallback_retains_clock_and_never_assumes_shares(tmp_path):
+    root = tmp_path / "finmind"
+    obj, receipt = _finmind_valuation_fixture(root)
+    store = MinutePriceStore([], [], require_receipts=True, finmind_root=root)
+    store.prepare({"00883B": {"2026-01-02"}})
+    assert store.prices("00883B", "2026-01-02") == {
+        "2026-01-02T09:01+08:00": 11., "2026-01-02T13:30+08:00": 13.}
+    proof = store.finmind_source_records["2026-01-02"]
+    assert proof["execution_capacity_claimed"] is False
+    assert proof["native_volume_use"] == "positive_trade_observation_only_not_shares_or_liquidity"
+    store.assert_sources_unchanged()
+    obj.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="source changed"):
+        store.assert_sources_unchanged()
+
+
+@pytest.mark.parametrize("broken", ["digest", "identity", "rows", "escape"])
+def test_local_finmind_valuation_rejects_bad_receipt(tmp_path, broken):
+    root = tmp_path / "finmind"
+    _, path = _finmind_valuation_fixture(root)
+    receipt = json.loads(path.read_text())
+    if broken == "digest": receipt["sha256"] = "f" * 64
+    elif broken == "identity": receipt["partition"] = "2026-01-05"
+    elif broken == "rows": receipt["rows"] += 1
+    else: receipt["parquet_path"] = "../outside.parquet"
+    path.write_text(json.dumps(receipt))
+    store = MinutePriceStore([], [], require_receipts=True, finmind_root=root)
+    with pytest.raises(RuntimeError):
+        store.prices("00883B", "2026-01-02")
+
+
+def test_local_finmind_valuation_cannot_override_exact_execution_source_pins(tmp_path):
+    root = tmp_path / "finmind"
+    _finmind_valuation_fixture(root)
+    store = MinutePriceStore([], [], require_receipts=True, finmind_root=root,
+        replay_symbol_sources={("2026-01-02", "00883B"): [tmp_path / "required.parquet"]})
+    assert store.prices("00883B", "2026-01-02") == {}
+    assert store.finmind_source_records == {}
+
+
 def test_public_history_prewarm_uses_only_local_read_only_gateway(monkeypatch) -> None:
     from scripts import maintain_tw_day_trade_minute_curves as maintenance
 
@@ -1252,6 +1340,158 @@ def test_opening_revaluation_uses_same_close_and_fees_as_following_minute(tmp_pa
     with pytest.raises(RuntimeError, match="missing completed 09:01"):
         rebuild_strategy_marks([opening, closing], positions, missing_store,
             start=date(2026, 8, 13), end=date(2026, 8, 13), revalue_opening_marks=True)
+
+
+@pytest.mark.parametrize("invalid_field", [None, "fill_contract", "simulation_only",
+                                         "synthetic_fill", "entry_price_source"])
+def test_full_0901_price_carry_is_explicit_and_never_a_fresh_trade(tmp_path, invalid_field):
+    from copy import deepcopy
+    from stockagent.live.tw_day_trade_simulation import REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+
+    day, market = "2026-08-13", "tw_day_trade"
+    position = _position()
+    opening = {"minute": f"{day}T09:01+08:00", "recorded_at": f"{day}T09:01:00+08:00",
+               "session_date": day, "market": market, "initial_capital_twd": 10_000_000.0,
+               "cumulative_realized_net_pnl_twd": 50.0, "open_position_count": 1,
+               "total_equity_twd": 10_000_000.0}
+    closing = {**opening, "minute": f"{day}T13:30+08:00",
+               "recorded_at": f"{day}T13:30:00+08:00", "open_position_count": 0,
+               "cumulative_realized_net_pnl_twd": 500.0, "total_equity_twd": 10_000_500.0}
+    entry = {"position_id": position["position_id"], "market": market, "session_date": day,
+             "symbol": "2330", "purpose": "entry", "quantity": 1000, "price": 101.0,
+             "fee_and_tax_twd": 30.0, "fill_at": f"{day}T09:01:00+08:00",
+             "recorded_at": "2026-10-21T15:00:00+08:00",
+             "fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+             "simulation_only": True, "simulation_replay": True,
+             "counterfactual_0901_price_fill": True, "synthetic_fill": False,
+             "entry_price_method": "minute_close", "entry_price_source": "retained_0901_source_close"}
+    if invalid_field:
+        entry[invalid_field] = True if invalid_field == "synthetic_fill" else None
+    fills = [entry, {**entry, "purpose": "exit", "fill_at": f"{day}T13:30:00+08:00",
+                     "entry_fee_allocated_twd": 30.0, "net_pnl_twd": 450.0}]
+    before = deepcopy(fills)
+    _minute_file(tmp_path / "kbars", "2330", [(datetime(2026, 8, 13, 9, 2), 102.0)])
+    store = MinutePriceStore(tmp_path / "kbars", tmp_path / "ticks")
+    kwargs = dict(start=date.fromisoformat(day), end=date.fromisoformat(day),
+                  fill_rows=fills, revalue_opening_marks=True)
+    if invalid_field:
+        with pytest.raises(RuntimeError, match="missing completed 09:01"):
+            rebuild_strategy_marks([opening, closing], {day: {market: [position]}}, store, **kwargs)
+        return
+    rows, stats = rebuild_strategy_marks([opening, closing], {day: {market: [position]}}, store, **kwargs)
+    assert len(rows) == 270
+    assert rows[0]["total_equity_twd"] == pytest.approx(10_000_050 + position_net_liquidation_pnl(
+        position, 101.0, signed_shares=1000, remaining_entry_fee_twd=30.0))
+    assert rows[0]["valuation_stale"] is True
+    assert rows[0]["fresh_trade_position_count"] == 0
+    assert rows[0]["last_trade_carried_position_count"] == 1
+    assert rows[1]["valuation_stale"] is False
+    assert rows[1]["fresh_trade_position_count"] == 1
+    assert rows[-1] == closing
+    assert stats["opening_full_target_fill_price_carried_symbol_days"] == 1
+    assert fills == before
+
+
+@pytest.fixture
+def clocked_flat_book():
+    day, market = "2026-08-13", "tw_day_trade"
+    first = {**_position(), "position_id": "first", "filled_shares": 2000,
+             "entry_price": 101.0, "entry_fee_twd": 30.0}
+    late = {**_position(), "position_id": "late", "symbol": "2317",
+            "entry_price": 200.0, "entry_fee_twd": 5.0}
+
+    def fill(identity, clock, purpose, quantity, price, **extra):
+        return {"position_id": identity, "symbol": "2330" if identity == "first" else "2317",
+                "market": market, "session_date": day, "purpose": purpose,
+                "quantity": quantity, "price": price, "fill_at": f"{day}T{clock}+08:00",
+                # Reconstruction time is not the execution clock.
+                "recorded_at": "2026-10-21T15:00:00+08:00", **extra}
+
+    fills = [fill("first", "09:01:00", "entry", 1000, 100.0, fee_and_tax_twd=10.0),
+             fill("first", "09:03:00", "entry_completion", 1000, 102.0, fee_and_tax_twd=20.0),
+             fill("late", "09:09:00", "entry", 1000, 200.0, fee_and_tax_twd=5.0),
+             fill("first", "12:30:00", "exit", 1000, 102.0,
+                  entry_fee_allocated_twd=15.0, net_pnl_twd=500.0),
+             fill("first", "13:30:00", "exit", 1000, 103.0,
+                  entry_fee_allocated_twd=15.0, net_pnl_twd=600.0),
+             fill("late", "13:30:00", "exit", 1000, 201.0,
+                  entry_fee_allocated_twd=5.0, net_pnl_twd=40.0)]
+    opening = {"minute": f"{day}T09:01+08:00", "recorded_at": f"{day}T09:01:30+08:00",
+               "session_date": day, "market": market, "initial_capital_twd": 10_000_000.0,
+               "cumulative_realized_net_pnl_twd": 50.0, "open_position_count": 1,
+               "total_equity_twd": 10_000_000.0}
+    closing = {**opening, "minute": f"{day}T13:30+08:00",
+               "recorded_at": f"{day}T13:30:00+08:00", "open_position_count": 0,
+               "cumulative_realized_net_pnl_twd": 1190.0, "total_equity_twd": 10_001_190.0}
+
+    class Store:
+        def prices(self, symbol, session_date):
+            assert session_date == day
+            if symbol == "2317":
+                # A late first entry cannot require a nonexistent 09:01 bar.
+                return {f"{day}T09:09+08:00": 201.0}
+            return {f"{day}T09:01+08:00": 102.0, f"{day}T09:03+08:00": 103.0}
+
+    return [opening, closing], {day: {market: [first, late]}}, Store(), fills
+
+
+def test_flat_minutes_replay_late_and_partial_entries_without_future_basis(clocked_flat_book):
+    from copy import deepcopy
+    endpoints, positions, store, fills = clocked_flat_book
+    original = deepcopy((endpoints, positions, fills))
+    # A prior-session fill outside the selected range must not reset the
+    # cumulative realized baseline or demand that old position's archive.
+    earlier = {**fills[0], "session_date": "2026-08-12", "position_id": "older"}
+    rows, stats = rebuild_strategy_marks(endpoints, positions, store,
+        start=date(2026, 8, 13), end=date(2026, 8, 13), fill_rows=[earlier, *fills],
+        revalue_opening_marks=True)
+    assert len(rows) == 270 and stats["generated_rows"] == 270
+    by_clock = {row["minute"][11:16]: row for row in rows}
+    first = positions["2026-08-13"]["tw_day_trade"][0]
+    initial_net = position_net_liquidation_pnl({**first, "inventory_basis_price": 100.0},
+        102.0, signed_shares=1000, remaining_entry_fee_twd=10.0)
+    completed_net = position_net_liquidation_pnl({**first, "inventory_basis_price": 101.0},
+        103.0, signed_shares=2000, remaining_entry_fee_twd=30.0)
+    assert by_clock["09:01"]["open_net_liquidation_pnl_twd"] == pytest.approx(initial_net)
+    assert by_clock["09:02"]["open_net_liquidation_pnl_twd"] == pytest.approx(initial_net)
+    assert by_clock["09:03"]["open_net_liquidation_pnl_twd"] == pytest.approx(completed_net)
+    assert by_clock["09:08"]["open_position_count"] == 1
+    assert by_clock["09:09"]["open_position_count"] == 2
+    assert by_clock["12:30"]["cumulative_realized_net_pnl_twd"] == 550.0
+    assert by_clock["12:30"]["open_net_liquidation_pnl_twd"] == pytest.approx(
+        position_net_liquidation_pnl({**first, "inventory_basis_price": 101.0},
+            103.0, signed_shares=1000, remaining_entry_fee_twd=15.0)
+        + position_net_liquidation_pnl(positions["2026-08-13"]["tw_day_trade"][1],
+            201.0, signed_shares=1000, remaining_entry_fee_twd=5.0))
+    assert rows[-1] == endpoints[-1]
+    assert (endpoints, positions, fills) == original
+
+
+@pytest.mark.parametrize("endpoint,field,value,message", [
+    (0, "open_position_count", 2, "position count mismatch"),
+    (1, "open_position_count", 1, "closing fill-book accounting disagrees"),
+    (1, "cumulative_realized_net_pnl_twd", 0.0, "closing fill-book accounting disagrees"),
+])
+def test_flat_fill_book_keeps_strict_endpoint_gates(clocked_flat_book, endpoint, field, value, message):
+    endpoints, positions, store, fills = clocked_flat_book
+    endpoints[endpoint][field] = value
+    with pytest.raises(RuntimeError, match=message):
+        rebuild_strategy_marks(endpoints, positions, store, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 13), revalue_opening_marks=True)
+
+
+def test_flat_opening_does_not_count_early_realized_fill_twice(clocked_flat_book):
+    endpoints, positions, store, fills = clocked_flat_book
+    fills.insert(1, {**fills[3], "fill_at": "2026-08-13T09:01:20+08:00",
+                     "quantity": 500, "entry_fee_allocated_twd": 5.0, "net_pnl_twd": 40.0})
+    fills[4] = {**fills[4], "quantity": 500, "entry_fee_allocated_twd": 10.0}
+    # The accepted opening already contains this 40; prior realized is 10.
+    # Later immutable exits total 1140, so the accepted close stays 1190.
+    rows, _ = rebuild_strategy_marks(endpoints, positions, store, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 13), revalue_opening_marks=True)
+    assert rows[0]["cumulative_realized_net_pnl_twd"] == 50.0
+    assert rows[1]["cumulative_realized_net_pnl_twd"] == 50.0
+    assert rows[-1] == endpoints[-1]
 
 
 def test_position_archive_cannot_resurrect_an_old_replay_without_entry_fill(tmp_path: Path) -> None:

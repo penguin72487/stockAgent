@@ -226,13 +226,26 @@ def candidate_sources(sweep: str, writer: str, variant: str) -> tuple[str, str]:
         raise ValueError("unknown exact candidate")
     if variant.startswith("prepared"):
         # Extract the saved canonical scan/deduplication, not a second policy.
-        begin = "    def iter_date_groups(self,definitions,symbols):\n"
-        end = "\n\ndef global_rule(kind,identity):"
         scan = '            table=pl.scan_parquet(path).filter(pl.col("feature").is_in(names)&pl.col("symbol").is_in(symbols)).collect(engine="streaming")\n'
         causal = "            table=causal_report_events(table,definitions,period_order=self.period_order,current_periods=current)\n"
-        if any(sweep.count(marker) != 1 for marker in (begin, end, causal)):
+        tree = ast.parse(sweep)
+        owners = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AnnualObservationEvents"]
+        methods = [node for owner in owners for node in owner.body
+                   if isinstance(node, ast.FunctionDef) and node.name == "iter_date_groups"]
+        if (len(owners) != 1 or len(methods) != 1 or methods[0].decorator_list
+                or [arg.arg for arg in methods[0].args.args] != ["self", "definitions", "symbols"]
+                or methods[0].args.vararg is not None or methods[0].args.kwarg is not None
+                or any(arg.arg not in {"after", "initial_periods"} for arg in methods[0].args.kwonlyargs)
+                or any(not isinstance(value, ast.Constant) or value.value is not None
+                       for value in methods[0].args.kw_defaults)
+                or sweep.count(causal) != 1):
             raise ValueError("saved original coordinate preparation no longer matches")
-        block_start, block_end = sweep.index(begin), sweep.index(end)
+        # Preserve frozen pre-checkpoint fixtures and the current defaulted
+        # continuation signature without a whitespace/signature string guard.
+        # Only this exact method is substituted; sibling methods stay intact.
+        lines = sweep.splitlines(keepends=True)
+        block_start = sum(map(len, lines[:methods[0].lineno-1]))
+        block_end = sum(map(len, lines[:methods[0].end_lineno]))
         if sweep.count(scan) == 1:
             preparation = sweep[sweep.index(scan):sweep.index(causal)]
             preparation = preparation.replace("            if table.is_empty():continue\n",

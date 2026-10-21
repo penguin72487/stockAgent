@@ -126,6 +126,23 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
         return references
     sources = tuple(source.resolve() for source in sources)
     scope_root = scope_root.resolve()
+    # Many services repeat the same executable, cwd and options. Resolving
+    # every occurrence walks Windows/remote mounts for unrelated arguments.
+    # Share only this pass's bounded resolutions, then recheck every reused
+    # name before accepting the observation. No result survives this call.
+    resolved_paths = {}
+    reused_paths = set()
+
+    def resolve(path: Path, *, strict=False):
+        key = (path, strict)
+        if key in resolved_paths:
+            reused_paths.add(key)
+            return resolved_paths[key]
+        value = path.resolve(strict=strict)
+        if len(resolved_paths) < 4096 and len(str(path)) <= 4096:
+            resolved_paths[key] = value
+        return value
+
     own_pid = os.getpid()
     for process in _process_directories():
         try:
@@ -150,12 +167,12 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
                 argument = Path(text)
                 if not argument.is_absolute():
                     try:
-                        cwd = (process / "cwd").resolve(strict=True)
+                        cwd = resolve(process / "cwd", strict=True)
                     except OSError as error:
                         _reference_read_error(process / "cwd", error)
                         continue
                     argument = cwd / argument
-                argument = argument.resolve(strict=False)
+                argument = resolve(argument)
                 # An orchestrator naming this artifact scope is a consumer.
                 # A generic Jupyter/server root such as '/' is not proof that
                 # it consumes every completed artifact on the machine.
@@ -176,6 +193,28 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
                 references.append(evidence)
             if len(references) >= 20:
                 return references
+    for path, strict in reused_paths:
+        try:
+            current = path.resolve(strict=strict)
+        except (OSError, ValueError) as error:
+            # An exited process is allowed as in the original scan. Other
+            # resolution failures are unknown use, not evidence of no use.
+            if isinstance(error, OSError) and error.errno in (errno.ENOENT, errno.ESRCH):
+                continue
+            raise SnapshotError('reused process argument cannot be rechecked') from error
+        if current != resolved_paths[(path, strict)]:
+            # A changing unrelated alias is not a consumer of this cleanup.
+            # Re-evaluate the actual protection predicate instead of requiring
+            # every path on the machine to remain unchanged. A changed cwd is
+            # different: it can redirect relative arguments, so defer safely.
+            if not strict:
+                try:
+                    current.relative_to(scope_root)
+                except ValueError:
+                    continue
+                if not any(source == current or current in source.parents for source in sources):
+                    continue
+            raise SnapshotError('process argument resolution changed during reference scan')
     return references
 
 

@@ -243,6 +243,78 @@ def test_native_hash_batch_checks_authority_before_and_after_not_per_member(tmp_
     assert all(path.read_bytes() == b'exact immutable member' for path in paths)
 
 
+@pytest.mark.parametrize('failure', [None, 'before', 'after', 'changed', 'short', 'excess',
+                                    'unconsumed', 'partial_failure', 'startup-once',
+                                    'startup-exhausted', 'other-error', 'consumer-error'])
+def test_exact_native_stream_batch_keeps_order_bounds_and_all_lifecycle_guards(tmp_path, monkeypatch, failure):
+    from stockagent.data_sync import cold_primary
+    paths = [tmp_path / str(i) for i in range(2)]
+    values = [b'\x00first', b'\xffsecond']
+    for path, value in zip(paths, values, strict=True):
+        path.write_bytes(value)
+    # The same object can occur twice in one original, and must not deduplicate.
+    members = [(paths[0], len(values[0])), (paths[1], len(values[1])), (paths[0], len(values[0]))]
+    expected = values[0] + values[1] + values[0]
+    launches, events = [], []
+    def guard(root):
+        events.append('guard')
+        if failure == 'before' and not launches or failure == 'after' and launches:
+            raise SnapshotError('authority unavailable')
+    class Process:
+        def __init__(self, output, code):
+            self.stdin = io.BytesIO()
+            self.stdout = io.BufferedReader(io.BytesIO(output))
+            self.code = code
+        def wait(self, **kwargs):return self.code
+        def poll(self):return self.code
+    def launch(configs, **options):
+        assert options == {'batched': True}
+        assert [c['expected_bytes'] for c in configs] == [n for _, n in members]
+        startup = failure in {'startup-exhausted', 'other-error'} or failure == 'startup-once' and not launches
+        output = b'' if startup else expected[:-1] if failure == 'short' else expected
+        if failure == 'excess':output += b'!'
+        p = Process(output, 1 if startup or failure == 'partial_failure' else 0)
+        launches.append(p)
+        stderr = (b'permission denied' if failure == 'other-error' else
+                  b'<3>WSL ERROR: UtilAcceptVsock:273: accept4 failed 110')
+        return p, io.BytesIO(stderr)
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', guard)
+    monkeypatch.setattr(native, '_configuration_on_checked_mount', lambda path, **k: k)
+    monkeypatch.setattr(native, '_launch', launch)
+    monkeypatch.setattr(native.time, 'sleep', lambda n: None)
+    def consume():
+        with native.binary_reader_many(members) as stream:
+            if failure == 'consumer-error':raise SnapshotError('consumer SHA mismatch')
+            if failure == 'unconsumed':return
+            actual = stream.read(len(expected))
+            if actual != expected:raise SnapshotError('truncated exact member')
+            if failure == 'changed':paths[1].write_bytes(b'changed')
+    if failure in {None, 'startup-once'}:
+        consume()
+        assert len(launches) == (2 if failure else 1)
+        assert events == ['guard'] * (3 if failure else 2)
+    else:
+        with pytest.raises(SnapshotError):consume()
+        assert len(launches) == (0 if failure == 'before' else 3 if failure == 'startup-exhausted' else 1)
+    assert all(p.stdin.closed and p.stdout.closed for p in launches)
+
+
+@pytest.mark.parametrize('members', [[], [(Path('/fixed'), True)], [(Path('/fixed'), -1)],
+                                    [(Path('/fixed'), 8 * 1024**3 + 1)],
+                                    [(Path('/fixed'), 1)] * 17,
+                                    [(Path('/fixed'), 8 * 1024**3)] * 3])
+def test_native_stream_batch_rejects_unbounded_inputs_before_authority_or_process(members, monkeypatch):
+    monkeypatch.setattr(native, '_launch', lambda *a, **k: pytest.fail('unbounded process'))
+    with pytest.raises(SnapshotError, match='bounds'):
+        with native.binary_reader_many(members):pass
+
+
+def test_native_exact_stream_checks_each_filestream_size_before_and_after():
+    script = native.SCRIPT.read_text()
+    assert "Exact read member size differs" in script
+    assert "Truncated exact read member" in script
+
+
 def test_native_copy_batch_failure_keeps_every_partial(tmp_path, monkeypatch):
     members = []
     for i in range(2):

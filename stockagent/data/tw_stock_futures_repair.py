@@ -27,28 +27,60 @@ def apply_block_evidence(official: pl.DataFrame, manifest_path: Path) -> tuple[p
     """Deduct only independently downloaded, hash-verified block quantities."""
     import io
     receipt = json.loads(manifest_path.read_text())
-    if receipt.get('source') != 'taifex_official_block_volume_v1':
+    ranged = receipt.get('source') == 'taifex_official_block_volume_inventory_v1'
+    if not ranged and receipt.get('source') != 'taifex_official_block_volume_v1':
         raise ValueError('invalid official block evidence source')
-    volumes = {}
+    volumes, intervals = {}, []
     for source in receipt['sources']:
         path = Path(source['path'])
+        raw = path.read_bytes()
         if (source['url'] != 'https://www.taifex.com.tw/cht/3/dlProductOrderDown'
-                or sha256_file(path) != source['sha256']):
+                or hashlib.sha256(raw).hexdigest() != source['sha256']):
             raise ValueError('official block evidence SHA/source mismatch')
-        reader = csv.DictReader(io.StringIO(path.read_bytes().decode('cp950')))
+        if ranged:
+            start = date.fromisoformat(source['source_first_date'])
+            end = date.fromisoformat(source['source_last_date'])
+            form = source.get('form', {})
+            if (source.get('method') != 'POST' or source.get('http_status') != 200
+                    or not start <= end or (end-start).days > 365
+                    or form.get('queryStartDate') != start.strftime('%Y/%m/%d')
+                    or form.get('queryEndDate') != end.strftime('%Y/%m/%d')
+                    or any(start <= b and a <= end for a, b in intervals)):
+                raise ValueError('invalid or overlapping official block query interval')
+        else:
+            start = end = date.fromisoformat(source['date'])
+        intervals.append((start, end))
+        reader = csv.DictReader(io.StringIO(raw.decode('cp950')))
         if not {'交易日期','契約','到期月份(週別)','成交數量','交易時段'} <= set(reader.fieldnames or []):
             raise ValueError('invalid block CSV schema; an HTTP response is not data')
         for row in reader:
             day = str(_parse_trading_date(row['交易日期']))
-            if day != source['date']:
+            if not str(start) <= day <= str(end):
                 raise ValueError('block CSV query date mismatch')
             if row['交易時段'].strip() != '一般':
                 continue
             physical = row['契約'].strip()+':'+row['到期月份(週別)'].strip()
             qty = int(row['成交數量'])
-            if qty < 0 or (day, physical) in volumes:
+            if qty < 0 or (not ranged and (day, physical) in volumes):
                 raise ValueError('negative or duplicate block quantity')
-            volumes[day, physical] = qty
+            volumes[day, physical] = volumes.get((day, physical), 0) + qty
+    if ranged:
+        # Only a complete official query interval can witness an absent block.
+        if any(not any(a <= d <= b for a, b in intervals) for d in official['date'].unique()):
+            raise ValueError('official block inventory does not cover selected dates')
+        keys = ['date', 'product', 'contract']
+        if not set(keys) <= set(official.columns) or official.select(keys).is_duplicated().any():
+            raise ValueError('block inventory needs unique dated product/delivery identities')
+        blocks = pl.DataFrame([
+            {'date': date.fromisoformat(d), 'product': p.split(':')[0],
+             'contract': p.split(':')[1], 'block_volume': v}
+            for (d, p), v in volumes.items()],
+            schema={'date': pl.Date, 'product': pl.String, 'contract': pl.String, 'block_volume': pl.Int64})
+        result = official.join(blocks, on=keys, how='left', validate='1:1').with_columns(pl.col('block_volume').fill_null(0))
+        if result.filter(pl.col('outright_volume').is_null()
+                         | (pl.col('block_volume') > pl.col('outright_volume'))).height:
+            raise ValueError('block volume exceeds unaccounted official volume')
+        return result.with_columns((pl.col('outright_volume') - pl.col('block_volume')).alias('outright_volume')), receipt
     rows = official.to_dicts()
     for row in rows:
         block = volumes.get((str(row['date']), row['physical_contract']), 0)

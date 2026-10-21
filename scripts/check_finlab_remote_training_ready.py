@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
 
 from stockagent.config import load_config  # noqa: E402
 from stockagent.data_sync.desync_snapshots import sha256_file  # noqa: E402
+from stockagent.data.parquet_lineage import ParquetLineage, assert_receipt  # noqa: E402
+from stockagent.data.partitioned_parquet import discover_sources  # noqa: E402
 
 DEFAULT_CONFIG = ROOT / "configs/deployments/tw_public_finlab_research_2014_v4_remote.yaml"
 
@@ -36,13 +38,14 @@ def check(config_path: Path) -> dict:
     if pq.ParquetFile(feature).metadata.num_rows != receipt.get("feature_rows"):
         raise RuntimeError("FinLab feature table row count differs from receipt")
     base = stock_root.parent / "features/tw_public_stock_daily.parquet"
-    if sha256_file(base) != receipt.get("base_feature_sha256"):
-        raise RuntimeError("TW public base does not match the FinLab research build")
-    if not stock_root.is_dir() or not any(stock_root.glob("*.parquet")):
+    formal = ParquetLineage(base)
+    assert_receipt(formal.identity, receipt, hash_key="base_feature_sha256", source_key="base_feature_source")
+    if not stock_root.is_dir() or not discover_sources(stock_root, pattern="*.parquet"):
         raise RuntimeError("TW price panel parquet root is missing")
     for member, expected_hash in receipt.get("formal_action_members_sha256", {}).items():
         if sha256_file(release_root / member) != expected_hash:
             raise RuntimeError(f"formal action companion mismatch: {member}")
+    formal.verify()
     return {
         "status": "inputs_exact_hash_verified",
         "feature_rows": receipt["feature_rows"],

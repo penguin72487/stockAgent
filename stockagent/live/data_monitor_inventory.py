@@ -8,6 +8,8 @@ only a bounded number of changed footers; HTTP requests only read the cache.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 import fcntl
@@ -31,7 +33,9 @@ from stockagent.live.data_monitor_record_codec import encode_record_cache
 # The new, independently versioned membership proof is an additive extension.
 INVENTORY_VERSION = 10
 DATASET_MEMBERSHIP_VERSION = 1
-FAST_INDEX_VERSION = 4
+FAST_INDEX_VERSION = 5
+_PARTITION_SUFFIX = ".manifest.json"
+_PARTITION_SNAPSHOTS = ContextVar("inventory_partition_snapshots", default=None)
 
 # Native JSON produces ordinary dicts. Avoid the Python ABC instance-check on
 # that common path, retaining exactly the original Mapping fallback otherwise.
@@ -109,8 +113,12 @@ class _SourceObservation:
             digest.update(b"?")
             self.matches_cache = False
         else:
-            identity = _file_identity(source_stat)
-            digest.update(b"I" + struct.pack("<QQQQQ", *identity))
+            identity = _source_file_identity(path, source_stat)
+            digest.update(b"I" + struct.pack("<QQQQQ", *identity[:5]))
+            if len(identity) > 5:
+                digest.update(b"P" + identity[5].encode())
+                if identity[5] == "invalid_partition":
+                    self.matches_cache = False
             if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or entry.get("file_identity") != identity:
                 self.matches_cache = False
 
@@ -142,12 +150,84 @@ def _feature_paths(directory: Path, *, files_only: bool = False) -> list[Path]:
         with os.scandir(directory) as entries:
             names = sorted(
                 entry.name for entry in entries
-                if entry.name.endswith("_features.parquet")
+                if entry.name.endswith(("_features.parquet", "_features.parquet" + _PARTITION_SUFFIX))
                 and (not files_only or entry.is_file())
             )
     except OSError:
         return []
-    return [directory / name for name in names]
+    return _logical_sources(directory / name for name in names)
+
+
+def _logical_sources(paths):
+    # Keep an ambiguous source visible as INVALID, not as an empty dataset or
+    # two independently counted files. ParquetSource rejects both ABIs present.
+    chosen = {}
+    for path in paths:
+        logical = str(path).removesuffix(_PARTITION_SUFFIX)
+        if logical not in chosen or path.name.endswith(_PARTITION_SUFFIX):
+            chosen[logical] = path
+    return _sorted_paths(chosen.values())
+
+
+def _pattern_sources(root, pattern):
+    if not any(marker in pattern for marker in ("*", "?", "[")):
+        path = root / pattern
+        return _logical_sources(candidate for candidate in (path, Path(str(path) + _PARTITION_SUFFIX))
+                                if candidate.is_file())
+    # One directory traversal, not one legacy scan plus another manifest scan.
+    # Exact suffix filtering excludes temp files, summaries and parts directories.
+    return _logical_sources(path for path in root.glob(pattern + "*")
+                            if path.name.endswith((".parquet", ".parquet" + _PARTITION_SUFFIX)) and path.is_file())
+
+
+@contextmanager
+def _partition_snapshot_scope():
+    if _PARTITION_SNAPSHOTS.get() is not None:
+        yield
+        return
+    snapshots = {}
+    token = _PARTITION_SNAPSHOTS.set(snapshots)
+    try:
+        yield
+        for source in snapshots.values():
+            source.verify()
+    finally:
+        _PARTITION_SNAPSHOTS.reset(token)
+
+
+def _partition_snapshot(path):
+    from stockagent.data.partitioned_parquet import ParquetSource, resolve_source
+    resolve_source(path)  # A stale legacy file appearing during a scan is invalid.
+    snapshots = _PARTITION_SNAPSHOTS.get()
+    key = str(path)
+    if snapshots is not None and key in snapshots:
+        source = snapshots[key]
+        source.verify()
+        return source
+    source = ParquetSource(path)
+    if snapshots is not None:
+        snapshots[key] = source
+    return source
+
+
+def _source_file_identity(path, metadata):
+    identity = _file_identity(metadata)
+    if not path.name.endswith(_PARTITION_SUFFIX):
+        return identity
+    try:
+        source = _partition_snapshot(path)
+        proof = [source.byte_sha256, source.signatures]
+        return [*identity, hashlib.sha256(json.dumps(proof, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()]
+    except (OSError, ValueError, RuntimeError, ImportError, KeyError, TypeError):
+        return [*identity, "invalid_partition"]
+
+
+def _valid_source_identity(identity):
+    return (isinstance(identity, list) and len(identity) in (5, 6)
+            and all(type(value) is int for value in identity[:5])
+            and (len(identity) == 5 or isinstance(identity[5], str)
+                 and re.fullmatch(r"[a-f0-9]{64}", identity[5]) is not None))
 
 # Physical families are deliberately explicit.  Raw retries, alternate views,
 # caches and SEC filing vintages must not be silently interpreted as unique
@@ -258,17 +338,21 @@ def _selection_fingerprint(
         for path in paths:
             if cache is None:
                 try:
-                    identity = _file_identity(path.stat())
+                    identity = _source_file_identity(path, path.stat())
                 except OSError:
                     return None
             else:
                 entry = cache.get(str(path))
                 identity = entry.get("file_identity") if isinstance(entry, _RUNTIME_MAPPING_TYPES) else None
-                if not isinstance(identity, list) or len(identity) != 5:
+                if not _valid_source_identity(identity):
                     return None
             try:
+                if not _valid_source_identity(identity):
+                    return None
                 digest.update(b"F" + os.fsencode(path) + b"\0")
-                digest.update(pack_identity(*identity))
+                digest.update(pack_identity(*identity[:5]))
+                if len(identity) > 5:
+                    digest.update(b"P" + identity[5].encode())
             except (OverflowError, TypeError, ValueError, struct.error):
                 return None
     return digest.hexdigest()
@@ -453,14 +537,14 @@ def _read_quick_index(
         if (
             not isinstance(hint, list) or len(hint) != 2
             or not isinstance(hint[0], str)
-            or not isinstance(hint[1], list) or len(hint[1]) != 5
-            or any(type(value) is not int for value in hint[1])
+            or not _valid_source_identity(hint[1])
         ):
             probe["outcome"] = "hint_contract_invalid"
             return None
         probe["hints_checked"] += 1
         try:
-            if _file_identity(Path(hint[0]).stat()) != hint[1]:
+            hint_path = Path(hint[0])
+            if _source_file_identity(hint_path, hint_path.stat()) != hint[1]:
                 probe["outcome"] = "source_hint_changed"
                 return None
         except (OSError, ValueError):
@@ -585,13 +669,13 @@ def _write_quick_index(
             pass
 
 
-def _entry_matches_stat(entry: Mapping[str, Any], stat: os.stat_result) -> bool:
+def _entry_matches_stat(entry: Mapping[str, Any], stat: os.stat_result, *, path=None) -> bool:
     return (
         entry.get("size") == stat.st_size
         and entry.get("mtime_ns") == stat.st_mtime_ns
         and (
             "file_identity" not in entry
-            or entry["file_identity"] == _file_identity(stat)
+            or entry["file_identity"] == (_source_file_identity(path, stat) if path is not None else _file_identity(stat))
         )
     )
 
@@ -629,6 +713,38 @@ def _date_text(value: Any, *, column: str) -> str | None:
 
 
 def parquet_footer_stats(path: Path) -> dict[str, Any] | None:
+    """One logical table, with every immutable member's complete byte proof."""
+    if not path.name.endswith(_PARTITION_SUFFIX):
+        return _legacy_parquet_footer_stats(path)
+    try:
+        source = _partition_snapshot(path)
+        parts = [_legacy_parquet_footer_stats(member) for member in source.members]
+        if any(part is None for part in parts):
+            return None
+        if not parts:
+            fields = [(field.name, str(field.type)) for field in source.schema]
+            return {"count": 0, "first": None, "last": None, "time_column": None,
+                "schema_id": hashlib.sha256(json.dumps(fields, ensure_ascii=False,
+                    separators=(",", ":")).encode()).hexdigest(),
+                "fields": fields, "non_null": [0] * len(fields)}
+        if any(part["schema_id"] != parts[0]["schema_id"] for part in parts):
+            return None
+        complete = all(not part["count"] or part["first"] and part["last"] for part in parts)
+        lows = [part["first"] for part in parts if part["first"]]
+        highs = [part["last"] for part in parts if part["last"]]
+        counts = list(zip(*(part["non_null"] for part in parts), strict=True))
+        result = {**parts[0], "count": sum(part["count"] for part in parts),
+                  "first": min(lows) if complete and lows else None,
+                  "last": max(highs) if complete and highs else None,
+                  "non_null": [sum(values) if all(type(value) is int for value in values) else None
+                               for values in counts]}
+        source.verify()
+        return result
+    except (OSError, ValueError, RuntimeError, ImportError, KeyError, TypeError):
+        return None
+
+
+def _legacy_parquet_footer_stats(path: Path) -> dict[str, Any] | None:
     """Return exact stored-row count and date bounds only when footer proves them."""
 
     try:
@@ -754,9 +870,7 @@ def _selected_files(root: Path) -> dict[str, list[Path]]:
                 files_only=True,
             )
         else:
-            selected[f"physical:{family}"] = _sorted_paths(
-                path for path in root.glob(pattern) if path.is_file()
-            )
+            selected[f"physical:{family}"] = _pattern_sources(root, pattern)
     return selected
 
 
@@ -784,7 +898,7 @@ def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
             continue
         if observation is not None:
             observation.observe(dataset, path, stat, entry=entry)
-        if not _entry_matches_stat(entry, stat):
+        if not _entry_matches_stat(entry, stat, path=path):
             continue
         if entry.get("error") == "invalid_parquet":
             invalid += 1
@@ -945,7 +1059,7 @@ def _build_record_inventory_unlocked(
             entry = cache.get(key)
             entry_current = (
                 isinstance(entry, _RUNTIME_MAPPING_TYPES)
-                and _entry_matches_stat(entry, stat)
+                and _entry_matches_stat(entry, stat, path=path)
                 and (isinstance(entry.get("stats"), _RUNTIME_MAPPING_TYPES) or entry.get("error") == "invalid_parquet")
                 and (entry.get("error") == "invalid_parquet" or (
                         entry["stats"].get("schema_id") in schemas
@@ -970,6 +1084,7 @@ def _build_record_inventory_unlocked(
                     break
                 refreshed += 1
             all_entries_unchanged = False
+            source_identity = _source_file_identity(path, stat)
             stats = parquet_footer_stats(path)
             try:
                 after_stat = path.stat()
@@ -978,7 +1093,7 @@ def _build_record_inventory_unlocked(
                 cache.pop(key, None)
                 feature_inputs_changed = True
                 continue
-            if _file_identity(stat) != _file_identity(after_stat):
+            if source_identity != _source_file_identity(path, after_stat):
                 # The footer may belong to an old inode or an in-flight write.
                 # Keep this file unverified and retry the next supervised run.
                 unavailable_during_refresh = True
@@ -992,10 +1107,10 @@ def _build_record_inventory_unlocked(
                 # must not invalidate every other owner of an unchanged schema.
                 schemas[stats["schema_id"]] = [list(field) for field in fields]
                 updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                           "file_identity": _file_identity(stat), "stats": stats}
+                           "file_identity": source_identity, "stats": stats}
             else:
                 updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                           "file_identity": _file_identity(stat), "error": "invalid_parquet"}
+                           "file_identity": source_identity, "error": "invalid_parquet"}
             if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or (
                 entry.get("stats"), entry.get("error")
             ) != (updated.get("stats"), updated.get("error")):
@@ -1178,6 +1293,12 @@ def build_record_inventory(
     repo_root: Path, *, refresh: bool = False, max_refresh_files: int = DEFAULT_REFRESH_FILES,
     snapshot: InventorySnapshot | None = None,
 ) -> dict[str, Any]:
+    with _partition_snapshot_scope():
+        return _build_record_inventory(repo_root, refresh=refresh,
+                                       max_refresh_files=max_refresh_files, snapshot=snapshot)
+
+
+def _build_record_inventory(repo_root, *, refresh, max_refresh_files, snapshot):
     """Read the inventory, serializing refreshes across snapshot processes."""
 
     if not refresh:
@@ -1337,6 +1458,10 @@ class FeatureInventoryScan:
                               "emit_rows": 0.0})
 
     def __iter__(self):
+        with _partition_snapshot_scope():
+            yield from self._iterate()
+
+    def _iterate(self):
         if self._iterated:
             raise ValueError("feature inventory scan is single-use")
         self._iterated = True
@@ -1356,7 +1481,7 @@ class FeatureInventoryScan:
                     self.observation.observe(dataset, path, None, entry=entry)
                     continue
                 self.observation.observe(dataset, path, source_stat, entry=entry)
-                if not _entry_matches_stat(entry, source_stat):
+                if not _entry_matches_stat(entry, source_stat, path=path):
                     continue
                 info = entry.get("stats")
                 if not isinstance(info, _RUNTIME_MAPPING_TYPES):

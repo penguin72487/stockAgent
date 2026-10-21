@@ -96,6 +96,30 @@ def provider_phase_latency(events, symbols, session_start):
             job.update(state=row.get("state", "unverified"), source_total_ms=row.get("last_total_ms"),
                        source_and_persistence_ms=row.get("source_and_persistence_ms"),
                        error_type=row.get("error_type"), http_status=row.get("http_status"))
+            for field in ("transport_recovery_probe", "transport_health_recovered"):
+                if field in row:
+                    job[field] = row[field]
+            # A dispatch observation is not proof of a request already on the
+            # wire. Keep the real provider invocation separately; older owners
+            # without this clock remain unmeasured, not a fabricated 0 ms.
+            if row.get("provider_invocation_at_taipei"):
+                try:
+                    invoked = datetime.fromisoformat(row["provider_invocation_at_taipei"])
+                    if invoked.tzinfo is None:
+                        raise ValueError("naive provider invocation")
+                    job["provider_invocation_after_open_ms"] = round((invoked - session_start).total_seconds() * 1000, 3)
+                    job["provider_invocation_boundary"] = "provider_function_entry_not_http_wire_or_exchange_publish"
+                except (TypeError, ValueError):
+                    job["provider_invocation_clock_state"] = "invalid"
+            # Retain the canonical owner's safe stage facts alongside first /
+            # full coverage. Parallel request spans are NOT additive to total
+            # latency; absent legacy spans remain absent rather than 0 ms.
+            job["stage_timing"] = {key: row[key] for key in (
+                "provider_call_offset_ms", "dispatch_telemetry_wait_ms", "dispatch_telemetry_recorded",
+                "last_diagnostics_ms", "last_cache_merge_ms", "last_validation_ms",
+                "input_flush", "transport_timing") if key in row and row[key] is not None
+                and (key != "transport_timing" or row[key])}
+            job["stage_timing_boundary"] = "nested_wall_spans_overlap_not_additive_v1"
             # Legacy counts are useful final observations, not first/full clocks.
             job.setdefault("valid_open_count", row.get("valid_open_count"))
     groups = {}
@@ -119,7 +143,7 @@ def provider_phase_latency(events, symbols, session_start):
             group["source_duration_percentiles_ms"] = {str(p): durations[max(0, math.ceil(len(durations) * p) - 1)]
                 if durations else None for p in (.5, .95, .99)}
             group["duration_sample_count_including_failures"] = len(durations)
-    return {"contract": "quote_phase_full_scope_per_job_latency_v1", "requested_count": requested_count,
+    return {"contract": "quote_phase_full_scope_per_job_latency_v2", "requested_count": requested_count,
         "requested_scope_sha256": scope_hash, "phases": groups,
         "boundary": "validated_opening_fields_not_fresh_executable_book_or_broker_fill",
         "full_positive_requires_every_symbol_to_have_a_genuine_open": True}
@@ -265,8 +289,12 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                         "started", "finished", "observations_delta", "provider_snapshot", "coverage_progress"}:
                     compact = {key: row.get(key) for key in ("provider", "event", "job_id", "owner_pid",
                         "requested_count", "state", "valid_open_count", "worker_queue_ms", "last_total_ms",
+                        "provider_invocation_at_taipei",
                         "requested_symbols_sha256", "requested_scope_sha256", "elapsed_ms", "measurement_clock",
                         "observed_no_print_count", "response_count", "source_and_persistence_ms", "error_type", "http_status")}
+                    compact.update({key: row[key] for key in ("provider_call_offset_ms", "dispatch_telemetry_wait_ms",
+                        "dispatch_telemetry_recorded", "last_diagnostics_ms", "last_cache_merge_ms",
+                        "last_validation_ms", "input_flush") if key in row})
                     if row["event"] == "observations_delta":
                         compact["observations"] = [{"symbol": obs["symbol"], "state": obs["state"]}
                             for obs in row.get("observations", [])]
@@ -299,7 +327,28 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                         or key in {"body_bytes", "provider_payload_rows", "mis_failed_request_count", "provider_failure_reused",
                             "mis_failure_phase_counts", "mis_dispatch_stopped", "mis_dispatch_stop_reason", "mis_dispatch_policy",
                             "mis_deferred_channel_count", "mis_request_count", "mis_http_workers",
-                            "mis_http_error_statuses", "mis_error_chain_types"}}
+                            "mis_http_error_statuses", "mis_error_chain_types", "mis_progress_batch_count",
+                            "mis_span_policy", "mis_local_overlap_policy"}}
+                    # Named finite numeric spans and a closed connection-origin
+                    # enum only; never URLs, headers, tokens or arbitrary text.
+                    for field, allowed in {
+                        "mis_requests": {"channel_count", "response_row_count", "elapsed_ms", "headers_ms",
+                            "http_status", "worker_queue_ms", "session_prepare_ms", "http_headers_ms", "http_session_origin",
+                            "body_read_ms", "body_bytes", "json_decode_ms", "row_decode_ms",
+                            "request_to_decoded_rows_ms"},
+                        "mis_progress_spans": {"row_count", "cohort_count", "snapshot_assembly_ms",
+                            "callback_ms", "elapsed_since_source_start_ms"},
+                    }.items():
+                        values = transport.get(field)
+                        if isinstance(values, list):
+                            safe = [{key: value for key, value in item.items() if key in allowed
+                                and ((type(value) in (int, float) and math.isfinite(value) and value >= 0)
+                                     or (key == "http_session_origin" and isinstance(value, str) and value in {
+                                         "validated_prewarm_exclusive_handoff", "new_worker_connection", "thread_local_keepalive"}))}
+                                for item in values if isinstance(item, dict)]
+                            safe = [item for item in safe if item]
+                            if safe:
+                                compact["transport_timing"][field] = safe
                     provider_events.append((elapsed, compact))
                 if provider != "merged" and row.get("event") in {"started", "finished", "observations_delta", "provider_snapshot"}:
                     known_providers.add(provider)

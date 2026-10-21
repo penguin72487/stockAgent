@@ -150,15 +150,31 @@ if (( finlab_preopen )); then
   exit 0
 fi
 
-# Only build/package the derived research ABI after a complete current sweep.
-# This avoids repeated ~million-row table work during a long quota backfill.
-if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2014_v3.parquet" ]]; then
-  if run_fintech_python "$finlab_repo_root/scripts/finlab_release_gate.py"; then
-    run_fintech_python "$finlab_repo_root/scripts/build_finlab_research_overlay.py" --refresh-canonical-base
+finlab_refresh_research() {
+    if run_fintech_python "$finlab_repo_root/scripts/build_finlab_research_overlay.py" --refresh-canonical-base; then
+      :
+    else
+      finlab_research_exit=$?
+      if [[ "$finlab_research_exit" == "75" ]]; then
+        echo "[finlab] public source writer busy; research deferred, independent minute queue continues"
+        return 0
+      fi
+      return "$finlab_research_exit"
+    fi
     # Stage rechecks every source SHA-256; catalog publication requires the
     # resulting freshness receipt. Raw data_finlab stays publish:false.
     if [[ "${FINLAB_PRIVATE_RESEARCH_PUBLISH:-1}" == "1" ]]; then
-      finlab_stage_result="$(run_fintech_python "$finlab_repo_root/scripts/stage_tw_public_finlab_research_release.py")"
+      if finlab_stage_result="$(run_fintech_python "$finlab_repo_root/scripts/stage_tw_public_finlab_research_release.py")"; then
+        :
+      else
+        finlab_research_exit=$?
+        if [[ "$finlab_research_exit" == "75" ]]; then
+          echo "$finlab_stage_result"
+          echo "[finlab] public source writer busy at staging; no publication, minute queue continues"
+          return 0
+        fi
+        return "$finlab_research_exit"
+      fi
       echo "$finlab_stage_result"
       finlab_should_publish=1
       if [[ "$finlab_stage_result" == *'"event": "finlab_research_stage_unchanged"'* ]]; then
@@ -173,10 +189,36 @@ if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2
         echo "[finlab] current source content changed; publishing audited private release"
       fi
       if [[ "$finlab_should_publish" == "1" ]]; then
-        stockagent-data publish tw-public-research-finlab-2014-v4
+        # Seal once under the original stage owner, then let the installed
+        # outbox consumer retry transport. A scan failure must not abort this
+        # account's minute queue or force another full research refresh.
+        finlab_publish_receipt_dir="$finlab_repo_root/artifacts/data_refresh/finlab/publication/commits"
+        mkdir -p "$finlab_publish_receipt_dir"
+        finlab_publish_receipt="$finlab_publish_receipt_dir/$(date -u +%Y%m%dT%H%M%S%N)-${BASHPID}.json"
+        finlab_publish_options=(--result-receipt "$finlab_publish_receipt")
+        finlab_defer_scan=0
+        if [[ -f "${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}/.stockagent-d-primary" ]]; then
+          finlab_publish_options+=(--defer-scan)
+          finlab_defer_scan=1
+        fi
+        stockagent-data publish tw-public-research-finlab-2014-v4 "${finlab_publish_options[@]}"
+        if (( finlab_defer_scan )); then
+          if ! systemctl start --no-block stockagent-d-cold-scan-retry.service; then
+            echo "[finlab] cold release committed; scan intent retained for the existing retry timer" >&2
+          fi
+        fi
         run_fintech_python "$finlab_repo_root/scripts/audit_finlab_research_cold.py"
       fi
     fi
+}
+
+# Only build/package the derived research ABI after a complete current sweep.
+# This avoids repeated ~million-row table work during a long quota backfill.
+# Expected dependency contention defers this branch only. Unexpected source,
+# schema, hash or permission failures still stop the run and retain evidence.
+if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2014_v3.parquet" ]]; then
+  if run_fintech_python "$finlab_repo_root/scripts/finlab_release_gate.py"; then
+    finlab_refresh_research
   else
     echo "[finlab] catalog not current; no derived rebuild, private package, or cold publication"
   fi
@@ -202,6 +244,19 @@ if [[ "$finlab_state" == "pass_complete" ]]; then
       'import json,sys; p=json.loads(sys.argv[1]); print(str(p.get("minute_residual_allowed", p.get("supplemental_allowed", False))).lower())' \
       "$finlab_general_status")"
     if [[ "$finlab_tick_allowed" == "true" ]]; then
+      # Do not initialize an SDK pool or rebuild the partition index merely
+      # to rediscover an already full disk. General/research work above is
+      # independent and must retain its opportunity to make progress.
+      if run_fintech_python "$finlab_repo_root/scripts/check_finlab_refresh_due.py" --intraday-disk-only; then
+        :
+      else
+        finlab_disk_exit=$?
+        if [[ "$finlab_disk_exit" == "1" ]]; then
+          echo "[finlab] intraday disk reserve reached; no pool, provider call or partition scan started"
+          exit 0
+        fi
+        exit "$finlab_disk_exit"
+      fi
       finlab_tick_reserve_mb="$(run_fintech_python -c \
         'import json,os,sys; from dotenv import dotenv_values; status=json.loads(sys.argv[1]); configured=os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB"); print(max(float(status.get("scheduled_reserve_mb",500)), float(configured) if configured else 50))' \
         "$finlab_general_status")"

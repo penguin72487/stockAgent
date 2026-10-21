@@ -183,7 +183,7 @@ async function refresh() {
     const data = await fetchJson("api/overview");
     renderTw(data.tw || {});
     renderOvernight(data.overnight || {});
-    if (Dashboard.isOwnerView()) {
+    if (Dashboard.canViewAllPages()) {
       renderTaifex(data.taifex || {});
       renderShioaji(data.shioaji || {});
       renderFinlab(data.finlab || {});

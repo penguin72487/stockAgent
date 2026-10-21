@@ -6117,8 +6117,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
     assert re.search(r'src="presentation\.js\?v=[1-9][0-9]*"', html)
     assert re.search(r'src="detail-components\.js\?v=[1-9][0-9]*"', html)
-    assert "let followLatestSession = false;" in javascript
-    assert "let followPerformanceRange = true;" in javascript
+    # Details default to the latest session; YTD remains an explicit action.
+    assert "let followLatestSession = true;" in javascript
+    assert "let followPerformanceRange = false;" in javascript
     assert 'const DEFAULT_PERFORMANCE_START_DATE = "2026-01-01";' in javascript
     assert 'id="performance-range"' in html
     assert "function chartHistoryMatchesSelection()" in javascript

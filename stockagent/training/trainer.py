@@ -3226,6 +3226,21 @@ def _mode_artifact_contract_for_config(
                 causal_account_policy_replay_version=1,
                 deployment_action_source="owned_market_policy_packets_resolved_from_continuously_carried_book_and_nav",
             )
+        if config.trading.tw_futures_portfolio_decision_time is not None:
+            from stockagent.data.tw_futures_decision_clock import decision_clock_contract
+            clock = decision_clock_contract(config.trading.tw_futures_portfolio_decision_time)
+            payload.update(decision_clock=f"{clock['decision_time']}_completed_prior_session_features",
+                           execution_clock=f"post_decision_minute_vwap_label_{clock['window_end_minute']}")
+            payload["mode_details"].update(entry_clock=clock,
+                entry_clock_source=config.trading.tw_futures_portfolio_entry_clock_path,
+                risk_clock="entry_proxy_boundary_and_official_settlement_not_intraday_broker_replay")
+            if config.trading.tw_futures_portfolio_opening_reference_path is not None:
+                from stockagent.data.tw_futures_decision_clock import opening_reference_contract
+                payload["decision_clock"] = f"{clock['decision_time']}_prior_features_and_causal_opening_reference"
+                payload["mode_details"]["opening_reference"] = {
+                    **opening_reference_contract(clock["decision_time"]),
+                    "source_path": config.trading.tw_futures_portfolio_opening_reference_path,
+                }
         return payload
     if (mode == "tw_stock_context_futures_portfolio"
             and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
@@ -22641,10 +22656,11 @@ def _train_epoch_windowed_tensor_ddp(
     gradient_transform: Callable[[], None] | None = None,
 ) -> tuple[torch.Tensor, TimingBreakdown]:
     if (gradient_only or gradient_transform is not None) and (
-            capture_only or return_tape is None or not day_trade_annual_episode_sharding
-            or not optimizer_step_per_trajectory or log_return_weights is None
-            or scaler.is_enabled()):
-        raise ValueError("gradient surgery requires verified, unscaled annual return VJPs")
+            capture_only or not day_trade_annual_episode_sharding
+            or not optimizer_step_per_trajectory or scaler.is_enabled()
+            or (log_return_weights is not None and return_tape is None)
+            or (log_return_weights is None and objective != "log_utility")):
+        raise ValueError("gradient capture requires unscaled complete annual log gradients or verified return VJPs")
     if gradient_only and gradient_transform is not None:
         raise ValueError("capture a task gradient or apply its combined update, not both")
     if (capture_only or return_tape is not None) and (
@@ -28756,6 +28772,9 @@ def _run_training_impl(
 
                     def combine_parameter_gradients():
                         diagnostics.update(bank.combine(method, seed=config.training.seed, step=int(epoch)))
+                        if gradient_transform is not None:
+                            gradient_transform()
+                            bank.mark_update_start()
 
                     for task_index, row_gradient in enumerate(replay_gradients):
                         if not _restore_rng_state(rng_state, rank_local=True):
@@ -28765,14 +28784,17 @@ def _run_training_impl(
                                                          expected_actions=recorded.actions)
                         _, timing = _run_one_train_epoch(
                             train_model, log_return_weights=row_gradient * (-rows / 252.),
-                            return_tape=replay, apply_return_adjoint=final,
-                            gradient_only=not final,
-                            gradient_transform=combine_parameter_gradients if final and bank is not None else None)
+                            return_tape=replay, apply_return_adjoint=final and not gradient_only,
+                            gradient_only=not final or gradient_only,
+                            gradient_transform=(combine_parameter_gradients if bank is not None
+                                                else gradient_transform) if final and not gradient_only else None)
                         maximum_error = max(maximum_error, replay.maximum_replay_error)
                         if bank is not None and not final:
                             bank.record()
                         if not final:
                             passes.append(timing)
+                    if bank is not None and gradient_only:
+                        diagnostics.update(bank.combine(method, seed=config.training.seed, step=int(epoch)))
                     if bank is not None:
                         diagnostics.update(bank.observe_update())
                     diagnostics["vjp_passes"] = float(len(replay_gradients))
@@ -29336,7 +29358,15 @@ def _run_training_impl(
                 )
             policy_step_prepare_s = time.perf_counter() - policy_step_started
             carry_compile_before = get_day_trade_carry_compile_stats()
-            train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
+            if config.training.sharpness_mode == "none":
+                train_loss_t, train_timing = _run_one_train_epoch(compiled_train_model)
+            else:
+                from stockagent.training.sharpness import run_sharpness_aware_epoch
+                train_loss_t, train_timing = run_sharpness_aware_epoch(
+                    compiled_train_model, lambda **kwargs: _run_one_train_epoch(compiled_train_model, **kwargs),
+                    mode=config.training.sharpness_mode, radius=config.training.sharpness_radius,
+                    alpha=config.training.sharpness_alpha,
+                    capture_rng_state=_capture_rng_state, restore_rng_state=_restore_rng_state)
             if config.training.day_trade_annual_episode_sharding and _distributed_should_write():
                 from downloader.artifact_io import atomic_write_json
                 cached_plan = compiled_train_model.__dict__.get("_annual_episode_plan")

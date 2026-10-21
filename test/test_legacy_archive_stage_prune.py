@@ -14,9 +14,26 @@ from stockagent.data_sync.legacy_artifact_archive import (
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 
 
-def fixture(tmp_path, monkeypatch):
+def fixture(tmp_path, monkeypatch, *, benchmark_d=False):
     from test_legacy_manual_capture import fixture as source_fixture
+    import stockagent.data_sync.materialized_cache as cache
+    # This unit fixture owns a private materialization tree. Exercise the real
+    # pin reader there, not a multi-million-file production cache per case.
+    # Individual fault tests may still override the reader after setup.
+    pin_root = tmp_path / 'materialized'
+    pin_root.mkdir()
+    read_pins = cache._pinned_snapshot_ids
+    monkeypatch.setattr(cache, '_pinned_snapshot_ids', lambda root: read_pins(pin_root))
     spec, artifacts, source = source_fixture(tmp_path)
+    if benchmark_d:
+        from test_local_offline_artifact_retirement import _completed_benchmark
+        target = artifacts / 'benchmarks/suite/completed-case'
+        target.parent.mkdir(parents=True)
+        source.rename(target)
+        source = target
+        _completed_benchmark(source)
+        spec = replace(spec, relative_root='benchmarks/suite/completed-case',
+                       capture_contract=module.MANUAL_WSL_CAPTURE_CONTRACT)
     packed = tmp_path / "packed"
     release = module.publish_archive(spec, artifacts, packed, repo_root=artifacts.parent,
                                      manual_capture=True)
@@ -26,11 +43,27 @@ def fixture(tmp_path, monkeypatch):
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"state": "cold-only", "dataset": spec.dataset,
                                 "relative_root": spec.relative_root, "snapshot_id": release["snapshot_id"]}))
-    monkeypatch.setattr(module, "C_TEMP_STAGE_ROOT", spec.stage_root)
+    monkeypatch.setattr(module, "D_BENCHMARK_STAGE_ROOT" if benchmark_d else "C_TEMP_STAGE_ROOT", spec.stage_root)
     import stockagent.data_sync.cold_primary as primary
     monkeypatch.setattr(primary, "_check_d_primary_mount", lambda root: None)
     options = {"artifact_root": artifacts, "state_root": states}
     return spec, packed, options
+
+
+@pytest.mark.parametrize('benchmark_d', [False, True])
+def test_stage_prune_reads_real_pins_from_isolated_fixture(tmp_path, monkeypatch, benchmark_d):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=benchmark_d)
+    release = resolve_latest_packed(packed, spec.dataset)
+    pin = tmp_path / 'materialized' / 'selected.pin.json'
+    pin.write_text(json.dumps({'manifest': {'snapshot_id': release.manifest['snapshot_id']}}))
+    with pytest.raises(SnapshotError, match='release is pinned'):
+        plan_archive_stage_prune(spec, packed, **options)
+    pin.write_text(json.dumps({'manifest': {}}))
+    with pytest.raises(SnapshotError, match='unknown protection schema'):
+        plan_archive_stage_prune(spec, packed, **options)
+    pin.unlink()
+    assert plan_archive_stage_prune(spec, packed, **options)['snapshot_id'] == release.manifest['snapshot_id']
+    assert (spec.stage_root / spec.dataset).is_dir()
 
 
 def test_c_encoding_scratch_is_pruned_only_after_cold_recovery_and_hot_retirement(tmp_path, monkeypatch):
@@ -43,6 +76,17 @@ def test_c_encoding_scratch_is_pruned_only_after_cold_recovery_and_hot_retiremen
     assert verified["cold_verified"] and verified["decoded_originals_verified"]
     assert verified["verification_scratch_removed"]
     assert verified["files"] == 2
+
+
+def test_completed_benchmark_d_scratch_uses_the_same_full_recovery_and_quarantine_gates(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                     owned_verified_plan=plan, **options)
+    assert result['pruned'] and result['cold_objects_deleted'] == 0
+    assert not (spec.stage_root / spec.dataset).exists()
+    proof = verify_cold_archive(spec, packed)
+    assert proof['cold_verified'] and proof['decoded_originals_verified'] and proof['files'] == 4
 
 
 @pytest.mark.parametrize('failure', [None, 'different-bytes', 'unknown-receipt', 'payload-temp', 'changed-after-audit'])
@@ -84,9 +128,10 @@ def test_syncthing_control_temp_requires_exact_fixed_receipt_duplicate(tmp_path,
         assert proof['decoded_originals_verified'] and proof['files']==2
 
 
+@pytest.mark.parametrize('benchmark_d', [False, True])
 @pytest.mark.parametrize("gate", ["source", "state", "object", "unknown", "receipt", "pin", "process", "d-mount"])
-def test_stage_prune_preserves_bytes_when_any_gate_fails(tmp_path, monkeypatch, gate):
-    spec, packed, options = fixture(tmp_path, monkeypatch)
+def test_stage_prune_preserves_bytes_when_any_gate_fails(tmp_path, monkeypatch, gate, benchmark_d):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=benchmark_d)
     stage = spec.stage_root / spec.dataset
     if gate == "source":
         (options["artifact_root"] / spec.relative_root).mkdir()
@@ -150,9 +195,10 @@ def test_cold_only_cli_recovers_directly_when_stage_has_been_pruned(tmp_path, mo
     assert proof["source_comparison"] == "not_requested_cold_only"
 
 
+@pytest.mark.parametrize('benchmark_d', [False, True])
 @pytest.mark.parametrize("mutation", ["unknown-file", "cold-object"])
-def test_post_rename_change_keeps_stage_quarantine(tmp_path, monkeypatch, mutation):
-    spec, packed, options = fixture(tmp_path, monkeypatch)
+def test_post_rename_change_keeps_stage_quarantine(tmp_path, monkeypatch, mutation, benchmark_d):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=benchmark_d)
     plan = plan_archive_stage_prune(spec, packed, **options)
     import stockagent.data_sync.cold_primary as primary
     checks = []
@@ -190,10 +236,11 @@ def test_owned_stage_plan_reuses_full_d_proof_and_still_decodes_the_quarantine(t
     assert verify_cold_archive(spec, packed)["decoded_originals_verified"]
 
 
+@pytest.mark.parametrize('benchmark_d', [False, True])
 @pytest.mark.parametrize("gate", ["expired", "future", "proof-contract", "cold-object", "source",
                                    "state", "pin", "process", "redirected", "unknown-file", "local-bytes"])
-def test_owned_stage_proof_never_bypasses_fresh_retirement_or_content_gates(tmp_path, monkeypatch, gate):
-    spec, packed, options = fixture(tmp_path, monkeypatch)
+def test_owned_stage_proof_never_bypasses_fresh_retirement_or_content_gates(tmp_path, monkeypatch, gate, benchmark_d):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=benchmark_d)
     plan = plan_archive_stage_prune(spec, packed, **options)
     stage = spec.stage_root / spec.dataset
     if gate in {"expired", "future"}:

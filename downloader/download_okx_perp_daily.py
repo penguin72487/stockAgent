@@ -28,7 +28,6 @@ from common import (  # noqa: E402
     atomic_write_text,
     describe_rate_limit,
     parquet_temporal_metadata,
-    provider_rate_limit,
     resolve_end_date,
     resolve_incremental_reconcile_start_ms,
     resolve_request_interval,
@@ -68,6 +67,19 @@ from ohlcv_hot_tail import (
 BASE_URL = "https://www.okx.com"
 INSTRUMENTS_ENDPOINT = "/api/v5/public/instruments"
 HISTORY_CANDLES_ENDPOINT = "/api/v5/market/history-candles"
+RECENT_CANDLES_ENDPOINT = "/api/v5/market/candles"
+RECENT_CANDLE_ENTRIES = 1440
+RECENT_RETENTION_MARGIN_ENTRIES = 300
+CANDLE_ROUTING_CONTRACT = {
+    "version": 1,
+    "recent_endpoint": RECENT_CANDLES_ENDPOINT,
+    "history_endpoint": HISTORY_CANDLES_ENDPOINT,
+    "recent_entries": RECENT_CANDLE_ENTRIES,
+    "retention_margin_entries": RECENT_RETENTION_MARGIN_ENTRIES,
+    "selection": "complete_closed_contiguous_1m_page_inside_safe_retention",
+    "fallback": "same_cursor_history_on_empty_short_or_invalid_recent_page",
+    "transport_errors": "propagate_without_switching_endpoint",
+}
 OUTPUT_COLUMNS = ["date", "open", "max", "min", "close", "adjclose", "Trading_Volume"]
 KLINE_BAR = "1m"
 CANDLE_INTERVAL_MS = 60 * 1000
@@ -184,7 +196,7 @@ def parse_args() -> argparse.Namespace:
         "--request-interval",
         type=float,
         default=None,
-        help="Global minimum seconds between API requests. Default uses official OKX history-candles profile.",
+        help="Optional slower per-endpoint minimum interval. Default uses each endpoint's official profile.",
     )
     parser.add_argument(
         "--max-retries", type=int, default=8, help="Max retries per HTTP request"
@@ -266,11 +278,15 @@ INSTRUMENT_RATE_LIMITED_PROFILES = frozenset({
 
 class OkxClient:
     def __init__(
-        self, request_interval: float | None, max_retries: int, retry_base: float
+        self, request_interval: float | None, max_retries: int, retry_base: float,
+        *, prefer_recent_candles: bool = True,
     ) -> None:
         self.request_interval = resolve_request_interval(
             "okx_history_candles", request_interval
         )
+        self.request_interval_override = request_interval
+        self.prefer_recent_candles = prefer_recent_candles
+        self._candle_routes = {"recent_pages": 0, "history_fallback_pages": 0}
         self.max_retries = max(0, max_retries)
         self.retry_base = max(0.1, retry_base)
         self._limiter_lock = threading.Lock()
@@ -285,6 +301,7 @@ class OkxClient:
     ) -> SharedRateLimiter:
         profile_by_path = {
             HISTORY_CANDLES_ENDPOINT: "okx_history_candles",
+            RECENT_CANDLES_ENDPOINT: "okx_recent_candles",
             "/api/v5/market/history-mark-price-candles": (
                 "okx_history_mark_price_candles"
             ),
@@ -302,7 +319,7 @@ class OkxClient:
         interval = self.request_interval
         limiter_name = f"okx:{path}"
         if profile_name is not None:
-            interval = max(interval, provider_rate_limit(profile_name).interval_seconds)
+            interval = resolve_request_interval(profile_name, self.request_interval_override)
             limiter_name = profile_name
         if profile_name in INSTRUMENT_RATE_LIMITED_PROFILES:
             instrument = str((params or {}).get("instId") or "unknown")
@@ -362,7 +379,44 @@ class OkxClient:
             )
         )
 
+    def candle_route_activity(self) -> dict[str, int]:
+        with self._limiter_lock:
+            return dict(self._candle_routes)
+
     def get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        # Latest candles have a separate, faster official bucket. Keep old
+        # pages on history and require a complete confirmed page before reuse.
+        # No catch-all fallback: a 429/ban/network failure is not permission
+        # to evade that endpoint's persisted backpressure through another URL.
+        if self.prefer_recent_candles and path == HISTORY_CANDLES_ENDPOINT:
+            try:
+                limit, after = int(params.get("limit", 300)), int(params["after"])
+                newest = ((after - 1) // CANDLE_INTERVAL_MS) * CANDLE_INTERVAL_MS
+                closed = _latest_closed_candle_start_ms()
+                floor = closed - (RECENT_CANDLE_ENTRIES - RECENT_RETENTION_MARGIN_ENTRIES) * CANDLE_INTERVAL_MS
+                eligible = (params.get("bar") == KLINE_BAR and 1 <= limit <= 300
+                            and newest <= closed and newest - (limit - 1) * CANDLE_INTERVAL_MS >= floor)
+            except (ValueError, TypeError, KeyError):
+                eligible = False
+            if eligible:
+                payload = self._get(RECENT_CANDLES_ENDPOINT, params)
+                chunk = payload.get("data")
+                try:
+                    complete = isinstance(chunk, list) and len(chunk) == limit and all(
+                        isinstance(row, list) and len(row) >= 9 and str(row[8]) == "1"
+                        and int(row[0]) == newest - index * CANDLE_INTERVAL_MS
+                        for index, row in enumerate(chunk)
+                    )
+                except (ValueError, TypeError):
+                    complete = False
+                with self._limiter_lock:
+                    key = "recent_pages" if complete else "history_fallback_pages"
+                    self._candle_routes[key] += 1
+                if complete:
+                    return payload
+        return self._get(path, params)
+
+    def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         last_error: Exception | None = None
         limiter = self._limiter_for_request(path, params)
         for attempt in range(self.max_retries + 1):
@@ -1260,6 +1314,8 @@ def _run_locked_download(
         "asset_class": "crypto_okx_perp",
         "interval": KLINE_BAR,
         "volume_units": VOLUME_UNIT_CONTRACT,
+        "candle_routing_contract": CANDLE_ROUTING_CONTRACT,
+        "candle_route_activity": client.candle_route_activity(),
         "requested_symbol_filter": args.symbols,
         "provider_scope_is_complete": not bool(args.symbols),
         "symbol_count": len(symbols),

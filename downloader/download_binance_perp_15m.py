@@ -76,6 +76,13 @@ CANDLE_INTERVAL_MS = 60 * 1000
 # 249.5 bars/weight, the best documented kline efficiency tier.
 KLINE_LIMIT = 499
 KLINE_REQUEST_WEIGHT = 2.0
+KLINE_PAGE_POLICY = {
+    "version": 1,
+    "maximum_limit": KLINE_LIMIT,
+    "selection": "min_remaining_window_slots_and_best_bulk_rows_per_weight_limit",
+    "request_weight": "1_for_limit_below_100_else_2_up_to_499",
+    "source_url": "https://developers.binance.info/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data",
+}
 OUTPUT_COLUMNS = [
     "date",
     "open",
@@ -91,6 +98,14 @@ OUTPUT_COLUMNS = [
     "binance_taker_buy_quote_volume",
     "binance_close_time_ms",
 ]
+
+
+def _kline_page_request(remaining_slots: int) -> tuple[int, float]:
+    """Avoid charging bulk weight for a small tail or final historical page."""
+    if remaining_slots < 1:
+        raise ValueError("a kline request requires at least one remaining slot")
+    limit = min(KLINE_LIMIT, remaining_slots)
+    return limit, 1.0 if limit < 100 else KLINE_REQUEST_WEIGHT
 
 
 @dataclass(slots=True)
@@ -1065,6 +1080,9 @@ def _download_symbol(
     for window_start, window_end in request_windows:
         cursor = window_start
         while cursor <= window_end:
+            page_limit, page_weight = _kline_page_request(
+                (window_end - cursor) // CANDLE_INTERVAL_MS + 1
+            )
             payload = client.get(
                 KLINE_ENDPOINT,
                 {
@@ -1072,9 +1090,9 @@ def _download_symbol(
                     "interval": KLINE_INTERVAL,
                     "startTime": str(cursor),
                     "endTime": str(window_end + CANDLE_INTERVAL_MS - 1),
-                    "limit": str(KLINE_LIMIT),
+                    "limit": str(page_limit),
                 },
-                weight=KLINE_REQUEST_WEIGHT,
+                weight=page_weight,
             )
             if page_progress_callback is not None:
                 page_progress_callback(record.code)
@@ -1092,7 +1110,7 @@ def _download_symbol(
             if next_cursor <= cursor:
                 raise RuntimeError("Binance kline pagination made no forward progress")
             cursor = next_cursor
-            if len(chunk) < KLINE_LIMIT:
+            if len(chunk) < page_limit:
                 break
 
     fresh = candles.finish()
@@ -1468,6 +1486,7 @@ def _run_locked_download(
         "request_weight_per_minute": client.weight_per_minute,
         "kline_limit": KLINE_LIMIT,
         "kline_request_weight": KLINE_REQUEST_WEIGHT,
+        "kline_page_policy": KLINE_PAGE_POLICY,
         "limiter_activity": limiter_activity,
         "endpoint_limiter_activity": client.endpoint_limiter_activity(),
     }

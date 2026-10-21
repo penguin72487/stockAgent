@@ -166,10 +166,11 @@ def test_moi_parse_failure_keeps_raw_and_retry_uses_no_network(monkeypatch, tmp_
     class Transport:
         def __init__(self, spec, budget, **kwargs):
             self.budget = budget
+            self.provider = spec.provider
 
         def fetch(self, *args):
             calls.append(1)
-            self.budget.used += 1
+            self.budget.claim(self.provider)
             return make_zip()
 
     job = source.moi_season_jobs(b'<option value="101S3">x</option>')[0]

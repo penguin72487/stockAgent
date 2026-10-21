@@ -240,6 +240,21 @@ test("table retries show actual next attempt without inventing completion or pau
   assert.match(descendantsText(d.byId("blocker-list")),/下次嘗試最早.*已到期，等待桌面與先行工作/);
 });
 
+test("missing company fragments remain visible without claiming their whole table stopped", () => {
+  const d=dashboard();d.context.data={scheduler:{alive:true,state:"executing",paused_reason:null},
+    activity:{contract:"tej_download_activity_v1",blocked_tasks_total:0,blocked_tasks:[],
+      completed_download_tasks:150,deferred_tasks_total:3,deferred_tasks:[{
+        table_name:"Partial table",error_code:"source_company_labels_absent_fragment",
+        retry_scope:"company_fragment",deferred_tasks:3,consecutive_failures:2,
+        next_attempt_at_utc:"2026-10-03T01:00:00+00:00",retry_after_seconds:120,
+      }]}};
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.match(d.byId("blocker-summary").textContent,/3 個待重試工作（含局部公司）/);
+  assert.match(descendantsText(d.byId("blocker-list")),/3 個局部公司工作；同表其餘範圍續抓/);
+  assert.doesNotMatch(descendantsText(d.byId("blocker-list")),/另有 2/);
+  assert.equal(d.byId("completed-downloads").textContent,"150");
+});
+
 test("status polling does not wait on features or repeatedly fetch unchanged detail pages", async () => {
   const d=dashboard();d.context.recordStatus=data=>d.context.newStatus=data;
   vm.runInContext("renderStatus = data => {state.latest=data;recordStatus(data);}",d.context);

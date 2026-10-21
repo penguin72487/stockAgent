@@ -80,7 +80,8 @@ def test_targeted_quality_run_preserves_global_evidence(tmp_path, monkeypatch, f
         okx_symbol=f"{base}-USDT-SWAP", base_ccy=base, quote_ccy="USDT", settle_ccy="USDT",
         ct_type="linear", inst_family=f"{base}-USDT", uly=f"{base}-USDT", state="live",
         list_time=None) for base in ("BTC", "ETH")]
-    monkeypatch.setattr(collector, "OkxClient", lambda **_: SimpleNamespace(limiter_activity=lambda: {}))
+    monkeypatch.setattr(collector, "OkxClient", lambda **_: SimpleNamespace(
+        limiter_activity=lambda: {}, candle_route_activity=lambda: {}))
     monkeypatch.setattr(collector, "_fetch_swap_symbols", lambda *_a, **_k: records)
     seen, enriched = [], []
 

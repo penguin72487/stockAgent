@@ -43,7 +43,7 @@ from stockagent.backtest.tw_futures_portfolio import (
     TW_FUTURES_PORTFOLIO_INTEGER_TRAINING_SURROGATE,
 )
 from stockagent.config import ExperimentConfig
-from stockagent.training.optimizer_config import optimizer_checkpoint_fields
+from stockagent.training.optimizer_config import optimizer_checkpoint_fields, sharpness_checkpoint_fields
 from stockagent.data.panel import PanelData, _TIFRS_MAX_CARRY_DAYS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
@@ -97,6 +97,11 @@ def _normalize_risk_objective(loss_type: str) -> str:
         "trajectory_mgda_return",
         "trajectory_pcgrad_parameter",
         "trajectory_mgda_parameter",
+        "trajectory_mgda_l2_parameter",
+        "trajectory_config_l2_parameter",
+        "trajectory_dibs_l2_1_parameter",
+        "trajectory_dibs_l2_5_parameter",
+        "trajectory_upgrad_log_l2_parameter",
         "log_utility",
         "log_util",
         "kelly",
@@ -403,6 +408,9 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if snapshot["training"]["sharpness_mode"] == "none":
+        for key in ("sharpness_mode", "sharpness_radius", "sharpness_alpha"):
+            snapshot["training"].pop(key)
     # A disabled infer-only source binding must not change historical training
     # configuration fingerprints. An enabled binding remains explicit in the
     # runtime snapshot; the executor records its actual content receipts too.
@@ -953,6 +961,7 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
         "objective": objective,
         "optimizer": {
             **optimizer_checkpoint_fields(training),
+            **sharpness_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
@@ -1182,6 +1191,7 @@ def _training_checkpoint_contract_schema_2(
         "loss_portfolio_activation": str(training.loss_portfolio_activation),
         "optimizer": {
             **optimizer_checkpoint_fields(training),
+            **sharpness_checkpoint_fields(training),
             "learning_rate": float(training.learning_rate),
             "weight_decay": float(training.weight_decay),
             "grad_clip_norm": float(training.grad_clip_norm),
@@ -1422,6 +1432,25 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "accounting": "continuous_notional_research_surrogate",
         }
     if execution_mode == "tw_stock_context_futures_portfolio":
+        if trading.tw_futures_portfolio_decision_time is not None:
+            from downloader.artifact_io import sha256_file
+            from stockagent.data.tw_futures_decision_clock import decision_clock_contract
+            clock_path = Path(trading.tw_futures_portfolio_entry_clock_path)
+            contract["futures_entry_clock"] = {
+                **decision_clock_contract(trading.tw_futures_portfolio_decision_time),
+                "source_path": str(clock_path),
+                "source_sha256": sha256_file(clock_path),
+                "manifest_sha256": sha256_file(clock_path.with_name("manifest.json")),
+            }
+            if trading.tw_futures_portfolio_opening_reference_path is not None:
+                from stockagent.data.tw_futures_decision_clock import opening_reference_contract
+                reference_path = Path(trading.tw_futures_portfolio_opening_reference_path)
+                contract["futures_opening_reference"] = {
+                    **opening_reference_contract(trading.tw_futures_portfolio_decision_time),
+                    "model_encoder": "four_relative_reference_channels_linear_residual_v1",
+                    "source_path": str(reference_path), "source_sha256": sha256_file(reference_path),
+                    "manifest_sha256": sha256_file(reference_path.with_name("opening_reference_manifest.json")),
+                }
         if trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross":
             contract["futures_benchmark_contract"] = {
                 "version": 1,

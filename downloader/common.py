@@ -381,6 +381,14 @@ PROVIDER_RATE_LIMITS: dict[str, ProviderRateLimit] = {
         source_url="https://fred.stlouisfed.org/docs/api/fred/errors.html",
         note="Direct FRED and OpenBB FRED requests share this host-global bucket.",
     ),
+    "okx_recent_candles": ProviderRateLimit(
+        provider="okx_recent_candles",
+        requests=40,
+        seconds=2,
+        basis="official endpoint limit; IP",
+        source_url="https://www.okx.com/docs-v5/en/",
+        note="GET /api/v5/market/candles; latest 1,440 entries, not all history.",
+    ),
     "okx_history_candles": ProviderRateLimit(
         provider="okx_history_candles",
         requests=20,

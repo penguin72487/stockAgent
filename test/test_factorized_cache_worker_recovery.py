@@ -49,6 +49,20 @@ def test_the_existing_owner_can_repair_before_the_derived_panel_is_fresh(owner):
     assert calls == ["canonical_source"]  # No repeated source command after acceptance.
 
 
+@pytest.mark.parametrize("field,value", [("phase", "completed"), ("error_type", "unknown"),
+    ("model_executed", True), ("last_good_generation_retained", False)])
+def test_unverified_preopen_hint_cannot_trigger_background_preparation(owner, field, value):
+    cfg, path, _state, _status, _bot, calls, _emissions = owner
+    state = {"status": "projection_refresh_required", "phase": "preopen",
+        "error_type": "FactorizedPreopenProjectionPending", "model_executed": False,
+        "last_good_generation_retained": True}
+    state[field] = value
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="unverified factorized"):
+        runner._recover_deferred_factorized_source(cfg)
+    assert calls == []
+
+
 @pytest.mark.parametrize("blocked", ["open", "publication"])
 def test_recovery_cannot_bypass_live_session_or_official_publication(owner, blocked):
     cfg, _path, _state, status, bot, calls, emissions = owner

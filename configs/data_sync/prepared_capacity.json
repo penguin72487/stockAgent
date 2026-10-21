@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "contract": "prepared_generation_admission_v1",
+  "family_capacity_bytes": 137438953472,
+  "maximum_generation_bytes": 17179869184
+}

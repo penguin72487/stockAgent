@@ -18,6 +18,19 @@ from stockagent.data.tw_delisting_rules import (
 )
 
 
+def _feature_implementation_sha256() -> str:
+    # Exact local semantic dependencies, not entire directories (news and
+    # unrelated collectors do not participate in this feature contract).
+    root = Path(__file__).parent
+    code = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
+        "tw_public_features.py", "tw_public_incremental.py", "tw_delisting_rules.py", "tw_security.py",
+        "partitioned_parquet.py")}
+    return hashlib.sha256(json.dumps({"code": code, "polars": pl.__version__}, sort_keys=True).encode()).hexdigest()
+
+
+_LOADED_FEATURE_IMPLEMENTATION_SHA256 = _feature_implementation_sha256()
+
+
 DEFAULT_MARKET_SYMBOL = "__MARKET__"
 DAY_TRADE_REGIME_START = date(2014, 1, 6)
 DAY_TRADE_SELL_FIRST_START = date(2014, 6, 30)
@@ -268,6 +281,9 @@ class TwPublicFeatureBuildResult:
     reused_rows: int = 0
     incremental_fallback_reason: str | None = None
     stage_elapsed_seconds: dict[str, float] = field(default_factory=dict)
+    input_partitions: dict = field(default_factory=dict)
+    incremental_plan: dict = field(default_factory=dict)
+    feature_implementation_sha256: str = ""
 
 
 # Completed-session publication only changes a short daily tail, but the raw
@@ -279,6 +295,9 @@ class TwPublicFeatureBuildResult:
 _INCREMENTAL_READ_RANGE: ContextVar[tuple[date, date] | None] = ContextVar(
     "tw_public_incremental_read_range",
     default=None,
+)
+_INCREMENTAL_CANONICAL_DATES: ContextVar[frozenset[str]] = ContextVar(
+    "tw_public_proven_canonical_dates", default=frozenset()
 )
 _BUILD_SESSION_DATES: ContextVar[tuple[Path, pl.DataFrame] | None] = ContextVar(
     "tw_public_build_session_dates", default=None
@@ -405,7 +424,8 @@ def _symbol_universe_receipt(symbols_root: str | Path | None) -> dict[str, str |
     else:
         root = Path(symbols_root)
         available = root.exists()
-        names = sorted(path.name for path in root.glob("*_features.parquet")) if available else []
+        from stockagent.data.partitioned_parquet import discover_sources, logical_name
+        names = sorted(logical_name(path) for path in discover_sources(root)) if available else []
     payload = "\n".join(names).encode("utf-8")
     return {
         "available": available,
@@ -450,6 +470,8 @@ def _incremental_base_is_compatible(
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
     if not isinstance(summary, dict):
+        return False
+    if summary.get("feature_implementation_sha256") != _LOADED_FEATURE_IMPLEMENTATION_SHA256:
         return False
     if list(schema) != [*KEY_COLUMNS, *OUTPUT_COLUMNS]:
         return False
@@ -510,6 +532,7 @@ def build_tw_public_training_features(
     allow_daily_publication_lag: bool = False,
     incremental_start_date: date | None = None,
     incremental_context_days: int = 45,
+    incremental_auto: bool = False,
 ) -> TwPublicFeatureBuildResult:
     input_dir = Path(input_dir)
     output_path = Path(output_path)
@@ -528,8 +551,31 @@ def build_tw_public_training_features(
         raise ValueError("incremental_start_date must not be after end_date")
 
     build_started = time.perf_counter()
+    feature_identity = _feature_implementation_sha256()
+    if feature_identity != _LOADED_FEATURE_IMPLEMENTATION_SHA256:
+        raise RuntimeError("TW public feature implementation changed after module load")
     source_receipts = _source_content_receipts(input_dir)
     symbol_universe_receipt = _symbol_universe_receipt(symbols_root)
+    input_partitions: dict = {}
+    incremental_plan: dict = {}
+    previous_summary: dict = {}
+    if incremental_auto:
+        if end_date is None:
+            raise ValueError("incremental_auto requires a completed end_date")
+        from stockagent.data.tw_public_incremental import affected_start, capture_partitions
+        try:
+            previous_summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            pass
+        if not isinstance(previous_summary, dict):
+            previous_summary = {}
+        input_partitions = capture_partitions(input_dir, source_receipts, previous_summary.get("input_partitions"))
+        auto_start, incremental_plan = affected_start(previous_summary, source_receipts, input_partitions, end_date)
+        if previous_summary.get("feature_implementation_sha256") != feature_identity:
+            auto_start = None
+            incremental_plan = {**incremental_plan, "mode": "full", "reason": "feature_implementation_bootstrap_or_changed"}
+    else:
+        auto_start = None
     base_compatible = bool(
         output_path.is_file()
         and _incremental_base_is_compatible(
@@ -541,9 +587,28 @@ def build_tw_public_training_features(
             allow_daily_publication_lag=allow_daily_publication_lag,
         )
     )
+    if incremental_auto and previous_summary.get("feature_implementation_sha256") != feature_identity:
+        # Identical source bytes do not certify outputs of another feature
+        # implementation. Bootstrap/rebuild once, never relabel an old result.
+        base_compatible = False
+    if auto_start is not None and not base_compatible:
+        changed_names = frozenset(incremental_plan["changed_sources"])
+        # The same exact output/universe/ABI fence remains mandatory. Only a
+        # complete per-session proof may admit changed dependency bytes.
+        base_compatible = _incremental_base_is_compatible(
+            output_path, resolved_summary_path, market_symbol=market_symbol,
+            source_receipts=source_receipts, symbol_universe_receipt=symbol_universe_receipt,
+            allow_daily_publication_lag=allow_daily_publication_lag,
+            allowed_changed_source_names=changed_names,
+        )
+        if not base_compatible:
+            incremental_plan = {**incremental_plan, "mode": "full", "reason": "output_universe_or_abi_not_verified"}
+    if incremental_auto:
+        incremental_start_date = auto_start if base_compatible else None
     market_only_summary: dict[str, object] = {}
     if (
         not base_compatible
+        and (not incremental_auto or previous_summary.get("feature_implementation_sha256") == feature_identity)
         and output_path.is_file()
         and end_date is not None
         and _incremental_base_is_compatible(
@@ -563,18 +628,20 @@ def build_tw_public_training_features(
     source_proof_done = time.perf_counter()
     if base_compatible:
         summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
-        if summary.get("requested_end_date") == (
+        if summary.get("source_receipts") == source_receipts and summary.get("requested_end_date") == (
             end_date.isoformat() if end_date is not None else None
         ):
             if source_receipts != _source_content_receipts(input_dir):
                 raise RuntimeError("TW public source parquet changed while verifying unchanged features")
             if symbol_universe_receipt != _symbol_universe_receipt(symbols_root):
                 raise RuntimeError("TW symbol universe changed while verifying unchanged features")
+            if _feature_implementation_sha256() != feature_identity:
+                raise RuntimeError("TW public feature implementation changed during verification")
             # Repeated 08:30 acceptance retries must not rewrite the 1+ GiB
             # feature table when every input, semantic option and output hash
             # already verifies. A needless replace invalidates the opening
             # panel cache even though the model-visible values are identical.
-            return TwPublicFeatureBuildResult(
+            result = TwPublicFeatureBuildResult(
                 output_path=output_path,
                 rows=int(summary["rows"]),
                 feature_count=int(summary["feature_count"]),
@@ -593,7 +660,16 @@ def build_tw_public_training_features(
                     "source_proof": round(source_proof_done - build_started, 3),
                     "total_before_summary": round(time.perf_counter() - build_started, 3),
                 },
+                input_partitions=input_partitions or summary.get("input_partitions", {}),
+                incremental_plan={**incremental_plan, "mode": "unchanged_verified"},
+                feature_implementation_sha256=feature_identity,
             )
+            old_partitions = summary.get("input_partitions")
+            if incremental_auto and (not isinstance(old_partitions, dict) or old_partitions.get("implementation_sha256") != input_partitions.get("implementation_sha256")):
+                # One metadata-only bootstrap binds the already SHA-verified
+                # output to its exact source partitions; no payload rewrite.
+                _write_summary(resolved_summary_path, result)
+            return result
     use_incremental = incremental_start_date is not None and base_compatible
     incremental_fallback_reason = (
         "base_contract_not_verified"
@@ -615,7 +691,7 @@ def build_tw_public_training_features(
         feature_stage_seconds[name] = round(time.perf_counter() - started, 3)
         return frame
 
-    read_token = None
+    read_token = canonical_token = None
     if use_incremental:
         assert incremental_start_date is not None
         assert end_date is not None
@@ -626,6 +702,10 @@ def build_tw_public_training_features(
                 end_date,
             )
         )
+        canonical_token = _INCREMENTAL_CANONICAL_DATES.set(frozenset(
+            name.removesuffix(".parquet") for name, proof in input_partitions.get("sources", {}).items()
+            if isinstance(proof.get("sessions"), dict)
+        ))
     session_token = None
     try:
         exchange_sessions = _exchange_session_dates(input_dir)
@@ -764,6 +844,8 @@ def build_tw_public_training_features(
             _BUILD_SESSION_DATES.reset(session_token)
         if read_token is not None:
             _INCREMENTAL_READ_RANGE.reset(read_token)
+        if canonical_token is not None:
+            _INCREMENTAL_CANONICAL_DATES.reset(canonical_token)
 
     frames = [frame for frame in (stock_features, market_features) if not frame.is_empty()]
     if frames:
@@ -866,6 +948,9 @@ def build_tw_public_training_features(
     if (use_incremental or use_market_only) and existing_identity != _stable_file_identity(output_path):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW public feature base changed during incremental build")
+    if _feature_implementation_sha256() != feature_identity:
+        temporary_output.unlink(missing_ok=True)
+        raise RuntimeError("TW public feature implementation changed during build")
     os.replace(temporary_output, output_path)
 
     source_files = sorted(str(path) for path in input_dir.glob("*.parquet"))
@@ -902,6 +987,9 @@ def build_tw_public_training_features(
             "parquet_write_and_proof": round(committed_done - assembly_done, 3),
             "total_before_summary": round(committed_done - build_started, 3),
         },
+        input_partitions=input_partitions,
+        incremental_plan=incremental_plan,
+        feature_implementation_sha256=feature_identity,
     )
     _write_summary(resolved_summary_path, result)
     return result
@@ -930,6 +1018,9 @@ def _write_summary(path: str | Path, result: TwPublicFeatureBuildResult) -> None
         "reused_rows": result.reused_rows,
         "incremental_fallback_reason": result.incremental_fallback_reason,
         "stage_elapsed_seconds": result.stage_elapsed_seconds,
+        "input_partitions": result.input_partitions,
+        "incremental_plan": result.incremental_plan,
+        "feature_implementation_sha256": result.feature_implementation_sha256,
         "availability_contract_version": TW_PUBLIC_FEATURE_AVAILABILITY_CONTRACT_VERSION,
         "availability_policy": AVAILABILITY_POLICY,
     }
@@ -944,7 +1035,8 @@ def _load_symbol_filter(symbols_root: str | Path | None) -> set[str] | None:
     root = Path(symbols_root)
     if not root.exists():
         return None
-    return {path.name.removesuffix("_features.parquet").upper() for path in root.glob("*_features.parquet")}
+    from stockagent.data.partitioned_parquet import discover_sources, logical_name
+    return {logical_name(path).removesuffix("_features.parquet").upper() for path in discover_sources(root)}
 
 
 def _read_date_bounded_parquet(
@@ -971,7 +1063,29 @@ def _read_date_bounded_parquet(
                 end,
                 closed="both",
             )
-        lazy = lazy.filter(predicate)
+        if date_dtype == pl.Date:
+            before_start = pl.col("date") < start
+        elif date_dtype == pl.String and dataset in _INCREMENTAL_CANONICAL_DATES.get():
+            # The typed partition proof checked EVERY date is canonical ISO.
+            # Avoid parsing the entire historical prefix through five formats
+            # just to retain one predecessor per issuer.
+            before_start = pl.col("date") < pl.lit(start.isoformat())
+        else:
+            before_start = _date_column_expr("date") < start
+        if dataset in {"twse_daily_ohlcv", "tpex_daily_ohlcv"}:
+            # The 1d return is previous OBSERVED close, even after a halt much
+            # longer than the context window. Keep one exact prior row per
+            # issuer; never replace it with a fabricated close or a zero.
+            symbol = "證券代號" if dataset == "twse_daily_ohlcv" else "代號"
+            prior = lazy.filter(before_start).sort("date").unique(
+                subset=[symbol], keep="last", maintain_order=True)
+            lazy = pl.concat([prior, lazy.filter(predicate)], how="vertical")
+        elif dataset in {"twse_taiex_ohlc", "twse_market_index"}:
+            prior = lazy.filter(before_start)
+            prior = prior.filter(pl.col("date") == pl.col("date").max())
+            lazy = pl.concat([prior, lazy.filter(predicate)], how="vertical")
+        else:
+            lazy = lazy.filter(predicate)
     if columns is not None:
         lazy = lazy.select(columns)
     return lazy.collect(engine="streaming")
@@ -989,9 +1103,13 @@ def _exchange_session_dates(input_dir: Path) -> pl.DataFrame:
     cached = _BUILD_SESSION_DATES.get()
     if cached is not None and cached[0] == input_dir.resolve():
         return cached[1]
-    calendar = _read_optional(input_dir, "twse_taiex_ohlc")
-    if not calendar.is_empty() and "date" in calendar.columns:
-        sessions = calendar.select(_date_column_expr("date").alias("_session_date"))
+    calendar_path = input_dir / "twse_taiex_ohlc.parquet"
+    calendar_schema = pl.read_parquet_schema(calendar_path) if calendar_path.is_file() else {}
+    if "date" in calendar_schema:
+        # Session ownership is global, not limited to the mutable feature tail.
+        # Project the small date column, not all historical index prices.
+        sessions = pl.scan_parquet(calendar_path).select(
+            _date_column_expr("date").alias("_session_date")).collect(engine="streaming")
     else:
         # Minimal/older official archives may have OHLCV before the separate
         # index table was collected. A nonempty official daily trading table
@@ -1982,7 +2100,7 @@ def _normalize_day_trade_universe(
         dataset=dataset,
         columns=["date", symbol_column],
     )
-    return (
+    normalized = (
         frame.select(
             _date_column_expr("date").alias("date"),
             _symbol_expr(symbol_column).alias("symbol"),
@@ -1995,6 +2113,13 @@ def _normalize_day_trade_universe(
         .unique()
         .sort(["date", "symbol"])
     )
+    read_range = _INCREMENTAL_READ_RANGE.get()
+    if read_range is not None:
+        # Price returns retain a possibly years-old observed predecessor.
+        # It is NOT a current-tail eligibility row and must not create a
+        # spurious coverage failure against the bounded official rule master.
+        normalized = normalized.filter(pl.col("date").is_between(*read_range, closed="both"))
+    return normalized
 
 
 def _require_day_trade_date_coverage(

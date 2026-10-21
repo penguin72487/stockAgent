@@ -116,8 +116,10 @@ def _wide_stock(
     path: Path, feature: str, calendar: list[date], *,
     date_lookup: pl.DataFrame | None = None, keep_source_index: bool = False,
     defer_collapse: bool = False,
+    prune_to_lookup: bool = False,
 ) -> pl.DataFrame:
-    frame = pl.read_parquet(path)
+    frame = (pl.scan_parquet(path).filter(pl.col("source_index").is_in(date_lookup["source_index"].implode()))
+             .collect(engine="streaming") if prune_to_lookup and date_lookup is not None else pl.read_parquet(path))
     fields = [name for name in frame.columns if name != "source_index"]
     if not fields:
         raise ValueError(f"no stock fields for {feature}")
@@ -147,8 +149,10 @@ def _wide_market(
     path: Path, feature: str, calendar: list[date], *,
     date_lookup: pl.DataFrame | None = None,
     keep_invalid_barriers: bool = False,
+    prune_to_lookup: bool = False,
 ) -> pl.DataFrame:
-    frame = pl.read_parquet(path)
+    frame = (pl.scan_parquet(path).filter(pl.col("source_index").is_in(date_lookup["source_index"].implode()))
+             .collect(engine="streaming") if prune_to_lookup and date_lookup is not None else pl.read_parquet(path))
     values = [name for name in frame.columns if name != "source_index" and name.strip()]
     if len(values) != 1:
         raise ValueError(f"expected one market value for {feature}")

@@ -16,7 +16,7 @@ import time
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import fetch_discovery, load_config
 from downloader.news_fulltext_bulk import wordpress_base
-from downloader.news_fulltext_feed import feed_page, feed_url
+from downloader.news_fulltext_feed import FEED_BODY_PROVENANCE_FIELDS, feed_page, feed_url
 from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_policy import NewsError
 from downloader.news_fulltext_queue import utc_now
@@ -44,7 +44,8 @@ def inspect(http, urls, *, output):
             item.update(status=response.status, response_sha256=hashlib.sha256(response.body).hexdigest(),
                         response_bytes=len(response.body), public_links=len(links),
                         permitted_body_candidates=[{k: r[k] for k in (
-                            'requested_url', 'body_sha256', 'published_at_raw', 'authors_json')}
+                            'requested_url', 'body_sha256', 'published_at_raw', 'authors_json', 'extraction_method',
+                            *FEED_BODY_PROVENANCE_FIELDS) if k in r}
                             for r in records],
                         item_error_counts=dict(Counter(e['error'] for e in errors)),
                         item_errors=[{k: e[k] for k in ('url', 'error')} for e in errors],

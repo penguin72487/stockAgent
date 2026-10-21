@@ -40,7 +40,8 @@ def read_json(path: Path):
 def normalize_source(path: Path, key: str, sessions: list[date], symbols: list[str],
                      uploads: pl.DataFrame | None = None, *,
                      publication_bounds: pl.DataFrame | None = None,
-                     quality_rows: list[dict] | None = None):
+                     quality_rows: list[dict] | None = None,
+                     available_after: date | None = None):
     rule, feature = rule_for(key), feature_name(key)
     if rule is None:
         raise ValueError("no source-family rule")
@@ -55,13 +56,23 @@ def normalize_source(path: Path, key: str, sessions: list[date], symbols: list[s
         raise ValueError("duplicate/null source index")
     lookup = apply_known_release_overrides(schedule_lookup(indexes, rule, sessions), key, sessions)
     usable = lookup.filter(pl.col("date").is_not_null()).select("source_index", "date")
+    # Daily/weekly observations collapse independently within each ready date.
+    # Filter before wide->long expansion, not after materializing all history.
+    # Report/revenue floors and issuer-specific delayed publication need their
+    # full context; do not generalize this optimization to those sources.
+    prune = (available_after is not None and rule.kind in {"daily", "weekly"}
+             and (publication_bounds is None
+                  or publication_bounds.filter(pl.col("dataset") == key).is_empty()))
+    if prune:
+        usable = usable.filter(pl.col("date") > available_after)
     if rule.kind in {"quarter", "quarter_date"} and uploads is not None:
         usable = lookup.select("source_index", pl.col("date").fill_null(sessions[-1] + timedelta(days=1)))
     if rule.scope == "market":
-        table = _wide_market(path, feature, sessions, date_lookup=usable, keep_invalid_barriers=True)
+        table = _wide_market(path, feature, sessions, date_lookup=usable, keep_invalid_barriers=True,
+                             prune_to_lookup=prune)
     else:
         table = _wide_stock(path, feature, sessions, date_lookup=usable, keep_source_index=True,
-                            defer_collapse=True)
+                            defer_collapse=True, prune_to_lookup=prune)
         table = table.filter(pl.col("symbol").is_in(symbols))
         table = table.join(lookup.select("source_index", "estimated_published_on"),
                            on="source_index", how="left", validate="m:1")

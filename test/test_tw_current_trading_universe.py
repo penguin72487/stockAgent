@@ -324,6 +324,56 @@ def test_opening_fan_in_fetches_official_symbols_not_in_model(setup, monkeypatch
         owner.close()
 
 
+def test_official_opening_source_bootstraps_without_model_receipt_or_source_read_lock(setup, monkeypatch):
+    import fcntl
+    setup.publish()
+    setup.clock[0] = setup.clock[0].replace(hour=9, minute=1)
+    path = quotes._tw_mis_opening_receipt_path(DAY)
+    assert not path.exists()
+    calls = []
+    def provider(names, values, progress):
+        calls.append(list(names))
+        return snapshot(names)
+    monkeypatch.setattr(acquisition, "configured_opening_providers", lambda *_: {"official_mis": provider})
+    owner = acquisition.OpeningPriceFanIn()
+    monkeypatch.setattr(acquisition, "OPENING_FAN_IN", owner)
+    lock = setup.root.parent.parent / ".locks" / "tw-public-refresh.lock"
+    lock.parent.mkdir()
+    try:
+        with lock.open("a+") as writer:
+            fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = quotes.repair_tw_opening_snapshot_receipt(parquet_root=setup.root, session_date=DAY)
+        assert result["status"] == "complete" and result["requested_count"] == 3
+        assert result["bootstrapped_from_official_universe"]
+        assert calls == [["0050", "2330", "6488"]]
+        assert owner.wait_idle(timeout_seconds=1)
+        receipt = json.loads(path.read_bytes())
+        assert receipt["requested_symbols"] == ["0050", "2330", "6488"]
+        assert set(receipt["rows"]) == set(receipt["requested_symbols"])
+    finally:
+        owner.close()
+
+
+@pytest.mark.parametrize("kind", ["foreign_root", "corrupt", "missing_authority", "preopen"])
+def test_official_source_bootstrap_never_overwrites_foreign_corrupt_or_unqualified_receipt(setup, monkeypatch, kind):
+    if kind != "missing_authority":
+        setup.publish()
+    setup.clock[0] = setup.clock[0].replace(hour=8 if kind == "preopen" else 9, minute=59 if kind == "preopen" else 1)
+    path = quotes._tw_mis_opening_receipt_path(DAY)
+    if kind in {"foreign_root", "corrupt"}:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"{" if kind == "corrupt" else json.dumps({"parquet_root": "foreign-root", "session_date": DAY}).encode())
+    before = path.read_bytes() if path.exists() else None
+    monkeypatch.setattr(acquisition, "configured_opening_providers", lambda *_: pytest.fail("unqualified scope cannot query"))
+    if kind == "missing_authority":
+        with pytest.raises(universe.TWTradingUniversePending):
+            quotes.repair_tw_opening_snapshot_receipt(parquet_root=setup.root, session_date=DAY)
+    else:
+        result = quotes.repair_tw_opening_snapshot_receipt(parquet_root=setup.root, session_date=DAY)
+        assert result["status"] == "not_started"
+    assert (path.read_bytes() if path.exists() else None) == before
+
+
 def test_receipt_counts_official_scope_and_preserves_excluded_observations(setup):
     setup.publish()
     setup.clock[0] = setup.clock[0].replace(hour=9, minute=1)
@@ -604,7 +654,8 @@ def test_daily_universe_timer_is_independent_and_protects_opening():
     assert "--scheduled" in service and "--force" not in service
     assert "discord-bot.service" not in service and "simulation.service" not in service
     assert "RestartSec=30s" in service and "StartLimitBurst=3" in service
-    assert "RestartPreventExitStatus=65" in service
+    assert "SuccessExitStatus=75" in service
+    assert "RestartPreventExitStatus=65 75" in service
     assert "08:30:00 Asia/Taipei" in timer and "08:55:00 Asia/Taipei" in timer
     assert "09:00:" not in timer and "Persistent=true" in timer and "OnBootSec=90s" in timer
     assert "--universe-only" in installer and "scoped_universe_install=true" in installer

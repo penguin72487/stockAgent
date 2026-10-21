@@ -84,6 +84,137 @@ def test_one_explicit_completed_benchmark_case_uses_existing_exact_archive_owner
     assert proof['files'] == 3 and target.is_dir()  # Publication never implies deletion.
 
 
+def _completed_openbb_selector(source):
+    fixture = {'contract': 'openbb_private_full_manifest_source_selector_v1',
+               'manifest_sha256': 'a' * 64, 'selector_sha256': 'b' * 64,
+               'module_sha256': 'c' * 64, 'tasks': 123,
+               'provider_calls': 0, 'production_writes': False}
+    names = ('01-original.json', '02-candidate.json', '03-candidate.json', '04-original.json')
+    trials = []
+    for name, variant in zip(names, ('original', 'candidate', 'candidate', 'original'), strict=True):
+        row = {'state': 'completed_trial', 'variant': variant, 'limit': 32768,
+               'fixture_manifest_sha256': fixture['manifest_sha256'],
+               'shared_code_sha256': fixture['module_sha256'], 'selected_files': 0,
+               'full_ordered_source_contract_sha256': 'd' * 64,
+               'provider_calls': 0, 'production_writes': False, 'model_runtime_imported': False}
+        (source / name).write_text(json.dumps(row))
+        trials.append(dict(name=name, **row))
+    accepted = {'contract': 'openbb_full_manifest_unassigned_source_abba_v1',
+                'state': 'accepted_bounded_phase_comparison', 'tasks': fixture['tasks'],
+                'fixture_manifest_sha256': fixture['manifest_sha256'],
+                'exact_full_ordered_source_parity': True, 'trials': trials,
+                'provider_calls': 0, 'production_writes': False}
+    (source / 'fixture.json').write_text(json.dumps(fixture))
+    (source / 'abba-receipt.json').write_text(json.dumps(accepted))
+    return fixture, accepted
+
+
+def test_openbb_distinct_fixture_and_comparison_abis_retain_exact_completion_evidence(tmp_path):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    source = tmp_path / 'case'
+    source.mkdir()
+    _completed_openbb_selector(source)
+    retained = tmp_path / 'retained'
+    proof = completed_benchmark_evidence(source, destination=retained)
+    assert proof == completed_benchmark_evidence(retained)
+    assert proof['producer_contract'] == 'openbb_private_full_manifest_source_selector_v1'
+    assert proof['producer_state'] == 'accepted_bounded_phase_comparison'
+    assert len(proof['files']) == 6
+    assert proof['scope'] == 'producer_declared_completion_not_benchmark_reexecution'
+
+
+@pytest.mark.parametrize('problem', [
+    'foreign_pair', 'same_contract_shortcut', 'missing_trial', 'sidecar_changed',
+    'unfinished', 'manifest', 'module', 'order', 'limit', 'nonzero_calls',
+    'writes', 'model_import', 'parity', 'selected_bool', 'calls_bool',
+    'tasks_bool', 'malformed_digest', 'parity_claim',
+])
+def test_openbb_completion_bridge_rejects_unbound_or_incomplete_evidence(tmp_path, problem):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    fixture, accepted = _completed_openbb_selector(tmp_path)
+    row = accepted['trials'][0]
+    if problem == 'foreign_pair':
+        accepted['contract'] = 'unknown_comparison'
+    elif problem == 'same_contract_shortcut':
+        accepted['contract'] = fixture['contract']
+    elif problem == 'missing_trial':
+        (tmp_path / row['name']).unlink()
+    elif problem == 'sidecar_changed':
+        (tmp_path / row['name']).write_text('{}')
+    elif problem == 'unfinished':
+        row['state'] = 'running'
+    elif problem == 'manifest':
+        accepted['fixture_manifest_sha256'] = 'e' * 64
+    elif problem == 'module':
+        row['shared_code_sha256'] = 'e' * 64
+    elif problem == 'order':
+        accepted['trials'].reverse()
+    elif problem == 'limit':
+        row['limit'] = 8192
+    elif problem == 'nonzero_calls':
+        row['provider_calls'] = 1
+    elif problem == 'writes':
+        accepted['production_writes'] = True
+    elif problem == 'model_import':
+        row['model_runtime_imported'] = True
+    elif problem == 'parity':
+        row['full_ordered_source_contract_sha256'] = 'e' * 64
+    elif problem == 'selected_bool':
+        row['selected_files'] = False
+    elif problem == 'calls_bool':
+        row['provider_calls'] = False
+    elif problem == 'tasks_bool':
+        fixture['tasks'] = accepted['tasks'] = True
+    elif problem == 'malformed_digest':
+        fixture['selector_sha256'] = 'not-a-sha256'
+    else:
+        accepted['exact_full_ordered_source_parity'] = False
+    # Rebind edited trial sidecars except in the explicit missing/tamper cases:
+    # rejection must not depend only on an incidental receipt mismatch.
+    if problem not in {'missing_trial', 'sidecar_changed'}:
+        for trial in accepted['trials']:
+            (tmp_path / trial['name']).write_text(json.dumps({
+                key: value for key, value in trial.items() if key != 'name'}))
+    (tmp_path / 'fixture.json').write_text(json.dumps(fixture))
+    (tmp_path / 'abba-receipt.json').write_text(json.dumps(accepted))
+    with pytest.raises(SnapshotError, match='completed producer'):
+        completed_benchmark_evidence(tmp_path)
+
+
+def test_temporary_stage_selection_is_fixed_and_bound_to_one_completed_benchmark_scope():
+    from scripts import retire_local_offline_artifacts as cleanup
+    assert cleanup.stage_profile({}) == (cleanup.C_TEMP_STAGE_ROOT, False)
+    inventory = {'staging_profile': cleanup.D_BENCHMARK_STAGE_PROFILE,
+                 'items': [{'relative_root': 'benchmarks/suite/completed-case'}]}
+    assert cleanup.stage_profile(inventory) == (cleanup.D_BENCHMARK_STAGE_ROOT, True)
+
+
+@pytest.mark.parametrize('problem', ['foreign', 'suite-root', 'raw-source', 'multiple',
+                                   'existing', 'physical-source', 'catalog', 'malformed'])
+def test_d_temporary_stage_cannot_override_other_sources_or_existing_archives(problem):
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.D_BENCHMARK_STAGE_PROFILE,
+                 'items': [{'relative_root': 'benchmarks/suite/completed-case'}]}
+    if problem == 'foreign':
+        inventory['staging_profile'] = '/arbitrary/volume'
+    elif problem == 'suite-root':
+        inventory['items'][0]['relative_root'] = 'benchmarks/suite'
+    elif problem == 'raw-source':
+        inventory['items'][0]['relative_root'] = 'data_tw_minute/shioaji_1m'
+    elif problem == 'multiple':
+        inventory['items'] *= 2
+    elif problem == 'existing':
+        inventory['items'][0]['existing_dataset'] = 'old-archive'
+    elif problem == 'physical-source':
+        inventory['source_origin'] = 'retained-hot-mirror-preservation-v1'
+    elif problem == 'catalog':
+        inventory['existing_catalog_sha256'] = 'a' * 64
+    else:
+        inventory['items'] = None
+    with pytest.raises(SnapshotError, match='staging profile'):
+        cleanup.stage_profile(inventory)
+
+
 @pytest.mark.parametrize('problem', ['missing', 'failed', 'unfinished', 'foreign_contract', 'contract_type'])
 def test_shared_capture_owner_also_rejects_unfinished_benchmarks_without_outer_cli(tmp_path, problem):
     root, source, row, catalog = example(tmp_path)
@@ -657,22 +788,19 @@ def test_recovery_scratch_selection_keeps_exact_decode_and_physical_capacity_gat
         admitted.append((path,required))
         raise SnapshotError('actual physical backing drive lacks capacity')
     monkeypatch.setattr(admission,'admit_workspace',reject)
-    if ram_available:
-        proof=cleanup.verify_for_retirement(spec,packed,target)
-        assert proof['decoded_originals_verified'] and proof['manifest_sha256']==published['manifest_sha256']
-        assert not admitted
-    else:
-        with pytest.raises(SnapshotError,match='physical backing drive'):
-            cleanup.verify_for_retirement(spec,packed,target)
-        assert admitted[0][0]==target/'verification-scratch'
-        assert admitted[0][1]>32*1024**3
+    proof=cleanup.verify_for_retirement(spec,packed,target)
+    assert proof['decoded_originals_verified'] and proof['manifest_sha256']==published['manifest_sha256']
+    assert not admitted
+    if not ram_available:
+        assert proof['verification_scratch_created'] is False
+        assert proof['cold_reconstruction']['independently_reconstructed_files'] > 0
     assert source.is_dir()
     assert not list(target.glob('verification-scratch/stockagent-legacy-verify-*'))
     progress = json.loads((target / 'recovery-progress.json').read_bytes())
     assert progress['snapshot_id'] == published['snapshot_id']
     assert progress['manifest_sha256'] == published['manifest_sha256']
     assert progress['acceptance_proof'] is False
-    assert progress['state'] == ('verified' if ram_available else 'failed')
+    assert progress['state'] == 'verified'
     assert not (target / 'retirement.json').exists()
 
 
@@ -686,7 +814,7 @@ def test_recovery_interrupt_keeps_partial_telemetry_and_never_accepts_retirement
     target = tmp_path / 'receipts'
     target.mkdir()
     monkeypatch.setattr(cleanup.shutil, 'disk_usage', lambda path: SimpleNamespace(free=64*1024**3))
-    def interrupted(spec, cold, *, verification_root, progress):
+    def interrupted(spec, cold, *, progress, **options):
         progress({'stage': 'hash-cold-blobs', 'recovery_step': 'fetch-encoded-archive',
                   'completed_items': 5, 'total_items': 10, 'completed_bytes': 1024, 'total_bytes': 2048})
         raise KeyboardInterrupt()
@@ -819,3 +947,71 @@ def test_complete_archive_publication_keeps_sha_gates_after_shared_link_removal(
         result=publish_archive(spec,root,tmp_path/'cold',repo_root=root.parent,manual_capture=True)
         assert verify_cold_archive(spec,tmp_path/'cold')['snapshot_id']==result['snapshot_id']
     assert manifest_path.read_bytes()==preserved
+
+
+def test_nested_phase_progress_restores_the_running_parent_clock(tmp_path):
+    from scripts.retire_local_offline_artifacts import phase
+    path = tmp_path / 'phase.json'
+    with phase(tmp_path, 'publish-to-D'):
+        parent = json.loads(path.read_text())
+        with phase(tmp_path, 'publish-under-shared-owner'):
+            child = json.loads(path.read_text())
+            assert child['phase_stack'] == ['publish-to-D', 'publish-under-shared-owner']
+            assert child['phase_depth'] == 1 and child['state'] == 'running'
+        resumed = json.loads(path.read_text())
+        assert resumed['phase'] == 'publish-to-D' and resumed['state'] == 'running'
+        assert resumed['started_at_epoch'] == parent['started_at_epoch']
+        assert resumed['last_subphase']['state'] == 'completed'
+        assert 'finished_at_epoch' not in resumed
+    completed = json.loads(path.read_text())
+    assert completed['contract'] == 'manual-retirement-phase-progress-v2'
+    assert completed['phase'] == 'publish-to-D' and completed['state'] == 'completed'
+
+
+@pytest.mark.parametrize('handled', [False, True])
+def test_nested_phase_failure_keeps_parent_active_until_its_own_outcome(tmp_path, handled):
+    from scripts.retire_local_offline_artifacts import phase
+    path = tmp_path / 'phase.json'
+    def run():
+        with phase(tmp_path, 'outer-audit'):
+            try:
+                with phase(tmp_path, 'child-audit'):
+                    raise ValueError('failed child')
+            except ValueError:
+                current = json.loads(path.read_text())
+                assert current['phase'] == 'outer-audit' and current['state'] == 'running'
+                assert current['last_subphase']['state'] == 'failed'
+                assert current['last_subphase']['error_type'] == 'ValueError'
+                if not handled:
+                    raise
+    if handled:
+        run()
+    else:
+        with pytest.raises(ValueError, match='failed child'):
+            run()
+    result = json.loads(path.read_text())
+    assert result['phase'] == 'outer-audit'
+    assert result['state'] == ('completed' if handled else 'failed')
+
+
+def test_nested_phase_targets_never_overwrite_each_others_progress(tmp_path):
+    from scripts.retire_local_offline_artifacts import phase
+    left, right = tmp_path / 'left', tmp_path / 'right'
+    left.mkdir(); right.mkdir()
+    with phase(left, 'left-audit'):
+        with phase(right, 'right-audit'):
+            assert json.loads((right / 'phase.json').read_text())['phase_stack'] == ['right-audit']
+        assert json.loads((right / 'phase.json').read_text())['state'] == 'completed'
+        assert json.loads((left / 'phase.json').read_text())['state'] == 'running'
+    assert json.loads((right / 'phase.json').read_text())['phase'] == 'right-audit'
+
+
+def test_phase_progress_does_not_resurrect_an_interrupted_disk_phase(tmp_path):
+    from scripts.retire_local_offline_artifacts import phase
+    path = tmp_path / 'phase.json'
+    path.write_text(json.dumps({'phase': 'interrupted-old-attempt', 'state': 'running'}))
+    with phase(tmp_path, 'new-attempt'):
+        assert json.loads(path.read_text())['phase_stack'] == ['new-attempt']
+    result = json.loads(path.read_text())
+    assert result['phase'] == 'new-attempt' and result['state'] == 'completed'
+    assert result['phase_depth'] == 0

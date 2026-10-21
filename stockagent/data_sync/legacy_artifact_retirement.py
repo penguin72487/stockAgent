@@ -48,12 +48,42 @@ def _active_service_references(source: Path, repo_root: Path) -> list[str]:
 def _assert_legacy_unlink_gates(
     spec: LegacyArchiveSpec, plan: Mapping[str, Any], quarantine: Path, **options: Any,
 ) -> dict[str, Any]:
-    """Use the same reviewed consumer domain in capture, plan and final unlink."""
-    return _assert_unlink_gates(
-        plan, quarantine,
-        _process_scope_root=legacy_process_scope(spec, Path(options["artifact_root"])),
-        **options,
-    )
+    """Wait out a bounded scan by replaying ALL gates, never cached usage.
+
+    Only the known idle-only transient may wait. Every retry starts again with
+    process/service/configuration/pin/bridge checks and a fresh transport probe;
+    callers still check exact generation/bindings and the original proof age.
+    """
+    deadline = time.monotonic() + 300
+    idle_only_checks = {
+        "folder_idle", "need_bytes_zero", "need_items_zero", "need_deletes_zero",
+        "errors_zero", "pull_errors_zero", "watch_error_empty",
+        "folder_errors_empty", "system_errors_empty",
+    }
+    while True:
+        try:
+            return _assert_unlink_gates(
+                plan, quarantine,
+                _process_scope_root=legacy_process_scope(spec, Path(options["artifact_root"])),
+                **options,
+            )
+        except SnapshotError as error:
+            remaining = deadline - time.monotonic()
+            probe = options.get("peer_probe")
+            if (str(error) != "retirement post-rename transport not converged; quarantine retained"
+                    or probe is None or remaining <= 0):
+                raise
+            proof = probe()
+            checks = proof.get("local_checks", {})
+            idle_only = (isinstance(checks, Mapping) and set(checks) == idle_only_checks
+                and checks["folder_idle"] is False
+                and all(value is True for key, value in checks.items() if key != "folder_idle")
+                and all(peer.get("ok") is True for peer in proof.get("peers", [])))
+            if proof.get("ok") is not True and not idle_only:
+                raise
+            # Do not sleep inside peer_probe: that would leave usage checks
+            # from BEFORE the wait as permission to unlink an opened file.
+            time.sleep(min(10, remaining))
 
 
 def _state_path(state_root: Path, dataset: str) -> Path:
@@ -431,7 +461,14 @@ def apply_legacy_retirement(
             or resolved.manifest_sha256 != plan["manifest_sha256"]):
             raise SnapshotError("legacy cold head changed after rename; quarantine retained")
         verify_cold_resilience(Path(options["sync_root"]), resolved, Path(options["backup_config"]))
+        unlink_binding = _full_verification_binding(
+            spec, quarantine / "source", quarantine / "hot", archive, Path(options["sync_root"]))
         unlink_peer_proof = _assert_legacy_unlink_gates(spec, plan, quarantine, **options)
+        full = plan.get("full_verification")
+        if (_full_verification_binding(
+                spec, quarantine / "source", quarantine / "hot", archive, Path(options["sync_root"])) != unlink_binding
+                or (full is not None and not 0 <= time.time()-float(full["verified_at_epoch"]) <= 1500)):
+            raise SnapshotError("legacy generation changed or full audit expired during final gates; quarantine retained")
         reclaimed_bytes = _reclaimable_file_bytes(quarantine / "source", quarantine / "hot")
         if (quarantine / "hot").is_dir():
             shutil.rmtree(quarantine / "hot")

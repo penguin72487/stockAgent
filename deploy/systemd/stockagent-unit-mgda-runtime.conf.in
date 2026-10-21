@@ -1,0 +1,5 @@
+# Optional profile for a roster containing exact Unit MGDA fold_10.
+# Install only on Discord bot, artifact-maintenance, postclose-cache and
+# artifact-retry owners; this does not configure execution or other training.
+[Service]
+EnvironmentFile=@REPO_ROOT@/configs/deployments/tw_day_trade_unit_mgda_fold10_runtime.env

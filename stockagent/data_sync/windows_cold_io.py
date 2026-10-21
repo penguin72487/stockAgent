@@ -32,7 +32,7 @@ ALIASES = (
 )
 
 
-def admit_workspace(path: Path, required_bytes: int) -> dict:
+def admit_workspace(path: Path, required_bytes: int, *, windows_distribution: str | None = None) -> dict:
     """Admit native SSD scratch using real backing capacity, without ML imports.
 
     Shared with the completed-return owner. The old public entrypoint delegates
@@ -52,7 +52,12 @@ def admit_workspace(path: Path, required_bytes: int) -> dict:
     free = fs.f_bavail * fs.f_frsize
     if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
         from stockagent.data_sync.recovery_queue import physical_free_bytes
-        config = {"windows_distribution": os.environ.get("WSL_DISTRO_NAME", ""),
+        if windows_distribution is not None and (
+                not isinstance(windows_distribution, str)
+                or re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", windows_distribution) is None):
+            raise SnapshotError("explicit WSL backing distribution is invalid")
+        config = {"windows_distribution": (os.environ.get("WSL_DISTRO_NAME", "")
+                                           if windows_distribution is None else windows_distribution),
                   "powershell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"}
         free = min(free, physical_free_bytes(config))
     if free < required_bytes:
@@ -147,6 +152,10 @@ def _configuration_on_checked_mount(
     if mode == 'hash':
         if type(expected_bytes) is not int or not 0 <= expected_bytes <= 8 * 1024**3:
             raise SnapshotError('Native full hash exceeds its exact member bound')
+        config['expected_bytes'] = expected_bytes
+    if mode == 'read' and expected_bytes is not None:
+        if type(expected_bytes) is not int or not 0 <= expected_bytes <= 8 * 1024**3:
+            raise SnapshotError('Native exact read exceeds its member bound')
         config['expected_bytes'] = expected_bytes
     return config
 
@@ -288,6 +297,72 @@ def copy_verified(source, destination, *, expected_sha256, expected_bytes):
         if process.poll() is None:
             process.terminate();process.wait(timeout=30)
         process.stdout.close();errors.close()
+
+
+@contextmanager
+def binary_reader_many(members):
+    """Stream ordered exact members through one bounded native process.
+
+    Repeated extents remain repeated bytes. The caller must consume the entire
+    stream and verify each member's SHA; no member is accepted before this
+    context's process, fresh authority and before/after signature checks pass.
+    Only an empty, known interop startup failure can retry, never partial data.
+    """
+    members = [(Path(path), count) for path, count in members]
+    if (not 1 <= len(members) <= 16
+            or any(type(count) is not int or not 0 <= count <= 8 * 1024**3 for _, count in members)
+            or sum(count for _, count in members) > 16 * 1024**3):
+        raise SnapshotError('Native read batch exceeds its exact immutable bounds')
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+    for attempt in range(3):
+        _check_d_primary_mount(Path('/srv/stockagent-packed'))
+        signatures = [path.lstat() for path, _ in members]
+        if any(not stat.S_ISREG(info.st_mode) or info.st_size != count
+               for (_, count), info in zip(members, signatures, strict=True)):
+            raise SnapshotError('Native read batch differs from an exact regular member')
+        configs = [_configuration_on_checked_mount(path, mode='read', expected_bytes=count)
+                   for path, count in members]
+        process, errors = _launch(configs, batched=True)
+        retry = False
+        try:
+            try:
+                process.stdin.write(json.dumps(configs, ensure_ascii=True).encode() + b'\n')
+                process.stdin.close()
+            except BrokenPipeError:
+                # Classify the real child failure below, never retry blindly.
+                if not process.stdin.closed:
+                    try:
+                        process.stdin.close()
+                    except BrokenPipeError:
+                        pass
+            if not process.stdout.peek(1) and process.wait(timeout=30):
+                errors.seek(0)
+                failure = errors.read(4096)
+                if attempt < 2 and retryable_interop_startup(failure):
+                    retry = True
+                else:
+                    raise SnapshotError('Native read batch startup failed: ' + failure.decode(errors='replace'))
+            if not retry:
+                yield process.stdout
+                if process.stdout.read(1):
+                    raise SnapshotError('Native read batch has unconsumed or excess bytes')
+                if process.wait(timeout=120):
+                    errors.seek(0)
+                    raise SnapshotError('Native read batch failed: ' + errors.read(4096).decode(errors='replace'))
+                _check_d_primary_mount(Path('/srv/stockagent-packed'))
+                if any(not _stable(before, path.lstat())
+                       for (path, _), before in zip(members, signatures, strict=True)):
+                    raise SnapshotError('Native read batch changed an exact member')
+                return
+        finally:
+            if not process.stdin.closed:
+                process.stdin.close()
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=30)
+            process.stdout.close()
+            errors.close()
+        time.sleep((0.2, 1.0)[attempt])
 
 
 @contextmanager

@@ -1,6 +1,6 @@
 # TEJ 目錄、下載故障自動恢復與驗收
 
-2026-10-10 初稿，2026-10-17 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
+2026-10-10 初稿，2026-10-21 更新，Asia/Taipei。10/10 凌晨修復的停滯不是程序停止，而是
 目錄準備失敗後，介面檢查也逾時，被誤歸為未知資料查詢，使整個佇列永久等待。
 10/10 下午重新盤點時，再重現 SQLite 忙碌導致失敗分類回滾、工作永久留在 `running`
 的第二條路徑；已補上負證據本機對帳及原 worker 身分保留。
@@ -508,3 +508,166 @@ API 支線在列數配額已耗盡時，原來仍先執行全來源價值排序�
 `quarantined_key_audit.json` 保存逐表列數、鍵範例及原回應 SHA，檢查新增 0 次
 來源查詢、採納 0 列。尚未證明是來源錯誤或期間模型問題，不能直接放寬日期
 驗證、回填發布時間或宣稱不可修復。
+
+## 10/19：缺少公司標籤的分流、開機恢復與重工消除
+
+本輪 Windows 實際於 **00:51:32** 重開機，WSL 開機工作於 00:52:06 啟動。
+互動 relay 已恢復，但服務存活不代表有效吞吐：`Ex_right Event`、
+`Treasury Stocks Performance`、`Cash Dividends`、`Shareholder Meeting`
+反覆在查詢準備階段找不到 `7956==>啟賦科技` 或 `7929==>碩通散熱`。
+例如 99 家公司的查詢只缺一家，舊流程仍讓整批等待；換日期或欄位批次後又重做
+相同的失敗準備。這是來源精確標籤缺席，不足以證明該公司歷史資料不存在。
+
+修復沿用原佇列、權限、資料價值排序與單一 Wizard writer，沒有猜測更名或代號：
+
+- 原生批次 lookup 必須完整查完、核對 owner／來源綁定及公司清單計數穩定，
+  才保存 `exact_current_company_membership_v1` sidecar，與原 request、attempt、
+  負證據及不可變 bridge SHA 綁定；部分 lookup、逾時或證據被改動一律不授權拆分。
+- 通過原介面獨立核對後，99 家拆成 **98 家續抓、1 家待補**。欄位、日期與
+  原工作量分母完全保留；缺標籤不是空資料，也不是已完成。逐表等待改成只擋
+  缺標籤的片段，其餘公司及後續歷史分區可繼續生成。
+- 同表、同完整來源標籤的其他未嘗試日期／欄位分區，可以沿用原負證據作
+  **有期限的排程提示**，只延至原重查時間，不增加來源失敗次數、不重設退避。
+  提示不是當前來源證據或 UI 操作許可；健康公司照常做新鮮來源驗證，提示
+  過期或綁定不符就恢復正常檢查。API 分工先於此提示，避免搶回 API 已負責的範圍。
+  已到期的缺公司片段亦可共用較新的完整 lookup；若曾嘗試，必須額外驗證該片段
+  自己的原 request、完整全缺席 sidecar、已結束且確定未送出的原 attempt。
+  只更新到較新 lookup 的原重查時間，不覆寫舊 attempt／traffic；尚未到期、
+  只有部分標籤重疊、證據不符或 Preview 可能送出，都不能沿用。
+- API 分工與 selector 拆分都是未送出查詢的本機交易，不再額外支付 2 秒來源
+  查詢間隔；真正查詢的既有 start-to-start／legacy finish-gap 限速及故障退避
+  不變。這消除本機排程空等，不代表來源限速或理論最大吞吐已被證明。
+- worker 新增 Linux boot UUID。跨 boot 的舊 PID／birth ticks 不再誤認為仍活著，
+  可立即分類為原 owner 已死的 **unknown**，不用先空等舊 900 秒期限；仍須先
+  對帳原結果、確認舊 Windows owner 退役及精確新介面，才依原授權有限重排。
+  同 boot 及舊版 owner 證據仍保留原截止條件；沒有把未知查詢直接改成 pending。
+- 網頁分別顯示「其餘公司續抓 · 部分公司待補」、實際待補片段與重查時間。
+  缺片段仍在清冊、分母及未完成範圍內，不再把單一公司缺席顯示成全表停止。
+  驗收工具改用既有 owner-only `127.0.0.1:8771/tej/api/status`；公開入口的
+  私有路由 403 是隔離設計，不為修面板而開放私有路由。
+
+### 本輪獨立驗證
+
+證據集中於 [`tej_resilience_2026-10-19/`](../artifacts/data_quality/tej_resilience_2026-10-19/)，
+不包含可公開傳送的原始資料。下列驗收各自保留，不能混算新下載與既有資料：
+
+- 最後完整 TEJ 回歸為 **1,915 passed（54.36 秒）**、**17 項前端測試通過**，
+  包含負證據竄改拒絕、全部／部分公司缺席、跨欄位提示、API 分工優先、
+  跨 boot unknown 邊界，以及本機分流前後真正查詢的限速不變。
+- [`native_membership_v1.json`](../artifacts/data_quality/tej_resilience_2026-10-19/native_membership_v1.json)：
+  真實 Windows WinForms 原生選取 fixture 通過 **125 項**，沒有 TEJ 查詢。
+- [`live_hint_acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-19/live_hint_acceptance.json)：
+  獨立稽核正式排程已採用的 **9 個**提示分流；逐筆原有 **9,999** 工作列前後
+  相等，全部欄位／日期／公司聯集保留，原 task 沒有 desktop attempt，也未增加
+  來源失敗計數。稽核本身新增 0 次來源／桌面操作。
+- [`shared_recheck_acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-19/shared_recheck_acceptance.json)：
+  獨立稽核最後版本實際採用的 **16 個**共用重查片段，其中 **11 個**保留過去
+  已結束的未送出 attempt。逐筆重驗自己的負證據、較新完整 lookup、精確標籤
+  及完整工作量；只有原到期時間改為較新 lookup 的既有到期時間。稽核不修改
+  正式佇列、不發出來源／桌面操作、不計為新下載。
+- [`production_acceptance_release19.json`](../artifacts/data_quality/tej_resilience_2026-10-19/production_acceptance_release19.json)：
+  最後版本 **02:00:21** 部署後才開始的 **8 份新收據**，含 **1 列非空資料、
+  24 個原始資料格**。目前 capture、ingest、planner、scheduler、startup SHA
+  均綁定；原故障證據 SHA 未變，正式排程執行中、沒有全域暫停。
+- [`production_acceptance_final.json`](../artifacts/data_quality/tej_resilience_2026-10-19/production_acceptance_final.json)：
+  **01:42:09** 部署後才開始的 8 份新下載收據，取得 **30 列、343 個原始資料格**；
+  五份原故障證據 SHA 未變，正式排程持續執行。這是加入本機間隔優化前的驗收，
+  後續版本另留新 cohort，不覆寫這份證據。
+- [`production_acceptance_query_gap.json`](../artifacts/data_quality/tej_resilience_2026-10-19/production_acceptance_query_gap.json)：
+  中間版本 **01:51:05** 部署後才開始的 8 份新收據為 **6 列、171 個原始資料格**。
+  此 cohort 與最後版本分開記錄，沒有拿舊收據冒充最後部署的新下載。
+- [`retained_values_final.json`](../artifacts/data_quality/tej_resilience_2026-10-19/retained_values_final.json)：
+  以目前 capture／ingest SHA 重驗既有 **5 列、55 個原始資料格**，不是新下載量。
+- [`rendered_final/rendered_acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-19/rendered_final/rendered_acceptance.json)：
+  1440px 桌面與 390px 手機實際渲染通過，無 JS 錯誤或橫向溢出；另驗證六種
+  輪詢狀態、篩選／焦點保留，以及讀回尚未提交時不能計為已下載。無外部來源請求。
+- [`boot_readback_v1.json`](../artifacts/data_quality/tej_resilience_2026-10-19/boot_readback_v1.json)：
+  Windows BootTrigger／S4U WSL 工作、Interactive 登入恢復工作、每分鐘 watchdog、
+  pinned launcher、systemd service 與 API timer 均獨立讀回通過。**仍需要 Windows
+  使用者登入才能操作 GUI**，沒有啟用自動登入或 Session 0 GUI。實際重開機早於
+  本輪修復，沒有為驗收再重開整台電腦，不能宣稱新版本已通過實機冷開機測試。
+
+API 支線當時本機保守預算為 **21 calls／50,000 rows**，剩餘 **479 calls、0 rows**；
+API timer 正常等待列數配額，與 Wizard 繼續抓取是兩條不同狀態。官方 usage
+快照不是本輪新取樣，不因 calls 尚有剩餘就繞過每日列數上限。
+
+本輪新增的舊 attempt 測試曾因 fixture 缺少 `attempted_at_utc` 而被守門正確
+拒絕；fixture 已改用該 registered attempt 的原開始時間，正式守門沒有放寬。
+原失敗 log 保留並綁定最後通過的 1,915／17 回歸為 superseded，不覆寫失敗紀錄。
+
+本輪沒有刪除舊收據、縮減欄位、合成歷史值或略過原值／鍵／scope 驗證。
+全歷史仍未完成：缺少的來源公司標籤、舊目錄／來源期間隔離及大表完整讀回
+仍有待處理。先前同範圍量測的大表讀回占比約 68%，不是本輪重新證明的比例；
+本輪新取得資料與舊空回基準不同，也不能相除宣稱速度倍數。canonical 任務
+`tej-resilience-throughput-20261017` 保持 active，不將本輪恢復與局部去重稱為
+已消除全部瓶頸或達到理論極限。
+
+## 10/21 WSL 重啟但原 Windows 查詢視窗仍存活
+
+本次停止點是 **01:20:17** 開始的下載。WSL 重啟後，原 Linux worker 已死亡，
+但 Windows 沒有重開機，原查詢視窗仍在。舊邏輯可辨識跨 boot 的死亡 worker，
+卻只接受「原 Windows 視窗也已退役」的授權重排證據；兩者生命週期不同，使
+服務持續存活、未知結果卻無法離開等待。原結果缺席不能證明查詢沒有送出。
+
+新增的恢復路徑沿用同一個 owner、查詢鎖與授權帳本：
+
+- 先恢復原結果；只有精確原 worker 已死亡、登記 attempt 仍為 unknown、原
+  request 雜湊與 scope 完全一致，才檢查原 Windows 視窗仍存活的情況。
+- 新鮮讀回必須確認原 session、活著且身分固定的互動 relay、視窗程序出生時間
+  早於原 worker、沒有來源通知、Preview 可用，而且沒有未綁定的既存資料列。
+  已保存的 raw、stage 或 outcome 一律先走原結果對帳，不覆蓋既有資料。
+- 通過後仍依既有明確授權重排：每筆／每小時最多 2 次、全域／每小時最多
+  6 次。原 unknown 證據保留；沒有把它改寫成「確定未送出」。
+- 桌面身分或修復證據實際改變時，等待中的排程最多 5 秒內重新檢查本機狀態，
+  不必沿用舊介面的檢查冷卻。每分鐘 watchdog 的時間更新不算修復事件，
+  也不會重設來源流量預算；本機輪詢不呼叫 TEJ API 或操作 GUI。
+- 恢復失敗新增逐次私有診斷，記錄故障階段與例外，權限為 `0600`；公開網站
+  不接收這些私有內容。介面狀態讀取取得的 COM 參照改為 `finally` 釋放，
+  不釋放其他共享物件或全域強制清理。此生命週期修正遵循
+  [Microsoft 的 COM 參照釋放與共享參照注意事項](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.interopservices.marshal.releasecomobject?view=net-10.0)。
+
+原故障於 **02:01:26** 透過既有「桌面已更換」路徑完成重排；它不是新增恢復
+分支的現場驗收。新增分支以死亡 worker、仍存活的原桌面及異常證據測試驗證，
+正式新版另於 **02:14:14** 安全重啟，並核對部署後才開始的新下載。
+
+### 本次部署驗收與開機恢復
+
+證據集中於 [`tej_resilience_2026-10-21/`](../artifacts/data_quality/tej_resilience_2026-10-21/)。
+
+- 完整 TEJ 回歸 **1,950 passed，67.43 秒**，另 **17 項前端測試通過**。
+  真實 Windows 原生 fixture **125 項通過**，沒有連接 TEJ／Excel 或發送來源查詢。
+- [`production_acceptance_v1.json`](../artifacts/data_quality/tej_resilience_2026-10-21/production_acceptance_v1.json)
+  在 **02:16:04** 核對部署後啟動的 **8 份新收據**。這批均為來源明確空回，
+  新增 **0 列**；原故障 request、bridge manifest 與死亡 worker 稽核 SHA 不變。
+  [`retained_values_current.json`](../artifacts/data_quality/tej_resilience_2026-10-21/retained_values_current.json)
+  另以目前 capture／ingest SHA 重驗既有 **5 列、55 個原始資料格**，不計為新下載。
+- [`production_acceptance_v2.json`](../artifacts/data_quality/tej_resilience_2026-10-21/production_acceptance_v2.json)
+  在 **02:20:04** 再驗證後續 **8 份新收據、104 列、2,620 個原始資料格**；
+  本次確有新增非空資料，正式排程與網站均在執行，原故障證據仍完整保留。
+- [`boot_readback_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21/boot_readback_final.json)
+  核對實際安裝的 BootTrigger／S4U WSL 工作、登入後 Interactive GUI 工作、
+  每分鐘 watchdog、pinned launcher、systemd service／API timer 及活著的互動 relay。
+  開機恢復仍須 Windows 使用者登入後才能操作 GUI，沒有啟用自動登入。
+  本次沒有重開整台主機，新版本實體冷開機驗收仍為 `false`。
+- [`release_summary_v2.json`](../artifacts/data_quality/tej_resilience_2026-10-21/release_summary_v2.json)
+  保存最後程式 SHA、正式下載計數、隔離工作、網站狀態及上述獨立驗收的 SHA。
+  網站與正式排程連動，不用 HTTP 200 或服務 active 代替來源收據。
+
+### 吞吐瓶頸與尚待處理的範圍
+
+[`baseline32.json`](../artifacts/data_quality/tej_resilience_2026-10-21/baseline32.json)
+的 32 份完整鏈路樣本合計 **272.01 秒**、中位數 **6.98 秒**，其中 **24 份明確
+空回、8 份非空、150 列**。Windows 條件準備中位數 **3.36 秒**，查詢／回覆
+**0.43 秒**；查詢前完整鏈路中位數 **6.17 秒**，不能只優化網路時間。
+其中一張表的選單有 56,633 個公司標籤、14,948 個日期，笛卡兒積達
+846,550,084 個工作格點；選單日期不是已證實存在資料的日期。
+
+[`after32.json`](../artifacts/data_quality/tej_resilience_2026-10-21/after32.json)
+在部署附近取得的另 32 份樣本中位數為 **8.91 秒**，包含部署前工作及並行的
+驗收負載；這兩批不同範圍不能拿來聲稱加速倍數或理論極限。本次確實消除的
+是原桌面存活時缺少恢復分支、修復後仍等待舊檢查冷卻，以及未釋放的狀態讀取
+參照；大量稀疏查詢與大表完整讀回仍需各自的容量證據及同範圍全鏈路量測。
+
+**22 個舊隔離工作**仍保留：17 個目錄工作、5 個來源期間驗證工作。缺公司標籤
+的片段也仍在分母內；不刪除年份、不把空回當新增列、不放寬原值與 scope 驗證。
+canonical 任務維持 active，後續優先處理稀疏查詢幾何、缺公司片段及逐表來源證據。

@@ -13,6 +13,30 @@ from stockagent.data.tw_stock_futures_repair import official_day_evidence, Exact
 from stockagent.data.tw_stock_futures_history import MINUTE_SCHEMA
 
 
+def test_ranged_official_block_inventory_maps_lifetimes_sums_real_rows_and_covers_zero(tmp_path):
+    # TAIFEX accepts a difference of 365 days, including the leap-year interval.
+    raw=tmp_path/'block.raw'
+    raw.write_text('交易日期,契約,到期月份(週別),成交數量,交易時段\n'
+        '2024/01/02,DDF,202402,3,一般\n2024/01/02,DDF,202402,2,一般\n'
+        '2024/01/02,DDF,202402,100,盤後\n',encoding='cp950')
+    source=dict(path=str(raw),sha256=sha256_file(raw),url='https://www.taifex.com.tw/cht/3/dlProductOrderDown',
+        source_first_date='2024-01-01',source_last_date='2024-12-31',method='POST',http_status=200,
+        form={'queryStartDate':'2024/01/01','queryEndDate':'2024/12/31'})
+    path=tmp_path/'manifest.json'
+    atomic_write_json(path,dict(source='taifex_official_block_volume_inventory_v1',sources=[source]))
+    official=pl.DataFrame(dict(date=[date(2024,1,2)]*2,product=['DDF']*2,contract=['202402','202403'],
+        physical_contract=['DDF:202402@g1','DDF:202403@g2'],outright_volume=[5,20]))
+    result,_=apply_block_evidence(official,path)
+    assert result['block_volume'].to_list()==[5,0]
+    assert result['outright_volume'].to_list()==[0,20]
+    assert official['outright_volume'].to_list()==[5,20]
+    with pytest.raises(ValueError,match='cover selected'):
+        apply_block_evidence(official.with_columns(pl.lit(date(2025,1,2)).alias('date')),path)
+    atomic_write_json(path,dict(source='taifex_official_block_volume_inventory_v1',sources=[source,source]))
+    with pytest.raises(ValueError,match='overlapping'):
+        apply_block_evidence(official,path)
+
+
 def test_repair_tasks_keep_adjusted_and_unobserved_held_contract_days():
     inventory = pl.DataFrame({'product':['PLF', 'PL1'], 'contract':['202410']*2})
     gaps = pl.DataFrame({'date':[date(2024,9,24), date(2024,9,25), date(2024,9,25)],

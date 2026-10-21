@@ -325,18 +325,17 @@ class HttpClient:
                     }
             except HTTPError as exc:
                 last_error = exc
-                if (
-                    exc.code in {408, 418, 429, 500, 502, 503, 504}
-                    and attempt < self.max_retries
-                ):
+                exc.close()
+                if exc.code in {408, 418, 429, 500, 502, 503, 504}:
                     limiter.defer(
                         retry_delay_seconds(
                             attempt,
                             base=self.retry_base,
-                            retry_after=exc.headers.get("Retry-After"),
+                            retry_after=exc.headers.get("Retry-After") if exc.headers else None,
                         )
                     )
-                    continue
+                    if attempt < self.max_retries:
+                        continue
                 raise
             except (
                 URLError,

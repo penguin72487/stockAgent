@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 import polars as pl
 
 from stockagent.data.tw_public_provisional_macro import RAW_FEATURE_BY_SERIES
+from stockagent.data.parquet_lineage import ParquetLineage, receipt_fields
 
 
 RESEARCH_CONTRACT_VERSION = 5
@@ -132,27 +133,33 @@ def _sha256(path: Path) -> str:
 
 def research_input_receipts(
     base_path: Path, macro_events_path: Path, xbrl_root: Path,
-    calendar_path: Path, minimum_year: int,
+    calendar_path: Path, minimum_year: int, *, base_source: ParquetLineage | None = None,
 ) -> dict:
+    base_source = base_source or ParquetLineage(base_path)
     fact_root = xbrl_root / "normalized" / "ifrs"
     facts = sorted(fact_root.glob("*/*/facts.parquet"))
     if not facts:
         raise FileNotFoundError(f"no normalized IFRS XBRL facts: {fact_root}")
     paths = [
-        base_path, macro_events_path, calendar_path,
+        macro_events_path, calendar_path,
         xbrl_root / "publication_candidates.parquet", *facts,
     ]
     paths.extend(
         path for group in _EVENT_SOURCE_GROUPS.values() for stem in group
         if (path := xbrl_root.parent / f"{stem}.parquet").is_file()
     )
+    files = {str(path.resolve()): {"bytes": path.stat().st_size, "sha256": _sha256(path)} for path in paths}
+    source = base_source.source
+    if source.manifest is None:
+        files[str(source.path)] = {"bytes": source.before["size"], "sha256": base_source.identity["sha256"]}
+    else:
+        files.update({path: {"bytes": size, "sha256": digest} for path, size, digest in source.fingerprints()})
+    base_source.verify()
     return {
-        "contract_version": RESEARCH_CONTRACT_VERSION,
+        "contract_version": RESEARCH_CONTRACT_VERSION + (source.manifest is not None),
         "minimum_year": int(minimum_year),
-        "files": {
-            str(path.resolve()): {"bytes": path.stat().st_size, "sha256": _sha256(path)}
-            for path in paths
-        },
+        "files": files,
+        **({"base_source": base_source.identity} if source.manifest is not None else {}),
     }
 
 
@@ -410,8 +417,11 @@ def build_tw_public_research_features(
     output_path = Path(output_path)
     if output_path.resolve() == base_path.resolve():
         raise ValueError("research output must not overwrite the canonical PIT feature table")
+    base_source = ParquetLineage(base_path)
+    if output_path.resolve() in base_source.source.source_paths():
+        raise ValueError("research output must not overwrite a source member")
     inputs = research_input_receipts(
-        base_path, macro_events_path, xbrl_root, calendar_path, minimum_year
+        base_path, macro_events_path, xbrl_root, calendar_path, minimum_year, base_source=base_source
     )
     receipt = output_path.with_suffix(".research.json")
     if output_path.is_file() and receipt.is_file():
@@ -420,6 +430,7 @@ def build_tw_public_research_features(
         except (OSError, ValueError):
             prior = {}
         if prior.get("inputs") == inputs and prior.get("output_sha256") == _sha256(output_path):
+            base_source.verify()
             return {**prior, "reused": True}
     sessions = sorted(set(pl.read_parquet(calendar_path, columns=["date"]).get_column("date").to_list()))
     if not sessions:
@@ -431,8 +442,8 @@ def build_tw_public_research_features(
     xbrl_summary["candidates_sha256"] = inputs["files"][
         str((xbrl_root / "publication_candidates.parquet").resolve())
     ]["sha256"]
-    columns = research_source_columns(pl.scan_parquet(base_path).collect_schema().names())
-    base = pl.scan_parquet(base_path).select(columns).with_columns(
+    columns = research_source_columns(base_source.source.schema.names)
+    base = base_source.source.scan().select(columns).with_columns(
         (pl.col("_twpub_attention_flag") if "_twpub_attention_flag" in columns else
          pl.lit(None, dtype=pl.Float64)).alias("twpub_attention_event_flag"),
         (pl.col("_twpub_disposal_flag") if "_twpub_disposal_flag" in columns else
@@ -466,12 +477,13 @@ def build_tw_public_research_features(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_suffix(output_path.suffix + ".tmp")
     combined.sink_parquet(temporary, compression="zstd", statistics=True)
+    base_source.verify()
     os.replace(temporary, output_path)
     summary = {
-        "contract_version": RESEARCH_CONTRACT_VERSION,
+        "contract_version": inputs["contract_version"],
         "output_path": str(output_path),
         "output_sha256": _sha256(output_path),
-        "base_sha256": inputs["files"][str(base_path.resolve())]["sha256"],
+        **receipt_fields(base_source.identity, hash_key="base_sha256", source_key="base_source"),
         "inputs": inputs,
         "reused": False,
         "columns": output_cols,

@@ -1,0 +1,9 @@
+# Exact-month bulk prints; independent official book-volume certificates.
+# Architecture, optimizer, split, accounting and stopping policy inherit v2.
+base_config: tw_stock_futures_carry_0845_openref_20261021_v2.yaml
+experiment_name: tw-stock-futures-carry-0845-openref-20261021-v3
+trading:
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v3/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v3/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v3/clock__0845

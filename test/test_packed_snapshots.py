@@ -1535,6 +1535,30 @@ def test_openbb_uncommitted_sibling_rule_is_explicit_and_not_a_generic_tmp_filte
     assert not packed_snapshots._is_private_writer_staging(name, ())
 
 
+@pytest.mark.parametrize('name,expected', [
+    ('logs/supervisor.log.1.tmp', True),
+    ('catalog/.provider_eta.parquet.1234.tmp', True),
+    ('catalog/.category_eta.parquet.1234.tmp', True),
+    ('catalog/.provider_endpoint_eta.parquet.1234.tmp', True),
+    ('catalog/.coverage.parquet.1234.tmp', True),
+    ('catalog/.compaction_summary.parquet.1234.tmp', True),
+    ('_state/archive_end_date.txt.tmp.1234', True),
+    ('raw/logs/supervisor.log.1.tmp', False),
+    ('logs/supervisor.log', False),
+    ('logs/supervisor.log.1', False),
+    ('logs/other.log.1.tmp', False),
+    ('raw/.provider_eta.parquet.1234.tmp', False),
+    ('catalog/.unreviewed.parquet.1234.tmp', False),
+    ('catalog/.provider_eta.parquet.x.tmp', False),
+    ('raw/archive_end_date.txt.tmp.1234', False),
+    ('_state/archive_end_date.txt.tmp.x', False),
+    ('_state/archive_end_date.txt', False),
+])
+def test_openbb_operational_staging_rule_is_explicit_and_keeps_final_logs(name, expected):
+    assert packed_snapshots._is_private_writer_staging(name, ('openbb_operational_atomic_sibling_v1',)) is expected
+    assert not packed_snapshots._is_private_writer_staging(name, ())
+
+
 def test_frozen_observation_cannot_silently_disappear_before_census(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()

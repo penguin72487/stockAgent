@@ -1,5 +1,6 @@
 """Source-backed CMNews SSR scope: no related/schema/hydration text fallback."""
 import json
+from dataclasses import replace
 from pathlib import Path
 from bs4 import BeautifulSoup
 
@@ -13,6 +14,10 @@ SLUG = "forumnews-" + UUID
 URL = "https://cmnews.com.tw/article/" + SLUG
 AUTHOR = "財經焦點情報站"
 TEXT = "來源原始營收 -12.5，成交量 12345 股，這是本篇正文。" * 10
+ANNOUNCEMENT_URL = URL.replace('forumnews-', 'cmfaren-')
+ANNOUNCEMENT_LINES = ['資料公告', '親愛的研究者您好：',
+    '合成原始值-12.5、123456股與比率0.75。', '請保留原始季度，不以抓取日期代替。']
+TEMPLATE_LOGO = 'https://fsv.cmoney.tw/cmstatic/notes/content/36746/20190620081239291.Jpeg'
 
 
 @pytest.fixture
@@ -223,6 +228,76 @@ def test_current_editor_table_figure_retains_raw_text_without_image_captions(sou
     result = extract_article(page(body=markup), source, page_url=URL)
     assert result["body"] == TEXT
     assert result["extraction_method"] == "css:.articleContent__textContent"
+
+
+def short_announcement_page():
+    markup = ('<div><p class="ck-heading--paragraph"><img alt="" src="' + TEMPLATE_LOGO + '"></p>'
+        '<figure class="table"><table><tbody><tr><td><p><strong>資料公告</strong></p></td></tr><tr><td>'
+        + ''.join('<p class="ck-heading--paragraph"><span>' + text + '</span></p>'
+                  for text in ANNOUNCEMENT_LINES[1:]) + '</td></tr></tbody></table></figure></div>')
+    return (page(body='ANNOUNCEMENT_FIXTURE_BODY').decode().replace('<p>ANNOUNCEMENT_FIXTURE_BODY</p>', markup)
+        .replace('forumnews-', 'cmfaren-').replace('/forumnews', '/cmfaren')
+        .replace(AUTHOR, 'CM法人團隊').replace('本篇標題', '[資料公告]合成季度更新公告')).encode()
+
+
+@pytest.mark.parametrize('parser', ['lxml', 'html.parser'])
+def test_whole_native_short_announcement_preserves_raw_values_and_source_clocks(source, parser):
+    raw = short_announcement_page()
+    original = raw
+    article = extract_article(raw, replace(source, html_parser=parser), page_url=ANNOUNCEMENT_URL)
+    assert article['body'] == '\n'.join(ANNOUNCEMENT_LINES) and len(article['body']) < 100
+    assert raw == original and json.loads(article['authors_json']) == ['CM法人團隊']
+    assert article['published_at_raw'] == '2026-10-09T14:20:23+08:00'
+    assert article['body_completeness'].startswith('verified_publisher_short_table_announcement;')
+    assert article['extraction_method'] == 'css:.articleContent__textContent'
+    assert not article['historical_point_in_time'] and not article['per_article_license_verified']
+
+
+@pytest.mark.parametrize('mutation', ['other_author', 'unknown_logo', 'chart', 'link', 'sidebar',
+    'hidden_cell', 'hidden_text', 'hidden_scope', 'hidden_class', 'comment', 'incomplete',
+    'non_announcement', 'unknown_label', 'nested_table', 'duplicate_table', 'paid', 'bad_clock'])
+@pytest.mark.parametrize('parser', ['lxml', 'html.parser'])
+def test_short_table_proof_never_admits_preview_media_other_authors_or_unknown_shape(source, mutation, parser):
+    soup = BeautifulSoup(short_announcement_page(), parser)
+    body = soup.select_one('.articleContent .articleContent__textContent')
+    table = body.find('table')
+    if mutation == 'other_author':
+        soup = BeautifulSoup(str(soup).replace('CM法人團隊', '別的作者'), parser)
+    elif mutation == 'unknown_logo': body.img['src'] = 'https://example.invalid/chart.png'
+    elif mutation == 'chart': table.find('td').append(soup.new_tag('img', src='/chart.png'))
+    elif mutation == 'link': table.find('td').append(soup.new_tag('a', href='/related'))
+    elif mutation == 'sidebar': body.div.append(soup.new_tag('aside'))
+    elif mutation == 'hidden_cell': table.find('td')['hidden'] = ''
+    elif mutation == 'hidden_text': table.find('span')['style'] = 'display: none'
+    elif mutation == 'hidden_scope': body['aria-hidden'] = 'true'
+    elif mutation == 'hidden_class': table['class'] = ['d-none']
+    elif mutation == 'comment':
+        from bs4.element import Comment
+        table.append(Comment('not visible source text'))
+    elif mutation == 'incomplete': table.find_all('p')[-1].string = '這是尚未完成的預覽'
+    elif mutation == 'non_announcement': soup.select_one('h1.articleContent__title').string = '其他短文章'
+    elif mutation == 'unknown_label': table.find('strong').string = '推薦閱讀'
+    elif mutation == 'nested_table': table.find('td').append(soup.new_tag('table'))
+    elif mutation == 'duplicate_table':
+        table.find_all('p')[-2].string = '合成一。'
+        table.find_all('p')[-1].string = '合成二。'
+        body.div.append(BeautifulSoup(str(body.figure), parser).figure)
+    elif mutation == 'paid':
+        script = soup.find('script', type='application/ld+json')
+        value = json.loads(script.get_text())
+        value['isAccessibleForFree'] = False
+        script.string = json.dumps(value, ensure_ascii=False)
+    elif mutation == 'bad_clock': soup.select_one('.articleContent__time').string = '2026-02-30 14:20'
+    with pytest.raises(NewsError):
+        extract_article(str(soup).encode(), replace(source, html_parser=parser), page_url=ANNOUNCEMENT_URL)
+
+
+def test_generic_short_body_and_other_native_profile_keep_their_original_floor(source):
+    with pytest.raises(NewsError, match='body_not_found'):
+        extract_article(page(body='這是沒有原生表格證明的短文。'), source, page_url=URL)
+    raw = short_announcement_page().replace(b'cmfaren', b'forumnews')
+    with pytest.raises(NewsError, match='body_not_found'):
+        extract_article(raw, source, page_url=URL)
 
 
 def test_current_diagrams_with_short_cta_are_not_missing_text_or_complete_article(source):

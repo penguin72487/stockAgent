@@ -14,6 +14,66 @@ from scripts.download_tw_futures_intraday_gaps import candidate_plan, valid_save
 DAY = date(2020, 3, 23)
 
 
+def bulk_fixture():
+    expected = pl.DataFrame(dict(date=[DAY]*3, product=['DDF']*3,
+        contract=['202004','202005','202006'], physical_contract=['DDF:202004@life1','DDF:202005@life1','DDF:202006@life1'],
+        asset_class=['stock_future']*3, high=[10.1,11.,None], low=[10.05,11.,None], close=[10.05,11.,None],
+        outright_volume=[6,1,0], block_volume=[0,0,20]))
+    raw = pl.DataFrame(dict(date=['2020-03-23 '+t for t in
+        ['08:45:00','08:46:10','08:46:10','13:45:00','09:01:02','09:01:03','15:01:00']],
+        futures_id=['DDF']*7, contract_date=['202004']*4+['202005','202004/202005','202004'],
+        price=pl.Series([10.05,10.1,10.1,10.05,11.,-100.,9.],dtype=pl.Float32),
+        volume=[2,2,4,4,2,200,200]))
+    return raw, expected
+
+
+def test_bulk_all_months_double_sided_quantity_exact_closing_print_and_real_reference():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
+    from stockagent.data.tw_futures_decision_clock import resolve_opening_references
+    raw, expected = bulk_fixture()
+    bars, coverage, events = normalize_bulk_stock_ticks(raw,day=DAY,expected=expected,source_sha256='a'*64)
+    assert coverage['verified'].all()
+    near = bars.filter(pl.col('physical_contract')=='DDF:202004@life1').sort('minute')
+    assert near['minute'].to_list()==[526,527,826]
+    assert near['volume'].to_list()==[1.,3.,2.]  # repeated real prints are not deduplicated
+    assert near['vwap'].to_list()==pytest.approx([10.05,10.1,10.05])
+    decisions=expected.select('date','physical_contract')
+    early=resolve_opening_references(decisions,events,decision_time='08:45')
+    late=resolve_opening_references(decisions,events,decision_time='09:00')
+    assert early['reference_kind'].to_list()==['unavailable']*3
+    assert late['reference_quote'].to_list()==[10.05,None,None]
+    assert late['reference_kind'][0]=='observed_session_open'  # stays first trade, not latest 10.1
+    assert late['reference_trade_ts'][0].hour==8
+    assert late['reference_available_by'][0].minute==46
+
+
+def test_bulk_full_day_certificate_rejects_quantity_deficit_instead_of_inventing_absence():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
+    raw, expected=bulk_fixture()
+    _,coverage,events=normalize_bulk_stock_ticks(raw.head(3).vstack(raw.slice(4)),day=DAY,
+        expected=expected,source_sha256='a'*64)
+    assert coverage.filter(pl.col('contract')=='202004')['verified'].item() is False
+    assert events.filter(pl.col('physical_contract')=='DDF:202004@life1').is_empty()
+
+
+@pytest.mark.parametrize('value',[10.06,float('nan'),0.,10.051])
+def test_bulk_price_decoder_requires_identical_f32_bits_and_unique_legal_tick(value):
+    import numpy as np
+    from stockagent.data.tw_futures_finmind_ticks import decode_bulk_stock_prices
+    with pytest.raises(ValueError):
+        decode_bulk_stock_prices(np.array([value],dtype=np.float32),day=DAY,products=np.array(['DDF']))
+
+
+def test_bulk_certificate_preserves_same_second_source_order_and_rejects_odd_volume():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
+    raw,expected=bulk_fixture()
+    with pytest.raises(ValueError,match='even'):
+        normalize_bulk_stock_ticks(raw.with_columns(pl.when(pl.col('date').str.contains('08:46'))
+            .then(3).otherwise(pl.col('volume')).alias('volume')),day=DAY,expected=expected,source_sha256='a'*64)
+    with pytest.raises(ValueError,match='unique dated'):
+        normalize_bulk_stock_ticks(raw,day=DAY,expected=pl.concat([expected,expected.head(1)]),source_sha256='a'*64)
+
+
 @pytest.mark.parametrize('reason', ['deadline_reached','stopped_by_file'])
 def test_bounded_download_rechecks_stop_after_shared_limiter_wait(tmp_path,monkeypatch,reason):
     from datetime import datetime,UTC,timedelta

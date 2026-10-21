@@ -1,0 +1,11 @@
+# Same prior-session information as 09:00; one minute latency, then [08:46,08:47).
+base_config: tw_stock_futures_factorized_carry_20261021_v1.yaml
+experiment_name: tw-stock-futures-carry-0845-20261021-v1
+trading:
+  tw_futures_portfolio_decision_time: '08:45'
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v1/0845/entries.parquet
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v1/clock__0845
+walk_forward:
+  expected_first_year: 2020
+  split_start_year: 2020

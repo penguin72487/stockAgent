@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.config import load_config
+from stockagent.data import partitioned_parquet as parquet_sources
 from scripts.build_tw_yahoo_fallback_archive import (
     _load_verified_transfer_adjustments,
 )
@@ -103,12 +104,20 @@ def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _outputs_exist(outputs: list[Path]) -> bool:
-    return bool(outputs) and all(path.exists() for path in outputs)
+    return bool(outputs) and all(parquet_sources.source_exists(path) for path in outputs)
 
 
 def _file_receipt(path: Path) -> dict[str, Any]:
+    path = parquet_sources.resolve_source(path)
     if not path.is_file():
         raise ValueError(f"stage output must be a regular file: {path}")
+    if path.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+        with parquet_sources.ParquetSource(path) as source:
+            proofs = source.fingerprints()
+            return {"path": str(path), "size": proofs[0][1], "sha256": proofs[0][2],
+                    "contract": parquet_sources.CONTRACT,
+                    "members": [{"path": name, "size": size, "sha256": digest}
+                                for name, size, digest in proofs[1:]]}
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -494,14 +503,14 @@ def _retained_daily_yahoo_symbols(
     except Exception:
         summary = {}
     if int(summary.get("missing_adjustment_rows") or 0) > 0:
-        for path in sorted(stock_root.glob("*_features.parquet")):
-            schema = pq.read_schema(path)
+        for path in parquet_sources.discover_sources(stock_root):
+            schema = parquet_sources.read_schema(path)
             if "adjclose" not in schema.names:
                 continue
-            values = pq.read_table(path, columns=["adjclose"])["adjclose"]
+            values = parquet_sources.read_table(path, columns=["adjclose"])["adjclose"]
             missing = pc.any(pc.or_(pc.is_null(values), pc.is_nan(values))).as_py()
             if missing:
-                symbols.add(path.name.removesuffix("_features.parquet"))
+                symbols.add(parquet_sources.logical_name(path).removesuffix("_features.parquet"))
     return sorted(symbol for symbol in symbols if symbol)
 
 
@@ -684,7 +693,7 @@ def _daily_baseline_ready(
     benchmark_name: str,
 ) -> bool:
     return all(
-        path.is_file()
+        parquet_sources.source_exists(path)
         for path in (
             stock_root / f"{benchmark_name}_features.parquet",
             public_dir / "twse_taiex_ohlc.parquet",
@@ -713,10 +722,10 @@ def _data_paths(args: argparse.Namespace, config) -> tuple[Path, Path, Path]:
 
 
 def _parquet_max_date(path: Path) -> date | None:
-    if not path.is_file():
+    if not parquet_sources.source_exists(path):
         return None
     try:
-        table = pq.read_table(path, columns=["date"])
+        table = parquet_sources.read_table(path, columns=["date"])
         value = pc.max(table["date"]).as_py()
     except Exception:
         return None

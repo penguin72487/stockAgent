@@ -784,8 +784,9 @@ service使用`PrivateNetwork=true`、`ProtectSystem=strict`及低CPU/IO weight�
 
 [正式service原生驗證](../artifacts/operations/agent-workflow/runs/opening-daily-systemd-final-20261016T040916-c7d53ed3/run.json)
 確認`Result=success`、timer enabled/active、下一次13:40排程。
-12:09:20的[每日讀回](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-16/latest.json)
-如實為`missed_or_unverified`；今天午間才安裝，沒有倒填08:55 scope。
+當時12:09:20的每日讀回記錄為`missed_or_unverified`；當天午間才安裝，沒有倒填08:55 scope。
+原 `artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-16/latest.json` 目前不在 checkout，
+這裡保留當時的觀察，不把缺少的原生收據改由後續重測冒充。
 原始第11秒有效覆蓋仍為449/2,301，五份訊號原始發布時間仍為09:36。
 
 #### 新版載入及驗收界線
@@ -1212,3 +1213,882 @@ run_fintech_python scripts/benchmark_tw_opening_sources.py \
 來源供價／失敗分布、GPU working set 與執行取價仍各自驗收。
 現有本機 CPU 成本約 0.31 秒，不是零；並未證明已到理論極限或「只剩 API 限制」。
 先保留這個完整可歸因基線，不用一輪離線成功保證外部錯誤永遠為零或每檔一秒有首筆成交。
+
+## 2026-10-19：HTTP 與本機驗證重疊、三時段測速續修
+
+### 這次改了什麼
+
+- 保持 canonical 三家已驗證來源與完整官方分母，盤前清冊更新仍由獨立原生 owner 負責；
+  不為測速新增券商登入、重建歷史帳本或發券商委託。
+- MIS 舊排程會在每個已完成 cohort 的驗證、合併與同步 journal/fsync 結束後才補發 HTTP。
+  現在先補滿**同一個**有界健康 HTTP window，再處理已到的 cohort；新請求與本機處理重疊，
+  不等待新請求、不多開併發，也不把快回應扣在慢 peer 後。
+  衝突來源仍分批保留 first-open 順序、各自價格及時計；失敗退避、四次 transport failure 熔斷、
+  殘缺 scope、已成功值與檔案／目錄 durability 不變。
+- 普通股／ETF 的正式 scope 不含創新板；移除 Fugle TIB 自動抓取／暖機的無用 HTTP，
+  保留明確 TIB adapter。Fugle 的不同市場 route 不是不同家獨立供應商。
+- 每個成功 MIS request 另記 `row_decode_ms`／`request_to_decoded_rows_ms`；
+  每個 cohort 記 assembly、callback、來源啟動後完成時間與行數。
+  `quote_phase_full_scope_per_job_latency_v2` 把這些與原有 HTTP／body／JSON、cache merge、
+  persistence、首筆及 50/90/95/99/100% positive／resolved 放進同一個 job／時段。
+  並行／巢狀 wall spans **不可加總**當端到端；只投影命名、有限非負 numeric 欄，
+  不複製 HTTP headers、URL、Token 或未列入白名單的 request 內容。舊欄缺省不是 0 ms。
+
+### 全市場、全流程與同版本控制
+
+沿用 10/16 原始 29 份 HTTP body／完整 2,301 檔 scope，不查網路，保留原始交易所時間。
+每輪從空的隔離 receipt 開始，包含 parser、fan-in、journal、真實 fsync 與最後獨立讀回；
+每組五輪交錯 A/B/B/A，沒有刪股、刪欄或熱快取代替來源。
+
+| 對照 | before 中位 ms | after 中位 ms | 證據／界線 |
+| --- | ---: | ---: | --- |
+| 初始重疊候選 | 279.046 | 250.004 | [完整結果](../artifacts/operations/tw_opening_latency_20261019/full_local_overlap_abba.json)；尚未加入所有分段測速 |
+| 加入測速後首組 | 354.880 | 330.212 | [完整結果](../artifacts/operations/tw_opening_latency_20261019/full_local_overlap_instrumented_abba.json)；保留與其他工作共用主機的慢樣本 |
+| 完整回歸後 | 257.951 | 201.394 | [完整結果](../artifacts/operations/tw_opening_latency_20261019/full_local_overlap_final_abba.json) |
+| 相同程式 A/A 控制 | 267.974 | 251.585 | [原始控制](../artifacts/operations/tw_opening_latency_20261019/full_local_same_code_control.json)；相同 SHA 仍約有 6.1% 量測差，不算程式加速 |
+| 控制後再次 A/B | 283.167 | 236.934 | [完整重測](../artifacts/operations/tw_opening_latency_20261019/full_local_overlap_repeat_abba.json)；中位約少 16.3%，不是網路或真實開盤加速比例 |
+
+所有對照的最終價格／量／mask／trial／各時計及 durable rows SHA 完全一致，每輪恰好 29 個
+原始 request，沒有網路、訊號發布、帳本改寫或下單。保留所有樣本，不挑最快 201 ms 宣稱極限。
+本機仍約 0.2–0.33 秒；CPU、排程與必要持久化成本不是零。
+
+原始 10/16 registry 早於 10/18 的 membership contract，不能用今天的 verifier 冒充相容。
+離線工具現允許**明確指定**封存 fan-in 與原始 registry verifier，對照記錄其 SHA，
+保留舊 verifier 的日期、scope、全部 raw source SHA 驗證；只在離線暫時模組綁定，退出即還原。
+正式每日新 membership admission 完全未放寬，scheduled probe 禁止載入離線 owner。
+首次不相容與中途投影測試失敗的原始 logs 保留，已由後續同 scope 成功收據解除，而非刪除失敗。
+
+重測沿用 `scripts/benchmark_tw_opening_sources.py --compare-mis-pipeline`，本輪完整命令可讀
+[受監督回歸與 ABBA log](../artifacts/operations/agent-workflow/runs/opening-1019-regression-latest-20261018T171816-458fe351/run.log)
+及其 run receipt 的 argv；封存 quote／fan-in 位於本輪私有 `artifacts/operations/tw_opening_latency_20261019/`，
+不用改寫正式來源或使用先前文件不再相容的 registry 讀法。
+
+### 測試、正式換版與今日監測
+
+五模組 [200 passed／13.25 秒](../artifacts/operations/agent-workflow/runs/opening-1019-regression-latest-20261018T171816-458fe351/run.log)，
+另八模組 [402 passed／15.67 秒](../artifacts/operations/agent-workflow/runs/opening-1019-boundary-regression-20261018T171910-8a2f4331/run.log)；
+共 602 項，包含 HTTP／progress 同時前進的事件測試、快批不等慢批、衝突不丟、全市場故障注入、
+單源失敗不拖其他來源、官方 scope、開盤時鐘、因果成交、持久化及安全換版；不是全庫測試。
+
+[Discord-only plan](../artifacts/operations/tw_opening_latency_20261019/discord_deployment_plan.json)
+通過後，[01:19:16 qualified apply](../artifacts/operations/tw_opening_latency_20261019/discord_apply.json)
+為 `accepted_code_admission_only`：新 Discord Gateway／core ready、當前 loaded code、exact engine ACK
+與三份完整 ledger prefix SHA 均通過，六個受保護 owner 和五個已接受訊號不變。
+沒有重啟持有行情與 paper 執行的 engine，也沒有更動其 45 筆既有 pending 模擬委託；
+這些委託不是本輪行情優化可以偷偷沖銷的工作。離峰 warmup 為原生 `pending`，不冒稱 GPU warm-ready。
+
+01:21 直接讀回一致，但 01:23 的
+[受監督獨立讀回](../artifacts/operations/agent-workflow/runs/opening-1019-independent-readbac-20261018T172308-b422b5fe/run.log)
+正確拒絕新舊程式不一致：`stockagent/data_sync/packed_snapshots.py` 在 01:22:45 變動。
+這是已完成推論快取恢復的真實相依，不是拿不相干新聞目錄當守門；沒有縮小 admission 或改寫已載入指紋。
+等待原生盤後工作閒置後，再經
+[新 plan](../artifacts/operations/tw_opening_latency_20261019/discord_after_dependency_plan.json)／
+[01:26:22 apply](../artifacts/operations/tw_opening_latency_20261019/discord_after_dependency_apply.json)
+完成相同 Discord-only 換版，不中斷其他 owner；另
+[412 項相依重驗／11.65 秒](../artifacts/operations/agent-workflow/runs/opening-1019-shared-dependency-t-20261018T172622-158b1812/run.log)
+通過，包含重複項，不能與上述 602 直接相加。
+
+[01:26:44 穩定版本獨立讀回](../artifacts/operations/agent-workflow/runs/opening-1019-stable-independent--20261018T172642-909b897b/run.log)
+再次驗證相同 code、run、entrypoint、engine ACK／零 revision lag、五個訊號及六個 protected owners。
+盤後 research maintenance 仍 `degraded`，不等於 Gateway 或來源 owner 中斷，也未被本輪改成正常。
+
+原生 audit／phase probe／每日官方清冊三個 timer 均 active；下一個時間各為 08:55、10:30、07:30。
+01:19 實際執行原生 phase probe 正確退出為
+[preopen skip](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-19/preopen_011912108127.json)，
+沒有送來源 HTTP、不補跑成假的盤後或開盤測速。正式 09:00 被動記錄仍由同一行情 owner 產生；
+09:00:11／31／09:01 驗收，10:30 完整 scope MIS／FinMind probe、10:31 audit，13:40 盤後 probe。
+Shioaji 不額外定期輪詢；現場 source-first/full、model、paper fill 和 broker fill 分開。
+
+**尚未證明**：今日真正 09:00 供價／全五模式／進場 SLA、全市場 Fugle 權限、外部錯誤永遠為零、
+或已到「只剩 API 限制」的理論極限。每日分母仍按當日官方有效清單，不硬寫離線 2,301 或昨日 2,300。
+
+## 2026-10-19：交易日開盤未達標與盤中續修
+
+### 真實開盤：來源與服務瓶頸分開
+
+當日 08:55 的官方清冊已驗收，`tw_official_active_stock_etf_membership_v1` 生效，
+掛牌 2,311 檔、當日策略產品範圍可交易 **2,301 檔**；沒有用來源回價數縮小分母。
+[原生 11 秒不可變驗收](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-19/first_assessment_11000ms.json)
+在 09:00:11.469849 記錄 `passed=false`：591 正開盤、0 已證明尚未首筆、1,710 未解；
+永豐 591、FinMind 211、MIS 0，來源間重疊不能相加。五模式原始發布 0／5，
+沒有拿 10/16 回放的執行紀錄或之後補來的價格改寫今天的原始成績。
+
+MIS 首輪不是 29 個請求都已送出：健康 window 先送 **4 個**，均 ReadTimeout 後熔斷，
+其餘 1,981 channels 保留待後續恢復。四筆約 4.12／4.36／5.57／6.42 秒，
+沒有 HTTP status／body，不能斷言 IP 封鎖。原始失敗仍在
+[同一來源 journal](../artifacts/live/tw_opening_snapshots/2026-10-19.acquisition.jsonl)。
+
+09:29 的額外單檔、唯讀傳輸診斷：DNS 6.322 ms、TCP 15.073 ms、TLS 35.469 ms、
+總計 45.251 ms，`curl (52) Empty reply from server`、HTTP 000，連到 117.56.218.179，沒有代理。
+這一筆證明 TCP／TLS 已建立後仍未得到 HTTP 回應；不證明供應者封鎖或其內部壅塞原因，
+也不是今天 09:00 每個 timeout 的完整網路追蹤。可重測同一公開 API 的單檔傳輸，
+不要因此繞過來源政策、輪換身份或對已拒絕端點送全市場 burst。
+
+本機也有可修原因：請求函式入口前有約 76～449 ms 的排程／開始 journal 等待；
+08:49 的實際 live 依賴（config、checkpoint／optimizer 等）改動後，舊 Discord process
+正確拒絕推論為 `LoadedImplementationChanged`。這不是不相干 news 檔案，也不是 API 慢。
+09:17:58 原生 watchdog 因 Factorized 無進度退出，09:18 由 systemd 恢復；不是本輪人工重啟。
+後續 catch-up 仍在運算，不能用 PID 存活或 Gateway 連線宣稱五模式已正常。
+
+### 這次的修正
+
+- 開始 journal 與 provider request 重疊：仍使用同一來源 owner 與日誌鎖，記下實際來源工作起點，
+  在 progress journal 前 join 開始收據，結束時亦一定 join。來源返回／報錯都不遺留開始工作。
+  開始日誌失敗保留 `dispatch_telemetry_recorded=false`；模型輸入原有落盤／fsync 門檻未省略。
+- 另記 `provider_invocation_at_taipei`、入口 offset、journal join wait；validation 時鐘在真正驗證時
+  凍結，不能因日誌稍後寫入而改成較晚的假來源時鐘。函式入口不是 HTTP on-wire 或交易所發布證據。
+- MIS 預熱直接驗證行情 API 的指定 2330 row，取消先等非報價 `stock/index.jsp` 的無用往返；
+  空／錯 row 不續期，失敗清除舊 readiness，API cookies 仍交給相同既有 HTTP workers。
+- 多源測速的 MIS 預熱移入自己的 worker。失敗只停該來源的診斷 sweep，不延遲 FinMind 等健康來源，
+  不改正式開盤的原生取價規則。每輪 FinMind network probe 強制新 HTTP，而不以解碼快取冒充網速；
+  quota／error backoff 仍不可強制穿透。
+- 報告增加入口、準備、各輪讀回、整體落盤的時鐘，明列 positive／已證明未首筆／unknown、
+  `quorum_reached`、`data_complete`、`resolved_complete`。舊 `all_sources_complete_ms` 只代表來源工作已停，
+  新 boundary 明寫不是完整報價。最後報告自身的 fsync span 在受監督 stdout 留存，不自填為零。
+  來源 worker 結束後清空隔離程序 cache，經 canonical reader 獨立重讀已落盤收據；
+  不補寫來掩蓋 producer 的失敗。新增故障注入證明「記憶體三檔、儲存只剩一檔」仍只能報 partial，
+  沒有把檔案存在或記憶體全量當作來源持久化完整。
+- Discord prewarm 與即時準備在昂貴來源掃描／builder／舊暖機快取前，先重用既有 loaded-code 驗證。
+  推論端原有二次驗證不刪；失配時不再做必然會被拒絕的重建，獨立來源修復仍繼續。
+- 驗收工具修正：自然暖機驗證器改用既有 lazy loader，不引用已移除的 `native.BOT`；pending／running
+  仍不載入推論。ownership benchmark 改隔離完整 canonical module（含欄位快取類別），
+  避免類別方法誤讀另一個 trial 的全域 cache；財務／時鐘／持久化完全相同的門檻未放寬。
+  純 panel fixture 也不再為了產生樣本就先載入未使用的 trainer／繪圖依賴，未關閉 warnings-as-errors。
+
+### 實測與對照，不混成一秒成功
+
+| 測量 | 結果 | 邊界 |
+| --- | --- | --- |
+| 今日原生開盤第 11 秒 | 591／2,301；五模式原始發布 0／5 | 未達標，保留不可變原始結果 |
+| 09:11 舊盤中 probe | 約 5.4 秒串行 MIS 預熱後才開始其餘來源；1,827／2,301 | 舊 564 ms 漏算前置工作，不是完整端到端 |
+| 09:21 新盤中 probe | 函式入口到讀回 683.570 ms、到最後報告落盤 982.523 ms；1,927／2,301 | 僅 partial；不含程序啟動，不是完整報價或成交 |
+| 09:37 最終獨立收據重讀 | 函式入口到讀回 1,424.968 ms、到最後報告落盤 1,476.442 ms；2,019／2,301 | 清空程序 cache，不強制清除 OS cache；282 未解，仍 partial |
+| 09:42 FinMind 同一連線兩筆新 HTTP | 第一輪來源工作至獨立重讀 672.714 ms、第二輪 332.813 ms；均 2,039／2,301 | 每輪空 receipt、`provider_response_reused=false`；262 未解，不是全量 |
+| 完整保留來源 5 輪 A/B/B/A（初組） | median 321.645 → 279.970 ms | 2,301 軸、29 原始 body、無網路；非開盤 SLA |
+| 同範圍最終 A/B | median 322.485 → 312.464 ms | 全財務／時鐘／durable rows SHA 一致 |
+| 相同程式 A/A 控制 | median 364.471 → 321.039 ms | 相同 SHA 仍差約 11.9%，大於最終 A/B 的 3.1%，不宣稱穩定均值加速 |
+
+事件式故障注入證明「開始 journal 卡住仍能先送來源請求」及「MIS 預熱卡住時健康來源仍前進」，
+但共用主機的平均速度差異受噪聲影響，不能用最佳一輪充當極限。
+保留原完整 29 份回應、原始時計、所有欄位與實際 durability；14～15 次 fsync 的 cohort 差異亦保留，
+沒有為了固定快分數刪掉 barrier。
+
+- [09:11 原始部分報告](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-19/intraday_091146400005.json)
+- [09:21 新報告與完整分時段投影](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-19/intraday_092122739781.json)、
+  [落盤總時鐘 stdout](../artifacts/operations/agent-workflow/runs/opening-1019-intraday-independen-20261019T012106-43262abd/run.log)
+- [09:37 最終網路與獨立讀回](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-19/intraday_093752299696.json)、
+  [最終落盤及程序時間](../artifacts/operations/agent-workflow/runs/opening-1019-durable-intraday-20261019T013749-fe4ff003/run.log)；
+  受監督 run 從執行開始到完成為 2.865 秒，包含程序啟動，與函式內 1.476 秒分開。
+- [09:42 FinMind 兩次真正 HTTP 與原始時鐘](../artifacts/operations/tw_opening_latency_20261019/finmind_two_fresh_responses.json)：
+  headers／body／JSON／全市場驗證第一輪為 289.082／155.233／5.870／28.165 ms，
+  第二輪為 141.172／45.013／5.153／7.997 ms；兩輪連同最後報告落盤 1,093.160 ms。
+  既有持久連線的作用已核對，沒有把解碼快取當 HTTP；這不是全市場已首筆或程式穩定加速倍率。
+- [初組全流程對照](../artifacts/operations/tw_opening_latency_20261019/full_dispatch_overlap_abba.json)、
+  [最終 A/B](../artifacts/operations/tw_opening_latency_20261019/full_dispatch_overlap_final_abba.json)、
+  [相同 SHA A/A](../artifacts/operations/tw_opening_latency_20261019/dispatch_same_code_control.json)
+- [最終 683 passed／33.57 秒](../artifacts/operations/agent-workflow/runs/opening-1019-durable-final-tests-20261019T013631-01e982ed/run.log)，
+  [前一輪 682 passed／36.31 秒](../artifacts/operations/agent-workflow/runs/opening-1019-complete-boundaries-20261019T013055-b3b077d1/run.log) 保留，兩輪含重複，不相加；
+  涵蓋價格、source fan-in、官方 scope、回復、source read guard、completed cache、Discord 排程、
+  發布／暖機與測速隔離；不是全庫測試。此前 16 項及後續 1 項失敗原始 logs 都保留，
+  按原因修復後才重驗，沒有從驗收範圍刪掉失敗測試。
+
+### 部署與尚未解除的邊界
+
+[09:24 Discord-only qualified plan](../artifacts/operations/tw_opening_latency_20261019/intraday_qualified_plan.json)
+因原生 Factorized catch-up 仍在途而 `blocked`，`restart_requested=false`。
+沒有取消 uncancellable builder、偽造 idle、縮小 code admission、重啟 paper engine 或改帳本。
+09:18 原生 restart 恰逢當次修改，之後 loaded code 又不一致；這個失敗沒有刪除。
+09:38:19 原生 watchdog 在來源 operation 固定期限後退出，systemd 09:38:20 自動恢復，
+本輪未發 restart。09:40 的
+[獨立當前版本讀回](../artifacts/operations/tw_opening_latency_20261019/native_current_code_readback.json)
+通過：Discord 新 run `1111107-1792373908858754501`、current loaded code 與 entrypoint SHA 相符、
+Gateway／core／exact engine ACK 正常，五模式暖機已完成；觀察者沒有 provider／CUDA／下單操作。
+當沖 engine 仍是 00:52:13 啟動的 MainPID 155／run `f646993656444b06bb06f46980a74f7f`。
+[09:41 再次 qualified plan](../artifacts/operations/tw_opening_latency_20261019/native_current_qualified_plan.json)
+為 `planned`；目前已採用最新碼，不做多餘人工 restart 或清掉已暖機模型。
+這是原生 adoption 與工作恢復，不改寫今天原始 deadline，也不宣稱所有原始訊號／成交完成。
+
+三個 canonical timer 仍 active：10:30 盤中 probe／10:31 audit、13:40 盤後 probe、次日每日官方名單更新；
+開盤由原生流程被動記錄。永豐不額外登入或新增定期高頻 snapshot 輪詢。
+
+目前限制包括外部供價／尚未首筆、MIS 無回應、Fugle 全市場權限，以及開盤前版本穩定與資料準備。
+09:37 FinMind 此筆 headers 等待 1,037.813 ms、body 154.507 ms、JSON 6.442 ms、全量驗證 12.782 ms，
+不可把 API 回應時間當成本機排程，也不可由這筆新程序／連線探測推定暖連線的固定下界。
+**尚未完成一秒全量與全模式成交驗收，也尚不能說只剩 API 延遲。**
+後續必須持續驗證已採用版本與實際交易日原生量測；來源未報價與未知不能填成真實開盤，
+尚未發生的 10:30／13:40 也不能寫成已測。未改策略／帳本、未發券商單。
+
+## 2026-10-19：盤後連線重用與完整欄位投影續修
+
+本節更新前節的盤後現況，不改原生 11 秒失敗結果。
+10:30 probe 的單檔 MIS 預熱成功（527.629 ms），但四個 80-channel 請求仍逾時，
+後續 1,981 channels 未繼續派送；FinMind 有價 2,154，入口至完整來源工作與讀回為 8,133.718 ms。
+13:40 單檔 MIS 即斷線，健康來源仍獨立得到 2,272 有價／29 未知，入口至報告前 1,094.076 ms。
+單檔預熱不能證明全市場容量或後續每個請求健康。
+
+### 共用修正與驗證
+
+- 成功預熱的 MIS Session 不再立刻丟棄：response 關閉後，原 Session 只移交給一個 HTTP worker。
+  其餘 worker 各用自己的 Session；不得跨執行緒同時使用，也不額外增加請求或提高併發。
+  工廠／PID fence 防止跨測試或 fork 沿用錯連線；強制預熱失敗關閉未移交的舊 Session。
+  每個請求記錄封閉列舉 `http_session_origin`，區分新建、已驗證移交、thread-local keep-alive；
+  Session 移交本身不保證底層 TCP socket 永遠不會重連。
+- canonical `_OpeningColumns` 仍逐列核對身分、TTL、世代與變更，但把已改動列的數值欄整批賦值，
+  減少微小 NumPy 寫入；正開盤／缺價計數共用同一個向量遮罩。不改價格、量、缺值或時間。
+- 新增雙 worker 排他移交、失敗清理、Session 工廠／PID fence，及完整欄位逐位元 scalar oracle 測試。
+  含 NaN、signed zero、null、刪除／更新的來源值；所有 fsync／原始來源觀察仍保留。
+- [最終相關回歸](../artifacts/operations/agent-workflow/runs/opening-1019-final-regression-20261019T101241-7975b518/run.log)：
+  **688 passed／36.79 秒**，含取價、fan-in、來源恢復、官方 scope、Discord、暖機與測速；不是全庫測試。
+
+[完整保留資料 A/B/B/A](../artifacts/operations/tw_opening_latency_20261019/evening_bulk_local_abba.json)
+維持 2,301 軸、29 份原始 body、原市場／接收時鐘及持久化，3 輪 median **319.317 → 223.192 ms**；
+全財務／時鐘與 durable rows SHA 相同。這是無網路的完整本機流程，不是行情外部延遲或成交 SLA。
+[同 SHA A/A 控制](../artifacts/operations/tw_opening_latency_20261019/evening_same_code_control.json)
+仍有 **238.282／207.306 ms** 差異，約 13% 環境噪聲；不把單組差異當固定生產加速倍率。
+
+### 真實網路與資格邊界
+
+| 實測 | 有正式開盤價／已證明無首筆／未知 | 入口至最後報告寫入前 |
+| --- | --- | ---: |
+| [17:50 baseline](../artifacts/operations/tw_opening_latency_20261019/evening_full_network_baseline.json) | 2,272／29／0 | 2,135.891 ms |
+| [18:04 candidate](../artifacts/operations/tw_opening_latency_20261019/evening_full_network_candidate.json) | 2,272／0／29 | 1,156.951 ms |
+
+第一輪 MIS 29 個請求全部成功；第二輪單檔即 `ConnectionResetError` 而未送全市場 sweep，
+所以不能宣稱兩次是同等覆蓋的加速比較，或新移交路徑已通過真實全市場網路驗收。
+18:11 額外單批唯讀 MIS 查核 30 channels，387.560 ms、HTTP 200，保留原始 body 與 SHA；
+這僅核對 29 檔及 2330 對照，不冒充完整市場。當日資格核對結果為 16 不具當沖／13 具當沖，
+完整清單與逐檔證據見[來源規劃](tw_opening_provider_plan_2026-10-13.md#1019-盤後續修與-29-檔的解釋)。
+沒有憑零成交縮小官方清冊、改模型軸、回寫歷史成交或新增券商登入。
+
+18:13 最初 Discord-only qualified plan 因服務控制 lease 被另一個 coordinator 持有而拒絕，
+`restart_requested=false`；稍後 lease 釋放後新 plan 通過。後續換版另以當前收據驗收，
+不由離線測試或磁碟程式已改宣稱 production adoption；交易引擎與帳本不在本輪重載範圍。
+[18:14 合格換版](../artifacts/operations/tw_opening_latency_20261019/evening_discord_apply.json)
+只重載 Discord，18:14:59 通過 `accepted_code_admission_only`；
+[獨立讀回](../artifacts/operations/tw_opening_latency_20261019/evening_discord_independent_readback.json)
+確認當前 code／entrypoint SHA、Gateway、core 與 exact engine ACK 相符。
+Discord 新 run 為 `2089920-1792404892722410816`；engine MainPID 155／原 run 不變。
+這只驗收程式採用與服務交接，盤後暖機仍 `pending`，不冒稱五模式 GPU 已暖機或明日開盤成功。
+下一交易日仍須由原生開盤 audit 驗證價格、訊號及模擬成交，**未達一秒全量／全模式成交**。
+
+## 2026-10-19：零成交輸入與今日帳本修復
+
+零成交的前值政策限定模型輸入：同交易日官方無首筆證據可使用前一已完成交易日收盤值，
+故開盤 gap 為零；未知、來源失敗及缺少前值不能冒充真實開盤或成交。
+保留官方交易清冊與模型軸，不因零成交刪除標的。既有共用政策已包含這項處理，
+本次以來源／覆蓋／首次真實成交覆寫前值的測試重驗，沒有另建替代取價管線。
+
+### 根因與共用修正
+
+- 今日其他四模式已有回放成交，保留原訊號、成交與會計；Factorized 則仍停在 10/16。
+- 歷史開盤生成器原本先掛接整個最新日曆，誤要求不需要的當日盤後 Factorized 特徵。
+  現在先依官方交易日找到必要的 t-1，再截斷基礎面板，最後進行原樣的完整掛接驗證。
+  不降低特徵完整性門檻、不換 checkpoint、不使用今天收盤特徵產生早盤訊號。
+- scoped 修復增加「追加缺少的已完成交易日」：前一日必須平倉且帳本一致，
+  不得重開已成交的當日訊號；不足一張的目標不額外下載分鐘路徑。只使用既有本機分鐘資料。
+- 首次正式追加曾因收盤處理器遍歷非目標帳戶而中斷。修正共用處理器只讀明確選取的模式，
+  並加入跨模式測試。中斷的暫時成交／原生清倉不冒充原候選驗收成功。
+- 新增有界的 interrupted recovery：隔離複製、核對操作前 journal prefixes、從同一來源重跑、
+  比對原先已驗證的經濟結果，最後沿用 atomic directory exchange。整份中斷目錄保留為回復證據，
+  沒有截斷或刪除 live 原始帳本；其他模式會計有變動即拒絕恢復。
+
+### 已驗證的今日結果
+
+[獨立本機／公網驗收](../artifacts/operations/tw_zero_volume_repair_20261019/ledger_final/acceptance.json)
+於 18:49:06 通過，Factorized 的 1802、1815、3406 共 **48,000 股進場／48,000 股出場**，
+持倉為零；09:01～13:30 **270 個唯一分鐘點**。零成交分鐘延用既有最後成交估值，
+28 個 carried 分鐘皆有明確零量／零金額來源，不捏造新成交或新鮮度。
+原始五份 journal 的操作前 SHA prefixes、來源 pins、候選／正式經濟結果、其他四帳戶未變，
+均由獨立讀回確認；公開 API 也核對逐筆價格、數量、回放標記與完整分鐘曲線。
+
+[操作收據](../artifacts/operations/tw_zero_volume_repair_20261019/ledger_final/ledger_repair_manifest.json)
+的 `atomic_recovery.rollback_directory` 保留整份中斷版本，
+`interrupted_manifest.json` 保留第一次失敗原因。所有補登明確為反事實模擬，不是當時即時訊號或券商成交。
+[最終相關回歸](../artifacts/operations/agent-workflow/runs/ledger-1019-final-recovery-regre-20261019T104933-46006235/run.log)
+為 **322 passed／4 skipped／24.58 秒**（四個未完成盤中的 missing-session 變體不適用），不是全庫測試。
+
+[18:51 Discord 合格換版](../artifacts/operations/tw_zero_volume_repair_20261019/discord_apply.json)
+已通過 `accepted_code_admission_only`，Gateway、core 與 exact engine ACK 正常；
+盤後 GPU 暖機仍 pending，不能由程式採用宣稱模型已 resident ready。
+
+原生 09:00 延遲失敗稽核沒有改寫。另有盤後特徵維護因磁碟 reserve admission 被拒絕，
+不以今日帳本恢復宣稱該資料工作或下一交易日一秒 SLO 已完成；沒有擅自刪除來源騰空間。
+
+## 2026-10-20：完整報價 window 與盤中重試去除本機等待
+
+本輪開始於 10/20 凌晨，尚未到當日開盤。故障診斷使用 **10/19 真實盤中**收據，
+新版本的完整流程比較使用明確標示的 **10/16 原始回覆離線重放**；兩者不可混成今日 09:00 成績。
+沒有改動正式帳本、模型權重、訊號內容、官方每日分母、輸入門檻或成交規則。
+
+### 來源／責任盤點
+
+| 入口 | 既有執行方式 | 10/19 證據與本輪邊界 |
+| --- | --- | --- |
+| 永豐原生行情 | 同一 execution owner 的串流與 ≤500 contracts 非同步 snapshots，經 IPC 共用 | 11 秒時已接受 591 個正式開盤；其餘回覆不能因 API 成功就視為正式開盤。本輪不新增登入、不中斷原生引擎。 |
+| 官方 TWSE／TPEx MIS | 同一 HTTP pool／keep-alive、80 channels／批、健康時 4 個並行，失敗後降載／熔斷 | 開盤先送出的四個請求皆 ReadTimeout、無 HTTP 回覆；不是 29 個皆已送出。17:50 才有當次完整 29／29 sweep 證據，不能倒填開盤。 |
+| FinMind 全市場 snapshot | 單一來源 owner／連線／完整解碼 view，按來源時鐘重試；各模式只取自己的 delta | 11 秒時 211 個正式開盤，與永豐重疊；不是額外 211 檔。其約十秒更新說明不是 11 秒全成交保證。見[官方文件](https://finmind.github.io/tutor/TaiwanMarket/RealTime/)。 |
+| Fugle TSE／OTC | 已設定的兩個全市場路由，獨立工作與權限退避 | 10/19 來源紀錄為 HTTP 403；不能將有 key／有 adapter 說成有全市場權限，也不能靠提高併發解除授權。 |
+| 其他券商／付費全市場 feed | 未有本輪可用連線與完整權限驗收 | 不建立假來源，不以昨日收盤或盤後檔案冒充即時首筆。 |
+
+來源間維持平行與 single-flight；來源內只把必要的 admission／解析／驗證／合併／持久化依賴序列化。
+「完整」分別記錄正式開盤、官方已證實尚無首筆、未知三類。官方零量只允許前一已完成交易日收盤
+作模型零 gap 輸入，不是即時成交價，也不從官方交易清冊排除該標的。
+
+### 已重現並修正的兩個本機缺陷
+
+1. **MIS 網路 window 被同步 progress 阻擋。** 舊版雖先補送下一批，再做驗證／日誌，
+   但下一批若在 callback 執行期間結束，後續 HTTP 槽位仍會空轉。現在以一個輕量 pump
+   持續補給相同 bounded window；呼叫端只驗證／合併已到達的 cohorts，不等慢來源。
+   併發、端點失敗預算與熔斷不放寬。handoff 只保留有限請求範圍內已有 rows 的引用；
+   callback／fsync 失敗會取消尚未派發的工作，drain 已准入請求並 join，不留下背景工作冒充成功。
+   新診斷欄位為 `mis_network_schedule_policy=bounded_window_independent_of_progress_v2`。
+2. **09:01 後 observer 又加了 30 秒等待。** 10/19 的 `opening_source_repair_latency.jsonl`
+   在 09:01:00.486 已記錄來源自身的 1／10／15／60 秒 deadline，但外層仍另設 30 秒 delay，
+   09:01:32.042 才進下一次觀測。現在有進展或來源正在執行時保留短觀測，否則取各來源
+   最早的有效 monotonic deadline；無期限資料時才沿用原有有界退避。
+   落盤後重新計算期限，避免把 fsync 時間再疊上來源期限。既有每秒 loop、真正推論讓位、
+   quota／403／429／端點 backoff 全部保留。新欄位為 `observer_retry_policy=earliest_shared_provider_deadline_v2`。
+
+### 完整範圍測速與故障注入
+
+[串行 ABBA 原始收據](../artifacts/operations/tw_opening_latency_20261020/window_serial_abba.json)
+對照 2,301 檔軸、全部 29 份原始回覆，各版五次；每次都包含 canonical fan-in、驗證、journal、fsync
+與獨立落盤讀回。原始正式開盤數為 **2,274**，未將全部 rows 冒充正式價格。
+所有財務欄位、原始交易所／本機接收時鐘與持久化 rows 的 SHA 完全一致：
+
+| 比較 | 舊版中位數 | 新版中位數 | 邊界 |
+| --- | --- | --- | --- |
+| 無額外人工延遲的本機完整流程 | 156.518 ms | 136.779 ms | 無網路的完整原始回覆重放，非開盤／成交 SLO |
+| 每 HTTP 人工加 5 ms、每 progress 人工加 20 ms | 381.842 ms | 288.229 ms | 明確故障注入，不能稱為實際 API／磁碟速度 |
+
+[同版本 AA 控制組](../artifacts/operations/tw_opening_latency_20261020/window_serial_aa.json)
+仍有 166.228／152.308 ms（約 8.4%）的中位數差異；主機負載／暖化會影響結果，
+因此不將 ABBA 的約 12.6% 改善宣稱為固定保證。
+[故障注入收據](../artifacts/operations/tw_opening_latency_20261020/window_serial_stall.json)
+亦通過全欄位／時鐘／落盤 SHA 對照。progress 數量減少只合併**已完成且不衝突**的 rows，
+沒有刪掉欄位、標的、驗證或最終 durable 門檻。
+[局部 profile](../artifacts/operations/tw_opening_latency_20261020/window_stages.json)
+另外保留巢狀、跨 thread 等待的局部診斷，profiling overhead 已計入，不能相加或取代未開 profile 的數字。
+
+新增決定性測試：第一個 callback 被阻擋時第三個 HTTP 仍須開始；快批不等慢批、衝突 venue
+不合併覆寫；callback 失敗必須 drain／join；最早健康來源期限不能被失敗來源拖慢；
+fsync 後不得重加舊 delay；人工延遲不能混入正式 network／scheduled probe。
+[相關回歸](../artifacts/operations/agent-workflow/runs/opening-1020-all-source-regressi-20261019T163929-62454ba7/run.log)
+為 **812 passed／27.34 秒**，涵蓋報價、來源 fan-in、原生 broker、持久化、官方名冊、
+Discord、原生延遲稽核與合格換版；不是全 repository 測試。
+修改前的停頓失敗、初次缺少 math import 及錯誤測試路徑的 run 均保留，不覆寫為成功。
+
+### 上線／仍未驗證的邊界
+
+[00:43 合格換版](../artifacts/operations/tw_opening_latency_20261020/discord_apply.json)
+通過 `accepted_code_admission_only`：只替換 Discord owner，Gateway／core／零落差 engine ACK
+與原始 journal prefixes 都通過；execution owner／其他受保護服務不變，GPU 暖機仍 pending。
+00:50 起另一工作又修改真正相依的 `stockagent/config.py`、`training/checkpoint_contract.py`、
+`training/multiobjective.py`；再次讀回確認 model code identity 已失配。
+沒有更新舊程序的 admission 或排除真正相依來掩蓋。檔案穩定後，再以完整 consumed-code
+identity 及本輪 entrypoint／quote／benchmark SHA 包住測試，確認測試前後皆相同：
+[最後穩定版本回歸](../artifacts/operations/agent-workflow/runs/opening-1020-stable-final-20261019T165422-fb3fb059/run.log)
+為 **886 passed／36.59 秒**，另涵蓋 completed inference cache 與 live admission。
+[00:56 最後合格採用](../artifacts/operations/tw_opening_latency_20261020/discord_final_apply.json)
+驗收的 `expected_code_sha256` 與該測試同為 `f25bdead376f138d9ba89534c763ba3cde23831d6387740bed823a76ec776850`；
+新程序 Gateway／ACK／journal prefixes 通過，engine 未重啟，GPU 暖機仍未驗證。
+這是同版本工程驗收，不允許之後的實際相依變更自動繞過 fresh-process 要求。
+[01:00 獨立交付讀回](../artifacts/operations/agent-workflow/runs/opening-1020-handoff-verificatio-20261019T165959-02498c2d/run.log)
+再次確認目前 consumed code、測試版本、已採用版本與 entrypoint 一致，Gateway／core 正常，
+同一未重啟的 execution owner ACK 落差為 0，相關本機證據連結皆存在。
+
+原生每日 08:55、09:00:11／31、09:01 稽核 timer，與 10:30／13:40 全市場來源 probe timer
+已確認啟用；開盤仍保留首份不可變 deadline 結果，來源取完、模型發布、紙上全成交分開驗收。
+磁碟一度只剩約 4.8 GiB，後續其他工作整理期間分別觀測約 15／29 GiB，
+仍不能據此宣稱盤後 reserve gate 已通過。
+本輪沒有刪資料、沒有補寫／修改帳本，沒有聲稱今日開盤已測、外部錯誤永遠為零、
+毫秒／一秒全市場全成交已達標，或只剩 API 延遲。
+
+### 同範圍重測
+
+以下只重放保留的原始回覆，禁用真實網路，不連券商；每版五次均保留完整軸與 durable 證據。
+不要與其他壓力測試同時執行。原保留清冊驗證器不可省略或換成寬鬆的現在版本。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tw_opening_sources.py \
+  --receipt artifacts/operations/tw_opening_latency_20261016/quote_phase_full_market_network.round1.receipt.json \
+  --compare-mis-pipeline artifacts/operations/tw_opening_latency_20261020/quote_before.py \
+  --retained-universe-owner artifacts/operations/tw_opening_latency_20261018/universe_membership_repair/reader_before.py \
+  --mis-responses artifacts/operations/tw_opening_latency_20261016/mis_efficiency_retained_responses.json \
+  --rounds 5 --output artifacts/operations/tw_opening_latency_20261020/window_retest.json
+```
+
+AA 控制組將 `--compare-mis-pipeline` 換成目前 `stockagent/live/quote_provider.py`，
+另選 output 路徑；人工 stall 對照另加 `--mis-simulated-http-delay-ms 5 --mis-simulated-progress-delay-ms 20`，
+不可把此參數帶入實際 network 或 scheduled probe。
+
+## 2026-10-20 續修：數值重用、整欄複製與嚴格收據編碼
+
+本輪重新保存 `quote_round2_before.py`／`acquisition_round2_before.py`，比較起點是上一節
+已採用的 window／observer 修正，不把上一輪加速重複計算。仍是凌晨工程驗收，最近實際
+開盤證據是 [10/19 的首份 11 秒收據](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-19/first_assessment_11000ms.json)：
+591 個正式開盤、0 個當時已證實無首筆、1,710 個未知；FinMind 的 211 個與永豐重疊。
+來源清冊與四個首輪 MIS ReadTimeout／Fugle 403 的診斷沿用上一節，沒有把它們改寫成成功。
+
+### 關鍵路徑與修正
+
+每個官方可交易標的可由最早的合格來源解決；整個範圍的等待受最後未解決標的支配。
+不同 provider 的耗時不能直接相加，解析、驗證與網路也能重疊。
+正式開盤、官方新鮮零成交證據、未知仍分開；零成交只准模型沿用前一已完成交易日收盤／零 gap，
+不是已成交報價、排除官方清冊或修改帳本。沒有首筆成交的標的也不能保證在 09:00 已存在正式開盤價。
+
+本輪修改仍在既有 quote／fan-in／atomic writer 內，未另建來源或成交路徑：
+
+1. 已經由 seed／load 正規化的 copy-on-write row 以私有型別標記，落盤不再重做每列十一欄的
+   浮點／數量轉換。舊版未標記 mapping 仍走原始 defensive parser；新來源、快取讀回、freshness、
+   欄位 shape 與跨日檢查不省略。正式開盤集合也只計算一次，不再為 count／missing 各掃一次。
+2. MIS 不重複目的 index 的批次改為 NumPy 整欄複製；重複／衝突 venue 留原始有序逐列路徑。
+   缺欄不覆寫、漲跌停／數量不變，整數時鐘不經 float64；測試另外覆蓋大於 `2**53` 的時鐘與 signed zero。
+3. 後續 barrier／增量寫入可借用**實際檔案 bytes 完全相同**的收據 metadata，只保留最新一份。
+   不用它供應價格或取代完整 restore validation。scope cache key 加上 ctime／inode／device，
+   修正「同長度、保留 mtime 的原子替換」可能誤用舊 fingerprint 的問題；目錄 fsync 失敗仍須重寫。
+4. 僅此私有收據可使用既有可選 msgspec 編碼器：價格欄位必須全部來自已驗證 row，header 與
+   任意舊 conflict metadata 另外檢查 JSON 型別與非有限值。套件不存在、特殊型別／大整數／alias
+   都回原 strict stdlib JSON；bytes、datetime、循環與非法 surrogate 不會被悄悄改值。
+   [msgspec 官方文件](https://msgspec.dev/supported-types#float)說明 NaN 預設會編成 null，故不能直接全面取代 JSON。
+   本輪沒有改 `stockagent.private_json.dumps` 或公網 wire encoder。file fsync＋rename＋directory fsync 依舊。
+5. fan-in 每次 wake 重複建立的 symbol set 改為一次建立後用 isdisjoint 查詢，provider 排程與等待語意不變。
+
+### 完整流程對照與持續測速
+
+[最終 ABBA 收據](../artifacts/operations/tw_opening_latency_20261020/round2_native_abba.json)
+每版五次、2,301 檔原始軸、29 份 10/16 原始 HTTP body，包含解析、驗證、fan-in、來源 journal、
+durable barrier 與落盤 JSON 解碼。實際為 2,300 個 response rows、2,274 個正式開盤，
+沒有把回覆筆數／來源工作結束當全市場價格完整。
+所有數值、原始來源／接收時鐘、mask 與 durable rows SHA 均完全一致；真實網路、訊號發布、
+券商下單與正式帳本寫入皆為零。
+
+| 範圍／中位數 | 本輪修改前 | 本輪修改後 | 限制 |
+| --- | --- | --- | --- |
+| 完整本機工作流 | 203.382 ms | 173.129 ms | 約少 14.9%；不是實際開盤／模型／成交時間 |
+| 收據投影、編碼與 durable write | 44.906 ms | 19.981 ms | 巢狀 span，不可再加到完整流程上 |
+| 人工 HTTP 5 ms／progress 20 ms 的完整流程 | 276.997 ms | 228.285 ms | 明確 fault injection，非實際來源／磁碟成績 |
+
+[同版本 AA](../artifacts/operations/tw_opening_latency_20261020/round2_native_aa.json)
+為 167.774／165.593 ms（約 1.3%），兩個 label 的 quote 與 acquisition SHA 相同；仍不承諾固定倍率。
+[故障注入收據](../artifacts/operations/tw_opening_latency_20261020/round2_native_stall.json)保留全欄位／時鐘／落盤 parity。
+探索期間的 `round2_stage_baseline.json`、`round2_normalized_abba.json`、`round2_final_abba.json`、
+`round2_accepted_abba.json` 均保留；中間版本整鏈改善僅約 1–7%，未選那些波動當數倍加速。
+通用逐值檢查再 native encode 的單段試驗收益小，最後採來源 schema 已驗證數值的窄路徑，
+不是移除 NaN／精度檢查或對全系統換 serializer。
+
+正式 source journal 的 quorum／finished 現在增加 `input_flush.receipt_stages`（熱 barrier 為空）：
+row_projection、previous_receipt_read、official_scope_and_archive、payload_assembly、json_encode、
+atomic_write_fsync、metadata_publish 的 ms，以及 encoder、encoded_bytes、重用／防守轉換 row count。
+舊的 captured revision、writer_queue、newer_input_pending 保留。benchmark 另有涵蓋所有呼叫 thread
+的 `local_stage_spans`、所有 `input_durable_flushes` 與 MIS 組裝／callback spans；巢狀／並行數字不可相加。
+這些測速不快取上一次 duration，不把慢／失敗的樣本排除。
+
+### 同範圍重測與剩餘邊界
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tw_opening_sources.py \
+  --receipt artifacts/operations/tw_opening_latency_20261016/quote_phase_full_market_network.round1.receipt.json \
+  --compare-mis-pipeline artifacts/operations/tw_opening_latency_20261020/quote_round2_before.py \
+  --baseline-acquisition-owner artifacts/operations/tw_opening_latency_20261020/acquisition_round2_before.py \
+  --retained-universe-owner artifacts/operations/tw_opening_latency_20261018/universe_membership_repair/reader_before.py \
+  --mis-responses artifacts/operations/tw_opening_latency_20261016/mis_efficiency_retained_responses.json \
+  --rounds 5 --output artifacts/operations/tw_opening_latency_20261020/round2_retest.json
+```
+
+AA 將 quote／acquisition baseline 同時換成目前 source；stress 另加上一節的人工 delay 參數。
+保持串行測試，不與另一測速工作同時跑。工程正確性回歸與合格換版證據見後續讀回；
+09:00／11 秒／全模式原始發布與全目標模擬成交，仍由既有每日原生 audit 獨立驗收。
+10/20 的 08:55 audit 與 10:30／13:40 全市場 probe timer 已確認排程，沒有用離線結果取代它們。
+外部端點不回覆、Fugle 授權與尚無首筆仍是實際來源邊界；本機也仍有必要的驗證／合併／journal 工作，
+尚未證明數學極限或只剩 API 延遲，更不保證外部零錯誤／一秒內所有成交。
+
+### 同版本回歸與部署讀回
+
+[最終穩定版本回歸](../artifacts/operations/agent-workflow/runs/opening-1020-round2-stable-20261019T173234-79653034/run.log)
+涵蓋 quote、fan-in、benchmark、來源恢復／串流、官方清冊、執行測速、Discord admission／warmup
+與 strict JSON 共 22 個模組，**914 passed in 33.90s**。前後 consumed implementation 與四個
+直接修改／入口檔案的 SHA 都一致；這不是全庫測試完成。consumed code 為
+`4492daee099c75f5b64b3513259454f4f5c30ea0c4b170c95fc5ac42ff69ea1a`，quote 為
+`802a2c1c55dc16ad943f1b9337e602076b0e70e70299e7e89f04471d2482609c`，
+acquisition 為 `4d3186a508fbbf3e2f1db953b88c6126b74e4ee482e9ad2dbd328a16df804c48`。
+
+換版只走既有 qualified Discord-only code admission，不重啟當沖引擎：即時 plan 的部位為零，
+但仍有一筆 pending order，沒有刪除或偽裝為 terminal。首次 plan 遇到協調鎖，
+[重讀 plan](../artifacts/operations/tw_opening_latency_20261020/round2_discord_plan_retry.json)才通過；
+[首次 apply](../artifacts/operations/tw_opening_latency_20261020/round2_discord_apply.json)
+又因 heartbeat 超過 10 秒時效拒絕，`restart_requested=false`。保留原失敗證據，沒有放寬 TTL、
+改心跳時間或移除鎖；只在原生心跳繼續更新、Gateway／ACK 正常後重新完整 admission。
+
+[重新 admission／apply](../artifacts/operations/tw_opening_latency_20261020/round2_discord_apply_retry.json)
+於 **10/20 01:43:14 +08:00** 通過 `accepted_code_admission_only`；這次才有一個新的
+Discord invocation，載入的 consumed code 與 914 項測試相同。Gateway／命令同步正常，
+五模式 exact ACK 的 revision lag 為零，沒有當次 watchdog／fatal；六個 protected owner
+保持相同 InvocationID／PID，當沖引擎仍為 PID 2157718，未重啟。
+events／orders／fills 共三個原始前綴 SHA 重新驗證不變，未送券商單、未操作帳本。
+
+[獨立讀回](../artifacts/operations/tw_opening_latency_20261020/round2_independent_readback.json)
+於 **01:45:24** 再驗證同一組測試／source SHA、新 Discord owner、原引擎、五模式 ACK、
+完整帳本前綴與當次 journal。兩個既有 timer 仍 enabled，沒有新增 scheduler 或報價登入。
+暖機是當前 run 的 `pending`，由原生盤前窗口繼續；這份驗收明確為 loaded-code／Gateway／ACK，
+不代表 GPU resident ready、價格齊備或 10/20 開盤 SLO 已通過。
+
+## LoadedImplementationChanged 根因與目錄級版本隔離（2026-10-20）
+
+### 原始事故與責任邊界
+
+10/20 09:00 五個模式在正式取價之前，均因 `LoadedImplementationChanged` 被拒絕。
+這與 10/19 的 MIS timeout 是不同事件。服務早先載入的 212 個 consumed Python files 中，
+`stockagent/config.py`、checkpoint／optimizer／multiobjective 與兩個 data-sync 共用相依在
+盤前被其他工作修改；正式 owner 仍直接使用可變的開發工作樹，磁碟版本因而不再代表其
+常駐模型與已載入的 Python 物件。版本檢查是正確的混版保護，不能刪除或把舊快取重新命名。
+
+[09:04 的 Discord-only 原生恢復](../artifacts/operations/tw_opening_latency_20261020/live_incident_discord_apply.json)
+已接受新的 code／Gateway／exact ACK，沒有重啟當沖引擎或操作帳本。
+之後四個模式恢復原始訊號；Factorized 仍有獨立的 `preopen_catch_up` 工作。
+09:24 的原生 source watchdog 因其 1,200 秒準備期限用盡而自行重啟；不是本輪人工重啟，
+也不是修復 LoadedImplementationChanged 就能宣稱該資料準備問題消失。
+
+當天[首次 11 秒評估](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-20/first_assessment_11000ms.json)
+保留原始失敗，沒有用 09:04 以後的恢復或離線測試補寫成功。
+
+### 原理與實作
+
+運行中的程式必須是一個穩定版本，而開發工作樹必須可繼續修改；兩者不能再共用可變的 code inode。
+新增共用 `stockagent/live/service_code_release.py` 與只做準備的
+`scripts/freeze_discord_code_release.py`，沿用既有 source-release manifest／SHA verifier、
+qualified reload、systemd 和同一個行情／推論 owner，不建立第二條交易路徑。
+
+- 每個 release 複製 Git 可見的 `stockagent`、`downloader`、`scripts` 與 Discord Python source，
+  不使用 hard link。捕捉前後的完整成員與 SHA 必須一致；程式、收據、復原 zip 均唯讀，
+  未記錄成員、symlink、hard link、權限／內容漂移或 archive checksum 不符均拒絕。
+- systemd 在服務自己的 namespace 中，把四個**程式目錄**唯讀綁定至原來的絕對路徑。
+  子程序、lazy import 與既有資料路徑保持一致。原始 markets／models／staged_accounts 目錄
+  維持 live、可寫；`.env` 只綁定原檔，沒有把任何憑證內容複製進快照或 zip。
+  其他資料、configs、模型、帳本與 artifacts 不搬動。
+- 啟動腳本在每次 pinned owner 啟動前驗證 manifest、原生 cgroup、所有 code inode／SHA
+  與八個掛載的 ro／rw 權限，之後才啟動 bot。壞版本不能趁重開機重新 admission。
+- `LoadedImplementationChanged` 的實作完全保留；實際 pinned code 變動仍須新 owner。
+  普通 Discord reload 和 engine-only reload 的 Discord code 比較會沿用已設定的 release，
+  不會因另一個研究工作修改開發檔案而偷偷升版或拒絕未變動的 Discord owner。
+- qualified cutover 仍要求原生 ACK、無 active input／互動工作、受保護 owner 不變、
+  帳本前綴不變；engine 的盤中／非空倉限制不放寬。單位設定先驗證，daemon-reload 後再
+  讀取 systemd D-Bus 的實際解析結果，要求八個 source／target／ro-rw 與已驗證版本相符。
+  解析結果不符或 reload 失敗只還原自己的 drop-in，尚不要求 restart；不修改其他服務設定。
+- 兩個正式 Discord 暖機／GPU idle 驗證 CLI 也在 active release 的 namespace 執行，
+  避免把開發工作樹與正式版本比較而誤報。環境變數本身不是版本證明，仍須驗證實際掛載。
+
+[systemd 官方掛載語意](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#BindPaths=)
+是設計依據；本機以真實 mount namespace／systemd 試驗確認，不只檢查設定字串。
+
+### 故障注入與驗收方式
+
+初版單檔 `bot.py` bind 在新程序的短測通過，但**同一個持續運行程序**測試發現：外部原子替換
+入口檔可繞過舊的 mount target dentry。因此未部署該版本，改為整個 Discord code 目錄唯讀，
+再把原始 live inputs 接回；原始失敗收據保留。
+
+`test/test_service_code_release.py` 以真實 kernel namespace，測試同一程序跨越工作樹原地修改、
+入口原子替換、設定原子替換；程式 SHA 不變、寫程式得到 `EROFS`，設定更新與原路徑寫入均可見。
+另涵蓋空的憑證 mount placeholder、快照損壞／新舊成員、unsafe path、未知 drop-in、
+更新 release、daemon-reload／解析錯誤 rollback、未知 schema／缺掛載／shadow mount 拒絕，
+以及啟動驗證失敗不啟動 bot。
+既有 qualified reload 測試同步覆蓋 mutable／pinned 版本、engine-only 不改 Discord drop-in、
+開發程式變動不影響 pin，而 pin 自身變動仍立即失敗。
+
+[最終準備收據](../artifacts/operations/tw_opening_latency_20261020/frozen_systemd_final_preparation.json)
+本身僅代表 `prepared_not_adopted`。在**該 release 的 namespace**執行的
+[同版本回歸](../artifacts/operations/tw_opening_latency_20261020/frozen_systemd_final_regression.json)
+為 **992 passed in 40.92s**，consumed identity 與測試檔前後一致。早期測試檔尚在修正的
+`implementation_stable=false` 收據保留，不能當同版本驗收。
+
+### 正式採用、部署失誤與獨立讀回
+
+09:43:25 僅設定下次原生啟動使用的 release，七個服務 owner 當時不變，未強制中斷
+Factorized 的 input work。09:45 再次碰到原生 1,200 秒 source watchdog 後啟動失敗：
+本輪 drop-in 錯把整個 `source:target` 加引號，systemd 雖通過語法驗證，實際卻將冒號當成
+來源路徑的一部分。這是本輪引入的 Discord 啟動故障，不能歸咎於行情或隱藏為正常。
+修正為受限字元集的無引號絕對路徑並 daemon-reload 後，既有原生重試於 **09:46:18**
+恢復。為避免重演，部署工具新增上述 D-Bus 實際解析驗證與回滾，測試也覆蓋此引號錯誤。
+測試 probe 改用與正式服務相同的 systemd 掛載實作，不再以另一套自製 mount 流程替代。
+
+[原生採用驗收](../artifacts/operations/tw_opening_latency_20261020/frozen_native_adoption.json)
+於 **09:47:45 +08:00** 確認正式 Python PID 4005242、InvocationID
+`6462ddb2af60473dac1e3ffeae1cd539`，完整 **1,557** 個 code inode／SHA 與八個掛載相符；
+loaded inference code 為 `6545bfefbd49d885c7e4c75eca97b580df4205ac8f12b3d53047b2f3e5e9cb8f`。
+Gateway 已連線、原生五模式暖機狀態為 ready、exact engine ACK revision lag 為零。
+這不另行宣稱 GPU 數值驗證通過。六個 protected owner 未變，當沖引擎仍為 PID 2157718、
+run `c18cd72d1728431186e5203c28cfca49`，三個帳本原始前綴 SHA 不變，未送券商單或操作帳本。
+
+[09:53:39 再次獨立讀回](../artifacts/operations/tw_opening_latency_20261020/frozen_native_repeat_readback.json)
+確認同一個原生版本與 owner、八個實際解析綁定、完整 code inode／SHA、exact ACK／lag 0、
+Gateway 與六個 protected owner，該 invocation 的 `LoadedImplementationChanged` 為 **0**。
+Factorized 仍在 `preopen_catch_up`，沒有把這個獨立資料問題寫成已修復。
+
+[最終部署工具與相關語意回歸](../artifacts/operations/tw_opening_latency_20261020/final_source_pin_deployment_regression.json)
+及[原始測試日誌](../artifacts/operations/agent-workflow/runs/opening-1020-final-pin-complete--20261020T015304-78a4dcad/run.log)
+為 **1,032 passed in 43.41s**，修改程式與測試 SHA 前後一致，包含新增解析防線與驗證 CLI。
+這是目前 operator tools 的驗收，不代表把後續開發檔案自動升版到正在運行的 immutable owner，
+也不是全 repository 測試完成。正式改版仍需下一次合格 plan／apply／verify。
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/freeze_discord_code_release.py \
+  --output artifacts/operations/discord_code_preparation_NEW.json
+run_fintech_python scripts/reload_tw_day_trade_services_if_flat.py \
+  --discord-only --code-admission-only \
+  --source-release artifacts/operations/service_code_releases/RELEASE/release.json \
+  --output artifacts/operations/discord_code_plan_NEW.json
+# 同版本回歸與安全 plan 通過後，才另以 --apply 建立新的 apply 收據。
+# 回滾亦使用同一命令指定先前已驗證的 release，不刪快照、不解除混版保護。
+```
+
+## Factorized 盤前準備逾時與最新交易日預設（2026-10-20）
+
+### 不是缺少快取，而是把全歷史 producer 放進盤前 consumer
+
+[當次來源診斷](../artifacts/operations/tw_opening_latency_20261020/factorized_source_diagnosis.json)
+確認固定原始 parent、模型設定與計算程式未變；350 個 FinLab receipt heads 的部分內容及
+public feature SHA 已更新。舊 `--phase preopen` 與 `completed` 都呼叫 `prepare()`，
+因此即使已發布版本完整涵蓋昨日收盤，也會因 raw head 變動重跑 2014 年起的 causal sweep。
+既有 payload reuse 省下壓縮與重複寫檔，**沒有省下整段歷史的矩陣計算**，不能稱為真正增量。
+現場 Python stack 停在 `causal_state_blocks` 的事件對應與逐日 sweep，不是正在等待 MIS。
+
+10/20 01:51:55 已有完整、immutable 的發布版本：3,119 個交易日、14,726 個模型通道、
+2,906 個成員，完成至 10/19、decision 為 10/20；原始 builder 耗時 **2,069.843 秒**，
+updater 全程 **2,075.037 秒**。這超過 Gateway preopen 的 1,200 秒期限與一般 completed
+command 的 1,800 秒期限，因此每次原生 source watchdog 都可能讓重算重新開始。
+提高 Gateway timeout 或略過資料驗證都不消除這個 producer/consumer 責任錯置。
+
+### 已實作的 consumer 修正與驗證範圍
+
+- `scripts/update_tw_day_trade_factorized_live.py`：`preopen` 只啟動既有官方 opening
+  activation，再完整驗收發布版本；只有 `completed` 仍交給 canonical `prepare()` 建置。
+  不刪歷史、不縮模型輸入、不啟動新行情或交易 owner。
+- `stockagent/data/factorized_panel.py`：抽出共同 `verify_factorized_layout`，讓正式模型讀取
+  與盤前 reader 共用完整 calendar、股票 universe、channel ABI、date/symbol block 分區檢查；
+  保留每個成員和 dictionary 的 SHA 檢查，不以 metadata-only 冒充完整驗收。
+- 未建好本交易日／完整 horizon 時，寫出 `projection_refresh_required`、
+  `model_executed=false`，交給既有 isolated artifact-maintenance owner；不在 Gateway
+  再重跑四次相同全歷史工作。背景原有 accepted-close／休市／kernel lease 與時間預算不放寬。
+  修正「已驗收收盤但 current projection 缺檔」先前未要求 source recovery 的遺漏。
+- receipt 明確保留原本 `source_identity`、`source_built_at_utc` 與 manifest SHA，並記錄
+  `input_policy=published_complete_session_projection_v1`、`latest_raw_heads_claimed=false`。
+  這表示消費已發布版本，不聲稱盤前新取得的所有 raw revision 都已加入；新修訂由背景發布。
+  最新 eligibility、正式交易清冊與 09:00 報價仍走獨立原生驗收，沒有改成昨日價格或假成交。
+
+[同一候選 immutable namespace 的完整驗證測速](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/frozen_consumer_benchmark.json)
+三次為 **8.430／5.804／6.412 秒**，每次皆驗證全部 3,119 日、14,726 通道與 2,906 成員。
+未控制 OS page cache，不能標榜為物理冷機；這是**完整已發布投影的消費驗收**，不是完整 raw
+source 重建加速到六秒，也不是交易日 09:00 至訊號／模擬成交的一秒或十一秒實測。
+分階段 metadata/calendar 與 member/dictionary SHA 耗時均保留於上述收據。
+
+回歸遇到本機 Matplotlib 3.9.1 使用 Pyparsing 3.3.3 舊 alias 的第三方 deprecation：
+正式 regression 的 warnings-as-errors 先如實失敗，沒有改金融邏輯、全域 warning policy 或
+共用套件環境。後續工程回歸只對該第三方 `PyparsingDeprecationWarning` 作 run-scoped
+相容處理，其他警告仍為錯誤；完整 pin 驗證另發現 direct shebang 測試誤用 systemd 的系統
+Python，測試改綁本次 canonical Python 的 PATH，與正式 bot 的 source-command resolver 一致。
+失敗收據保留，不用較早的測試成功覆蓋。
+
+### 預設最新交易日，歷史仍可選取
+
+當沖與隔日沖共用 `app.js` 現預設 `followLatestSession=true`、
+`followPerformanceRange=false`，首頁的 status、持倉／訊號與分鐘曲線只請求目前 session 的範圍。
+保留「2026 年起績效」按鈕、自選日曆、完整歷史與原始累積資產，不修改帳本或裁切資料；
+手選歷史後仍固定該區間，不被即時 refresh 強制拉回最新日。
+同步更新 immutable JS URL 的內容 hash，避免舊瀏覽器資產快取留住原先預設。
+
+[原生瀏覽器驗證](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/latest_session_browser.json)
+在兩個正式 localhost 頁面、1366×768 筆電及 390×844 手機四種組合皆確認起訖等於各自
+server session、分鐘 history 的 request／回應同日、無 page error、無水平溢出。
+當沖為 10/20，隔日沖當時仍為 10/19 的持有 session，沒有套用客戶端今日日期捏造新資料。
+18 項 Node 日期／rollover／非同步資料保留測試通過；瀏覽器收據保留各 API 的實際 response
+duration（含首次慢與後續快的樣本），不是只挑最快熱快取。
+
+### 真正增量仍是獨立的後端未完成工作
+
+使用者提出的目標正確：常態新交易日只算新增／被修訂的區段。此輪 consumer 修正消除了
+盤前不必要重建，**還沒有把 canonical producer 變成真正增量**。不能把檔案 hard-link reuse
+或只讀 current 偷換成「最新一天已增量建置」。正確後續邊界為：
+
+1. 保存可驗證的 normalized observations 分區／來源版本與完整 calendar、lifecycle 身分。
+2. 保存 exact causal state（Float64 原值、observed clock、NULL barrier、report-period floors、
+   TTL／issuer lifecycle），不能從 Float32 展示投影逆推原始狀態。
+3. 新來源只影響新日且歷史 prefix 證明不變時，重用 immutable prefix，只算新日；若有歷史
+   revision、report reset、calendar／ABI 變更，從最早受影響 boundary 重算，不能硬稱 append-only。
+4. 先以完整重建作 equality oracle，驗證所有特徵、缺值與正式模型輸入；冷 bootstrap 和當日
+   update 分別測速，記錄 reused／recomputed sessions、失效原因與完整端到端耗時。
+
+此外，01:52 的 isolated artifact-maintenance 原生失敗仍為它本身的
+`LoadedImplementationChanged`；Gateway 的 immutable pin 不等於該不同 owner 已採用相同
+版本。07:40 的 minute-curve worker 也有獨立 rebuild failure。兩者不可因本次 UI 成功或
+Factorized consumer 驗證而改報健康，需各自完成版本／原始結果驗收。
+
+### 本次正式採用與當日自然恢復
+
+[候選同版本回歸](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/frozen_verified_regression.json)
+及[完整日誌](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/frozen_verified_regression.log)
+為 **1,192 passed in 101.99s**，source identity 與全部測試檔 SHA 前後一致，包含上述有限的
+第三方 warning 相容條件。不是全庫測試宣告，也沒有把測試程序當正式 owner。
+
+[10:27:00 的安全 staging](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/source_stage.json)
+僅更新下次原生啟動的 code pin；受控制鎖保護，先驗 candidate 全 manifest，核對當前
+原生 namespace／Gateway／ACK、七個 owner 與三個帳本前綴，再核對 systemd 實際解析的
+八個綁定。此時 owner 均未變，`restart_requested=false`，並未在 input work 執行中強制 reload。
+舊 owner 隨後自行遇到原有 1,200.139 秒 source watchdog，systemd 的正常恢復於
+**10:27:53** 載入新 release；不是人工重啟交易引擎或中止 source 命令。
+
+[10:31:08 的獨立原生採用驗收](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/native_adoption.json)
+確認 Discord MainPID 4088562／Python PID 4088630、InvocationID
+`09c67597384d42ada5a0ae71bcc4e33f`，已採用完整 1,557 個 frozen source files 與八個掛載；
+loaded inference code 為 `3bf7a203c9bcd51327e9578c4a4748098d6b1e06bca786c1ab73df67170deb11`，
+與本次候選 regression 相同。當次 invocation 的 `LoadedImplementationChanged` 為零，
+沒有 source watchdog／fatal，Gateway／命令同步正常、五模式當次暖機 receipt ready，
+opening input inflight 為零，五個 signal ID 的 engine exact ACK revision lag 為零。
+這不是額外的 GPU 數值驗證。
+
+原生 updater 的 consumer 全驗為 **14.353 秒**（metadata/calendar 11.503 秒、
+全部 member/dictionary SHA 2.844 秒）；另記 canonical activation **2.282 秒**。
+此樣本發生在冷 owner 啟動與五模式暖機同時進行，不能用隔離測速的 5.804 秒取代它，
+也不能只把 consumer 計時稱作整個 updater／開盤工作流。
+重點是此段按既有 08:15 preparation clock 在開盤前完成，不再在 09:00 內重算約 35 分鐘歷史。
+
+Factorized 隨原生 scheduler 以接受的 published inputs 與多源價格自行恢復，
+**10/20 10:28:41** 發布新的真實時間戳模擬訊號，原引擎確認並建立 **2 筆模擬持倉**。
+六個 protected owner 的 PID／InvocationID 不變，當沖引擎仍為 PID 2157718、原 run
+`c18cd72d1728431186e5203c28cfca49`，三個既有帳本前綴 SHA 不變；正常引擎可繼續 append，
+沒有把整個帳本說成未變、未手改歷史或送券商單。
+今天原始 09:00／11 秒失敗仍保留，不能把這次延遲恢復回填成準時成交。
+
+[公網 HTTPS 與 JS SHA 讀回](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/public_ui_readback.json)
+確認 `penguin72487.dpdns.org` 兩個頁面實際送出新資產；
+[最終前端驗證](../artifacts/operations/tw_opening_latency_20261020/factorized_repair/frontend_final.json)
+另檢查載入資料前的 accessible button 預設狀態與公網 HTML，保留新版 source／test SHA。
+
+此變更沒有鎖定整台機器的 Mamba／系統套件，也沒有測試 Windows／實體斷電重開。
+真正 09:00 的時鐘、外部來源延遲、Factorized 資料準備與全目標模擬成交仍須各自驗收，
+不能由版本隔離測試推論為全系統已正常或延遲 SLO 已達標。
+
+## 完整開盤取價與 MIS 斷線恢復（2026-10-21）
+
+### 今日原始失敗與來源責任
+
+此次以官方當日交易清冊 **2,308 檔**為分母，不以模型成員、供應商回傳數或有成交量檔數
+縮小範圍（登錄 2,313 檔，官方停交易 5 檔）。五模式盤前 final-arm 於 08:45–08:46
+已有 ready 證據；不能把這次延遲籠統歸因為「模型沒有暖機」。
+
+[今日第一份 11 秒驗收](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-21/first_assessment_11000ms.json)
+保留 `missed_or_unverified`：494 檔真開盤、0 檔官方無首筆、1,814 檔未知，五模式原始訊號
+與完整模擬成交均未通過期限。晚到資料或 09:01 回放不能覆蓋這份原始失敗。
+[來源與原生狀態取證](../artifacts/operations/tw_opening_latency_20261021/forensics.json)
+保留完整分階段日誌；這個檔案較大，日常查閱應只投影指定時間／job 的摘要。
+
+| 階段／來源 | 本次觀察 | 可控部分與外部邊界 |
+| --- | --- | --- |
+| 官方日曆維護 | 09:00 的半小時 timer 持有共用 source writer lock，整段約 1.214 秒；首輪全來源到 09:00:01.573 才啟動 | 移開不必要的維護 writer，並使取價不再等待模型讀取／今日 receipt 建立；不放寬模型的來源一致性鎖 |
+| 永豐共享 owner | 首批約 09:00:01.815；首輪完整 response 約 09:00:03.074，但不是每檔已有有效首筆 | 保留既有 session、分批回呼與原生來源時鐘；全量 response 不等於完整真開盤價 |
+| FinMind 全市場 | 首輪 2,886 列只有 3 列有效首筆、2,831 列仍是其他日期；首輪 headers 約 974 ms、body 約 235 ms | 保留共享 single-flight 與首 11 秒一秒 cadence；來源更新前不能把昨日列改成今日價格 |
+| 官方 MIS | 首 4 個請求全數 timeout，約 4.18–5.17 秒；6.802 秒結束後又固定等 15 秒，21.899 秒才重試 | 固定靜默可改；timeout 僅定位到 connect/TLS/headers 等待，不能據此臆測是哪個網路節點故障 |
+| Fugle | TSE／OTC 回覆 403 | 尚非可用的第四路全市場行情；保留權限退避，不重試轟炸或宣稱已接通 |
+
+目前可用接線仍為永豐共享 owner、官方 MIS、FinMind；「有設定憑證」不是每條路都健康，
+也不是全市場串流權限。永豐 Snapshot 是查詢而非即時推播，官方限制與訂閱上限仍須遵守：
+[Snapshot](https://sinotrade.github.io/tutor/market_data/snapshot/)、
+[使用限制](https://sinotrade.github.io/zh/tutor/limit/)。
+FinMind 的[即時資料說明](https://finmind.github.io/tutor/TaiwanMarket/RealTime/)
+約十秒更新不是固定相位的 09:00 首筆或十一秒全市場 SLA。
+
+### 共用責任入口的修正
+
+1. 日曆 launcher 在取得 writer lock **前後**檢查開盤保護窗口；已有驗證日曆時延後重複維護。
+   缺少／不可信日曆仍可走原 collector bootstrap，真正檢查錯誤不改成成功。
+   原 systemd timer 直接呼叫此 launcher，無須重啟交易服務；真正 09:00 行為仍待下一次開盤驗收。
+2. `repair_tw_opening_snapshot_receipt` 可從目前官方交易清冊獨立 bootstrap，不再依賴模型先建立
+   今日價格 receipt。盤前不送行情請求；錯誤日期、foreign root、毀損 receipt 與缺少官方清冊
+   仍拒絕，不用新路徑覆蓋不可信資料。
+3. 來源 observer 於 08:59:30–09:00:10 使用 10 Hz 喚醒，其他時間維持一秒；既有來源 owner
+   仍掌管 single-flight、持久化與退避。08:59:30–49 每個 root 最多一次平行 transport 預熱，
+   不建立新永豐登入、不準備模型，也不把探測回應當開盤資料。避免 08:59:59 才啟動長探測。
+4. MIS 全掃斷線後保留 15 秒 full-sweep circuit，但允許 **一檔、單一 inflight** 的 half-open
+   探測：0.5、1、2、4、8、15 秒指數等待。收到可解析 requested row 才恢復 unresolved delta；
+   舊日列只能證明 transport 恢復，不能證明有效開盤。401／402／403／429 仍保留 60 秒退避。
+   並行成功來源與已取得資料不被失敗來源取消；未改官方無首筆、正成交量、來源日期的驗證。
+5. 日誌新增 `transport_recovery_probe`、`transport_health_recovered` 與 observer cadence，
+   canary 仍標示局部範圍，不能拿它冒充全市場完成。無首筆且官方確認成交量零時，沿用前一
+   完成交易日值仍僅是既有模型輸入政策，不是可成交開盤價或帳本事實。
+
+### 重複測速、回歸與部署邊界
+
+[完整分母 ABBA 故障注入](../artifacts/operations/tw_opening_latency_20261021/mis_half_open_abba.json)
+以相同 2,308 檔、空的私有 cache、真實退避時鐘跑四次；情境為「首次全掃斷線、來源隨後恢復」。
+含驗證、合併、journal/fsync、owner drain 及獨立 durable readback，中位數由 **15,108.636 ms
+降至 621.721 ms**。全部金融值、來源時鐘及 durable rows hash 一致。這是**離線故障恢復比較**，
+不是實際網路開盤、全部 API 速度提高 24 倍、模型完成或模擬成交 SLA。
+
+重測入口使用既有 benchmark，不新增行情 owner：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tw_opening_sources.py \
+  --receipt artifacts/live/tw_opening_snapshots/2026-10-21.json \
+  --compare-mis-recovery artifacts/operations/tw_opening_latency_20261021/baseline/opening_price_acquisition.py \
+  --rounds 2 \
+  --output artifacts/operations/tw_opening_latency_20261021/mis_half_open_abba_repeat.json
+```
+
+每次使用未占用的輸出檔名；原始 baseline、比較結果與 SHA 皆保留，不覆蓋舊測速。
+
+10:30 的[原生獨立網路樣本](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-21/intraday_103001748749.json)
+全流程約 1,230.213 ms，但僅 2,140 檔真開盤、168 檔未知，`data_complete=false`；MIS 探測失敗、
+Fugle 403。這不是完整取價成功，也不是本次變更的實際 before/after。
+
+[工作區相關回歸](../artifacts/operations/agent-workflow/runs/opening-1021-final-source-plus-d-20261021T025427-40a5aa74/run.log)
+為 **769 passed in 50.14s**，涵蓋來源 fan-in、清冊、持久化、來源鎖、日曆排程、Discord cadence、
+訊號／執行計時與 source namespace。沒有宣稱全庫測試。
+部署驗證另找到 relative receipt path 直接進 systemd BindPaths 的錯誤；現在使用 verifier 回傳的
+absolute receipt 建立綁定，symlink 拒絕不變，並補相對路徑／symlink 回歸。
+
+第一份部署 plan 因控制鎖被占用而拒絕；第二次 freeze 因 source membership/content 變動而拒絕。
+保留全部失敗 run，不清鎖、不忽略版本檢查。後續
+[第三份完整凍結版本](../artifacts/operations/tw_opening_latency_20261021/source_release_preparation_v3.json)
+與[相對路徑原生 namespace 驗證](../artifacts/operations/tw_opening_latency_20261021/source_release_verification_v3.json)
+確認 1,585 source files、唯讀掛載與相同 manifest；此時仍是 `prepared_not_adopted`。
+[新的 plan-only](../artifacts/operations/tw_opening_latency_20261021/deployment_plan_v3.json)
+已通過 Discord-only code admission 前置檢查，未要求重啟。正式採用、原生模型暖機、下次 09:00
+首筆／全量取價及全目標模擬成交須另附證據；不能因 plan 或工程測試成功而預先宣稱完成。
+
+### 凍結版本回歸與正式取價端採用
+
+同一份候選的[原生唯讀 namespace 回歸](../artifacts/operations/agent-workflow/runs/opening-1021-frozen-source-regre-20261021T030038-4835b3ad/run.log)
+另通過 **769 passed in 45.03s**，不是只測可能持續修改的工作區。
+控制鎖解除、所有前置檢查通過後，於 **11:03:43** 完成
+[qualified Discord-only 採用](../artifacts/operations/tw_opening_latency_20261021/source_adoption_v3.json)：
+`accepted_code_admission_only`，loaded code SHA 為
+`b52f00a25deada847ff57303296be87e2f0e16b61746b3ed8162de12ef2a7702`，Python owner
+`1255414-1792551811055849914`；Gateway／命令同步及五模式 exact engine ACK 通過，revision lag 為零。
+
+六個 protected owner 的 PID／InvocationID 不變，當沖引擎仍為 MainPID **536534**、run
+`0e95c7f2ed354874a09a76bd0762bb63`；三份 append-only 帳本前綴 SHA 通過，沒有人工改寫訊號、
+成交或歷史。這次只重啟 Discord／取價端，沒有重啟交易引擎、改模型或送券商單。
+新程式的來源修復 observer 已由新 run 自然執行並寫入新的 cadence policy。
+當時的 code-only 驗收明確為 `gpu_warmup_verified=false`；模型快取由原生無下單暖機繼續完成，
+不把 Gateway ready 或版本採用成功當成模型駐留就緒。
+
+既有 `stockagent-tw-opening-audit.timer` 與 `stockagent-tw-quote-phase-benchmark.timer` 仍排程運行，
+持續保留開盤、盤中與盤後的原生日誌及完整範圍。**下一次真實開盤的首筆、全量輸入、原始訊號
+與全目標模擬成交尚未驗收**；來源端發布週期、尚未首筆成交與服務端拒絕仍是獨立外部限制，
+不能承諾一秒、零錯誤或宣稱所有瓶頸都已排除。
+
+**11:09 的獨立唯讀驗收**另保存在
+[原生採用讀回](../artifacts/operations/tw_opening_latency_20261021/native_adoption_readback_v3.json)。
+沿用 qualified reload 的 `native_ready` 完整分支驗證同一新 owner，五模式自然暖機於
+**11:06:03** 完成，148.422 秒、5/5 ready、resident ready；重新核對 source namespace、
+六個 protected owner、三份帳本前綴及最新 exact ACK（lag=0）。驗證器沒有呼叫 provider、GPU、
+重啟或寫帳本。取價 observer 當時為 **2,186 真開盤＋122 官方無首筆＝2,308 已解析輸入**、
+unknown=0，仍標示 `awaiting_first_print`；122 檔不能冒充有真實開盤價，11:09 的覆蓋也不能
+回填成 09:00 的成績。
+
+獨立讀回的首個工程命令誤用了「盤前自然暖機」validator 的不相容 control schema，
+保留其 `KeyError` 失敗收據；改用本次盤中 qualified reload 對應的現有 `native_ready`，
+沒有放寬共享 verifier、延長暖機窗口或重新啟動 owner。

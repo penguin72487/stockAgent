@@ -18,6 +18,7 @@ from datetime import datetime
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -45,7 +46,8 @@ from stockagent.live.tw_day_trade_simulation import _atomic_json
 
 
 def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds, profile_local=False,
-                         baseline_acquisition_file=None, retained_universe_file=None):
+                         baseline_acquisition_file=None, retained_universe_file=None,
+                         simulated_http_delay_ms=0., simulated_progress_delay_ms=0.):
     """Replay retained public response bytes through the complete local owner.
 
     Original exchange clocks are untouched; the explicitly frozen local clock
@@ -54,6 +56,9 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
     """
     if quotes._SHIOAJI_STOCK_API is not None or not symbols or len(set(symbols)) != len(symbols):
         raise ValueError("MIS comparison requires logged-out isolation and unique symbols")
+    if any(not math.isfinite(value) or not 0 <= value <= 100
+           for value in (simulated_http_delay_ms, simulated_progress_delay_ms)):
+        raise ValueError("offline stage delays must be finite and within 0..100ms")
     retained = json.loads(responses_file.read_bytes())
     fixed = datetime.fromisoformat(retained["observed_at_taipei"])
     if fixed.utcoffset() is None or not 1 <= rounds <= 5:
@@ -118,6 +123,8 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                         if key not in bodies:
                             raise AssertionError("request scope differs from retained responses")
                         requests_seen.append(key)
+                        if simulated_http_delay_ms:
+                            time.sleep(simulated_http_delay_ms / 1000.)
                         body = bodies[key]
                         return SimpleNamespace(content=body, json=lambda: json.loads(body), status_code=200,
                             raise_for_status=lambda: None, close=lambda: None)
@@ -150,6 +157,36 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                     profile = cProfile.Profile()
                     storage = {"fsync_calls": 0, "fsync_sum_ms": 0.0, "progress_batches": 0}
                     storage_lock, original_fsync = threading.Lock(), os.fsync
+                    stage_spans = {}
+                    input_flushes = []
+
+                    def measure_stage(target, attribute, label):
+                        original = getattr(target, attribute)
+
+                        def measured(*args, **kwargs):
+                            stage_started = time.perf_counter()
+                            try:
+                                return original(*args, **kwargs)
+                            finally:
+                                duration = (time.perf_counter() - stage_started) * 1000
+                                with storage_lock:
+                                    spans = stage_spans.setdefault(label, {"calls": 0, "sum_ms": 0., "max_ms": 0.})
+                                    spans["calls"] += 1
+                                    spans["sum_ms"] += duration
+                                    spans["max_ms"] = max(spans["max_ms"], duration)
+                                    if attribute == "persist_tw_opening_snapshot_cache" and kwargs.get("timings"):
+                                        input_flushes.append(dict(kwargs["timings"]))
+
+                        stack.enter_context(patch.object(target, attribute, measured))
+
+                    # Lightweight wall spans cover EVERY calling thread, unlike
+                    # the optional provider-thread-only cProfile. Nested and
+                    # concurrent spans are diagnostic, never additive costs.
+                    for attribute in ("seed_tw_opening_snapshot_cache", "fetch_tw_mis_opening_snapshot",
+                                      "tw_opening_observation_diagnostics", "persist_tw_opening_snapshot_cache",
+                                      "_persist_tw_mis_opening_receipt"):
+                        measure_stage(module, attribute, attribute)
+                    measure_stage(owner_module, "_record_source_events", "source_journal")
 
                     def measured_fsync(fd):
                         sync_started = time.perf_counter()
@@ -165,6 +202,8 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                     def provider(names, values, progress):
                         def measured_progress(scope, snapshot):
                             storage["progress_batches"] += 1
+                            if simulated_progress_delay_ms:
+                                time.sleep(simulated_progress_delay_ms / 1000.)
                             progress(scope, snapshot)
                         if profile_local:
                             profile.enable()
@@ -190,7 +229,11 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                         owner.close()
                     elapsed_ms, cpu_ms = (time.perf_counter() - started) * 1000, (time.process_time() - cpu_started) * 1000
                     final = module.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
-                    receipt = json.loads(module._tw_mis_opening_receipt_path(fixed.date().isoformat()).read_bytes())
+                    receipt_path = module._tw_mis_opening_receipt_path(fixed.date().isoformat())
+                    receipt = json.loads(receipt_path.read_bytes())
+                    events = [json.loads(line) for line in receipt_path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+                    completed_source = next(row for row in reversed(events)
+                        if row["provider"] == "official_mis" and row["event"] == "finished")
                     digest = hashlib.sha256()
                     for name in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
                                  "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms"):
@@ -207,6 +250,15 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                         "total_local_workflow_ms": round(elapsed_ms, 3), "process_cpu_ms": round(cpu_ms, 3),
                         "storage_barriers": {**storage, "fsync_sum_ms": round(storage["fsync_sum_ms"], 3),
                             "span_policy": "overlapping_barrier_sum_not_additive_to_total"},
+                        "local_stage_spans": {name: {key: round(value, 3) if key.endswith("_ms") else value
+                            for key, value in span.items()} for name, span in stage_spans.items()},
+                        "local_stage_policy": "all_threads_nested_wall_spans_not_additive_v1",
+                        "input_durable_flushes": input_flushes,
+                        "mis_local_pipeline": {key: completed_source.get("transport_timing", {}).get(key)
+                            for key in ("mis_first_pass_ms", "mis_total_ms", "mis_progress_spans", "mis_column_assembly_policy")},
+                        "source_dispatch": {key: completed_source[key] for key in (
+                            "worker_queue_ms", "provider_call_offset_ms", "dispatch_telemetry_wait_ms",
+                            "dispatch_telemetry_recorded", "dispatch_journal_policy") if key in completed_source},
                         "request_count": len(requests_seen), "durable_requested_count": receipt["requested_count"],
                         "valid_open_count": int(module.tw_session_open_observed_mask(final).sum()),
                         "financial_and_clock_sha256": digest.hexdigest(),
@@ -222,6 +274,9 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
             "requested_count": len(symbols), "response_count": len(bodies), "rounds": rounds,
             "local_clock_policy": "fixed_to_capture_clock_for_exact_receipt_comparison",
             "provider_thread_profiling_enabled": profile_local,
+            "controlled_stage_delays": {"http_delay_ms": simulated_http_delay_ms,
+                "progress_delay_ms": simulated_progress_delay_ms,
+                "boundary": "explicit_synthetic_delays_not_observed_provider_or_storage_latency"},
             "baseline_sha256": hashlib.sha256(baseline_file.read_bytes()).hexdigest(),
             "candidate_sha256": hashlib.sha256(Path(quotes.__file__).read_bytes()).hexdigest(),
             "baseline_acquisition_sha256": hashlib.sha256(Path(baseline_acquisition.__file__).read_bytes()).hexdigest(),
@@ -561,6 +616,123 @@ def compare_independent_poll(symbols, root, baseline_file: Path, *, rounds: int)
         "network_requests": 0, "production_ledger_modified": False, "opening_slo_claim": False,
         "financial_and_exchange_clock_parity": True, "samples": samples,
         "median_full_source_quorum_ms": {label: statistics.median(row["full_source_quorum_ms"]
+            for row in samples if row["variant"] == label) for label in ("before", "after")}}
+
+
+def compare_mis_recovery(symbols, root, baseline_file: Path, *, rounds: int) -> dict:
+    """Full-axis fault injection with real retry clocks; NOT live API timing.
+
+    The first sweep reports a transport outage, then the fixture is healthy.
+    Both owners retain their own production retry policy, scope, validation,
+    journal and durable writer. No scaled backoff or deleted input is timed.
+    """
+    import types
+    if (not symbols or len(set(symbols)) != len(symbols) or not 1 <= rounds <= 5
+            or quotes._SHIOAJI_STOCK_API is not None):
+        raise ValueError("isolated logged-out process, unique full scope and 1..5 rounds required")
+    code = baseline_file.read_bytes()
+    before = types.ModuleType("_mis_recovery_baseline")
+    sys.modules[before.__name__] = before
+    samples = []
+    fixed = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=9, minute=0, second=0, microsecond=0)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz or fixed.tzinfo)
+
+    def forbidden(*a, **k):
+        raise AssertionError("offline recovery comparison forbids network")
+
+    try:
+        exec(compile(code, str(baseline_file), "exec"), before.__dict__)
+        for round_id in range(rounds):
+            variants = [("before", before), ("after", acquisition)]
+            for label, module in (variants if round_id % 2 == 0 else reversed(variants)):
+                with tempfile.TemporaryDirectory(prefix="opening-mis-recovery-") as temporary, \
+                        patch.dict(os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary}), \
+                        patch("requests.sessions.Session.request", forbidden), \
+                        patch.object(module, "datetime", Clock), patch.object(quotes, "datetime", Clock), \
+                        patch.object(quotes, "_TW_MIS_OPENING_CACHE_KEY", None), \
+                        patch.object(quotes, "_TW_MIS_OPENING_CACHE", {}), \
+                        patch.object(quotes, "_TW_MIS_OPENING_REQUESTED", set()), \
+                        patch.object(quotes, "_TW_MIS_OPENING_DIRTY", False), \
+                        patch.object(quotes, "_TW_MIS_OPENING_REVISION", 0):
+                    calls = []
+                    stamp = int(fixed.timestamp() * 1000)
+                    fallback = np.full(len(symbols), 99.)
+                    started = time.perf_counter()
+
+                    def provider(names, values, progress):
+                        calls.append({"count": len(names), "started_ms": round((time.perf_counter() - started) * 1000, 3)})
+                        healthy = len(calls) > 1
+                        size = len(names)
+                        return quotes.PriceSnapshot(prices=np.full(size, 100.) if healthy else values,
+                            open_prices=np.full(size, 100. if healthy else np.nan), source="twse_tpex:mis",
+                            available_mask=np.full(size, healthy), available_count=size if healthy else 0,
+                            requested_count=size, volumes=np.full(size, 1. if healthy else np.nan),
+                            timestamps_ms=np.full(size, stamp, dtype=np.int64),
+                            exchange_timestamps_ms=np.full(size, stamp, dtype=np.int64),
+                            transport_timing={} if healthy else {"mis_dispatch_stopped": True,
+                                "mis_failed_request_count": 4, "mis_error_chain_types": ["ReadTimeout"]})
+
+                    owner = module.OpeningPriceFanIn()
+                    try:
+                        for _ in range(4):
+                            result = owner.fetch(symbols, fallback, parquet_root=root,
+                                providers={"official_mis": provider}, minimum_coverage=1., timeout_seconds=.1,
+                                cache_reader=lambda: quotes.fetch_tw_mis_opening_snapshot(
+                                    symbols, fallback, parquet_root=root, allow_network=False))
+                            if not owner.wait_idle(timeout_seconds=5):
+                                raise AssertionError("fixture source leaked work")
+                            if quotes.tw_session_open_observed_mask(result).all():
+                                break
+                            metric = next(iter(owner._sessions.values())).metrics["official_mis"]
+                            deadline = min(metric.get("retry_after_monotonic", 0.),
+                                metric.get("transport_probe_after_monotonic", float("inf")))
+                            time.sleep(max(0., deadline - time.monotonic()))
+                        else:
+                            raise AssertionError("recovery failed to acquire the complete fixture")
+                    finally:
+                        owner.close()
+                    # Independent readback after every admitted worker/barrier
+                    # has drained. A return from the in-memory quorum is not
+                    # the end of this complete local workflow measurement.
+                    receipt = json.loads(quotes._tw_mis_opening_receipt_path(fixed.date().isoformat()).read_bytes())
+                    if set(receipt["requested_symbols"]) != set(symbols) or set(receipt["rows"]) != set(symbols):
+                        raise AssertionError("recovery lost canonical requested/durable scope")
+                    digest = hashlib.sha256()
+                    for field in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
+                                  "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms"):
+                        value = getattr(result, field, None)
+                        digest.update(field.encode())
+                        digest.update(b"none" if value is None else np.asarray(value).tobytes())
+                    samples.append({"round": round_id + 1, "variant": label,
+                        "complete_workflow_ms": round((time.perf_counter() - started) * 1000, 3),
+                        "source_calls": calls, "valid_open_count": int(quotes.tw_session_open_observed_mask(result).sum()),
+                        "durable_requested_count": len(receipt["requested_symbols"]),
+                        "financial_and_clock_sha256": digest.hexdigest(),
+                        "durable_rows_sha256": hashlib.sha256(json.dumps(receipt["rows"],
+                            sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()})
+    finally:
+        if hasattr(before, "OPENING_FAN_IN"):
+            before.OPENING_FAN_IN.close()
+        if hasattr(before, "_TELEMETRY_START_POOL"):
+            before._TELEMETRY_START_POOL.shutdown(wait=True)
+        sys.modules.pop(before.__name__, None)
+    if any(len({row[key] for row in samples}) != 1
+           for key in ("financial_and_clock_sha256", "durable_rows_sha256")):
+        raise AssertionError("recovery changed source/financial clocks or durable rows")
+    return {"contract": "full_axis_mis_transport_half_open_recovery_comparison_v1",
+        "scope": "offline_injected_outage_real_retry_clocks_not_live_opening_or_fill_slo",
+        "requested_count": len(symbols), "synthetic_market_clock": fixed.isoformat(),
+        "fixture": "first_full_sweep_transport_timeout_then_healthy_source",
+        "baseline_code_sha256": hashlib.sha256(code).hexdigest(),
+        "candidate_code_sha256": hashlib.sha256(Path(acquisition.__file__).read_bytes()).hexdigest(),
+        "network_requests": 0, "production_ledger_modified": False, "signal_published": False,
+        "broker_order_submitted": False, "opening_slo_claim": False,
+        "financial_and_clock_parity": True, "durable_row_parity": True, "samples": samples,
+        "median_complete_workflow_ms": {label: statistics.median(row["complete_workflow_ms"]
             for row in samples if row["variant"] == label) for label in ("before", "after")}}
 
 
@@ -1010,12 +1182,15 @@ def main() -> int:
     parser.add_argument("--compare-no-progress", action="store_true", help="OFFLINE: compare provider-local retry using synthetic stale replies over the receipt's complete universe")
     parser.add_argument("--compare-finmind-cadence", action="store_true", help="OFFLINE: pinned old owner versus bounded start-clock polling over the full recorded universe")
     parser.add_argument("--compare-independent-poll", type=Path, help="OFFLINE: captured previous acquisition owner versus source-owned retry while a competing source stalls")
+    parser.add_argument("--compare-mis-recovery", type=Path, help="OFFLINE: full-axis transport outage recovery against a captured acquisition owner; real retry clocks, no live SLO claim")
     parser.add_argument("--compare-finmind-decoder", type=Path, help="OFFLINE: captured prior owner versus complete retained FinMind response ingestion, validation and persistence")
     parser.add_argument("--finmind-payload", type=Path, help="Private retained original response bytes, required only for --compare-finmind-decoder")
     parser.add_argument("--baseline-quote-owner", type=Path, help="Captured pre-change quote owner for the complete local FinMind ingestion comparison")
     parser.add_argument("--compare-mis-pipeline", type=Path, help="OFFLINE: explicit prior quote owner versus retained complete MIS response parsing, fan-in and durable receipts")
     parser.add_argument("--mis-responses", type=Path, help="Integrity-checked retained original MIS response manifest; required with --compare-mis-pipeline")
     parser.add_argument("--profile-mis-local", action="store_true", help="Add provider-thread cProfile; profiling overhead is included, so keep off for ordinary timings")
+    parser.add_argument("--mis-simulated-http-delay-ms", type=float, default=0., help="OFFLINE retained MIS comparison only: explicit synthetic per-request wait, 0..100ms")
+    parser.add_argument("--mis-simulated-progress-delay-ms", type=float, default=0., help="OFFLINE retained MIS comparison only: explicit synthetic per-callback wait, 0..100ms")
     parser.add_argument("--baseline-acquisition-owner", type=Path, help="OFFLINE MIS comparison: also compare the captured pre-change fan-in owner")
     parser.add_argument("--retained-universe-owner", type=Path, help="OFFLINE MIS comparison: captured registry verifier matching the retained historical response contract; never bypasses its source hashes")
     parser.add_argument("--compare-stream-priority", action="store_true", help="OFFLINE: full-universe native-priority scheduling and opening price parity; not a live feed SLA")
@@ -1031,7 +1206,9 @@ def main() -> int:
     schedule_context = None
     if args.scheduled:
         if args.output or args.rounds != 2 or any(value for name, value in vars(args).items()
-                if name.startswith("compare_") or name in {"mis_only", "finmind_only", "profile_mis_local"}):
+                if name.startswith("compare_") or name in {"mis_only", "finmind_only", "profile_mis_local",
+                    "baseline_acquisition_owner", "retained_universe_owner", "baseline_quote_owner",
+                    "mis_responses", "finmind_payload", "mis_simulated_http_delay_ms", "mis_simulated_progress_delay_ms"}):
             parser.error("scheduled probe owns its providers, one round and append-only output paths")
         args.receipt, args.output, schedule_context = scheduled_probe_context(receipt_path=args.receipt)
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1055,6 +1232,8 @@ def main() -> int:
 
 
 def _network_or_comparison(args, parser, schedule_context=None) -> int:
+    probe_started = time.perf_counter()
+    probe_entered_at = datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")
     source_bytes = args.receipt.read_bytes()
     source = json.loads(source_bytes)
     session_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
@@ -1063,11 +1242,13 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
     symbols = list(source.get("requested_symbols") or source["rows"])
     if not symbols or len(set(symbols)) != len(symbols):
         parser.error("universe must be nonempty and unique")
-    comparisons = sum(bool(value) for value in (args.compare_no_progress, args.compare_finmind_cadence, args.compare_stream_priority, args.compare_callback_pipeline, args.compare_independent_poll, args.compare_finmind_decoder, args.compare_mis_pipeline))
+    comparisons = sum(bool(value) for value in (args.compare_no_progress, args.compare_finmind_cadence, args.compare_stream_priority, args.compare_callback_pipeline, args.compare_independent_poll, args.compare_mis_recovery, args.compare_finmind_decoder, args.compare_mis_pipeline))
     if bool(args.compare_mis_pipeline) != bool(args.mis_responses):
         parser.error("retained MIS comparison requires both baseline quote owner and response manifest")
     if args.profile_mis_local and not args.compare_mis_pipeline:
         parser.error("MIS local profiling requires the retained-response comparison")
+    if (args.mis_simulated_http_delay_ms or args.mis_simulated_progress_delay_ms) and not args.compare_mis_pipeline:
+        parser.error("simulated stage delays require the offline retained MIS comparison")
     if (args.baseline_acquisition_owner or args.retained_universe_owner) and not args.compare_mis_pipeline:
         parser.error("captured fan-in/registry owners require the offline retained MIS comparison")
     if bool(args.compare_finmind_decoder) != bool(args.finmind_payload):
@@ -1087,11 +1268,14 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
         result = (compare_mis_pipeline(symbols, source["parquet_root"], args.compare_mis_pipeline, args.mis_responses,
                     rounds=args.rounds, profile_local=args.profile_mis_local,
                     baseline_acquisition_file=args.baseline_acquisition_owner,
-                    retained_universe_file=args.retained_universe_owner)
+                    retained_universe_file=args.retained_universe_owner,
+                    simulated_http_delay_ms=args.mis_simulated_http_delay_ms,
+                    simulated_progress_delay_ms=args.mis_simulated_progress_delay_ms)
                   if args.compare_mis_pipeline else compare_finmind_decoder(symbols, source["parquet_root"], args.compare_finmind_decoder, args.finmind_payload,
                     rounds=args.rounds, baseline_quotes_path=args.baseline_quote_owner)
                   if args.compare_finmind_decoder else compare_independent_poll(symbols, source["parquet_root"], args.compare_independent_poll, rounds=args.rounds)
-                  if args.compare_independent_poll else compare_finmind_cadence(symbols, source["parquet_root"], rounds=args.rounds)
+                  if args.compare_independent_poll else compare_mis_recovery(symbols, source["parquet_root"], args.compare_mis_recovery, rounds=args.rounds)
+                  if args.compare_mis_recovery else compare_finmind_cadence(symbols, source["parquet_root"], rounds=args.rounds)
                   if args.compare_finmind_cadence else compare_callback_pipeline(symbols, args.compare_callback_pipeline, rounds=args.rounds)
                   if args.compare_callback_pipeline else compare_stream_priority(symbols, source["parquet_root"], rounds=args.rounds,
                     evidence_dir=args.output.parent / (args.output.stem + ".sources"))
@@ -1122,6 +1306,13 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
         providers = {"official_mis": mis_probe}
     else:
         providers = acquisition.configured_opening_providers(root)
+        if providers.get("finmind_snapshot") is acquisition.fetch_finmind_opening_prices:
+            def fresh_finmind_probe(names, values, progress):
+                # Empty receipt does not imply an empty source response cache.
+                # A requested network round must retain a new HTTP/body clock,
+                # while source-error backoff still cannot be forced through.
+                return acquisition.fetch_finmind_opening_prices(names, values, progress, force_network=True)
+            providers = {**providers, "finmind_snapshot": fresh_finmind_probe}
     if schedule_context is not None:
         providers = {name: provider for name, provider in providers.items() if name != "shioaji_shared"}
         args.rounds = 1
@@ -1130,32 +1321,77 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
     report["phase"] = quote_session_phase(datetime.now(ZoneInfo("Asia/Taipei")))
     if schedule_context:
         report["schedule"] = schedule_context
+    report["workflow_timing"] = {
+        "probe_entered_at_taipei": probe_entered_at,
+        "boundary": "network_probe_entry_includes_scope_env_prewarm_and_readback_before_final_report_write",
+    }
+    report["finmind_probe_policy"] = "fresh_http_per_round_preserve_provider_error_backoff"
+
+    def commit_report():
+        # A report cannot contain the duration of its own final durable write.
+        # Keep that last span in the workflow's captured stdout instead of
+        # silently dropping it or inventing a self-referential zero duration.
+        report["workflow_timing"]["total_before_final_report_write_ms"] = round(
+            (time.perf_counter() - probe_started) * 1000, 3)
+        writing = time.perf_counter()
+        _atomic_json(args.output, report)
+        committed = time.perf_counter()
+        print(json.dumps({"event": "probe_receipt_committed", "report": str(args.output),
+            "total_entry_to_report_committed_ms": round((committed - probe_started) * 1000, 3),
+            "final_report_write_ms": round((committed - writing) * 1000, 3),
+            "status": report["status"], "data_complete": report["data_complete"]},
+            ensure_ascii=False), flush=True)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="opening-source-probe-") as temporary, patch.dict(quotes.os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary}):
         report["mis_connection_prewarm"] = {"performed": False}
-        if not args.no_connection_prewarm and not args.finmind_only:
+        prewarm_error = []
+
+        def prewarm_mis():
+            if report["mis_connection_prewarm"]["performed"]:
+                return report["mis_connection_prewarm"].get("ready") is True
+            prewarm_started = time.perf_counter()
+            observation = {"performed": True,
+                "started_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")}
             try:
-                report["mis_connection_prewarm"] = quotes.warm_tw_mis_quote_client()
+                observation.update(quotes.warm_tw_mis_quote_client())
             except Exception as exc:
-                # A failed source prewarm must not cancel the independent race.
-                report["mis_connection_prewarm"] = {
+                prewarm_error.append(exc)
+                observation.update({
                     "ready": False, "error_type": type(exc).__name__,
                     "error_chain_types": quotes._tw_mis_transport_error_types(exc),
-                }
-        if args.mis_only and report["mis_connection_prewarm"].get("ready") is False:
+                })
+            observation["elapsed_ms"] = round((time.perf_counter() - prewarm_started) * 1000, 3)
+            report["mis_connection_prewarm"] = observation
+            return observation.get("ready") is True
+
+        prewarm_enabled = not args.no_connection_prewarm and "official_mis" in providers
+        if args.mis_only and prewarm_enabled and not prewarm_mis():
             # This is a diagnostic of a refused source, not an accepted full
             # market acquisition. Do not issue a burst after the single-symbol
             # transport probe already proved the endpoint unavailable.
             report.update(status="waiting_source", data_complete=False,
                           network_sweep_skipped="failed_single_symbol_transport_probe")
-            _atomic_json(args.output, report)
-            print(json.dumps(report, ensure_ascii=False), flush=True)
+            commit_report()
             return 0
-        if report["mis_connection_prewarm"].get("ready") is False:
-            # Bounded read-only diagnosis must not burst a refused endpoint.
-            # This does not change the production 09:00 all-source policy.
-            report["providers_dispatch_skipped"] = {"official_mis": "failed_single_symbol_transport_probe"}
-            providers = {name: provider for name, provider in providers.items() if name != "official_mis"}
+        if prewarm_enabled and not args.mis_only:
+            mis_source = providers["official_mis"]
+
+            def independent_mis(names, values, progress):
+                # The optional diagnostic guard belongs to MIS's own worker.
+                # Its slow/failed proof must not hold up independent sources.
+                # Reuse this one proof across rounds; never burst a source
+                # after its transport probe already failed.
+                if not prewarm_mis():
+                    report["providers_dispatch_skipped"] = {"official_mis": "failed_single_symbol_transport_probe"}
+                    error = RuntimeError("MIS diagnostic sweep skipped after failed transport proof")
+                    error.opening_transport_timing = {"mis_connection_prewarm": report["mis_connection_prewarm"],
+                        "network_sweep_skipped": "failed_single_symbol_transport_probe"}
+                    raise error from (prewarm_error[0] if prewarm_error else None)
+                return mis_source(names, values, progress)
+
+            providers = {**providers, "official_mis": independent_mis}
+            report["mis_prewarm_dispatch"] = "independent_provider_worker_not_global_barrier"
         for round_id in range(1, args.rounds + 1):
             quotes._TW_MIS_OPENING_CACHE_KEY = None
             quotes._TW_MIS_OPENING_CACHE.clear()
@@ -1166,12 +1402,26 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                 receipt.unlink()  # validated, exact temporary probe file only
             owner = acquisition.OpeningPriceFanIn()
             started = time.perf_counter()
+            if round_id == 1:
+                report["workflow_timing"]["preparation_before_first_fan_in_ms"] = round(
+                    (started - probe_started) * 1000, 3)
             try:
                 snapshot = owner.fetch(symbols, fallback, parquet_root=root, providers=providers, minimum_coverage=0.90, cache_reader=lambda: quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False))
                 quorum_ms = (time.perf_counter() - started) * 1000
                 drained = owner.wait_idle(timeout_seconds=40 if schedule_context else 30 if args.mis_only else 8)
             finally:
                 owner.close()
+            volatile_final = quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
+            volatile_positive = int(quotes.tw_session_open_observed_mask(volatile_final).sum())
+            persistence_pending = quotes._TW_MIS_OPENING_DIRTY
+            # The source workers have stopped. Reconstruct via the canonical
+            # receipt reader with an empty process cache: a file's existence
+            # alone does not prove every in-memory source fact was committed.
+            # Do not flush here; that would hide a failed producer's barrier.
+            quotes._TW_MIS_OPENING_CACHE_KEY = None
+            quotes._TW_MIS_OPENING_CACHE = {}
+            quotes._TW_MIS_OPENING_REQUESTED = set()
+            quotes._TW_MIS_OPENING_DIRTY = False
             final = quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
             provider_states = {name: dict(metric) for state in owner._sessions.values() for name, metric in state.metrics.items()}
             record = {"round": round_id, "initial_cached_open_count": 0, "quorum_return_ms": round(quorum_ms, 3), "all_sources_complete_ms": round((time.perf_counter() - started) * 1000, 3), "background_drained": drained, "positive_opens_at_quorum": int(quotes.tw_session_open_observed_mask(snapshot).sum()), "resolved_at_quorum": int((quotes.tw_session_open_observed_mask(snapshot) | quotes.tw_session_no_open_print_mask(snapshot)).sum()), "final_positive_opens": int(quotes.tw_session_open_observed_mask(final).sum()), "final_observed_no_prints": int(quotes.tw_session_no_open_print_mask(final).sum()), "quorum_timing": snapshot.transport_timing, "providers": provider_states, "final_conflicts": final.transport_timing.get("opening_conflict_count", 0)}
@@ -1182,6 +1432,20 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             else:
                 record["durable_receipt_retained"] = False
                 record["data_state"] = "missing_durable_receipt"
+            record.update(
+                volatile_final_positive_opens=volatile_positive,
+                input_persistence_pending_before_readback=persistence_pending,
+                readback_boundary="canonical_receipt_empty_process_cache_not_forced_os_disk_cache_miss",
+                unknown_open_count=len(symbols) - record["final_positive_opens"] - record["final_observed_no_prints"],
+                quorum_reached=record["resolved_at_quorum"] >= int(np.ceil(len(symbols) * .90)),
+                data_complete=record["durable_receipt_retained"] and record["final_positive_opens"] == len(symbols),
+                resolved_complete=record["durable_receipt_retained"] and record["final_positive_opens"] + record["final_observed_no_prints"] == len(symbols),
+                all_sources_complete_boundary="source_jobs_stopped_not_full_quote_coverage",
+                entry_to_round_readback_ms=round((time.perf_counter() - probe_started) * 1000, 3))
+            if record["durable_receipt_retained"]:
+                record["data_state"] = ("complete" if record["data_complete"] else
+                    "awaiting_first_print" if record["resolved_complete"] else
+                    "partial" if record["final_positive_opens"] + record["final_observed_no_prints"] else "waiting_source")
             _atomic_json(args.output, report)
             print(json.dumps({k: v for k, v in record.items() if k not in {"quorum_timing", "providers"}}, ensure_ascii=False), flush=True)
         telemetry = quotes._tw_mis_opening_receipt_path(session_date).with_suffix(".acquisition.jsonl")
@@ -1191,7 +1455,12 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             audit = opening_coverage_milestones(telemetry, session_date, symbols)
             report["provider_latency"] = audit["provider_latency"]
             report["provider_phase_latency"] = audit["provider_phase_latency"]
-            _atomic_json(args.output, report)
+    report["data_complete"] = bool(report["rounds"]) and all(row["data_complete"] for row in report["rounds"])
+    report["resolved_complete"] = bool(report["rounds"]) and all(row["resolved_complete"] for row in report["rounds"])
+    report["status"] = ("complete" if report["data_complete"] else
+        "awaiting_first_print" if report["resolved_complete"] else
+        "partial" if any(row["final_positive_opens"] + row["final_observed_no_prints"] for row in report["rounds"]) else "waiting_source")
+    commit_report()
     return 0
 
 

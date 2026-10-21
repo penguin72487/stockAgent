@@ -111,11 +111,14 @@ def causal_report_events(events,definitions,*,period_order=None,current_periods=
     return table.filter(pl.col("_rank")==pl.col("_latest")).select(events.columns)
 
 
-def prepare_annual_coordinates(path, names, symbols):
+def prepare_annual_coordinates(path, names, symbols, *, after=None):
     """One canonical source-part precedence policy for cold and uncached reads."""
-    table = pl.scan_parquet(path).filter(
+    scan = pl.scan_parquet(path).filter(
         pl.col("feature").is_in(names) & pl.col("symbol").is_in(symbols)
-    ).collect(engine="streaming")
+    )
+    if after is not None:
+        scan = scan.filter(pl.col("date") > after)
+    table = scan.collect(engine="streaming")
     if table.is_empty():
         return table.drop("_source_part")
     # Masked conflicts and approved NULL-only fills were resolved upstream.
@@ -165,6 +168,7 @@ class AnnualObservationEvents:
         if any(current[0]<=previous[1] for previous,current in zip(ranges,ranges[1:])):
             raise ValueError("annual observation streams overlap; merge by release date before the causal sweep")
         self.paths=[item[2] for item in ranges]
+        self._ranges = ranges
         periods=pl.scan_parquet(self.paths).select(
             pl.col("period").fill_null(pl.col("date").cast(pl.String)).alias("subject")).unique().collect(engine="streaming")["subject"]
         self.period_order={subject:i for i,subject in enumerate(sorted(periods.to_list()))}
@@ -213,7 +217,24 @@ class AnnualObservationEvents:
                 path, names, symbols, prepare, prepare_identity=identity, on_prepared=restore
             )
 
-    def iter_date_groups(self,definitions,symbols):
+    def iter_date_groups(self,definitions,symbols,*,after=None,initial_periods=None):
+        if after is not None:
+            # Restore every state-key floor, not only grouped report resets.
+            # Tail reads keep the original precedence/NULL policy and never
+            # replay an old revision over a newer report at the checkpoint.
+            current = {(symbol, key): self.period_order[subject]
+                       for symbol, key, subject in (initial_periods or [])}
+            for _, end, path in self._ranges:
+                if end <= after:
+                    continue
+                table = prepare_annual_coordinates(path,
+                    [definition["feature"] for definition in definitions], symbols, after=after)
+                if table.is_empty():
+                    continue
+                table = causal_report_events(table, definitions, period_order=self.period_order, current_periods=current)
+                for (day,), part in sorted(table.partition_by("date", as_dict=True).items()):
+                    yield day, part
+            return
         if self._cache is not None:
             yield from self._iter_cached(definitions, symbols)
             return
@@ -286,7 +307,8 @@ def combine_column_rows(rows,shape,symbol_block_size):
 
 def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *, resets=None,
                         max_block_bytes=128*1024**2, column_blocks=False, symbol_block_size=128,
-                        model_channel_policy="value_available_age_updated"):
+                        model_channel_policy="value_available_age_updated", resume_state=None,
+                        checkpoint_row=None, on_checkpoint=None):
     """One chronological sweep, O(events + emitted cells); no per-feature joins.
 
     A NULL report is a state barrier. A newer issuer report clears omitted
@@ -298,31 +320,54 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
     channel_count = 1 if model_channel_policy == "value_only" else 4
     names=[d["feature"] for d in definitions];width=len(names);count=len(symbols)
     fmap={n:i for i,n in enumerate(names)};smap={n:i for i,n in enumerate(symbols)}
+    state_keys = {definition["feature"]: definition.get("report_group") or definition["feature"]
+                  for definition in definitions}
     rules=[rule_from_spec(d) for d in definitions]
     ttl=np.asarray([r.carry_days for r in rules],dtype=np.int32)
     older=np.asarray([r.older_carry_days for r in rules],dtype=np.int32)
     change=np.asarray([date.fromisoformat(r.cadence_change_on).toordinal() if r.cadence_change_on else -1 for r in rules])
     values=np.full((count,width),np.nan,dtype=np.float64)
     observed=np.full((count,width),-1000000,dtype=np.int32)
+    from stockagent.data.causal_projection_state import CONTRACT as STATE_CONTRACT, sweep_identity, validate_state
+    start_row = 0
+    if resume_state is not None:
+        start_row = validate_state(resume_state, dates, symbols, definitions, model_channel_policy, symbol_block_size)
+        values = resume_state["values"].copy()
+        observed = resume_state["observed"].copy()
+    after = dates[start_row] if start_row else None
+    event_periods = {} if resume_state is None else {(s, key): subject for s, key, subject in resume_state["event_periods"]}
     groups=defaultdict(list)
     for i,definition in enumerate(definitions):
         if definition.get("report_group"):groups[definition["report_group"]].append(i)
     if isinstance(events,AnnualObservationEvents):
-        event_iterator=iter(events.iter_date_groups(definitions,symbols))
+        event_iterator=iter(events.iter_date_groups(definitions,symbols,
+            **({"after": after, "initial_periods": resume_state["event_periods"]} if resume_state is not None else {})))
     else:
         events=events.filter(pl.col("feature").is_in(names)&pl.col("symbol").is_in(symbols))
-        events=causal_report_events(events,definitions)
+        if after is not None:
+            events = events.filter(pl.col("date") > after)
+        subjects = (sorted(set(events["period"].fill_null(events["date"].cast(pl.String)).to_list())
+                           | set(event_periods.values())) if "period" in events.columns else [])
+        period_order = {subject: index for index, subject in enumerate(subjects)}
+        events=causal_report_events(events,definitions, period_order=period_order,
+            current_periods={(s, key): period_order[subject] for (s, key), subject in event_periods.items()})
         event_iterator=iter(sorted((k[0],v) for k,v in events.partition_by("date",as_dict=True).items()))
     next_event=next(event_iterator,None)
     resets_by_date={} if resets is None else resets.partition_by("date",as_dict=True,maintain_order=False)
+    if after is not None:
+        resets_by_date = {key: table for key, table in resets_by_date.items() if key[0] > after}
     group_mapping=pl.DataFrame({"feature":names,"report_group":[d.get("report_group") or "" for d in definitions]})
     reset_dates=iter(sorted(k[0] for k in resets_by_date));next_reset=next(reset_dates,None)
-    report_periods={}
+    report_periods={} if resume_state is None else {(s, key): subject for s, key, subject in resume_state["report_periods"]}
     rows=max(1,min(32,int(max_block_bytes)//max(1,count*width*channel_count*4)))
     block=[];available_count=np.zeros(width,dtype=np.int64)
     column_candidates=[set() for _ in range((count+symbol_block_size-1)//symbol_block_size)]
+    if resume_state is not None:
+        available_count = resume_state["available_count"].copy()
+        column_candidates = [set(columns) for columns in resume_state["column_candidates"]]
     block_bytes=0
-    for row,day in enumerate(dates):
+    for row in range(start_row, len(dates)):
+        day = dates[row]
         # Stored t-1 contains only facts ready by decision t. The final
         # completed day has no next ready decision and therefore no new facts.
         decision=dates[row+1] if row+1<len(dates) else None
@@ -350,6 +395,10 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
                             index=np.asarray(groups[group],dtype=np.int64)
                             values[smap[symbol],index]=np.nan;observed[smap[symbol],index]=-1000000
                 if table is not None and table.height:
+                    if "period" in table.columns:
+                        for symbol, feature, subject in table.select("symbol", "feature", "period").iter_rows():
+                            key = (symbol, state_keys[feature])
+                            event_periods[key] = max(event_periods.get(key, ""), subject or released.isoformat())
                     if report_periods and "period" in table.columns:
                         latest=pl.DataFrame([{"symbol":s,"report_group":g,"_period_floor":p} for (s,g),p in report_periods.items()])
                         table=table.join(group_mapping,on="feature",validate="m:1").join(latest,on=["symbol","report_group"],how="left",validate="m:1").filter(
@@ -403,7 +452,18 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
                 block=[];block_bytes=0
             block.append(compact);block_bytes+=new_bytes
         else:block.append(matrix.reshape(count,width*channel_count))
-        if len(block)==(32 if column_blocks else rows) or row+1==len(dates):
+        if row + 1 == checkpoint_row:
+            if decision is None or on_checkpoint is None:
+                raise ValueError("causal checkpoint needs a real ready decision and callback")
+            # Callback consumes arrays synchronously, before the next release
+            # mutates them. Float32 output is never used to reconstruct state.
+            on_checkpoint({"contract": STATE_CONTRACT, "row": row + 1, "decision": decision.isoformat(),
+                "identity": sweep_identity(symbols, definitions, model_channel_policy, symbol_block_size),
+                "values": values, "observed": observed, "available_count": available_count,
+                "report_periods": [[s, key, value] for (s, key), value in sorted(report_periods.items())],
+                "event_periods": [[s, key, value] for (s, key), value in sorted(event_periods.items())],
+                "column_candidates": [sorted(columns) for columns in column_candidates]})
+        if len(block)==(32 if column_blocks else rows) or row+1==len(dates) or row+1==checkpoint_row:
             output=combine_column_rows(block,(0,count,width*channel_count),symbol_block_size) if column_blocks else np.stack(block)
             yield row+1-len(block),output,available_count.copy()
             block=[];block_bytes=0
@@ -420,10 +480,13 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
     if out.exists():raise FileExistsError("new ABI requires a fresh panel/output root")
     out.mkdir(parents=True);observations=out/"observations";observations.mkdir()
     annual_root=out/"annual_events";annual_root.mkdir();annual_writers={};annual_paths={}
-    public=source/"features/tw_public_stock_daily.parquet"
-    rules=[n for n in pl.scan_parquet(public).collect_schema() if n.startswith("_twpub_")]
+    from stockagent.data import partitioned_parquet
+    public=partitioned_parquet.resolve_source(source/"features/tw_public_stock_daily.parquet")
+    public_source=partitioned_parquet.ParquetSource(public)
+    rules=[n for n in public_source.schema.names if n.startswith("_twpub_")]
     rule_path=out/"execution_rules.parquet"
-    pl.scan_parquet(public).select("date","symbol",*rules).sink_parquet(rule_path,compression="zstd")
+    public_source.scan().select("date","symbol",*rules).sink_parquet(rule_path,compression="zstd")
+    public_source.verify()
     if "tw_corporate_action_entitlements.summary.json" in manifest["files"]:attach_formal_companions(source,out,manifest)
     generated={"base_config":str(base_config.resolve()),"experiment_name":"tw-day-trade-nullable-factorized-panel-20261004-v1",
         "runner":{"output_dir":str(node_root(ROOT)/"artifacts/markets"/out.parent.name/"training"),"resume":False,"post_train_infer":False},
@@ -528,7 +591,8 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
                             commit(fill.select("date","symbol","feature","value","period"),[definitions[primary_feature]],"revised missing-only "+key)
                         continue
         else:
-            table=pl.scan_parquet(public).select("date","symbol",pl.col(spec["source_column"]).alias("value")).collect(engine="streaming")
+            table=public_source.scan().select("date","symbol",pl.col(spec["source_column"]).alias("value")).collect(engine="streaming")
+            public_source.verify()
             if rule.scope=="market":
                 calendar=table.select("date").unique()
                 table,bad=collapse_conflicting_observations(table.filter(pl.col("value").is_finite()),["date"])
@@ -637,7 +701,7 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
     lifecycle=np.full((len(dates),len(symbols)),1000000,dtype=np.int32)
     dmap={d:i for i,d in enumerate(dates)}
     for s,symbol in enumerate(symbols):
-        raw=pl.read_parquet(source/"stocks"/f"{symbol}_features.parquet",columns=["date","lifecycle_episode_id"])
+        raw=pl.from_arrow(partitioned_parquet.read_table(source/"stocks"/f"{symbol}_features.parquet",columns=["date","lifecycle_episode_id"]))
         raw=raw.with_columns(pl.col("date").cast(pl.Date))
         starts=raw.group_by("lifecycle_episode_id").agg(pl.col("date").min().alias("start"))
         for day,start in raw.join(starts,on="lifecycle_episode_id",validate="m:1").select("date","start").iter_rows():

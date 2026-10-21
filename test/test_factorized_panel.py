@@ -11,7 +11,6 @@ from stockagent.data.factorized_panel import CONTRACT, attach_factorized_feature
 from stockagent.data.panel import PanelData
 from stockagent.training.checkpoint_contract import _panel_array_content_fingerprint
 from stockagent.training.dataset import CrossSectionalDataset
-from stockagent.training.trainer import _fit_masked_training_feature_rms, _panel_training_transform_fingerprint
 from stockagent.training.windowed import dataset_to_windowed_tensors
 
 
@@ -271,7 +270,54 @@ def example(tmp_path):
     return panel, path, dense
 
 
+@pytest.mark.parametrize("start,stop", [(0, 2), (1, 4), (3, 7)])
+def test_verified_end_keeps_factorized_prefix_and_training_slabs_lazy(tmp_path, start, stop):
+    from stockagent.data.panel import slice_panel_end, slice_panel_start
+    from stockagent.training.trainer import _fit_masked_training_feature_rms
+    panel, path, dense = example(tmp_path)
+    panel = attach_factorized_features(panel, path)
+    original = panel.features
+    original.max_slab_bytes = dense[:1].nbytes
+    with pytest.raises(MemoryError, match="slab needs"):
+        original[:stop]
+    trimmed = slice_panel_end(panel, panel.dates[stop - 1])
+    trimmed = slice_panel_start(trimmed, panel.dates[start])
+    expected = dense[start:stop]
+    assert trimmed.features._cache is original._cache
+    assert original._cache.misses == 0
+    assert original.shape == dense.shape and trimmed.features.shape == expected.shape
+    assert np.shares_memory(trimmed.features.base, original.base)
+    assert np.shares_memory(trimmed.features.common, original.common)
+    assert trimmed.features.content_fingerprint != original.content_fingerprint
+    assert _panel_array_content_fingerprint(trimmed, "features", trimmed.features) == trimmed.features.content_fingerprint
+    assert trimmed.features.content_fingerprint == original.slice_dates(start, stop).content_fingerprint
+    assert slice_panel_end(trimmed, trimmed.dates[-1]) is trimmed
+    for row in range(len(expected)):
+        actual = trimmed.features.as_torch().slab(row, 1).stock_chunk(0, 3)
+        np.testing.assert_array_equal(actual.numpy().view(np.uint32), expected[row:row + 1].view(np.uint32))
+    selected = trimmed.features.subset_symbols(np.array([2, 0]))
+    np.testing.assert_array_equal(selected[-1].view(np.uint32), dense[stop - 1, [2, 0]].view(np.uint32))
+    assert selected.content_fingerprint != original.subset_symbols(np.array([2, 0])).content_fingerprint
+    trimmed.features.max_slab_bytes = dense.nbytes
+    rows = np.array([len(expected) - 1, 0, len(expected) - 1])
+    columns, values = trimmed.features.compact_statistics_rows(rows)
+    np.testing.assert_array_equal(values.view(np.uint32), expected[rows][..., columns].view(np.uint32))
+    rebuilt = np.zeros_like(expected[rows])
+    for row_positions, stocks, columns, values in trimmed.features.compact_transfer_rectangles(rows):
+        rebuilt[np.ix_(row_positions, stocks, columns)] = values
+    np.testing.assert_array_equal(rebuilt[..., 2:6].view(np.uint32), expected[rows, :, 2:6].view(np.uint32))
+    for candidate in (trimmed.features, expected):
+        result = _fit_masked_training_feature_rms(candidate, trimmed.alive_mask,
+            np.arange(len(expected)), epsilon=1e-8, minimum_dates=1)
+        if candidate is trimmed.features:
+            actual_rms = result
+        else:
+            for actual, reference in zip(actual_rms, result, strict=True):
+                np.testing.assert_array_equal(actual, reference)
+
+
 def test_bounded_reads_common_broadcast_masks_and_fingerprint(tmp_path, capsys):
+    from stockagent.training.trainer import _panel_training_transform_fingerprint
     panel, path, dense = example(tmp_path)
     attach_factorized_features(panel, path)
     assert panel.features._cache.misses == 0, "the summary must not expand or read blocks"
@@ -285,6 +331,84 @@ def test_bounded_reads_common_broadcast_masks_and_fingerprint(tmp_path, capsys):
     assert panel.features._cache.bytes <= panel.features._cache.budget_bytes
     assert panel.features.shape[-1] == len(panel.feature_names) == 10
     assert "[panel-model] features (10): base=2, individual=4, common=4" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", [0.25, float("nan"), float("inf")])
+def test_futures_factorized_attachment_rejects_unavailable_cash_open(tmp_path, value):
+    panel, path, _ = example(tmp_path)
+    panel.feature_names[1] = "next_session_open_gap_logret"
+    panel.features[:, :, 1] = 0
+    panel.features[-1, -1, 1] = value
+    with pytest.raises(ValueError, match="08:45 futures.*explicitly zero-filled"):
+        attach_factorized_features(panel, path, execution_mode="tw_stock_context_futures_portfolio")
+    assert isinstance(panel.features, np.ndarray)
+
+
+def test_futures_factorized_clock_is_admitted_by_canonical_panel_builder(tmp_path, monkeypatch):
+    import train
+    panel, path, dense = example(tmp_path)
+    name = "next_session_open_gap_logret"
+    panel.feature_names[1] = name
+    panel.features[:, :, 1] = dense[:, :, 1] = 0
+    manifest = json.loads(path.read_text())
+    manifest["base_feature_names"][1] = name
+    path.write_text(json.dumps(manifest))
+    config = SimpleNamespace(data=SimpleNamespace(parquet_root="unused", factorized_feature_manifest=str(path),
+        factorized_transfer_mode="dense_cpu", factorized_host_cache_bytes=1),
+        trading=SimpleNamespace(execution_mode="tw_stock_context_futures_portfolio"))
+    monkeypatch.setattr(train, "_build_panel_kwargs", lambda _: {})
+    attached = train._build_panel_rank_coordinated(lambda *_a, **_k: panel, config, "none")
+    np.testing.assert_array_equal(attached.features[:], dense)
+    assert attached.features.content_fingerprint["execution_clock"] == "prior_cash_session_before_0845_zero_open_gap_v1"
+    assert manifest["historical_point_in_time"] is False
+
+
+def test_factorized_attachment_rejects_other_execution_modes(tmp_path):
+    panel, path, _ = example(tmp_path)
+    with pytest.raises(ValueError, match="require tw_day_trade or stock-context futures"):
+        attach_factorized_features(panel, path, execution_mode="crypto_perpetual")
+
+
+def test_factorized_futures_action_and_parameter_gradients_match_dense(tmp_path):
+    import copy
+    from stockagent.models.financial_transformer_futures import FinancialTransformerFuturesModel
+    from stockagent.data.tw_stock_context_futures_portfolio import TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS
+    panel, path, dense = example(tmp_path)
+    attach_factorized_features(panel, path, execution_mode="tw_stock_context_futures_portfolio")
+    torch.manual_seed(42)
+    model = FinancialTransformerFuturesModel(lookback=4, num_features=10, num_symbols=3,
+        d_model=8, attention_mode="market_token", num_market_tokens=2, temporal_heads=2,
+        temporal_layers=1, temporal_pooling="last", temporal_query_mode="last_only",
+        use_symbol_pos=False, portfolio_mode="long_short", portfolio_output_mode="score_entmax_log_cash",
+        center_long_short_logits=False, futures_denomination_hard_projection=False,
+        futures_margin_budget_output=True, futures_margin_amount_context=True,
+        futures_causal_account_policy=True, feature_bottleneck_dim=0, dropout=0., return_aux=False).eval()
+    oracle = copy.deepcopy(model)
+    candidates = torch.zeros(2, 1936, len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS) + 5)
+    candidates[:, :2, 1:18] = torch.randn(2, 2, 17)
+    candidates[..., len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS) - 1] = 1004
+    candidates[..., -5:] = torch.tensor([100., .1, .75, .02, 1.])
+    candidate_mask = torch.zeros(2, 1936, dtype=torch.bool)
+    candidate_mask[:, :2] = True
+    context = dict(candidate_features=candidates, candidate_mask=candidate_mask)
+    mask = torch.ones(2, 3, dtype=torch.bool)
+    x = torch.tensor(dense[1:6]).unfold(0, 4, 1).permute(0, 3, 1, 2)
+    expected = oracle(x, mask, portfolio_context=context)
+    actual = model.forward_from_panel_slab(panel.features.as_torch().slab(1, 5), mask,
+        return_aux=False, portfolio_context=context)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    weights = torch.randn_like(actual)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    nonzero = 0
+    for (name, p), (other_name, q) in zip(model.named_parameters(), oracle.named_parameters(), strict=True):
+        assert name == other_name
+        assert (p.grad is None) == (q.grad is None), name
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), name
+            torch.testing.assert_close(p.grad, q.grad, rtol=3e-4, atol=3e-5, msg=name)
+            nonzero += int(p.grad.abs().sum() > 0)
+    assert nonzero > 10
 
 
 def test_live_date_projection_is_bitwise_equal_and_preserves_base_cache(tmp_path):
@@ -426,6 +550,7 @@ def test_host_cache_config_keeps_semantic_resume_unchanged(tmp_path):
 
 
 def test_canonical_windowed_and_rms_parity(tmp_path):
+    from stockagent.training.trainer import _fit_masked_training_feature_rms
     panel, path, dense = example(tmp_path)
     dense_panel = replace(panel, features=dense, feature_names=["f"+str(i) for i in range(10)])
     attach_factorized_features(panel, path)
@@ -583,6 +708,7 @@ def test_streamed_stock_encoder_raw_basis_shared_kernel_forward_gradient_parity(
 
 
 def test_two_axis_storage_reads_and_canonical_slab_metadata(tmp_path):
+    from stockagent.training.trainer import _fit_masked_training_feature_rms
     panel,path,dense=example(tmp_path);manifest=json.loads(path.read_text())
     replacements=[]
     for block in manifest["blocks"]:
@@ -615,6 +741,7 @@ def test_two_axis_storage_reads_and_canonical_slab_metadata(tmp_path):
 
 
 def test_lossless_zero_column_codec_preserves_negative_zero_and_dense_statistics(tmp_path):
+    from stockagent.training.trainer import _fit_masked_training_feature_rms
     panel,path,dense=example(tmp_path)
     manifest=json.loads(path.read_text())
     dense[2,0,2]=-0.0

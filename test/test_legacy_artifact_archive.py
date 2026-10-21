@@ -316,6 +316,62 @@ def test_full_cold_recovery_progress_preserves_all_three_independent_steps(tmp_p
     assert (source / 'fold_01/checkpoint_best.pt').exists()
 
 
+def test_existing_encoding_recovery_checks_cold_and_originals_without_second_tree(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / "packed"
+    released = publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    encoding = spec.stage_root / spec.dataset / "archive"
+    monkeypatch.setattr(archive_module, "fetch_packed_snapshot",
+                        lambda *a, **kw: pytest.fail("allocated another complete recovery tree"))
+    events = []
+    proof = archive_module.verify_cold_archive(
+        spec, packed, reuse_encoded_archive=encoding, progress=events.append)
+    assert proof["snapshot_id"] == released["snapshot_id"]
+    assert proof["cold_verified"] and proof["decoded_originals_verified"]
+    assert proof["verification_scratch_created"] is False
+    assert proof["cold_reconstruction"]["independently_reconstructed_files"] == 3
+    assert proof["files"] == 2
+    assert {row["recovery_step"] for row in events} == {
+        "independent-cold-reconstruction", "decode-originals"}
+    assert encoding.is_dir() and source.is_dir()
+
+
+@pytest.mark.parametrize("damage", ["cold", "encoding", "changed_during_decode", "foreign_path"])
+def test_existing_encoding_never_substitutes_for_exact_recovery(tmp_path, monkeypatch, damage):
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / "packed"
+    publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    encoding = spec.stage_root / spec.dataset / "archive"
+    resolved = resolve_latest_packed(packed, spec.dataset)
+    if damage == "cold":
+        item = resolved.manifest["archive"]["objects"][0]
+        payload = packed / item["relpath"]
+        raw = payload.read_bytes()
+        payload.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+    elif damage == "foreign_path":
+        foreign = tmp_path / "foreign"
+        import shutil
+        shutil.copytree(encoding, foreign)
+        encoding = foreign
+    else:
+        payload = next((encoding / "payload").rglob("*.raw"))
+        def mutate():
+            raw = payload.read_bytes()
+            payload.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+        if damage == "encoding":
+            mutate()
+        else:
+            original = archive_module.verify_archive_directory
+            def decode_then_mutate(*a, **kw):
+                result = original(*a, **kw)
+                mutate()
+                return result
+            monkeypatch.setattr(archive_module, "verify_archive_directory", decode_then_mutate)
+    with pytest.raises(SnapshotError):
+        archive_module.verify_cold_archive(spec, packed, reuse_encoded_archive=encoding)
+    assert source.is_dir() and encoding.is_dir()
+
+
 @pytest.mark.parametrize("redirect", [False, True])
 def test_verification_workspace_rejects_cold_overlap_or_symlinks(tmp_path, redirect):
     spec, artifact_root, source = _fixture(tmp_path)
@@ -426,6 +482,38 @@ def test_guarded_stage_refuses_missing_d_mount_before_writes(tmp_path: Path, mon
     assert (source / "fold_01/checkpoint_best.pt").read_bytes() == b"legacy incomplete checkpoint"
 
 
+def test_benchmark_d_scratch_keeps_the_full_source_budget_and_32_gib_reserve(tmp_path, monkeypatch):
+    from test_local_offline_artifact_retirement import _completed_benchmark
+    import stockagent.data_sync.cold_primary as primary
+    spec, artifacts, original = _fixture(tmp_path)
+    source = artifacts / 'benchmarks/suite/case'
+    source.parent.mkdir(parents=True)
+    original.rename(source)
+    _completed_benchmark(source)
+    stage = tmp_path / 'guarded-d-scratch'
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', stage)
+    spec = replace(spec, relative_root='benchmarks/suite/case', stage_root=stage,
+                   capture_contract=archive_module.MANUAL_WSL_CAPTURE_CONTRACT,
+                   manual_capture_min_stable_hours=12)
+    guards = []
+    monkeypatch.setattr(primary, '_check_d_primary_mount', lambda root: guards.append(root))
+    monkeypatch.setattr(archive_module.shutil, 'disk_usage', lambda root:
+                        type('Usage', (), {'free': 32 * 1024**3})())
+    with pytest.raises(SnapshotError, match='source-size budget plus 32 GiB reserve'):
+        prepare_archive(spec, artifacts, manual_capture=True)
+    assert guards == [Path('/srv/stockagent-packed')]
+    assert not stage.exists() and source.is_dir()
+
+
+def test_benchmark_scratch_cannot_capture_an_arbitrary_legacy_d_source(tmp_path, monkeypatch):
+    spec, artifacts, source = _fixture(tmp_path)
+    stage = tmp_path / 'benchmark-only-scratch'
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', stage)
+    with pytest.raises(SnapshotError, match='completed-case scope'):
+        prepare_archive(replace(spec, stage_root=stage), artifacts)
+    assert not stage.exists() and source.is_dir()
+
+
 def test_legacy_exact_recovery_accepts_hardlink_ctime_drift(tmp_path):
     spec, artifact_root, source = _fixture(tmp_path)
     payload = source / "fold_01/checkpoint_best.pt"
@@ -474,3 +562,164 @@ def test_legacy_ctime_fix_never_ignores_recoverable_metadata_or_bytes(tmp_path, 
         payload.chmod(0o400 if info.st_mode & 0o7777 == 0o600 else 0o600)
     with pytest.raises(SnapshotError, match="source differs"):
         verify_archive_directory(spec.stage_root / spec.dataset / "archive", source)
+
+
+@pytest.mark.parametrize("codec", ["raw", "gzip", "zstd"])
+@pytest.mark.parametrize("repeats", [0, 1_200_000], ids=["empty", "multi-block"])
+def test_single_input_pass_preserves_both_complete_hashes(tmp_path, codec, repeats, monkeypatch):
+    import hashlib
+    payload = b"archive-proof\0" * repeats
+    source, encoding = tmp_path / "source", tmp_path / "encoded"
+    source.write_bytes(payload)
+    archive_module._encode_one(source, encoding, codec)
+    encoded_bytes = encoding.read_bytes()
+    observed = []
+    read = archive_module._HashingReader.read
+
+    def observe(self, size=archive_module.COPY_CHUNK):
+        block = read(self, size)
+        observed.append(len(block))
+        return block
+
+    monkeypatch.setattr(archive_module._HashingReader, "read", observe)
+    actual = archive_module._encoded_original_hashes(encoding, codec)
+    assert actual == (hashlib.sha256(encoded_bytes).hexdigest(), len(encoded_bytes),
+                      hashlib.sha256(payload).hexdigest(), len(payload))
+    assert sum(observed) == len(encoded_bytes)  # Not two reads of the encoding.
+    assert max(observed) <= archive_module.COPY_CHUNK
+    assert archive_module._decode_hash(encoding, codec) == actual[2:]
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+@pytest.mark.parametrize("damage", ["truncated", "corrupt", "trailing"])
+def test_single_pass_rejects_invalid_complete_stream(tmp_path, codec, damage):
+    source, encoding = tmp_path / "source", tmp_path / "encoded"
+    source.write_bytes(b"must decode completely\0" * 100_000)
+    archive_module._encode_one(source, encoding, codec)
+    payload = encoding.read_bytes()
+    if damage == "truncated":
+        payload = payload[:-3]
+    elif damage == "corrupt":
+        payload = b"invalid compression header" + payload[20:]
+    else:
+        payload += b"not another valid compressed frame"
+    encoding.write_bytes(payload)
+    with pytest.raises(SnapshotError, match="decode failed"):
+        archive_module._encoded_original_hashes(encoding, codec)
+
+
+@pytest.mark.parametrize("codec", ["raw", "gzip", "zstd"])
+@pytest.mark.parametrize("damage", ["replace", "mtime", "inplace"])
+def test_single_pass_keeps_fd_and_path_generation_fences(tmp_path, codec, damage, monkeypatch):
+    source, encoding = tmp_path / "source", tmp_path / "encoded"
+    source.write_bytes(b"unchanged original" * 1000)
+    archive_module._encode_one(source, encoding, codec)
+    read = archive_module._HashingReader.read
+    changed = False
+
+    def mutate(self, size=archive_module.COPY_CHUNK):
+        nonlocal changed
+        block = read(self, size)
+        if not changed and block:
+            changed = True
+            if damage == "replace":
+                replacement = encoding.with_suffix(".replacement")
+                replacement.write_bytes(encoding.read_bytes())
+                os.replace(replacement, encoding)
+            elif damage == "mtime":
+                info = encoding.stat()
+                os.utime(encoding, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+            else:
+                with encoding.open("ab") as output:
+                    output.write(b"\0")
+        return block
+
+    monkeypatch.setattr(archive_module._HashingReader, "read", mutate)
+    with pytest.raises(SnapshotError, match="changed during verification|decode failed"):
+        archive_module._encoded_original_hashes(encoding, codec)
+
+
+@pytest.mark.parametrize("kind", ["fifo", "directory", "symlink"])
+def test_single_pass_never_blocks_on_nonregular_or_redirected_payload(tmp_path, kind):
+    path = tmp_path / "encoded"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "directory":
+        path.mkdir()
+    else:
+        target = tmp_path / "foreign"
+        target.write_bytes(b"foreign")
+        path.symlink_to(target)
+    with pytest.raises((SnapshotError, OSError)):
+        archive_module._encoded_original_hashes(path, "raw")
+
+
+def test_single_pass_zstd_failure_closes_feeder_and_all_owned_descriptors(tmp_path, monkeypatch):
+    import threading
+    source, encoding = tmp_path / "source", tmp_path / "encoded"
+    source.write_bytes(os.urandom(2 * 1024**2))
+    archive_module._encode_one(source, encoding, "zstd")
+    before = {thread.ident for thread in threading.enumerate()}
+    original_sha256 = archive_module.hashlib.sha256
+    original_open = archive_module.os.open
+    opened = []
+
+    def observe_open(path, flags, *args, **kwargs):
+        fd = original_open(path, flags, *args, **kwargs)
+        if Path(path) == encoding:
+            opened.append(fd)
+        return fd
+
+    class BrokenHash:
+        def update(self, _block):
+            raise ValueError("injected hash consumer failure")
+
+    calls = 0
+
+    def fail_original():
+        nonlocal calls
+        calls += 1
+        return BrokenHash() if calls == 2 else original_sha256()
+
+    monkeypatch.setattr(archive_module.hashlib, "sha256", fail_original)
+    monkeypatch.setattr(archive_module.os, "open", observe_open)
+    with pytest.raises(ValueError, match="injected hash consumer failure"):
+        archive_module._encoded_original_hashes(encoding, "zstd")
+    assert {thread.ident for thread in threading.enumerate()} == before
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_single_pass_hashes_all_concatenated_members(tmp_path, codec):
+    import hashlib
+    parts = [b"first complete member\0" * 1024, b"second complete member\0" * 4096]
+    encodings = []
+    for index, payload in enumerate(parts):
+        source, encoded = tmp_path / f"source-{index}", tmp_path / f"encoded-{index}"
+        source.write_bytes(payload)
+        archive_module._encode_one(source, encoded, codec)
+        encodings.append(encoded.read_bytes())
+    path = tmp_path / "concatenated"
+    path.write_bytes(b"".join(encodings))
+    result = archive_module._encoded_original_hashes(path, codec)
+    assert result == (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size,
+                      hashlib.sha256(b"".join(parts)).hexdigest(), sum(map(len, parts)))
+
+
+def test_single_pass_zstd_rejects_input_failure_even_after_complete_frame(tmp_path, monkeypatch):
+    source, encoding = tmp_path / "source", tmp_path / "encoded"
+    source.write_bytes(b"complete frame before IO failure" * 1024)
+    archive_module._encode_one(source, encoding, "zstd")
+    read = archive_module._HashingReader.read
+
+    def fail_at_end(self, size=archive_module.COPY_CHUNK):
+        block = read(self, size)
+        if not block:
+            raise OSError("injected encoded input failure")
+        return block
+
+    monkeypatch.setattr(archive_module._HashingReader, "read", fail_at_end)
+    with pytest.raises(OSError, match="injected encoded input failure"):
+        archive_module._encoded_original_hashes(encoding, "zstd")

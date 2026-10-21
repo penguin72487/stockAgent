@@ -1,0 +1,4 @@
+# v1 was rejected before any formal training by a near-zero Gram oracle.
+# v2 binds the corrected precision-floor fallback to a fresh source and root.
+base_spec: tw_scratch_gradient_frontier_20261020_v1.yaml
+output_root: artifacts/markets/tw_scratch_gradient_frontier_20261020_v2

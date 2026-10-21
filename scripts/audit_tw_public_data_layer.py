@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.config import ExperimentConfig, load_config
+from stockagent.data import partitioned_parquet as parquet_sources
 from stockagent.data.panel import (
     DAY_TRADE_OPEN_GAP_FEATURE,
     _normalize_feature_patterns,
@@ -81,6 +82,25 @@ BASE_FEATURES = {
     "lower_shadow",
     "shadow_imbalance",
 }
+
+
+def _scan_parquet(path: Path):
+    """Keep legacy pushdown; audit an explicit manifest as one verified copy.
+
+    The audit-wide generation fence additionally covers the manifest and every
+    immutable member. No later lazy collect can read a mixed member generation.
+    """
+    path = parquet_sources.resolve_source(path)
+    if path.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+        return pl.from_arrow(parquet_sources.read_table(path)).lazy()
+    return pl.scan_parquet(path)
+
+
+def _read_parquet(path: Path, *, columns=None):
+    path = parquet_sources.resolve_source(path)
+    if path.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+        return pl.from_arrow(parquet_sources.read_table(path, columns=columns))
+    return pl.read_parquet(path, columns=columns)
 
 # Availability classes are stated relative to a regular-close portfolio
 # decision.  The opening price is observable before that decision.  All other
@@ -406,7 +426,7 @@ def _benchmark_sessions(
     panel_start_date: str | None = None,
 ) -> np.ndarray:
     path = root / f"{benchmark_name}_features.parquet"
-    if not path.exists():
+    if not parquet_sources.source_exists(path):
         raise FileNotFoundError(f"benchmark parquet is missing: {path}")
     if public_dir is None:
         if public_feature_path is None:
@@ -425,7 +445,7 @@ def _benchmark_sessions(
         )
     else:
         benchmark_first = (
-            pl.scan_parquet(path)
+            _scan_parquet(path)
             .select(_date_column_expr("date").alias("date"))
             .drop_nulls("date")
             .select(pl.col("date").min())
@@ -445,14 +465,14 @@ def audit_delisted_universe_coverage(
     benchmark_sessions: np.ndarray,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Finding]]:
     canonical_symbols = {
-        path.name.removesuffix("_features.parquet")
-        for path in parquet_root.glob("*_features.parquet")
-        if not path.name.removesuffix("_features.parquet").endswith(("_TW", "_TWO"))
+        parquet_sources.logical_name(path).removesuffix("_features.parquet")
+        for path in parquet_sources.discover_sources(parquet_root)
+        if not parquet_sources.logical_name(path).removesuffix("_features.parquet").endswith(("_TW", "_TWO"))
     }
     synthetic_archives = sorted(
         path.name
-        for path in parquet_root.glob("*_features.parquet")
-        if path.name.removesuffix("_features.parquet").endswith(("_TW", "_TWO"))
+        for path in parquet_sources.discover_sources(parquet_root)
+        if parquet_sources.logical_name(path).removesuffix("_features.parquet").endswith(("_TW", "_TWO"))
     )
     profiles: list[dict[str, Any]] = []
     missing_rows: list[dict[str, Any]] = []
@@ -468,11 +488,11 @@ def audit_delisted_universe_coverage(
         if cached is not None:
             return cached
         symbol_path = parquet_root / f"{symbol}_features.parquet"
-        if not symbol_path.exists() or "date" not in pq.read_schema(symbol_path).names:
+        if not parquet_sources.source_exists(symbol_path) or "date" not in parquet_sources.read_schema(symbol_path).names:
             result = (None, None)
         else:
             dates = (
-                pl.scan_parquet(symbol_path)
+                _scan_parquet(symbol_path)
                 .select(_date_column_expr("date").alias("date"))
                 .drop_nulls("date")
                 .select(
@@ -618,13 +638,13 @@ def _audit_quote_file(
     benchmark_sessions: np.ndarray,
     source_sessions: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    symbol = path.name.removesuffix("_features.parquet")
+    symbol = parquet_sources.logical_name(path).removesuffix("_features.parquet")
     security_type = classify_tw_stock_or_etf(symbol)
     required = ("date", "open", "max", "min", "close", "adjclose", "Trading_Volume")
     try:
-        metadata = pq.read_metadata(path)
-        schema = set(metadata.schema.to_arrow_schema().names)
-        raw_source = (metadata.metadata or {}).get(b"stockagent.source", b"")
+        snapshot = parquet_sources.ParquetSource(path)
+        schema = set(snapshot.schema.names)
+        raw_source = (snapshot.schema.metadata or {}).get(b"stockagent.source", b"")
         source = raw_source.decode("utf-8", errors="replace") if raw_source else ""
         missing = [column for column in required if column not in schema]
         if missing:
@@ -744,7 +764,7 @@ def _audit_quote_file(
                 .str.strip_chars()
                 .alias("official_listing_evidence")
             )
-        frame = pl.read_parquet(path, columns=read_columns).select(select_expressions)
+        frame = pl.from_arrow(snapshot.table(columns=read_columns)).select(select_expressions)
     except Exception as exc:
         return {
             "symbol": symbol,
@@ -1323,7 +1343,7 @@ def audit_quote_source_files(
     require_official: bool = False,
     source_sessions: np.ndarray | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list[Finding]]:
-    paths = sorted(parquet_root.glob("*_features.parquet"))
+    paths = parquet_sources.discover_sources(parquet_root)
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
         profiles = list(
             executor.map(
@@ -1748,8 +1768,8 @@ def audit_official_symbol_build(
                 manifest["code"].cast(pl.Utf8, strict=False).drop_nulls().to_list()
             )
             parquet_codes = {
-                item.name.removesuffix("_features.parquet")
-                for item in parquet_root.glob("*_features.parquet")
+                parquet_sources.logical_name(item).removesuffix("_features.parquet")
+                for item in parquet_sources.discover_sources(parquet_root)
             }
             manifest_sources = set(manifest["source"].drop_nulls().to_list())
             manifest_fallback_symbols = int(
@@ -1795,9 +1815,9 @@ def audit_official_symbol_build(
     actual_listing_boundary_quarantined_rows = 0
     actual_unverified_extreme_quarantined_rows = 0
     lineage_columns_valid = True
-    for quote_path in parquet_root.glob("*_features.parquet"):
+    for quote_path in parquet_sources.discover_sources(parquet_root):
         try:
-            quote_schema = set(pq.read_schema(quote_path).names)
+            quote_schema = set(parquet_sources.read_schema(quote_path).names)
             required_lineage_columns = {
                 "fallback_reason",
                 "ohlc_normalization",
@@ -1809,7 +1829,7 @@ def audit_official_symbol_build(
             if required_lineage_columns - quote_schema:
                 lineage_columns_valid = False
                 continue
-            lineage = pl.read_parquet(
+            lineage = _read_parquet(
                 quote_path,
                 columns=sorted(required_lineage_columns),
             )
@@ -1961,7 +1981,7 @@ def audit_official_symbol_build(
         ),
         "stock_etf_manifest": manifest_valid,
         "symbol_count": int(summary.get("symbols", -1))
-        == len(list(parquet_root.glob("*_features.parquet"))),
+        == len(parquet_sources.discover_sources(parquet_root)),
     }
     result.update(
         {
@@ -2892,14 +2912,22 @@ def _audit_input_signatures(
         # Original-release completeness lives beside, not inside, its data.
         # A collector may replace this receipt without changing value rows.
         *public_dir.glob("state/*.json"),
-        *parquet_root.glob("*_features.parquet"),
+        *parquet_sources.discover_sources(parquet_root),
         parquet_root / "official_symbol_build_summary.json",
         parquet_root / "symbols.csv",
         public_feature_path,
-        public_feature_path.with_suffix(".summary.json"),
+        public_feature_path.with_name(parquet_sources.logical_name(public_feature_path)).with_suffix(".summary.json"),
     }
-    signatures: dict[str, tuple[int, int, int] | None] = {}
+    expanded = set()
     for path in paths:
+        resolved = parquet_sources.resolve_source(path)
+        if resolved.is_file() and resolved.name.endswith(parquet_sources.MANIFEST_SUFFIX):
+            with parquet_sources.ParquetSource(resolved) as source:
+                expanded.update(source.source_paths())
+        else:
+            expanded.add(resolved)
+    signatures: dict[str, tuple[int, int, int] | None] = {}
+    for path in expanded:
         key = str(path.resolve())
         try:
             stat = path.stat()
@@ -3558,7 +3586,9 @@ def audit_feature_build_receipt(
     public_dir: Path,
     parquet_root: Path,
 ) -> tuple[dict[str, Any], list[Finding]]:
-    summary_path = public_feature_path.with_suffix(".summary.json")
+    logical_path = public_feature_path.with_name(parquet_sources.logical_name(public_feature_path))
+    summary_path = logical_path.with_suffix(".summary.json")
+    public_feature_path = parquet_sources.resolve_source(public_feature_path)
     summary = _read_json_object(summary_path)
     receipt_summary: dict[str, Any] = {"path": str(summary_path), "valid": False}
     if summary is None:
@@ -3589,6 +3619,11 @@ def audit_feature_build_receipt(
         public_feature_path.exists()
         and summary.get("output_receipt") == _file_content_receipt(public_feature_path)
     )
+    if public_feature_path.name.endswith(parquet_sources.MANIFEST_SUFFIX) and public_feature_path.is_file():
+        # The exact pointer SHA binds every immutable member proof. Validate
+        # all of those bytes, not just the selected feature/date partitions.
+        with parquet_sources.ParquetSource(public_feature_path):
+            pass
     receipt_summary["checks"] = checks
     receipt_summary["valid"] = all(checks.values())
     failed_checks = [name for name, passed in checks.items() if not passed]
@@ -3618,6 +3653,7 @@ def audit_public_feature_table(
     market_symbol: str,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[Finding]]:
     findings: list[Finding] = []
+    path = parquet_sources.resolve_source(path)
     if not path.exists():
         return {}, [], [
             Finding(
@@ -3631,7 +3667,7 @@ def audit_public_feature_table(
             )
         ]
 
-    schema = pq.read_schema(path).names
+    schema = parquet_sources.read_schema(path).names
     public_selected = [feature for feature in selected_features if feature.startswith(("twpub_", "twfl_"))]
     missing_features = [feature for feature in public_selected if feature not in schema]
     missing_rules = [rule for rule in RULE_COLUMNS if rule not in schema]
@@ -3661,7 +3697,7 @@ def audit_public_feature_table(
         )
 
     available = [feature for feature in public_selected if feature in schema]
-    scan = pl.scan_parquet(path)
+    scan = _scan_parquet(path)
     duplicate_keys = (
         scan.group_by(["date", "symbol"])
         .len()

@@ -3,8 +3,60 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
+import os
+
+import pytest
 
 from stockagent.live import openbb_archive_dashboard as dashboard
+
+
+@pytest.mark.parametrize("change", ["same_size", "correct_and_append", "truncate", "atomic"])
+def test_history_revision_rebuilds_only_when_verified_prefix_changes(tmp_path, change):
+    state = tmp_path / "data_openBB/_state"
+    state.mkdir(parents=True)
+    path = state / "monitor_dashboard_history.jsonl"
+    now = datetime(2026, 10, 20, 2, tzinfo=UTC)
+    row = {"checked_at": now.isoformat(), "accepted_tasks": 10}
+    path.write_text(json.dumps(row) + "\n")
+    first = dashboard.build_openbb_public_history(tmp_path, "all", now=now)
+    original = path.stat()
+    corrected = json.dumps({**row, "accepted_tasks": 20}) + "\n"
+    if change == "same_size":
+        path.write_text(corrected)
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    elif change == "correct_and_append":
+        path.write_text(corrected + json.dumps({**row, "accepted_tasks": 30}) + "\n")
+    elif change == "truncate":
+        path.write_text("")
+    else:
+        staged = state / "new.jsonl"
+        staged.write_text(corrected)
+        staged.replace(path)
+    result = dashboard.build_openbb_public_history(tmp_path, "all", now=now)
+    assert first["history"][0]["accepted_tasks"] == 10
+    assert [item["accepted_tasks"] for item in result["history"]] == (
+        [] if change == "truncate" else [20, 30] if change == "correct_and_append" else [20])
+
+
+def test_history_daily_append_decodes_only_new_complete_rows(tmp_path):
+    state = tmp_path / "data_openBB/_state"
+    state.mkdir(parents=True)
+    path = state / "monitor_dashboard_history.jsonl"
+    now = datetime(2026, 10, 20, 2, tzinfo=UTC)
+    row = {"checked_at": now.isoformat(), "accepted_tasks": 10}
+    path.write_text((json.dumps(row) + "\n") * 100)
+    assert len(dashboard.build_openbb_public_history(tmp_path, "all", now=now)["history"]) == 100
+    with path.open("a") as stream:
+        stream.write(json.dumps({**row, "accepted_tasks": 11}))
+    assert len(dashboard.build_openbb_public_history(tmp_path, "all", now=now)["history"]) == 100
+    assert dashboard._HISTORY_FILE_CACHE[path.resolve()].parsed_rows == 0
+    with path.open("a") as stream:
+        stream.write("\n")
+    result = dashboard.build_openbb_public_history(tmp_path, "all", now=now)
+    assert len(result["history"]) == 101
+    assert result["history"][-1]["accepted_tasks"] == 11
+    assert dashboard._HISTORY_FILE_CACHE[path.resolve()].parsed_rows == 1
+    assert dashboard._HISTORY_FILE_CACHE[path.resolve()].prefix_verified_bytes > 0
 
 
 def _write_json(path: Path, payload: object) -> None:

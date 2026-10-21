@@ -42,7 +42,8 @@ def _digest(value: Any) -> str:
 
 def write_array_block(path: Path, values: np.ndarray, *, omit_zero_columns: bool = False,
                       logical_columns: np.ndarray | None = None,
-                      logical_shape: tuple[int, int, int] | None = None) -> dict:
+                      logical_shape: tuple[int, int, int] | None = None,
+                      output_open=None) -> dict:
     """Lossless Float32 storage; never quantize training inputs to BF16."""
     import pyarrow as pa
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -80,7 +81,7 @@ def write_array_block(path: Path, values: np.ndarray, *, omit_zero_columns: bool
         np.save(serialized, values, allow_pickle=False)
     raw = serialized.getbuffer()
     codec = pa.Codec("zstd", compression_level=3)
-    with path.open("xb") as stream:
+    with (output_open(path) if output_open is not None else path.open("xb")) as stream:
         stream.write(codec.compress(raw))
     return {"path": path.name, "sha256": file_sha256(path),
             "bytes": path.stat().st_size, "shape": list(shape),
@@ -193,6 +194,7 @@ class FactorizedPanelFeatures:
         from stockagent.data.panel_cache import array_content_fingerprint
         self.base_identity = array_content_fingerprint(base) if base_identity is None else base_identity
         self.root_identity = _digest({"contract":manifest.get("contract",CONTRACT),"manifest":manifest,"base":self.base_identity})
+        self._source_root_identity, self._row_offset = self.root_identity, 0
         self.content_fingerprint = {"present": True, "shape": list(self.shape), "dtype": "float32",
             "sha256": _digest({"root":self.root_identity,"symbols":self.symbol_indices.tolist()}),
             "fingerprint_kind": "factorized_source_and_base_contract_not_dense_byte_hash"}
@@ -217,6 +219,31 @@ class FactorizedPanelFeatures:
             "sha256":_digest({"root":self.root_identity,"symbols":subset.symbol_indices.tolist()})}
         return subset
 
+    def slice_dates(self, start: int = 0, stop: int | None = None):
+        """Keep a calendar interval without decoding individual feature blocks.
+
+        Small base/common arrays stay views and the immutable block cache is
+        shared. Physical block lookups use the retained source-row offset.
+        """
+        stop = self.shape[0] if stop is None else stop
+        if not 0 <= start <= stop <= self.shape[0]:
+            raise IndexError("factorized date interval outside the source calendar")
+        if start == 0 and stop == self.shape[0]:
+            return self
+        subset = object.__new__(type(self))
+        subset.__dict__ = dict(self.__dict__)
+        subset.base, subset.common = self.base[start:stop], self.common[start:stop]
+        subset.shape = (stop - start, *self.shape[1:])
+        subset._row_offset = self._row_offset + start
+        subset.root_identity = _digest({"source": self._source_root_identity,
+            "start": subset._row_offset, "stop": self._row_offset + stop})
+        subset.content_fingerprint = {**self.content_fingerprint, "shape": list(subset.shape),
+            "sha256": _digest({"root": subset.root_identity, "symbols": subset.symbol_indices.tolist()})}
+        return subset
+
+    def prefix_dates(self, stop: int):
+        return self.slice_dates(stop=stop)
+
     def __getitem__(self, key):
         keys = key if isinstance(key, tuple) else (key,)
         rows = np.arange(self.shape[0], dtype=np.int64)[keys[0]]
@@ -230,10 +257,11 @@ class FactorizedPanelFeatures:
         asset_end = base_end + len(self.manifest["individual_channels"])
         result[..., :base_end] = self.base[rows[:, None], self.symbol_indices[None, :]]
         if asset_end > base_end and rows.size:
-            blocks = np.searchsorted(self._starts, rows, side="right") - 1
+            source_rows = rows + self._row_offset
+            blocks = np.searchsorted(self._starts, source_rows, side="right") - 1
             for block_id in np.unique(blocks):
                 selected = np.flatnonzero(blocks == block_id)
-                offsets = rows[selected] - self._starts[block_id]
+                offsets = source_rows[selected] - self._starts[block_id]
                 for cache_id,sstart,send in self._symbol_blocks[block_id]:
                     positions=np.flatnonzero((self.symbol_indices>=sstart)&(self.symbol_indices<send))
                     if not positions.size:continue
@@ -263,13 +291,14 @@ class FactorizedPanelFeatures:
         to its sums/products. RMS retains the full alive-cell denominator.
         """
         rows = np.asarray(rows, dtype=np.int64).reshape(-1)
-        block_ids = np.searchsorted(self._starts, rows, side="right") - 1
+        source_rows = rows + self._row_offset
+        block_ids = np.searchsorted(self._starts, source_rows, side="right") - 1
         rectangles = []
         pieces = []
         individual_width = len(self.manifest["individual_channels"])
         for block_id in np.unique(block_ids):
             selected = np.flatnonzero(block_ids == block_id)
-            offsets = rows[selected] - self._starts[block_id]
+            offsets = source_rows[selected] - self._starts[block_id]
             for cache_id, sstart, send in self._symbol_blocks[block_id]:
                 positions = np.flatnonzero((self.symbol_indices >= sstart) & (self.symbol_indices < send))
                 if not positions.size:
@@ -305,10 +334,11 @@ class FactorizedPanelFeatures:
         Contiguous source ranges remain views until the bounded pinned copy.
         """
         rows=np.asarray(rows,dtype=np.int64).reshape(-1)
-        block_ids=np.searchsorted(self._starts,rows,side="right")-1
+        source_rows=rows+self._row_offset
+        block_ids=np.searchsorted(self._starts,source_rows,side="right")-1
         for block_id in np.unique(block_ids):
             selected=np.flatnonzero(block_ids==block_id)
-            offsets=rows[selected]-self._starts[block_id]
+            offsets=source_rows[selected]-self._starts[block_id]
             for cache_id,sstart,send in self._symbol_blocks[block_id]:
                 positions=np.flatnonzero((self.symbol_indices>=sstart)&(self.symbol_indices<send))
                 if not positions.size:continue
@@ -324,7 +354,7 @@ class FactorizedPanelFeatures:
 
     def iter_reduction_column_slabs(self, row_indices, *, symbol_rows=128):
         indices = np.asarray(row_indices, dtype=np.int64)
-        block_ids = np.searchsorted(self._starts, indices, side="right") - 1
+        block_ids = np.searchsorted(self._starts, indices + self._row_offset, side="right") - 1
         for block in np.unique(block_ids):
             selected = indices[block_ids == block]
             for symbol_start in range(0, self.shape[1], symbol_rows):
@@ -336,7 +366,7 @@ class FactorizedPanelFeatures:
     def iter_reduction_slabs(self,row_indices,*,symbol_rows=128,date_rows=32):
         """Read each bounded physical rectangle, not an enormous dense cube."""
         indices=np.asarray(row_indices,dtype=np.int64)
-        block_ids=np.searchsorted(self._starts,indices,side="right")-1
+        block_ids=np.searchsorted(self._starts,indices+self._row_offset,side="right")-1
         for block in np.unique(block_ids):
             selected=indices[block_ids==block]
             for symbol_start in range(0,self.shape[1],symbol_rows):
@@ -719,6 +749,10 @@ def factorized_member_proofs(manifest: dict) -> list[dict]:
         proofs.append({"path":"feature_dictionary.json","sha256":manifest["feature_dictionary_sha256"]})
     proofs.extend(manifest.get("observations",[]))
     proofs.extend(manifest.get("annual_events",[]))
+    proofs.extend(manifest.get("normalized_sources", {}).values())
+    for state in manifest.get("daily_incremental", {}).get("states", {}).values():
+        proofs.append(state)
+        proofs.extend(state["arrays"].values())
     for block in manifest["blocks"]:proofs.extend(block.get("symbol_blocks",[block]))
     return proofs
 
@@ -762,13 +796,9 @@ def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None
                 progress(done)
 
 
-def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu",
-                               host_cache_bytes: int | None = None, progress_callback=None):
-    """Attach model-only storage after the ordinary price/rule cache load."""
-    if host_cache_bytes is not None and host_cache_bytes < 1:
-        raise ValueError("factorized host cache budget must be positive")
-    path = Path(manifest_path).resolve(strict=True)
-    manifest = json.loads(path.read_text())
+def verify_factorized_layout(manifest: dict, *, symbols: list[str], dates: list[str],
+                             base_feature_names: list[str]) -> list[str]:
+    """Shared full-calendar/schema admission without constructing model tensors."""
     if manifest.get("contract") not in SUPPORTED_CONTRACTS or manifest.get("status") != "complete":
         raise ValueError("factorized panel contract/build is not complete")
     if manifest.get("contract") == VALUE_ONLY_CONTRACT:
@@ -782,18 +812,16 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
             or manifest.get("research_only") is not True
             or manifest.get("feature_lag") != 1):
         raise ValueError("factorized research/lag contract mismatch")
-    if manifest["symbols"] != panel.symbols or manifest["dates"] != [str(d)[:10] for d in panel.dates]:
+    if manifest["symbols"] != symbols or manifest["dates"] != dates:
         raise ValueError("factorized feature universe/calendar differs from executable panel")
-    if manifest["base_feature_names"] != panel.feature_names:
+    if manifest["base_feature_names"] != base_feature_names:
         raise ValueError("factorized base features differ from the declared base ABI")
-    root = path.parent
-    verify_factorized_members(root,manifest,progress_callback=progress_callback)
-    names = [*panel.feature_names, *manifest["individual_channels"], *manifest["common_channels"]]
+    names = [*base_feature_names, *manifest["individual_channels"], *manifest["common_channels"]]
     if len(names) != len(set(names)):
         raise ValueError("factorized logical features are not unique")
     rows = 0
     for block in manifest["blocks"]:
-        if block["start"] != rows or block["shape"][1:] != [panel.num_symbols, len(manifest["individual_channels"])]:
+        if block["start"] != rows or block["shape"][1:] != [len(symbols), len(manifest["individual_channels"])]:
             raise ValueError("factorized blocks are not a complete aligned partition")
         rows += block["shape"][0]
         if "symbol_blocks" in block:
@@ -802,13 +830,47 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
                 if part["symbol_start"]!=width or part["shape"][0]!=block["shape"][0] or part["shape"][2]!=len(manifest["individual_channels"]):
                     raise ValueError("factorized symbol blocks are not a complete aligned partition")
                 width+=part["shape"][1]
-            if width!=panel.num_symbols:raise ValueError("factorized symbol blocks omit securities")
-    if rows != panel.num_dates:
+            if width!=len(symbols):raise ValueError("factorized symbol blocks omit securities")
+    if rows != len(dates):
         raise ValueError("factorized blocks do not cover the full executable calendar")
+    return names
+
+
+def _factorized_execution_clock(panel, execution_mode: str) -> str | None:
+    if execution_mode == "tw_day_trade":
+        return None
+    if execution_mode != "tw_stock_context_futures_portfolio":
+        raise ValueError("factorized research features require tw_day_trade or stock-context futures")
+    # The lag-one stock panel puts session t's 09:00 opening gap on row t-1.
+    # A futures decision at 08:45 cannot observe it. Inspect the small base
+    # panel before attachment; never expand the factorized feature universe.
+    name = "next_session_open_gap_logret"
+    if name in panel.feature_names:
+        values = panel.features[:, :, panel.feature_names.index(name)]
+        if not np.isfinite(values).all() or np.any(values != 0):
+            raise ValueError("08:45 futures require next_session_open_gap_logret to be explicitly zero-filled")
+    return "prior_cash_session_before_0845_zero_open_gap_v1"
+
+
+def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mode: str = "dense_cpu",
+                               host_cache_bytes: int | None = None, progress_callback=None,
+                               execution_mode: str = "tw_day_trade"):
+    """Attach model-only storage after the ordinary price/rule cache load."""
+    if host_cache_bytes is not None and host_cache_bytes < 1:
+        raise ValueError("factorized host cache budget must be positive")
+    clock = _factorized_execution_clock(panel, execution_mode)
+    path = Path(manifest_path).resolve(strict=True)
+    manifest = json.loads(path.read_text())
+    names = verify_factorized_layout(manifest, symbols=panel.symbols,
+        dates=[str(d)[:10] for d in panel.dates], base_feature_names=panel.feature_names)
+    root = path.parent
+    verify_factorized_members(root,manifest,progress_callback=progress_callback)
     features = FactorizedPanelFeatures(root, manifest, panel.features,
         cache_bytes=(int(manifest.get("host_cache_bytes", 512 * 1024**2))
                      if host_cache_bytes is None else int(host_cache_bytes)),
         max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode)
+    if clock is not None:
+        features.content_fingerprint = {**features.content_fingerprint, "execution_clock": clock}
     panel.features, panel.feature_names = features, names
     panel.content_fingerprints = {**(panel.content_fingerprints or {}), "features": features.content_fingerprint}
     # build_panel prints the executable base columns before this adapter runs.
@@ -855,6 +917,15 @@ class FactorizedDateView:
 
     def subset_symbols(self, indices):
         return FactorizedDateView(self.source.subset_symbols(indices), self.rows)
+
+    def prefix_dates(self, stop):
+        return self.slice_dates(stop=stop)
+
+    def slice_dates(self, start=0, stop=None):
+        stop = self.shape[0] if stop is None else stop
+        if not 0 <= start <= stop <= self.shape[0]:
+            raise IndexError("factorized date interval outside the source calendar")
+        return self if start == 0 and stop == self.shape[0] else FactorizedDateView(self.source, self.rows[start:stop])
 
 
 class FactorizedLiveWindow:

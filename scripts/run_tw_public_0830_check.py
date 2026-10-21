@@ -52,10 +52,19 @@ AUDIT_CODE_DEPENDENCIES = (
     "scripts/audit_tw_public_data_layer.py",
     "scripts/build_tw_official_symbol_parquets.py",
     "scripts/build_tw_public_training_features.py",
+    "stockagent/data/tw_public_incremental.py",
     "stockagent/data/tw_public_features.py",
     "stockagent/data/panel.py",
     "stockagent/data/panel_cache.py",
     "stockagent/data/panel_chunks.py",
+    "stockagent/data_sync/cache_capacity.py",
+    "stockagent/data_sync/completed_forward_capacity.py",
+    "stockagent/data_sync/materialized_cache.py",
+    "stockagent/data_sync/immutable_cache_files.py",
+    "stockagent/data_sync/windows_cold_io.py",
+    "stockagent/data_sync/recovery_queue.py",
+    "configs/training_rescue.json",
+    "configs/data_sync/cache_capacity.json",
 )
 
 
@@ -632,6 +641,7 @@ def _derived_data_commands(
             [
                 "--incremental-tail-days",
                 str(int(public_feature_incremental_days)),
+                "--incremental-auto",
             ]
         )
     return commands

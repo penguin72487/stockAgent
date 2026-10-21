@@ -1,0 +1,30 @@
+base_config: configs/markets/tw_stock_futures_carry_0845_openref_20261021_v2.yaml
+output_root: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v2
+fold_selection: last
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+  fixed_overrides:
+    training:
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      early_stopping_min_delta: 0.0001
+      pretrained_initialization_root: null
+      warm_start_from_previous_fold: false
+    runner:
+      resume: false
+      require_cuda: true
+  dimensions:
+    - name: clock
+      enabled: true
+      variants:
+        - name: '0845'
+          description: '08:45 真實開盤／前筆成交參考 / observed-open or last-real-trade; carry.'
+          overrides: {}
+        - name: '0900'
+          description: '09:00 真實開盤／前筆成交參考 / observed-open or last-real-trade; carry.'
+          overrides:
+            trading:
+              tw_futures_portfolio_decision_time: '09:00'
+              tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v2/0900/entries.parquet
+              tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v2/0900/opening_reference.parquet

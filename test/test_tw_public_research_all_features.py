@@ -78,6 +78,32 @@ def test_all_features_reconstructs_macro_history_and_keeps_sparse_cells(tmp_path
     assert build_all_research_features(wide_path=wide, official_path=official, output_path=output)["reused"]
 
 
+def test_partitioned_official_source_preserves_full_research_union_and_cache(tmp_path, monkeypatch):
+    from stockagent.data import partitioned_parquet as parts
+    from stockagent.data_sync import cache_capacity
+    from stockagent.data.parquet_lineage import ParquetLineage
+    controls = tmp_path / "controls"
+    controls.mkdir()
+    monkeypatch.setattr(cache_capacity, "CONTROL_ROOT", controls)
+    monkeypatch.setattr(cache_capacity, "_admit_backing_volume", lambda *_: {})
+    wide, official = _source_tables(tmp_path)
+    reference = tmp_path / "reference.parquet"
+    build_all_research_features(wide_path=wide, official_path=official, output_path=reference)
+    partitioned = tmp_path / "partitioned.parquet"
+    parts.write_partitioned_table(pl.read_parquet(official).to_arrow(), partitioned, source_identity={"original": "test"})
+    output = tmp_path / "partitioned-all.parquet"
+    receipt = build_all_research_features(wide_path=wide, official_path=partitioned, output_path=output)
+    assert receipt["contract_version"] == 3
+    assert "sha256" not in receipt["inputs"]["official"]
+    assert receipt["inputs"]["official"]["source"] == ParquetLineage(partitioned).identity
+    assert_frame_equal(pl.read_parquet(output), pl.read_parquet(reference), check_exact=True)
+    assert build_all_research_features(wide_path=wide, official_path=partitioned, output_path=output)["reused"]
+    member = ParquetLineage(partitioned).source.members[0]
+    member.rename(member.with_suffix(".offline"))
+    with pytest.raises((OSError, ValueError)):
+        build_all_research_features(wide_path=wide, official_path=partitioned, output_path=output)
+
+
 def test_all_features_rejects_missing_official_keys(tmp_path):
     wide, official = _source_tables(tmp_path)
     broken = pl.read_parquet(official).with_columns(
@@ -88,6 +114,30 @@ def test_all_features_rejects_missing_official_keys(tmp_path):
         build_all_research_features(
             wide_path=wide, official_path=official, output_path=tmp_path / "all.parquet"
         )
+
+
+def test_key_preflight_rejects_later_year_before_any_feature_join_or_write(tmp_path, monkeypatch):
+    from stockagent.data import tw_public_research_all_features as module
+    wide, official = _source_tables(tmp_path)
+    # A valid earlier year used to be fully joined and written before the
+    # missing final-year key was found. Neither work is necessary on failure.
+    for source in (wide, official):
+        frame = pl.read_parquet(source)
+        earlier = frame.with_columns(pl.col("date").dt.offset_by("-1y"))
+        pl.concat([earlier, frame]).write_parquet(source)
+    frame = pl.read_parquet(official)
+    frame.with_columns(
+        pl.when((pl.col("date").dt.year() == 2014) & (pl.col("symbol") == "2330"))
+        .then(pl.lit("9999")).otherwise(pl.col("symbol")).alias("symbol")
+    ).write_parquet(official)
+    monkeypatch.setattr(module, "_derived_market_values", lambda *_: pytest.fail("feature decode before preflight"))
+    monkeypatch.setattr(module.pq, "ParquetWriter", lambda *a, **kw: pytest.fail("write before preflight"))
+    output = tmp_path / "previous.parquet"
+    output.write_bytes(b"previous accepted output")
+    with pytest.raises(ValueError, match="keys absent"):
+        build_all_research_features(wide_path=wide, official_path=official, output_path=output)
+    assert output.read_bytes() == b"previous accepted output"
+    assert not output.with_suffix(".parquet.tmp").exists()
 
 
 def test_annual_join_keeps_cross_year_lags_raw_values_and_null_fallbacks(tmp_path):

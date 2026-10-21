@@ -21,6 +21,9 @@ OPERATOR_GEOMETRY_CONTRACT = 'operator_unknown_record_geometry_prior_v1'
 LOCAL_CAPACITY_CONTRACT = 'native_preview_full_local_capacity_v1'
 SELECTOR_CONTRACT = 'bounded_source_selector_geometry_v1'
 MAX_SELECTOR_LABELS = 2000  # ExactListIndices / SelectListBatch / TrySelectListBulk.
+COMPANY_MEMBERSHIP_CONTRACT = 'exact_current_company_membership_v1'
+COMPANY_MEMBERSHIP_DEFERRED = 'source_company_labels_absent_fragment'
+COMPANY_HINT_CONTRACT = 'prior_negative_company_membership_scheduling_only_v1'
 
 
 def rectangle_queries(companies: int, dates: int, rows: int, size: int, keys: int,
@@ -277,7 +280,7 @@ def refill_ready_plans(con) -> int:
     from downloader.tej_value_priority import installed_priority
 
     generated=0
-    plans=con.execute("SELECT p.table_id,p.next_query,p.phase,p.priority FROM download_plans p WHERE p.next_query<p.total_queries AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.table_id=p.table_id AND t.kind='download' AND t.scope_contract=? AND t.state IN ('pending','running','blocked')) ORDER BY p.priority,p.table_id",(SOURCE_SCOPE_CONTRACT,)).fetchall()
+    plans=con.execute("SELECT p.table_id,p.next_query,p.phase,p.priority FROM download_plans p WHERE p.next_query<p.total_queries AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.table_id=p.table_id AND t.kind='download' AND t.scope_contract=? AND t.state IN ('pending','running','blocked') AND NOT(t.state='pending' AND COALESCE(t.last_error_code,'')=?)) ORDER BY p.priority,p.table_id",(SOURCE_SCOPE_CONTRACT,COMPANY_MEMBERSHIP_DEFERRED)).fetchall()
     for row in plans:
         definition=dict(con.execute('SELECT * FROM tables WHERE table_id=?',(row['table_id'],)).fetchone())
         encoded=con.execute('SELECT plan_json FROM download_plans WHERE table_id=?',(row['table_id'],)).fetchone()[0]
@@ -358,6 +361,240 @@ def repartition_selector_pending(con, root, row) -> bool:
     if retry is not None:
         con.execute('UPDATE desktop_retry_windows SET task_id=? WHERE table_id=?',(children[0][0],row['table_id']))
     return True  # Caller commits the queue; durable intent is not a download receipt.
+
+
+def company_membership_failure(root, task: dict, verified: dict) -> dict | None:
+    """Validate a COMPLETE native lookup; absence is not a missing observation.
+
+    The ordinary finished negative-attempt proof must be checked first. A
+    missing sidecar, timeout, duplicate label or changed source never licenses
+    partitioning. The sidecar contains positions, not guessed replacement IDs.
+    """
+    from datetime import datetime
+    import re
+    from downloader.tej_history import DesktopBridge
+    from downloader.tej_operation_clock import source_operation_clock
+    digest = verified['outcome'].get('company_membership_sha256')
+    if digest is None:
+        return None
+    if not isinstance(digest,str) or not re.fullmatch(r'[0-9a-f]{64}',digest):
+        raise ValueError('Exact company-membership fingerprint required')
+    path = root/'raw'/(verified['attempt_id']+'.json.company-membership.json')
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise ValueError('Bounded original company-membership readback required')
+    body = path.read_bytes()
+    if hashlib.sha256(body).hexdigest()!=digest:
+        raise ValueError('Company-membership readback changed')
+    value = json.loads(body.decode('utf-8-sig'))
+    labels = verified['request']['company_labels']
+    if not isinstance(value,dict):
+        raise ValueError('Company-membership readback object required')
+    positions = value.get('absent_positions')
+    if (value.get('contract')!=COMPANY_MEMBERSHIP_CONTRACT
+            or value.get('task_id')!=task['task_id']
+            or value.get('query_attempt_id')!=verified['attempt_id']
+            or value.get('prepared_request_sha256')!=verified['prepared_request_sha256']
+            or type(value.get('requested_count')) is not int or value['requested_count']!=len(labels)
+            or type(value.get('available_count')) is not int or not 1<=value['available_count']<=150000
+            or not isinstance(positions,list) or not positions or len(positions)>len(labels)
+            or any(type(i) is not int or not 0<=i<len(labels) for i in positions)
+            or positions!=sorted(set(positions)) or len(set(labels))!=len(labels)
+            or not 1<=len(labels)<=MAX_SELECTOR_LABELS
+            or any(value.get(k) is not True for k in
+                   ('complete_lookup_verified','source_binding_verified','source_list_count_stable'))
+            or value.get('market_data_query_submitted') is not False
+            or verified['outcome']['error_code']!='local_list_selection_failed_before_preview'):
+        raise ValueError('Complete exact unsent company-membership evidence required')
+    window=verified['source_clock_evidence']
+    source_operation_clock(value['observed_at_utc'],
+        datetime.fromisoformat(window['local_window_started_at_utc']),
+        datetime.fromisoformat(window['local_window_finished_at_utc']))
+    release, script_digest=DesktopBridge.bound_script_release(root,verified['attempt_id'],verified['prepared_path'])
+    if COMPANY_MEMBERSHIP_CONTRACT.encode() not in release.read_bytes():
+        raise ValueError('Original bridge does not implement company-membership evidence')
+    return {'absent_positions':positions,'sha256':digest,'path':str(path.relative_to(root)),
+            'bridge_script_sha256':script_digest,'available_count':value['available_count']}
+
+
+def repartition_missing_companies(con, root, task: dict, verified: dict, membership: dict,
+                                 *, due: str, failures: int, audit_path, scheduling_hint: dict | None = None) -> dict:
+    """Preserve ALL work; defer only absent labels, unblock the present labels.
+
+    Called only after the canonical fresh owned-interface acknowledgement.
+    One atomic queue transaction and a preceding durable intent preserve the
+    original failed attempt, lazy-plan cursor, denominator and retry history.
+    No source value is adopted and no company name is silently substituted.
+    """
+    from datetime import UTC, datetime
+    from downloader.artifact_io import atomic_write_json
+    from downloader.tej_history import SOURCE_SCOPE_CONTRACT, compact_request, stable_id
+    from downloader.tej_key_layout import key_count
+    request=verified['request']; labels=request['company_labels']
+    absent=set(membership['absent_positions'])
+    groups=[([label for i,label in enumerate(labels) if i not in absent],False),
+            ([label for i,label in enumerate(labels) if i in absent],True)]
+    expected=len(labels)*(1 if key_count(request)==1 else len(request['date_labels']))
+    if (expected!=task['expected_rows'] or expected!=(task['work_expected_rows'] or expected)
+            or any(task.get(k) is not None for k in ('actual_rows','actual_bytes','receipt_path','output_path','completed_at_utc'))):
+        raise ValueError('Company partition must preserve the exact unadopted work denominator')
+    definition=dict(con.execute('SELECT * FROM tables WHERE table_id=?',(task['table_id'],)).fetchone())
+    children=[]
+    contract=COMPANY_HINT_CONTRACT if scheduling_hint is not None else COMPANY_MEMBERSHIP_CONTRACT
+    if groups[0][0]:
+        for selected,missing in groups:
+            part={**request,'company_labels':selected,'company_membership_partition':{
+                'contract':contract,'parent_task_id':task['task_id'],
+                'membership_sha256':membership['sha256'],
+                **({'delayed_by_prior_absence_hint':missing} if scheduling_hint is not None else
+                   {'currently_absent':missing})}}
+            count=len(selected)*(1 if key_count(part)==1 else len(part['date_labels']))
+            identifier=stable_id([task['table_id'],part])
+            if con.execute('SELECT 1 FROM tasks WHERE task_id=?',(identifier,)).fetchone():
+                raise ValueError('Company partition child already exists; reconcile the original intent')
+            children.append((identifier,part,count,missing))
+    missing_task_id=children[-1][0] if children else task['task_id']
+    audit={'contract':contract,'state':'prepared',
+        'observed_at_utc':datetime.now(UTC).isoformat(),'original_task':task,
+        'membership':membership,'prepared_request_sha256':verified['prepared_request_sha256'],
+        'prequery_outcome_sha256':verified['prequery_outcome_sha256'],
+        'interface_readback_path':verified['interface_readback_path'],
+        'interface_readback_sha256':verified['interface_readback_sha256'],
+        'replacement_task_ids':[child[0] for child in children],
+        'present_companies':len(groups[0][0]),'deferred_companies':len(groups[1][0]),
+        'work_rows_before':expected,'work_rows_after':sum(child[2] for child in children) if children else expected,
+        'provider_queries_sent':0,'source_rows_adopted':False,'original_attempt_preserved':True,
+        'retry_budget_reset':False,'next_attempt_at_utc':due,'consecutive_failures':failures}
+    if scheduling_hint is not None:
+        audit['scheduling_hint']=scheduling_hint
+        audit['fresh_source_membership_claimed']=False
+        audit['source_failure_count_increased']=False
+    if audit['work_rows_before']!=audit['work_rows_after']:
+        raise ValueError('Company partition lost original scope')
+    atomic_write_json(audit_path,audit,durable=True)
+    if children:
+        con.execute('UPDATE tasks SET state=? WHERE task_id=?',
+            ('superseded_company_hint_v1' if scheduling_hint is not None else 'superseded_company_membership_v1',task['task_id']))
+        for identifier,part,count,missing in children:
+            con.execute('INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,'
+                'work_expected_rows,safe_prequery_retries,next_attempt_at_utc,last_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+                (identifier,task['table_id'],'download',task['phase'],task['priority'],
+                 json.dumps(compact_request(part,definition),ensure_ascii=False,separators=(',',':')),
+                 count,SOURCE_SCOPE_CONTRACT,count,task['safe_prequery_retries'],due if missing else None,
+                 COMPANY_MEMBERSHIP_DEFERRED if missing else None))
+    else:
+        con.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=?,last_error_code=? WHERE task_id=?",
+                    (due,COMPANY_MEMBERSHIP_DEFERRED,task['task_id']))
+    if scheduling_hint is None:
+        con.execute('INSERT OR REPLACE INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+            (task['table_id'],missing_task_id,verified['attempt_id'],failures,due,
+             COMPANY_MEMBERSHIP_DEFERRED,str(audit_path.relative_to(root))))
+    con.execute("UPDATE tables SET state='backfilling',last_error_code=? WHERE table_id=?",
+                (COMPANY_MEMBERSHIP_DEFERRED,task['table_id']))
+    return {'state':'selector_scope_repartitioned' if children else 'prequery_failure_deferred',
+        'task_id':task['task_id'],'table_id':task['table_id'],'membership':membership,
+        'present_companies':len(groups[0][0]),'deferred_companies':len(groups[1][0]),
+        'work_rows_before':expected,'work_rows_after':expected,'replacement_task_ids':[c[0] for c in children],
+        'next_attempt_at_utc':due,'consecutive_failures':failures,'provider_queries_sent':0,
+        'source_rows_adopted':False,'data_query_repeated':False,'audit':str(audit_path.relative_to(root))}
+
+
+def defer_planned_company_hint(con, root, task: dict, *, now=None) -> bool:
+    """Skip repeated FAILED preparation, never skip or certify source data.
+
+    A recent exact negative lookup may delay the same display labels in a
+    DIFFERENT, wholly unattempted date/field tile until the ORIGINAL due time.
+    Due all-missing fragments may share a newer verified lookup's due time,
+    rather than repeating it once per date. An older attempt must independently
+    prove its own finished, complete all-absent, never-submitted outcome first.
+    Every field/date/company remains queued. Healthy companies still undergo full
+    fresh native selection and source validation when actually queried. The
+    old proof is scheduling metadata, NOT a new no-query outcome or UI grant.
+    """
+    from datetime import UTC, datetime
+    import uuid
+    from downloader.tej_desktop_attempts import proved_unsent_prequery
+    from downloader.tej_history import compact_request,expand_request
+    deferred=task.get('last_error_code')==COMPANY_MEMBERSHIP_DEFERRED
+    attempted=any(task.get(k) is not None for k in ('attempted_at_utc','active_attempt_id'))
+    if (task['kind']!='download' or task['state']!='pending'
+            or task.get('last_error_code') not in (None,COMPANY_MEMBERSHIP_DEFERRED)
+            or attempted and (not deferred or any(task.get(k) is None for k in ('attempted_at_utc','active_attempt_id')))
+            or any(task.get(k) is not None for k in ('actual_rows','actual_bytes',
+                'receipt_path','output_path','completed_at_utc'))):
+        return False
+    previous=con.execute('SELECT * FROM desktop_retry_windows WHERE table_id=?',(task['table_id'],)).fetchone()
+    if previous is None or previous['error_code']!=COMPANY_MEMBERSHIP_DEFERRED:
+        return False
+    try:
+        now=now or datetime.now(UTC);due=datetime.fromisoformat(previous['next_attempt_at_utc'])
+        if now.tzinfo is None or due.tzinfo is None or not 0<(due-now).total_seconds()<=900:
+            return False
+        if deferred:
+            old_due=datetime.fromisoformat(task['next_attempt_at_utc'])
+            if old_due.tzinfo is None or old_due>now:
+                return False  # Never renew a live cooldown or extend it on each loop.
+        own_negative=None
+        if attempted:
+            own=proved_unsent_prequery(root,con,task,finished=True)
+            own_membership=company_membership_failure(root,task,own)
+            if own_membership is None or len(own_membership['absent_positions'])!=len(own['request']['company_labels']):
+                return False
+            own_negative={'attempt_id':own['attempt_id'],
+                'prepared_request_sha256':own['prepared_request_sha256'],
+                'prequery_outcome_sha256':own['prequery_outcome_sha256'],
+                'company_membership_sha256':own_membership['sha256']}
+        path=root/previous['audit_path']
+        if (path.is_symlink() or path.resolve().parent!=(root/'selector_replanning').resolve()
+                or not path.is_file() or path.stat().st_size>2*1024**2):
+            return False
+        audit=json.loads(path.read_text());prior=audit['original_task']
+        if audit.get('contract')!=COMPANY_MEMBERSHIP_CONTRACT or prior['table_id']!=task['table_id']:
+            return False
+        observed=datetime.fromisoformat(audit['observed_at_utc'])
+        if observed.tzinfo is None or not 0<=(now-observed).total_seconds()<=900:
+            return False
+        row=con.execute('SELECT * FROM tasks WHERE task_id=?',(prior['task_id'],)).fetchone()
+        if row is None or row['active_attempt_id']!=prior['active_attempt_id']:
+            return False
+        proof=proved_unsent_prequery(root,con,dict(row),finished=True)
+        membership=company_membership_failure(root,dict(row),proof)
+        if (membership!=audit['membership'] or previous['attempt_id']!=proof['attempt_id']
+                or proof['prepared_request_sha256']!=audit['prepared_request_sha256']
+                or proof['prequery_outcome_sha256']!=audit['prequery_outcome_sha256']):
+            return False
+        definition=dict(con.execute('SELECT * FROM tables WHERE table_id=?',(task['table_id'],)).fetchone())
+        request=expand_request(json.loads(task['request_json']),definition,task['table_id'])
+        if any(request.get(k)!=proof['request'].get(k) for k in
+                ('action','type','smart_id','table','catalog_fields','source_key_mode','key_layout_contract')):
+            return False
+        fields=request.get('fields');catalog=json.loads(definition['fields_json'])
+        if (not isinstance(fields,list) or not fields or len(set(fields))!=len(fields)
+                or any(field not in catalog for field in fields) or request.get('catalog_fields')!=catalog):
+            return False
+        compact_request(request,definition)  # Exact registered field partition, even across field batches.
+        absent={proof['request']['company_labels'][i] for i in membership['absent_positions']}
+        positions=[i for i,label in enumerate(request['company_labels']) if label in absent]
+        if not positions or deferred and len(positions)!=len(request['company_labels']):
+            return False
+        hint={'contract':COMPANY_HINT_CONTRACT,'prior_task_id':prior['task_id'],
+            'prior_attempt_id':proof['attempt_id'],'prior_partition_path':str(path.relative_to(root)),
+            'prior_partition_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
+            'prior_lookup_observed_at_utc':audit['observed_at_utc'],
+            'valid_until_utc':due.isoformat(),'current_request_has_no_desktop_attempt':not attempted,
+            'original_finished_all_absent_attempt':own_negative,
+            'previously_deferred_fragment':deferred,
+            'previous_fragment_due_at_utc':task.get('next_attempt_at_utc'),
+            'prior_negative_proof_applies_only_to_prior_request':True}
+        current={'request':request,'prepared_request_sha256':None,'prequery_outcome_sha256':None,
+            'interface_readback_path':None,'interface_readback_sha256':None}
+        projected={**membership,'absent_positions':positions}
+        repartition_missing_companies(con,root,task,current,projected,due=due.isoformat(),
+            failures=previous['consecutive_failures'],
+            audit_path=root/'selector_replanning'/(task['task_id']+'-'+uuid.uuid4().hex+'-company-hint.json'),
+            scheduling_hint=hint)
+        return True
+    except (OSError,ValueError,KeyError,TypeError,AttributeError):
+        return False  # A damaged/stale hint cannot suppress normal fresh preparation.
 
 
 def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) -> dict:

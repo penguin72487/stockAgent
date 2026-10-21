@@ -10,9 +10,10 @@ from collections import OrderedDict
 
 import requests
 
-from downloader.news_fulltext_connection_observation import ConnectionObservingAdapter
+from downloader.news_fulltext_connection_observation import ConnectionObservingAdapter, MAX_IDLE_CONNECTION_SECONDS
 from downloader.news_fulltext_robots import policy_origin
 from downloader.news_fulltext_metrics import CONNECTION_ORIGIN_ISOLATION_CONTRACT_VERSION
+from downloader.news_fulltext_tls import reviewed_origin_context
 
 
 MAX_CONNECTION_ORIGINS_PER_WORKER = 10
@@ -30,15 +31,19 @@ class OriginConnectionSession(requests.Session):
         super().__init__()
         self.origin_adapters = OrderedDict()
         self.origin_pool_evictions = 0
+        self.idle_connection_expirations = 0
 
     def _new_origin_adapter(self):
-        return ConnectionObservingAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
+        return ConnectionObservingAdapter(pool_connections=1, pool_maxsize=1, max_retries=0,
+                                          max_idle_seconds=MAX_IDLE_CONNECTION_SECONDS)
 
     def finish_connection_observation(self, url):
         # Do not create/refresh pools merely to observe an injected transport.
         adapter = self.origin_adapters.get(policy_origin(url))
         if isinstance(adapter, ConnectionObservingAdapter):
-            return adapter.finish_connection_observation()
+            observation = adapter.finish_connection_observation()
+            self.idle_connection_expirations += adapter.take_idle_expirations()
+            return observation
         return None
 
     def get_adapter(self, url):
@@ -52,6 +57,16 @@ class OriginConnectionSession(requests.Session):
                 displaced.close()
                 self.origin_pool_evictions += 1
             adapter = self._new_origin_adapter()
+            try:
+                context = reviewed_origin_context(origin)
+                if context is not None:
+                    adapter.bind_verified_tls_context(origin, context)
+            except (OSError, ValueError) as error:
+                adapter.close()
+                raise requests.exceptions.SSLError('reviewed_origin_tls_configuration_invalid') from error
+            except Exception:
+                adapter.close()
+                raise
         self.origin_adapters[origin] = adapter
         return adapter
 

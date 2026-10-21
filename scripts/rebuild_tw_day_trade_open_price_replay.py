@@ -335,6 +335,7 @@ def _accepted_repair_signal_lineage(
     contracts = {
         "never_filled_missing_open_append_only_minute_repair_v1",
         "never_filled_original_signal_append_only_minute_repair_v2",
+        "missing_completed_session_append_only_minute_repair_v1",
     }
     result: dict[tuple[str, str], dict[str, Any]] = {}
     for manifest_path in manifests:
@@ -364,7 +365,14 @@ def _accepted_repair_signal_lineage(
             original_id = str(original["signal_id"])
             repaired_id = applied.get(day, "")
             preserve = contract.endswith("_v2")
-            if (not market or not repaired_id or repaired_id == original_id
+            missing_session = contract == "missing_completed_session_append_only_minute_repair_v1"
+            invalid_missing_session = missing_session and (
+                receipt.get("append_missing_session") is not True
+                or repaired_id != original_id
+                or not str((receipt.get("anchor") or {}).get("session_date") or "")
+                or str(receipt["anchor"]["session_date"]) >= day)
+            if (not market or not repaired_id or invalid_missing_session
+                    or (not missing_session and repaired_id == original_id)
                     or (preserve and (receipt.get("preserve_original_signal") is not True
                         or original.get("original_weights_preserved") is not True
                         or not repaired_id.startswith(original_id + ":minute-repair:")))):
@@ -1989,10 +1997,10 @@ def _close_quotes(
     halted = set().union(*(halted_symbols(root, trading_date) for root in {
         twse_daily_ohlcv_path.parent, *(s.margin_corporate_action_reference_path.parent
             for s in specs_by_market.values() if s.margin_corporate_action_reference_path is not None)}))
-    for market, mode in (engine.state.get("modes") or {}).items():
+    for market, spec in specs_by_market.items():
+        mode = engine.state["modes"][market]
         if str(mode.get("session_date") or "") != trading_date.isoformat():
             continue
-        spec = specs_by_market[str(market)]
         for position in (mode.get("positions") or {}).values():
             if int(position.get("signed_shares") or 0) == 0:
                 continue
@@ -3092,6 +3100,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _require_completed_full_replay_window(*, end: date, current: datetime,
+                                          include_current_open_session: bool) -> None:
+    # Today is historical only after the source-maintenance window. The
+    # receipt-verified completed calendar and official prices are still checked
+    # below; the wall clock alone never admits a completed session.
+    if (include_current_open_session or end > current.date()
+            or (end == current.date()
+                and current.timetz().replace(tzinfo=None) < time(14, 31))):
+        raise ValueError("--historical-full-fill-0901 accepts completed sessions only; today's open session is not historical")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     start = date.fromisoformat(args.start_date)
@@ -3102,10 +3121,9 @@ def main() -> None:
             args.source_ledger_dir is None or args.signal_root is not None
             or args.single_market_signal_dir is not None):
         raise ValueError("--missing-signal-root requires --source-ledger-dir and cannot replace signal roots")
-    if args.historical_full_fill_0901 and (
-        args.include_current_open_session or end >= datetime.now(TAIPEI).date()
-    ):
-        raise ValueError("--historical-full-fill-0901 accepts completed past sessions only")
+    if args.historical_full_fill_0901:
+        _require_completed_full_replay_window(end=end, current=datetime.now(TAIPEI),
+            include_current_open_session=args.include_current_open_session)
     if args.historical_full_fill_0901 and not args.replay_intraday_kbars:
         raise ValueError("--historical-full-fill-0901 requires --replay-intraday-kbars")
     state_dir = args.state_dir.resolve()
@@ -3222,6 +3240,8 @@ def main() -> None:
     official_sessions, official_calendar_sha256 = _validated_taiex_session_dates(
         args.tw_public_dir.resolve(), start, calendar_end
     )
+    if args.historical_full_fill_0901 and end not in official_sessions:
+        raise ValueError("full 09:01 replay end is not a receipt-verified completed session")
     if args.include_current_open_session:
         today = current.date()
         official_sessions = set(official_sessions)
@@ -3318,7 +3338,11 @@ def main() -> None:
             raise ValueError("--historical-full-fill-0901 requires --source-ledger-dir")
         prior_paper_fills, prior_paper_fill_provenance = _retained_prior_paper_fills(
             args.source_ledger_dir.resolve(),
-            pinned_signal_keys=set(source_signal_ids),
+            # An isolated addition has no prior fills. Do not import another
+            # mode's paper prices merely because its pins share the source
+            # ledger; only the explicitly replayed scope can retain a fill.
+            pinned_signal_keys={key for key in source_signal_ids
+                                if key[1] in specs_by_market},
             end_date=end,
         )
         manifest_path = state_dir / "prior_paper_fills.json"

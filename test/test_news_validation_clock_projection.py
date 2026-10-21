@@ -25,12 +25,31 @@ def test_clock_failure_never_changes_kind_with_registration_or_permission(regist
     states = {CLOCK: 3, "complete": 2, PRIVATE_ERROR: 1}
     original = deepcopy(states)
     value = classify_news_outcomes(states, registered=registered, body_enabled=enabled)
-    assert value["contract_version"] == 2
+    assert value["contract_version"] == 3
     assert value["categories"]["repair_required"] == 3
     assert value["categories"]["unknown_outcome"] == 1
     assert value["categories"]["complete_state"] == 2
     assert value["known_urls"] == sum(value["categories"].values()) == 6
     assert value["definitively_unavailable_urls"] is value["closure_progress_ratio"] is None
+    assert not value["all_history_complete"] and not value["queue_mutation_possible"]
+    assert states == original
+
+
+@pytest.mark.parametrize("nontext", [
+    "source_body_embedded_only", "source_body_image_only", "pdf_image_only_or_body_not_found",
+])
+def test_v3_nontext_extension_keeps_clock_failure_separate_and_does_not_complete_work(nontext):
+    """The v3 vocabulary extension must not reclassify the existing clock gate."""
+    states = {CLOCK: 3, nontext: 4, "complete": 2, PRIVATE_ERROR: 1}
+    original = deepcopy(states)
+    value = classify_news_outcomes(states, registered=True, body_enabled=True)
+    assert value["contract_version"] == 3
+    assert value["categories"]["repair_required"] == 3
+    assert value["categories"]["nontext_representation"] == 4
+    assert value["categories"]["complete_state"] == 2
+    assert value["categories"]["unknown_outcome"] == 1
+    assert value["known_urls"] == sum(value["categories"].values()) == 10
+    assert value["closure_progress_ratio"] is value["definitively_unavailable_urls"] is None
     assert not value["all_history_complete"] and not value["queue_mutation_possible"]
     assert states == original
 
@@ -59,7 +78,7 @@ def test_readonly_projection_preserves_clock_counts_but_never_invents_body_or_et
     _clock_payload(tmp_path, now)
     value = build_news_public_status(tmp_path, now=now + timedelta(seconds=age_seconds))
     assert value["read_only"] and value["snapshot_consistent"]
-    assert value["news_outcome_classification_contract_version"] == 2
+    assert value["news_outcome_classification_contract_version"] == 3
     row = next(source for source in value["providers"] if source["id"] == "cnyes")
     assert row["states"] == {"complete": 2, CLOCK: 3, "other": 1}
     assert row["known_urls"] == 6 and row["stored_body_urls"] == row["complete_urls"] == 2

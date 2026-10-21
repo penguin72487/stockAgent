@@ -14,6 +14,35 @@ import pytest
 
 from services.discord_bot import bot as discord_bot
 from stockagent.live import quote_provider, signal_engine
+from stockagent.live.completed_inference_cache import LoadedImplementationChanged
+
+
+def test_changed_loaded_code_rejects_before_uncancellable_prewarm_source_builder(monkeypatch):
+    def changed():
+        raise LoadedImplementationChanged()
+
+    monkeypatch.setattr(discord_bot, "loaded_implementation_identity", changed)
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_serialized",
+        lambda *_: pytest.fail("inadmissible process must not start a source/model build"))
+    # No config, cache, lock or source access is needed to reject code drift.
+    with pytest.raises(LoadedImplementationChanged):
+        discord_bot._prewarm_market_signal_sync(object())
+
+
+@pytest.mark.parametrize("completed_session", [False, True])
+def test_changed_loaded_code_rejects_before_realtime_freshness_or_source_refresh(monkeypatch, completed_session):
+    def changed():
+        raise LoadedImplementationChanged()
+
+    monkeypatch.setattr(discord_bot, "loaded_implementation_identity", changed)
+    monkeypatch.setattr(discord_bot, "_ensure_signal_ready",
+        lambda *_: pytest.fail("code drift must be checked before source scans"))
+    monkeypatch.setattr(discord_bot, "_run_pre_signal_command",
+        lambda *_: pytest.fail("inadmissible process must not run a source hook"))
+    monkeypatch.setattr(discord_bot, "_run_completed_session_command",
+        lambda *_: pytest.fail("inadmissible process must not run a completed-session hook"))
+    with pytest.raises(LoadedImplementationChanged):
+        discord_bot._prepare_realtime_signal_sync(object(), force_refresh=True, completed_session=completed_session)
 
 
 def test_restart_recovers_original_observed_clock_not_new_process_wake(monkeypatch, tmp_path):
@@ -176,6 +205,95 @@ def test_opening_source_observer_delay_does_not_compound_provider_backoff(
     result = {"status": status, "recovered_count": 0, "recovered_input_count": progress}
     now = datetime.fromisoformat(f"2026-10-14T{at}+08:00")
     assert discord_bot._opening_source_repair_delay(result, attempt, now) == expected
+
+
+@pytest.mark.parametrize("providers,expected", [
+    ({"healthy": {"retry_after_monotonic": 108.}, "failed": {"retry_after_monotonic": 160.}}, 8.),
+    ({"inflight": {"state": "running"}, "failed": {"retry_after_monotonic": 160.}}, .5),
+    ({"ready": {"retry_after_monotonic": 99.}}, .5),
+    ({"failed": {"retry_after_monotonic": 160.}}, 30.),
+    ({"bad": {"retry_after_monotonic": float("nan")}, "good": {"retry_after_monotonic": 102.}}, 2.),
+    ({"bad": {"retry_after_monotonic": float("inf")}}, 30.),
+    ({"bad": {"retry_after_monotonic": True}}, 30.),
+    ({"bad": None, "other": "invalid"}, 30.),
+])
+def test_opening_source_observer_aligns_with_earliest_provider_not_failed_peer(monkeypatch, providers, expected):
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: 100.)
+    result = {"status": "waiting_source", "opening_acquisition": {"opening_providers": providers}}
+    now = datetime.fromisoformat("2026-10-19T09:12:00+08:00")
+    assert discord_bot._opening_source_repair_delay(result, 60, now) == expected
+
+
+def test_opening_observer_does_not_add_receipt_io_to_provider_retry(monkeypatch, tmp_path):
+    now = datetime.fromisoformat("2026-10-19T09:12:00+08:00")
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("fixture")
+    cfg = SimpleNamespace(day_trade_simulation_enabled=True, config_path=str(cfg_path))
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot.time, "monotonic", lambda: 100.)
+    monkeypatch.setattr(discord_bot, "_market_configs", lambda: {"test": cfg})
+    monkeypatch.setattr(discord_bot, "_market_enabled", lambda cfg: True)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "fixture"))
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", None)
+    monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_retry_at", {})
+    monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_attempts", {})
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_root", lambda *a: str(tmp_path))
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_sync", lambda *a: {
+        "status": "waiting_source", "minimum_observer_retry_delay_seconds": 9.,
+        "opening_acquisition": {"opening_providers": {"finmind": {"retry_after_monotonic": 101.}}},
+    })
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    assert discord_bot.bot._opening_source_repair_retry_at[now.date().isoformat() + ":" + str(tmp_path)] == 101.
+
+
+@pytest.mark.parametrize("at,interval", [("08:59:29", 1.), ("08:59:30", .1),
+    ("09:00:00", .1), ("09:00:10", .1), ("09:00:11", 1.), ("10:00:00", 1.)])
+def test_source_owner_enters_fast_wake_before_gate_independently_of_models(monkeypatch, at, interval):
+    now = datetime.fromisoformat("2026-10-21T" + at + "+08:00")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz or now.tzinfo)
+    calls = []
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_market_configs", lambda: {})
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_must_defer", lambda: False)
+    monkeypatch.setattr(discord_bot, "_set_scheduler_poll_seconds", lambda loop, seconds: calls.append(seconds))
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    assert calls == [interval]
+
+
+@pytest.mark.parametrize("at,expected", [("08:59:29", 0), ("08:59:30", 1),
+    ("08:59:49", 1), ("08:59:50", 0), ("08:59:59", 0)])
+def test_source_transport_renews_once_before_gate_not_as_a_late_opening_dependency(monkeypatch, tmp_path, at, expected):
+    now = datetime.fromisoformat("2026-10-21T" + at + "+08:00")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz or now.tzinfo)
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("fixture")
+    cfg = SimpleNamespace(day_trade_simulation_enabled=True, config_path=str(cfg_path))
+    calls = []
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    monkeypatch.setattr(discord_bot, "_market_configs", lambda: {"test": cfg})
+    monkeypatch.setattr(discord_bot, "_market_enabled", lambda *_: True)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *a: (True, "fixture"))
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_must_defer", lambda: False)
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_root", lambda *a: str(tmp_path))
+    monkeypatch.setattr(discord_bot, "_set_scheduler_poll_seconds", lambda *a: None)
+    monkeypatch.setattr(discord_bot.bot, "_opening_source_repair_retry_at", {})
+    monkeypatch.setattr(discord_bot, "_opening_source_transport_prewarm_sync", lambda *a: calls.append(a))
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_sync", lambda *a: pytest.fail("no source acquisition before 09:00"))
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    asyncio.run(discord_bot.opening_source_repair.coro())
+    assert len(calls) == expected
 
 
 def test_overlapping_commands_share_work_cancel_independently_and_next_call_is_fresh(monkeypatch):

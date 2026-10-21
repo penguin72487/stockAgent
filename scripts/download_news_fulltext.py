@@ -67,6 +67,8 @@ def main(argv=None):
     parser.add_argument("--refresh", action="store_true", help="Recheck selected saved articles with conditional HTTP")
     parser.add_argument("--reason", help="Bounded review reason for a missing-body repair request; repair only, no HTTP or owner restart")
     parser.add_argument("--reviewed-supplement", type=Path, help="Retained public-source diagnostic report for an explicit finite supplement; requires source opt-in, at most16 direct --url arguments; original cohort unchanged")
+    parser.add_argument('--reviewed-native-diagnostics', type=Path,
+                        help='Explicit approved native diagnostic manifest; fetch only, 1-16 direct URLs, no HTTP or scope/retry reset')
     parser.add_argument("--materialize-reviewed-response", action="store_true",
                         help="Revalidate and durably accept the immutable reviewed response without a second HTTP request; fetch plus --reviewed-supplement only")
     parser.add_argument("--reviewed-source-outcomes", type=Path, help="Explicit non-body finite metadata correction through retained canonical probes; enqueue only, no HTTP or scope extension")
@@ -76,12 +78,16 @@ def main(argv=None):
     if (args.command == 'repair') != (args.reason is not None):
         parser.error('repair requires --reason; --reason belongs to repair')
     if args.command == 'repair' and (args.refresh or args.reviewed_supplement or args.materialize_reviewed_response
-            or args.reviewed_source_outcomes or args.skip_local_ingest):
-        parser.error('repair submits known missing semantic failures only; no refresh, supplement or ingest flags')
+            or args.reviewed_native_diagnostics or args.reviewed_source_outcomes or args.skip_local_ingest):
+        parser.error('repair submits known missing parser failures under the reviewed source contract only; no refresh, supplement or ingest flags')
     if args.reviewed_supplement and (args.command not in {"enqueue", "fetch"} or args.url_file is not None or not 1 <= len(args.url) <= 16):
         parser.error("reviewed supplement requires enqueue/fetch and one to sixteen direct --url arguments")
     if args.materialize_reviewed_response and (args.command != "fetch" or not args.reviewed_supplement or args.refresh):
         parser.error("retained materialization requires fetch plus explicit reviewed supplement, without refresh")
+    if args.reviewed_native_diagnostics and (args.command != 'fetch' or args.url_file is not None
+            or not 1 <= len(args.url) <= 16 or args.refresh or args.reviewed_supplement
+            or args.materialize_reviewed_response or args.reviewed_source_outcomes):
+        parser.error('reviewed native materialization requires fetch and 1-16 direct URLs, without other mutations')
     if args.reviewed_source_outcomes and (args.command != 'enqueue' or args.url_file is not None
             or not 1 <= len(args.url) <= 16 or args.reviewed_supplement or args.refresh):
         parser.error('source outcome review requires enqueue and one to sixteen direct URLs, without refresh or supplement')
@@ -185,6 +191,17 @@ def main(argv=None):
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         if args.command in {"enqueue", "fetch"}:
+            if args.reviewed_native_diagnostics:
+                from downloader.news_fulltext_retained_native import materialize_reviewed_native
+                replay = materialize_reviewed_native(queue, list(selected_urls(args)),
+                    args.reviewed_native_diagnostics, lease_seconds=config['lease_seconds'])
+                result = queue.status(accepted_this_run=replay['materialized_bodies'],
+                                      activity='reviewed_retained_source_materialized')
+                result['reviewed_native_materialization'] = replay
+                if args.output:
+                    atomic_write_json(args.output, result)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
             # Explicit links do not trigger a scan of the metadata lake or
             # requests to FinLab/FinMind. They share the same identity/owner.
             urls, selected, submitted, buffer = [], set(), 0, []

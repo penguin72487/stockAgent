@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import time
 
 import numpy as np
 
@@ -33,13 +34,16 @@ PROGRESS_NAME = "storage_progress.json"
 MAX_MEMBERS = 8192
 MAX_RESUME_ATTEMPTS = 8
 MAX_GENERATION_NAMES = 4096
+PROGRESS_BATCH_MEMBERS = 64
+PROGRESS_INTERVAL_SECONDS = 2.0
 
 
 def implementation_identity() -> dict[str, str]:
     """Bind producer reuse and its existing integrity/codec dependencies."""
+    from stockagent.data_sync.cache_capacity import GenerationWriteBudget
     paths = {Path(__file__), *(Path(function.__code__.co_filename) for function in (
         write_array_block, array_content_fingerprint, link_immutable_payload, read_cache_metadata,
-        atomic_write_bytes))}
+        atomic_write_bytes, GenerationWriteBudget.charge))}
     return {str(path.resolve()): file_sha256(path) for path in sorted(paths)}
 
 
@@ -64,12 +68,15 @@ class FactorizedProjectionReuse:
     staging: Path
     donor_manifest: Path | None = None
     resume_generation: str | None = None
+    write_budget: object | None = None
     donors: dict = field(init=False, default_factory=dict)
     dictionary_donors: list = field(init=False, default_factory=list)
     progress_members: dict = field(init=False, default_factory=dict)
     progress_dictionary: dict | None = field(init=False, default=None)
     progress_metadata: dict | None = field(init=False, default=None)
     resume_roots: set = field(init=False, default_factory=set)
+    progress_pending: int = field(init=False, default=0)
+    progress_last_commit: float = field(init=False, default=0.0)
     counters: dict = field(init=False, default_factory=lambda: dict.fromkeys((
         "written_payloads", "reused_payloads", "written_payload_bytes", "avoided_payload_bytes",
         "unsealed_donor_generations", "rejected_donors",
@@ -195,25 +202,45 @@ class FactorizedProjectionReuse:
             self.resume_roots.add(root)
             self.counters["resume_attempts_loaded"] += 1
 
-    def _checkpoint(self, proof=None, dictionary=None):
-        """One replace-in-place small receipt, never one sidecar per payload."""
+    def _checkpoint(self, proof=None, dictionary=None, *, force=False):
+        """Batch the canonical receipt, never publish unverified partial files.
+
+        The first payload and phase boundaries are durable immediately. A hard
+        process death can lose at most the uncommitted batch's *reuse*, not a
+        committed generation or source data. Readers still require full SHA.
+        """
         if self.resume_generation is None:
             return
+        path = self.staging / PROGRESS_NAME
+        if self.progress_metadata is not None and payload_info(path) != self.progress_metadata:
+            raise ValueError("own attempt progress changed before publication")
         if proof is not None:
+            self._validate_members([proof])
             self.progress_members[proof["path"]] = dict(proof)
+            self.progress_pending += 1
         if dictionary is not None:
             self.progress_dictionary = dict(dictionary)
+            self.progress_pending += 1
+            force = True
+        if not self.progress_pending:
+            return
+        now = time.monotonic()
+        if (not force and self.progress_metadata is not None
+                and self.progress_pending < PROGRESS_BATCH_MEMBERS
+                and now - self.progress_last_commit < PROGRESS_INTERVAL_SECONDS):
+            return
         members = list(self.progress_members.values())
         self._validate_members(members)
-        path = self.staging / PROGRESS_NAME
-        if (self.progress_metadata is not None and payload_info(path) != self.progress_metadata):
-            raise ValueError("own attempt progress changed before publication")
         value = {"contract": PROGRESS_CONTRACT, "generation": self.resume_generation,
                  "implementation": self.code, "members": members,
                  "dictionary": self.progress_dictionary}
-        atomic_write_bytes(path, json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                           allow_nan=False).encode(), durable=True, mode=0o444)
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        if self.write_budget is not None:
+            self.write_budget.charge(len(payload))
+        atomic_write_bytes(path, payload, durable=True, mode=0o444)
         self.progress_metadata = payload_info(path)
+        self.progress_last_commit = now
+        self.progress_pending = 0
         self.counters["progress_commits"] += 1
 
     def _key(self, kind, values, columns=None, logical_shape=None):
@@ -233,6 +260,8 @@ class FactorizedProjectionReuse:
             if proof.get("shape") != list(shape):
                 self.counters["rejected_donors"] += 1
                 continue
+            if self.write_budget is not None:
+                self.write_budget.charge(0)
             if link_immutable_payload(source, target, sha256=proof["sha256"], size=proof["bytes"]):
                 self.counters["reused_payloads"] += 1
                 self.counters["avoided_payload_bytes"] += proof["bytes"]
@@ -263,27 +292,50 @@ class FactorizedProjectionReuse:
         if reused is not None:
             return reused
         proof = write_array_block(self.staging / name, values, omit_zero_columns=True,
-                                  logical_columns=columns, logical_shape=logical_shape)
+                                  logical_columns=columns, logical_shape=logical_shape,
+                                  **({"output_open": self.write_budget.open} if self.write_budget is not None else {}))
         return self._record_written(proof, key)
+
+    def adopt_prefix_block(self, proof):
+        """Reuse a source-proven prefix without rematerializing its dense cells.
+
+        The preparer must first prove unchanged causal inputs and checkpoint.
+        The canonical sealed donor inventory, full SHA, shape and new-target
+        checks remain mandatory here; an arbitrary file is not a donor.
+        """
+        self._validate_members([proof])
+        key = proof["producer_input_sha256"]
+        if not any(member["sha256"] == proof["sha256"] and member["bytes"] == proof["bytes"]
+                   and member["shape"] == proof["shape"] for _, member in self.donors.get(key, ())):
+            raise ValueError("proven prefix is absent from the sealed donor inventory")
+        result = self._reuse(proof["path"], key, proof["shape"])
+        if result is None or result["sha256"] != proof["sha256"]:
+            raise ValueError("proven prefix donor changed; last good generation retained")
+        return {**result, **({"symbol_start": proof["symbol_start"]} if "symbol_start" in proof else {})}
 
     def common(self, values):
         values = np.asarray(values)
         key = self._key("common_npy", values)
         reused = self._reuse("common.npy", key, values.shape)
         if reused is not None:
+            self._checkpoint(force=True)
             return reused
         path = self.staging / "common.npy"
-        with path.open("xb") as stream:
+        with (self.write_budget.open(path) if self.write_budget is not None else path.open("xb")) as stream:
             np.save(stream, values, allow_pickle=False)
         proof = {"path": path.name, "shape": list(values.shape),
                  "sha256": file_sha256(path), "bytes": path.stat().st_size}
-        return self._record_written(proof, key)
+        result = self._record_written(proof, key)
+        self._checkpoint(force=True)
+        return result
 
     def dictionary(self, source: Path, expected_sha256: str):
         """Writable originals need one sealed copy, not another copy per build."""
         target = self.staging / "feature_dictionary.json"
         if os.path.lexists(target):
             raise ValueError("projection dictionary already exists")
+        if self.write_budget is not None:
+            self.write_budget.charge(0)
         if link_immutable_payload(source, target, sha256=expected_sha256, size=source.stat().st_size):
             self.counters["reused_dictionary_bytes"] += target.stat().st_size
             self._checkpoint(dictionary={"sha256": expected_sha256, "bytes": target.stat().st_size})
@@ -299,7 +351,7 @@ class FactorizedProjectionReuse:
                 self.counters["reused_dictionary_bytes"] += before["size"]
                 self._checkpoint(dictionary={"sha256": expected_sha256, "bytes": before["size"]})
                 return
-        with target.open("xb") as writer, source.open("rb") as reader:
+        with (self.write_budget.open(target) if self.write_budget is not None else target.open("xb")) as writer, source.open("rb") as reader:
             shutil.copyfileobj(reader, writer, 1024**2)
         seal_new_file(target)
         if payload_info(source) != before or file_sha256(target) != expected_sha256:
@@ -310,4 +362,5 @@ class FactorizedProjectionReuse:
     def stats(self):
         if implementation_identity() != self.code:
             raise ValueError("projection storage implementation changed during preparation")
+        self._checkpoint(force=True)
         return {"contract": CONTRACT, **self.counters}

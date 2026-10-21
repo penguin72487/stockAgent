@@ -23,7 +23,10 @@ from scripts.stage_tw_public_research_release import (  # noqa: E402
     _formal_inventory_hashes,
     _required_formal_members,
     _stage_copy,
+    _action_members,
+    _assert_formal_inventory,
 )
+from stockagent.data.parquet_lineage import ParquetLineage, assert_receipt, receipt_fields  # noqa: E402
 from stockagent.data_sync.desync_snapshots import sha256_file  # noqa: E402
 
 
@@ -39,7 +42,7 @@ MODEL_CHANNELS = STOCK_VALUE_CHANNELS + PUBLIC_VALUE_CHANNELS * 2
 
 def _validated_contract() -> tuple[dict, pq.FileMetaData, str, str]:
     receipt = json.loads(SOURCE_RECEIPT.read_text(encoding="utf-8"))
-    if int(receipt.get("contract_version", -1)) != 2:
+    if int(receipt.get("contract_version", -1)) not in {2, 3}:
         raise RuntimeError("unexpected all-observed feature contract version")
     source_hash = sha256_file(SOURCE)
     if source_hash != receipt.get("output_sha256"):
@@ -74,21 +77,13 @@ def main() -> int:
                 encoding="utf-8"
             )
         )
-        required_members = _required_formal_members(entitlement_summary, LIVE_ROOT)
+        formal = ParquetLineage(FORMAL_FEATURE)
+        required_members = _required_formal_members(entitlement_summary, LIVE_ROOT, feature_identity=formal.identity)
         inventory_hashes = _formal_inventory_hashes(
             args.base_snapshot_id, args.sync_root, required_members=required_members
         )
-        formal_hash = sha256_file(FORMAL_FEATURE)
-        receipt_formal_hash = receipt.get("inputs", {}).get("official", {}).get("sha256")
-        if not (
-            formal_hash
-            == receipt_formal_hash
-            == inventory_hashes["features/tw_public_stock_daily.parquet"]
-        ):
-            raise RuntimeError(
-                "all-observed/formal lineage mismatch: rebuild from the current "
-                "published tw-public base before staging"
-            )
+        _assert_formal_inventory(formal.identity, inventory_hashes)
+        assert_receipt(formal.identity, receipt.get("inputs", {}).get("official"))
         end_date = str(pc.max(pq.read_table(SOURCE, columns=["date"])["date"]).as_py())
         staged_files = (
             (SOURCE, Path("features") / SOURCE.name, source_hash),
@@ -109,7 +104,7 @@ def main() -> int:
             _stage_copy(source, args.staged_root / relative, expected)
             staged_hashes[relative.as_posix()] = expected
         action_hashes: dict[str, str] = {}
-        for name in required_members[1:]:
+        for name in _action_members(required_members, formal.identity):
             source = LIVE_ROOT / name
             expected = inventory_hashes[name]
             if sha256_file(source) != expected:
@@ -117,14 +112,14 @@ def main() -> int:
             _stage_copy(source, args.staged_root / name, expected)
             action_hashes[name] = expected
         release = {
-            "schema_version": 1,
+            "schema_version": 1 if formal.identity["kind"] == "file" else 2,
             "status": "complete",
             "research_only": True,
             "historical_vintage_verified": False,
             "end_date": end_date,
             "base_dataset": "tw-public",
             "base_snapshot_id": args.base_snapshot_id,
-            "base_feature_sha256": formal_hash,
+            **receipt_fields(formal.identity, hash_key="base_feature_sha256", source_key="base_feature_source"),
             "feature_rows": int(metadata.num_rows),
             "public_value_channels": PUBLIC_VALUE_CHANNELS,
             "stock_value_channels": STOCK_VALUE_CHANNELS,
@@ -135,6 +130,7 @@ def main() -> int:
             "formal_action_members_sha256": action_hashes,
         }
         target = args.staged_root / "release_receipt.json"
+        formal.verify()
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_suffix(".json.tmp")
         try:

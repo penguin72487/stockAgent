@@ -1,0 +1,76 @@
+# First stock-futures carry baseline, with the stock research input ABI.
+# A reviewed stock-only physical-contract release must be built at the paths
+# below before admission. These paths deliberately do not use a moving alias.
+base_config: tw_futures_v8_margin_components_causal_account_capital100m_v5.yaml
+experiment_name: tw-stock-futures-factorized-carry-20261021-v1
+
+data:
+  parquet_root: /srv/stockagent-packed-materialized/tw-daytrade-panel-sources-20261004-gaprepair-v4/tw-daytrade-panel-sources-20261004-gapre-20261004T163754531166169Z-l0-penguin-6160c54fa6faa702/stocks
+  panel_start_date: '2014-01-06'
+  tw_public_feature_path: artifacts/data_preparation/tw_day_trade_factorized_panel_20261005_gaprepair_v4/prepared/execution_rules.parquet
+  use_tw_public_features: true
+  use_tw_public_rules: false
+  factorized_feature_manifest: artifacts/data_preparation/tw_day_trade_factorized_values_20261005_gaprepair_v4/prepared/factorized_manifest.json
+  factorized_host_cache_bytes: 25769803776
+  factorized_transfer_mode: dense_cpu
+  panel_cache_root: artifacts/cache/tw_stock_futures_factorized_carry_20261021_v1/base_panel
+  feature_include: [open_raw, high_raw, low_raw, close_raw, trading_volume_raw, next_session_open_gap_logret]
+  feature_exclude: []
+  feature_availability_indicators: []
+  day_trade_open_feature: true
+  # Preserve the six-column base schema, but do not expose the 09:00 cash
+  # opening observation to the futures decision at 08:45.
+  feature_shift_next_session: [next_session_open_gap_logret]
+  feature_zero_fill: [next_session_open_gap_logret]
+
+trading:
+  tw_futures_portfolio_data_path: artifacts/data_preparation/tw_stock_futures_carry_20261021_v1/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/data_preparation/tw_stock_futures_carry_20261021_v1/release/rules/rules.parquet
+  tw_futures_portfolio_final_settlement_path: artifacts/data_preparation/tw_stock_futures_final_reference_20261021_v1/futures_final_settlement_history.parquet
+  # New physical-contract admission must supply observed/official valuations.
+  # Do not inherit the earlier frozen-contract-value research exception.
+  tw_futures_portfolio_valuation_research_contract: null
+  tw_futures_portfolio_holding_policy: carry
+  tw_futures_portfolio_integer_contracts: true
+  tw_futures_portfolio_capital_basis: initial_margin
+  tw_futures_portfolio_benchmark_mode: tx_front_rolling_1x_gross
+  tw_futures_portfolio_benchmark_data_path: artifacts/data_preparation/tx_front_reference_20261021_v1/continuous_daily.parquet
+  tw_futures_portfolio_benchmark_sha256: b27a4a95bc39896d4b7a6d0b0d59094665784d7e6396bb904a495b426bfee95b
+
+training:
+  lookback: 32
+  batch_size_train: 128
+  epochs: 1000
+  early_stopping_no_improve_ratio: 0.1
+  early_stopping_min_delta: 0.0001
+  pretrained_initialization_root: null
+  warm_start_from_previous_fold: false
+  cache_train_tensors_on_gpu: false
+  cache_eval_tensors_on_gpu: false
+  financial_transformer:
+    d_model: 32
+    feature_bottleneck_dim: 0
+    feature_svd_components: 0
+    temporal_basis_families: []
+    temporal_basis_disabled_families: []
+    temporal_basis_components_by_family: {}
+    temporal_basis_input: embedded
+    temporal_basis_algebraic_contraction: false
+    temporal_basis_fp32_contraction: false
+    temporal_blocks_fp32: true
+    portfolio_blocks_fp32: true
+    futures_causal_account_policy: true
+    futures_current_open_feature: false
+    futures_denomination_hard_projection: false
+    portfolio_output_mode: score_entmax_log_cash
+
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_factorized_carry_20261021_v1
+  require_cuda: true
+  start_fold: 1
+  resume: false
+  isolate_train_folds: true
+
+walk_forward:
+  expected_first_year: 2014
+  split_start_year: null

@@ -66,6 +66,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--summary-path", default=None, help="Optional JSON summary path.")
+    parser.add_argument("--incremental-auto", action="store_true",
+                        help="Use exact dated-source partition proofs; rebuild from the first affected date, not a fixed window.")
     parser.add_argument(
         "--lock-timeout-seconds", type=float, default=7200.0,
         help="Maximum time to wait for another writer of the same output path.",
@@ -116,6 +118,7 @@ def main() -> None:
             end_date=end_date,
             allow_daily_publication_lag=bool(args.allow_daily_publication_lag),
             incremental_start_date=incremental_start_date,
+            incremental_auto=bool(args.incremental_auto),
         )
     print(
         "[tw-public-features] "

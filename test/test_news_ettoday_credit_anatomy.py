@@ -50,7 +50,7 @@ def test_missing_credit_sample_does_not_assert_absence_beyond_its_bound():
 
 def test_existing_metadata_is_additive_and_never_substitutes_organization_for_reporter():
     facts = ettoday_validation_metadata(page(), page_url=URLS[0], adapter_contract_version=7)
-    assert facts['contract_version'] == 3 and facts['native_credit_shapes'][0]['native_reporter_signature_shape']
+    assert facts['contract_version'] == 4 and facts['native_credit_shapes'][0]['native_reporter_signature_shape']
     assert facts['declared_author_types'] == [['Organization']]
     anatomy = facts['story_credit_anatomy'][0]
     # The prose fixture also begins with 記者, but is not a byline. A broad

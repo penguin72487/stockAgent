@@ -3,7 +3,7 @@
 (function () {
   "use strict";
 
-  const metric = (label, source, note, fallback = "") => ({label, source, note, fallback});
+  const metric = (label, source, note, fallback = "", labelSource = "") => ({label, source, note, fallback, labelSource});
   const group = (key, label, hint, selectors) => ({key, label, hint, selectors});
   const profiles = Object.freeze({
     shioaji: {
@@ -66,7 +66,7 @@
       metrics: [
         metric("下載器狀態", "news-health", "news-freshness"),
         metric("已保存正文", "body-count", "body-bytes"),
-        metric("可回補網址", "remaining-count", "remaining-note"),
+        metric("待排網址", "remaining-count", "remaining-note", "", "remaining-label"),
         metric("全來源完成估時", "global-eta", "global-eta-basis"),
       ],
       progress: ["download-progress", "download-progress-label", "已知網址正文取得比例 · 非全網完整率", "download-progress-detail"],
@@ -228,6 +228,7 @@
     const sources = profile.metrics.map((entry) => ({
       ...entry, element: document.getElementById(entry.source),
       noteElement: entry.note ? document.getElementById(entry.note) : null,
+      labelElement: entry.labelSource ? document.getElementById(entry.labelSource) : null,
     }));
     const progressSource = profile.progress && document.getElementById(profile.progress[0]);
     if (sources.some((entry) => !entry.element || (entry.note && !entry.noteElement)) || (profile.progress && !progressSource)) {
@@ -267,10 +268,12 @@
       const value = node("strong", "acq-metric-value", "讀取中");
       value.dataset.acqSource = entry.source;
       const note = node("small", "acq-metric-note", entry.fallback);
-      card.append(node("span", "acq-metric-label", entry.label), value, note);
+      const label = node("span", "acq-metric-label", entry.label);
+      card.append(label, value, note);
       metrics.append(card);
       bindings.push([entry.element, value]);
       if (entry.noteElement) bindings.push([entry.noteElement, note]);
+      if (entry.labelElement) bindings.push([entry.labelElement, label]);
     }
     overview.append(metrics);
     if (profile.progress) {

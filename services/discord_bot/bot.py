@@ -3022,6 +3022,10 @@ def _prepare_realtime_signal_sync(
     force_refresh: bool = False,
     completed_session: bool = False,
 ) -> tuple[str | None, MarketRuntimeStatus, bool]:
+    # Reject an inadmissible resident process before source freshness scans,
+    # refresh hooks or panel preparation. The inference owner checks again at
+    # execution; this early check never blesses a changed model/cache version.
+    loaded_implementation_identity()
     status = _ensure_signal_ready(cfg)
     should_refresh = bool(force_refresh or _market_schedule_interval_minutes(cfg) is not None)
     if should_refresh:
@@ -4243,6 +4247,10 @@ def _warm_startup_inference_sync() -> dict[str, Any]:
 def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
     """Single-flight one market/session prewarm across scheduler task loops."""
 
+    # A process with changed live dependencies cannot use the result anyway.
+    # Do not launch an uncancellable source builder or return an old warm
+    # result before checking that existing admission still describes it.
+    loaded_implementation_identity()
     timezone_name = cfg.timezone or "Asia/Taipei"
     session_date = datetime.now(ZoneInfo(timezone_name)).date().isoformat()
     key = (str(cfg.market), session_date)
@@ -12058,7 +12066,9 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
         "observed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="milliseconds"),
         "simulation_only": True, "inference_performed": False, "orders_submitted": False,
         "observer_policy": "shared_provider_backoff_no_source_wait_starvation_v1",
-        "observer_loop_interval_seconds": 1.0,
+        "observer_retry_policy": "earliest_shared_provider_deadline_v2",
+        "observer_loop_interval_seconds": float(opening_source_repair.seconds),
+        "observer_opening_wake_policy": "10hz_before_gate_through_first_11_seconds_v1",
         "minimum_observer_retry_delay_seconds": _opening_source_repair_delay(
             result, attempt, datetime.now(ZoneInfo("Asia/Taipei")),
         ),
@@ -12081,11 +12091,23 @@ def _opening_source_repair_must_defer() -> bool:
     )
 
 
+def _opening_source_transport_prewarm_sync(root: str, session_date: str) -> dict[str, Any]:
+    """Renew idle connections before 09:00, without preparing a model/panel.
+
+    Use the existing parallel transport and broker owners. Probes do not seed
+    opening prices or replace the actual full-universe requests after the gate.
+    They retain their own per-provider completion/failure journal.
+    """
+    from stockagent.live.opening_price_acquisition import OPENING_FAN_IN, configured_transport_probes
+    return OPENING_FAN_IN.warm_transports(parquet_root=root, session_date=session_date,
+        probes=configured_transport_probes(force=True), force=True, timeout_seconds=1.5)
+
+
 def _opening_source_repair_delay(result: dict[str, Any], attempt: int, now: datetime) -> float:
     """Observer cadence only; the shared fan-in owns each provider's cooldown.
 
-    An absent receipt is not a completed acquisition. During the first minute,
-    do not compound provider backoff with an unrelated 30/60-second sleep.
+    An absent receipt is not a completed acquisition. Do not compound a live
+    provider's monotonic retry deadline with an unrelated 30-second sleep.
     Explicit no-first-print evidence advances model inputs without making up a
     price, so it counts as progress alongside newly accepted opening prices.
     """
@@ -12097,10 +12119,27 @@ def _opening_source_repair_delay(result: dict[str, Any], attempt: int, now: date
             or result.get("recovered_count", 0) > 0
             or (now.hour == 9 and now.minute == 0)):
         return 0.5
+    acquisition = result.get("opening_acquisition")
+    providers = acquisition.get("opening_providers") if isinstance(acquisition, dict) else None
+    if isinstance(providers, dict):
+        deadlines = []
+        for metric in providers.values():
+            if not isinstance(metric, dict):
+                continue
+            if metric.get("state") == "running":
+                return 0.5  # Observe accepted progress; do not duplicate inflight work.
+            deadline = metric.get("retry_after_monotonic")
+            if isinstance(deadline, (int, float)) and not isinstance(deadline, bool) and math.isfinite(deadline):
+                deadlines.append(deadline)
+        if deadlines:
+            # The fan-in still admits requests and owns every quota/cooldown.
+            # Wake for the earliest source, not the slowest failing peer. A
+            # short expired-deadline retry is bounded by the existing 1s loop.
+            return min(30.0, max(0.5, min(deadlines) - time.monotonic()))
     return min(30.0, 0.5 * (2 ** min(max(attempt - 1, 0), 6)))
 
 
-@tasks.loop(seconds=1)
+@tasks.loop(seconds=0.1)
 async def opening_source_repair() -> None:
     """Finish pending source rows even after every model has published.
 
@@ -12109,7 +12148,14 @@ async def opening_source_repair() -> None:
     event loop and completely separate from execution/ledger ownership.
     """
     now = datetime.now(ZoneInfo("Asia/Taipei"))
-    if not (9 <= now.hour < 14) or (now.hour == 13 and now.minute >= 30):
+    # Wake independently of model/source readiness at the opening gate. The
+    # shared source owner still deduplicates every request and owns backoff.
+    # Outside this short critical interval retain the ordinary one-second poll.
+    opening_clock = now.hour * 3600 + now.minute * 60 + now.second
+    _set_scheduler_poll_seconds(opening_source_repair,
+        .1 if 8 * 3600 + 59 * 60 + 30 <= opening_clock < 9 * 3600 + 11 else 1.)
+    transport_warm_window = 8 * 3600 + 59 * 60 + 30 <= opening_clock < 8 * 3600 + 59 * 60 + 50
+    if not transport_warm_window and (not (9 <= now.hour < 14) or (now.hour == 13 and now.minute >= 30)):
         return
     configs = [cfg for cfg in _market_configs().values()
                if getattr(cfg, "day_trade_simulation_enabled", False)
@@ -12133,15 +12179,28 @@ async def opening_source_repair() -> None:
             _log_exception("opening_source_repair:config", exc)
     for root in sorted(roots):
         key = now.date().isoformat() + ":" + root
+        if transport_warm_window:
+            warm_key = "transport:" + key
+            if time.monotonic() < bot._opening_source_repair_retry_at.get(warm_key, 0.0):
+                continue
+            # At most once in this 20-second window; start early enough for an
+            # 8-second MIS probe to drain before opening. Do not issue a late
+            # 08:59:59 probe that could consume the opening worker window.
+            bot._opening_source_repair_retry_at[warm_key] = time.monotonic() + 60.
+            try:
+                await asyncio.to_thread(_opening_source_transport_prewarm_sync, root, now.date().isoformat())
+            except Exception as exc:
+                _log_exception("opening_source_repair:transport_prewarm", exc)
+            continue
         if time.monotonic() < bot._opening_source_repair_retry_at.get(key, 0.0):
             continue
         attempt = bot._opening_source_repair_attempts.get(key, 0) + 1
         bot._opening_source_repair_attempts[key] = attempt
         try:
             result = await asyncio.to_thread(_opening_source_repair_sync, root, now.date().isoformat(), attempt)
-            delay = result.get("minimum_observer_retry_delay_seconds")
-            if delay is None:
-                delay = _opening_source_repair_delay(result, attempt, now)
+            # Recalculate after durable receipt I/O. Reusing its earlier delay
+            # would add fsync time on top of an absolute provider deadline.
+            delay = _opening_source_repair_delay(result, attempt, datetime.now(ZoneInfo("Asia/Taipei")))
             bot._opening_source_repair_retry_at[key] = time.monotonic() + delay
         except Exception as exc:
             bot._opening_source_repair_retry_at[key] = time.monotonic() + 5.0

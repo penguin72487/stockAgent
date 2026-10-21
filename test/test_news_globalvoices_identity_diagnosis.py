@@ -76,3 +76,71 @@ def test_unreviewed_provider_cannot_use_native_GV_diagnostic_contract():
     with pytest.raises(ValueError, match='globalvoices_native_identity_metadata_scope_required'):
         globalvoices_public_identity_shape(BeautifulSoup(page(), 'lxml'),
             replace(source(), provider='unreviewed'), page_url=URL)
+
+
+def empty_entry_page():
+    soup = BeautifulSoup(page(), 'lxml')
+    soup.select_one('.entry').clear()
+    return soup
+
+
+@pytest.mark.parametrize('whitespace', ['', ' \n\t '])
+def test_bound_empty_native_response_is_not_a_body_or_an_exhausted_archive(whitespace):
+    soup = empty_entry_page()
+    soup.select_one('.entry').append(whitespace)
+    before = str(soup)
+    result = globalvoices_public_identity_shape(soup, source(), page_url=URL)
+    shape = result['native_body_observation']
+    assert result['contract_version'] == 2
+    assert result['current_exception_identity_verified']
+    assert shape['verified_empty_native_container']
+    assert not shape['all_authorized_alternatives_exhausted']
+    assert not shape['queue_mutation_possible'] and not result['article_durably_accepted']
+    assert str(soup) == before
+    assert BODY not in json.dumps(result)
+
+
+@pytest.mark.parametrize('markup', [
+    '<p></p>', '<br>', '<img src="https://media.test/photo">',
+    '<iframe src="https://media.test/embed"></iframe>',
+    '<script>const privateText = "not a body";</script>',
+    '<!-- unknown loading directive -->', '<template>Unknown body</template>',
+    '<p hidden>Invisible source text</p>', 'Unknown source text', '\u200b',
+])
+def test_textless_rendered_widgets_comments_or_hidden_content_are_not_verified_empty(markup):
+    soup = empty_entry_page()
+    fragment = BeautifulSoup(markup, 'html.parser')
+    soup.select_one('.entry').extend(list(fragment.contents))
+    result = globalvoices_public_identity_shape(soup, source(), page_url=URL)
+    assert not result['native_body_observation']['verified_empty_native_container']
+    assert not result['article_durably_accepted']
+    assert 'privateText' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('change', [
+    'wrong_canonical', 'missing_license', 'unknown_author', 'naive_clock',
+    'duplicate_entry', 'hidden_entry', 'loading_attribute', 'unknown_class', 'paywall',
+])
+def test_empty_shape_requires_same_visible_article_identity_and_known_plain_container(change):
+    soup = empty_entry_page()
+    entry = soup.select_one('.entry')
+    if change == 'wrong_canonical':
+        soup.select_one('link[rel=canonical]')['href'] = URL + '?different=1'
+    elif change == 'missing_license':
+        soup.select_one('[rel=license]').decompose()
+    elif change == 'unknown_author':
+        soup.select_one('#post-header-credit').clear()
+    elif change == 'naive_clock':
+        soup.select_one('meta[property="article:published_time"]')['content'] = '2010-09-24T12:00:00'
+    elif change == 'duplicate_entry':
+        entry.parent.append(BeautifulSoup('<div class="entry"></div>', 'html.parser').div)
+    elif change == 'hidden_entry':
+        entry['hidden'] = ''
+    elif change == 'loading_attribute':
+        entry['data-loading'] = 'unknown'
+    elif change == 'unknown_class':
+        entry['class'].append('unknown')
+    elif change == 'paywall':
+        entry.parent['class'] = ['paywall']
+    result = globalvoices_public_identity_shape(soup, source(), page_url=URL)
+    assert not result['native_body_observation']['verified_empty_native_container']

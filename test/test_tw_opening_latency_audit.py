@@ -82,6 +82,22 @@ def test_preopen_other_day_and_naive_time_cannot_count_as_today(tmp_path):
     assert result["malformed_lines"] == 1
 
 
+def test_half_open_health_probe_stays_partial_and_separate_from_full_sweep():
+    import hashlib
+    from scripts.audit_tw_opening_latency import provider_phase_latency
+    gate = datetime.fromisoformat("2026-10-21T09:00:00+08:00")
+    events = [(600., {"provider": "official_mis", "owner_pid": 1, "job_id": "probe:1",
+        "event": "started", "requested_count": 1,
+        "requested_scope_sha256": hashlib.sha256(b"A").hexdigest()}),
+        (610., {"provider": "official_mis", "owner_pid": 1, "job_id": "probe:1", "event": "finished",
+            "state": "complete", "transport_recovery_probe": True, "transport_health_recovered": True})]
+    report = provider_phase_latency(events, ["A", "B"], gate)
+    jobs = report["phases"]["opening"]["official_mis"]
+    assert jobs["full_scope_jobs"] == 0
+    job = jobs["jobs"][0]
+    assert job["transport_recovery_probe"] and job["transport_health_recovered"]
+
+
 def test_missing_evidence_is_unavailable_not_zero_latency(tmp_path):
     result = opening_coverage_milestones(tmp_path / "missing", "2026-10-13", ["A"])
     assert result["state"] == "unavailable"
@@ -468,22 +484,35 @@ def test_phase_latency_separates_full_scope_delta_no_print_and_failures(tmp_path
     base = {"job_id": "full", "owner_pid": 1, "requested_count": 2}
     progress = {**base, "event": "coverage_progress", "measurement_clock": "provider_job_perf_counter_v1",
         "valid_open_count": 1, "observed_no_print_count": 1, "response_count": 2, "elapsed_ms": 12.5}
+    stage = {"mis_requests": [{"http_headers_ms": 8., "body_read_ms": 1., "json_decode_ms": .5,
+        "row_decode_ms": .25, "http_session_origin": "validated_prewarm_exclusive_handoff"}], "mis_progress_spans": [{"callback_ms": 2.}],
+        "mis_span_policy": "nested_local_wall_spans_overlap_http_not_additive_v1"}
     write(path, [event("mis", 1, event="started", requested_scope_sha256=sha256(b"A\nB").hexdigest(), **base),
-        event("mis", 14, **progress), event("mis", 20, event="finished", state="complete", last_total_ms=18., source_and_persistence_ms=19., **base),
+        event("mis", 14, **progress), event("mis", 20, event="finished", state="complete", last_total_ms=18.,
+            source_and_persistence_ms=19., transport_timing=stage, last_cache_merge_ms=.25,
+            provider_call_offset_ms=.1, provider_invocation_at_taipei="2026-10-13T09:00:00.002+08:00",
+            dispatch_telemetry_wait_ms=.2, dispatch_telemetry_recorded=False, **base),
         event("mis", 3600000, event="started", job_id="delta", owner_pid=1, requested_count=1),
         event("mis", 3600010, event="finished", job_id="delta", owner_pid=1, requested_count=1, state="failed", last_total_ms=4000.),
         event("mis", 18000000, event="started", job_id="close", owner_pid=1, requested_count=2),
         event("mis", 18000010, event="finished", job_id="close", owner_pid=1, state="failed", last_total_ms=4200.)])
     result = opening_coverage_milestones(path, "2026-10-13", symbols)["provider_phase_latency"]
+    assert result["contract"] == "quote_phase_full_scope_per_job_latency_v2"
     opening = result["phases"]["opening"]["mis"]
     assert opening["full_scope_jobs"] == 1
     job = opening["jobs"][0]
     assert job["first_valid_open_ms"] == job["resolved_coverage_ms"]["1.0"] == 12.5
     assert "1.0" not in job["positive_coverage_ms"]
     assert job["unknown_count"] == 0 and job["source_and_persistence_ms"] == 19.
+    assert job["stage_timing"] == {"transport_timing": stage, "last_cache_merge_ms": .25,
+        "provider_call_offset_ms": .1, "dispatch_telemetry_wait_ms": .2, "dispatch_telemetry_recorded": False}
+    assert job["stage_timing_boundary"] == "nested_wall_spans_overlap_not_additive_v1"
+    assert job["provider_invocation_after_open_ms"] == 2.
+    assert job["provider_invocation_boundary"] == "provider_function_entry_not_http_wire_or_exchange_publish"
     intraday = result["phases"]["intraday"]["mis"]
     assert intraday["full_scope_jobs"] == 0 and intraday["failed_or_degraded_jobs"] == 1
     assert intraday["source_duration_percentiles_ms"]["0.99"] == 4000.
+    assert intraday["jobs"][0]["stage_timing"] == {}  # Legacy is unmeasured, not zero.
     assert result["phases"]["postclose"]["mis"]["failed_or_degraded_jobs"] == 1
     assert quote_session_phase(datetime.fromisoformat("2026-10-13T01:00:00+00:00")) == "opening"
     with pytest.raises(ValueError, match="aware"):

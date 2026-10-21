@@ -264,6 +264,9 @@ def sync_cohorts(queue, *, freeze_new=True):
                 # but do not freeze the few old rows before that batch arrives.
                 continue
             with queue.db:
+                from downloader.news_fulltext_urls import seed_unfrozen_finite_originals
+                if not seed_unfrozen_finite_originals(queue, source):
+                    continue  # Never freeze a partial large-scope routing prefix.
                 queue.db.execute("INSERT INTO finite_cohort_members SELECT provider,id,url FROM articles WHERE provider=?",
                                  (source.provider,))
                 count, digest = membership_digest(queue.db, source.provider)

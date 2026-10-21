@@ -44,11 +44,15 @@ def warm_proof(status: dict, control: dict, now: datetime | None = None) -> dict
             or type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0):
         raise ValueError("invalid_natural_warmup_clock")
     windows = {row["market"]: row["protection_start_minutes"] for row in control["startup_preparation"]}
+    # The idle verifier intentionally loads inference dependencies lazily.
+    # There is no module-global BOT; do not restore the expensive eager import
+    # just to verify a pending warmup or a journal-only observation.
+    bot = native.verification_cache().discord_bot
     for market in expected:
-        cfg = native.BOT._resolve_market(market)
+        cfg = bot._resolve_market(market)
         zone = ZoneInfo(cfg.timezone or "Asia/Taipei")
         begin, finish = started.astimezone(zone), completed.astimezone(zone)
-        deadline = native.BOT._startup_gpu_prepare_minutes(cfg)
+        deadline = bot._startup_gpu_prepare_minutes(cfg)
         if (deadline is None or market not in windows or begin.date() != finish.date()
                 or begin.date() != now.astimezone(zone).date()
                 or begin.hour * 60 + begin.minute + begin.second / 60 < windows[market]
@@ -103,4 +107,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    from stockagent.live.service_code_release import run_cli_against_active_source
+    pinned = run_cli_against_active_source(ROOT, Path(__file__), sys.argv[1:])
+    if pinned is None:
+        main()
+    else:
+        raise SystemExit(pinned)

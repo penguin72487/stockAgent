@@ -92,9 +92,20 @@ class DatasetVersionLifecycle:
             self.phase = await workflow.execute_activity(advance_dataset_versions,
                 start_to_close_timeout=timedelta(hours=24), heartbeat_timeout=timedelta(seconds=60),
                 retry_policy=retry)
-            await workflow.sleep(timedelta(minutes=10) if self.phase["state"] == "waiting_next_daily_cycle"
-                                 else timedelta(seconds=30))
+            delay = dataset_version_poll_seconds(self.phase)
+            if delay:
+                await workflow.sleep(timedelta(seconds=delay))
         workflow.continue_as_new({})
+
+
+def dataset_version_poll_seconds(phase: dict) -> int:
+    """Keep old recorded timers; new results admit ready sources immediately."""
+    if phase['state'] == 'waiting_next_daily_cycle':
+        return 600
+    delay = phase.get('next_poll_seconds', 30)
+    if type(delay) is not int or not 0 <= delay <= 300:
+        raise ValueError('dataset version polling delay is outside its bounded contract')
+    return delay
 
 
 @workflow.defn

@@ -28,7 +28,11 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_recovery_uses_full_verified_native_pack_reads_only_for_original_D(
         tmp_path, monkeypatch, cold, native_packs):
     selected = SimpleNamespace(manifest_sha256='a' * 64, manifest={'source': {'files': 31}})
-    monkeypatch.setattr(migration, 'resolve_packed_snapshot_id', lambda *args: selected)
+    resolutions = []
+    def resolve(*args, **options):
+        resolutions.append(options)
+        return selected
+    monkeypatch.setattr(migration, 'resolve_packed_snapshot_id', resolve)
     calls = []
     def verify(root, release, **options):
         calls.append((root, release, options))
@@ -37,10 +41,12 @@ def test_recovery_uses_full_verified_native_pack_reads_only_for_original_D(
     receipt = tmp_path / 'recovery.json'
     proof = migration._recover(Path(cold), 'dataset', 'fixed-release', receipt, tmp_path / 'progress.json')
     assert len(calls) == 1
+    assert resolutions == [{'require_objects': False}]
     root, release, options = calls[0]
     assert root == Path(cold) and release is selected
     assert options['reconstruct_all'] is True
     assert options['d_primary_native_pack_reads'] is native_packs
+    assert options['d_primary_native_chunk_reads'] is (Path(cold) == Path('/srv/stockagent-packed'))
     assert callable(options['progress'])
     assert 'd_primary_native_blob_reads' not in options
     assert proof['full_original_file_reconstruction_verified'] is True
@@ -51,6 +57,34 @@ def test_recovery_uses_full_verified_native_pack_reads_only_for_original_D(
     assert migration._recover(Path(cold), 'dataset', 'fixed-release', receipt,
                               tmp_path / 'progress.json') == proof
     assert len(calls) == 1
+    assert resolutions == [{'require_objects': False}, {'require_objects': True}]
+
+
+def test_full_recovery_checks_presence_once_and_cached_proof_still_rejects_missing_object(tmp_path, monkeypatch):
+    import stockagent.data_sync.packed_snapshots as packed
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'file.bin').write_bytes(b'a' * 64)
+    cold = tmp_path / 'cold'
+    release = packed.publish_packed_snapshot(cold, 'dataset', source, node_id='test',
+        loose_file_threshold_bytes=16, file_chunk_bytes=16, pack_buckets=2)
+    original = packed._validate_object_presence
+    calls = []
+    def presence(root, manifest):
+        calls.append(manifest['snapshot_id'])
+        return original(root, manifest)
+    monkeypatch.setattr(packed, '_validate_object_presence', presence)
+    receipt = tmp_path / 'proof.json'
+    proof = migration._recover(cold, 'dataset', release.manifest['snapshot_id'], receipt, tmp_path / 'progress.json')
+    assert proof['full_original_file_reconstruction_verified']
+    assert proof['independently_reconstructed_bytes'] == 64
+    assert calls == [release.manifest['snapshot_id']]
+    migration._recover(cold, 'dataset', release.manifest['snapshot_id'], receipt, tmp_path / 'progress.json')
+    assert len(calls) == 2  # Cached proof cannot bypass live presence checks.
+    (cold / release.manifest['archive']['objects'][0]['relpath']).unlink()
+    with pytest.raises(SnapshotError, match='not locally complete'):
+        migration._recover(cold, 'dataset', release.manifest['snapshot_id'], receipt, tmp_path / 'progress.json')
+    assert len(calls) == 3
 
 
 def test_native_sqlite_backup_pins_wal_snapshot_while_collectors_keep_writing(tmp_path, monkeypatch):
@@ -479,6 +513,703 @@ def test_recursive_mutable_controls_do_not_restart_the_entire_baseline(setup, mo
     restored = fetch_packed_snapshot(private, repo / 'restored', resolve_latest_packed(private, 'private'))
     assert all((restored / name).read_text() == '{"value":1}' for name in controls)
     assert all((source / name).read_text() == '{"value":2}' for name in controls)
+
+
+@pytest.mark.parametrize('memory_rows', [1, 10000])
+@pytest.mark.parametrize('root,controls', [
+    ('data_crypto_reference', ['state/providers/etherscan.json', 'state/datasets/supply.json']),
+    ('data_finlab', ['receipts/prices.json', 'raw_receipts/after_market_fixed_price.json',
+                     'attempts/prices.json',
+                     'intraday/attempts/tw_minute-0103/2026-09-21.json',
+                     'intraday/receipts/tw_minute-0103/2026-09-21.json',
+                     'intraday/derived_minute/receipts/tw_tick-0103/2026-09-21.json']),
+    ('data_finmind', ['receipts/TaiwanStockInfo/2026-10-19.json',
+                      'complement/receipts/TaiwanStockNews/all/2026-10-19.json',
+                      'sponsor/receipts/TaiwanStockPrice/all/2026-10-19.json']),
+    ('data_tej', ['progress/task-attempt.json.progress.json']),
+])
+def test_named_provider_controls_stream_into_cold_without_millions_of_freeze_files(
+        setup, monkeypatch, root, controls, memory_rows):
+    from stockagent.data_sync import packed_snapshots as packed
+    monkeypatch.setattr(packed, 'METADATA_MEMORY_ROWS', memory_rows)
+    repo, cold, entries, args, policy = setup
+    source = repo / root
+    Path(entries[1]['source']).rename(source)
+    entry = {**entries[1], 'source': str(source)}
+    for logical in controls:
+        path = source / logical
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"value":1}')
+    raw = source / 'raw/original.json'
+    raw.parent.mkdir()
+    raw.write_text('{"unmodified_original":true}')
+    original = packed._write_pack
+    def while_packing(root, selected, temporary, **options):
+        for logical in controls:
+            (source / logical).write_text('{"value":2000}')
+        result = original(root, selected, temporary, **options)
+        for logical in controls:
+            (source / logical).write_text('{"value":3}')
+        return result
+    monkeypatch.setattr(packed, '_write_pack', while_packing)
+    result = migration.migrate_catalog(repo, args, [entry])
+    assert result['state'] == 'verified', result
+    private = migration.private_history_root(cold, policy)
+    saved = resolve_latest_packed(private, 'private')
+    assert saved.manifest['source']['selection']['atomic_json_observed_files'] == len(controls)
+    restored = fetch_packed_snapshot(private, repo / 'restored', saved)
+    assert all((restored / name).read_text() == '{"value":2000}' for name in controls)
+    assert all((source / name).read_text() == '{"value":3}' for name in controls)
+    assert saved.manifest['source']['logical_bytes'] == sum(p.stat().st_size for p in restored.rglob('*') if p.is_file())
+    published = json.loads((args.migration_state / 'publication/private.json').read_text())
+    assert published['logical_bytes_processed'] == published['logical_bytes_total'] == saved.manifest['source']['logical_bytes']
+    preparation = json.loads((args.migration_state / 'preparations/private.json').read_bytes())
+    assert not set(controls).intersection(preparation['controls'])
+    monkeypatch.setattr(packed, '_write_pack', original)
+    # Changed control bytes make one incremental release; unchanged bytes reuse it.
+    progress = []
+    revised = packed.publish_packed_snapshot(private, 'private', source, pack_buckets=1,
+        file_chunk_bytes=policy['file_chunk_bytes'], private_observation_cohort=True,
+        private_atomic_json_controls=True, progress=progress.append)
+    assert revised.manifest_sha256 != saved.manifest_sha256
+    assert progress[-1]['logical_bytes_processed'] == progress[-1]['logical_bytes_total'] == revised.manifest['source']['logical_bytes']
+    packed.verify_packed_snapshot(private, revised, reconstruct_all=True)
+    unchanged = packed.publish_packed_snapshot(private, 'private', source, pack_buckets=1,
+        file_chunk_bytes=policy['file_chunk_bytes'], private_observation_cohort=True,
+        private_atomic_json_controls=True)
+    assert unchanged.manifest_sha256 == revised.manifest_sha256
+    assert raw.read_text() == '{"unmodified_original":true}'
+
+
+@pytest.mark.parametrize('source_name', ['data_finlab', 'data_finmind', 'data_tej', 'data_crypto_reference'])
+def test_provider_control_scope_does_not_admit_raw_receipts_by_basename(tmp_path, source_name):
+    source = tmp_path / source_name
+    (source / 'raw/receipts').mkdir(parents=True)
+    (source / 'raw/receipts/2026-10-19.json').write_text('{"price":-7}')
+    capture = migration._freeze_controls(source, tmp_path / 'private/capture', [])
+    assert not capture
+
+
+@pytest.mark.parametrize('fault', ['none', 'atomic_replace', 'in_place_write', 'invalid_json', 'redirected'])
+def test_inline_control_fd_observation_is_bounded_and_does_not_create_a_copy(tmp_path, monkeypatch, fault):
+    import os
+    from stockagent.data_sync import packed_snapshots as packed
+    source = tmp_path / 'data_finmind'
+    original = source / 'complement/receipts/market/all/current.json'
+    original.parent.mkdir(parents=True)
+    original.write_bytes(b'{"price":-7,"volume":null}')
+    replacement = tmp_path / 'replacement.json'
+    replacement.write_bytes(b'{"value":2}')
+    native = os.fstat
+    touched = []
+    def change_after_open(descriptor):
+        info = native(descriptor)
+        if os.readlink(f'/proc/self/fd/{descriptor}') == str(original):
+            if fault == 'atomic_replace' and not touched:
+                os.replace(replacement, original)
+                touched.append(True)
+            elif fault == 'in_place_write':
+                original.write_bytes(b'{"value":' + str(len(touched) + 1).encode() + b'}')
+                touched.append(True)
+        return info
+    monkeypatch.setattr(packed.os, 'fstat', change_after_open)
+    if fault == 'invalid_json':
+        original.write_bytes(b'{"incomplete":')
+    if fault == 'redirected':
+        original.unlink()
+        original.symlink_to(replacement)
+    entry = packed._SourceEntry(path=original.relative_to(source).as_posix(),
+                               kind='file', mode=0o644, atomic_json_control=True)
+    if fault in {'invalid_json', 'redirected', 'in_place_write'}:
+        with pytest.raises((SnapshotError, OSError, ValueError)):
+            packed._read_atomic_json_control(source, entry)
+    else:
+        raw = packed._read_atomic_json_control(source, entry)
+        assert raw == b'{"price":-7,"volume":null}'
+        assert entry.size == len(raw)
+        if fault == 'atomic_replace':
+            assert original.read_bytes() == b'{"value":2}'
+    assert list(original.parent.iterdir()) == [original]
+
+
+def test_inline_controls_are_never_admitted_to_shared_publication(setup):
+    _, cold, entries, _, _ = setup
+    with pytest.raises(SnapshotError, match='private cohort'):
+        publish_packed_snapshot(cold, 'public', Path(entries[0]['source']),
+                                private_atomic_json_controls=True)
+
+
+def test_inline_control_option_still_rejects_changed_raw_payload(setup, monkeypatch):
+    import stockagent.data_sync.packed_snapshots as packed
+    repo, _, entries, args, _ = setup
+    source = repo / 'data_finmind'
+    Path(entries[1]['source']).rename(source)
+    raw = source / 'raw/receipts/original.json'
+    raw.parent.mkdir(parents=True)
+    raw.write_text('{"original":-7}')
+    original = packed._write_pack
+    def mutated(root, selected, temporary, **options):
+        result = original(root, selected, temporary, **options)
+        raw.write_text('{"original":-7000}')
+        return result
+    monkeypatch.setattr(packed, '_write_pack', mutated)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['state'] != 'verified'
+    assert result['datasets']['private']['state'] == 'waiting_retry'
+    assert raw.read_text() == '{"original":-7000}'
+
+
+def test_inline_control_rejects_oversized_file_before_reading(tmp_path):
+    from stockagent.data_sync import packed_snapshots as packed
+    source = tmp_path / 'data_finmind'
+    path = source / 'receipts/oversized.json'
+    path.parent.mkdir(parents=True)
+    with path.open('wb') as stream:
+        stream.truncate(64 * 1024**2 + 1)
+    entry = packed._SourceEntry(path='receipts/oversized.json', kind='file',
+                               mode=0o644, atomic_json_control=True)
+    with pytest.raises(SnapshotError, match='bounded regular-file'):
+        packed._read_atomic_json_control(source, entry)
+
+
+def test_public_catalog_scope_upgrade_keeps_complete_jsonl_and_old_observations(tmp_path, monkeypatch):
+    source = tmp_path / 'data_tw_public'
+    (source / 'metadata').mkdir(parents=True)
+    (source / 'raw').mkdir()
+    (source / 'status.json').write_bytes(b'{"old":true}')
+    stage = tmp_path / 'private/captures'
+    old = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v8', 'source': str(source), 'excluded': []}))
+    (source / 'status.json').write_bytes(b'{"new":true}')
+    metadata = b'{"title":"official catalog","publishedDate":"2026-10-16"}'
+    journal = b'{"value":-7,"missing":null}\n{"value":3}\n'
+    (source / 'metadata/mof_customs_trade.json').write_bytes(metadata)
+    (source / 'metadata/catalog_versions.jsonl').write_bytes(journal)
+    (source / 'raw/catalog_versions.jsonl').write_bytes(b'not a control')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw census repeated'))
+    frozen = migration._freeze_controls(source, stage, [], existing=old,
+                                        upgrade_from='recursive_mutable_controls_v8')
+    assert set(frozen) == {'status.json', 'metadata/mof_customs_trade.json', 'metadata/catalog_versions.jsonl'}
+    assert Path(frozen['status.json']['path']).read_bytes() == b'{"old":true}'
+    assert Path(frozen['metadata/mof_customs_trade.json']['path']).read_bytes() == metadata
+    assert Path(frozen['metadata/catalog_versions.jsonl']['path']).read_bytes() == journal
+    assert (source / 'raw/catalog_versions.jsonl').read_bytes() == b'not a control'
+
+
+@pytest.mark.parametrize('source_name,controls', [
+    ('data_finmind', ['json_pipeline_last.json', 'complement/json_pipeline_last.json',
+                      'sponsor/json_pipeline_last.json']),
+    ('data_openBB', ['_state/public_priority_cursors.json',
+                     '_state/public_priority_queue_event.json', '_state/public_priority_plan.json']),
+])
+def test_v10_control_upgrade_probes_exact_atomic_producer_heads_only(tmp_path, monkeypatch,
+                                                                  source_name, controls):
+    source = tmp_path / source_name
+    source.mkdir()
+    (source / 'status.json').write_bytes(b'{"old":true}')
+    stage = tmp_path / 'private/captures'
+    captured = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v9', 'source': str(source), 'excluded': []}))
+    (source / 'status.json').write_bytes(b'{"current":true}')
+    for name in controls:
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b'{"value":-7,"missing":null}')
+    raw = source / 'raw/json_pipeline_last.json'
+    raw.parent.mkdir()
+    raw.write_bytes(b'{"original":true}')
+    unknown = source / '_state/unknown_raw.json'
+    unknown.parent.mkdir(exist_ok=True)
+    unknown.write_bytes(b'{"original":true}')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw census repeated'))
+    upgraded = migration._freeze_controls(source, stage, [], existing=captured,
+                                         upgrade_from='recursive_mutable_controls_v9')
+    assert set(upgraded) == {'status.json', *controls}
+    assert Path(upgraded['status.json']['path']).read_bytes() == b'{"old":true}'
+    assert all(Path(upgraded[name]['path']).read_bytes() == b'{"value":-7,"missing":null}'
+               for name in controls)
+    assert migration._freeze_controls(source, stage, [], existing=upgraded,
+                                     upgrade_from=migration.CONTROL_SCOPE) == upgraded
+    assert raw.read_bytes() == unknown.read_bytes() == b'{"original":true}'
+
+
+@pytest.mark.parametrize('source_name,controls', [
+    ('data_finmind', ['complement/json_pipeline_last.json']),
+    ('data_openBB', ['_state/public_priority_cursors.json', '_state/public_priority_plan.json',
+                     '_state/public_priority_queue_event.json']),
+])
+def test_v10_atomic_queue_updates_preserve_exact_cold_roundtrip(setup, monkeypatch,
+                                                              source_name, controls):
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, cold, entries, args, policy = setup
+    source = repo / source_name
+    Path(entries[1]['source']).rename(source)
+    for name in controls:
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(b'{"value":-7,"missing":null}')
+    original = packed._write_pack
+    def updated(root, selected, temporary, **options):
+        for name in controls:
+            (source / name).write_bytes(b'{"current":true}')
+        return original(root, selected, temporary, **options)
+    monkeypatch.setattr(packed, '_write_pack', updated)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['state'] == 'verified', result
+    private = migration.private_history_root(cold, policy)
+    restored = fetch_packed_snapshot(private, repo / 'restored', resolve_latest_packed(private, 'private'))
+    assert all((restored / name).read_bytes() == b'{"value":-7,"missing":null}' for name in controls)
+    assert all((source / name).read_bytes() == b'{"current":true}' for name in controls)
+
+
+@pytest.mark.parametrize('source_name,controls', [
+    ('data_openBB', {'_state/l1_compaction_attempt_latest.json': b'{"state":"running"}',
+                     '_state/l1_compaction_latest.json': b'{"count":-7,"missing":null}'}),
+    ('data_tw_public', {'state/journals/tpex_daily_ohlcv.jsonl':
+                       b'{"rows":7,"missing":null}\n{"rows":-3}\n'}),
+    ('data_finlab', {'runs/latest.json': b'{"state":"running","active_key":"price"}'}),
+    ('data_tw_public', {'features/tw_public_stock_daily.summary.json': b'{"rows":7}',
+                       'features/tw_public_research_wide_2014_v1.research.json': b'{"rows":8}',
+                       'features/tw_public_research_wide_2014_v1.parquet': b'closed original table'}),
+])
+def test_v11_control_delta_keeps_old_capture_and_never_rewalks_payload(
+        tmp_path, monkeypatch, source_name, controls):
+    source = tmp_path / source_name
+    source.mkdir()
+    (source / 'status.json').write_bytes(b'{"old":true}')
+    stage = tmp_path / 'private/captures'
+    previous = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v10', 'source': str(source), 'excluded': []}))
+    (source / 'status.json').write_bytes(b'{"current":true}')
+    for name, raw in controls.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+    unknown = source / 'raw/state/journals/tpex_daily_ohlcv.jsonl'
+    unknown.parent.mkdir(parents=True)
+    unknown.write_bytes(b'not a control')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw census repeated'))
+    selected = migration._freeze_controls(source, stage, [], existing=previous,
+                                         upgrade_from='recursive_mutable_controls_v10')
+    assert set(selected) == {'status.json', *controls}
+    assert Path(selected['status.json']['path']).read_bytes() == b'{"old":true}'
+    for name, raw in controls.items():
+        assert Path(selected[name]['path']).read_bytes() == raw
+        (source / name).write_bytes(raw + (b'{"later":true}\n' if name.endswith('.jsonl') else b' '))
+    assert migration._freeze_controls(source, stage, [], existing=selected,
+                                     upgrade_from=migration.CONTROL_SCOPE) == selected
+    assert unknown.read_bytes() == b'not a control'
+
+
+@pytest.mark.parametrize('source_name,logical,payload,changed', [
+    ('data_tw_public', 'state/journals/tpex_daily_ohlcv.jsonl',
+     b'{"rows":-7,"missing":null}\n', b'{"rows":-7,"missing":null}\n{"rows":2}\n'),
+    ('data_openBB', '_state/l1_compaction_attempt_latest.json',
+     b'{"state":"running"}', b'{"state":"completed"}'),
+    ('data_openBB', '_state/l1_compaction_latest.json',
+     b'{"count":-7,"missing":null}', b'{"count":30}'),
+    ('data_finlab', 'runs/latest.json',
+     b'{"state":"running","active_key":"price"}', b'{"state":"finished"}'),
+    ('data_tw_public', 'features/tw_public_stock_daily.summary.json',
+     b'{"rows":7,"missing":null}', b'{"rows":8}'),
+    ('data_tw_public', 'features/tw_public_research_wide_2014_v1.research.json',
+     b'{"rows":7,"unit":"shares"}', b'{"rows":8}'),
+    ('data_tw_public', 'features/tw_public_research_wide_2014_v1.parquet',
+     b'closed original table', b'new closed table'),
+])
+def test_v11_producer_updates_roundtrip_complete_selected_original(
+        setup, monkeypatch, source_name, logical, payload, changed):
+    import hashlib
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, cold, entries, args, policy = setup
+    source = repo / source_name
+    Path(entries[1]['source']).rename(source)
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    original = packed._write_pack
+    def while_packing(root, selected, temporary, **options):
+        path.write_bytes(changed)
+        return original(root, selected, temporary, **options)
+    monkeypatch.setattr(packed, '_write_pack', while_packing)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['state'] == 'verified', result
+    private = migration.private_history_root(cold, policy)
+    saved = resolve_latest_packed(private, 'private')
+    restored = fetch_packed_snapshot(private, repo / 'restored', saved)
+    assert (restored / logical).read_bytes() == payload
+    assert path.read_bytes() == changed
+    preparation = json.loads((args.migration_state / 'preparations/private.json').read_bytes())
+    assert preparation['controls'][logical]['sha256'] == hashlib.sha256(payload).hexdigest()
+    assert preparation['control_scope'] == migration.CONTROL_SCOPE
+
+
+@pytest.mark.parametrize('source_name,logical', [
+    ('data_finlab', 'runs/latest.json'),
+    ('data_tw_public', 'features/tw_public_stock_daily.summary.json'),
+])
+def test_v12_upgrade_probes_only_named_paths_and_keeps_v11_observations(
+        tmp_path, monkeypatch, source_name, logical):
+    source = tmp_path / source_name
+    source.mkdir()
+    (source / 'status.json').write_bytes(b'{"prior":true}')
+    stage = tmp_path / 'private/captures'
+    old = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v11', 'source': str(source), 'excluded': []}))
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"current":true}')
+    (source / 'status.json').write_bytes(b'{"prior":false}')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw census repeated'))
+    upgraded = migration._freeze_controls(source, stage, [], existing=old,
+                                         upgrade_from='recursive_mutable_controls_v11')
+    assert set(upgraded) == {'status.json', logical}
+    assert Path(upgraded['status.json']['path']).read_bytes() == b'{"prior":true}'
+    assert Path(upgraded[logical]['path']).read_bytes() == b'{"current":true}'
+    assert migration._freeze_controls(source, stage, [], existing=upgraded,
+                                     upgrade_from=migration.CONTROL_SCOPE) == upgraded
+
+
+@pytest.mark.parametrize('source_name,logical', [
+    ('data_finlab', 'raw/runs/latest.json'),
+    ('data_tw_public', 'raw/features/tw_public_stock_daily.summary.json'),
+    ('foreign_source', 'runs/latest.json'),
+    ('data_tw_public', 'features/foreign.summary.json'),
+    ('data_tw_public', 'features/foreign.parquet'),
+])
+def test_v12_named_companions_do_not_admit_foreign_or_raw_lookalikes(tmp_path, source_name, logical):
+    source = tmp_path / source_name
+    path = source / logical
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"not_a_control":true}')
+    assert logical not in migration._freeze_controls(source, tmp_path / 'private/captures', [])
+
+
+@pytest.mark.parametrize('source_name,logical,payload', [
+    ('data_finlab', 'catalog/discovery.json', b'{"keys":["price"],"missing":null}'),
+    ('data_openBB', 'logs/supervisor.log', b'original running log\n'),
+    ('data_openBB', 'logs/supervisor.log.1', b'previous rotated log\n'),
+    ('data_openBB', 'logs/supervisor_launcher.log', b'launcher original\n'),
+    ('data_openBB', 'logs/supervisor-launch.log', b'boot original\n'),
+    ('data_openBB', '_state/monitor_history.jsonl', b'{"observed":-7,"missing":null}\n'),
+    ('data_openBB', '_state/monitor_dashboard_history.jsonl', b'{"progress":0}\n'),
+    ('data_openBB', '_state/provider_scheduler.json', b'{"quota":-7,"missing":null}'),
+    ('data_openBB', '_state/provider_cooldowns.json', b'{"until":null}'),
+    ('data_openBB', '_state/monitor_latest.json', b'{"complete":false}'),
+    ('data_openBB', '_state/audit_latest.json', b'{"complete":false}'),
+    ('data_openBB', '_state/archive_end_date.txt', b'2026-10-21\n'),
+    ('data_openBB', '_state/supervisor.pid', b'4321\n'),
+    ('data_openBB', '_state/openbb_l1_compaction.lock', b'{"epoch":1}'),
+    ('data_openBB', 'catalog/completeness_contract_summary.json', b'{"passed":false}'),
+    ('data_openBB', 'catalog/provider_eta.parquet', b'closed monitor projection'),
+    ('data_openBB', 'catalog/coverage.parquet', b'closed catalog projection'),
+    ('data_openBB', 'catalog/l1_compaction_audit.parquet', b'closed audit projection'),
+])
+def test_v13_producer_controls_survive_changes_and_full_original_cold_recovery(
+        setup, monkeypatch, source_name, logical, payload):
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, cold, entries, args, policy = setup
+    args.retire_staging = True
+    source = repo / source_name
+    Path(entries[1]['source']).rename(source)
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    native = packed._write_pack
+    def changed(root, selected, temporary, **options):
+        result = native(root, selected, temporary, **options)
+        path.write_bytes(payload + b'updated during long packing\n')
+        return result
+    monkeypatch.setattr(packed, '_write_pack', changed)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['state'] == 'verified', result
+    row = result['datasets']['private']
+    proof = json.loads(Path(row['recovery_receipt']).read_bytes())
+    assert proof['full_original_file_reconstruction_verified'] is True
+    assert row['owned_scratch_retirement']['state'] == 'retired'
+    private = migration.private_history_root(cold, policy)
+    selected = resolve_latest_packed(private, 'private')
+    restored = fetch_packed_snapshot(private, repo / 'restored', selected)
+    assert (restored / logical).read_bytes() == payload
+    assert path.read_bytes() == payload + b'updated during long packing\n'
+
+
+@pytest.mark.parametrize('source_name,logical,payload', [
+    ('data_finlab', 'catalog/discovery.json', b'{"keys":[]}'),
+    ('data_openBB', 'logs/supervisor.log', b'first log\n'),
+    ('data_openBB', '_state/monitor_history.jsonl', b'{"first":true}\n'),
+    ('data_openBB', 'catalog/provider_eta.parquet', b'closed projection'),
+])
+def test_v13_prepared_delta_never_recensuses_or_replaces_v12_captures(
+        tmp_path, monkeypatch, source_name, logical, payload):
+    source = tmp_path / source_name
+    source.mkdir()
+    (source / 'status.json').write_bytes(b'{"first":true}')
+    stage = tmp_path / 'private/captures'
+    old = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v12', 'source': str(source), 'excluded': []}))
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    (source / 'status.json').write_bytes(b'{"first":false}')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw tree walked again'))
+    captured = migration._freeze_controls(source, stage, [], existing=old,
+                                         upgrade_from='recursive_mutable_controls_v12')
+    assert set(captured) == {'status.json', logical}
+    assert Path(captured['status.json']['path']).read_bytes() == b'{"first":true}'
+    assert Path(captured[logical]['path']).read_bytes() == payload
+    path.write_bytes(b'new operational observation\n')
+    assert migration._freeze_controls(source, stage, [], existing=captured,
+                                      upgrade_from=migration.CONTROL_SCOPE) == captured
+
+
+@pytest.mark.parametrize('source_name,logical', [
+    ('data_finlab', 'raw/catalog/discovery.json'),
+    ('foreign', 'catalog/discovery.json'),
+    ('data_openBB', 'raw/logs/supervisor.log'),
+    ('foreign', 'logs/supervisor.log'),
+    ('data_openBB', 'logs/unreviewed.log'),
+    ('data_openBB', '_state/unreviewed.jsonl'),
+    ('data_openBB', 'catalog/unreviewed.parquet'),
+])
+def test_v13_control_lookalikes_still_reject_raw_mutation(setup, monkeypatch, source_name, logical):
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, _, entries, args, _ = setup
+    source = repo / source_name
+    Path(entries[1]['source']).rename(source)
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'original raw observation\n')
+    native = packed._write_pack
+    def changed(root, selected, temporary, **options):
+        result = native(root, selected, temporary, **options)
+        path.write_bytes(b'changed raw observation\n')
+        return result
+    monkeypatch.setattr(packed, '_write_pack', changed)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['datasets']['private']['state'] == 'waiting_retry'
+    assert 'changed while packing' in result['datasets']['private']['error']
+
+
+@pytest.mark.parametrize('payload', [b'{"partial":', b'{"complete":true}', b'not JSON\n',
+                                     b'{"complete":true}\n{"partial":'])
+def test_v13_streamed_journal_rejects_partial_records_and_keeps_source(tmp_path, payload):
+    source = tmp_path / 'data_openBB'
+    path = source / '_state/monitor_history.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    stage = tmp_path / 'private/captures'
+    with pytest.raises((SnapshotError, ValueError)):
+        migration._freeze_controls(source, stage, [], upgrade_from='recursive_mutable_controls_v12')
+    assert path.read_bytes() == payload
+    assert not (stage / path.relative_to(source)).exists()
+    assert not list(stage.rglob('*.partial'))
+
+
+def test_v13_large_operational_log_has_bounded_memory_and_retains_first_capture(tmp_path):
+    import tracemalloc
+    source = tmp_path / 'data_openBB'
+    path = source / 'logs/supervisor.log'
+    path.parent.mkdir(parents=True)
+    with path.open('wb') as stream:
+        stream.truncate(70 * 1024**2)
+    stage = tmp_path / 'private/captures'
+    tracemalloc.start()
+    try:
+        captured = migration._freeze_controls(source, stage, [], upgrade_from='recursive_mutable_controls_v12')
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    row = captured['logs/supervisor.log']
+    assert row['bytes'] == 70 * 1024**2 and peak < 32 * 1024**2
+    assert row['capture_kind'] == 'stable_operational_log'
+    assert migration.sha256_file(path) == row['sha256']
+    path.write_bytes(b'new log\n')
+    # Recover an atomic installed capture after a crash before receipt save.
+    assert migration._freeze_controls(source, stage, [], upgrade_from='recursive_mutable_controls_v12') == captured
+
+
+@pytest.mark.parametrize('logical', ['logs/supervisor.log', '_state/monitor_history.jsonl',
+                                     'catalog/discovery.json'])
+def test_v13_named_observations_honor_excluded_trees(tmp_path, logical):
+    source = tmp_path / ('data_finlab' if logical.startswith('catalog/') else 'data_openBB')
+    path = source / logical
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"raw":true}\n')
+    assert migration._freeze_controls(source, tmp_path / 'private/captures', [logical.split('/')[0]],
+        upgrade_from='recursive_mutable_controls_v12') == {}
+
+
+@pytest.mark.parametrize('large', [False, True])
+def test_v13_nonblocking_regular_open_cannot_hang_on_substituted_fifo(tmp_path, monkeypatch, large):
+    import os
+    source = tmp_path / ('data_openBB' if large else 'data_finlab')
+    path = source / ('logs/supervisor.log' if large else 'catalog/discovery.json')
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"first":true}\n')
+    native = migration.os.open
+    def replaced(target, flags, *args, **kwargs):
+        if Path(target) == path:
+            assert flags & os.O_NONBLOCK and flags & os.O_NOFOLLOW
+            path.unlink()
+            os.mkfifo(path)
+        return native(target, flags, *args, **kwargs)
+    monkeypatch.setattr(migration.os, 'open', replaced)
+    with pytest.raises(SnapshotError, match='regular'):
+        migration._freeze_controls(source, tmp_path / 'private/captures', [],
+                                  upgrade_from='recursive_mutable_controls_v12')
+    assert not list((tmp_path / 'private/captures').rglob('*.partial'))
+
+
+@pytest.mark.parametrize('payload', [b'{"partial":', b'{"complete":true}', b'not JSON\n',
+                                     b'{"complete":true}\n{"partial":'])
+def test_v11_query_journal_rejects_partial_or_malformed_without_truncation(tmp_path, payload):
+    source = tmp_path / 'data_tw_public'
+    path = source / 'state/journals/tpex_daily_ohlcv.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    stage = tmp_path / 'private/captures'
+    with pytest.raises((SnapshotError, ValueError)):
+        migration._freeze_controls(source, stage, [])
+    assert path.read_bytes() == payload
+    assert not (stage / path.relative_to(source)).exists()
+
+
+def test_v11_query_journal_delta_honors_excluded_subtree(tmp_path):
+    source = tmp_path / 'data_tw_public'
+    path = source / 'state/journals/tpex_daily_ohlcv.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'{"rows":-7}\n')
+    result = migration._freeze_controls(source, tmp_path / 'private/captures', ['state'],
+                                        upgrade_from='recursive_mutable_controls_v10')
+    assert not result
+
+
+@pytest.mark.parametrize('source_name,logical', [
+    ('data_tw_public', 'raw/state/journals/tpex_daily_ohlcv.jsonl'),
+    ('unrelated', 'state/journals/tpex_daily_ohlcv.jsonl'),
+    ('data_openBB', 'raw/l1_compaction_attempt_latest.json'),
+])
+def test_v11_similar_raw_or_foreign_paths_still_reject_payload_mutation(
+        setup, monkeypatch, source_name, logical):
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, _, entries, args, _ = setup
+    source = repo / source_name
+    Path(entries[1]['source']).rename(source)
+    path = source / logical
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"original":-7}\n')
+    original = packed._write_pack
+    def changed(root, selected, temporary, **options):
+        result = original(root, selected, temporary, **options)
+        path.write_bytes(b'{"original":-7000}\n')
+        return result
+    monkeypatch.setattr(packed, '_write_pack', changed)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['datasets']['private']['state'] == 'waiting_retry'
+    assert path.read_bytes() == b'{"original":-7000}\n'
+
+
+def test_owned_scratch_progress_distinguishes_retirement_from_recovery(tmp_path, monkeypatch):
+    import hashlib
+    from stockagent.data_sync import materialized_cache
+    operation = tmp_path / 'operation'
+    capture = operation / 'controls/owned/status.json'
+    capture.parent.mkdir(parents=True)
+    raw = b'{"raw":-7,"missing":null}'
+    capture.write_bytes(raw)
+    observations = []
+    monkeypatch.setattr(materialized_cache, 'process_references_many', lambda *_: [])
+    result = migration._retire_owned_scratch(operation, 'fixture', {'frozen_control_files': {
+        'status.json': {'path': str(capture), 'sha256': hashlib.sha256(raw).hexdigest()}}},
+        progress=observations.append)
+    assert result['state'] == 'retired'
+    assert [row['stage'] for row in observations] == [
+        'verify-owned-preparation-scratch', 'check-owned-scratch-process-references',
+        'unlink-owned-preparation-scratch', 'owned-preparation-scratch-retired']
+    assert observations[-1]['completed_items'] == observations[-1]['total_items'] == 1
+    assert all(row['acceptance'] is False and row['source_files_deleted'] == 0
+               and row['cold_objects_deleted'] == 0 and row['nas_files_deleted'] == 0
+               for row in observations)
+    assert not capture.exists()
+
+
+@pytest.mark.parametrize('payload', [b'{"partial":', b'{"complete":true}', b'not JSON\n'])
+def test_public_catalog_version_capture_never_silently_truncates_invalid_rows(tmp_path, payload):
+    source = tmp_path / 'data_tw_public'
+    path = source / 'metadata/catalog_versions.jsonl'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    with pytest.raises((SnapshotError, ValueError)):
+        migration._freeze_controls(source, tmp_path / 'private/captures', [])
+    assert path.read_bytes() == payload
+
+
+def test_unrelated_metadata_directory_is_not_a_public_catalog_control(tmp_path):
+    source = tmp_path / 'unrelated'
+    (source / 'metadata').mkdir(parents=True)
+    (source / 'metadata/original.json').write_bytes(b'{"original":-7}')
+    (source / 'metadata/original_versions.jsonl').write_bytes(b'{"original":-7}\n')
+    assert not migration._freeze_controls(source, tmp_path / 'private/captures', [])
+
+
+def test_public_catalog_updates_do_not_invalidate_complete_cold_roundtrip(setup, monkeypatch):
+    from stockagent.data_sync import packed_snapshots as packed
+    repo, cold, entries, args, policy = setup
+    source = repo / 'data_tw_public'
+    Path(entries[1]['source']).rename(source)
+    (source / 'metadata').mkdir()
+    originals = {'metadata/mof_customs_trade.json': b'{"publishedDate":"2026-10-16"}',
+                 'metadata/catalog_versions.jsonl': b'{"value":-7,"missing":null}\n'}
+    for name, raw in originals.items():
+        (source / name).write_bytes(raw)
+    original = packed._write_pack
+    def updated(root, selected, temporary, **options):
+        for name in originals:
+            (source / name).write_bytes(b'{"newer":true}\n')
+        return original(root, selected, temporary, **options)
+    monkeypatch.setattr(packed, '_write_pack', updated)
+    result = migration.migrate_catalog(repo, args, [{**entries[1], 'source': str(source)}])
+    assert result['state'] == 'verified', result
+    private = migration.private_history_root(cold, policy)
+    restored = fetch_packed_snapshot(private, repo / 'restored', resolve_latest_packed(private, 'private'))
+    assert all((restored / name).read_bytes() == raw for name, raw in originals.items())
+    assert all((source / name).read_bytes() == b'{"newer":true}\n' for name in originals)
+
+
+@pytest.mark.parametrize('tamper', [False, True])
+def test_large_control_evidence_stays_out_of_progress_but_is_verified_before_retirement(setup, monkeypatch, tamper):
+    repo, _, entries, args, _ = setup
+    source = Path(entries[1]['source'])
+    (source / 'status.json').write_bytes(b'{"value":-7}')
+    monkeypatch.setattr(migration, 'FROZEN_CONTROLS_INLINE_LIMIT', 0)
+    from stockagent.data_sync import materialized_cache
+    monkeypatch.setattr(materialized_cache, 'process_references_many', lambda *_: [])
+    original = migration._recover
+    def recovered(*call_args, **options):
+        result = original(*call_args, **options)
+        if tamper:
+            path = args.migration_state / 'preparations/private.json'
+            path.write_bytes(path.read_bytes() + b'\n')
+        return result
+    monkeypatch.setattr(migration, '_recover', recovered)
+    args.retire_staging = True
+    result = migration.migrate_catalog(repo, args, [entries[1]])
+    row = result['datasets']['private']
+    assert 'frozen_control_files' not in row['publication']
+    assert row['publication']['frozen_controls_receipt']['files'] == 1
+    assert 'files' not in row.get('owned_scratch_retirement', {})
+    captured = json.loads((args.migration_state / 'preparations/private.json').read_bytes())['controls']['status.json']
+    assert Path(captured['path']).exists() is tamper
+    assert row['state'] == ('waiting_retry' if tamper else 'verified')
+    if tamper:
+        assert 'exact preparation' in row['error']
+    assert (source / 'status.json').read_bytes() == b'{"value":-7}'
 
 
 def test_control_freeze_accepts_atomic_replace_but_captures_the_original_fd(tmp_path, monkeypatch):
@@ -950,6 +1681,43 @@ def test_mutable_cohort_benchmark_keeps_complete_recovery_and_equal_original_val
     assert reference['production_source_payloads_deleted'] == fixed['production_source_payloads_deleted'] == 0
 
 
+def test_operational_controls_benchmark_measures_complete_retry_and_equal_originals():
+    from scripts.benchmark_sealed_pack_recovery import mutable_trial
+    reference = mutable_trial(32, False, operational_controls=True)
+    candidate = mutable_trial(32, True, operational_controls=True)
+    assert reference['attempts'] == 2 and candidate['attempts'] == 1
+    assert reference['inventory_sha256'] == candidate['inventory_sha256']
+    for row in (reference, candidate):
+        assert row['full_original_readback'] and row['owned_scratch_retired']
+        assert row['original_control_files'] == 3 and row['operational_controls_workload']
+        assert row['production_source_payloads_deleted'] == 0
+
+
+@pytest.mark.parametrize('provider,root_name,logical,payload', [
+    ('finlab', 'data_finlab', 'catalog/discovery.json', b'{"keys":[],"missing":null}'),
+    ('openbb', 'data_openBB', '_state/monitor_history.jsonl', b'{"value":-7,"missing":null}\n'),
+])
+def test_live_operational_readback_verifies_only_isolated_copies(
+        tmp_path, monkeypatch, provider, root_name, logical, payload):
+    from scripts import benchmark_sealed_pack_recovery as benchmark
+    root = tmp_path / root_name
+    path = root / logical
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    # The canonical large catalog is explicitly excluded, never admitted just
+    # because it shares a known operational directory.
+    if provider == 'openbb':
+        (root / 'openbb_l1.duckdb').write_bytes(b'not selected')
+    monkeypatch.setattr(benchmark, 'ROOT', tmp_path)
+    result = benchmark.live_operational_trial(provider)
+    assert result['state'] == 'accepted_live_operational_observation_readback'
+    assert result['files'] == 1 and result['logical_bytes'] == len(payload)
+    assert result['full_original_readback'] and result['owned_capture_copies_retired']
+    assert result['production_source_writes'] == result['production_cold_writes'] == 0
+    assert result['provider_calls'] == 0 and not result['production_migration_claim']
+    assert path.read_bytes() == payload
+
+
 def test_retry_deadline_and_untouched_work_prevent_head_of_line_starvation(setup, monkeypatch):
     repo, cold, entries, args, _ = setup
     original = publisher._publish_entry
@@ -1143,7 +1911,8 @@ def test_owned_scratch_is_retired_only_after_recovery_not_originals(setup, monke
     assert row["state"] == "verified", row
     assert row["owned_scratch_retirement"]["state"] == "retired"
     assert (source / "status.json").exists() and (source / "state.sqlite3").exists()
-    assert not any(Path(name).exists() for name in row["owned_scratch_retirement"]["files"])
+    retirement = json.loads(Path(row['owned_scratch_retirement']['receipt']).read_bytes())
+    assert not any(Path(name).exists() for name in retirement['files'])
     assert row['publication']['sealed_pack_hint_files']
     assert all(not Path(item['path']).exists() for item in row['publication']['sealed_pack_hint_files'])
     assert json.loads(Path(row["recovery_receipt"]).read_text())["full_original_file_reconstruction_verified"]
@@ -1173,6 +1942,38 @@ def test_completed_source_budget_keeps_the_remaining_plan_durable(setup):
     assert migration.migrate_catalog(repo, args, entries)["state"] == "verified"
 
 
+@pytest.mark.parametrize('outcome', ['failed', 'source_owner_busy', 'verified'])
+def test_attempt_budget_yields_at_failed_busy_and_completed_source_boundaries(setup, monkeypatch, outcome):
+    repo, _, entries, args, _ = setup
+    args.maximum_attempted_sources = 1
+    original = publisher._publish_entry
+    def first_attempt(*call_args):
+        if outcome == 'failed':
+            raise SnapshotError('source remains changing')
+        if outcome == 'source_owner_busy':
+            return {'publish_ready': False}, None
+        return original(*call_args)
+    monkeypatch.setattr(publisher, '_publish_entry', first_attempt)
+    first = migration.migrate_catalog(repo, args, entries)
+    assert first['datasets']['public']['attempts'] == 1
+    assert first['datasets']['private']['attempts'] == 0
+    assert first['datasets']['private']['state'] == 'pending'
+    monkeypatch.setattr(publisher, '_publish_entry', original)
+    second = migration.migrate_catalog(repo, args, entries)
+    assert second['datasets']['private']['state'] == 'verified'
+    assert second['datasets']['public']['attempts'] == 1
+    assert second['plan_sha256'] == first['plan_sha256']
+
+
+@pytest.mark.parametrize('budget', [0, -1, True, 1.5])
+def test_attempt_budget_rejects_invalid_scope_before_writing(setup, budget):
+    repo, _, entries, args, _ = setup
+    args.maximum_attempted_sources = budget
+    with pytest.raises(SnapshotError, match='attempt budget'):
+        migration.migrate_catalog(repo, args, entries)
+    assert not args.migration_state.exists()
+
+
 def test_existing_lifecycle_resumes_all_sources_then_sleeps_daily_not_per_poll(setup, monkeypatch):
     repo, cold, entries, args, _ = setup
     path = repo / "configs/columnar_storage.json"
@@ -1183,12 +1984,33 @@ def test_existing_lifecycle_resumes_all_sources_then_sleeps_daily_not_per_poll(s
     configuration = {"cold_root": str(cold), "state_root": str(args.migration_state.parent / "control")}
     first = migration.advance_catalog_versions(repo, configuration, now=100)
     assert first["verified_datasets"] == 1 and first["source_count"] == 2
+    assert first['next_poll_seconds'] == 0
     second = migration.advance_catalog_versions(repo, configuration, now=200)
     assert second["state"] == "verified"
     monkeypatch.setattr(migration, "migrate_catalog", lambda *a: pytest.fail("rehashed every poll"))
     sleeping = migration.advance_catalog_versions(repo, configuration, now=300)
     assert sleeping["state"] == "waiting_next_daily_cycle"
     assert sleeping["next_cycle_unix"] == 200 + 86400
+
+
+def test_lifecycle_schedules_ready_sources_without_delay_but_respects_each_busy_deadline(setup, monkeypatch):
+    repo, cold, entries, args, _ = setup
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *_: ({'publish_ready': False}, None))
+    monkeypatch.setattr(migration, '_private_publish', lambda *_: (None, {'state': 'waiting_source_owner'}))
+    monkeypatch.setattr(migration.time, 'time', lambda: 100)
+    configuration = {'cold_root': str(cold), 'state_root': str(args.migration_state.parent / 'control')}
+    assert migration.advance_catalog_versions(repo, configuration)['next_poll_seconds'] == 0
+    second = migration.advance_catalog_versions(repo, configuration)
+    assert second['next_poll_seconds'] == 60
+    current = json.loads((Path(configuration['state_root']) / 'dataset-versions/current.json').read_bytes())
+    progress_path = Path(current['operation_directory']) / 'progress.json'
+    before = json.loads(progress_path.read_bytes())
+    assert all(row['attempts'] == 1 and row['retry_at_unix'] == 160 for row in before['datasets'].values())
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *_: pytest.fail('busy deadline was ignored'))
+    monkeypatch.setattr(migration, '_private_publish', lambda *_: pytest.fail('busy deadline was ignored'))
+    assert migration.advance_catalog_versions(repo, configuration)['next_poll_seconds'] == 60
+    assert all(row['attempts'] == 1 for row in json.loads(progress_path.read_bytes())['datasets'].values())
 
 
 def test_root_subtree_bindings_do_not_silently_omit_the_rest(setup):

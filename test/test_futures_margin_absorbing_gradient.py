@@ -11,24 +11,44 @@ from stockagent.data import tw_futures_margin as m
 from test_tw_futures_margin import tape
 
 
-def failed_margin_close(rows, sign=1., future_move=100.):
+def failed_terminal_close(rows, sign=1., future_move=100.):
     x = tape(rows)
     x[0, :, 4] = 1000 - sign * 140
     x[1, :, 3:5] = 1000 - sign * 130
     x[1, :, m.PREVIOUS_MARK] = x[0, :, 4]
     x[1, :, m.CAN_SELL if sign > 0 else m.CAN_BUY] = 0
+    # An ordinary unfilled risk reduction remains a carried liability under
+    # account contract 7. An unfulfilled terminal obligation has no next
+    # tradable session and is the actual absorbing default used by this test.
+    x[1, :, 2] = 1
+    x[1, :, m.TERMINAL_CAN_SELL if sign > 0 else m.TERMINAL_CAN_BUY] = 0
+    x[1, :, m.TERMINAL_CAPACITY] = 0
     x[2:, :, 4] += sign * future_move
     return x
+
+
+@pytest.mark.parametrize('sign', [-1., 1.])
+def test_unfilled_ordinary_risk_reduction_is_not_a_terminal_default(sign):
+    x = failed_terminal_close(2, sign)
+    x[1, :, 2] = 0  # no terminal obligation; a future session is still available
+    w = torch.full((2, 1), sign * .5, requires_grad=True)
+    r = run(w, x, initial_capital=1000., recoverable_backward=True)
+    assert r.final_alive
+    assert r.default_reason_history.tolist() == [0, 0]
+    assert r.final_weights.item() == sign * 5
+    assert r.final_equity_scale.item() == pytest.approx(.35)
+    r.strategy_returns.sum().backward()
+    assert torch.isfinite(w.grad).all()
 
 
 @pytest.mark.parametrize('sign', [-1., 1.])
 @pytest.mark.parametrize('future_move', [-100., 100.])
 def test_post_default_market_cannot_reverse_pre_default_learning(sign, future_move):
     # A shared action parameter loses 700/1000, breaches maintenance, then
-    # cannot close. Appending 126 untradeable-in-time days cannot alter its
+    # cannot fulfill its terminal close. Appending 126 later days cannot alter its
     # reward or gradient. Re-capitalizing a backward-only shadow used to let
     # those future profits reverse the direction learned from the failure.
-    x = failed_margin_close(128, sign, future_move)
+    x = failed_terminal_close(128, sign, future_move)
     prefix = torch.full((2, 1), sign * .5, requires_grad=True)
     full = torch.full((128, 1), sign * .5, requires_grad=True)
     a = run(prefix, x[:2], initial_capital=1000., recoverable_backward=True)
@@ -46,7 +66,7 @@ def test_post_default_market_cannot_reverse_pre_default_learning(sign, future_mo
 
 @pytest.mark.parametrize('recover', [False, True])
 def test_absorbing_gradient_survives_public_batch_boundary(recover):
-    x = failed_margin_close(4)
+    x = failed_terminal_close(4)
     prefix = run(torch.full((2, 1), .5), x[:2], initial_capital=1000.)
     assert not prefix.final_alive
     weights = torch.full((2, 1), .5, requires_grad=True)
@@ -75,7 +95,7 @@ def test_cuda_graph_replay_retains_absorbing_default(monkeypatch):
     monkeypatch.setenv('STOCKAGENT_FUTURES_FUNDING_COMPILE', '1')
     for initially_alive in (True, False):
         outputs, gradients = [], []
-        x = failed_margin_close(8).cuda()
+        x = failed_terminal_close(8).cuda()
         for graph in (False, True):
             monkeypatch.setenv('STOCKAGENT_FUTURES_CUDA_GRAPH', str(int(graph)))
             w = torch.full((8, 1), .5, device='cuda', requires_grad=True)

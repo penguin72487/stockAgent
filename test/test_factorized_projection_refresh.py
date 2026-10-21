@@ -106,6 +106,15 @@ def test_current_projection_has_no_refresh_request(stale):
     assert runner._stale_factorized_projection_request() is None
 
 
+def test_missing_projection_is_a_source_recovery_request_not_a_silent_idle(stale):
+    _cfg, _completed, path, _manifest = stale
+    path.unlink()
+    hint = runner._stale_factorized_projection_request()
+    assert hint["reason"] == "published_projection_missing"
+    assert hint["expected_completed_session"] == "2020-03-03"
+    assert hint["status"] == "projection_refresh_required" and hint["model_executed"] is False
+
+
 def test_current_tail_still_requests_the_selected_formal_history_scope(stale, monkeypatch):
     from stockagent import config as config_module
 
@@ -201,3 +210,27 @@ def test_source_receipt_and_real_calendar_are_both_required_after_recovery(stale
         with pytest.raises(RuntimeError, match="still lacks"):
             runner._recover_deferred_factorized_source(cfg)
     assert calls == ["configured_canonical_updater"]
+
+
+def test_preopen_missing_projection_hint_uses_the_same_verified_offhours_recovery(stale, monkeypatch):
+    cfg, _completed, path, manifest = stale
+    path.unlink()
+    request = runner._factorized_source_updater_receipt()
+    request.parent.mkdir(exist_ok=True)
+    request.write_text(json.dumps({"status": "projection_refresh_required", "phase": "preopen",
+        "error_type": "FactorizedPreopenProjectionPending", "model_executed": False,
+        "last_good_generation_retained": True}))
+    calls = []
+    def command(got, *, bypass_cache):
+        assert bypass_cache is True
+        assert got.completed_session_timeout_seconds == runner.FACTORIZED_SOURCE_RECOVERY_SECONDS
+        calls.append("same_canonical_source")
+        manifest["dates"].append("2020-03-03")
+        path.write_text(json.dumps(manifest))
+        request.write_text('{"status":"verified"}')
+    bot = SimpleNamespace(_ensure_signal_ready=lambda _: SimpleNamespace(market_open=False),
+        _completed_session_publication_ready=lambda _: True, _run_completed_session_command=command)
+    monkeypatch.setattr(runner, "_load_discord_bot", lambda: bot)
+    assert runner._recover_deferred_factorized_source(cfg)
+    assert runner._recover_deferred_factorized_source(cfg)
+    assert calls == ["same_canonical_source"]

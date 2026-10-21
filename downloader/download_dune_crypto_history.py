@@ -459,7 +459,19 @@ class DuneClient:
                 return decoded
             except HTTPError as exc:
                 last_error = exc
-                detail = exc.read().decode("utf-8", errors="replace")[:500]
+                retryable = exc.code in {408, 429, 500, 502, 503, 504}
+                try:
+                    if retryable:
+                        limiter.defer(
+                            retry_delay_seconds(
+                                attempt,
+                                base=self.retry_base,
+                                retry_after=exc.headers.get("Retry-After") if exc.headers else None,
+                            )
+                        )
+                    detail = exc.read(4096).decode("utf-8", errors="replace")[:500]
+                finally:
+                    exc.close()
                 if exc.code == 402:
                     raise DuneCreditsExhausted(
                         "Dune returned HTTP 402; no additional executions will be started"
@@ -473,17 +485,7 @@ class DuneClient:
                         "Dune subscription does not permit the requested API execution tier; "
                         "no additional partitions will be submitted"
                     ) from exc
-                if (
-                    exc.code in {408, 429, 500, 502, 503, 504}
-                    and attempt < self.max_retries
-                ):
-                    limiter.defer(
-                        retry_delay_seconds(
-                            attempt,
-                            base=self.retry_base,
-                            retry_after=exc.headers.get("Retry-After"),
-                        )
-                    )
+                if retryable and attempt < self.max_retries:
                     continue
                 raise RuntimeError(f"Dune HTTP {exc.code}: {detail}") from exc
             except (

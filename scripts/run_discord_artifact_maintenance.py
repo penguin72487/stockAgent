@@ -130,6 +130,13 @@ def _factorized_source_updater_receipt() -> Path:
 def _deferred_factorized_source_request() -> dict | None:
     """A bounded wakeup hint, never acceptance of source/data/model readiness."""
     state = _read_retry_json(_factorized_source_updater_receipt())
+    if state.get("status") == "projection_refresh_required":
+        if (state.get("error_type") != "FactorizedPreopenProjectionPending"
+                or state.get("phase") != "preopen"
+                or state.get("last_good_generation_retained") is not True
+                or state.get("model_executed") is not False):
+            raise ValueError("unverified factorized projection request cannot invoke the source owner")
+        return state
     if state.get("status") != "cache_warming_required":
         return None
     from stockagent.data.annual_cache_admission import CONTRACT
@@ -163,7 +170,10 @@ def _stale_factorized_projection_request(*, config_path: str | Path | None = Non
     root = ROOT / "artifacts/data_preparation/tw_factorized_scale_cash_live_v1"
     pointer = root / "current/factorized_manifest.json"
     if not pointer.is_file():
-        return None
+        return {"status": "projection_refresh_required", "expected_completed_session": expected,
+                "projection_end": None, "manifest": str(pointer), "reason": "published_projection_missing",
+                "advisory_only": True, "model_executed": False,
+                "contract": "factorized_paper_projection_lag1_v1"}
     path = pointer.resolve(strict=True)
     if not path.is_relative_to(root.resolve()):
         raise ValueError("factorized projection pointer escapes the canonical source root")

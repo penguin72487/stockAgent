@@ -35,6 +35,25 @@ Use the section for the service being changed. Operational acceptance requires f
 - Keep `pre_signal_timeout_seconds` for bounded data activation and
   `formal_history_timeout_seconds` for full fold inference. Never shorten the
   latter to the former; measure full-universe inference before changing either.
+- For the selected Factorized lag-1 paper projection, preopen consumes one
+  published complete-session generation: verify its original parent/config,
+  full official calendar, channel/layout ABI and every member SHA. Advancing
+  raw acquisition heads alone must not launch a multi-decade feature rebuild
+  in the opening owner. Retain the actual source identity/publication time;
+  `published_complete_session_projection_v1` does not claim the latest raw
+  revisions were incorporated. Missing session/scope requests the existing
+  isolated source-maintenance owner; corrupt inputs remain rejected. Full
+  source generation and true affected-session incrementality are separate
+  from this consumer optimization. See the [Factorized timeout evidence](../tw_opening_latency_stages_2026-10-14.md#factorized-盤前準備逾時與最新交易日預設2026-10-20).
+- The Factorized source owner may reuse sealed normalized-source members only
+  with identical raw receipt, selected definitions/symbols, publication context
+  and normalizer/runtime identity. An unchanged source with unresolved future
+  release dates must be normalized again when the official calendar extends.
+  Daily/weekly sources without issuer-specific publication bounds may prune
+  ready dates before wide expansion; report/revenue period floors and delayed
+  filings retain their full causal context. Every normalized member remains in
+  full generation SHA verification. `capacity_deferred` is not readiness and
+  must not trigger repeated full preparation in the same updater loop.
 - Artifact-maintenance attempts must persist a structured status receipt across
   restarts, use bounded exponential retry, suppress duplicate channel alerts,
   and become `ready` only after the requested history or signal artifact exists.
@@ -130,6 +149,22 @@ Use the section for the service being changed. Operational acceptance requires f
   invalidate admission. Real dependency changes retain the fresh-owner rule;
   never clear/rebind an old owner's admission to bypass it. See the
   [scoped-dependency repair and native acceptance](../tw_opening_latency_stages_2026-10-14.md#discord-相依範圍修正與今日訊號恢復2026-10-16).
+- Production Discord may pin a verified source release with the qualified
+  reload tool's `--discord-only --code-admission-only --source-release` option.
+  Use private, copied (not hard-linked) code and directory-level read-only
+  mounts at the canonical paths; a single-file bind does not survive an
+  external atomic replacement of its target. Reconnect original configuration
+  directories with live mounts; never copy credentials, datasets or checkpoints
+  into the release. Verify the full manifest and actual namespace before every
+  startup, then independently verify native owner, code, ACK and ledger prefixes.
+  Validate parsed manager bind-path properties after daemon-reload, not only
+  unit-file syntax; roll back this drop-in before restart on any mismatch.
+  Native-owner verification CLIs inspect that same active source namespace,
+  not a newer research workspace or an environment-variable label alone.
+  Workspace edits are not automatic production promotion; later qualified
+  reloads retain the configured release, including an engine-only reload's
+  comparison against its unchanged Discord owner. Actual pinned-source drift
+  still fails closed. See [the recurrence repair](../tw_opening_latency_stages_2026-10-14.md#loadedimplementationchanged-根因與目錄級版本隔離2026-10-20).
 - Healthy FinMind opening retries have a bounded wake clock inside the shared
   fan-in, not behind slow MIS/broker completion or the scheduler's next pass.
   Keep shared snapshot single-flight, request-start cadence, accepted facts,
@@ -215,6 +250,17 @@ Use the section for the service being changed. Operational acceptance requires f
   or silently rewrite historical receipts. The shared quote worker remains in
   the existing simulation engine process/session, not another login. See the
   [multi-source implementation and bounded measurements](../tw_opening_latency_repair_2026-10-08.md#多源平行開盤取價2026-10-08-續作).
+- Opening acquisition may bootstrap from the verified current official universe
+  before any model creates today's price receipt. Do not make source repair
+  depend on successful inference, or bypass corrupt/foreign receipts to obtain
+  that independence. Redundant calendar refresh must yield around opening when
+  the official calendar is already verified; check admission both before and
+  after waiting for its writer lock. Unknown calendar bootstrap and model source
+  consistency checks remain separate. An MIS transport circuit may admit one
+  single-flight half-open requested-symbol probe; parsed stale data proves only
+  transport recovery, never opening-price validity or full-market completion.
+  Preserve permission/quota backoff and the complete universe in telemetry. See
+  [the 2026-10-21 forensics and full-axis recovery comparison](../tw_opening_latency_stages_2026-10-14.md#完整開盤取價與-mis-斷線恢復2026-10-21).
 - A current-session Snapshot book may supply explicitly labelled indicative
   valuation only. Unknown `simtrade` remains unknown; these fields must not
   supply execution prices, volume, bracket triggers or non-trial evidence.

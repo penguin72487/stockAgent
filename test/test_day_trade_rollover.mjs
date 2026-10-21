@@ -4,6 +4,7 @@ import test from "node:test";
 import vm from "node:vm";
 
 const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+const html = readFileSync(new URL("../services/tw_day_trade_dashboard/index.html", import.meta.url), "utf8");
 function harness({overnight = false, latestOnly = true} = {}) {
   const nodes = new Map();
   const timers = new Map();
@@ -23,6 +24,7 @@ function harness({overnight = false, latestOnly = true} = {}) {
   vm.runInContext(app.slice(app.indexOf("let snapshot = null;"), app.indexOf("try {\n  const storedHiddenSeries")), context);
   vm.runInContext(app.match(/^const DEFAULT_PERFORMANCE_START_DATE = .*;$/m)[0], context);
   if (latestOnly) vm.runInContext("followLatestSession = true; followPerformanceRange = false", context);
+  if (latestOnly === false) vm.runInContext("followLatestSession = false; followPerformanceRange = true", context);
   vm.runInContext(app.slice(app.indexOf("function selectedMode()"), app.indexOf("function chartWindowLabel()")), context);
   vm.runInContext(app.slice(app.indexOf("function validateDetailPage"), app.indexOf("function healthPresentation")), context);
   vm.runInContext(app.slice(app.indexOf("function syncFilters(data)"), app.indexOf("function renderModes(data)")), context);
@@ -31,7 +33,27 @@ function harness({overnight = false, latestOnly = true} = {}) {
   return {context, run, byId, timers, data};
 }
 
-test("default performance starts at 2026-01-01 and follows new sessions without fabricating earlier data", () => {
+test("initial accessible button state agrees with the latest-session default before data arrives", () => {
+  assert.match(html, /id="performance-range"[^>]*aria-pressed="false"/);
+  assert.match(html, /id="follow-latest-session"[^>]*aria-pressed="true"/);
+});
+
+test("new visits default to the latest session in both dashboards without loading all history", () => {
+  for (const overnight of [false, true]) {
+    const {context, run, byId, data} = harness({overnight, latestOnly: null});
+    context.data = data("2026-10-20"); run("syncFilters(data)");
+    assert.equal(run("followLatestSession"), true);
+    assert.equal(run("followPerformanceRange"), false);
+    assert.equal(byId("detail-start-date").value, "2026-10-20");
+    assert.equal(byId("detail-end-date").value, "2026-10-20");
+    assert.equal(run("selectedDate()"), "");
+    context.data = data("2026-10-21"); run("syncFilters(data)");
+    assert.equal(byId("detail-start-date").value, "2026-10-21");
+    assert.equal(byId("detail-end-date").value, "2026-10-21");
+  }
+});
+
+test("optional year-to-date starts at 2026-01-01 and follows new sessions without fabricating earlier data", () => {
   for (const overnight of [false, true]) {
     const {context, run, byId, data} = harness({overnight, latestOnly: false});
     context.data = data("2026-10-16"); run("syncFilters(data)");

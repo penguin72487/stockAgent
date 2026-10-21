@@ -115,6 +115,11 @@ def _require_article_response(response, source):
     pdf = mime == "application/pdf" and source.pdf_path_pattern
     if mime not in {"text/html", "application/xhtml+xml"} and not pdf:
         raise NewsError("unsupported_content_type")
+    if source.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2'} and response.body == b'':
+        # Observed real HTTP200/zero-byte envelopes contain no article or
+        # identity evidence. Treat this as a bounded recoverable response,
+        # not a permanent parser/rights verdict. Other sources are unchanged.
+        raise NewsError('empty_http_response', retry=True, delay=30)
     return pdf
 
 
@@ -168,6 +173,14 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     headers = {}
     request_url = row["url"]
     resolution_basis = "requested_public_url"
+    if source.provider == 'idn':
+        from downloader.news_fulltext_idn import idn_article_id
+        if idn_article_id(request_url, requested=True) is None:
+            raise NewsError('unsupported_article_path')
+    if source.provider == 'videoland':
+        from downloader.news_fulltext_videoland import videoland_article_id
+        if videoland_article_id(request_url) is None:
+            raise NewsError('unsupported_article_path')
     ettoday_version = ETTODAY_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0)
     # Verified publisher permalink alias, not another observation/URL identity.
     # Keep the original print URL in the frontier and acceptance receipt.
@@ -198,6 +211,26 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         if ettoday_request_identity(request_url, requested=True,
                 allow_finance_redirect_query=ettoday_version >= 16,
                 allow_house=ettoday_version >= 24 and 'house.ettoday.net' in source.reviewed_article_subsites) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
+        from downloader.news_fulltext_pocket import pocket_article_id
+        if pocket_article_id(request_url, requested=True) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'watchmedia_visible_article_v1', 'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}:
+        from downloader.news_fulltext_watchmedia import watchmedia_article_id
+        if watchmedia_article_id(request_url, requested=True) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2'}:
+        from downloader.news_fulltext_pinview import pinview_article_id
+        if pinview_article_id(request_url) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'peoplemedia_visible_article_v1', 'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3'}:
+        from downloader.news_fulltext_peoplemedia import peoplemedia_article_id
+        if peoplemedia_article_id(request_url) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in {'mitrade_visible_article_v1', 'mitrade_visible_article_v2', 'mitrade_visible_article_v3', 'mitrade_visible_article_v4', 'mitrade_visible_article_v5', 'mitrade_visible_article_v6'}:
+        from downloader.news_fulltext_mitrade import mitrade_article_id
+        if mitrade_article_id(request_url) is None:
             raise NewsError('unsupported_article_path')
     validator_url = row.get('validator_url')
     if row.get("body_sha256") and validator_url:
@@ -254,6 +287,28 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         # The reviewed portal has no verified article alias contract. A
         # different current release is not the originally requested ID.
         raise NewsError("article_identity_not_verified")
+    if source.provider in {'idn', 'videoland'} and (
+            response.url != request_url or getattr(response, 'redirects', ())):
+        raise NewsError('article_identity_not_verified')
+    if source.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
+        from downloader.news_fulltext_pocket import pocket_article_id
+        hops = getattr(response, 'redirects', ())
+        if (pocket_article_id(response.url) != pocket_article_id(request_url, requested=True)
+                or response.url != request_url and (not hops or hops[0].from_url != request_url
+                    or hops[-1].to_url != response.url)):
+            from downloader.news_fulltext_diagnostics import FailureResponse
+            error = NewsError('article_identity_not_verified')
+            error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
+            raise error
+        if response.url != request_url:
+            resolution_basis = 'verified_pocket_literal_same_id_source_redirect_v1; original_frontier_url_retained'
+    if source.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2',
+                                         'peoplemedia_visible_article_v1', 'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3',
+                                         'mitrade_visible_article_v1', 'mitrade_visible_article_v2', 'mitrade_visible_article_v3', 'mitrade_visible_article_v4', 'mitrade_visible_article_v5', 'mitrade_visible_article_v6'} and (
+            response.url != request_url or getattr(response, 'redirects', ())):
+        # No host/ID alias for these layouts has a verified transport witness. A title,
+        # declared OG or a different story's HTTP 200 cannot create one.
+        raise NewsError('article_identity_not_verified')
     if response.status == 304:
         # A 304 has no article body to parse. It proves freshness only for the
         # exact saved representation whose validators were actually requested,
@@ -287,6 +342,9 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     with metrics.measure("article_extraction", source.provider) if metrics else nullcontext():
         try:
             article = extract_article_response(response, source)
+            if source.embedded_article_layout in {'watchmedia_visible_article_v1', 'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}:
+                from downloader.news_fulltext_watchmedia import watchmedia_response_identity
+                resolution_basis = watchmedia_response_identity(request_url, response, article['title'], row.get('title'))
             if (source.embedded_article_layout == 'taiwanhot_visible_article_v3'
                     and not taiwanhot_route_matches(request_url, article['source_native_article_id'], article['title'])):
                 # A candidate intersection is admission only. The actual OG
@@ -377,6 +435,9 @@ def discovery_links(payload: bytes, kind: str, source, *, page_url: str | None =
         host = urlsplit(url).hostname or ""
         if not any(host == domain or host.endswith("." + domain) for domain in source.domains):
             continue
+        if (source.embedded_article_layout in {'max_visible_post_v1', 'max_visible_post_v2', 'max_visible_post_v3', 'max_visible_post_v4'} and title == 'sitemap'
+                and not re.fullmatch(r'https://maxfinanciallife[.]com/post-sitemap[1-9][0-9]*[.]xml', url)):
+            continue  # Native post leaves only; not pages, taxonomy or theme blocks.
         if title != "sitemap" and source.article_path_pattern and not re.search(source.article_path_pattern, urlsplit(url).path):
             continue
         accepted.append((url, title, date))
@@ -403,11 +464,13 @@ def seed_discovery(queue: NewsQueue):
                                      ((url, kind, source.provider) for kind, urls in (("feed", source.feeds), ("sitemap", source.sitemaps))
                                       for url in urls if url not in source.fulltext_feeds))
                 for url in source.fulltext_feeds:
+                    fingerprints = fulltext_feed_discovery_fingerprints(source)
                     queue.db.execute("INSERT INTO discovery(url,kind,provider,priority) VALUES (?,'rss_fulltext',?,0) "
                                      "ON CONFLICT(url) DO UPDATE SET kind='rss_fulltext',priority=0,"
                                      "due=CASE WHEN error_code IS NULL THEN 0 ELSE due END "
-                                     "WHERE kind!='rss_fulltext' OR (parser_fingerprint IS NOT NULL AND parser_fingerprint!=?)",
-                                     (url, source.provider, discovery_fingerprint(source)))
+                                     "WHERE kind!='rss_fulltext' OR (parser_fingerprint IS NOT NULL AND parser_fingerprint NOT IN ("
+                                     + ','.join('?' for _ in fingerprints) + '))',
+                                     (url, source.provider, *fingerprints))
                 queue.db.executemany("INSERT OR IGNORE INTO discovery(url,kind,provider) VALUES (?,'index',?)",
                                      ((url, source.provider) for url in source.index_pages))
                 # Previously accepted indexes need one reparse when their
@@ -512,12 +575,32 @@ def seed_discovery(queue: NewsQueue):
 
 
 def discovery_fingerprint(source):
+    fingerprint = (cnyes_bulk_fingerprint(source) if source.cnyes_apis
+                   else source.fulltext_feed_data_fingerprint or source.data_fingerprint)
+    return _discovery_fingerprint(source, fingerprint)
+
+
+def _discovery_fingerprint(source, fingerprint):
     rss_contract = ':rss-controls-metadata-only-v1' if source.fulltext_feeds else ''
     envelope_contract = (':mixed-bulk-continuation-v' + str(BULK_ENVELOPE_CONTINUATION_CONTRACT_VERSION)
                          if source.fulltext_feeds or source.wordpress_apis or source.cnyes_apis else '')
-    fingerprint = (cnyes_bulk_fingerprint(source) if source.cnyes_apis
-                   else source.fulltext_feed_data_fingerprint or source.data_fingerprint)
     return hashlib.sha256((fingerprint + ":news-discovery-parser-v2" + rss_contract + envelope_contract).encode()).hexdigest()
+
+
+def fulltext_feed_discovery_fingerprints(source):
+    """A body-only GV revision does not replay healthy history or refusals.
+
+    Old v1/v2 receipts retain their own parser. Conditional requests may use their
+    validators at the original due time; a 304 never claims a new body parse.
+    """
+    current = discovery_fingerprint(source)
+    prior = source.prior_fulltext_feed_data_fingerprint
+    fingerprints = [current]
+    fingerprints.extend(_discovery_fingerprint(source, fingerprint)
+                        for _, fingerprint in reversed(source.fulltext_feed_body_fingerprints))
+    if prior:
+        fingerprints.append(_discovery_fingerprint(source, prior))
+    return tuple(dict.fromkeys(fingerprints))
 
 
 def fetch_discovery(http: NewsHTTP, task: dict):
@@ -547,6 +630,8 @@ def fetch_discovery(http: NewsHTTP, task: dict):
     if index_task:
         from downloader.news_fulltext_cnyes_index import compatible_fingerprints
         compatible = task.get('parser_fingerprint') in compatible_fingerprints(source)
+    if task['kind'] == 'rss_fulltext':
+        compatible = task.get('parser_fingerprint') in fulltext_feed_discovery_fingerprints(source)
     if task["etag"] and compatible:
         headers["If-None-Match"] = task["etag"]
     if task["last_modified"] and compatible:
@@ -793,7 +878,8 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
         page = feed_page(task["url"]) if task["kind"] == "rss_fulltext" else wordpress_page(task["url"])
         live_index = task['kind'] == 'index' and task['url'] in source.incremental_index_pages
         delay = source.discovery_interval_seconds if task["kind"] == "feed" or bulk and page == 1 or live_index else 86400
-        if task["kind"] == "rss_fulltext" and page > 1:
+        if task["kind"] == "rss_fulltext" and (page > 1
+                or wordpress_base(task['url']) in source.historical_fulltext_feeds):
             delay = 365 * 86400
         if bulk and (wordpress_page(task["url"]) > 1 or task["kind"] == "cnyes_news" and "startAt=" in task["url"]):
             delay = 365 * 86400
@@ -960,6 +1046,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 from downloader.news_fulltext_repairs import consume_repairs
                 with queue.metrics.measure('reviewed_repair_admission'):
                     consume_repairs(queue, stop=http.stop)
+                    from downloader.news_fulltext_candidate_diagnostics import pump_candidates
+                    pump_candidates(queue, stop=http.stop)
                 last_reviewed_repair = time.monotonic()
             if (continuous_budgets and not draining and not low_disk
                     and 'cnyes' in active and now >= next_cnyes_work_backfill):
@@ -1020,7 +1108,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 row = None
                 excluded_hosts = http.blocked_gateway_hosts(provider)
                 historical_bulk = bool(task and (
-                    task["kind"] == "rss_fulltext" and feed_page(task["url"]) > 1
+                    task["kind"] == "rss_fulltext" and (feed_page(task["url"]) > 1
+                        or wordpress_base(task['url']) in source.historical_fulltext_feeds)
                     or task["kind"] == "wordpress_posts" and wordpress_page(task["url"]) > 1
                     or task["kind"] == "cnyes_news" and "startAt=" in task["url"]
                     or task['kind'] == 'index' and task['url'].startswith('https://api.cnyes.com/media/api/v1/newslist/all?')))
@@ -1082,12 +1171,27 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                         submitted_in_round += 1
                         http.articles_since_sitemap[provider] = http.articles_since_sitemap.get(provider, 0) + 1
                         http.bulk_since_article[provider] = 0
+            # Candidate metadata uses the SAME HTTP owner, pacer and executor.
+            # All ordinary provider work gets first choice of every free slot;
+            # a busy Anue request must not block another publisher's free slot.
+            if (continuous_budgets and not draining and not low_disk and provider_ids is None
+                    and getattr(queue, 'native_candidate_ready_providers', None)):
+                from downloader.news_fulltext_candidate_diagnostics import claim_candidate, fetch_candidate
+                for provider in provider_order:
+                    if (len(futures) >= config['workers'] or active[provider] >= http.parallelism[provider]
+                            or http.provider_not_before.get(provider, 0) > time.time()):
+                        continue
+                    job = claim_candidate(queue, http, config, provider)
+                    if job:
+                        futures[executor.submit(fetch_candidate, http, job)] = ('candidate_metadata', job)
+                        active[provider] += 1
+                        submitted_in_round += 1
             provider_order.rotate(-1)
             metadata_only = False
             if not futures:
                 if continuous_budgets and not draining and not low_disk:
-                    from downloader.news_fulltext_urls import original_url_progress
-                    metadata_only = original_url_progress(queue)['remaining_urls'] > 0
+                    from downloader.news_fulltext_urls import has_original_url_work
+                    metadata_only = has_original_url_work(queue)
                 if not metadata_only:
                     break
             # Fill every independently reserved response slot before sleeping.
@@ -1098,6 +1202,16 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
             for future in done:
                 kind, row = futures.pop(future)
                 active[row["provider"]] -= 1
+                if kind == 'candidate_metadata':
+                    from downloader.news_fulltext_candidate_diagnostics import finish_candidate, pump_candidates
+                    try:
+                        candidate_result = future.result()
+                    except Exception as error:
+                        finish_candidate(queue, row, error=error)
+                    else:
+                        finish_candidate(queue, row, result=candidate_result)
+                    pump_candidates(queue, stop=http.stop)
+                    continue
                 if kind == "discovery":
                     discovery_inflight.remove(row["url"])
                     try:
@@ -1205,6 +1319,9 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
                 idle_until = time.monotonic() + delay
                 with queue.metrics.measure("idle_wait"):
                     while not http.stop.is_set() and idle_until > time.monotonic():
+                        from downloader.news_fulltext_candidate_diagnostics import has_unadmitted_candidates
+                        if result['activity'] != 'waiting_disk' and has_unadmitted_candidates(queue):
+                            break
                         queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                                      activity="waiting_disk" if result["activity"] == "waiting_disk" else "waiting_next_due",
                                      provider_cooldowns=http.provider_not_before)

@@ -16,7 +16,8 @@ from stockagent.config import TrainingConfig, load_config
 from stockagent.training import trainer
 from stockagent.training.checkpoint_contract import _training_checkpoint_contract
 from stockagent.training.multiobjective import (
-    MULTIOBJECTIVE_ABI, MULTIOBJECTIVE_OBJECTIVES, TASK_NAMES, TASK_OBJECTIVES, ParameterGradientBank,
+    MULTIOBJECTIVE_ABI, MGDA_L2_ABI, FRONTIER_L2_ABI, FRONTIER_L2_METHODS,
+    MULTIOBJECTIVE_OBJECTIVES, TASK_NAMES, TASK_OBJECTIVES, ParameterGradientBank,
     combine_task_gradients, mgda_coefficients,
 )
 from stockagent.training.return_adjoint import (
@@ -28,6 +29,7 @@ from test_day_trade_training_episodes import annual_fixture, independent_year_re
 
 
 BASE = "configs/deployments/tw_day_trade_factorized_values_20261007_scale_separated_cash_annual_v1.yaml"
+METHODS = ("pcgrad", "mgda", "mgda_l2", *FRONTIER_L2_METHODS)
 
 
 def direct_pcgrad(rows, seed=42, step=0):
@@ -90,6 +92,115 @@ def test_return_space_mgda_is_not_a_parameter_space_common_descent_guarantee():
     assert bool((parameter_rows @ correct >= correct.square().sum() - 1e-12).all())
 
 
+def test_unit_mgda_is_invariant_to_objective_units_and_matches_geometric_oracle():
+    rows = torch.tensor([[2., 0.], [0., 3.], [5., 0.], [0., 7.]], dtype=torch.float64)
+    expected = torch.tensor([.5, .5], dtype=torch.float64)
+    mixed, info = combine_task_gradients(rows, "mgda_l2")
+    torch.testing.assert_close(mixed, expected, rtol=0, atol=1e-12)
+    scaled, _ = combine_task_gradients(rows * torch.tensor(
+        [1e-9, 1e8, 1e3, 1e-4], dtype=torch.float64)[:, None], "mgda_l2")
+    torch.testing.assert_close(scaled, mixed, rtol=0, atol=1e-12)
+    assert sum(info[f"coefficient_{name}"] for name in TASK_NAMES) == pytest.approx(1.)
+    assert all(info[f"raw_descent_derivative_{name}"] < 0 for name in TASK_NAMES)
+    assert info["mgda_kkt_margin"] >= -1e-12
+
+
+@pytest.mark.parametrize("kind", ["random", "one_zero", "all_zero", "opposite"])
+def test_unit_mgda_retains_zero_tasks_and_sgd_preserves_common_descent(kind):
+    rows = torch.tensor(np.random.default_rng(8).normal(size=(4, 17)), dtype=torch.float64)
+    if kind == "one_zero": rows[3] = 0.
+    if kind == "all_zero": rows[:] = 0.
+    if kind == "opposite": rows[1] = -rows[0]
+    mixed, info = combine_task_gradients(rows, "mgda_l2")
+    p = torch.nn.Parameter(torch.zeros(17, dtype=torch.float64))
+    p.grad = mixed.clone()
+    torch.nn.utils.clip_grad_norm_([p], .01)
+    torch.optim.SGD([p], lr=.03, momentum=0, weight_decay=0).step()
+    assert bool((rows @ p.detach() <= 1e-12).all())
+    assert info["mgda_kkt_margin"] >= -1e-12
+    if kind != "random":
+        torch.testing.assert_close(mixed, torch.zeros_like(mixed), rtol=0, atol=1e-12)
+
+
+@pytest.mark.parametrize("method", FRONTIER_L2_METHODS)
+@pytest.mark.parametrize("kind", ["random", "duplicate", "opposite", "nearly_opposite", "one_zero", "all_zero"])
+def test_frontier_gram_matches_independent_full_vector_oracles(method, kind):
+    rows = np.random.default_rng(231).normal(size=(4, 19))
+    if kind == "duplicate": rows[:] = rows[0]
+    if kind == "opposite": rows[1] = -rows[0]
+    if kind == "nearly_opposite": rows[1] = -rows[0] + 1e-9 * rows[2]
+    if kind == "one_zero": rows[2] = 0.
+    if kind == "all_zero": rows[:] = 0.
+    tensor = torch.tensor(rows, dtype=torch.float64)
+    reference, _ = combine_task_gradients(tensor, "mgda_l2")
+    units = rows / np.where(np.linalg.norm(rows, axis=1) > 0,
+                           np.linalg.norm(rows, axis=1), 1.)[:, None]
+    if reference.norm() <= (64 * np.finfo(np.float64).eps) ** .5:
+        expected = reference.numpy()
+    elif method == "config_l2":
+        # Q's rcond=1e-12 corresponds to U's singular-value rcond=1e-6.
+        expected = np.linalg.pinv(units, rcond=1e-6) @ np.ones(4)
+        if np.min(units @ expected) < -1e-10:
+            expected = reference.numpy()
+        expected *= float(reference.norm()) / np.linalg.norm(expected)
+    elif method == "upgrad_log_l2":
+        from scipy.optimize import minimize
+        anchor = units[1]
+        result = minimize(lambda x: .5 * np.square(x - anchor).sum(), np.zeros_like(anchor),
+                          jac=lambda x: x - anchor,
+                          constraints={"type": "ineq", "fun": lambda x: units @ x,
+                                       "jac": lambda x: units},
+                          method="SLSQP", options={"ftol": 1e-13, "maxiter": 100})
+        assert result.success
+        expected = result.x * float(reference.norm()) / np.linalg.norm(result.x)
+    else:
+        displacement = np.zeros(rows.shape[1])
+        for _ in range(int(method.rsplit("_", 1)[1])):
+            distances = np.linalg.norm(displacement[None, :] + units, axis=1)
+            displacement -= .2 * np.sum(distances[:, None] * units, axis=0)
+        expected = -displacement
+        expected *= float(reference.norm()) / np.linalg.norm(expected)
+    mixed, info = combine_task_gradients(tensor, method)
+    np.testing.assert_allclose(mixed.numpy(), expected, rtol=1e-10, atol=1e-12)
+    assert float(mixed.norm()) == pytest.approx(float(reference.norm()), abs=1e-12)
+    assert "mgda_kkt_margin" not in info  # No false KKT claim for the new direction.
+    assert info["reference_mgda_kkt_margin"] >= -1e-9
+    if method in {"config_l2", "upgrad_log_l2"}:
+        assert float((tensor @ mixed).min()) >= -1e-9
+    scaled, _ = combine_task_gradients(tensor * torch.tensor(
+        [1e-7, 1e6, .03, 2e3], dtype=torch.float64)[:, None], method)
+    if kind == "nearly_opposite":
+        # Inside Gram roundoff, preserve the parent MGDA vector for EACH
+        # input; do not amplify it. The near-singular parent simplex solve
+        # itself need not be bitwise invariant to normalization roundoff.
+        scaled_reference, _ = combine_task_gradients(tensor * torch.tensor(
+            [1e-7, 1e6, .03, 2e3], dtype=torch.float64)[:, None], "mgda_l2")
+        torch.testing.assert_close(scaled, scaled_reference, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(scaled, mixed, rtol=1e-9, atol=1e-12)
+    # The log-preferred method keeps its named log-return row at index 1.
+    order = [2, 1, 3, 0] if method == "upgrad_log_l2" else [2, 0, 3, 1]
+    permuted, _ = combine_task_gradients(tensor[order], method)
+    if kind == "nearly_opposite":
+        permuted_reference, _ = combine_task_gradients(tensor[order], "mgda_l2")
+        torch.testing.assert_close(permuted, permuted_reference, rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(permuted, mixed, rtol=1e-9, atol=1e-12)
+
+
+def test_config_singular_conflicting_least_squares_uses_certified_mgda_fallback():
+    # A common descent direction exists, but the overdetermined equal-alignment
+    # least-squares solution opposes one row. Rank deficiency must not hide it.
+    angles = np.array([-1.5091920353466102, 1.467925984692512,
+                       -0.4720620974087253, -1.3901039172225234])
+    rows = torch.tensor(np.stack([np.cos(angles), np.sin(angles)], axis=1))
+    mixed, info = combine_task_gradients(rows, "config_l2")
+    assert info["direction_fallback_mgda"] == 1
+    assert (rows @ mixed).min() >= -1e-12
+    reference, _ = combine_task_gradients(rows, "mgda_l2")
+    torch.testing.assert_close(mixed, reference, rtol=0, atol=1e-12)
+
+
 def test_four_objectives_use_log_return_and_preserve_complete_account_resets():
     r = torch.tensor([-.04, .03, -.02, .01, -.06], dtype=torch.float64, requires_grad=True)
     values, gradients = task_return_gradients(r, [0, 2, 5])
@@ -107,7 +218,7 @@ def test_four_objectives_use_log_return_and_preserve_complete_account_resets():
         torch.testing.assert_close(trajectory_metric_loss(r, objective), -252 * r.mean())
 
 
-@pytest.mark.parametrize("method", ["pcgrad", "mgda"])
+@pytest.mark.parametrize("method", METHODS)
 @pytest.mark.parametrize("device_name", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"))])
 def test_parameter_bank_matches_direct_update_and_leaves_unused_parameters_absent(method, device_name):
@@ -159,7 +270,11 @@ def test_configs_fingerprint_each_surgery_space_and_reject_auxiliary_losses(tmp_
     assert surgery["objective"] == objective
     assert surgery["validation_selection"] == "pure_log_utility_no_test_selection"
     assert surgery["tasks"] == list(TASK_OBJECTIVES)
-    assert surgery["abi"] == MULTIOBJECTIVE_ABI != "annual_four_metric_raw_gram_surgery_v1"
+    is_frontier = any(f"trajectory_{method}_" in objective for method in FRONTIER_L2_METHODS)
+    assert surgery["abi"] == (FRONTIER_L2_ABI if is_frontier else
+                              MGDA_L2_ABI if "mgda_l2" in objective else MULTIOBJECTIVE_ABI)
+    assert surgery["abi"] != "annual_four_metric_raw_gram_surgery_v1"
+    assert (surgery["scaling"] == "unit_global_l2_task_gradients_zero_tasks_retained") == ("mgda_l2" in objective or is_frontier)
     assert surgery["calmar_task"]["abi"] == "annual_calmar_return_adjoint_v1"
     assert surgery["calmar_task"]["calmar_drawdown_epsilon"] == 1e-8
     raw["evaluation"] = {"gamma_turnover": .01}
@@ -185,7 +300,9 @@ def test_scratch_calmar_surgery_inherits_measured_neural_recipe_without_old_weig
         "gradient__pcgrad_return", "gradient__mgda_return",
         "gradient__pcgrad_parameter", "gradient__mgda_parameter",
     ]
-    assert {row["overrides"]["training"]["loss_type"] for row in rows} == MULTIOBJECTIVE_OBJECTIVES
+    assert {row["overrides"]["training"]["loss_type"] for row in rows} == (
+        MULTIOBJECTIVE_OBJECTIVES - {"trajectory_mgda_l2_parameter"} - {
+            f"trajectory_{method}_parameter" for method in FRONTIER_L2_METHODS})
     assert spec["fold_selection"] == "last"
     fixed = spec["matrix"]["fixed_overrides"]["training"]
     assert fixed["epochs"] == 1000 and fixed["early_stopping_no_improve_ratio"] == .1
@@ -204,7 +321,7 @@ def _physical_worker(rank, rendezvous, results, backend):
     dist.init_process_group(backend, init_method=f"file://{rendezvous}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=90))
     try:
-        for method in ("pcgrad", "mgda"):
+        for method in METHODS:
             for space in ("return", "parameter"):
                 split, runtime, loss_fn = annual_fixture()
                 split = trainer._pad_windowed_training_split(split, 6)
@@ -280,7 +397,7 @@ def test_two_rank_physical_surgery_matches_four_monolithic_account_gradients(tmp
         return result
     monkeypatch.setattr(loss_module, "run_backtest_torch", capture)
     references = {}
-    for method in ("pcgrad", "mgda"):
+    for method in METHODS:
         for space in ("return", "parameter"):
             captured.clear()
             split, runtime, loss_fn = annual_fixture()
@@ -305,7 +422,7 @@ def test_two_rank_physical_surgery_matches_four_monolithic_account_gradients(tmp
     results = context.Queue()
     workers = [context.Process(target=_physical_worker, args=(rank, str(tmp_path / "init"), results, backend)) for rank in range(2)]
     for worker in workers: worker.start()
-    observed = [results.get(timeout=150) for _ in range(8)]
+    observed = [results.get(timeout=150) for _ in range(2 * len(METHODS) * 2)]
     for worker in workers:
         worker.join(timeout=15)
         if worker.is_alive(): worker.terminate()

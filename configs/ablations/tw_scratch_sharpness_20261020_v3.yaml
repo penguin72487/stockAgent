@@ -1,0 +1,53 @@
+# New runtime identity after preserved orphan-metadata repair. All fresh starts.
+# Finish five environment-rejected cases; bracket perturbation strength separately.
+base_spec: tw_scratch_sharpness_20261020_v2.yaml
+output_root: artifacts/markets/tw_scratch_sharpness_20261020_v3
+matrix:
+  include_baseline: false
+  dimensions:
+    - name: sharpness_recovery
+      enabled: true
+      variants:
+        - name: unit_mgda_control
+          description: 新環境單位MGDA控制 / Fresh-runtime unit MGDA control.
+          overrides: {}
+        - name: simple_log_control
+          description: 新環境單一對數效用控制 / Fresh-runtime single log utility control.
+          overrides:
+            training: {loss_type: log_utility}
+        - name: xsam_log_r3e3_a05
+          description: 小鄰域保守方向混合 / Fixed-alpha XSAM, radius 0.003, alpha 0.5.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: xsam, sharpness_radius: 0.003, sharpness_alpha: 0.5}
+        - name: sam_log_r1e3
+          description: 十分之一擾動對數效用 / SAM log utility, radius 0.001.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: sam, sharpness_radius: 0.001}
+        - name: sam_log_r3e3
+          description: 較小擾動對數效用 / SAM log utility, radius 0.003.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: sam, sharpness_radius: 0.003}
+        - name: xsam_log_r1e2_a05
+          description: 同半徑保守方向控制 / Fixed-alpha XSAM, radius 0.01, alpha 0.5.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: xsam, sharpness_radius: 0.01, sharpness_alpha: 0.5}
+        - name: recovered_sam_mgda_r001
+          description: 補跑環境拒絕的MGDA鄰域穩健 / Recover SAM with unit MGDA, radius 0.01.
+          overrides:
+            training: {sharpness_mode: sam, sharpness_radius: 0.01}
+        - name: recovered_asam_log_r005
+          description: 補跑自適應鄰域穩健 / Recover ASAM log utility, adaptive radius 0.05.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: asam, sharpness_radius: 0.05}
+        - name: recovered_sam_log_r005
+          description: 補跑較大鄰域穩健 / Recover SAM log utility, radius 0.05.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: sam, sharpness_radius: 0.05}
+        - name: recovered_xsam_log_r005_a15
+          description: 補跑顯式鄰域穩健 / Recover fixed-alpha XSAM, radius 0.05, alpha 1.5.
+          overrides:
+            training: {loss_type: log_utility, sharpness_mode: xsam, sharpness_radius: 0.05, sharpness_alpha: 1.5}
+        - name: recovered_sam_mgda_r005
+          description: 補跑較大MGDA鄰域穩健 / Recover SAM with unit MGDA, radius 0.05.
+          overrides:
+            training: {sharpness_mode: sam, sharpness_radius: 0.05}

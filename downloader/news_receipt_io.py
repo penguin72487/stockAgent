@@ -11,6 +11,7 @@ RECEIPT_CHUNK_BYTES = 1 << 20
 RECEIPT_PROBE_STRIDE = 16
 RECEIPT_PREFETCH_MAX_CHUNKS = 16
 ADAPTIVE_RECEIPT_STRATEGY_VERSION = 2
+RECEIPT_PREFIX_IO_VERSION = 2
 
 
 def receipt_parent_matches(path, directory):
@@ -45,6 +46,28 @@ def _chunks(paths):
         yield chunk
 
 
+def _read_prefix(path, limit):
+    """Read the same bounded bytes without a per-file BufferedReader.
+
+    Raw reads may be short without EOF. Only an empty read ends the input;
+    later errors propagate instead of accepting a successfully read prefix.
+    Context-managed FileIO preserves path/open/close failures and subclasses.
+    """
+    with path.open('rb', buffering=0) as stream:
+        first = stream.read(limit)
+        remaining = limit - len(first)
+        if not remaining or not first:
+            return first
+        parts = [first]
+        while remaining:
+            part = stream.read(remaining)
+            if part == b'':
+                break
+            parts.append(part)
+            remaining -= len(part)
+        return first if len(parts) == 1 else b''.join(parts)
+
+
 def _read_chunk(paths, root=None):
     """One future per SQL-sized batch, not one future per tiny receipt.
 
@@ -61,8 +84,7 @@ def _read_chunk(paths, root=None):
             try:
                 if root is not None and not receipt_parent_matches(path, receipt_directory):
                     path.relative_to(root)  # Guard explicit paths before any speculative I/O.
-                with path.open('rb') as stream:
-                    candidate = stream.read(remaining + 1)
+                candidate = _read_prefix(path, remaining + 1)
             except Exception as error:
                 result.append((path, None, error))
                 result.extend((later, None, None) for later in paths[len(result):])

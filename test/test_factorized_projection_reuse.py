@@ -405,6 +405,44 @@ def test_own_progress_replacement_is_not_silently_overwritten(tmp_path):
     assert progress.read_text() == "changed outside owner"
 
 
+def test_progress_batches_repeated_receipts_and_flushes_at_acceptance(tmp_path, monkeypatch):
+    monkeypatch.setattr(reuse_module.time, "monotonic", lambda: 1.0)
+    values, columns, shape = source_values()
+    first = attempt(tmp_path)
+    for index in range(130):
+        first.block(f"part-{index}.zst", values, logical_columns=columns, logical_shape=shape)
+    assert first.counters["progress_commits"] == 3
+    assert len(json.loads((first.staging / reuse_module.PROGRESS_NAME).read_bytes())["members"]) == 129
+    assert first.stats()["progress_commits"] == 4
+    retry = attempt(tmp_path)
+    retry.block("part-129.zst", values, logical_columns=columns, logical_shape=shape)
+    assert retry.stats()["resumed_payloads"] == 1
+
+
+def test_progress_elapsed_time_flushes_even_a_small_batch(tmp_path, monkeypatch):
+    now = [1.0]
+    monkeypatch.setattr(reuse_module.time, "monotonic", lambda: now[0])
+    values, columns, shape = source_values()
+    first = attempt(tmp_path)
+    first.block("a.zst", values, logical_columns=columns, logical_shape=shape)
+    now[0] += reuse_module.PROGRESS_INTERVAL_SECONDS
+    first.block("b.zst", values, logical_columns=columns, logical_shape=shape)
+    assert first.counters["progress_commits"] == 2
+
+
+def test_interrupted_uncheckpointed_batch_is_not_a_donor(tmp_path, monkeypatch):
+    monkeypatch.setattr(reuse_module.time, "monotonic", lambda: 1.0)
+    values, columns, shape = source_values()
+    first = attempt(tmp_path)
+    first.block("a.zst", values, logical_columns=columns, logical_shape=shape)
+    first.block("b.zst", values + 1, logical_columns=columns, logical_shape=shape)
+    retry = attempt(tmp_path)
+    retry.block("a.zst", values, logical_columns=columns, logical_shape=shape)
+    retry.block("b.zst", values + 1, logical_columns=columns, logical_shape=shape)
+    assert retry.stats()["resumed_payloads"] == 1
+    assert retry.stats()["written_payloads"] == 1
+
+
 def test_real_process_exit_retains_durable_progress_for_a_fresh_owner(tmp_path):
     script = """
 import json, os, sys, uuid

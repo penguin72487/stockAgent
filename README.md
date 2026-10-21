@@ -13,6 +13,8 @@
 已登錄原 Temporal worker 的持久遷移，逐項發布、完整還原後才回收可刪副本；
 處理／等待不代表已完成。可執行 `run_fintech_python scripts/dataset_migration_status.py`
 查看原日誌；原件與唯一歷史不因登錄而自動刪除。
+最新的[寫入容量預算、七日 GC 與精確回收修正](docs/storage_capacity_recovery_2026-10-20.md)
+說明既有產生路徑的空間控制，以及仍阻塞的實機回收／同步界線。
 
 ## 目錄
 
@@ -460,6 +462,29 @@ printf 'dataset=%s\n' "$data_path"
 `--link` 只會原子更新 symlink；若目標是實體目錄，工具會拒絕覆蓋。訓練期間不要編輯
 materialized tree；要產生新資料應在 canonical 工作區完成 audit 後重新發布。
 
+### `capacity`：看容量預算，不刪資料
+
+```bash
+stockagent-data capacity
+stockagent-data capacity --panel-cache artifacts/cache/live_signal_panels/panel_cache_v2
+```
+
+目前只登錄 **penguin**：新解封（含 subtree）及原生 Panel 寫入會先預留容量；既有有效快取仍可讀。
+預設保留 **25 GiB** 檔案系統空間，managed 解封區上限 **256 GiB**，每個
+Panel namespace **64 GiB**；政策在
+[`cache_capacity.json`](configs/data_sync/cache_capacity.json)。這是寫入准入，不是自動刪檔，
+也不是所有 `artifacts/cache` 都已具備七日回收。公開資料旁的相容 Panel 路徑也受控；
+自訂未登錄根目錄不會因此取得任何回收權。
+遠端訓練機不會僅因拉取同一份程式碼而套用服務機的容量預算；另行登錄時須依該機工作集配置。
+
+多程序用同一檔案系統上的 kernel lease 協調容量，不把 crash 遺留紀錄當成使用中。
+WSL 新寫入也必須通過既有 recovery 工具對實際 VHDX backing volume 的容量核對，
+不能只看 ext4 的虛擬可用空間；無法查證時同樣延期。
+盤點以實際 blocks、同 inode 只計一次，包含未分類內容；預設最多 20 萬項／5 秒。
+`inventory_complete=false` 是尚未完成盤點，**不是 0 bytes**。空間、預算或盤點不足時
+延期新寫入，保留來源、冷庫及舊有效快取；不降低安全保留量或先刪舊資料硬擠。
+目前控制只涵蓋這些合作寫入端，不是作業系統所有程序的硬配額。
+
 ### `gc`：清除所有已到期且安全的熱快取
 
 語法：
@@ -477,6 +502,10 @@ GC 每次都檢查 managed hot lease。若 `/proc` 顯示程序的 fd、mmap、c
 executable 指向資料樹，就把 `last_used_at` 更新為當下，並依原 lease TTL 自動延長；沒有
 程序引用時才處理已到期版本。刪除候選仍須 cold release 可完整重建、READY proof 相符且
 沒有 pin。冷庫 `/srv/stockagent-packed` 不會被這個命令刪除。
+
+回收前會完整核對冷物件、逐檔重建與熱資料內容；熱目錄多出獨有檔或內容被改過時保留。
+慢速冷驗證結束後再查 pin、程序引用及完整熱目錄世代，無法看清 `/proc` 或 pin 損壞時延期。
+這些 gate 同樣適用手動 `evict`，不因磁碟快滿而省略。
 
 這個偵測不掃描每個資料檔，也不使用可能被 `noatime/relatime` 關閉或延遲的 access time。
 每五分鐘取樣適合長時間訓練、mmap 與持續讀取；短於取樣間隔的單次工具仍應先執行

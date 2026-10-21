@@ -4,6 +4,7 @@ from datetime import date
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 from stockagent.data.tw_public_research_features import (
     _event_source_coverage,
@@ -24,21 +25,32 @@ def test_research_columns_remove_log_asinh_but_keep_ratios_and_rules() -> None:
     ]
 
 
+@pytest.mark.parametrize("partitioned", [False, True])
 def test_research_builder_backdates_obtainable_values_only_to_estimated_release(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch, partitioned,
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
     base_path = source / "features" / "strict.parquet"
     base_path.parent.mkdir()
-    pl.DataFrame({
+    base_frame = pl.DataFrame({
         "date": [date(2014, 5, 15), date(2014, 5, 16), date(2014, 5, 16)],
         "symbol": ["__MARKET__", "__MARKET__", "2330"],
         "twpub_pe_log": [None, None, 1.5],
         "twpub_official_turnover_ratio": [None, None, 0.05],
         "twpub_cbc_m2_raw": [None, None, None],
         "_twpub_can_sell": [None, None, 1.0],
-    }).write_parquet(base_path)
+    })
+    if partitioned:
+        from stockagent.data import partitioned_parquet as parts
+        from stockagent.data_sync import cache_capacity
+        controls = tmp_path / "controls"
+        controls.mkdir()
+        monkeypatch.setattr(cache_capacity, "CONTROL_ROOT", controls)
+        monkeypatch.setattr(cache_capacity, "_admit_backing_volume", lambda *_: {})
+        parts.write_partitioned_table(base_frame.to_arrow(), base_path, source_identity={"fixture": "base"})
+    else:
+        base_frame.write_parquet(base_path)
     pl.DataFrame({"date": [date(2014, 5, 15), date(2014, 5, 16)]}).write_parquet(
         source / "twse_taiex_ohlc.parquet"
     )

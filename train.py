@@ -903,8 +903,6 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str, *, 
     def attach_features(panel):
         manifest = getattr(config.data, "factorized_feature_manifest", "")
         if manifest:
-            if str(config.trading.execution_mode) != "tw_day_trade":
-                raise ValueError("factorized lag-one research features require tw_day_trade")
             manifest = Path(manifest).resolve(strict=True)
             if inference:
                 projection = json.loads(manifest.read_text())
@@ -927,7 +925,8 @@ def _build_panel_rank_coordinated(build_panel, config, active_strategy: str, *, 
             from stockagent.data.factorized_panel import attach_factorized_features
             panel = attach_factorized_features(panel, manifest,
                 transfer_mode=config.data.factorized_transfer_mode,
-                host_cache_bytes=getattr(config.data, "factorized_host_cache_bytes", None))
+                host_cache_bytes=getattr(config.data, "factorized_host_cache_bytes", None),
+                execution_mode=str(config.trading.execution_mode))
         return panel
     if active_strategy != "distributed_data_parallel" or _distributed_world_size() <= 1:
         return attach_features(build_panel(config.data.parquet_root, **kwargs))
@@ -2160,6 +2159,15 @@ def main() -> None:
                     include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
                     include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
                     account_policy_lookback=config.training.lookback,
+                )
+            if config.trading.tw_futures_portfolio_decision_time is not None:
+                from stockagent.data.tw_futures_decision_clock import attach_futures_decision_clock
+                panel = attach_futures_decision_clock(
+                    panel, config.trading.tw_futures_portfolio_entry_clock_path,
+                    decision_time=config.trading.tw_futures_portfolio_decision_time,
+                    participation=config.trading.max_volume_participation,
+                    broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
+                    opening_reference_path=config.trading.tw_futures_portfolio_opening_reference_path,
                 )
             if (
                 _distributed_rank() == 0

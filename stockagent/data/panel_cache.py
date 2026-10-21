@@ -333,9 +333,25 @@ def save_panel_cache_v2(
     version: int,
     chunk_storage: bool = True,
 ) -> Path:
+    from stockagent.data_sync.cache_capacity import reserve_cache_write
+
     cache_dir = panel_cache_v2_dir(parquet_root)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    with _cache_writer_lock(cache_dir):
+    # Conservative serialization bound, including generated fallback masks,
+    # headers/chunk manifests and metadata. Immutable reuse remains unchanged;
+    # admission never evicts an accepted generation to make a new one fit.
+    def maximum_growth():
+        names = ("dates", "features", "returns_1d", "tradable_mask", "can_buy_mask",
+                 "can_sell_mask", "can_short_open_mask", "force_short_cover_mask",
+                 "force_exit_mask", "alive_mask", "benchmark_returns", "close_prices",
+                 "daily_volumes", *OPTIONAL_ARRAY_NAMES)
+        growth = sum(np.asarray(value).nbytes for name in set(names)
+                     if (value := getattr(panel_like, name, None)) is not None)
+        growth += np.asarray(panel_like.tradable_mask).size * 8
+        return growth + np.asarray(panel_like.close_prices).size * 8 + 8 * 1024**2
+    with _cache_writer_lock(cache_dir), reserve_cache_write(
+            cache_dir, key=f"{source_hash}:{backend_key}:{version}",
+            maximum_growth_bytes=maximum_growth, family="panel"):
         return _save_panel_cache_v2_locked(
             parquet_root,
             panel_like,
@@ -507,21 +523,22 @@ def _save_panel_cache_v2_locked(
     try:
         referenced_generations = {generation}
         variants_dir = cache_dir / PANEL_CACHE_V2_VARIANTS_DIRNAME
+        variants_to_retire = []
         if variants_dir.exists():
             for variant_path in variants_dir.glob("*.json"):
                 try:
                     variant_meta = _read_json(variant_path)
                 except (OSError, json.JSONDecodeError):
-                    variant_path.unlink(missing_ok=True)
-                    continue
-                if not isinstance(variant_meta, dict):
-                    variant_path.unlink(missing_ok=True)
-                    continue
+                    return cache_dir  # Unknown protection is not garbage.
+                if (not isinstance(variant_meta, dict)
+                        or not re.fullmatch(r"[0-9a-f]{32}", str(variant_meta.get("generation", "")))
+                        or not isinstance(variant_meta.get("backend_key"), str)
+                        or not isinstance(variant_meta.get("source_hash"), str)):
+                    return cache_dir
                 try:
                     variant_version = int(variant_meta.get("version", -1))
                 except (TypeError, ValueError):
-                    variant_path.unlink(missing_ok=True)
-                    continue
+                    return cache_dir
                 variant_backend_key = str(variant_meta.get("backend_key", ""))
                 variant_source_hash = str(variant_meta.get("source_hash", ""))
                 stale_same_contract = (
@@ -530,17 +547,35 @@ def _save_panel_cache_v2_locked(
                     and variant_source_hash != str(source_hash)
                 )
                 if variant_version != int(version) or stale_same_contract:
-                    variant_path.unlink(missing_ok=True)
+                    variants_to_retire.append(variant_path)
                     continue
                 referenced = str(variant_meta.get("generation", "")).strip()
                 if referenced:
                     referenced_generations.add(referenced)
-        for candidate in generations_dir.iterdir():
-            if candidate.name not in referenced_generations:
-                if candidate.is_dir():
-                    shutil.rmtree(candidate, ignore_errors=True)
-                else:
-                    candidate.unlink(missing_ok=True)
+        candidates = [candidate for candidate in generations_dir.iterdir()
+                      if candidate.name not in referenced_generations]
+        if any(not re.fullmatch(r"[0-9a-f]{32}", candidate.name)
+               or candidate.is_symlink() or not candidate.is_dir() for candidate in candidates):
+            return cache_dir
+        legacy_paths = [*(_array_file(cache_dir, name) for name in ARRAY_NAMES),
+                        _json_file(cache_dir, "symbols"), _json_file(cache_dir, "feature_names")]
+        protected_paths = [*candidates, *variants_to_retire,
+                           *(path for path in legacy_paths if path.exists())]
+        if protected_paths:
+            from stockagent.data_sync.materialized_cache import process_references_many
+            from stockagent.data_sync.desync_snapshots import SnapshotError
+            try:
+                if process_references_many(protected_paths, include_current_process=True):
+                    return cache_dir
+            except (OSError, SnapshotError):
+                return cache_dir  # New commit is valid; retirement is deferred.
+        # Do not invalidate the previous contract until ALL metadata and live
+        # readers have been checked. Invalid metadata and active mmap generations
+        # remain intact; no reader is asked to recover after losing its input.
+        for variant_path in variants_to_retire:
+            variant_path.unlink()
+        for candidate in candidates:
+            shutil.rmtree(candidate)
         for name in ARRAY_NAMES:
             _array_file(cache_dir, name).unlink(missing_ok=True)
         _json_file(cache_dir, "symbols").unlink(missing_ok=True)

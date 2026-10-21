@@ -37,6 +37,27 @@ def test_repair_refuses_existing_orders_fills_and_even_closed_history(change):
         repair._require_empty_target({**_flat(), **change})
 
 
+def test_missing_session_append_retains_prior_closed_history_without_rearming():
+    mode = {**_flat(), "positions": {"closed": {"signed_shares": 0}},
+            "entry_requested_shares": 1000, "entry_filled_shares": 1000}
+    repair._require_missing_session_target(mode, date(2026, 10, 8))
+    assert mode["positions"] == {"closed": {"signed_shares": 0}}
+    with pytest.raises(RuntimeError):
+        repair._require_empty_target(mode)
+
+
+@pytest.mark.parametrize("change", [
+    {"session_date": "2026-10-08"}, {"session_date": "2026-10-09"},
+    {"positions": {"open": {"signed_shares": -1000}}},
+    {"ledger_state_divergence": {"bad": True}},
+    {"pending_entry_orders": {"pending": {}}},
+    {"pending_reduction_orders": {"pending": {}}},
+])
+def test_missing_session_append_cannot_replace_current_or_bypass_inventory(change):
+    with pytest.raises(RuntimeError):
+        repair._require_missing_session_target({**_flat(), **change}, date(2026, 10, 8))
+
+
 def test_outcome_keeps_economics_but_not_new_audit_identity():
     first = _flat()
     first["positions"] = {"p": {"symbol": "2330", "side": "short", "signed_shares": -1000,
@@ -96,6 +117,64 @@ def test_changed_source_pin_is_rejected(tmp_path):
     path.write_text("changed")
     with pytest.raises(RuntimeError, match="source changed"):
         repair._assert_source_pins(pins)
+
+
+def test_interrupted_recovery_exchanges_only_after_candidate_validation_and_retains_failed_directory(tmp_path, monkeypatch):
+    import hashlib
+
+    live, operation = tmp_path / "live", tmp_path / "operation"
+    live.mkdir(); operation.mkdir()
+    before_mode = _flat()
+    final_mode = {**_flat(), "session_date": "2026-10-08", "signal_id": "new", "total_equity_twd": 12_001_000}
+    interrupted_mode = {**final_mode, "total_equity_twd": 11_999_000}
+    other = {**_flat(), "signal_id": "other"}
+    repair._atomic_json(live / "state.json", {"modes": {"m": interrupted_mode, "other": other}})
+    repair._atomic_json(operation / "state_before_apply.json", {"modes": {"m": before_mode, "other": other}})
+    repair._atomic_json(operation / "position_history_before_apply.json", {})
+    names = ("signals.jsonl", "orders.jsonl", "fills.jsonl", "marks.jsonl", "events.jsonl")
+    proofs = {}
+    for name in names:
+        source = live / name
+        source.write_bytes(b"original\nfailed transaction\n")
+        stat = source.stat()
+        proofs[name] = dict(prefix_bytes=9, sha256=hashlib.sha256(b"original\n").hexdigest(),
+                            device=stat.st_dev, inode=stat.st_ino)
+    repair._atomic_json(operation / "journal_prefix_baseline.json", {"journals": proofs})
+    manifest = dict(status="apply_interrupted_requires_audit", append_missing_session=True,
+                    market="m", live_dir=str(live), source_pins=[], spec_sha256="same",
+                    journal_prefix_bytes={name: 9 for name in names},
+                    candidate_final_outcome=repair._outcome(final_mode))
+    repair._atomic_json(operation / "ledger_repair_manifest.json", manifest)
+    monkeypatch.setattr(repair, "control_lease", lambda **kw: nullcontext())
+    monkeypatch.setattr(repair, "_spec", lambda *a: (SimpleNamespace(market="m"), None))
+    monkeypatch.setattr(repair, "_spec_digest", lambda *a: "same")
+    monkeypatch.setattr(repair, "_prepared_sessions", lambda *a, **kw: ([{
+        "day": date(2026, 10, 8), "summary": {"signal_id": "new"}}], []))
+    monkeypatch.setattr(repair, "_acquire_engine_lock", lambda *a: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(repair.subprocess, "run", lambda *a, **kw: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(repair, "_curve_proof", lambda *a: [])
+
+    class Engine:
+        def __init__(self, path, **kw):
+            self.path, self.state = path, repair._object(path / "state.json")
+
+    def execute(engine, *_a, **_kw):
+        assert engine.state["modes"]["m"] == before_mode
+        assert all((engine.path / name).read_bytes() == b"original\n" for name in names)
+        engine.state["modes"]["m"] = final_mode
+        repair._atomic_json(engine.path / "state.json", engine.state)
+        return [{"signal_id": "new", "session_date": "2026-10-08"}]
+
+    monkeypatch.setattr(repair, "TwDayTradeSimulationEngine", Engine)
+    monkeypatch.setattr(repair, "_execute", execute)
+    result = repair.recover_interrupted(SimpleNamespace(operation_root=operation, live_dir=live,
+                                                       market="m", markets_dir=tmp_path))
+    rollback = Path(result["atomic_recovery"]["rollback_directory"])
+    assert result["status"] == "applied" and rollback.is_dir()
+    assert repair._object(live / "state.json")["modes"]["m"] == final_mode
+    assert repair._object(rollback / "state.json")["modes"]["m"] == interrupted_mode
+    assert all((rollback / name).read_bytes() == b"original\nfailed transaction\n" for name in names)
+    assert repair._object(live / "state.json")["modes"]["other"] == other
 
 
 def test_read_only_fill_guard_never_constructs_engine(tmp_path, monkeypatch):
@@ -158,7 +237,10 @@ def test_chart_keeps_replay_provenance_first_seen_after_inference_prefix(tmp_pat
 @pytest.mark.parametrize("weight", [0.025, 0.0001])
 @pytest.mark.parametrize("strict_intraday", [False, True])
 @pytest.mark.parametrize("postclose", [False, True])
-def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_path, monkeypatch, weight, strict_intraday, postclose):
+@pytest.mark.parametrize("append_missing", [False, True])
+def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_path, monkeypatch, weight, strict_intraday, postclose, append_missing):
+    if append_missing and not postclose:
+        pytest.skip("missing-session append is deliberately post-close only")
     class FixedDateTime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -176,6 +258,8 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
     other = {"positions": {"untouched": {"signed_shares": 1000}}, "custom": "keep"}
     prior = {**_flat(), "terminal_curve_mark": ["2026-10-06", 12_000_000, 2_000_000, 0, 0, 0,
                                               "2026-10-06T13:30:00+08:00"]}
+    if append_missing:
+        prior["session_date"] = "2026-10-05"
     repair._atomic_json(tmp_path / "state.json", {"schema_version": repair.SIMULATION_SCHEMA_VERSION,
                                                "modes": {"m": prior, "other": other}})
     engine = TwDayTradeSimulationEngine(tmp_path, publication_clock=lambda: FixedDateTime.now())
@@ -207,7 +291,12 @@ def test_canonical_two_session_replay_keeps_capital_other_modes_and_curves(tmp_p
                              symbol="2330", venue="twse", security_type="stock", eligible=True,
                              short_open=True, covered=True, source_date=str(day))},
                          "coverage": {}, "bars": bars, "end_at": end, "rule_data_dir": tmp_path})
-    accepted = repair._execute(engine, spec, sessions, reason=repair.ORIGINAL_SIGNAL_CONTRACT if postclose else repair.CONTRACT)
+    if append_missing:
+        monkeypatch.setattr(engine, "rearm_flat_session", lambda *a, **kw: pytest.fail("a new session must not rearm history"))
+        accepted = [repair._execute(engine, spec, [item], reason=repair.MISSING_SESSION_CONTRACT)[0]
+                    for item in sessions]
+    else:
+        accepted = repair._execute(engine, spec, sessions, reason=repair.ORIGINAL_SIGNAL_CONTRACT if postclose else repair.CONTRACT)
     shares = 3000 if weight == 0.025 else 0
     assert accepted[0]["entry_requested_shares"] == shares
     assert accepted[0]["entry_filled_shares"] == shares

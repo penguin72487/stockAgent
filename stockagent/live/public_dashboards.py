@@ -238,6 +238,11 @@ def _scrub_public_value(
     return value
 
 
+def sanitize_member_dashboard_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep full-site metadata while retaining public quote/credential rules."""
+    return _scrub_public_value(dict(payload), private_prices=False)
+
+
 def _project_rows(
     payload: dict[str, Any],
     key: str,

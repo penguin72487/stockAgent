@@ -156,6 +156,7 @@ def source_identity(root: Path, *, allow_tracked_deletions: bool = False) -> dic
                 "services/*.html", "services/*.css", "services/*.js", "services/*.mjs", "services/*.ts",
                 "deploy/systemd/*.in",
                 "schemas/public/*.json", "package.json", "package-lock.json",
+                "configs/data_sync/cache_capacity.json", "configs/data_sync/prepared_capacity.json",
                 "train.py", "plot_epoch_curves.py", "coda_runner.sh", "pyproject.toml", "uv.lock", "requirements*.txt", "README.md"]
     result = subprocess.run(
         ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", *patterns],

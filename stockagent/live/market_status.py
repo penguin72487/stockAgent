@@ -218,14 +218,15 @@ def checkpoint_info(
 
 
 def _feature_path(root: Path, symbol: str | None) -> Path | None:
+    from stockagent.data.partitioned_parquet import logical_name, resolve_source
     if not symbol:
         return None
-    direct = root / f"{symbol}{FEATURE_SUFFIX}"
-    if direct.exists():
+    direct = resolve_source(root / f"{symbol}{FEATURE_SUFFIX}")
+    if direct.is_file():
         return direct
     normalized = str(symbol).replace(".", "").replace("-", "").replace("_", "")
     for path in _feature_files(root):
-        candidate = path.name.removesuffix(FEATURE_SUFFIX).replace(".", "").replace("-", "").replace("_", "")
+        candidate = logical_name(path).removesuffix(FEATURE_SUFFIX).replace(".", "").replace("-", "").replace("_", "")
         if candidate.upper() == normalized.upper():
             return path
     return None
@@ -300,24 +301,41 @@ def _max_date_from_parquet(path: Path, *, date_only: bool = True) -> str | None:
     # Cache only an immutable scalar bound to the actual file identity. The
     # expected session/market clock is still recomputed on every status check;
     # this is not the display TTL cache and cannot make yesterday's file fresh.
-    path = Path(path)
+    from stockagent.data.partitioned_parquet import MANIFEST_SUFFIX, ParquetSource, resolve_source
+    requested = Path(path)
     for _ in range(2):
         try:
+            path = resolve_source(requested)
+            if path.name.endswith(MANIFEST_SUFFIX):
+                # Every immutable member is byte-verified before even a scalar
+                # date-cache hit. A recent last-year footer cannot certify a
+                # missing/corrupt older partition. Reuse metadata, not old proofs.
+                with ParquetSource(path) as source:
+                    dates = [_max_date_from_parquet_cached(str(member), date_only, _file_identity(member))
+                             for member in source.members]
+                    if not dates or any(value is None for value in dates):
+                        return None
+                    source.verify()
+                    if resolve_source(requested).resolve() != source.path:
+                        raise _UncacheableParquetDate("Parquet ABI changed during date read")
+                    return max(dates)
             identity = _file_identity(path)
             value = _max_date_from_parquet_cached(str(path.absolute()), date_only, identity)
             if _file_identity(path) == identity:
                 return value
-        except _UncacheableParquetDate:
+        except (_UncacheableParquetDate, OSError, ValueError, KeyError, TypeError):
             continue
-        except OSError:
-            return None
     return None
 
 
 @lru_cache(maxsize=64)
 def _feature_files_cached(root_text: str, identity: tuple[int, ...]) -> tuple[Path, ...]:
+    from stockagent.data.partitioned_parquet import discover_sources
     root = Path(root_text)
-    paths = tuple(root.glob(f"*{FEATURE_SUFFIX}"))
+    try:
+        paths = tuple(discover_sources(root, f"*{FEATURE_SUFFIX}"))
+    except ValueError as exc:
+        raise OSError("ambiguous feature source inventory") from exc
     if _file_identity(root) != identity:
         raise OSError("feature directory changed during inventory read")
     return paths
@@ -834,10 +852,10 @@ def data_freshness(
     crypto_intraday = market_type.lower() == "crypto"
     try:
         feature_files = _feature_files(parquet_root)
-    except OSError:
+        benchmark_path = _feature_path(parquet_root, benchmark_name)
+    except (OSError, ValueError):
         return DataFreshness(parquet_root, None, None, None, None, False, "feature inventory unavailable", 0, 0, False)
     total_files = len(feature_files)
-    benchmark_path = _feature_path(parquet_root, benchmark_name)
     # Daily canonical pipelines certify the whole data layer before promotion.
     # Runtime freshness therefore follows the configured benchmark/session
     # anchor instead of stat/read-scanning thousands of symbol files on every

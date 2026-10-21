@@ -9,7 +9,7 @@ const count = value => value == null ? "—" : Dashboard.formatNumber(value, {ma
 const decimal = value => value == null ? "—" : Dashboard.formatNumber(value, {maximumFractionDigits: 2});
 const bytes = value => value == null ? "—" : Dashboard.formatBytes(value, {maximumFractionDigits: 2});
 const labels = Object.freeze({
-  running: "正在抓取", backfilling: "等待回補", inventorying: "清點新網址", idle: "等待到期工作", waiting: "等待來源",
+  running: "正在抓取", backfilling: "等待回補", rechecking: "正文已存，等待重查", inventorying: "清點新網址", idle: "等待到期工作", waiting: "等待來源",
   cooldown: "來源冷卻", known_queue_clear: "已知待辦已清", attention: "需注意", not_enabled: "未啟用／待確認",
   finite_complete: "固定批次正文已存", waiting_cohort: "新文章等待納入批次",
   authorized_api_pending: "授權 API 待接線",
@@ -20,7 +20,9 @@ const labels = Object.freeze({
 });
 const stateLabels = Object.freeze({
   complete: "已完成狀態", pending: "待回補", inflight: "處理中", retry: "待重試", retry_cooldown: "重試冷卻",
+  empty_http_response: "來源回傳零位元，等待有界重試",
   awaiting_authorization: "未啟用／待確認", unsupported_article_path: "網址格式未支援", body_not_found: "缺正文",
+  redirect_not_article: "轉址未到文章，原網址待查",
   waiting_cohort: "新文章待納入，非抓取失敗",
   article_attribution_not_verified: "作者未驗證", article_title_not_verified: "標題未驗證", article_license_not_verified: "授權標記未驗證", robots_disallowed: "robots 限制",
   article_identity_not_verified: "文章身分待驗證", article_rights_not_verified: "原創／來源署名待驗證", article_rights_or_scope_excluded: "原創／作者權利未確認或超出範圍",
@@ -53,7 +55,7 @@ const outcomeLabels = Object.freeze({complete_state: "正文完成狀態", queue
   repair_required: "解析／時間／端點待修", nontext_representation: "圖片／嵌入／PDF 待文字驗證",
   nonarticle_response: "行情／測試／文件索引", source_currently_empty: "目前空模板",
   origin_absent: "原站撤下／不存在", unknown_outcome: "其他待查"});
-const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000, cnyesListOpen: false};
+const state = {latest: null, filter: "all", query: "", sort: "state", page: 0, inFlight: false, retry: null, retryDelay: 3000, cnyesListOpen: false, outcomeOpen: new Set(), feedOpen: new Set()};
 const PAGE_SIZE = 24;
 const fetchJson = Dashboard.createJsonFetcher({expectedRoot: "object", cache: "no-store", timeoutMs: 15000});
 
@@ -86,6 +88,14 @@ function progress(id, ratio) {
   const bar = $(id);
   if (ratio == null) bar.removeAttribute("value");
   else bar.value = Math.max(0, Math.min(1, ratio));
+}
+
+function outcomeRows(disposition, coverage, provider = null) {
+  return Object.entries(disposition.categories || {}).filter(([, value]) => value > 0).map(([key, value]) => {
+    const attribute = provider == null ? 'data-news-outcome-total' : 'data-news-outcome';
+    const suffix = provider == null ? '-total' : '';
+    return `<tr><td>${escape(outcomeLabels[key] || "其他待查")}</td><td ${attribute}="${escape(key)}">${count(value)}</td><td data-news-missing${suffix}="${escape(key)}">${count(coverage?.missing_body_outcomes?.categories?.[key])}</td><td data-news-retained${suffix}="${escape(key)}">${count(coverage?.retained_body_outcomes?.categories?.[key])}</td></tr>`;
+  }).join('');
 }
 function errorLabel(source) {
   const errors = Object.entries(source.http_errors || {}).map(([code, value]) => `HTTP ${code} × ${count(value)}`);
@@ -151,7 +161,7 @@ function renderSources(data) {
       || (state.filter === "permission" && source.source_policy_review === "permission_required")
       || (state.filter === "attention" && (["cooldown", "attention", "stale", "stopped", "invalid", "waiting_disk", "waiting_restart"].includes(source.state)
         || source.robots_origin_policy_pause?.active_origin_count > 0))));
-  if (state.sort === "remaining") rows.sort((a, b) => (b.remaining_urls || 0) - (a.remaining_urls || 0));
+  if (state.sort === "remaining") rows.sort((a, b) => (b.body_coverage?.missing_body_urls ?? b.remaining_urls ?? 0) - (a.body_coverage?.missing_body_urls ?? a.remaining_urls ?? 0));
   else if (state.sort === "complete") rows.sort((a, b) => (b.complete_urls || 0) - (a.complete_urls || 0));
   else if (state.sort === "name") rows.sort((a, b) => a.name.localeCompare(b.name, "zh-TW"));
   const pages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
@@ -185,7 +195,9 @@ function renderSources(data) {
     const outcomeNote = outcomes && outcomes.urls ? `；已核對非正文 ${count(outcomes.urls)} 個網址（來源不存在 ${count(outcomes.states.source_not_found || 0)}，非文章路徑 ${count(outcomes.states.unsupported_article_path || 0)}），不計入已存正文` : "";
     const cohortNote = cohort ? `原固定批次 ${count(cohort.stored_bodies)} / ${count(cohort.urls)}，不重抓${supplement ? `；已核對追加 ${count(supplement.stored_bodies)} / ${count(supplement.urls)} 正文` : ""}${outcomeNote}；未核對新增 ${count(cohort.unreviewed_new_urls ?? cohort.new_urls_outside_cohort)} 個網址（待排 ${count(source.growth_waiting_urls)}）` : "";
     const disposition = source.outcome_progress;
-    const dispositionNote = !disposition ? "" : `<details class="news-provider-list" data-news-outcome-provider="${escape(source.id)}"><summary>缺口分類與下一步</summary><dl class="news-provider-facts">${Object.entries(disposition.categories || {}).filter(([, value]) => value > 0).map(([key, value]) => `<div><dt>${escape(outcomeLabels[key] || "其他待查")}</dt><dd data-news-outcome="${escape(key)}">${count(value)}</dd></div>`).join("")}</dl><p class="news-provider-note">分類依已保留的網址狀態；不覆寫正文、收據或重試期限。原站不存在不代表所有可用替代都已找過；尚無全途徑不可取得／結案比例的驗收。舊正文可能在重查或原站撤下後仍保留，不與狀態數相加。</p></details>`;
+    const coverage = source.body_coverage;
+    const coverageNote = coverage ? `<p class="news-provider-note" data-news-body-partition>待排缺文 <span data-news-queued-missing>${count(coverage.queued_missing_body_urls)}</span> · 已有正文待排重查 <span data-news-queued-retained>${count(coverage.queued_stored_body_recheck_urls)}</span>；已有正文、非完成狀態 <span data-news-retained-noncomplete>${count(coverage.retained_body_noncomplete_urls)}</span>，不算缺文。估時只計待排缺文。</p>` : '<p class="news-provider-note" data-news-body-partition-unknown>尚無可核對的正文／狀態交叉統計，不推測缺文與重查各有多少。</p>';
+    const dispositionNote = !disposition ? "" : `<details class="news-provider-list" data-news-outcome-provider="${escape(source.id)}"${state.outcomeOpen.has(source.id) ? " open" : ""}><summary>缺口分類與下一步</summary><div class="table-scroll"><table><caption>全部網址狀態，拆分尚缺正文與已有正文</caption><thead><tr><th scope="col">分類</th><th scope="col">全部</th><th scope="col">缺正文</th><th scope="col">已有正文</th></tr></thead><tbody>${outcomeRows(disposition, coverage, source.id)}</tbody></table></div><p class="news-provider-note">缺正文與已有正文互斥，相加為全部網址；無交叉統計時顯示未知。不覆寫正文、收據或重試期限。原站不存在不代表所有可用替代都已找過；尚無全途徑不可取得／結案比例的驗收。</p></details>`;
     const apiNote = source.authorized_api_setup ? '<p class="news-provider-eta">已確認 API 授權；先設定 CNA_API_KEY 並核對實際工具、全文範圍與配額。目前未開始 API 全文下載，完成時間未知；舊網頁佇列保留，不算完成。</p>' : '';
     const work = source.body_work_progress;
     const forecast = source.completion_forecast;
@@ -196,12 +208,18 @@ function renderSources(data) {
       ? `<div class="news-provider-work"><dl class="news-provider-facts"><div><dt>未找到已存主文／待分類</dt><dd data-news-work="missing">${count(work.no_known_primary_body_urls)}</dd></div><div><dt>主文已存，網址版本待驗證</dt><dd data-news-work="candidate">${count(work.existing_primary_body_candidates)}</dd></div><div><dt>本網址正文已存，待重查</dt><dd data-news-work="stored">${count(work.stored_body_recheck_urls)}</dd></div></dl><p class="news-provider-note">以上合計為待回補網址；同 ID 是排程提示，不代表正文相同或已完成。尚無主文優先，網址版本仍定期排入。</p></div>`
       : '<p class="news-provider-note news-provider-work">正文工作分類尚未就緒；不以未知數當成零或完成。</p>';
     return `<article class="pipeline-card"><header class="pipeline-card-header"><div class="news-provider-identity"><strong>${escape(source.name)}</strong><small>${escape(source.id)}</small></div><span class="pipeline-status ${badge}">${escape(labels[source.state] || "待觀測")}</span></header>${apiNote}
-      <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>待回補</dt><dd>${count(source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
-      ${feedNote}${metadataNote}${workNote}${cnyesListProgress(source)}
+      <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>${coverage ? "尚缺正文（含阻塞）" : "待排網址（含重查）"}</dt><dd data-news-missing-body-urls>${count(coverage ? coverage.missing_body_urls : source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
+      ${coverageNote}${feedNote}${metadataNote}${workNote}${cnyesListProgress(source)}${fulltextFeedInventory(source)}
       <progress class="news-provider-progress mini-progress-track" max="1"${bodyRatio == null ? "" : ` value="${bodyRatio}"`} aria-label="${escape(source.name)} ${hasStoredCounters ? '已存正文占全部已知網址的比例' : cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${hasStoredCounters ? '全部已知網址' : cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>${dispositionNote}
       <p class="news-provider-note">剩餘 ${escape(eta(source, data))} · ${escape(finish)}</p>${forecastNote}<p class="news-provider-note">${escape(reviewLabels[source.source_policy_review] || "來源審閱紀錄不可用")}${source.source_reviewed_at_utc ? ` · 核對 ${escape(stamp(source.source_reviewed_at_utc))}` : ""}</p><p class="news-provider-note">${source.authorized_api_setup ? "官方 API 能力檢查已實作，全文管線未啟用" : source.adapter_registered ? "共用下載器已接線" : "來源尚未註冊"} · ${source.adapter_acceptance === "committed_body_heads_observed" ? "已觀測正文入庫" : "尚無正文入庫證據"}${source.source_role === "redirector" ? " · 轉址來源，須找到原始媒體 URL" : ""}</p><p class="news-provider-note">${escape(errorLabel(source))}</p></article>`;
   }).join(""));
   if (restoreListFocus) $("pipeline-grid").querySelector('[data-news-list-provider="cnyes"] > summary')?.focus({preventScroll: true});
+}
+function fulltextFeedInventory(source) {
+  const feed = source.fulltext_feed_inventory;
+  if (!feed) return "";
+  const months = feed.first_registered_month && feed.last_registered_month ? `；登記月份 ${escape(feed.first_registered_month)}～${escape(feed.last_registered_month)}` : "";
+  return `<details class="news-provider-list" data-news-feed-provider="${escape(source.id)}"${state.feedOpen.has(source.id) ? " open" : ""}><summary>RSS 正文端點與分頁</summary><dl class="news-provider-facts"><div><dt>追新根 feed</dt><dd data-news-feed-count="roots">${count(feed.registered_root_feeds)}</dd></div><div><dt>歷史月份 scope</dt><dd data-news-feed-count="months">${count(feed.registered_monthly_feeds)}</dd></div><div><dt>其他歷史 scope</dt><dd data-news-feed-count="other">${count(feed.registered_other_historical_feeds)}</dd></div><div><dt>本程序已結束 RSS 請求</dt><dd data-news-feed-count="requests">${count(feed.owner_terminal_requests)}</dd></div><div><dt>200 回應頁／304 未異動</dt><dd><span data-news-feed-count="pages">${count(feed.owner_200_pages)}</span> / <span data-news-feed-count="unchanged">${count(feed.owner_304_pages)}</span></dd></div><div><dt>RSS 已入庫新正文網址</dt><dd data-news-feed-count="new-bodies">${count(feed.owner_new_stored_url_heads)}</dd></div></dl><p class="news-provider-note">端點數是登記範圍，不代表歷史已抓齊${months}。請求包含根頁、歷史分頁與失敗；200 頁仍須驗證正文、作者與時間，不等於新增文章。只有已入庫新正文計入完成量，重疊文章、304 與既有正文不重複計入。缺少程序計數顯示未知，不補成零。</p></details>`;
 }
 function renderTraffic(data) {
   const workloadLabels = { cnyes_bulk: "批次正文", wordpress_posts: "批次正文", rss_fulltext: "RSS 正文", article_pdf: "PDF", article_html: "單篇 HTML", mixed: "混合工作，不能當成同工作量測速", metadata: "目錄／索引", unclassified: "舊版未分類量測" };
@@ -224,12 +242,23 @@ function renderOriginalURLs(data) {
     : "轉址快照數量不一致，暫不提供比例或估時。正文進度另列。");
   text("original-url-eta", live(data) && resolution.snapshot_consistent ? duration(resolution.conditional_eta_seconds) : "目前暫無有效估時");
   progress("original-url-progress", ratio);
+  const routing = resolution.routing_work;
+  const known = routing?.snapshot_consistent === true;
+  text("original-routing-count", known
+    ? `${count(routing.completed_hosts)} / ${count(routing.known_hosts)} 個主機` : "未知");
+  text("original-routing-state", known
+    ? ({pending: "基線尚未完成", complete: "目前基線已完成", empty: "無既有原站主機"}[routing.state] || "未知") : "等待有效快照");
+  text("original-routing-detail", known
+    ? `尚有 ${count(routing.pending_hosts)} 個主機待核對；此比例按主機計算，不是連結或正文完整率。新增來源或規則變更會另行續排。`
+    : "目前快照未提供有效的來源路由進度；不由轉址解析百分比推算，也不當成零剩餘。");
+  progress("original-routing-progress", known ? routing.host_progress_ratio : null);
 }
 
 function render(data) {
   if (data.schema_version !== 1 || !Array.isArray(data.providers) || !data.acquisition || !data.worker) throw new Error("invalid news status contract");
   state.latest = data;
   const acquisition = data.acquisition;
+  const coverage = data.body_coverage;
   const badge = $("news-health");
   badge.className = `status ${data.health === "running" ? "updating" : data.health === "initializing" ? "loading" : data.health === "initializing_stale" ? "stale" : data.health}`;
   badge.lastChild.textContent = labels[data.health] || "狀態待確認";
@@ -241,11 +270,12 @@ function render(data) {
   text("body-count", count(acquisition.stored_body_articles));
   text("body-bytes", `正文 UTF-8 ${bytes(acquisition.text_bytes)} · 非壓縮容量`);
   text("known-count", count(acquisition.known_urls));
-  text("remaining-count", count(acquisition.remaining_urls));
-  text("remaining-note", `處理中 ${count(acquisition.inflight_urls)} · 待重試 ${count(acquisition.retry_urls)}`);
+  text("remaining-label", coverage ? "待排缺正文" : "待排網址（含重查）");
+  text("remaining-count", count(coverage ? coverage.queued_missing_body_urls : acquisition.remaining_urls));
+  text("remaining-note", coverage ? `所有缺文 ${count(coverage.missing_body_urls)} · 已有正文待排重查 ${count(coverage.queued_stored_body_recheck_urls)}` : `處理中 ${count(acquisition.inflight_urls)} · 待重試 ${count(acquisition.retry_urls)}；缺文／重查尚未知`);
   text("restricted-count", count(acquisition.awaiting_authorization_urls));
   text("download-progress-label", `${count(acquisition.stored_body_articles)} / ${count(acquisition.known_urls)}${acquisition.progress_ratio == null ? "" : ` · ${decimal(acquisition.progress_ratio * 100)}%`}`);
-  text("download-progress-detail", "正文／已清點唯一網址；探索仍在增加分母，未啟用或失敗的網址不算完成。");
+  text("download-progress-detail", `正文／已清點唯一網址${coverage ? `；尚缺正文 ${count(coverage.missing_body_urls)}（含未接線、範圍限制與其他阻塞）` : ""}。探索仍在增加分母，不是全歷史完整率。`);
   progress("download-progress", acquisition.progress_ratio);
   text("global-eta", "未知");
   text("global-eta-basis", "未啟用／被拒絕來源與未知歷史仍存在；不是成功倒數。");
@@ -253,10 +283,10 @@ function render(data) {
   text("eligible-eta-basis", acquisition.eligible_eta_seconds == null ? "有來源缺有效落盤速率或正在冷卻，請看逐來源條件估時。" : "各來源並行，採最長條件工時；未含新探索或阻塞來源。");
   text("metadata-count", `${count(acquisition.metadata_partitions)} 個來源分區`);
   text("discovery-count", `到期清點 ${count(acquisition.discovery_due)} 個 · 清點錯誤 ${count(acquisition.discovery_errors)} 個 · 端點暫停 ${count(acquisition.temporarily_blocked_bulk_pages)} 頁`);
-  text("retry-count", `${count(acquisition.retry_urls)} 個待重試`);
+  text("retry-count", coverage ? `缺文待重試 ${count((coverage.missing_body_states.retry || 0) + (coverage.missing_body_states.retry_cooldown || 0))} · 已有正文重試 ${count((coverage.retained_body_states.retry || 0) + (coverage.retained_body_states.retry_cooldown || 0))}` : `${count(acquisition.retry_urls)} 個待重試（含重查）`);
   const outcomes = data.outcome_progress?.categories;
-  text("error-count", outcomes ? `待修 ${count(outcomes.repair_required)} · 原站不存在 ${count(outcomes.origin_absent)} · 非文字／非文章 ${count(outcomes.nontext_representation + outcomes.nonarticle_response)} · metadata 失敗 ${count(acquisition.metadata_errors)}` : `未啟用／其他不可執行 ${count(acquisition.blocked_urls)} · metadata 失敗 ${count(acquisition.metadata_errors)}`);
-  html("outcome-rows", outcomes ? Object.entries(outcomes).filter(([, value]) => value > 0).map(([key, value]) => `<tr><td>${escape(outcomeLabels[key] || "其他待查")}</td><td data-news-outcome-total="${escape(key)}">${count(value)}</td></tr>`).join("") : '<tr><td colspan="2">尚無有效分類快照</td></tr>');
+  text("error-count", coverage ? `缺文待修 ${count(coverage.missing_body_outcomes.categories.repair_required)} · 已有正文、非完成狀態 ${count(coverage.retained_body_noncomplete_urls)} · metadata 失敗 ${count(acquisition.metadata_errors)}` : outcomes ? `全部網址待修狀態 ${count(outcomes.repair_required)}（可能已有正文）· metadata 失敗 ${count(acquisition.metadata_errors)}` : `未啟用／其他不可執行 ${count(acquisition.blocked_urls)} · metadata 失敗 ${count(acquisition.metadata_errors)}`);
+  html("outcome-rows", outcomes ? outcomeRows(data.outcome_progress, coverage) : '<tr><td colspan="4">尚無有效分類快照</td></tr>');
   text("request-count", count(data.worker.requests));
   text("response-bytes", bytes(data.worker.response_bytes));
   const measured = data.providers.filter(source => source.enabled && source.owner_articles_per_second != null);
@@ -322,6 +352,16 @@ $("source-previous").addEventListener("click", () => {state.page = Math.max(0, s
 $("source-next").addEventListener("click", () => {state.page += 1; if (state.latest) renderSources(state.latest);});
 $("pipeline-grid").addEventListener("toggle", event => {
   if (event.target.isConnected && event.target.matches?.('[data-news-list-provider="cnyes"]')) state.cnyesListOpen = event.target.open;
+  if (event.target.isConnected && event.target.matches?.('[data-news-feed-provider]')) {
+    const provider = event.target.dataset.newsFeedProvider;
+    if (event.target.open) state.feedOpen.add(provider);
+    else state.feedOpen.delete(provider);
+  }
+  if (event.target.isConnected && event.target.matches?.('[data-news-outcome-provider]')) {
+    const provider = event.target.dataset.newsOutcomeProvider;
+    if (event.target.open) state.outcomeOpen.add(provider);
+    else state.outcomeOpen.delete(provider);
+  }
 }, true);
 renderSources = Dashboard.createDeferredRenderer("pipelines", renderSources);
 renderTraffic = Dashboard.createDeferredRenderer("traffic", renderTraffic);

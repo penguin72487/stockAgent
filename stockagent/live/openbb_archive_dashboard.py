@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,10 @@ class _HistoryFileCache:
     offset: int = 0
     size: int = 0
     mtime_ns: int = 0
+    ctime_ns: int = 0
+    prefix_sha256: str = ""
+    parsed_rows: int = 0
+    prefix_verified_bytes: int = 0
     rows: deque[dict[str, Any]] = field(
         default_factory=lambda: deque(maxlen=MAX_HISTORY_ROWS)
     )
@@ -61,12 +66,8 @@ _ALERT_MESSAGES = {
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
-    try:
-        if path.stat().st_size > MAX_JSON_BYTES:
-            return {}
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    value = read_json_snapshot(path, max_bytes=MAX_JSON_BYTES)
     return value if isinstance(value, dict) else {}
 
 
@@ -587,31 +588,69 @@ def build_openbb_public_history(
         with _HISTORY_CACHE_LOCK, history_path.open("rb") as handle:
             stat = os.fstat(handle.fileno())
             cached = _HISTORY_FILE_CACHE.get(cache_key)
-            if (
-                cached is None
-                or (cached.device, cached.inode) != (stat.st_dev, stat.st_ino)
-                or stat.st_size < cached.offset
-            ):
-                cached = _HistoryFileCache(device=stat.st_dev, inode=stat.st_ino)
-                _HISTORY_FILE_CACHE[cache_key] = cached
-            if cached.size != stat.st_size or cached.mtime_ns != stat.st_mtime_ns:
-                handle.seek(cached.offset)
-                appended = handle.read(stat.st_size - cached.offset)
-                complete_size = appended.rfind(b"\n") + 1
-                for line in appended[:complete_size].splitlines():
-                    if not line.strip() or len(line) > 32_768:
+            from stockagent.live.dashboard_updates import metadata_signature
+            generation = metadata_signature(stat)
+            unchanged = cached is not None and (
+                cached.device, cached.inode, cached.size, cached.mtime_ns, cached.ctime_ns
+            ) == generation
+            if not unchanged:
+                # A growing same-inode file may ALSO correct older rows. Prove
+                # its retained prefix, not merely size/mtime, before tail reuse.
+                checksum = hashlib.sha256()
+                verified_bytes = 0
+                if (cached is not None and cached.offset <= stat.st_size
+                        and (cached.device, cached.inode) == generation[:2]):
+                    while verified_bytes < cached.offset:
+                        chunk = handle.read(min(1024**2, cached.offset - verified_bytes))
+                        if not chunk:
+                            raise OSError("OpenBB history changed during prefix verification")
+                        checksum.update(chunk)
+                        verified_bytes += len(chunk)
+                    reusable = checksum.hexdigest() == cached.prefix_sha256
+                else:
+                    reusable = False
+                if reusable:
+                    pending = _HistoryFileCache(
+                        device=stat.st_dev, inode=stat.st_ino, offset=cached.offset,
+                        rows=deque(cached.rows, maxlen=MAX_HISTORY_ROWS),
+                    )
+                else:
+                    handle.seek(0)
+                    checksum = hashlib.sha256()
+                    pending = _HistoryFileCache(device=stat.st_dev, inode=stat.st_ino)
+                while handle.tell() < stat.st_size:
+                    start = handle.tell()
+                    line = handle.readline(min(32_769, stat.st_size - start))
+                    oversized = len(line) > 32_768
+                    part_digest = checksum.copy()
+                    part_digest.update(line)
+                    while oversized and line and not line.endswith(b"\n") and handle.tell() < stat.st_size:
+                        line = handle.readline(min(32_769, stat.st_size - handle.tell()))
+                        part_digest.update(line)
+                    if not line.endswith(b"\n"):
+                        break  # Partial writes are retried, never acknowledged.
+                    checksum = part_digest
+                    pending.offset = handle.tell()
+                    if oversized or not line.strip():
                         continue
                     try:
                         raw = json.loads(line)
                     except (UnicodeDecodeError, json.JSONDecodeError):
                         continue
+                    pending.parsed_rows += 1
                     if isinstance(raw, Mapping):
                         row = project_openbb_history_row(raw)
                         if row:
-                            cached.rows.append(row)
-                cached.offset += complete_size
-                cached.size = stat.st_size
-                cached.mtime_ns = stat.st_mtime_ns
+                            pending.rows.append(row)
+                pending.size, pending.mtime_ns, pending.ctime_ns = generation[2:]
+                pending.prefix_sha256 = checksum.hexdigest()
+                pending.prefix_verified_bytes = verified_bytes
+                if generation != metadata_signature(os.fstat(handle.fileno())) or generation != metadata_signature(history_path.stat()):
+                    raise OSError("OpenBB history changed before projection commit")
+                cached = pending
+                _HISTORY_FILE_CACHE[cache_key] = pending
+            if generation != metadata_signature(history_path.stat()):
+                raise OSError("OpenBB history changed before projection readback")
             projected_rows = list(cached.rows)
     except OSError:
         projected_rows = []

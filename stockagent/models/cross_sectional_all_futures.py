@@ -18,6 +18,7 @@ from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS,
     TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
 )
+from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
 from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean_finite,
@@ -66,6 +67,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_notional_score_coordinates: bool = False,
         futures_margin_amount_context: bool = False,
         futures_causal_account_policy: bool = False,
+        futures_opening_reference_feature: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
     ) -> None:
@@ -115,6 +117,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self.futures_margin_budget_output = bool(futures_margin_budget_output)
         self.futures_margin_amount_context = bool(futures_margin_amount_context)
         self.futures_causal_account_policy = bool(futures_causal_account_policy)
+        self.futures_opening_reference_feature = bool(futures_opening_reference_feature)
+        if self.futures_opening_reference_feature and not self.futures_causal_account_policy:
+            raise ValueError("opening references require the causal margin account policy")
         if self.futures_causal_account_policy and (
             not self.futures_margin_budget_output or not self.futures_margin_amount_context
             or self.futures_current_open_feature or self.futures_denomination_hard_projection
@@ -243,6 +248,11 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 )
                 nn.init.zeros_(self.futures_account_response_head.weight)
                 nn.init.zeros_(self.futures_account_response_head.bias)
+        self.futures_opening_reference_encoder = (
+            nn.Linear(len(OPENING_REFERENCE_FEATURES), self.d_model, bias=False,
+                      device=self.futures_action_head.weight.device, dtype=self.futures_action_head.weight.dtype)
+            if self.futures_opening_reference_feature else None
+        )
 
     def set_futures_feature_rms_normalizer(
         self,
@@ -306,6 +316,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         margin_features = expected_features + 2 + int(self.futures_margin_amount_context)
         if self.futures_causal_account_policy:
             margin_features += len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+        if self.futures_opening_reference_feature:
+            margin_features += len(OPENING_REFERENCE_FEATURES)
         if features is None or mask is None:
             raise ValueError(
                 "all-futures candidate_features and candidate_mask must be paired"
@@ -452,7 +464,10 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         return_aux: bool | None = None,
         return_scores: bool = False,
         portfolio_context: dict[str, torch.Tensor] | None = None,
+        _risk_calibration_inputs_only: bool = False,
     ):
+        if _risk_calibration_inputs_only:
+            raise ValueError("stock-futures output does not support cash-stock risk calibration inputs")
         if portfolio_context is None:
             raise ValueError(
                 "cross_sectional_all_futures requires causal futures context"
@@ -581,6 +596,10 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 current_open_token,
                 torch.zeros_like(current_open_token),
             )
+        if self.futures_opening_reference_encoder is not None:
+            reference = candidate_features[..., -len(OPENING_REFERENCE_FEATURES):].to(dtype=z_stock.dtype)
+            reference_token = self.futures_opening_reference_encoder(reference)
+            futures_tokens = futures_tokens + reference_token.masked_fill(~candidate_mask.unsqueeze(-1), 0.)
         valid_underlying = (
             (underlying_indices >= 0)
             & (underlying_indices < int(z_stock.size(1)))

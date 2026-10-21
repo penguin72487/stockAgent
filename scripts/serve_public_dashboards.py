@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.live.public_dashboards import (  # noqa: E402
     UnsafePublicDashboardPayload,
+    sanitize_member_dashboard_payload,
     sanitize_taifex_history,
     sanitize_taifex_status,
     sanitize_tw_events,
@@ -44,6 +45,7 @@ from stockagent.live.public_dashboards import (  # noqa: E402
 )
 from stockagent.live.dashboard_updates import (
     DashboardUpdateHub,
+    json_snapshot_metrics,
     metadata_signature,
 )  # noqa: E402
 from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource  # noqa: E402
@@ -110,6 +112,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     build_dashboard_signal_page,
     build_dashboard_snapshot,
     dashboard_session_clock,
+    history_projection_work,
     warm_dashboard_session_indexes,
 )
 from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
@@ -1649,12 +1652,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
         audience: str = "public",
         traffic_observer: PublicTrafficObserver | None = None,
     ) -> None:
-        if audience not in {"public", "owner"}:
+        if audience not in {"public", "member", "owner"}:
             raise ValueError("unknown dashboard audience")
-        if audience == "owner" and address[0] not in {"127.0.0.1", "::1", "localhost"}:
-            raise ValueError("owner dashboard listener must be loopback-only")
+        if audience != "public" and address[0] not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("authenticated dashboard listener must be loopback-only")
         self.audience = audience
         self.is_owner = audience == "owner"
+        self.can_view_all_pages = audience != "public"
         super().__init__(address, PublicDashboardHandler)
         self.public_static_root = Path(public_static_root)
         self.taifex_static_root = Path(taifex_static_root)
@@ -1812,7 +1816,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 return cached.response
         body = target.read_bytes()
         if content_type.startswith("text/html"):
-            body = project_html(body, owner=self.is_owner)
+            body = project_html(body, audience=self.audience)
         response = _prepared(
             body,
             content_type=content_type,
@@ -2011,9 +2015,15 @@ class PublicDashboardServer(ThreadingHTTPServer):
         """Build and cache a local allowlisted status payload."""
 
         def build() -> PreparedResponse:
+            payload = dict(builder())
+            if self.audience == "member" and not cache_key.startswith(("tw-", "overnight-", "taifex-")):
+                # Price-bearing strategy DTOs already use the canonical quote
+                # policy with record context. Other full-site readers must not
+                # accidentally disclose an unsanitized provider price field.
+                payload = sanitize_member_dashboard_payload(payload)
             encoded = (
                 json.dumps(
-                    dict(builder()),
+                    payload,
                     ensure_ascii=False,
                     separators=(",", ":"),
                     allow_nan=False,
@@ -2823,7 +2833,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         return self._measured_build(build)
 
     def public_overview(self) -> Mapping[str, Any]:
-        if not self.is_owner:
+        if not self.can_view_all_pages:
             # Do not read private provider inventories/quotas just to discard
             # them. Public visitors need only these two strategy summaries.
             sources = {
@@ -2971,6 +2981,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
     def prewarm_default_views(self) -> None:
         if not self.is_owner:
+            # The member listener shares source owners, not their large
+            # response caches. Build requested pages lazily instead of adding
+            # a third full history scan at startup.
             self.prewarm_overview()
             return
         """Warm every first-view cache without delaying the listener."""
@@ -3203,7 +3216,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             # A retained owner validator must never validate a public response
             # after the same browser moves between LAN/VPN identities.
             etag = f'"{self.server.audience}-{etag.strip(chr(34))}"'
-            cache_control = "private, no-store" if self.server.is_owner else "no-store"
+            cache_control = "private, no-store" if self.server.can_view_all_pages else "no-store"
         if status == HTTPStatus.OK and _etag_matches(
             self.headers.get("If-None-Match"), etag
         ):
@@ -3728,7 +3741,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if raw_query and path in _PUBLIC_API_ROUTES and path not in _QUERY_API_ROUTES:
             raise InvalidPublicRequest("endpoint does not accept query fields")
         if path == "/api/access":
-            return _prepared((json.dumps(access_description(owner=self.server.is_owner)) + "\n").encode(),
+            return _prepared((json.dumps(access_description(audience=self.server.audience)) + "\n").encode(),
                              content_type="application/json; charset=utf-8", cache_control="no-store")
         if path == "/api/overview":
             return self.server.cached_local_json(
@@ -4040,6 +4053,19 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 exclude_current_request=True
             )
             payload["cache"].update(self.server.cache_residency())
+            payload["daily_incremental"] = {
+                "scope": "current_process_observations_not_live_readiness",
+                "source_snapshots": json_snapshot_metrics(),
+                "history_projections": {
+                    name: history_projection_work(self.server.repo_root / "artifacts/live" / root)
+                    for name, root in (("tw-day-trade", "tw_day_trade_simulation"),
+                                       ("tw-overnight", "tw_overnight_simulation"))
+                },
+            }
+            payload["definitions"]["daily_incremental"] = (
+                "來源解碼／重用計數與最近逐日投影的重建、載入及合併耗時；"
+                "計數隨程序重啟歸零，空物件表示尚未觀察。這不是資料完整或即時就緒證明。"
+            )
             payload["definitions"]["cache_resident_bytes"] = (
                 "程序內 JSON 回應快取目前保留的原始與 gzip body；不含靜態資源、"
                 "Python 物件與作業系統頁面快取。"
@@ -4180,7 +4206,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         path = parsed.path
-        if not permitted_path(path, owner=self.server.is_owner):
+        if not permitted_path(path, audience=self.server.audience):
             self._send_json(HTTPStatus.FORBIDDEN, {"error": "access_denied"}, head_only=head_only)
             return
         if path in {
@@ -4374,6 +4400,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--owner-port", type=int, default=0,
                         help="optional separate loopback-only owner listener; never selected by HTTP identity headers")
+    parser.add_argument("--member-port", type=int, default=0,
+                        help="optional loopback-only full-site listener with public quote policy")
     parser.add_argument(
         "--public-static-root",
         type=Path,
@@ -4447,6 +4475,9 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("port must be between 1 and 65535")
     if args.owner_port and (not 1 <= args.owner_port <= 65_535 or args.owner_port == args.port):
         raise ValueError("owner port must be valid and distinct")
+    if args.member_port and (not 1 <= args.member_port <= 65_535
+                             or args.member_port in {args.port, args.owner_port}):
+        raise ValueError("member port must be valid and distinct")
     server_options = dict(
         public_static_root=Path(args.public_static_root),
         taifex_static_root=Path(args.taifex_static_root),
@@ -4471,6 +4502,11 @@ def main(argv: list[str] | None = None) -> int:
         owner_server = PublicDashboardServer(("127.0.0.1", args.owner_port), **server_options,
                                               audience="owner", traffic_observer=server.traffic_observer)
         threading.Thread(target=owner_server.serve_forever, name="owner-dashboard-listener", daemon=True).start()
+    member_server = None
+    if args.member_port:
+        member_server = PublicDashboardServer(("127.0.0.1", args.member_port), **server_options,
+                                               audience="member", traffic_observer=server.traffic_observer)
+        threading.Thread(target=member_server.serve_forever, name="member-dashboard-listener", daemon=True).start()
     threading.Thread(
         target=server.prewarm_default_views,
         name="public-default-views-prewarm",
@@ -4479,6 +4515,9 @@ def main(argv: list[str] | None = None) -> int:
     if owner_server is not None:
         threading.Thread(target=owner_server.prewarm_default_views,
                          name="owner-default-views-prewarm", daemon=True).start()
+    if member_server is not None:
+        threading.Thread(target=member_server.prewarm_default_views,
+                         name="member-default-views-prewarm", daemon=True).start()
     print(
         f"[public-dashboards] listening=http://{args.host}:{args.port} "
         "upstreams=localhost-only",
@@ -4489,6 +4528,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        if member_server is not None:
+            member_server.shutdown()
+            member_server.server_close()
         if owner_server is not None:
             owner_server.shutdown()
             owner_server.server_close()

@@ -1,0 +1,8 @@
+base_config: tw_stock_futures_carry_0845_openref_20261021_v3.yaml
+experiment_name: tw-stock-futures-carry-0900-openref-20261021-v3
+trading:
+  tw_futures_portfolio_decision_time: '09:00'
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v3/0900/entries.parquet
+  tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_decision_clocks_20261021_v3/0900/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_decision_clocks_20261021_v3/clock__0900

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from datetime import datetime
 import hashlib
 from itertools import islice
@@ -27,11 +28,15 @@ if __package__ in {None, ''}:
 from bs4 import BeautifulSoup
 from lxml import etree
 
-from downloader.artifact_io import atomic_write_json, atomic_write_parquet, table_from_records, sha256_file
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, table_from_records, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_http import NewsHTTP
-from downloader.news_fulltext_policy import NewsError, _objects, _plain_text_node, extract_article
+from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, _objects, _plain_text_node, extract_article
 from downloader.news_fulltext_queue import utc_now
+from downloader.news_fulltext_candidates import (
+    compare_native_candidate, ettoday_candidate_source, extraction_failure_location,
+    max_candidate_source, videoland_candidate_source,
+)
 
 
 def require_diagnostic_owner_scope(config, registry, canonical_config, canonical_registry, repo):
@@ -55,51 +60,45 @@ def require_diagnostic_owner_scope(config, registry, canonical_config, canonical
         raise ValueError('isolated_diagnostic_overlaps_enabled_production_host; use canonical collector config/root')
 
 
+def isolated_diagnostic_config(config, sources, *, root, repo, canonical_registry):
+    """Prepare disjoint-source diagnosis without inheriting another owner's work.
+
+    A production failure focus/replay describes exact live publisher URLs, not
+    defaults for a new source. Clear those selections only in this private
+    copy, preserving source permission, transport limits and the live owner.
+    No directory, queue, HTTP client or publisher request is created here.
+    """
+    if (not isinstance(sources, list) or not 1 <= len(sources) <= 8
+            or any(not isinstance(source, dict) for source in sources)):
+        raise ValueError('bounded explicit diagnostic source list required')
+    if (Path(repo) / root).resolve() == (Path(repo) / config['root']).resolve():
+        raise ValueError('isolated diagnostic requires a disjoint root')
+    candidate = deepcopy(config)
+    candidate.pop('provider_catalog', None)
+    candidate.update(root=str(root), providers=deepcopy(sources),
+        exclusive_http_owner=True, publish=False, remote_training_export=False,
+        adaptive_rate={'enabled': False}, failure_diagnostic_focus=None,
+        failure_diagnostic_metadata_identity_upgrade=False,
+        retained_cnyes_failure_replay_enabled=False, cached_cnyes_replay_enabled=False,
+        cached_cnyes_metadata_replay_enabled=False)
+    registry = PolicyRegistry(candidate, base=Path(repo))
+    if any(not source.allowed for source in registry.sources.values()):
+        raise ValueError('diagnostic source still requires reviewed permission')
+    workers = sum(source.parallelism for source in registry.sources.values() if source.request_enabled)
+    if not 1 <= workers <= 16:
+        raise ValueError('diagnostic worker reservations exceed bounded budget')
+    candidate['workers'] = workers
+    require_diagnostic_owner_scope(candidate, registry, config, canonical_registry, Path(repo))
+    return candidate
+
+
 FAILURE_PROBE_CODES = (
     'body_not_found', 'article_attribution_not_verified',
     'article_title_not_verified', 'article_identity_not_verified',
     'invalid_bulk_publication_clock', 'article_rights_or_scope_excluded',
     'article_license_not_verified',
+    'redirect_not_article',
 )
-
-
-def extraction_failure_location(error):
-    """Code-generation-local parser sites, never traceback text or locals.
-
-    The error code alone cannot distinguish a conflicting canonical from a
-    schema/title mismatch. Keep only trusted downloader filenames, function
-    names and line numbers; no response text, source URLs or absolute paths.
-    """
-    parser_root = Path(__file__).resolve().parent.parent / 'downloader'
-    sites, visibility, frame, examined = [], None, error.__traceback__, 0
-    while frame is not None and examined < 32:
-        code = frame.tb_frame.f_code
-        path = Path(code.co_filename)
-        if (path.parent == parser_root
-                and re.fullmatch(r'news_fulltext(?:_[a-z_]+)?[.]py', path.name)
-                and re.fullmatch(r'[_a-zA-Z][_a-zA-Z0-9]{0,120}', code.co_name)):
-            sites.append({'module': path.name, 'function': code.co_name, 'line': frame.tb_lineno})
-            if path.name == 'news_fulltext_public_originals.py' and code.co_name == '_visible':
-                from bs4 import Tag
-                candidate = frame.tb_frame.f_locals.get('node')
-                refusing = frame.tb_frame.f_locals.get('parent')
-                if isinstance(candidate, Tag) and isinstance(refusing, Tag):
-                    # Only structural flags from this trusted visibility guard.
-                    # Never serialize locals, IDs, classes, CSS, links or text.
-                    ancestors = [candidate, *candidate.parents]
-                    style = re.sub(r'\s+', '', str(refusing.get('style', ''))).lower()
-                    visibility = {'candidate_tag': candidate.name, 'refusing_tag': refusing.name,
-                        'candidate_text_characters': len(candidate.get_text(' ', strip=True)),
-                        'refusing_hidden': refusing.has_attr('hidden'),
-                        'refusing_aria_hidden': str(refusing.get('aria-hidden', '')).lower() == 'true',
-                        'refusing_display_none': 'display:none' in style,
-                        'refusing_visibility_hidden': 'visibility:hidden' in style,
-                        'within_registered_cnyes_ad_slot': any(str(n.get('id', '')).startswith(
-                            'div-gpt-ad-cnyes_news_article_') for n in ancestors if getattr(n, 'attrs', None))}
-        frame = frame.tb_next
-        examined += 1
-    return {'contract_version': 2, 'sites': sites[-8:], 'visibility': visibility,
-            'line_numbers_are_code_generation_local': True, 'source_text_or_locals_exported': False}
 
 
 def require_current_missing_body_failures(root, urls, registry, *, now=None, failure_code='body_not_found'):
@@ -337,19 +336,46 @@ def globalvoices_public_identity_shape(soup, source, *, page_url):
                 row['aware_clock'] = False
         return row
 
-    return {'contract_version': 1, 'numeric_requested_post_id': numeric[1] if numeric else None,
+    identity_verified = _globalvoices_visible_article_identity(
+        soup, source, page_url=page_url, allow_empty_title=True) is not None
+    entry = roles['entry'][0] if len(roles['entry']) == 1 else None
+    # An actually empty native container is a source observation, not proof of
+    # missing parser coverage or a permanently absent archive. Do not confuse
+    # blank get_text() from a script/image/comment/hidden placeholder with an
+    # empty response, or serialize its text/attributes into diagnostic output.
+    # Exact empty-entry markup is cheap to check and fails closed on unknown
+    # layouts; acceptance, source clocks and queue states are unchanged.
+    from bs4 import NavigableString
+    from downloader.news_fulltext_policy import _has_paywall
+    empty_entry = bool(identity_verified and entry is not None
+        and entry.attrs == {'class': ['entry']}
+        and all(type(child) is NavigableString and not str(child).strip() for child in entry.children)
+        and not _has_paywall(soup))
+
+    return {'contract_version': 2, 'numeric_requested_post_id': numeric[1] if numeric else None,
         'counts': {role: len(nodes) for role, nodes in roles.items()},
         'nodes': {role: [describe(node, role) for node in nodes[:8]] for role, nodes in roles.items()},
-        'current_exception_identity_verified': _globalvoices_visible_article_identity(
-            soup, source, page_url=page_url, allow_empty_title=True) is not None,
+        'current_exception_identity_verified': identity_verified,
+        'native_body_observation': {
+            'contract_version': 1,
+            'verified_empty_native_container': empty_entry,
+            'scope': 'this supplied response only; not current HTTP or all historical versions',
+            'empty_source_is_not_parser_repair_proof': True,
+            'queue_mutation_possible': False,
+            'all_authorized_alternatives_exhausted': False,
+        },
         'body_text_exported': False, 'raw_response_retained': False,
         'article_durably_accepted': False, 'automatic_profile_requests': 0}
 
 
-def probe_provider(http, urls, *, retain=False, output_root=None):
+def probe_provider(http, urls, *, retain=False, output_root=None, candidate_source=None):
     results = []
     for url in urls:
         source = http.registry.require(url)
+        if candidate_source is not None and (source.provider not in {'maxfinanciallife', 'ettoday', 'videoland'}
+                or candidate_source.provider != source.provider
+                or candidate_source.authorization_fingerprint != source.authorization_fingerprint or retain):
+            raise ValueError('metadata_only_same_source_candidate_required')
         if http.provider_not_before.get(source.provider, 0) > time.time():
             results.append({"url": url, "provider": source.provider, "error": "persisted_provider_cooldown", "sent": False})
             break
@@ -364,6 +390,32 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                 if source.provider == 'globalvoices':
                     item['globalvoices_public_identity'] = globalvoices_public_identity_shape(
                         soup, source, page_url=response.url)
+                if source.provider == 'watchmedia':
+                    from downloader.news_fulltext_watchmedia import watchmedia_validation_metadata
+                    item['watchmedia_native_validation'] = watchmedia_validation_metadata(soup, page_url=response.url)
+                if source.provider == 'pocket':
+                    from downloader.news_fulltext_pocket import pocket_identity_metadata
+                    item['pocket_native_validation'] = pocket_identity_metadata(soup, page_url=response.url)
+                    item['pocket_native_clock_validation'] = item['pocket_native_validation']['clock_shapes']
+                if source.provider == 'pinview':
+                    from downloader.news_fulltext_pinview import pinview_validation_metadata
+                    item['pinview_native_validation'] = pinview_validation_metadata(soup, page_url=response.url)
+                if source.provider == 'peoplemedia':
+                    from downloader.news_fulltext_peoplemedia import peoplemedia_validation_metadata
+                    item['peoplemedia_native_validation'] = peoplemedia_validation_metadata(soup, page_url=response.url)
+                if source.provider == 'mitrade':
+                    from downloader.news_fulltext_mitrade import mitrade_validation_metadata
+                    item['mitrade_native_validation'] = mitrade_validation_metadata(
+                        soup, page_url=response.url, include_editorial=True)
+                if source.provider == 'idn':
+                    from downloader.news_fulltext_idn import idn_validation_metadata
+                    item['idn_native_validation'] = idn_validation_metadata(soup, page_url=response.url)
+                if source.provider == 'videoland':
+                    from downloader.news_fulltext_videoland import videoland_validation_metadata
+                    item['videoland_native_validation'] = videoland_validation_metadata(soup, page_url=response.url)
+                    if candidate_source is not None:
+                        from downloader.news_fulltext_videoland import videoland_description_repair_metadata
+                        item['videoland_description_repair_preview'] = videoland_description_repair_metadata(soup, page_url=response.url)
                 if source.provider == 'cnyes':
                     from scripts.inspect_cnyes_news import cnyes_html_structure
                     item['cnyes_structure'] = cnyes_html_structure(soup, source, page_url=response.url)
@@ -491,6 +543,9 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                                 _visible(node)
                         except NewsError:
                             item["reviewed_current_byline_scope"] = False
+                if source.provider == 'maxfinanciallife':
+                    from downloader.news_fulltext_max import max_native_clock_metadata
+                    item['max_native_clock_metadata'] = max_native_clock_metadata(soup, source)
                 if source.provider in {"nownews", "ftvnews", "voa_chinese", "voa_cantonese", "tvbs"}:
                     # Public credits/clocks only, including failed original-
                     # scope decisions. Never retain a third-party/paid body to
@@ -590,6 +645,9 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                 except NewsError as error:
                     item["extraction_error"] = error.code
                     item['extraction_failure_location'] = extraction_failure_location(error)
+                if candidate_source is not None:
+                    item['candidate_parser'] = compare_native_candidate(
+                        response.body, source, candidate_source, page_url=response.url)
                 if retain and item.get("extraction_error") not in {"paywall_or_login", "access_challenge", "article_rights_or_scope_excluded",
                                                                 "article_license_not_verified", "article_rights_not_verified"} and (
                         source.provider != 'cnyes' or item.get('cnyes_structure', {}).get('raw_public_scope', False)) and (
@@ -734,11 +792,26 @@ def probe_provider(http, urls, *, retain=False, output_root=None):
                 chain = chain.__cause__ or chain.__context__
         item.update(wall_seconds=time.monotonic() - start,
                     robot_delay_seconds=http.robot_delays.get(source.provider, 0))
+        if source.provider == 'videoland' and candidate_source is not None:
+            # This new candidate contract exports finite facts only. Generic
+            # diagnostics can contain title/byline/link samples; neither the
+            # returned report nor stdout may retain them on this path.
+            item = {key: value for key, value in item.items() if key in {
+                'url', 'provider', 'status', 'final_url', 'bytes', 'response_sha256',
+                'videoland_native_validation', 'videoland_description_repair_preview',
+                'extraction_error', 'extraction_failure_location', 'candidate_parser',
+                'error', 'retry', 'delay', 'wall_seconds', 'robot_delay_seconds'}}
         results.append(item)
         print(json.dumps({k: v for k, v in item.items() if k not in {"links", "byline_elements"}}, ensure_ascii=False), flush=True)
         if http.provider_not_before.get(source.provider, 0) > time.time():
             break
     return results
+
+
+def _write_candidate_result(path, result):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write_bytes(path, (json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False)+'\n').encode(),
+                       durable=True, mode=0o600)
 
 
 def main(argv=None):
@@ -747,7 +820,12 @@ def main(argv=None):
     selection = parser.add_mutually_exclusive_group(required=True)
     selection.add_argument("--probe", action="append", default=[])
     selection.add_argument('--current-failure-provider', help='Select current due missing-body failures after draining the canonical producer')
+    selection.add_argument('--candidate-request-status', help='Read a resident-owner candidate request; no HTTP or owner lock')
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
+    parser.add_argument('--enqueue-candidate', action='store_true',
+        help='Submit one reviewed metadata-only candidate to the resident owner; do not stop it or issue HTTP here')
+    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2), default=1,
+        help='Resident finite evidence: v1 candidate; v2 reviewed Videoland native credit/clock formats')
     parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
                         help='Explicit observed missing-article failure; validation diagnosis is metadata-only')
     parser.add_argument("--output", type=Path, required=True)
@@ -755,6 +833,10 @@ def main(argv=None):
     parser.add_argument("--trace-access", action="store_true", help="Record private bounded redirect/header/robots structure through the same HTTP path")
     parser.add_argument('--require-current-missing-body-failure', action='store_true',
                         help='Read-only exact-head preflight; reject saved, leased, denied, undated or not-yet-due selections')
+    parser.add_argument('--candidate-embedded-layout', choices=[
+        *[name for name, version in MAX_LAYOUT_VERSIONS.items() if version >= 4],
+        'ettoday_visible_article_v39', 'videoland_visible_article_v4'],
+        help='Compare one reviewed MAX, ETtoday or Videoland candidate using the same received envelope; metadata-only, no acceptance/requeue')
     args = parser.parse_args(argv)
     if args.failure_code != 'body_not_found' and (
             not (args.current_failure_provider or args.require_current_missing_body_failure)
@@ -765,6 +847,18 @@ def main(argv=None):
     config, registry, repo = load_config(args.config)
     canonical_config, canonical_registry, _ = load_config(repo / 'configs/news_fulltext.json')
     require_diagnostic_owner_scope(config, registry, canonical_config, canonical_registry, repo)
+    if args.candidate_request_status:
+        if (args.candidate_embedded_layout or args.enqueue_candidate or args.retain_reviewed_response
+                or args.candidate_evidence_contract != 1):
+            parser.error('candidate_status_is_read_only')
+        from downloader.news_fulltext_candidate_diagnostics import candidate_status
+        _write_candidate_result(args.output, candidate_status(repo/config['root'], args.candidate_request_status))
+        return 0
+    if args.enqueue_candidate and not args.candidate_embedded_layout:
+        parser.error('resident_candidate_requires_reviewed_candidate_layout')
+    if args.candidate_evidence_contract == 2 and (not args.enqueue_candidate
+            or args.candidate_embedded_layout != 'videoland_visible_article_v4'):
+        parser.error('reviewed_Videoland_resident_credit_clock_evidence_required')
     if args.current_failure_provider:
         try:
             args.probe = select_current_failure_urls(repo / config['root'], args.current_failure_provider, registry,
@@ -788,6 +882,16 @@ def main(argv=None):
     groups = defaultdict(list)
     for url in args.probe:
         groups[registry.require(url).provider].append(url)
+    candidate = None
+    if args.candidate_embedded_layout:
+        candidate_provider = ('videoland' if args.candidate_embedded_layout == 'videoland_visible_article_v4'
+            else 'ettoday' if args.candidate_embedded_layout in ETTODAY_LAYOUT_VERSIONS else 'maxfinanciallife')
+        if (set(groups) != {candidate_provider} or len(args.probe) != 1 or args.retain_reviewed_response
+                or not args.require_current_missing_body_failure or args.failure_code == 'body_not_found'):
+            parser.error('one_current_reviewed_validation_failure_metadata_only_candidate_required')
+        factory = (videoland_candidate_source if candidate_provider == 'videoland'
+            else ettoday_candidate_source if candidate_provider == 'ettoday' else max_candidate_source)
+        candidate = factory(config, registry, repo, args.candidate_embedded_layout)
     failure_grant = None
     if args.require_current_missing_body_failure:
         try:
@@ -810,6 +914,13 @@ def main(argv=None):
             })
             return 0
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.enqueue_candidate:
+        from downloader.news_fulltext_candidate_diagnostics import submit_candidate
+        result = submit_candidate(repo/config['root'], config, registry, args.probe[0],
+            args.candidate_embedded_layout, reason='Explicit reviewed same-response parser candidate; metadata only, no body acceptance',
+            evidence_contract_version=args.candidate_evidence_contract)
+        _write_candidate_result(args.output, result)
+        return 0
     diagnostics = args.output.parent / "private-source-diagnostics"
     if args.retain_reviewed_response:
         diagnostics.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -820,7 +931,10 @@ def main(argv=None):
     http = NewsHTTP(registry, config, repo / config["root"], access_observer=trace.observe if trace else None)
     try:
         with ThreadPoolExecutor(max_workers=min(len(groups), config["workers"])) as pool:
-            results = list(pool.map(lambda urls: probe_provider(http, urls, retain=args.retain_reviewed_response, output_root=diagnostics), groups.values()))
+            options = {'retain': args.retain_reviewed_response, 'output_root': diagnostics}
+            if candidate is not None:
+                options['candidate_source'] = candidate
+            results = list(pool.map(lambda urls: probe_provider(http, urls, **options), groups.values()))
         result = {"observed_at_utc": utc_now(), "probes": [r for group in results for r in group],
                   "performance": http.metrics.snapshot(), "official_rate_limit": None}
         if failure_grant is not None:

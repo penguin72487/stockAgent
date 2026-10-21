@@ -139,12 +139,18 @@ def test_capacity_audit_separates_prior_fill_from_missing_price(tmp_path):
 
 
 def test_full_replay_rejects_current_session_and_daily_only_path(monkeypatch, tmp_path):
-    today = datetime.now(ZoneInfo("Asia/Taipei")).date()
+    class OpeningDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 21, 9, 30, tzinfo=ZoneInfo("Asia/Taipei"))
+
+    monkeypatch.setattr(replay, "datetime", OpeningDatetime)
+    today = OpeningDatetime.now().date()
     monkeypatch.setattr("sys.argv", ["replay", "--state-dir", str(tmp_path / "candidate"),
                                     "--start-date", today.isoformat(),
                                     "--end-date", today.isoformat(),
                                     "--historical-full-fill-0901", "--replay-intraday-kbars"])
-    with pytest.raises(ValueError, match="completed past sessions only"):
+    with pytest.raises(ValueError, match="completed sessions only"):
         replay.main()
     yesterday = today - timedelta(days=1)
     monkeypatch.setattr("sys.argv", ["replay", "--state-dir", str(tmp_path / "candidate"),
@@ -153,3 +159,22 @@ def test_full_replay_rejects_current_session_and_daily_only_path(monkeypatch, tm
                                     "--historical-full-fill-0901"])
     with pytest.raises(ValueError, match="requires --replay-intraday-kbars"):
         replay.main()
+
+
+@pytest.mark.parametrize("end,clock,include_open,accepted", [
+    (date(2026, 10, 20), (9, 0), False, True),
+    (date(2026, 10, 21), (9, 1), False, False),
+    (date(2026, 10, 21), (14, 30), False, False),
+    (date(2026, 10, 21), (14, 31), False, True),
+    (date(2026, 10, 21), (16, 0), True, False),
+    (date(2026, 10, 22), (16, 0), False, False),
+])
+def test_full_replay_clock_does_not_admit_open_or_future_session(end, clock, include_open, accepted):
+    current = datetime(2026, 10, 21, *clock, tzinfo=ZoneInfo("Asia/Taipei"))
+    if accepted:
+        replay._require_completed_full_replay_window(end=end, current=current,
+            include_current_open_session=include_open)
+    else:
+        with pytest.raises(ValueError, match="completed sessions only"):
+            replay._require_completed_full_replay_window(end=end, current=current,
+                include_current_open_session=include_open)

@@ -297,7 +297,8 @@ public static class TejBridgeNative {
     public static int[] AccessibleState(long h) {
         Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
         Marshal.ThrowExceptionForHR(AccessibleObjectFromWindow(new IntPtr(h),0xFFFFFFFCu,ref iid,out a));
-        return new int[]{Convert.ToInt32(a.get_accRole(0)),Convert.ToInt32(a.get_accState(0))};
+        try {return new int[]{Convert.ToInt32(a.get_accRole(0)),Convert.ToInt32(a.get_accState(0))};}
+        finally {ReleaseAccessible(a);}
     }
     public static string AccessibleDefaultAction(long h) {
         Guid iid=new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");Accessibility.IAccessible a;
@@ -1751,6 +1752,8 @@ try {
             })
             $payload.source_binding_unchanged=$true;$payload.date_text_input_sent=$false;
             $payload.query_button_invoked=$false;$payload.source_rows_adopted=$false
+            $ownedProcess=Get-Process -Id $TejProcessId -ErrorAction Stop
+            $payload.owned_desktop_process_start_utc=$ownedProcess.StartTime.ToUniversalTime().ToString('o')
             $payload.source_key_labels=@(Native-Controls $source 'WindowsForms10.STATIC.'|ForEach-Object {
                 @{name=$_.Current.Name;handle=$_.Current.NativeWindowHandle}
             })
@@ -2566,7 +2569,7 @@ try {
 } finally {
     # Failed preparation is real elapsed work too. Optional timing is NEVER
     # negative source evidence, submission permission or a deadline renewal.
-    $flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds
+    if(-not $flowTimings.ContainsKey('scope_preparation_seconds')){$flowTimings.scope_preparation_seconds=$scopeClock.Elapsed.TotalSeconds}
     $flowTimings.scope_stages=$scopeTimings
     Write-FlowTiming
     foreach($comObject in @($range,$sheet,$book,$excel)) {

@@ -271,7 +271,9 @@ def test_lookup_batch_is_read_only_and_does_not_cache_action_authorization():
     lookup=BRIDGE.split('public static int[] ExactListIndices',1)[1].split('public static void SelectListBatch',1)[0]
     assert lookup.count('AssertControlScope(root,control,expectedPid,title)') == 2
     assert lookup.count('VerifyLookupList(root,control)') == 2
-    assert 'StringComparer.Ordinal' in lookup and 'ExactListIndexCore(control,labels[i],count)' in lookup
+    assert 'StringComparer.Ordinal' in lookup and 'ExactListIndexCore(control,labels[i],count,true)' in lookup
+    assert lookup.index('VerifyLookupList(root,control)!=count') < lookup.index('LastAbsentLabelPositions=absent.ToArray()')
+    assert 'LastAbsentLabelPositions=new int[0];LastLookupListCount=-1' in lookup
     for forbidden in ('SelectListItem(', 'Message(button', 'NotifyBinding(', 'Activate('):
         assert forbidden not in lookup
 

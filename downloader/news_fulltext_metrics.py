@@ -9,7 +9,8 @@ import threading
 import time
 
 from downloader.news_fulltext_connection_observation import (
-    CONNECTION_REUSE_OBSERVATION_CONTRACT_VERSION, connection_observation_bucket,
+    CONNECTION_REUSE_OBSERVATION_CONTRACT_VERSION, IDLE_CONNECTION_EXPIRY_CONTRACT_VERSION,
+    connection_observation_bucket,
 )
 
 REQUEST_DISPATCH_CLOCK_CONTRACT_VERSION = 2
@@ -32,7 +33,7 @@ CNYES_NATIVE_BODY_FAILURE_STAGES = frozenset({
 })
 ETTODAY_ATTRIBUTION_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
 ETTODAY_ATTRIBUTION_FAILURE_STAGES = frozenset({
-    'bare_reporter_creator_mismatch', 'image_credit_structure',
+    'bare_reporter_creator_mismatch', 'named_author_schema_mismatch', 'image_credit_structure',
     'image_caption_structure', 'image_caption_ambiguous_credit',
     'image_credit_missing_following_prose', 'caption_credit_structure',
     'caption_credit_boundaries', 'caption_credit_reporter',
@@ -283,6 +284,7 @@ class NewsMetrics:
                 "transport_failure_diagnostic_contract_version": TRANSPORT_FAILURE_DIAGNOSTIC_CONTRACT_VERSION,
                 "connection_origin_isolation_contract_version": CONNECTION_ORIGIN_ISOLATION_CONTRACT_VERSION,
                 "connection_reuse_observation_contract_version": CONNECTION_REUSE_OBSERVATION_CONTRACT_VERSION,
+                "idle_connection_expiry_contract_version": IDLE_CONNECTION_EXPIRY_CONTRACT_VERSION,
                 "connection_reuse_observation_basis": "native urllib3 checkout after dropped-socket check; open socket and idle since this connection object's prior terminal; connect() hooks include DNS/TCP/TLS together, not source server or packet timing; injected/unobserved transports explicitly unknown",
                 "http_host_phase_time_basis": "local request wrapper to headers, then headers to terminal including cleanup; phase CPU unmeasured and omitted; not DNS/connect/TLS/server or kernel/WAN separation; decoded response bytes, not wire bytes",
                 "request_dispatch_clock_contract_version": REQUEST_DISPATCH_CLOCK_CONTRACT_VERSION,

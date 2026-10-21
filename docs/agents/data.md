@@ -87,6 +87,16 @@ raw units/clocks and legacy payloads are not moved or deleted merely by adopting
 this policy. Reader-first activation and remaining producer migrations are
 explicit in [the common layout](../dataset_incremental_storage.md).
 
+TW public Parquet readers distinguish one legacy byte file from an explicit
+ordered partition manifest. Reuse `ParquetSource` and `ParquetLineage`; do not
+put a logical or manifest digest into an existing raw-file SHA field. New
+partition receipts carry an explicit source identity and every referenced
+member's raw byte hash, including older partitions. Conflicting ABIs, changed
+generations and missing/corrupt historical members fail closed. Reader support,
+offline full-value parity and formal runtime admission remain separate gates;
+the formal writer does not switch merely because a reader supports manifests.
+See [implementation and measured boundaries](../dashboard_daily_incremental_2026-10-20.md#第六階段1021-研究發布身分與驗收恢復).
+
 ### News native copy-on-write
 
 `data_news` versions are complete logical views, not new full physical copies.
@@ -233,3 +243,21 @@ Rules:
   layer, not in the model input.
 - Historical 98-feature close-complete checkpoints remain a separate schema.
   Use a new artifact root and retrain for the 99-feature open-aware model.
+
+### Observed opening reference and last real trade
+
+The user's 2026-10-21 definition is the observed first trade of the current
+trading session; until that print is known, retain the latest already-known real
+trade, including a prior session's actual close or an evidenced pre-open trade.
+Retain the original trade date/time, source identity, availability bound and
+carried-reference status. A known old trade can remain an input during a source
+gap, but does not prove that no new trade occurred. Indicative auction quotes,
+official settlement marks and missing observations are not real trades.
+
+This is an input/reference policy, never permission to fill an order or create
+volume at a stale price. The opt-in futures opening-reference ABI keeps stock
+history unchanged, appends normalized reference/availability/age context, and
+retains canonical post-decision execution and carrying margin accounting.
+Historical minute endpoints are availability bounds, not invented tick or
+receive timestamps. Use a fresh artifact/source/checkpoint identity. See
+[paired futures experiments](../daytrade_research_closeout_futures_2026-10-21.md).

@@ -64,6 +64,92 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return spec, source, hot_tree, options
 
 
+@pytest.mark.parametrize('late_change', [None, 'process', 'pin', 'stale', 'timeout', 'error', 'incomplete'])
+def test_idle_scan_wait_rechecks_all_unlink_gates_and_never_accepts_failed_health(tmp_path, monkeypatch, late_change):
+    import stockagent.data_sync.artifact_retirement as common
+    from types import SimpleNamespace
+
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    quarantine = tmp_path/'quarantine'
+    quarantine.mkdir()
+    state = {'elapsed': 0, 'healthy': False}
+    sleeps, probes, process_checks = [], [], []
+    def process_refs(*args):
+        process_checks.append(state['elapsed'])
+        return ['new-open-fd'] if state['elapsed'] and late_change == 'process' else []
+    monkeypatch.setattr(common, 'artifact_process_references', process_refs)
+    monkeypatch.setattr(common, 'process_references', lambda *args: [])
+    monkeypatch.setattr(common, '_pinned_snapshot_ids', lambda *args:
+                        {plan['snapshot_id']} if state['elapsed'] and late_change == 'pin' else set())
+    def probe():
+        probes.append(state['elapsed'])
+        checks = dict(folder_idle=state['healthy'], need_bytes_zero=True, need_items_zero=True,
+                      need_deletes_zero=True, errors_zero=True, pull_errors_zero=True,
+                      watch_error_empty=True, folder_errors_empty=True, system_errors_empty=True)
+        if late_change == 'error':
+            checks['errors_zero'] = False
+        if late_change == 'incomplete':
+            checks.pop('watch_error_empty')
+        return {'ok': all(checks.values()), 'local_checks': checks,
+                'checked_at': ('2000-01-01T00:00:00+00:00' if state['healthy'] and late_change == 'stale'
+                               else datetime.now(timezone.utc).isoformat()), 'peers': []}
+    def sleep(seconds):
+        sleeps.append(seconds)
+        state['elapsed'] += seconds
+        state['healthy'] = late_change != 'timeout'
+    monkeypatch.setattr(retirement, 'time', SimpleNamespace(
+        monotonic=lambda: state['elapsed'], sleep=sleep))
+    options['peer_probe'] = probe
+    if late_change is None:
+        result = retirement._assert_legacy_unlink_gates(spec, plan, quarantine, **options)
+        assert result['ok'] is True and sleeps == [10]
+    else:
+        with pytest.raises(SnapshotError):
+            retirement._assert_legacy_unlink_gates(spec, plan, quarantine, **options)
+        if late_change in ('error', 'incomplete'):
+            assert not sleeps
+        elif late_change == 'timeout':
+            assert sum(sleeps) == 300 and state['elapsed'] == 300
+        else:
+            assert sleeps == [10]
+    assert process_checks[0] == 0
+    if sleeps:
+        assert process_checks[-1] == state['elapsed']  # Usage is checked AFTER waiting.
+    assert source.is_dir() and hot.is_dir() and quarantine.is_dir()
+    assert probes and options['peer_proof']['ok'] is True  # Old health never grants deletion.
+
+
+@pytest.mark.parametrize('change', ['quarantine-bytes', 'cold', 'expired'])
+def test_final_scan_gate_cannot_extend_full_proof_or_hide_generation_changes(tmp_path, monkeypatch, change):
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    original_gate = retirement._assert_legacy_unlink_gates
+    def late_change(spec, current_plan, quarantine, **kwargs):
+        proof = original_gate(spec, current_plan, quarantine, **kwargs)
+        if change == 'expired':
+            current_plan['full_verification']['verified_at_epoch'] = time.time()-1501
+        else:
+            if change == 'quarantine-bytes':
+                target = quarantine/'source/checkpoint.pt'
+            else:
+                resolved = resolve_latest_packed(options['sync_root'], spec.dataset)
+                target = options['sync_root']/resolved.manifest['archive']['objects'][0]['relpath']
+            info = target.stat()
+            target.write_bytes(b'X'*info.st_size)
+            os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+        return proof
+    monkeypatch.setattr(retirement, '_assert_legacy_unlink_gates', late_change)
+    with pytest.raises(SnapshotError, match='changed or full audit expired'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                          owned_verified_plan=plan, **options)
+    state = json.loads(retirement._state_path(options['state_root'], spec.dataset).read_text())
+    assert state['state'] == 'retiring' and not source.exists() and not hot.exists()
+    assert (Path(state['quarantine'])/'source/checkpoint.pt').is_file()
+
+
 @pytest.mark.parametrize('failure', [None, 'source-bytes', 'mirror', 'cold', 'unknown',
     'original-reappeared', 'state', 'expired', 'service', 'pin', 'process', 'peer', 'redirect'])
 def test_interrupted_quarantine_resume_reaudits_exact_bytes_and_final_gates(tmp_path, monkeypatch, failure):

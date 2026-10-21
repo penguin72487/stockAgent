@@ -18,11 +18,31 @@ from test_news_failure_diagnostics import fail, reports
 from test_news_fulltext import config as cfg
 from test_news_taiwanhot_native import URL, page
 from test_news_taiwanhot_routes import registry, OLD
+from test_news_max_original import settings as max_settings, schema_only_post, URL as MAX_URL
 
 
 def evidence(root):
     paths=sorted((root/'identity_metadata').rglob('*.json'))
     return paths,[json.loads(p.read_bytes()) for p in paths]
+
+
+@pytest.mark.parametrize('code', ['article_identity_not_verified', 'invalid_bulk_publication_clock'])
+def test_max_received_clock_metadata_observes_missing_tag_and_hidden_template_without_refetch(max_settings, tmp_path, code):
+    policy = PolicyRegistry(max_settings, base=tmp_path)
+    raw = Response(MAX_URL, 200, {'content-type': 'text/html'}, schema_only_post().encode())
+    with closing(NewsQueue(tmp_path / 'store', policy)) as queue:
+        fail(queue, raw, code=code, received_at_utc='2026-10-20T10:00:00+00:00')
+        paths, rows = evidence(queue.root)
+        assert len(rows) == 1
+        shape = rows[0]['facts']['max_native_clock_metadata']
+        assert shape['contract_version'] == 2 and shape['head_clock_count'] == 1
+        assert shape['header_time_count'] == 2 and shape['schema_clock_count'] == 2
+        assert shape['header_times'][0]['in_native_hidden_update_template']
+        assert not shape['body_text_exported'] and not shape['public_visibility_inferred']
+        assert not shape['source_clock_inferred'] and not shape['article_durably_accepted']
+        assert '完整合成研究細節' not in paths[0].read_text()
+        assert not reports(queue.root)[0]
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
 
 
 def test_failed_identity_only_retains_redacted_declarations_hashes_and_container_counts(cfg,tmp_path):

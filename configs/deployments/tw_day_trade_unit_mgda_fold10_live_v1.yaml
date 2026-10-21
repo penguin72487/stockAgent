@@ -1,0 +1,19 @@
+# Exact geometry__unit_mgda_sgd_step / fold_10 / selected epoch 128.
+# The original, fully resolved configuration is restored with the checkpoint
+# from the fixed cold release; it is not reconstructed from a newer baseline.
+# Checkpoint SHA256: 2c59e3dd3af0dbb377cbc1796ab77607f71de3fc4c741311132ad6b01225d1af
+base_config: ../../artifacts/operations/day-trade-unit-mgda-deployment-20261021/restored-model/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training/generated_config_20261019_073228.yaml
+data:
+  parquet_root: /srv/stockagent-live/data_tw_public/stocks
+  tw_public_feature_path: /srv/stockagent-live/data_tw_public/features/tw_public_stock_daily.parquet
+  day_trade_inference_public_feature_path: /srv/stockagent-live/data_tw_public/features/tw_public_stock_daily.parquet
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  # Same value-only lag-1 source ABI as the original model. Publication remains
+  # owned by the existing Factorized updater, not a second feature pipeline.
+  factorized_feature_manifest: /root/stockAgent/artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/base
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/physical-source
+  live_tail_panel_rows: 48
+  factorized_host_cache_bytes: 2147483648
+runner:
+  mode: infer

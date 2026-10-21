@@ -1,0 +1,9 @@
+# Manual, exact artifact selection. No automatic replacement by a newer fold.
+mode: manual
+config_path: configs/deployments/tw_day_trade_unit_mgda_fold10_live_v1.yaml
+output_dir: artifacts/operations/day-trade-unit-mgda-deployment-20261021/restored-model/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training
+fold_id: 10
+checkpoint_path: artifacts/operations/day-trade-unit-mgda-deployment-20261021/restored-model/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training/fold_10/checkpoint_best.pt
+weights_path: artifacts/operations/day-trade-unit-mgda-deployment-20261021/restored-model/artifacts/markets/tw_scratch_gradient_geometry_20261019_v1/_capacity/geometry__unit_mgda_sgd_step/attempt-00/training/fold_10/daily_weights.parquet
+model_scoped_live_output: true
+model_deployment_manifest: artifacts/discord_bot/deployments/tw_day_trade_unit_mgda.json

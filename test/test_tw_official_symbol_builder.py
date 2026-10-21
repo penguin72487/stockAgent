@@ -39,6 +39,101 @@ from scripts.build_tw_yahoo_fallback_archive import (
     main as build_yahoo_fallback_archive,
 )
 from stockagent.data.tw_security import classify_tw_stock_or_etf
+from polars.testing import assert_frame_equal
+
+
+def _incremental_frame(count=5):
+    return pl.DataFrame({
+        "date": [date(2026, 10, 12 + i) for i in range(count)],
+        "symbol": ["2330"] * count, "name": ["TSMC"] * count,
+        "market": ["twse"] * count, "security_type": ["stock"] * count,
+        **{name: [100.0 + i for i in range(count)] for name in ("open", "max", "min", "close")},
+        "Trading_Volume": [1000.0] * count, "signed_change": [0.0] + [1.0] * (count-1),
+        "source_factor": [None] * count, "source_adjclose": [None] * count,
+        "reference_override": [None] * count, "_yahoo_fallback_factor": [None] * count,
+        "_legacy_source_id": ["official"] * count, "quote_source": ["twse_official"] * count,
+        "_lifecycle_episode_id": [0] * count,
+    }).with_columns(pl.col(name).cast(pl.Float64) for name in (
+        "source_factor", "source_adjclose", "reference_override", "_yahoo_fallback_factor"))
+
+
+@pytest.mark.parametrize("case", ["append", "missing_last", "episode", "revision", "delete", "corrupt_state", "corrupt_output"])
+def test_symbol_exact_prefix_checkpoint_matches_independent_full(tmp_path, case):
+    frame = _incremental_frame()
+    if case == "missing_last":
+        frame = frame.with_columns(pl.when(pl.col("date") == date(2026, 10, 14))
+            .then(None).otherwise(pl.col("signed_change")).alias("signed_change"))
+    if case == "episode":
+        frame = frame.with_columns(pl.when(pl.col("date") >= date(2026, 10, 15))
+            .then(1).otherwise(0).alias("_lifecycle_episode_id"))
+    out, reference = tmp_path / "incremental", tmp_path / "full"
+    out.mkdir()
+    reference.mkdir()
+    states = {}
+    seed = _write_symbol(out, "2330", frame.head(3), requested_end_date="2026-10-14", dry_run=False, state_sink=states)
+    assert seed.status == "created", seed.message
+    # Exercise persisted JSON, not an in-process cache.
+    prior = json.loads(json.dumps(states["2330"]))
+    if case == "revision":
+        frame = frame.with_columns(pl.when(pl.col("date") == date(2026, 10, 13))
+            .then(2.0).otherwise(pl.col("signed_change")).alias("signed_change"))
+    if case == "delete":
+        frame = frame.filter(pl.col("date") != date(2026, 10, 13))
+    if case == "corrupt_state":
+        prior["reference_state"]["value_hex"] = float(1000).hex()
+    if case == "corrupt_output":
+        (out / "2330_features.parquet").write_bytes(b"not a checkpoint")
+    result = _write_symbol(out, "2330", frame, requested_end_date="2026-10-16", dry_run=False,
+        previous_state=prior, state_sink={})
+    full = _write_symbol(reference, "2330", frame, requested_end_date="2026-10-16", dry_run=False)
+    assert result.status == full.status == "created", (result.message, full.message)
+    assert_frame_equal(pl.read_parquet(out / "2330_features.parquet"),
+        pl.read_parquet(reference / "2330_features.parquet"), check_exact=True)
+    assert result.missing_adjustment_rows == full.missing_adjustment_rows
+    assert result.reused_adjustment_rows == (3 if case in {"append", "missing_last", "episode"} else 0)
+
+
+def test_same_symbol_input_keeps_inode_and_proof_but_changed_checked_day_does_not(tmp_path):
+    frame, states = _incremental_frame(), {}
+    first = _write_symbol(tmp_path, "2330", frame, requested_end_date="2026-10-16", dry_run=False, state_sink=states)
+    assert first.status == "created", first.message
+    path = tmp_path / "2330_features.parquet"
+    before = path.stat()
+    hit = _write_symbol(tmp_path, "2330", frame, requested_end_date="2026-10-16", dry_run=False,
+        previous_state=states["2330"], state_sink={})
+    assert hit.reused_output and path.stat() == before
+    refreshed = _write_symbol(tmp_path, "2330", frame, requested_end_date="2026-10-19", dry_run=False,
+        previous_state=states["2330"], state_sink={})
+    assert not refreshed.reused_output
+    assert pq.read_schema(path).metadata[b"stockagent.official_checked_through"] == b"2026-10-19"
+
+
+@pytest.mark.parametrize("batch", [True, False])
+def test_symbol_batch_retains_each_file_data_sync_and_one_directory_commit(tmp_path, monkeypatch, batch):
+    import stat
+    counts = {"data": 0, "directory": 0}
+    original = official_symbol_builder.os.fsync
+    def observe(descriptor):
+        counts["directory" if stat.S_ISDIR(official_symbol_builder.os.fstat(descriptor).st_mode) else "data"] += 1
+        return original(descriptor)
+    monkeypatch.setattr(official_symbol_builder.os, "fsync", observe)
+    frames = {symbol: _incremental_frame().with_columns(pl.lit(symbol).alias("symbol"))
+              for symbol in ("2330", "2317", "0050")}
+    results = official_symbol_builder._write_symbol_batch(tmp_path, frames,
+        requested_end_date="2026-10-16", workers=2, batch_directory_fsync=batch)
+    assert all(item.status == "created" for item in results)
+    assert counts == {"data": 3, "directory": 1 if batch else 3}
+
+
+def test_batch_directory_failure_never_returns_a_publishable_result(tmp_path, monkeypatch):
+    def fail(directory):
+        raise OSError("directory durability failed")
+    monkeypatch.setattr(official_symbol_builder, "_fsync_directory", fail)
+    with pytest.raises(OSError, match="durability"):
+        official_symbol_builder._write_symbol_batch(tmp_path, {"2330": _incremental_frame()},
+            requested_end_date="2026-10-16", workers=1)
+    # A file remains recoverable evidence; no successful batch was returned.
+    assert (tmp_path / "2330_features.parquet").is_file()
 
 
 def _raw_scale_frame(

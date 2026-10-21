@@ -44,6 +44,56 @@ def test_binance_kline_limit_uses_best_documented_rows_per_weight_tier() -> None
     assert binance.KLINE_REQUEST_WEIGHT == alternatives[binance.KLINE_LIMIT]
 
 
+@pytest.mark.parametrize("remaining,expected", [(1, (1, 1.0)), (99, (99, 1.0)),
+    (100, (100, 2.0)), (499, (499, 2.0)), (500, (499, 2.0)), (1000, (499, 2.0))])
+def test_kline_page_uses_remaining_window_and_exact_weight_tier(remaining, expected):
+    assert binance._kline_page_request(remaining) == expected
+
+
+@pytest.mark.parametrize("remaining", [0, -1])
+def test_kline_page_rejects_empty_window_without_request(remaining):
+    with pytest.raises(ValueError):
+        binance._kline_page_request(remaining)
+
+
+@pytest.mark.parametrize("slots,sparse", [(1, False), (99, False), (100, False),
+    (499, False), (500, False), (1000, False), (1000, True)])
+def test_adaptive_kline_pages_match_fixed_bulk_oracle_without_more_calls(
+    tmp_path, monkeypatch, slots, sparse,
+):
+    start = binance._date_to_ms("2026-01-01", end_of_day=False)
+    interval = binance.CANDLE_INTERVAL_MS
+    truth = [_raw_candle(start + n * interval) for n in range(slots)
+             if not sparse or n not in {3, 7}]
+    record = SimpleNamespace(code="BTCUSDT", binance_symbol="BTCUSDT",
+                             market="binance_usdm_perp", onboard_time=None)
+    adaptive = binance._kline_page_request
+    frames, calls = {}, {}
+
+    class Client:
+        def __init__(self, variant):
+            self.variant = variant
+        def get(self, path, params, *, weight):
+            calls[self.variant].append((int(params["limit"]), weight))
+            return [row for row in truth if int(params["startTime"]) <= row[0] <= int(params["endTime"])][:int(params["limit"])]
+
+    for variant in ("fixed", "adaptive"):
+        calls[variant] = []
+        monkeypatch.setattr(binance, "_kline_page_request", adaptive if variant == "adaptive"
+                            else lambda _remaining: (binance.KLINE_LIMIT, binance.KLINE_REQUEST_WEIGHT))
+        output = tmp_path / variant
+        output.mkdir()
+        result = binance._download_symbol(Client(variant), record, output,
+            start_ms=start, end_ms=start+(slots-1)*interval, mode="full", refresh=True)
+        assert result.status == "updated"
+        frames[variant] = pl.read_parquet(output / "BTCUSDT_features.parquet")
+    assert frames["fixed"].equals(frames["adaptive"])
+    assert len(calls["adaptive"]) <= len(calls["fixed"])
+    assert sum(weight for _, weight in calls["adaptive"]) <= sum(weight for _, weight in calls["fixed"])
+    if slots < 100:
+        assert calls["adaptive"] == [(slots, 1.0)]
+
+
 def test_binance_statistics_pages_bound_end_time_and_keep_head():
     interval = features.STATISTICS_INTERVAL_MS
     observed: list[tuple[int, int]] = []
@@ -217,8 +267,8 @@ def test_binance_symbol_download_paginates_and_publishes_atomically(
     class FakeClient:
         def get(self, path: str, params: dict[str, object], *, weight: float):
             assert path == binance.KLINE_ENDPOINT
-            assert params["limit"] == str(binance.KLINE_LIMIT)
-            assert weight == binance.KLINE_REQUEST_WEIGHT
+            assert params["limit"] == "2"
+            assert weight == 1.0
             return [
                 _raw_candle(start_ms),
                 _raw_candle(start_ms + binance.CANDLE_INTERVAL_MS),
@@ -288,7 +338,7 @@ def test_binance_full_reconcile_probes_actual_head_before_repeating_history(
     )
 
     assert result.status == "updated"
-    assert calls == [(start_ms, 1), (start_ms + 7 * interval, binance.KLINE_LIMIT)]
+    assert calls == [(start_ms, 1), (start_ms + 7 * interval, 3)]
     assert pl.read_parquet(output).height == 5
 
 
@@ -320,7 +370,7 @@ def test_binance_full_reconcile_repairs_proven_missing_head(tmp_path: Path) -> N
     )
 
     assert result.status == "updated"
-    assert calls == [(start_ms, 1), (start_ms + 2 * interval, binance.KLINE_LIMIT)]
+    assert calls == [(start_ms, 1), (start_ms + 2 * interval, 8)]
     assert pl.read_parquet(output)["date"].to_list()[0] == binance._ms_to_date_string(
         start_ms + 2 * interval
     )

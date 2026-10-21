@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import contextmanager
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -45,20 +46,38 @@ def local_metadata_clock(value):
 
 
 def reference_sync(q, *, limit=256, max_seconds=.04):
-    """Exact pre-v79 routine: whole-policy cursor, per-proof existence seek."""
-    fingerprint = q.db.execute("SELECT value FROM queue_settings WHERE key='policy_fingerprint'").fetchone()[0]
-    progress = routing._read_checkpoint(q, KEY, {'policy_fingerprint': fingerprint, 'after': ''}, routing._valid_routing)
+    """Pre-host-plan v2: global keyset with the existing grouped target seek."""
+    fingerprint = q._original_url_routing_fingerprint
+    default = {'contract_version': 2, 'routing_fingerprint': fingerprint, 'after': ''}
+    progress = routing._read_checkpoint(q, KEY, default, routing._valid_routing)
+    if progress.get('routing_fingerprint') != fingerprint:
+        progress = default
     if progress['after'] == 'done':
         return 0
     started, examined = time.monotonic(), 0
     rows = q.db.execute(QUERY, (routing._VERSION, bytes.fromhex(progress['after']), limit)).fetchall()
     with q.metrics.measure('original_url_routing'), q.db:
+        selected = []
         for proof in rows:
             if examined and time.monotonic() - started >= max_seconds:
                 break
-            routing._route_literal(q, proof, proof)
+            source = q.registry.match(proof['original_url'])
+            if source and source.allowed:
+                q.add_articles([{'url': proof['original_url'], 'title': proof['title'],
+                                 'date': proof['metadata_date_raw']}])
+            selected.append(proof)
             progress['after'] = proof['alias_id'].hex()
             examined += 1
+        targets = list({p['original_id'] for p in selected if not p['target_queued']})
+        exists = set()
+        for offset in range(0, len(targets), 400):
+            chunk = targets[offset:offset + 400]
+            exists.update(row[0] for row in q.db.execute('SELECT id FROM articles WHERE id IN ('
+                           + ','.join('?' for _ in chunk) + ')', chunk))
+        q.db.executemany('UPDATE original_url_resolutions SET target_queued=1 '
+                         'WHERE contract_version=? AND alias_id=? AND target_queued=0',
+                         ((routing._VERSION, p['alias_id']) for p in selected
+                          if not p['target_queued'] and p['original_id'] in exists))
         if not rows:
             progress['after'] = 'done'
         if examined or not rows:
@@ -108,8 +127,19 @@ def _sealed_batch(root, db):
         'sha256': receipt['sha256'], 'receipt_sha256': sha256_file(receipt_path), 'rows': table.num_rows}
 
 
-def benchmark(config_path, workspace, *, limit=256, repetitions=2):
+def benchmark(config_path, workspace, *, limit=256, repetitions=2, changed_provider=None):
+    implementation = {str(path): sha256_file(path) for path in (
+        Path(__file__), Path('downloader/news_fulltext_urls.py'), Path('downloader/news_fulltext_queue.py'),
+        Path('downloader/news_fulltext_routing.py'))}
     cfg, registry, repo = load_config(config_path)
+    before_registry = registry
+    if changed_provider is not None:
+        if changed_provider not in registry.sources or not registry.sources[changed_provider].allowed:
+            raise ValueError('reviewed_enabled_delta_provider_required')
+        before_registry = deepcopy(registry)
+        del before_registry.sources[changed_provider]
+        if hasattr(before_registry, '_domain_providers'):
+            del before_registry._domain_providers
     root = repo / cfg['root']
     workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
     db = sqlite3.connect(f'file:{root / "queue.sqlite3"}?mode=ro', uri=True)
@@ -125,8 +155,25 @@ def benchmark(config_path, workspace, *, limit=256, repetitions=2):
         finite = [dict(row) for row in db.execute('SELECT * FROM finite_cohorts')]
         records, sealed = _sealed_batch(root, db)
         metrics = [dict(row) for row in db.execute('SELECT * FROM original_url_metrics WHERE urls>0')]
+        delta_proofs = []
+        if changed_provider is not None:
+            for host, count in db.execute('SELECT original_host,metadata_links FROM original_url_host_metrics '
+                                          'WHERE contract_version=? AND metadata_links>0', (routing._VERSION,)):
+                source = registry.match('https://' + host + '/')
+                if source is not None and source.provider == changed_provider:
+                    if count + len(delta_proofs) > 128:
+                        raise ValueError('bounded_retained_delta_scope_required')
+                    delta_proofs.extend(dict(row) for row in db.execute(
+                        'SELECT r.*,a.title,a.metadata_date_raw FROM original_url_resolutions r '
+                        'INDEXED BY original_url_host JOIN articles a ON a.id=r.alias_id '
+                        'WHERE r.original_host=? AND r.original_host IS NOT NULL AND r.contract_version=? '
+                        "AND r.outcome='literal_original' ORDER BY r.alias_id", (host, routing._VERSION)))
+            if not delta_proofs:
+                raise ValueError('retained_literal_delta_proofs_required')
         for label, lower in [('first_literal_prefix', b''), ('current_keyset', cursor), ('last_keyspace', b'\xf0')]:
             proofs = [dict(row) for row in db.execute(QUERY, (routing._VERSION, lower, limit))]
+            if changed_provider is not None:
+                proofs = sorted({row['alias_id']: row for row in proofs + delta_proofs}.values(), key=lambda row: row['alias_id'])
             aliases = _rows(db, 'articles', [row['alias_id'] for row in proofs])
             targets = _rows(db, 'articles', list({row['original_id'] for row in proofs}))
             alias_ids = [row['alias_id'] for row in proofs]
@@ -149,7 +196,7 @@ def benchmark(config_path, workspace, *, limit=256, repetitions=2):
             phases, outputs = [], {}
             for repetition in range(repetitions):
                 for phase, mode in enumerate(('reference', 'candidate', 'candidate', 'reference')):
-                    q = queue_module.NewsQueue(Path(temp) / f'{window["label"]}-{repetition}-{phase}', registry)
+                    q = queue_module.NewsQueue(Path(temp) / f'{window["label"]}-{repetition}-{phase}', before_registry)
                     try:
                         with q.db:
                             _insert(q.db, 'finite_cohorts', finite)
@@ -157,14 +204,26 @@ def benchmark(config_path, workspace, *, limit=256, repetitions=2):
                             _insert(q.db, 'articles', list(combined.values()))
                             _insert(q.db, 'source_links', window['links'])
                             _insert(q.db, 'original_url_resolutions', window['proofs'])
-                            payload = ({'policy_fingerprint': settings['policy_fingerprint'], 'after': window['lower']}
-                                if mode == 'reference' else {'contract_version': routing.ORIGINAL_URL_ROUTING_CONTRACT_VERSION,
-                                    'routing_fingerprint': routing.routing_fingerprint(registry), 'after': window['lower']})
+                            payload = {'contract_version': routing.ORIGINAL_URL_ROUTING_CONTRACT_VERSION,
+                                       'routing_fingerprint': routing.routing_fingerprint(before_registry),
+                                       'after': '' if changed_provider else window['lower']}
                             q.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (KEY, json.dumps(payload)))
+                        if changed_provider is not None:
+                            with local_metadata_clock(observed):
+                                while routing.sync_original_url_routes(q, limit=limit):
+                                    pass
+                            if json.loads(q.db.execute('SELECT value FROM queue_settings WHERE key=?', (KEY,)).fetchone()[0])['after'] != 'done':
+                                raise ValueError('baseline_eligibility_not_complete')
+                            q.registry = registry
                         execute = reference_sync if mode == 'reference' else routing.sync_original_url_routes
                         examined, slices = 0, 0
                         start, cpu = time.perf_counter(), time.process_time()
                         with local_metadata_clock(observed):
+                            if changed_provider is not None:
+                                if mode == 'candidate':
+                                    routing.initialize_original_urls(q)
+                                else:
+                                    q._original_url_routing_fingerprint = routing.routing_fingerprint(registry)
                             while count := execute(q, limit=limit):
                                 examined += count
                                 slices += 1
@@ -191,6 +250,7 @@ def benchmark(config_path, workspace, *, limit=256, repetitions=2):
                         full_cost = {'full_replay_wall_seconds': time.perf_counter() - start,
                                      'full_replay_cpu_seconds': time.process_time() - cpu}
                         phases.append({'mode': mode, 'repetition': repetition, 'examined': examined,
+                            'expected_examined': len(delta_proofs) if changed_provider and mode == 'candidate' else len(window['proofs']),
                             'slices': slices, **cost, **full_cost, 'body_receipt_verified': proof['accepted'],
                             'receipt_recovery_verified': recovery['accepted'], 'replayed_body_versions': len(records),
                             'accepted_parquet_sha256': accepted_digest,
@@ -208,19 +268,22 @@ def benchmark(config_path, workspace, *, limit=256, repetitions=2):
                 'all_routing_tables_match': outputs['reference'] == outputs['candidate'],
                 'all_sealed_replay_parquet_digests_match': len({p['accepted_parquet_sha256'] for p in phases}) == 1,
                 'phases': phases, 'comparisons': comparisons})
+    if any(sha256_file(Path(path)) != digest for path, digest in implementation.items()):
+        raise ValueError('routing_benchmark_implementation_changed_during_measurement')
     return {'contract_version': 1, 'observed_at_utc': observed, 'input_owner_id': owner,
         'routing_contract_version': routing.ORIGINAL_URL_ROUTING_CONTRACT_VERSION,
         'routing_fingerprint': routing.routing_fingerprint(registry), 'legacy_routing_checkpoint': saved,
         'proof_metrics': metrics, 'sealed_body_input': sealed, 'case_limit': limit, 'repetitions': repetitions,
         'cases': cases, 'accepted': all(case['all_routing_tables_match'] and case['all_sealed_replay_parquet_digests_match']
-            and all(p['examined'] == case['retained_aliases'] and p['body_receipt_verified'] and p['receipt_recovery_verified']
+            and all(p['examined'] == p['expected_examined'] and p['body_receipt_verified'] and p['receipt_recovery_verified']
                     for p in case['phases']) for case in cases),
         'cost_scope': 'routing window AND whole routing/sealed replay/receipt/SQL recovery/verification window; temporary fixture setup is separate',
         'peak_process_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         'production_queue_writes': False, 'publisher_requests': 0, 'publish': False,
         'official_limit_proved': False, 'publisher_speedup_claimed': False, 'whole_history_complete': False,
-        'implementation_sha256': {str(path): sha256_file(path) for path in (
-            Path(__file__), Path('downloader/news_fulltext_urls.py'), Path('downloader/news_fulltext_queue.py'))}}
+        'reference_implementation': 'grouped_global_eligibility_v2',
+        'changed_provider': changed_provider, 'delta_aliases': len(delta_proofs),
+        'implementation_stable_during_measurement': True, 'implementation_sha256': implementation}
 
 
 def main(argv=None):
@@ -228,11 +291,13 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, default=Path('configs/news_fulltext.json'))
     parser.add_argument('--limit', type=int, default=256)
     parser.add_argument('--repeat', type=int, default=2)
+    parser.add_argument('--changed-provider', help='Replay a bounded real provider addition after a proven complete baseline')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     if not 16 <= args.limit <= 512 or not 1 <= args.repeat <= 3:
         parser.error('bounded retained alias/repetition count required')
-    result = benchmark(args.config, args.output.parent, limit=args.limit, repetitions=args.repeat)
+    result = benchmark(args.config, args.output.parent, limit=args.limit, repetitions=args.repeat,
+                       changed_provider=args.changed_provider)
     atomic_write_json(args.output, result)
     print(json.dumps({'accepted': result['accepted'], 'cases': [
         {k: case[k] for k in ('window', 'retained_aliases', 'all_routing_tables_match', 'comparisons')}

@@ -504,7 +504,7 @@ def reconcile_unsent_attempt_annotation(root: Path, task_id: str) -> bool:
 
 
 def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int = 60,
-                         max_seconds: int = 900) -> dict:
+                         max_seconds: int = 900, allow_company_partition: bool = False) -> dict:
     """Retry one proved-unsent fragment after a durable per-table backoff.
 
     Caller holds .download.lock. Only a finished exact negative proof and a
@@ -521,8 +521,11 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
 
     def verified_task(con):
         row=con.execute('SELECT * FROM tasks WHERE task_id=?',(task_id,)).fetchone()
-        if (row is None or row['state']!='blocked' or row['safe_prequery_retries']<2
-                or row['last_error_code'] not in EXHAUSTED_PREQUERY_ERRORS):
+        exhausted=(row is not None and row['state']=='blocked' and row['safe_prequery_retries']>=2
+                   and row['last_error_code'] in EXHAUSTED_PREQUERY_ERRORS)
+        partition_candidate=(allow_company_partition and row is not None and row['state']=='pending'
+                             and row['last_error_code']=='local_list_selection_failed_before_preview')
+        if not exhausted and not partition_candidate:
             raise ValueError('Only an exhausted proved-unsent local input task may be deferred')
         if (con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
                 "(state='blocked' AND last_error_code='unknown_outcome_no_auto_retry') LIMIT 1").fetchone()
@@ -531,8 +534,13 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
             raise ValueError('Unresolved shared source action remains a barrier')
         task=dict(row);proof=proved_unsent_prequery(root,con,task,finished=True)
         from downloader.tej_history import PREQUERY_FAILURES
-        if PREQUERY_FAILURES[proof['outcome']['error_code']]!=task['last_error_code']:
+        if not partition_candidate and PREQUERY_FAILURES[proof['outcome']['error_code']]!=task['last_error_code']:
             raise ValueError('Current task classification differs from exact negative proof')
+        from downloader.tej_planning import company_membership_failure
+        membership=company_membership_failure(root,task,proof)
+        if partition_candidate and membership is None:
+            raise ValueError('Immediate partition requires complete company-membership evidence')
+        proof['company_membership']=membership
         return task,proof
 
     with closing(_connect(root)) as con:
@@ -565,6 +573,15 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
         failures=previous['consecutive_failures']+1 if previous else 1
         seconds=min(max_seconds,base_seconds*2**min(failures-1,12))
         now=datetime.now(UTC);due=(now+timedelta(seconds=seconds)).isoformat()
+        if rechecked['company_membership']!=verified['company_membership']:
+            raise ValueError('Company-membership evidence changed during interface acknowledgement')
+        if verified['company_membership'] is not None:
+            from downloader.tej_planning import repartition_missing_companies
+            partition_path=root/'selector_replanning'/(verified['attempt_id']+'-company-membership.json')
+            partition_proof={**verified,'interface_readback_path':str(readback.relative_to(root)),
+                'interface_readback_sha256':hashlib.sha256(readback.read_bytes()).hexdigest()}
+            return repartition_missing_companies(con,root,task,partition_proof,verified['company_membership'],
+                due=due,failures=failures,audit_path=partition_path)
         audit_path=root/'local_prequery_recovery'/(verified['attempt_id']+'-table_retry.json')
         result={'state':PREQUERY_DEFERRED,'task_id':task_id,'table_id':task['table_id'],
                 'next_attempt_at_utc':due,'backoff_seconds':seconds,'consecutive_failures':failures,
@@ -748,6 +765,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                            allow_unstaged_interop: bool = False,
                            allow_unstaged_script_preparation: bool = False,
                            allow_orphaned_desktop_loss: bool = False,
+                           allow_orphaned_worker_loss: bool = False,
                            allow_interrupted_stage_write: bool = False,
                            standing_authorization: dict | None = None) -> dict:
     """Canonical one-shot replay, with manual or bounded standing user authority.
@@ -785,7 +803,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                 or (root / 'raw' / (task['active_attempt_id'] + '.json')).exists()):
             raise ValueError('Reconcile exact saved response before any authorized replay')
     modes = (allow_unstaged_interop, allow_unstaged_script_preparation,
-             allow_orphaned_desktop_loss, allow_interrupted_stage_write)
+             allow_orphaned_desktop_loss, allow_orphaned_worker_loss, allow_interrupted_stage_write)
     if any(type(mode) is not bool for mode in modes) or sum(modes) > 1:
         raise ValueError('Explicit operator replay mode required')
     unstaged=any(modes)
@@ -796,6 +814,9 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
     elif allow_orphaned_desktop_loss:
         from downloader.tej_startup import orphan_desktop_loss_proof
         diagnostic = orphan_desktop_loss_proof(root, task, request, prepared)
+    elif allow_orphaned_worker_loss:
+        from downloader.tej_startup import surviving_desktop_worker_loss_proof
+        diagnostic = surviving_desktop_worker_loss_proof(root, task, request, prepared)
     else:
         diagnostic = unstaged_interop_diagnostic(root, task, request, prepared,
             script_preparation=allow_unstaged_script_preparation) if unstaged else None
@@ -841,6 +862,23 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
             or not isinstance(role_state, list) or len(role_state) != 2 or role_state[0] != 43
             or button.get('default_action') != 'Press' or payload.get('source_key_mode') not in (1, 2, 3)):
         raise ValueError('Exact idle owned query button required; unknown barrier preserved')
+    if allow_orphaned_worker_loss:
+        # A missing stage cannot bind an existing Preview to this attempt.
+        # Never overwrite retained source values to manufacture liveness.
+        original_owner = json.loads(diagnostic.read_text(encoding='utf-8-sig'))['worker']
+        original_start = datetime.fromisoformat(original_owner['observed_at_utc'])
+        process_start = datetime.fromisoformat(payload['owned_desktop_process_start_utc'].replace('Z','+00:00'))
+        if process_start.tzinfo is None or original_start.tzinfo is None or process_start > original_start:
+            raise ValueError('Surviving desktop birth must predate the original worker claim')
+        grids = payload.get('current_preview_grids')
+        if (not isinstance(grids, list) or len(grids) > 16
+                or any(not isinstance(grid, dict)
+                       or not isinstance(grid.get('native_shape'), list)
+                       or len(grid['native_shape']) != 2
+                       or any(type(n) is not int or n < 0 for n in grid['native_shape'])
+                       or grid['native_shape'][0] > 1 for grid in grids)):
+            raise ValueError('Retained or unverified Preview requires reconciliation before worker-loss replay')
+        surviving_desktop_worker_loss_proof(root, task, request, prepared)
     if interrupted is not None and interrupted_stage_write_proof(root, task, request, prepared) != interrupted:
         raise ValueError('Interrupted stage evidence changed during fresh readback')
     authorization = uuid.uuid4().hex
@@ -855,6 +893,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
              'unstaged_interop_replay_explicitly_authorized':allow_unstaged_interop,
              'unstaged_script_preparation_replay_explicitly_authorized':allow_unstaged_script_preparation,
              'orphaned_desktop_loss_replay_authorized':allow_orphaned_desktop_loss,
+             'surviving_desktop_dead_worker_replay_authorized':allow_orphaned_worker_loss,
              'interrupted_stage_write_replay_proof':interrupted,
              'original_launch_diagnostic_path':str(diagnostic.relative_to(root)) if diagnostic else None,
              'original_launch_diagnostic_sha256':hashlib.sha256(diagnostic.read_bytes()).hexdigest() if diagnostic else None,

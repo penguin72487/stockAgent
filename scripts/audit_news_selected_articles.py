@@ -16,16 +16,17 @@ import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
+from downloader.news_fulltext_feed import FEED_BODY_PROVENANCE_FIELDS, replay_feed_body_version
 from downloader.news_fulltext_policy import NewsError, extract_article, normalize_url
 from downloader.news_fulltext_queue import source_path, utc_now
 from scripts.benchmark_cnyes_acquisition import verify_batches
 from stockagent.data.news_source_catalog import configuration_paths
 
 
-CONTRACT_VERSION = 8
+CONTRACT_VERSION = 10
 
 
-def _replay_feed_envelope(payload, request_url, registry, source):
+def _replay_feed_envelope(payload, request_url, registry, source, *, body_contract_version=1):
     """Use the registered feed parser, with no transport or relaxed rights.
 
     A mixed restricted envelope is never a valid historical body source. A
@@ -37,7 +38,8 @@ def _replay_feed_envelope(payload, request_url, registry, source):
 
     response = SimpleNamespace(url=request_url, body=payload,
                                headers={'content-type': 'application/rss+xml'})
-    rows, errors = feed_records(response, SimpleNamespace(registry=registry), source)
+    rows, errors = feed_records(response, SimpleNamespace(registry=registry), source,
+                                body_contract_version=body_contract_version)
     if any(error['error'] in BULK_RESTRICTED_ITEM_ERRORS for error in errors):
         raise ValueError('selected_feed_contains_restricted_text')
     indexed = {row['article_id']: row for row in rows}
@@ -86,7 +88,7 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                         **{k: record.get(k) for k in ("requested_url", "final_url", "source_request_url", "published_at_raw",
                             "published_time_basis", "modified_at_raw", "authors_json", "author_attribution_detail_json", "data_fingerprint",
                             "article_identity_basis", "declared_canonical_url", "extraction_method", "response_sha256", "license_verification_basis",
-                            "per_article_license_verified", "declared_license_urls_json")}}
+                            "per_article_license_verified", "declared_license_urls_json", *FEED_BODY_PROVENANCE_FIELDS)}}
                     if registry is not None:
                         try:
                             source = registry.require(record["final_url"])
@@ -107,18 +109,19 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                                 if len(replay_matches) != 1:
                                     raise ValueError('selected_api_item_not_replayable')
                                 replay = replay_matches[0]
-                            elif record.get('extraction_method') == 'rss_content_encoded_v1':
-                                key = (record['source_response_article_id'], record['source_request_url'], source.provider)
+                            elif str(record.get('extraction_method', '')).startswith('rss_content_encoded_'):
+                                version = replay_feed_body_version(record, source)
+                                key = (record['source_response_article_id'], record['source_request_url'], source.provider, version)
                                 if key not in feed_replays:
                                     feed_replays[key] = _replay_feed_envelope(
-                                        payload, record['source_request_url'], registry, source)
+                                        payload, record['source_request_url'], registry, source, body_contract_version=version)
                                 feed_rows, failed_urls = feed_replays[key]
                                 replay = feed_rows.get(record['article_id'])
                                 if replay is None or record['requested_url'] in failed_urls:
                                     raise ValueError('selected_feed_item_not_replayable')
                                 if (any(replay.get(k) != record.get(k) for k in (
                                         'requested_url', 'final_url', 'published_time_basis', 'body_completeness',
-                                        'license_verification_basis', 'per_article_license_verified'))
+                                        'license_verification_basis', 'per_article_license_verified', *FEED_BODY_PROVENANCE_FIELDS))
                                         or json.loads(replay['declared_license_urls_json'])
                                         != json.loads(record['declared_license_urls_json'])):
                                     raise ValueError('current_source_replay_changed_rss_license_or_scope')

@@ -142,6 +142,7 @@ class TaiwanStockContextFuturesPortfolioDaily:
     margin_rules_path: str | None = None
     margin_contract_version: int = 0
     margin_session_mask: np.ndarray | None = None
+    decision_clock_contract: dict | None = None
     carry_valuation_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantine_mask: np.ndarray | None = None
     expiry_settlement_quarantined_physical_contracts: int = 0

@@ -185,6 +185,108 @@ def test_batch_ownership_paths_fail_closed_when_directory_changes_during_batch(
         monitor._resolve_ownership_paths([leaf])
 
 
+@pytest.mark.parametrize("receipt_parent", ["root", "shard"])
+def test_batch_ownership_paths_allow_unrelated_receipts_only_after_exact_oracle(
+    tmp_path: Path, monkeypatch, receipt_parent: str,
+) -> None:
+    directory = tmp_path / "data" / "shard"
+    directory.mkdir(parents=True)
+    leaves = [directory / f"file-{index}.parquet" for index in range(3)]
+    for leaf in leaves:
+        leaf.touch()
+    expected = monitor._resolve_ownership_paths_reference(leaves)
+    real_lstat = Path.lstat
+    real_oracle = monitor._resolve_ownership_paths_reference
+    oracle_calls = []
+    mutated = False
+
+    def publish_receipt(path):
+        nonlocal mutated
+        value = real_lstat(path)
+        if path == leaves[0] and not mutated:
+            mutated = True
+            parent = tmp_path if receipt_parent == "root" else directory
+            receipt = parent / "status.json.tmp"
+            receipt.write_text("{}")
+            receipt.replace(parent / "status.json")
+            # Filesystems may have coarse clocks; deterministically exercise
+            # timestamp invalidation without replacing the directory inode.
+            current = parent.stat()
+            os.utime(parent, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000))
+        return value
+
+    def counted_oracle(paths):
+        oracle_calls.append(list(paths))
+        return real_oracle(paths)
+
+    monkeypatch.setattr(Path, "lstat", publish_receipt)
+    monkeypatch.setattr(monitor, "_resolve_ownership_paths_reference", counted_oracle)
+    assert monitor._resolve_ownership_paths(leaves) == expected
+    assert oracle_calls == [leaves]
+
+
+def test_batch_ownership_paths_reject_leaf_symlink_swap_during_receipt_churn(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    directory = tmp_path / "data"
+    directory.mkdir()
+    leaf = directory / "file.parquet"
+    leaf.touch()
+    target = tmp_path / "different.parquet"
+    target.touch()
+    real_lstat = Path.lstat
+    mutated = False
+
+    def replace_leaf(path):
+        nonlocal mutated
+        value = real_lstat(path)
+        if path == leaf and not mutated:
+            mutated = True
+            leaf.rename(directory / "retained.parquet")
+            leaf.symlink_to(target)
+            current = directory.stat()
+            os.utime(directory, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000))
+        return value
+
+    monkeypatch.setattr(Path, "lstat", replace_leaf)
+    with pytest.raises(RuntimeError, match="namespace changed during batch"):
+        monitor._resolve_ownership_paths([leaf])
+
+
+def test_batch_ownership_paths_reject_further_mutation_after_exact_oracle(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    directory = tmp_path / "data"
+    directory.mkdir()
+    leaf = directory / "file.parquet"
+    leaf.touch()
+    real_lstat = Path.lstat
+    real_oracle = monitor._resolve_ownership_paths_reference
+    mutated = False
+
+    def touch_directory():
+        current = directory.stat()
+        os.utime(directory, ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000))
+
+    def publish_receipt(path):
+        nonlocal mutated
+        value = real_lstat(path)
+        if path == leaf and not mutated:
+            mutated = True
+            touch_directory()
+        return value
+
+    def oracle_then_mutate(paths):
+        result = real_oracle(paths)
+        touch_directory()
+        return result
+
+    monkeypatch.setattr(Path, "lstat", publish_receipt)
+    monkeypatch.setattr(monitor, "_resolve_ownership_paths_reference", oracle_then_mutate)
+    with pytest.raises(RuntimeError, match="changed during reference validation"):
+        monitor._resolve_ownership_paths([leaf])
+
+
 def test_archive_metadata_batches_preserve_first_row_and_decode_tail(tmp_path: Path) -> None:
     path = tmp_path / 'provenance.parquet'
     table = pa.table({'_provider': ['official'] * 200001,

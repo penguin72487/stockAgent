@@ -56,6 +56,61 @@ class _Response:
         return self._body
 
 
+@pytest.mark.parametrize("provider", ["coinmetrics", "public", "keyed", "etf", "dune"])
+@pytest.mark.parametrize("status", [429, 503, 403])
+@pytest.mark.parametrize("bucket_error", [False, True])
+def test_exhausted_provider_http_request_closes_body_and_defers_shared_bucket(
+    monkeypatch, provider, status, bucket_error,
+) -> None:
+    # No real API calls, credentials, threads or production pacing files.
+    from downloader import download_coinmetrics_community as coinmetrics
+    from downloader import download_crypto_etf_history as etf
+    from downloader import download_crypto_keyed_context as keyed
+    from downloader import download_dune_crypto_history as dune
+    from downloader import download_free_public_context as public
+
+    module = {"coinmetrics": coinmetrics, "public": public, "keyed": keyed,
+              "etf": etf, "dune": dune}[provider]
+    limiter = _Limiter()
+    if bucket_error:
+        def fail_defer(seconds):
+            limiter.defers.append(seconds)
+            raise OSError("fixture pacing state unavailable")
+        monkeypatch.setattr(limiter, "defer", fail_defer)
+    monkeypatch.setattr(module, "SharedRateLimiter", lambda *args, **kwargs: limiter)
+    body = BytesIO(b'{"error":"fixture"}')
+    calls = []
+
+    def fail(request, **kwargs):
+        calls.append(request)
+        raise HTTPError(request.full_url, status, "fixture", {"Retry-After": "120"}, body)
+
+    monkeypatch.setattr(module, "urlopen", fail)
+    if provider == "coinmetrics":
+        client = module.CoinMetricsClient(max_retries=0, retry_base=0.1)
+        fetch = lambda: client._get("https://example.invalid/fixture")
+    elif provider == "public":
+        client = module.PublicClient(max_retries=0, retry_base=0.1)
+        spec = module.DATASETS[0]
+        fetch = lambda: client.request(spec)
+    elif provider == "keyed":
+        client = module.HttpClient(max_retries=0, retry_base=0.1)
+        fetch = lambda: client.get_json("https://example.invalid/fixture", profile_name="coingecko_demo")
+    elif provider == "etf":
+        client = module.HttpClient(max_retries=0, retry_base=0.1)
+        fetch = lambda: client.get("https://example.invalid/fixture", profile_name="sec_edgar", user_agent="fixture")
+    else:
+        client = module.DuneClient("fixture", max_retries=0, retry_base=0.1, poll_seconds=1, page_size=100)
+        fetch = lambda: client._request("GET", "/fixture", high=True)
+
+    expected = OSError if bucket_error and status in {429, 503} else (HTTPError, RuntimeError)
+    with pytest.raises(expected):
+        fetch()
+    assert len(calls) == len(limiter.waits) == 1
+    assert body.closed
+    assert limiter.defers == ([120.0] if status in {429, 503} else [])
+
+
 def test_atomic_artifacts_are_complete_under_same_process_thread_contention(
     tmp_path: Path,
 ) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 import hashlib
@@ -17,6 +18,7 @@ from typing import Any
 
 import numpy as np
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +37,8 @@ from stockagent.data.tw_security import (
     classify_tw_stock_or_etf,
 )
 from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
+from downloader.artifact_io import atomic_write_json
+from stockagent.data.tw_public_incremental import _generation, table_content_sha256
 
 
 OFFICIAL_SOURCE_NAME = "twse_tpex_official"
@@ -62,6 +66,8 @@ RETURN_QUARANTINE_REASONS = frozenset(
         "unverified_extreme_adjusted_return",
     }
 )
+INCREMENTAL_CONTRACT = "official_symbol_exact_prefix_state_v1"
+INCREMENTAL_STATE_NAME = "official_symbol_incremental_state.json"
 OFFICIAL_CORE_SOURCE_FILENAMES = (
     "twse_daily_ohlcv.parquet",
     "tpex_daily_ohlcv.parquet",
@@ -147,6 +153,16 @@ class BuildResult:
     listing_boundary_quarantined_rows: int = 0
     unverified_extreme_quarantined_rows: int = 0
     message: str | None = None
+    reused_adjustment_rows: int = 0
+    rebuilt_adjustment_rows: int = 0
+    reused_output: bool = False
+    input_proof_seconds: float = 0.0
+    normalization_seconds: float = 0.0
+    adjustment_seconds: float = 0.0
+    quote_assembly_seconds: float = 0.0
+    parquet_write_seconds: float = 0.0
+    output_proof_seconds: float = 0.0
+    partitioned_write: dict | None = None
 
 
 @dataclass(slots=True)
@@ -191,6 +207,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-dir", type=Path, default=Path("data_tw_public"))
     parser.add_argument("--output-dir", type=Path, default=Path("data_tw_public/stocks"))
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--output-layout", choices=("file", "year"), default="file",
+                        help="Opt-in reader-first yearly manifests; use a fresh output root, never mixed legacy files")
+    parser.add_argument("--source-cache-root", type=Path,
+                        default=REPO_ROOT / "artifacts/cache/tw_official_source_groups",
+                        help="Derived row-local parser cache; source receipts and whole-frame rules stay authoritative")
+    parser.add_argument("--no-source-cache", action="store_true",
+                        help="Diagnostic full-parser reference; never alters source semantics")
+    parser.add_argument("--incremental-merge-cache", action="store_true",
+                        help="Opt-in exact session merge reuse; requires source cache and retains full original receipts")
     parser.add_argument(
         "--end-date",
         default=None,
@@ -524,7 +549,7 @@ def _empty_listing_boundaries() -> pl.DataFrame:
 
 def _load_official_lifecycle_policy(
     input_dir: Path,
-    current_official: pl.DataFrame,
+    current_official: pl.DataFrame | pl.LazyFrame,
     session_calendar: pl.DataFrame,
     *,
     required: bool,
@@ -550,6 +575,16 @@ def _load_official_lifecycle_policy(
     def following_official_session(value: date) -> date | None:
         index = bisect_right(sessions, value)
         return sessions[index] if index < len(sessions) else None
+
+    def relevant_quotes(keys: pl.DataFrame, on: list[str]) -> pl.DataFrame:
+        # Both lifecycle joins are keyed by a small event universe. Quotes for
+        # any other key cannot affect the result. Filter before materializing,
+        # deduplicating or sorting history; retain source order for keep="last".
+        quotes = (current_official.lazy() if isinstance(current_official, pl.DataFrame)
+                  else current_official)
+        return (quotes.select("date", "symbol", "name", "market")
+                .join(keys.lazy(), on=on, how="semi", maintain_order="left")
+                .collect())
 
     delistings: list[dict[str, Any]] = []
     for filename, default_market in (
@@ -671,7 +706,8 @@ def _load_official_lifecycle_policy(
             pl.col("date").cast(pl.Date)
         )
         quote_dates = (
-            current_official.select(
+            relevant_quotes(proposed.select("symbol", "market").unique(),
+                            ["symbol", "market"]).select(
                 "symbol",
                 "market",
                 pl.col("date").alias("quote_date"),
@@ -704,14 +740,14 @@ def _load_official_lifecycle_policy(
         )
         listing_events.extend(confirmed.to_dicts())
 
-    if delistings and not current_official.is_empty():
+    if delistings:
         delisting_frame = pl.DataFrame(delistings).select(
             "symbol",
             pl.col("date").cast(pl.Date),
             pl.col("market").alias("delisting_market"),
         )
         quote_dates = (
-            current_official.select(
+            relevant_quotes(delisting_frame.select("symbol").unique(), ["symbol"]).select(
                 "symbol",
                 pl.col("date").alias("quote_date"),
                 pl.col("market").alias("quote_market"),
@@ -1426,9 +1462,15 @@ def _write_official_quote_parquet(
     *,
     checked_through: str,
     source: str = OFFICIAL_SOURCE_NAME,
-) -> None:
+    sync_directory: bool = True,
+    partition_source_identity: dict | None = None,
+    replace_from: date | None = None,
+    partition_write_budget=None,
+    partition_previous=None,
+    logical_first_date: str | None = None,
+) -> dict | None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    first_date = str(frame["date"].min())
+    first_date = logical_first_date or str(frame["date"].min())
     last_date = str(frame["date"].max())
     table = frame.to_arrow()
     metadata = dict(table.schema.metadata or {})
@@ -1445,6 +1487,16 @@ def _write_official_quote_parquet(
         }
     )
     table = table.replace_schema_metadata(metadata)
+    if output_path.name.endswith(".manifest.json"):
+        from stockagent.data.partitioned_parquet import write_partitioned_table
+        suffix = table
+        if replace_from is not None:
+            import pyarrow.compute as pc
+            suffix = table.filter(pc.greater_equal(table["date"], pa.scalar(replace_from, type=pa.date32())))
+        return write_partitioned_table(suffix, output_path, period="year",
+            source_identity=partition_source_identity, replace_from=replace_from,
+            write_budget=partition_write_budget, previous_source=partition_previous,
+            sync_directory=sync_directory)
     handle = tempfile.NamedTemporaryFile(
         prefix=f".{output_path.name}.",
         suffix=".tmp",
@@ -1465,7 +1517,8 @@ def _write_official_quote_parquet(
         with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, output_path)
-        _fsync_directory(output_path.parent)
+        if sync_directory:
+            _fsync_directory(output_path.parent)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -1510,6 +1563,7 @@ def _remove_stale_official_symbol_files(
     *,
     dry_run: bool,
 ) -> list[str]:
+    _reject_stale_partitioned_symbols(output_dir, target_symbols)
     removed: list[str] = []
     for path in sorted(output_dir.glob("*_features.parquet")):
         symbol = path.name.removesuffix("_features.parquet")
@@ -1527,6 +1581,16 @@ def _remove_stale_official_symbol_files(
     return removed
 
 
+def _reject_stale_partitioned_symbols(output_dir: Path, target_symbols: set[str]) -> None:
+    """Retain immutable history; require an explicit retirement for removals."""
+    suffix = "_features.parquet.manifest.json"
+    stale = sorted(path.name.removesuffix(suffix)
+        for path in output_dir.glob("*" + suffix)
+        if path.name.removesuffix(suffix) not in target_symbols)
+    if stale:
+        raise ValueError(f"partitioned symbol removal requires explicit retirement; retained: {stale[:20]}")
+
+
 def _signed_number_expr(column: str) -> pl.Expr:
     return (
         pl.col(column)
@@ -1538,8 +1602,8 @@ def _signed_number_expr(column: str) -> pl.Expr:
     )
 
 
-def _twse_frame(path: Path) -> pl.DataFrame:
-    schema = set(pl.read_parquet_schema(path))
+def _twse_rows(frame: pl.DataFrame, *, source, date_expression=None) -> pl.DataFrame:
+    schema = set(frame.collect_schema().names() if isinstance(frame, pl.LazyFrame) else frame.columns)
     required = {
         "date",
         "證券代號",
@@ -1554,7 +1618,7 @@ def _twse_frame(path: Path) -> pl.DataFrame:
     }
     missing = sorted(required - schema)
     if missing:
-        raise ValueError(f"{path} is missing official TWSE columns: {missing}")
+        raise ValueError(f"{source} is missing official TWSE columns: {missing}")
     direction = pl.col("漲跌(+/-)").cast(pl.Utf8, strict=False).str.strip_chars()
     magnitude = _num_expr("漲跌價差").abs()
     signed_change = (
@@ -1567,9 +1631,9 @@ def _twse_frame(path: Path) -> pl.DataFrame:
         .otherwise(None)
     )
     return (
-        pl.read_parquet(path)
+        frame
         .select(
-            _date_column_expr("date").alias("date"),
+            (date_expression if date_expression is not None else _date_column_expr("date")).alias("date"),
             _symbol_expr("證券代號").str.to_uppercase().alias("symbol"),
             pl.col("證券名稱").cast(pl.Utf8, strict=False).str.strip_chars().alias("name"),
             pl.lit("twse").alias("market"),
@@ -1584,12 +1648,12 @@ def _twse_frame(path: Path) -> pl.DataFrame:
     )
 
 
-def _tpex_frame(path: Path) -> pl.DataFrame:
-    schema = set(pl.read_parquet_schema(path))
+def _tpex_rows(frame: pl.DataFrame, *, source, date_expression=None) -> pl.DataFrame:
+    schema = set(frame.collect_schema().names() if isinstance(frame, pl.LazyFrame) else frame.columns)
     required = {"date", "代號", "名稱", "開盤", "最高", "最低", "收盤", "成交股數", "漲跌"}
     missing = sorted(required - schema)
     if missing:
-        raise ValueError(f"{path} is missing official TPEx columns: {missing}")
+        raise ValueError(f"{source} is missing official TPEx columns: {missing}")
     change_text = pl.col("漲跌").cast(pl.Utf8, strict=False).str.strip_chars()
     next_reference = (
         _num_expr("次日參考價")
@@ -1597,9 +1661,9 @@ def _tpex_frame(path: Path) -> pl.DataFrame:
         else pl.lit(None, dtype=pl.Float64)
     )
     return (
-        pl.read_parquet(path)
+        frame
         .select(
-            _date_column_expr("date").alias("date"),
+            (date_expression if date_expression is not None else _date_column_expr("date")).alias("date"),
             _symbol_expr("代號").str.to_uppercase().alias("symbol"),
             pl.col("名稱").cast(pl.Utf8, strict=False).str.strip_chars().alias("name"),
             pl.lit("tpex").alias("market"),
@@ -1615,6 +1679,18 @@ def _tpex_frame(path: Path) -> pl.DataFrame:
             next_reference.alias("source_next_reference"),
         )
     )
+
+
+def _twse_frame(path: Path, *, source_cache=None) -> pl.DataFrame:
+    if source_cache is None:
+        return _twse_rows(pl.read_parquet(path), source=path)
+    return source_cache.project(path, lambda frame: _twse_rows(frame, source=path), parser="twse_official")
+
+
+def _tpex_frame(path: Path, *, source_cache=None) -> pl.DataFrame:
+    if source_cache is None:
+        return _tpex_rows(pl.read_parquet(path), source=path)
+    return source_cache.project(path, lambda frame: _tpex_rows(frame, source=path), parser="tpex_official")
 
 
 def _legacy_official_frame(
@@ -1713,11 +1789,26 @@ def _legacy_official_frame(
     return normalized
 
 
-def _official_frame(
+def _official_frame(input_dir, legacy_paths=None, fallback_paths=None, end_date=None, source_cache=None,
+                    incremental_merge=False):
+    if source_cache is None or not incremental_merge:
+        return _official_frame_impl(input_dir, legacy_paths, fallback_paths, end_date, source_cache=source_cache)
+    from stockagent.data.official_merge_projection import OfficialMergeProjection
+    with OfficialMergeProjection(source_cache.root / "merged", source_cache.implementation,
+                                 capacity_policy=source_cache.capacity_policy) as merged:
+        result = _official_frame_impl(input_dir, legacy_paths, fallback_paths, end_date,
+                                      source_cache=source_cache, merge_cache=merged)
+        source_cache.work["merge_projection"] = merged.stats()
+        return result
+
+
+def _official_frame_impl(
     input_dir: Path,
     legacy_paths: list[Path] | None = None,
     fallback_paths: list[Path] | None = None,
     end_date: date | None = None,
+    source_cache=None,
+    merge_cache=None,
 ) -> tuple[
     pl.DataFrame,
     list[dict[str, Any]],
@@ -1754,6 +1845,27 @@ def _official_frame(
     before = [_file_content_receipt(path) for path in paths]
     legacy_before = [_receipt(path) for path in legacy_paths]
     fallback_before = [_receipt(path) for path in fallback_paths]
+
+    def verify_sources():
+        if (before != [_file_content_receipt(path) for path in paths]
+                or legacy_before != [_receipt(path) for path in legacy_paths]
+                or fallback_before != [_receipt(path) for path in fallback_paths]
+                or session_calendar_receipt != _file_content_receipt(input_dir / "twse_taiex_ohlc.parquet")
+                or session_calendar_summary_receipt != _file_content_receipt(input_dir / "twse_taiex_ohlc.summary.json")):
+            raise RuntimeError("official OHLCV source changed during symbol build")
+
+    dated_receipts = [*({**receipt, "path": str(path)} for path, receipt in zip(core_paths, before[:3], strict=True)),
+                      *legacy_before, *fallback_before]
+    if merge_cache is not None:
+        merge_cache.prepare_sources(dated_receipts)
+
+    def current_quotes(index, *, lower=None):
+        path = core_paths[index]
+        if merge_cache is None:
+            return (_twse_frame if index == 0 else _tpex_frame)(path, source_cache=source_cache)
+        scan, expression = merge_cache.input_scan(path, lower=lower, upper=end_date)
+        return (_twse_rows if index == 0 else _tpex_rows)(scan, source=path, date_expression=expression)
+
     merge_columns = [
         "date",
         "symbol",
@@ -1773,31 +1885,79 @@ def _official_frame(
         "_legacy_source_id",
         "_source_priority",
     ]
-    current = pl.concat(
-        [
-            _twse_frame(core_paths[0]).with_columns(
-                pl.lit("twse_official").alias("quote_source")
-            ),
-            _tpex_frame(core_paths[1]).with_columns(
-                pl.lit("tpex_official").alias("quote_source")
-            ),
-        ],
-        how="vertical_relaxed",
-    ).with_columns(
-        pl.lit(None, dtype=pl.Float64).alias("source_reference"),
-        pl.lit(None, dtype=pl.Float64).alias("source_adjclose"),
-        pl.lit(None, dtype=pl.Float64).alias("source_factor"),
-        pl.lit(-1, dtype=pl.Int32).alias("_legacy_source_id"),
-        pl.lit(2, dtype=pl.Int8).alias("_source_priority"),
-    ).select(merge_columns)
-    if end_date is not None:
-        current = current.filter(pl.col("date") <= pl.lit(end_date))
+    # Plan prefix reuse BEFORE parsing every historical price. The lazy owner
+    # expressions retain exactly the original normalization/schema checks;
+    # projection pushdown decodes only lifecycle evidence for admission.
+    def combined_current(*, lower=None):
+        frame = pl.concat([current_quotes(index, lower=lower).with_columns(
+            pl.lit("twse_official" if index == 0 else "tpex_official").alias("quote_source"))
+            for index in range(2)], how="vertical_relaxed").with_columns(
+                pl.lit(None, dtype=pl.Float64).alias("source_reference"),
+                pl.lit(None, dtype=pl.Float64).alias("source_adjclose"),
+                pl.lit(None, dtype=pl.Float64).alias("source_factor"),
+                pl.lit(-1, dtype=pl.Int32).alias("_legacy_source_id"),
+                pl.lit(2, dtype=pl.Int8).alias("_source_priority"),
+            ).select(merge_columns)
+        # Also apply the original normalized predicate: an unsupported archive
+        # clock must retain its generic parser, not a guessed raw comparison.
+        if end_date is not None:
+            frame = frame.filter(pl.col("date") <= pl.lit(end_date))
+        if lower is not None:
+            frame = frame.filter(pl.col("date") >= pl.lit(lower))
+        return frame
+
+    current = combined_current()
+    lifecycle_started = time.perf_counter()
+    lifecycle_current = current.select("date", "symbol", "name", "market")
     lifecycle_policy = _load_official_lifecycle_policy(
         input_dir,
-        current,
+        lifecycle_current,
         session_calendar,
         required=bool(fallback_paths),
     )
+    prefix = None
+    start_date = None
+    reference_current = current
+    if merge_cache is not None:
+        merge_cache.work["lifecycle_evidence_seconds"] = time.perf_counter() - lifecycle_started
+        semantics = {
+            "lifecycle_intervals": table_content_sha256(lifecycle_policy.terminal_intervals.to_arrow()),
+            "listing_boundaries": table_content_sha256(lifecycle_policy.listing_boundaries.to_arrow()),
+            "nonterminal_transfers": lifecycle_policy.nonterminal_transfer_examples,
+            "legacy_order": [str(path.absolute()) for path in legacy_paths],
+            "fallback_order": [str(path.absolute()) for path in fallback_paths],
+        }
+        # Lifecycle evidence is interpreted above from the complete official
+        # history. Receipts still cover it; only identical semantic state may
+        # retain the prefix when a new source observation is appended.
+        start_date = merge_cache.plan(dated_receipts, semantics=semantics,
+                                      calendar=session_calendar, end_date=end_date)
+        prefix = merge_cache.prefix()
+        if merge_cache.unchanged:
+            statistics = OfficialMergeStats(**merge_cache.previous.manifest["source_identity"]["statistics"])
+            statistics.session_calendar_rows = session_calendar.height
+            statistics.session_calendar_receipt = session_calendar_receipt
+            statistics.session_calendar_summary_receipt = session_calendar_summary_receipt
+            statistics.lifecycle_source_receipts = lifecycle_policy.source_receipts
+            verify_sources()
+            return prefix, before, legacy_before, fallback_before, statistics
+        current_started = time.perf_counter()
+        if start_date is not None:
+            # Select original groups BEFORE the price expressions are parsed.
+            # Keep schema/order/defaults identical to the original owner.
+            current = combined_current(lower=start_date)
+        current = current.collect()
+        # The global duplicate-reference rejection is part of the original
+        # contract even for old/non-selected rows. Read those exact columns,
+        # not the entire historical price frame or only its latest session.
+        reference_current = reference_current.select(
+            "date", "symbol", "quote_source", "source_next_reference").filter(
+                (pl.col("quote_source") == "tpex_official")
+                & pl.col("source_next_reference").is_not_null()
+                & pl.col("source_next_reference").is_finite()
+                & (pl.col("source_next_reference") > 0.0)).collect()
+        merge_cache.work["current_price_rows"] = current.height
+        merge_cache.work["current_price_decode_seconds"] = time.perf_counter() - current_started
     legacy_frames = [
         _legacy_official_frame(path, default_quote_source="official_archive").with_columns(
             pl.lit(source_id, dtype=pl.Int32).alias("_legacy_source_id"),
@@ -1826,6 +1986,9 @@ def _official_frame(
         fallback_frames = [
             frame.filter(pl.col("date") <= cutoff) for frame in fallback_frames
         ]
+    if start_date is not None:
+        legacy_frames = [frame.filter(pl.col("date") >= pl.lit(start_date)) for frame in legacy_frames]
+        fallback_frames = [frame.filter(pl.col("date") >= pl.lit(start_date)) for frame in fallback_frames]
     for path, fallback_frame in zip(fallback_paths, fallback_frames, strict=True):
         before_2000 = fallback_frame.filter(pl.col("date") < pl.lit(date(2000, 1, 1)))
         if before_2000.height:
@@ -1856,6 +2019,9 @@ def _official_frame(
     fallback_rows_before_lifecycle_filter = sum(
         fallback_frame.height for fallback_frame in fallback_frames
     )
+    if merge_cache is not None:
+        before_lifecycle = pl.concat(fallback_frames, how="vertical_relaxed") if fallback_frames else pl.DataFrame(schema={"date": pl.Date})
+        merge_cache.metric("fallback_rows_before_lifecycle_filter", before_lifecycle)
     lifecycle_dropped_frames: list[pl.DataFrame] = []
     lifecycle_filtered_frames: list[pl.DataFrame] = []
     for fallback_frame in fallback_frames:
@@ -1957,22 +2123,12 @@ def _official_frame(
         .drop_nulls(["date", "symbol", "reference_override"])
         .unique(["date", "symbol"], keep="last", maintain_order=True)
     )
+    if start_date is not None:
+        reference = reference.filter(pl.col("date") >= pl.lit(start_date))
     frame = frame.join(reference, on=["date", "symbol"], how="left").with_columns(
         pl.coalesce("reference_override", "source_reference").alias("reference_override")
     )
-    after = [_file_content_receipt(path) for path in paths]
-    legacy_after = [_receipt(path) for path in legacy_paths]
-    fallback_after = [_receipt(path) for path in fallback_paths]
-    if (
-        before != after
-        or legacy_before != legacy_after
-        or fallback_before != fallback_after
-        or session_calendar_receipt
-        != _file_content_receipt(input_dir / "twse_taiex_ohlc.parquet")
-        or session_calendar_summary_receipt
-        != _file_content_receipt(input_dir / "twse_taiex_ohlc.summary.json")
-    ):
-        raise RuntimeError("official OHLCV source changed during symbol build")
+    verify_sources()
     stock_symbol = pl.col("symbol").str.contains(TW_STOCK_SYMBOL_PATTERN).fill_null(False)
     etf_symbol = pl.col("symbol").str.contains(TW_ETF_SYMBOL_PATTERN).fill_null(False)
     in_scope = (
@@ -2038,6 +2194,20 @@ def _official_frame(
         on=["date", "symbol"],
         how="anti",
     )
+    if merge_cache is not None:
+        key_example = pl.concat_str(pl.col("date").cast(pl.String), pl.lit(":"), pl.col("symbol"))
+        for metric_name, metric_frame in (
+            ("official_unusable_ohlcv_rows", needs_fallback_keys),
+            ("fallback_replaced_unusable_official_rows", replaced_unusable_keys),
+            ("unfilled_unusable_official_rows", unfilled_unusable_keys),
+            ("dropped_off_calendar_fallback_rows", off_calendar_fallback),
+        ):
+            merge_cache.metric(metric_name, metric_frame, example=key_example)
+        after_lifecycle = pl.concat(fallback_frames, how="vertical_relaxed") if fallback_frames else pl.DataFrame(schema={"date": pl.Date})
+        merge_cache.metric("fallback_rows_after_lifecycle_filter", after_lifecycle)
+        merge_cache.metric("dropped_post_terminal_fallback_rows", dropped_post_terminal_fallback,
+            example=pl.concat_str(key_example, pl.lit(":terminal="), pl.col("terminal_date").cast(pl.String),
+                                  pl.lit(":source="), pl.col("terminal_source")))
     merge_stats = OfficialMergeStats(
         official_unusable_ohlcv_rows=needs_fallback_keys.height,
         fallback_replaced_unusable_official_rows=replaced_unusable_keys.height,
@@ -2167,7 +2337,7 @@ def _official_frame(
         pl.col("date").shift(1).alias("_previous_official_session")
     )
     previous_next_references = (
-        current.filter(
+        reference_current.filter(
             (pl.col("quote_source") == "tpex_official")
             & pl.col("source_next_reference").is_not_null()
             & pl.col("source_next_reference").is_finite()
@@ -2209,6 +2379,16 @@ def _official_frame(
             ),
         )
     )
+    if prefix is not None and not prefix.is_empty():
+        # A suspended symbol's last selected row can be arbitrarily old. Keep
+        # its exact date/episode, rather than guessing one calendar-day context.
+        context = prefix.group_by("symbol", maintain_order=True).last().select(
+            "symbol", pl.col("date").alias("_prefix_previous_date"),
+            pl.col("_lifecycle_episode_id").alias("_prefix_previous_episode"))
+        frame = frame.join(context, on="symbol", how="left").with_columns(
+            pl.coalesce("_selected_previous_date", "_prefix_previous_date").alias("_selected_previous_date"),
+            pl.coalesce("_selected_previous_episode", "_prefix_previous_episode").alias("_selected_previous_episode"),
+        ).drop("_prefix_previous_date", "_prefix_previous_episode")
     previous_reference_candidate = (
         (pl.col("quote_source") == "tpex_official")
         & pl.col("_previous_official_session").is_not_null()
@@ -2255,6 +2435,11 @@ def _official_frame(
         .head(20)
         .to_dicts()
     ]
+    if merge_cache is not None:
+        merge_cache.metric("previous_session_next_reference_candidate_rows", previous_reference_candidates,
+            example=pl.struct("date", "symbol", "_previous_official_session", "_previous_session_next_reference").map_elements(
+                lambda row: f"{row['date']}:{row['symbol']}:previous_session={row['_previous_official_session']}:"
+                            f"reference={row['_previous_session_next_reference']}", return_dtype=pl.String))
     # Some legacy official TPEx reports use the exact sentinel O=H=L=0 while
     # still publishing a positive official close and volume.  Keep the raw
     # archive untouched, but make the derived per-symbol K-line a flat bar at
@@ -2279,8 +2464,12 @@ def _official_frame(
             for column in ("open", "max", "min")
         ]
     )
-    if frame.is_empty():
+    if frame.is_empty() and (prefix is None or prefix.is_empty()):
         raise RuntimeError("official TWSE/TPEx sources produced no valid stock rows")
+    if merge_cache is not None:
+        verify_sources()
+        frame, merge_stats = merge_cache.commit(frame, merge_stats, prefix=prefix)
+        verify_sources()
     return frame, before, legacy_before, fallback_before, merge_stats
 
 
@@ -2291,6 +2480,10 @@ def _normalized_reference_index(
     reference_override: np.ndarray | None = None,
     factor_override: np.ndarray | None = None,
     episode_ids: np.ndarray | None = None,
+    *,
+    initial_state: float | None = None,
+    previous_episode: object = None,
+    state_out: dict | None = None,
 ) -> tuple[np.ndarray, int]:
     close = np.asarray(close, dtype=np.float64)
     change = np.asarray(signed_change, dtype=np.float64)
@@ -2315,11 +2508,13 @@ def _normalized_reference_index(
     output = np.full(close.shape, np.nan, dtype=np.float64)
     if close.size == 0:
         return output, 0
-    state = 10.0
-    output[0] = state
+    state = 10.0 if initial_state is None else initial_state
+    if initial_state is None:
+        output[0] = state
     missing = 0
-    for idx in range(1, close.size):
-        if episodes[idx] != episodes[idx - 1]:
+    for idx in range(1 if initial_state is None else 0, close.size):
+        prior_episode = episodes[idx - 1] if idx else previous_episode
+        if episodes[idx] != prior_episode:
             state = 10.0
             output[idx] = state
             continue
@@ -2342,6 +2537,8 @@ def _normalized_reference_index(
             continue
         state *= factor
         output[idx] = state
+    if state_out is not None:
+        state_out.update(value_hex=float(state).hex(), missing=missing)
     return output, missing
 
 
@@ -2421,6 +2618,11 @@ def _normalize_yahoo_fallback_raw_ohlc(
 
     quote_sources = np.asarray(frame["quote_source"].to_list(), dtype=object)
     fallback = quote_sources == YAHOO_FALLBACK_SOURCE_NAME
+    if not np.any(fallback):
+        return frame.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("raw_ohlc_scale_factor"),
+            pl.lit(None, dtype=pl.Date).alias("raw_ohlc_scale_reference_date"),
+        ), 0, 0, 0
     close = np.asarray(frame["close"].to_numpy(), dtype=np.float64)
     yahoo_close = np.asarray(
         frame["_yahoo_fallback_close"].to_numpy(), dtype=np.float64
@@ -2557,15 +2759,33 @@ def _normalize_yahoo_fallback_raw_ohlc(
     )
 
 
-def _write_symbol(
+def _build_symbol(
     output_dir: Path,
     symbol: str,
     frame: pl.DataFrame,
     *,
     requested_end_date: str,
     dry_run: bool,
+    reference_checkpoint: dict | None = None,
+    checkpoint_out: dict | None = None,
+    defer_directory_fsync: bool = False,
+    output_layout: str = "file",
+    partition_source_identity: dict | None = None,
+    partition_write_budget=None,
+    output_prefix=None,
+    partition_previous=None,
 ) -> BuildResult:
     path = output_dir / f"{symbol}_features.parquet"
+    if output_layout == "year":
+        from stockagent.data.partitioned_parquet import manifest_path
+        path = manifest_path(path)
+    elif output_layout != "file":
+        raise ValueError("unknown official symbol output layout")
+    from stockagent.data.partitioned_parquet import resolve_source
+    if resolve_source(output_dir / f"{symbol}_features.parquet") not in (
+            path, output_dir / f"{symbol}_features.parquet"):
+        raise ValueError("official symbol layout cannot replace another ABI in place")
+    started = time.perf_counter()
     try:
         frame = frame.sort("date")
         if "_official_zero_ohlc_normalized" not in frame.columns:
@@ -2649,9 +2869,12 @@ def _write_symbol(
             ).item()
             or 0
         )
+        normalized_at = time.perf_counter()
         output_source = (
             MIXED_FALLBACK_SOURCE_NAME if fallback_rows else OFFICIAL_SOURCE_NAME
         )
+        if output_prefix is not None and output_prefix["result"]["source"] == MIXED_FALLBACK_SOURCE_NAME:
+            output_source = MIXED_FALLBACK_SOURCE_NAME
         episode_ids = frame["_lifecycle_episode_id"].to_numpy()
         explicit_factor = frame["source_factor"].to_numpy()
         source_adjusted_factor = _source_adjustment_factors(
@@ -2717,24 +2940,35 @@ def _write_symbol(
             fallback_factor,
             factor_override,
         )
-        fallback_adjustment_rows = int(np.count_nonzero(uses_fallback_adjustment))
+        count_start = 1 if output_prefix is not None else 0
+        fallback_adjustment_rows = int(np.count_nonzero(uses_fallback_adjustment[count_start:]))
         previous_session_next_reference_adjustment_rows = int(
-            np.count_nonzero(uses_previous_session_next_reference)
+            np.count_nonzero(uses_previous_session_next_reference[count_start:])
         )
         normalized_zero_ohlc_rows = int(
-            frame.select(pl.col("_official_zero_ohlc_normalized").sum()).item()
+            frame.slice(count_start).select(pl.col("_official_zero_ohlc_normalized").sum()).item()
             or 0
         )
         if fallback_adjustment_rows:
             output_source = MIXED_FALLBACK_SOURCE_NAME
-        adjusted, missing = _normalized_reference_index(
-            frame["close"].to_numpy(),
-            frame["signed_change"].to_numpy(),
-            frame["Trading_Volume"].to_numpy(),
-            frame["reference_override"].to_numpy(),
-            factor_override,
-            episode_ids,
+        resume_rows = reference_checkpoint["rows"] if reference_checkpoint else 0
+        continuation = {}
+        adjusted_tail, missing = _normalized_reference_index(
+            frame["close"].to_numpy()[resume_rows:],
+            frame["signed_change"].to_numpy()[resume_rows:],
+            frame["Trading_Volume"].to_numpy()[resume_rows:],
+            frame["reference_override"].to_numpy()[resume_rows:],
+            factor_override[resume_rows:], episode_ids[resume_rows:],
+            initial_state=(float.fromhex(reference_checkpoint["value_hex"]) if resume_rows else None),
+            previous_episode=(episode_ids[resume_rows - 1] if resume_rows else None),
+            state_out=continuation,
         )
+        adjusted = (np.concatenate([reference_checkpoint["adjusted"], adjusted_tail])
+                    if resume_rows else adjusted_tail)
+        missing += reference_checkpoint["missing"] if resume_rows else 0
+        if checkpoint_out is not None and continuation:
+            checkpoint_out.update(value_hex=continuation["value_hex"], missing=missing)
+        adjusted_at = time.perf_counter()
         adjustment_source = np.asarray(
             frame["quote_source"].to_list(), dtype=object
         )
@@ -2866,30 +3100,62 @@ def _write_symbol(
                 dtype=pl.String,
             ),
         ).drop("_official_zero_ohlc_normalized")
+        if output_prefix is not None:
+            if (resume_rows != 1 or frame.height < 2
+                    or output_prefix["quote"].height != 1
+                    or output_prefix["quote"]["date"][0] != frame["date"][0]):
+                raise ValueError("incremental quote prefix does not match the exact recurrence boundary")
+            # Only the preceding label can change when an observed new row is
+            # appended. Reuse all its original lineage/price fields verbatim;
+            # the canonical quarantine computation above supplies that label.
+            prior_quote = output_prefix["quote"].with_columns(
+                quotes["return_quarantined"].head(1),
+                quotes["return_quarantine_reason"].head(1))
+            quotes = pl.concat([prior_quote, quotes.slice(1)], how="vertical")
+            if output_layout == "file":
+                quotes = pl.concat([output_prefix["prefix"], quotes], how="vertical")
         first = frame["date"].min()
         last = frame["date"].max()
         market = str(frame["market"][-1])
         name = str(frame["name"][-1] or symbol)
+        assembled_at = time.perf_counter()
+        partitioned_write = None
         if not dry_run:
-            _write_official_quote_parquet(
+            partitioned_write = _write_official_quote_parquet(
                 quotes,
                 path,
                 checked_through=requested_end_date,
                 source=output_source,
+                sync_directory=not defer_directory_fsync,
+                partition_source_identity=partition_source_identity,
+                # A new destination can quarantine the previous label row.
+                # Rewind that row, including across a year boundary.
+                replace_from=(frame["date"][resume_rows-1] if resume_rows else None),
+                partition_write_budget=partition_write_budget,
+                partition_previous=partition_previous,
+                logical_first_date=(output_prefix["result"]["first_date"] if output_prefix else None),
             )
+        written_at = time.perf_counter()
         return BuildResult(
             symbol=symbol,
             security_type=str(frame["security_type"][-1]),
             market=market,
             name=name,
             status="planned" if dry_run else "created",
-            rows=frame.height,
-            adjusted_rows=int(np.count_nonzero(np.isfinite(adjusted))),
+            rows=frame.height-count_start,
+            adjusted_rows=int(np.count_nonzero(np.isfinite(adjusted[count_start:]))),
             missing_adjustment_rows=missing,
             first_date=str(first),
             last_date=str(last),
             output_path=str(path),
             source=output_source,
+            reused_adjustment_rows=resume_rows,
+            rebuilt_adjustment_rows=frame.height-resume_rows,
+            normalization_seconds=normalized_at-started,
+            adjustment_seconds=adjusted_at-normalized_at,
+            quote_assembly_seconds=assembled_at-adjusted_at,
+            parquet_write_seconds=written_at-assembled_at,
+            partitioned_write=partitioned_write,
             input_fallback_rows=input_fallback_rows,
             fallback_rows=fallback_rows,
             fallback_adjustment_rows=fallback_adjustment_rows,
@@ -2932,6 +3198,242 @@ def _write_symbol(
         )
 
 
+def _symbol_code_identity() -> dict:
+    identity = {"builder": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "typed_proof": hashlib.sha256(Path(table_content_sha256.__code__.co_filename).read_bytes()).hexdigest(),
+            "parser_shared": hashlib.sha256(Path(_num_expr.__code__.co_filename).read_bytes()).hexdigest(),
+            "group_projection": hashlib.sha256((REPO_ROOT / "stockagent/data/parquet_group_projection.py").read_bytes()).hexdigest(),
+            "merge_projection": hashlib.sha256((REPO_ROOT / "stockagent/data/official_merge_projection.py").read_bytes()).hexdigest(),
+            "partitioned_parquet": hashlib.sha256((REPO_ROOT / "stockagent/data/partitioned_parquet.py").read_bytes()).hexdigest(),
+            "polars": pl.__version__, "numpy": np.__version__, "arrow": pa.__version__}
+    loaded = globals().get("_LOADED_SYMBOL_CODE_IDENTITY")
+    if loaded is not None and loaded != identity:
+        raise RuntimeError("official symbol implementation changed after module load")
+    return identity
+
+
+_LOADED_SYMBOL_CODE_IDENTITY = _symbol_code_identity()
+
+
+def _symbol_state_sha256(state: dict) -> str:
+    return hashlib.sha256(json.dumps({key: value for key, value in state.items() if key != "state_sha256"},
+        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+
+def _write_symbol(output_dir, symbol, frame, *, requested_end_date, dry_run,
+                  previous_state=None, state_sink=None, code_identity=None,
+                  defer_directory_fsync=False, prepared_input=None, output_layout="file",
+                  partition_write_budget=None) -> BuildResult:
+    """Reuse only exact input/output proofs; a changed history is a full miss.
+
+    The full source merge is still authoritative. Yahoo fallback runs retain
+    their full normalization because a later official boundary can reject the
+    whole preceding run. No snapshot, price or missing observation is invented.
+    """
+    if state_sink is None or dry_run:
+        return _build_symbol(output_dir, symbol, frame, requested_end_date=requested_end_date, dry_run=dry_run,
+                             defer_directory_fsync=defer_directory_fsync, output_layout=output_layout,
+                             partition_source_identity={"symbol": symbol, "implementation": _symbol_code_identity()},
+                             partition_write_budget=partition_write_budget)
+    started = time.perf_counter()
+    identity = code_identity if code_identity is not None else _symbol_code_identity()
+    if prepared_input is None:
+        frame = frame.sort("date")
+        digest = table_content_sha256(frame.to_arrow())
+        prefix_digest, preparation_seconds = None, 0.0
+    else:
+        if prepared_input[0] is not frame:
+            raise ValueError("symbol proof belongs to another immutable input frame")
+        _, digest, prefix_digest, preparation_seconds = prepared_input
+    path = output_dir / f"{symbol}_features.parquet"
+    partition_previous = None
+    if output_layout == "year":
+        from stockagent.data.partitioned_parquet import manifest_path, ParquetSource
+        path = manifest_path(path)
+        if path.is_file():
+            partition_previous = ParquetSource(path)
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    reference = None
+    output_prefix = None
+    build_frame = frame
+    try:
+        before = _generation(path) if path.is_file() else None
+        if (previous.get("implementation") == identity and before is not None
+                and previous.get("state_sha256") == _symbol_state_sha256(previous)
+                and _receipt(path)["sha256"] == previous["output_sha256"]):
+            if _generation(path) != before:
+                raise ValueError("symbol output changed during checkpoint verification")
+            if previous["input_sha256"] == digest and previous["checked_through"] == requested_end_date:
+                result = BuildResult(**previous["result"])
+                if result.symbol != symbol or result.output_path != str(path) or result.status != "created":
+                    raise ValueError("wrong checkpoint output")
+                result.reused_output = True
+                result.reused_adjustment_rows = result.rows
+                result.rebuilt_adjustment_rows = 0
+                if result.partitioned_write is not None:
+                    stats = result.partitioned_write
+                    result.partitioned_write = {**stats, "written_partitions": 0,
+                        "reused_partitions": stats["written_partitions"] + stats["reused_partitions"],
+                        "written_rows": 0, "reused_rows": result.rows, "written_payload_bytes": 0,
+                        "phase_seconds": {}}
+                result.input_proof_seconds = preparation_seconds + time.perf_counter()-started
+                for key in ("normalization_seconds", "adjustment_seconds", "quote_assembly_seconds",
+                            "parquet_write_seconds", "output_proof_seconds"):
+                    setattr(result, key, 0.0)
+                state_sink[symbol] = previous
+                return result
+            count = previous["input_rows"]
+            if (type(count) is int and 0 < count < frame.height
+                    and (prefix_digest if prefix_digest is not None else table_content_sha256(frame.head(count).to_arrow())) == previous["input_sha256"]
+                    and not frame.select((pl.col("quote_source") == YAHOO_FALLBACK_SOURCE_NAME).any()).item()
+                    and previous["result"]["rows"] == count):
+                saved = previous["reference_state"]
+                from stockagent.data.partitioned_parquet import read_table
+                prior_quotes = (pl.from_arrow(partition_previous.table(tail_rows=1))
+                    if partition_previous is not None else pl.from_arrow(read_table(path)))
+                quote = prior_quotes.tail(1)
+                old = quote["adjclose"].to_numpy()
+                if _generation(path) != before:
+                    raise ValueError("symbol output changed while restoring checkpoint")
+                expected = 1
+                if len(old) != expected or type(saved["missing"]) is not int or saved["missing"] < 0:
+                    raise ValueError("invalid reference checkpoint")
+                float.fromhex(saved["value_hex"])
+                reference = {**saved, "rows": expected, "adjusted": old}
+                if partition_previous is None and prior_quotes.height != count:
+                    raise ValueError("invalid whole-file prefix row count")
+                output_prefix = {"result": previous["result"], "quote": quote, "rows": count,
+                                 "prefix": prior_quotes.head(count-1) if partition_previous is None else None}
+                build_frame = frame.slice(count-1)
+    except (OSError, KeyError, TypeError, ValueError):
+        reference = None
+        output_prefix = None
+        build_frame = frame
+    input_proof_seconds = preparation_seconds + time.perf_counter()-started
+    saved_reference = {}
+    result = _build_symbol(output_dir, symbol, build_frame, requested_end_date=requested_end_date,
+                           dry_run=False, reference_checkpoint=reference, checkpoint_out=saved_reference,
+                           defer_directory_fsync=defer_directory_fsync, output_layout=output_layout,
+                           partition_source_identity={"symbol": symbol, "input_sha256": digest, "implementation": identity},
+                           partition_write_budget=partition_write_budget,
+                           output_prefix=output_prefix, partition_previous=partition_previous)
+    if result.status == "created" and output_prefix is not None:
+        for name in ("rows", "adjusted_rows", "input_fallback_rows", "fallback_rows", "fallback_adjustment_rows",
+                "previous_session_next_reference_adjustment_rows", "normalized_zero_ohlc_rows",
+                "normalized_fallback_ohlc_rows", "dropped_unanchored_fallback_rows", "dropped_discontinuous_fallback_rows",
+                "return_quarantined_rows", "lifecycle_episode_quarantined_rows", "listing_boundary_quarantined_rows",
+                "unverified_extreme_quarantined_rows"):
+            setattr(result, name, getattr(result, name) + output_prefix["result"][name])
+        result.first_date = output_prefix["result"]["first_date"]
+        result.reused_adjustment_rows = output_prefix["rows"]
+    result.input_proof_seconds = input_proof_seconds
+    if result.status == "created":
+        output_proof_started = time.perf_counter()
+        output_sha = _receipt(path)["sha256"]
+        result.output_proof_seconds = time.perf_counter()-output_proof_started
+        state = {"implementation": identity, "input_sha256": digest,
+            "input_rows": frame.height, "checked_through": requested_end_date,
+            "output_sha256": output_sha, "result": asdict(result),
+            "reference_state": saved_reference}
+        state["state_sha256"] = _symbol_state_sha256(state)
+        state_sink[symbol] = state
+    return result
+
+
+def _read_symbol_incremental_state(path: Path) -> dict:
+    try:
+        if path.stat().st_size > 16 * 1024**2:
+            return {}
+        payload = json.loads(path.read_bytes())
+        if payload.get("contract") == INCREMENTAL_CONTRACT and isinstance(payload.get("symbols"), dict):
+            return payload["symbols"]
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return {}
+
+
+def _write_symbol_batch(output_dir, groups, *, requested_end_date, dry_run=False, workers=8,
+                        previous_states=None, state_sink=None, code_identity=None,
+                        batch_directory_fsync=True, output_layout="file"):
+    """One canonical batch durability boundary, before any summary publication.
+
+    Each file still fsyncs its data before rename. The owner joins all workers
+    (also after an exception), then fsyncs their shared directory once. Standalone
+    _write_symbol keeps its original per-file directory commit by default.
+    """
+    results = []
+    prepared = {}
+    from stockagent.data.partitioned_parquet import manifest_path
+    _reject_stale_partitioned_symbols(output_dir,
+        {str(key[0] if isinstance(key, tuple) else key) for key in groups})
+    for key in groups:
+        symbol = str(key[0] if isinstance(key, tuple) else key)
+        legacy = output_dir / f"{symbol}_features.parquet"
+        conflicting = legacy if output_layout == "year" else manifest_path(legacy)
+        if conflicting.exists():
+            raise ValueError("official symbol output layout requires a fresh/unambiguous root")
+    if state_sink is not None and not dry_run:
+        # IPC stream/schema construction is a small, GIL-sensitive operation.
+        # Prove immutable frames on the coordinator instead of eight threads
+        # contending for the same interpreter before any useful file I/O.
+        ordered = {}
+        for key, frame in groups.items():
+            started = time.perf_counter()
+            symbol = str(key[0] if isinstance(key, tuple) else key)
+            frame = frame.sort("date")
+            digest = table_content_sha256(frame.to_arrow())
+            previous = (previous_states or {}).get(symbol, {})
+            count = previous.get("input_rows") if isinstance(previous, dict) else None
+            prefix = None
+            if (type(count) is int and 0 < count < frame.height
+                    and previous.get("implementation") == code_identity
+                    and not frame["quote_source"].eq(YAHOO_FALLBACK_SOURCE_NAME).any()):
+                prefix = table_content_sha256(frame.head(count).to_arrow())
+            ordered[key] = frame
+            prepared[key] = (frame, digest, prefix, time.perf_counter() - started)
+        groups = ordered
+    with ExitStack() as leases:
+        budgets = {}
+        if output_layout == "year" and not dry_run and groups:
+            from stockagent.data_sync.cache_capacity import (
+                GenerationWriteBudget, load_capacity_policy, reserve_cache_write,
+            )
+            estimates = {}
+            for key, frame in groups.items():
+                symbol = str(key[0] if isinstance(key, tuple) else key)
+                prior = (previous_states or {}).get(symbol, {})
+                possible_hit = (key in prepared and prior.get("implementation") == code_identity
+                    and prior.get("input_sha256") == prepared[key][1]
+                    and prior.get("checked_through") == requested_end_date
+                    and prior.get("state_sha256") == _symbol_state_sha256(prior))
+                if not possible_hit:
+                    estimates[key] = max(1024**2, frame.estimated_size() * 3 + 2 * 1024**2
+                        + (frame["date"].max().year - frame["date"].min().year + 1) * 512 * 1024)
+            if estimates:
+                leases.enter_context(reserve_cache_write(output_dir,
+                    key=hashlib.sha256(json.dumps(code_identity, sort_keys=True).encode()).hexdigest(),
+                    maximum_growth_bytes=sum(estimates.values()), family="panel", policy=load_capacity_policy()))
+            # One filesystem/backing-volume lease, disjoint enforced budgets
+            # per worker: no repeated Windows queries and no shared-counter race.
+            budgets = {key: GenerationWriteBudget(size) for key, size in estimates.items()}
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+                futures = [executor.submit(_write_symbol, output_dir,
+                    str(key[0] if isinstance(key, tuple) else key), frame,
+                    requested_end_date=requested_end_date, dry_run=dry_run,
+                    previous_state=(previous_states or {}).get(str(key[0] if isinstance(key, tuple) else key)),
+                    state_sink=state_sink, code_identity=code_identity,
+                    defer_directory_fsync=batch_directory_fsync, prepared_input=prepared.get(key),
+                    output_layout=output_layout, partition_write_budget=budgets.get(key))
+                    for key, frame in groups.items()]
+                for future in as_completed(futures):
+                    results.append(future.result())
+        finally:
+            if batch_directory_fsync and not dry_run:
+                _fsync_directory(output_dir)
+    return results
+
+
 def main() -> None:
     build_started = time.perf_counter()
     args = parse_args()
@@ -2959,11 +3461,21 @@ def main() -> None:
             getattr(args, "allow_daily_publication_lag", False)
         ),
     )
+    implementation = _symbol_code_identity()
+    source_cache = None
+    if (not args.dry_run and not getattr(args, "no_source_cache", False)
+            and getattr(args, "source_cache_root", None) is not None):
+        from stockagent.data.parquet_group_projection import ParquetGroupProjection
+        source_cache = ParquetGroupProjection(args.source_cache_root, implementation)
+    if getattr(args, "incremental_merge_cache", False) and source_cache is None:
+        raise ValueError("--incremental-merge-cache requires enabled source cache and a non-dry run")
     frame, receipts, legacy_receipts, fallback_receipts, merge_stats = _official_frame(
         args.input_dir,
         list(args.legacy_official_ohlcv),
         list(args.fallback_ohlcv),
         end_date=end_date,
+        source_cache=source_cache,
+        incremental_merge=bool(getattr(args, "incremental_merge_cache", False)),
     )
     if frame.is_empty():
         raise RuntimeError(f"no official rows remain through end_date={end_date_text!r}")
@@ -2972,25 +3484,18 @@ def main() -> None:
     requested_end_date = str(end_date or frame["date"].max())
     groups = frame.partition_by("symbol", as_dict=True, maintain_order=False)
     partitioned_at = time.perf_counter()
-    results: list[BuildResult] = []
-    with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
-        futures = {
-            executor.submit(
-                _write_symbol,
-                args.output_dir,
-                str(key[0] if isinstance(key, tuple) else key),
-                symbol_frame,
-                requested_end_date=requested_end_date,
-                dry_run=bool(args.dry_run),
-            ): key
-            for key, symbol_frame in groups.items()
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+    state_path = args.output_dir / INCREMENTAL_STATE_NAME
+    previous_states = _read_symbol_incremental_state(state_path)
+    new_states = {}
+    results = _write_symbol_batch(args.output_dir, groups, requested_end_date=requested_end_date,
+        dry_run=bool(args.dry_run), workers=args.workers, previous_states=previous_states,
+        state_sink=new_states, code_identity=implementation, output_layout=getattr(args, "output_layout", "file"))
     symbols_built_at = time.perf_counter()
     failed = [result for result in results if result.status == "failed"]
     if failed:
         raise RuntimeError(f"official symbol parquet writes failed: {[asdict(item) for item in failed[:10]]}")
+    if _symbol_code_identity() != implementation:
+        raise RuntimeError("official symbol implementation changed during build")
     previous_session_next_reference_adjustment_rows = sum(
         result.previous_session_next_reference_adjustment_rows
         for result in results
@@ -3046,6 +3551,7 @@ def main() -> None:
         status_counts[result.status] = status_counts.get(result.status, 0) + 1
     summary = {
         "schema_version": OFFICIAL_SYMBOL_BUILD_SCHEMA_VERSION,
+        "output_layout": getattr(args, "output_layout", "file"),
         "source": (
             MIXED_FALLBACK_SOURCE_NAME
             if any(
@@ -3166,6 +3672,21 @@ def main() -> None:
             for result in active_results
         ),
         "status_counts": status_counts,
+        "daily_incremental": {"contract": INCREMENTAL_CONTRACT,
+            "reused_outputs": sum(item.reused_output for item in results),
+            "reused_adjustment_rows": sum(item.reused_adjustment_rows for item in results),
+            "rebuilt_adjustment_rows": sum(item.rebuilt_adjustment_rows for item in results),
+            "summed_worker_seconds_not_parallel_wall": {key: sum(getattr(item, key) for item in results)
+                for key in ("input_proof_seconds", "normalization_seconds", "adjustment_seconds",
+                            "quote_assembly_seconds", "parquet_write_seconds", "output_proof_seconds")},
+            "input_proof_schedule": "coordinator_before_parallel_symbol_writes",
+            "directory_commit": "one_after_all_payload_fsyncs_before_metadata",
+            "source_projection": source_cache.stats() if source_cache is not None else {"enabled": False},
+            "full_source_merge_retained": True,
+            "whole_changed_symbol_rewrite_retained": getattr(args, "output_layout", "file") == "file",
+            "partitioned_write": {key: sum((item.partitioned_write or {}).get(key, 0) for item in results)
+                for key in ("written_partitions", "reused_partitions", "written_rows", "reused_rows",
+                            "written_payload_bytes", "old_generations_removed")}},
         "stage_elapsed_seconds": {
             "input_validation_and_merge": round(input_merged_at - build_started, 3),
             "symbol_partition": round(partitioned_at - input_merged_at, 3),
@@ -3177,18 +3698,29 @@ def main() -> None:
     }
     summary_path = args.summary_path or args.output_dir / "official_symbol_build_summary.json"
     report_path = args.report_path or args.output_dir / "official_symbol_build_report.csv"
+    if not args.dry_run:
+        atomic_write_json(state_path, {"contract": INCREMENTAL_CONTRACT, "symbols": new_states})
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    pl.DataFrame([asdict(result) for result in sorted(results, key=lambda item: item.symbol)]).write_csv(
-        report_path
-    )
+    pl.DataFrame(_report_rows(results)).write_csv(report_path)
     print(
         f"[tw-official-symbols] rows={frame.height} symbols={len(active_results)} "
         f"missing_adjustments={summary['missing_adjustment_rows']} summary={summary_path}",
         flush=True,
     )
+
+
+def _report_rows(results):
+    """CSV remains scalar even when a partitioned result has nested timing."""
+    rows = []
+    for result in sorted(results, key=lambda item: item.symbol):
+        row = asdict(result)
+        if row["partitioned_write"] is not None:
+            row["partitioned_write"] = json.dumps(row["partitioned_write"], sort_keys=True)
+        rows.append(row)
+    return rows
 
 
 if __name__ == "__main__":

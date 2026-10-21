@@ -118,7 +118,7 @@ def test_v5_diagnostic_reports_syntax_shape_only_using_the_selected_parser_abi()
     old = ettoday_validation_metadata(soup, page_url=native.URLS[0])
     new = ettoday_validation_metadata(soup, page_url=native.URLS[0], adapter_contract_version=5)
     assert old['schema_error'] and not new['schema_error']
-    assert new['contract_version'] == 3 and new['article_schema_count'] == 1
+    assert new['contract_version'] == 4 and new['article_schema_count'] == 1
     assert new['observed_schema_syntax_anomalies'] == ['source_unescaped_json_value_control']
     assert not new['body_text_retained'] and not new['raw_scope_or_article_acceptance_granted']
     assert native.PROSE not in json.dumps(new, ensure_ascii=False)

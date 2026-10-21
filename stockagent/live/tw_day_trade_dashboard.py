@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import (
     date as datetime_date,
     datetime,
@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from typing import Any, Final
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
@@ -162,7 +163,8 @@ _HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 3
 _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
 _HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 4
 _HISTORY_SESSION_PROJECTION_MAX_COMPRESSED_BYTES: Final[int] = 4 * 1024 * 1024
-_HISTORY_SESSION_REBUILD_LIMIT: Final[int] = 8
+_HISTORY_PROJECTION_WORK: dict[Path, dict[str, Any]] = {}
+_HISTORY_PROJECTION_WORK_LOCK = threading.Lock()
 _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
 _COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
 _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
@@ -274,6 +276,11 @@ class _LedgerSessionIndex:
     modified_ns: int
     scanned_offset: int
     spans: dict[str, list[tuple[int, int]]]
+    prefix_sha256: str | None = None
+    changed_ns: int | None = None
+    # Append extensions keep this lineage; any complete rescan gets a new
+    # lineage even if byte spans happen to be unchanged after a correction.
+    lineage: str = field(default_factory=lambda: uuid.uuid4().hex)
     # A runtime-only observation for complete-session readers. Legacy disk
     # indices have no ctime proof; this does not invent one across restarts.
     facts_signature: tuple[int, int, int, int, int] | None = None
@@ -360,6 +367,11 @@ def _load_persistent_ledger_index(
             modified_ns=modified_ns,
             scanned_offset=scanned_offset,
             spans=spans,
+            prefix_sha256=(str(payload["prefix_sha256"]) if re.fullmatch(
+                r"[0-9a-f]{64}", str(payload.get("prefix_sha256"))) else None),
+            changed_ns=(int(payload["changed_ns"]) if payload.get("changed_ns") is not None else None),
+            lineage=(str(payload["lineage"]) if re.fullmatch(r"[0-9a-f]{32}", str(payload.get("lineage")))
+                     else uuid.uuid4().hex),
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -385,6 +397,9 @@ def _persist_ledger_index(
         "observed_size": index.observed_size,
         "modified_ns": index.modified_ns,
         "scanned_offset": index.scanned_offset,
+        "prefix_sha256": index.prefix_sha256,
+        "changed_ns": index.changed_ns,
+        "lineage": index.lineage,
         "spans": {
             session_date: [[start, end] for start, end in ranges]
             for session_date, ranges in index.spans.items()
@@ -1208,7 +1223,9 @@ def _ledger_session_index(
     tens of thousands of decoded signal dictionaries merely to learn those
     dates amplified a 105 MiB ledger into hundreds of MiB of resident Python
     objects. This index parses each complete line once, retains only compact
-    contiguous byte spans, and scans only appended bytes on later calls.
+    contiguous byte spans, and parses only appended bytes on later calls.
+    A changed mutable archive still needs a complete prefix SHA check: size
+    growth alone cannot prove its old sessions were not corrected as well.
     """
 
     source = Path(path)
@@ -1262,7 +1279,8 @@ def _ledger_session_index(
                 and stat.st_size >= cached.observed_size
                 and not (
                     stat.st_size == cached.observed_size
-                    and stat.st_mtime_ns != cached.modified_ns
+                    and (stat.st_mtime_ns != cached.modified_ns
+                         or stat.st_ctime_ns != cached.changed_ns)
                 )
             )
             if (
@@ -1288,6 +1306,23 @@ def _ledger_session_index(
                 spans = {}
 
             with source.open("rb") as handle:
+                if metadata_signature(os.fstat(handle.fileno())) != metadata_signature(stat):
+                    continue
+                prefix_digest = hashlib.sha256()
+                if can_extend and cached is not None:
+                    remaining = scanned_offset
+                    while remaining:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            raise OSError(f"dashboard ledger prefix was truncated: {source}")
+                        prefix_digest.update(chunk)
+                        remaining -= len(chunk)
+                    if prefix_digest.hexdigest() != cached.prefix_sha256:
+                        # Same inode + larger size can also be a repair and an
+                        # append. Reindex/re-digest rather than resurrecting
+                        # unchanged-span session shards from the old lineage.
+                        can_extend, scanned_offset, spans = False, 0, {}
+                        prefix_digest = hashlib.sha256()
                 handle.seek(scanned_offset)
                 cursor = scanned_offset
                 while cursor < stat.st_size:
@@ -1306,6 +1341,7 @@ def _ledger_session_index(
                         raise ValueError(
                             f"dashboard ledger line is too large: {source}"
                         )
+                    prefix_digest.update(line)
                     if not line.strip():
                         scanned_offset = cursor
                         continue
@@ -1320,16 +1356,13 @@ def _ledger_session_index(
                         else:
                             date_spans.append((line_start, cursor))
                     scanned_offset = cursor
+                if metadata_signature(os.fstat(handle.fileno())) != metadata_signature(stat):
+                    continue
 
             final_stat = source.stat()
             if observed_signature is not None and metadata_signature(final_stat) != observed_signature:
                 raise OSError(f"dashboard ledger changed during index build: {source}")
-            if (
-                final_stat.st_dev,
-                final_stat.st_ino,
-                final_stat.st_size,
-                final_stat.st_mtime_ns,
-            ) != (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+            if metadata_signature(final_stat) != metadata_signature(stat):
                 continue
             result = _LedgerSessionIndex(
                 device=stat.st_dev,
@@ -1338,6 +1371,9 @@ def _ledger_session_index(
                 modified_ns=stat.st_mtime_ns,
                 scanned_offset=scanned_offset,
                 spans=spans,
+                prefix_sha256=prefix_digest.hexdigest(),
+                changed_ns=stat.st_ctime_ns,
+                lineage=cached.lineage if can_extend and cached is not None else uuid.uuid4().hex,
                 facts_signature=observed_signature,
             )
             _LEDGER_SESSION_INDEX_CACHE[cache_key] = result
@@ -3123,6 +3159,7 @@ def _digest_ledger_sessions(
             prior = previous_sessions.get(session_date)
             can_reuse = bool(
                 isinstance(prior, Mapping)
+                and previous.get("lineage") == index.lineage
                 and previous_identity is not None
                 and list(previous_identity[:2]) == identity[:2]
                 and prior.get("spans") == spans
@@ -3152,7 +3189,7 @@ def _digest_ledger_sessions(
         index.modified_ns,
     ):
         raise OSError(f"dashboard ledger changed during session digest: {source}")
-    return output, {"identity": identity, "sessions": metadata}
+    return output, {"identity": identity, "lineage": index.lineage, "sessions": metadata}
 
 
 def _history_session_source_context(
@@ -3795,6 +3832,7 @@ def _load_or_rebuild_history_session_projection(
     sources: Mapping[str, Any],
     available_session_dates: list[str],
 ) -> dict[str, Any] | None:
+    started = time.perf_counter()
     head = _history_session_head(state_dir)
     if head is None or head.get("product") != product:
         return None
@@ -3819,12 +3857,11 @@ def _load_or_rebuild_history_session_projection(
             changed.append(session_date)
         else:
             loaded[session_date] = shard
-    if set(head_sessions) - set(available_session_dates):
-        # Source history removal is exceptional. A complete rebuild gives the
-        # existing correctness path one chance to validate the new scope.
-        return None
-    if len(changed) > _HISTORY_SESSION_REBUILD_LIMIT:
-        return None
+    # Missing/backfilled dates and corrections are independent absolute-NAV
+    # session projections, not a recurrence. There is no reason to recompute
+    # unchanged history after 8 changes or after a date was removed. The head
+    # writer records removals as tombstones; retained shards stay immutable.
+    loaded_at = time.perf_counter()
     entries = {
         session_date: dict(head_sessions[session_date])
         for session_date in loaded
@@ -3864,11 +3901,32 @@ def _load_or_rebuild_history_session_projection(
         available_session_dates=available_session_dates,
         sessions=entries,
     )
-    return _merge_history_session_shards(
+    rebuilt_at = time.perf_counter()
+    result = _merge_history_session_shards(
         list(loaded.values()),
         available_session_dates=available_session_dates,
         is_overnight=is_overnight,
     )
+    with _HISTORY_PROJECTION_WORK_LOCK:
+        if len(_HISTORY_PROJECTION_WORK) >= 128:
+            _HISTORY_PROJECTION_WORK.pop(next(iter(_HISTORY_PROJECTION_WORK)))
+        _HISTORY_PROJECTION_WORK[Path(state_dir).resolve()] = {
+            "mode": "session_delta", "available_sessions": len(available_session_dates),
+            "rebuilt_sessions": list(changed),
+            "reused_sessions": len(available_session_dates) - len(changed),
+            "removed_sessions": sorted(set(head_sessions) - set(available_session_dates)),
+            "load_seconds": loaded_at - started,
+            "rebuild_seconds": rebuilt_at - loaded_at,
+            "merge_seconds": time.perf_counter() - rebuilt_at,
+            "wall_seconds": time.perf_counter() - started,
+        }
+    return result
+
+
+def history_projection_work(state_dir: Path) -> dict[str, Any]:
+    """Last actual shard operation, separate from API/response-cache timing."""
+    with _HISTORY_PROJECTION_WORK_LOCK:
+        return deepcopy(_HISTORY_PROJECTION_WORK.get(Path(state_dir).resolve(), {}))
 
 
 def _make_benchmark_history_index(

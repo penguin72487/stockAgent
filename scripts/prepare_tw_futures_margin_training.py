@@ -30,6 +30,7 @@ from stockagent.data.tw_futures_margin_preparation import (
     apply_loss_reduction_halt_values, bind_dated_corporate_terms,
     bind_equity_margin_families, bind_equity_position_families,
     bind_physical_position_inputs, bind_adjusted_terminal_values, equity_contract_families,
+    stock_futures_preparation_scope,
 )
 from stockagent.data.tw_futures_margin_release import (
     read_bound_output, materialize_margin_market_rows, margin_execution_dependency_rows,
@@ -965,8 +966,10 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
           previous_sources: Path | None = None, omit_empty_account_prefixes: bool = False,
           empty_prefix_max_volume_participation: float | None = None,
           replay_accounting: Path | None = None, rule_delta: Path | None = None,
-          valuation_research_policy: Path | None = None) -> dict:
+          valuation_research_policy: Path | None = None, stock_futures_only: bool = False) -> dict:
     begun = time.monotonic()
+    if type(stock_futures_only) is not bool:
+        raise ValueError('stock-futures scope must be an explicit boolean')
     if output.exists() and not reuse_accounting and not (
             replay_accounting is not None and (output/'research_accounting_composition.json').is_file()):
         raise FileExistsError("build output exists; use --reuse-accounting for its exact compiled checkpoint")
@@ -996,6 +999,8 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     if universe.height != 711 or not universe["settlement_currency"].eq("TWD").all():
         raise ValueError("the explicitly retained 711-product TWD universe changed")
     parent_products = universe['product'].to_list()
+    if stock_futures_only:
+        universe = stock_futures_preparation_scope(universe)
     if diagnostic_products:
         if not set(diagnostic_products) <= set(universe["product"]):
             raise ValueError("diagnostic products exceed the retained universe")
@@ -1019,6 +1024,8 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     products = universe["product"].to_list()
     inputs = dict(source_manifest_sha256=sha256_file(source / "source_manifest.json"),
         end=str(end), slots=slots, products=products, calculation=_calculation_identity())
+    if stock_futures_only:
+        inputs['asset_class_scope'] = 'stock_future'
     accounting_source, information_reviews, valuation_policy = source, [], None
     if rule_delta is not None and replay_proof is None:
         accounting_source, information_reviews, valuation_policy, replay_policies, integration = _integrated_rule_inputs(
@@ -1257,6 +1264,8 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         elapsed_s=time.monotonic()-begun, compiler_sha256=sha256_file(ROOT / "stockagent/data/tw_futures_execution_terms.py"),
         builder_sha256=sha256_file(Path(__file__)), source_manifest_sha256=sha256_file(source / "source_manifest.json"),
         initial_capital_twd=100000000, runtime_training_verified=False)
+    if stock_futures_only:
+        summary['asset_class_scope'] = 'stock_future'
     atomic_write_json(output / "build_acceptance.json", summary)
     log("release_validated", products=len(chosen_products), rows=chosen.height, excluded_products=review["excluded_products"])
     return summary
@@ -1269,6 +1278,8 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=date.fromisoformat, default=date(2010, 11, 1))
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 9, 4))
     parser.add_argument("--slots", type=int, default=2816)
+    parser.add_argument('--stock-futures-only', action='store_true',
+                        help='Compile only source-declared stock futures, retaining adjusted contract families')
     parser.add_argument("--previous-sources", type=Path, help="Verified previous source for a margin-only incremental repair")
     parser.add_argument("--reuse-accounting", action="store_true")
     parser.add_argument("--repair-release-metadata", action="store_true")
@@ -1294,6 +1305,9 @@ if __name__ == "__main__":
     parser.add_argument('--empty-prefix-max-volume-participation', type=float,
                         help='Whole-contract prefix ABI; reject runtime participation above this explicit bound')
     args = parser.parse_args()
+    if args.stock_futures_only and (args.rule_delta or args.publish_replay or args.repair_release_metadata
+                                   or args.diagnostic_product or args.previous_sources):
+        parser.error('stock-futures scope requires a fresh ordinary or integrated-source build')
     if args.empty_prefix_max_volume_participation is not None:
         if (not args.omit_empty_account_prefixes or (args.rule_delta and not args.publish_replay) or args.repair_release_metadata
                 or not 0 < args.empty_prefix_max_volume_participation <= 1):
@@ -1310,7 +1324,8 @@ if __name__ == "__main__":
         build(args.sources,args.output,start=args.start,end=args.end,slots=args.slots,
             reuse_accounting=args.reuse_accounting,omit_empty_account_prefixes=True,
             empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
-            rule_delta=args.integrate_rule_delta,valuation_research_policy=args.valuation_research_policy)
+            rule_delta=args.integrate_rule_delta,valuation_research_policy=args.valuation_research_policy,
+            stock_futures_only=args.stock_futures_only)
     elif args.publish_replay:
         if (not args.rule_delta or not args.valuation_research_policy or not args.omit_empty_account_prefixes
                 or args.reuse_accounting or args.previous_sources or args.repair_release_metadata
@@ -1340,4 +1355,5 @@ if __name__ == "__main__":
         build(args.sources, args.output, start=args.start, end=args.end, slots=args.slots,
               diagnostic_products=args.diagnostic_product, reuse_accounting=args.reuse_accounting,
               previous_sources=args.previous_sources, omit_empty_account_prefixes=args.omit_empty_account_prefixes,
-              empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation)
+              empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
+              stock_futures_only=args.stock_futures_only)

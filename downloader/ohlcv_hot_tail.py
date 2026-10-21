@@ -228,6 +228,13 @@ def read_logical_parquet(
     reads leave it unset.
     """
 
+    from stockagent.data.partitioned_parquet import MANIFEST_SUFFIX, read_table, resolve_source
+    resolved = resolve_source(base_path)
+    if resolved.name.endswith(MANIFEST_SUFFIX):
+        logical_base = resolved.with_name(resolved.name.removesuffix(MANIFEST_SUFFIX))
+        if hot_tail_path(logical_base).exists():
+            raise ValueError("partitioned BASE cannot also carry an OHLCV hot tail")
+        return pl.from_arrow(read_table(resolved, columns=columns, filters=filters, tail_rows=tail_rows))
     parts = logical_parts(base_path)
     if not parts:
         raise FileNotFoundError(base_path)

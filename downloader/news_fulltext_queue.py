@@ -33,18 +33,20 @@ from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha2
 from downloader.news_fulltext_metrics import (
     NewsMetrics, CNYES_NATIVE_BODY_FAILURE_STAGES, ETTODAY_ATTRIBUTION_FAILURE_STAGES,
 )
-from downloader.news_fulltext_policy import (CONTRACT_VERSION, ETTODAY_LAYOUT_VERSIONS, NewsError, PolicyRegistry, normalize_url,
+from downloader.news_fulltext_policy import (CONTRACT_VERSION, ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, normalize_url,
                                             REQUEST_DEFERRAL_CONTRACT_VERSION, REQUEST_DEFERRAL_CODES)
 from stockagent.private_json import loads as decode_private_json
 from downloader.news_receipt_io import (
     RECEIPT_CHUNK, RECEIPT_PROBE_STRIDE, adaptive_receipt_readers, receipt_input_chunks,
     receipt_parent_matches, RECEIPT_PREFETCH_MAX_CHUNKS, ADAPTIVE_RECEIPT_STRATEGY_VERSION,
+    RECEIPT_PREFIX_IO_VERSION,
 )
 from downloader.news_fulltext_status import (
     STATUS_PROJECTION_CONTRACT_VERSION, STATUS_QUERY_TIMING_CONTRACT_VERSION,
     BULK_ERROR_COUNT_CONTRACT_VERSION, bulk_item_error_count, initialize_bulk_error_count,
     summarize_bulk_window_gaps, DISCOVERY_SUMMARY_CONTRACT_VERSION,
     discovery_summary, initialize_discovery_summary,
+    ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION, initialize_article_body_states,
 )
 from downloader.news_fulltext_metadata_ingest import METADATA_INGEST_CONTRACT_VERSION
 
@@ -277,12 +279,50 @@ def native_body_only_layout(source):
         or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'))
 
 
+_NATIVE_TEXT_REPAIR_SPECS = {
+    'pocket': (frozenset({'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}), ('article_identity_not_verified', 'invalid_bulk_publication_clock')),
+    'watchmedia': (frozenset({'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}), ('article_identity_not_verified',)),
+    'pinview': (frozenset({'pinview_visible_article_v2'}), ('article_rights_or_scope_excluded',)),
+    'peoplemedia': (frozenset({'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3'}),
+                   ('article_rights_or_scope_excluded', 'article_identity_not_verified')),
+    'mitrade': (frozenset({'mitrade_visible_article_v3'}), ('article_identity_not_verified',)),
+    'idn': (frozenset({'idn_visible_article_v2', 'idn_visible_article_v3'}),
+            ('invalid_bulk_publication_clock', 'article_rights_or_scope_excluded')),
+    'videoland': (frozenset({'videoland_visible_article_v2', 'videoland_visible_article_v3', 'videoland_visible_article_v4'}), ('article_attribution_not_verified',)),
+}
+
+
+def native_text_parser_repair(source, previous_capture):
+    """Only an attested native predecessor, never a changed source scope."""
+    spec = _NATIVE_TEXT_REPAIR_SPECS.get(source.provider) if source else None
+    return bool(spec and source.allowed and source.embedded_article_layout in spec[0]
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def pocket_native_parser_repair(source, previous_capture):
+    """Retained public predicate for the already accepted Pocket repair."""
+    return bool(source and source.provider == 'pocket' and native_text_parser_repair(source, previous_capture))
+
+
 def native_body_only_parser_repair(source, previous_capture):
     """Exact prior capture only; never a changed rights/scope or clock replay."""
     return bool(native_body_only_layout(source) and source.allowed
         and source.data_fingerprint == source.parser_repair_capture_fingerprint
         and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
         and previous_capture == source.parser_repair_prior_capture_fingerprint
+        and previous_capture != source.data_fingerprint)
+
+
+def max_native_clock_parser_repair(source, previous_capture):
+    """Only attested MAX native clock/body predecessors, never a policy reset."""
+    return bool(source and source.allowed and source.provider == 'maxfinanciallife'
+        and MAX_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2
+        and source.data_fingerprint == source.parser_repair_capture_fingerprint
+        and re.fullmatch(r'[0-9a-f]{64}', source.parser_repair_prior_capture_fingerprint)
+        and previous_capture in (source.parser_repair_capture_history or (source.parser_repair_prior_capture_fingerprint,))
         and previous_capture != source.data_fingerprint)
 
 
@@ -612,21 +652,6 @@ class NewsQueue:
                 provider TEXT NOT NULL,state TEXT NOT NULL,articles INTEGER NOT NULL,body_bytes INTEGER NOT NULL,
                 PRIMARY KEY(provider,state)
             ) WITHOUT ROWID;
-            CREATE TRIGGER IF NOT EXISTS metrics_insert AFTER INSERT ON articles BEGIN
-                INSERT INTO state_metrics VALUES (NEW.provider,NEW.state,1,coalesce(NEW.body_bytes,0))
-                ON CONFLICT(provider,state) DO UPDATE SET articles=articles+1,body_bytes=body_bytes+excluded.body_bytes;
-            END;
-            CREATE TRIGGER IF NOT EXISTS metrics_update AFTER UPDATE OF provider,state,body_bytes ON articles
-            WHEN OLD.provider!=NEW.provider OR OLD.state!=NEW.state OR OLD.body_bytes!=NEW.body_bytes BEGIN
-                UPDATE state_metrics SET articles=articles-1,body_bytes=body_bytes-coalesce(OLD.body_bytes,0)
-                WHERE provider=OLD.provider AND state=OLD.state;
-                INSERT INTO state_metrics VALUES (NEW.provider,NEW.state,1,coalesce(NEW.body_bytes,0))
-                ON CONFLICT(provider,state) DO UPDATE SET articles=articles+1,body_bytes=body_bytes+excluded.body_bytes;
-            END;
-            CREATE TRIGGER IF NOT EXISTS metrics_delete AFTER DELETE ON articles BEGIN
-                UPDATE state_metrics SET articles=articles-1,body_bytes=body_bytes-coalesce(OLD.body_bytes,0)
-                WHERE provider=OLD.provider AND state=OLD.state;
-            END;
             CREATE TABLE IF NOT EXISTS origins(
                 id INTEGER PRIMARY KEY, origin_key TEXT NOT NULL UNIQUE, provider TEXT NOT NULL,
                 receipt_path TEXT NOT NULL, sha256 TEXT NOT NULL, rows INTEGER NOT NULL,
@@ -796,9 +821,8 @@ class NewsQueue:
         with self.metrics.measure('discovery_due_index_initialization'):
             self.db.execute("CREATE INDEX IF NOT EXISTS discovery_due_frontier ON discovery(provider,due) "
                             "WHERE superseded_by_windows_json IS NULL")
-        if not self.db.execute("SELECT 1 FROM state_metrics LIMIT 1").fetchone():
-            self.db.execute("INSERT INTO state_metrics SELECT provider,state,count(*),coalesce(sum(body_bytes),0) "
-                            "FROM articles GROUP BY provider,state")
+        with self.metrics.measure('article_body_state_counter_initialization'):
+            initialize_article_body_states(self.db)
         if not self.db.execute("SELECT 1 FROM hosts LIMIT 1").fetchone():
             self.db.execute("INSERT INTO hosts SELECT host,provider FROM articles GROUP BY host")
         self.db.commit()
@@ -824,14 +848,17 @@ class NewsQueue:
             self.lifecycle.phase('policy_reconciliation')
         self.reconcile_policy()
         self.reconcile_successful_feed_rechecks()
+        # The first finite freeze may now admit a complete indexed snapshot of
+        # retained original URLs. Initialize/reconcile its derived host summary
+        # first, so a corrupt counter cannot block its existing repair owner.
+        from downloader.news_fulltext_urls import initialize_original_urls
+        initialize_original_urls(self)
         try:
             self.sync_finite_cohorts(freeze_new=not defer_initial_finite_freeze)
         except Exception:
             self.close()
             raise
         self.migrate_cnyes_endpoint_circuits()
-        from downloader.news_fulltext_urls import initialize_original_urls
-        initialize_original_urls(self)
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('current_owner_id',?)", (self.owner,))
         if self.lifecycle is not None:
@@ -1294,6 +1321,9 @@ class NewsQueue:
         self.recheck_ettoday_independent_release_revision_clocks(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_ettoday_literal_json_values(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_verified_native_bodies(prior_sources)
+        self.recheck_mitrade_reviewed_profile_scope(prior_sources.get('source_capture_fingerprint:mitrade'))
+        for provider in _NATIVE_TEXT_REPAIR_SPECS:
+            self.recheck_native_text_parser(provider, prior_sources.get('source_capture_fingerprint:' + provider))
         self.recheck_ettoday_social_headlines(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_ettoday_break_credits(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_ettoday_static_imgur(prior_sources.get('source_capture_fingerprint:ettoday'))
@@ -1318,6 +1348,7 @@ class NewsQueue:
         self.recheck_taiwanhot_route_metadata(prior_sources.get('source_capture_fingerprint:taiwanhot'),
                                             prior_parsers.get('source_parser_repair_fingerprint:taiwanhot'))
         self.recheck_restricted_bulk_pages(skip_providers=scheduling_only_changes)
+        self.recheck_max_native_clocks(prior_sources.get('source_capture_fingerprint:maxfinanciallife'))
         if previous and previous[0] == fingerprint:
             if parser_settings:
                 with self.db:
@@ -1364,6 +1395,10 @@ class NewsQueue:
                             and not ettoday_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
                             and not ettoday_literal_value_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
                             and not native_body_only_layout(source)
+                            and not (source.provider in _NATIVE_TEXT_REPAIR_SPECS
+                                     and source.embedded_article_layout in _NATIVE_TEXT_REPAIR_SPECS[source.provider][0])
+                            and not (source.provider == 'maxfinanciallife'
+                                     and MAX_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2)
                             and not (source.provider == 'ettoday'
                                      and ETTODAY_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 7)
                             and not (source.provider == 'taiwanhot'
@@ -1502,6 +1537,45 @@ class NewsQueue:
         self.migrate_unknown_cnyes_body_rechecks()
         self.migrate_unknown_cnyes_identity_rechecks()
 
+    def recheck_max_native_clocks(self, previous_capture):
+        source = self.registry.sources.get('maxfinanciallife')
+        if not max_native_clock_parser_repair(source, previous_capture):
+            return
+        version = source.embedded_article_layout.rsplit('_v', 1)[1]
+        marker = 'max_native_clock_parser_repair:v' + version + ':' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        with self.db:
+            rows = self.db.execute("SELECT id,url,attempts,due,error_code,last_checked_at_utc FROM articles "
+                "INDEXED BY dispatch WHERE provider=? AND state='article_identity_not_verified' "
+                "AND body_sha256 IS NULL AND due<=? AND lease_owner IS NULL AND lease_until IS NULL",
+                (source.provider, time.time())).fetchall()
+            deferred = []
+            if version in {'7', '8'}:
+                from downloader.news_fulltext_max import MAX_V7_DEFERRED_EMBED_PATHS
+                deferred = [row for row in rows if urlsplit(row['url']).path in MAX_V7_DEFERRED_EMBED_PATHS]
+                rows = [row for row in rows if urlsplit(row['url']).path not in MAX_V7_DEFERRED_EMBED_PATHS]
+            self.db.executemany("UPDATE articles SET state='retry' WHERE id=?", ((row['id'],) for row in rows))
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'old_source_fingerprint': previous_capture, 'new_source_fingerprint': source.data_fingerprint,
+                'source_observation': ('exact native connection hints and non-executed chart/video reference metadata; no external payload fetched or inferred as article prose'
+                    if version == '9' else 'native HTML5 header is article introduction prose below the verified body container; external embed heads remain excluded from this retry'
+                    if version == '8' else 'reviewed exact native presentation sheets and literal same-graph title variants; observed unimplemented embed heads excluded from this retry'
+                    if version == '7' else 'two exact reviewed native presentation CSS sheets are not article prose; source numbers tables and all original clocks remain unchanged'
+                    if version == '6' else 'native unchanged post repeats published clock in hidden header template; actual visible publication and equal schema revision remain authoritative'
+                    if version == '5' else 'native post omits head revision tag; equal source schema clocks and hidden theme update retained separately'
+                    if version in {'3', '4'} else 'native unmodified post omits visible revision label'),
+                'previous_outcome': 'article_identity_not_verified', 'target_state': 'retry',
+                'url_count': len(rows), 'observed_at_utc': utc_now(),
+                **({'known_unimplemented_embed_heads_deferred': len(deferred),
+                    'deferred_urls_sha256': hashlib.sha256('\n'.join(row['url'] for row in deferred).encode()).hexdigest()}
+                   if version in {'7', '8'} else {}),
+                'urls_sha256': hashlib.sha256('\n'.join(row['url'] for row in rows).encode()).hexdigest(),
+                'attempts_errors_due_and_last_http_checks_preserved': True,
+                'source_refusals_stored_heads_future_deadlines_and_budgets_reset': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, 'native_clock_v' + version + '_parser_rechecks', len(rows))
+
     def recheck_ftnn_release_clocks(self, previous_capture):
         """One retry of exact old native clock failures; never erase evidence.
 
@@ -1613,6 +1687,169 @@ class NewsQueue:
                 'saved_heads_leases_refusals_and_other_failure_cohorts_changed': False,
                 'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
             self.metrics.count(source.provider, f'native_layout_rechecks_v{version}', len(repaired))
+
+    def recheck_native_text_parser(self, provider, previous_capture):
+        """Retry the source's declared missing native predecessor failures once.
+
+        Accepted bodies, leases, access refusals, unsupported routes, attempts,
+        deadlines and original failure/observation evidence remain untouched.
+        A normal canonical fetch must still establish and commit the body.
+        """
+        source = self.registry.sources.get(provider)
+        if not native_text_parser_repair(source, previous_capture):
+            return
+        if provider == 'pocket':
+            from downloader.news_fulltext_pocket import pocket_article_id as article_id
+        elif provider == 'pinview':
+            from downloader.news_fulltext_pinview import pinview_article_id as article_id
+        elif provider == 'peoplemedia':
+            from downloader.news_fulltext_peoplemedia import peoplemedia_v2_repair_article_id, peoplemedia_v3_repair_article_id
+            article_id = (peoplemedia_v3_repair_article_id if source.embedded_article_layout == 'peoplemedia_visible_article_v3'
+                          else peoplemedia_v2_repair_article_id)
+        elif provider == 'mitrade':
+            from downloader.news_fulltext_mitrade import mitrade_article_id as article_id
+        elif provider == 'idn':
+            from downloader.news_fulltext_idn import idn_article_id as article_id
+        elif provider == 'videoland':
+            from downloader.news_fulltext_videoland import videoland_article_id as article_id
+        else:
+            from downloader.news_fulltext_watchmedia import watchmedia_article_id as article_id
+        errors = _NATIVE_TEXT_REPAIR_SPECS[provider][1]
+        if provider == 'idn' and source.embedded_article_layout == 'idn_visible_article_v3':
+            errors = ('article_attribution_not_verified',)
+        elif provider == 'videoland' and source.embedded_article_layout == 'videoland_visible_article_v3':
+            errors = ('body_not_found',)
+        elif provider == 'videoland' and source.embedded_article_layout == 'videoland_visible_article_v4':
+            errors = ('article_identity_not_verified',)
+        elif provider == 'pocket' and source.embedded_article_layout == 'pocket_visible_article_v3':
+            # The witnessed repair is five inner calendar-label grammars, not
+            # an author, identity, rights, HTTP or already-saved body retry.
+            errors = ('invalid_bulk_publication_clock',)
+        elif provider == 'pocket' and source.embedded_article_layout == 'pocket_visible_article_v4':
+            # Native nonprose/media/embedded block boundaries only. Neither
+            # missing clocks, paths nor rights/refusal states are a v4 retry.
+            errors = ('article_identity_not_verified',)
+        elif provider == 'pocket' and source.embedded_article_layout in {'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
+            # Native heading/adjacent-account-CTA interpretation only. Observed
+            # identity errors may retry; clocks, paths and refusals stay intact.
+            errors = ('article_identity_not_verified',)
+        version = int(source.embedded_article_layout.rsplit('_v', 1)[1])
+        marker = provider + f'_native_parser_recheck_v{version}:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired = []
+        with self.db:
+            rows = self.db.execute(
+                'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles INDEXED BY dispatch '
+                'WHERE provider=? AND state IN (' + ','.join('?' for _ in errors) + ') '
+                'AND error_code=state AND body_sha256 IS NULL AND parquet_path IS NULL '
+                'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
+                'ORDER BY url', (provider, *errors)).fetchall()
+            for row in rows:
+                if article_id(row['url'], requested=True) is None:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.tzinfo is None or observed.timestamp() > time.time() + 2:
+                        continue
+                except (ValueError, TypeError):
+                    continue
+                self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],))
+                repaired.append({key: value for key, value in dict(row).items() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'stored_heads_leases_refusals_unsupported_paths_changed': False,
+                'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
+        self.metrics.count(provider, f'native_parser_rechecks_v{version}', len(repaired))
+
+    def recheck_mitrade_reviewed_team_scope(self, previous_capture):
+        """Compatibility entrypoint for the accepted v2 team-scope repair."""
+        source = self.registry.sources.get('mitrade')
+        if source and source.embedded_article_layout == 'mitrade_visible_article_v2':
+            self.recheck_mitrade_reviewed_profile_scope(previous_capture)
+
+    def recheck_mitrade_reviewed_profile_scope(self, previous_capture):
+        """One pinned, reviewed profile extension, not a generic rights retry.
+
+        Primary native declarations document each added locale/profile pair.
+        Only its exact production predecessor can re-evaluate an unsaved native
+        exclusion; original attempts, deadline, error and observation survive.
+        Access refusals, complete bodies and active leases are never cleared.
+        """
+        from downloader.news_fulltext_mitrade import (
+            MITRADE_V2_SCOPE_REPAIR_IDENTITY, MITRADE_V4_SCOPE_REPAIR_IDENTITY,
+            MITRADE_V5_SCOPE_REPAIR_IDENTITY, MITRADE_V6_SCOPE_REPAIR_IDENTITY,
+            MITRADE_V7_SCOPE_REPAIR_IDENTITY, MITRADE_V6_REPAIR_COHORT, MITRADE_V7_REPAIR_COHORT, mitrade_article_id,
+        )
+        source = self.registry.sources.get('mitrade')
+        specs = {
+            'mitrade_visible_article_v2': (2, MITRADE_V2_SCOPE_REPAIR_IDENTITY,
+                'mitrade_reviewed_team_scope_v2:', 'mitrade-editor',
+                'one exact publisher-declared analysis-team/profile pair; not a verified person',
+                'reviewed_native_team_scope_rechecks_v2'),
+            'mitrade_visible_article_v4': (4, MITRADE_V4_SCOPE_REPAIR_IDENTITY,
+                'mitrade_reviewed_profile_scope_v4:', 'insights',
+                'exact zh Insights/insights native profile pair; not an independently verified person',
+                'reviewed_native_profile_scope_rechecks_v4'),
+            'mitrade_visible_article_v5': (5, MITRADE_V5_SCOPE_REPAIR_IDENTITY,
+                'mitrade_reviewed_profile_scope_v5:', 'alison-ho',
+                'exact zh Alison Ho/alison-ho and Tony Chou/tony pairs; publisher declarations, not independently verified people',
+                'reviewed_native_profile_scope_rechecks_v5'),
+            'mitrade_visible_article_v6': (6, MITRADE_V6_SCOPE_REPAIR_IDENTITY,
+                'mitrade_reviewed_profile_scope_v6:', 'Invest',
+                'exact zh 投資-槓把子/Invest pair; publisher pen-name declaration, not an independently verified person; only two inspected missing originals',
+                'reviewed_native_profile_scope_rechecks_v6'),
+            'mitrade_visible_article_v7': (7, MITRADE_V7_SCOPE_REPAIR_IDENTITY,
+                'mitrade_reviewed_profile_scope_v7:', 'mitrade-team',
+                'one inspected zh company author/reviewer pair and separate AI-assisted proofreading notice; not verified people or fact-checks',
+                'reviewed_native_profile_scope_rechecks_v7'),
+        }
+        spec = specs.get(source.embedded_article_layout) if source else None
+        if (not source or not source.allowed or not source.known_url_only or not spec
+                or (previous_capture, source.data_fingerprint) != spec[1]):
+            return
+        version, _, marker_prefix, profile, change, metric = spec
+        predecessor = self.db.execute("SELECT value FROM queue_settings WHERE key='source_capture_fingerprint:mitrade'").fetchone()
+        if predecessor is None or predecessor[0] != previous_capture:
+            return
+        marker = marker_prefix+source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired = []
+        with self.db:
+            for row in self.db.execute("SELECT id,url,state,error_code,attempts,due,last_checked_at_utc "
+                    "FROM articles INDEXED BY dispatch WHERE provider='mitrade' "
+                    "AND state='article_rights_or_scope_excluded' AND error_code=state "
+                    "AND body_sha256 IS NULL AND parquet_path IS NULL "
+                    "AND lease_owner IS NULL AND lease_until IS NULL ORDER BY url").fetchall():
+                if mitrade_article_id(row['url']) is None:
+                    continue
+                if version == 6 and row['url'] not in MITRADE_V6_REPAIR_COHORT:
+                    continue
+                if version == 7 and row['url'] not in MITRADE_V7_REPAIR_COHORT:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'])
+                    if observed.utcoffset() is None or observed.timestamp() > time.time():
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],))
+                repaired.append({key: value for key, value in dict(row).items() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': version, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'primary_profile': 'https://www.mitrade.com/zh/insights/profile/'+profile,
+                **({'additional_primary_profiles': ['https://www.mitrade.com/zh/insights/profile/tony']}
+                   if version == 5 else {}),
+                'reviewed_change': change,
+                'rows': repaired, 'attempts_due_error_observation_preserved': True,
+                'http_refusals_leases_stored_bodies_or_diagnostic_budgets_reset': False,
+                'all_old_exclusions_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
+        self.metrics.count('mitrade', metric, len(repaired))
 
     def recheck_verified_native_bodies(self, prior_sources):
         """Requeue only observed, unsaved, unleased native missing bodies.
@@ -2885,6 +3122,33 @@ class NewsQueue:
                 'source_requests_or_acceptance_asserted': False, 'article_or_source_outcomes_reset': False,
                 'http_refusals_requeued': False, 'observed_at_utc': utc_now()}, sort_keys=True)))
 
+    def record_feed_body_only_discovery_guard(self, prefix, source, parser, error):
+        """Do not replay an already-applied XML/rights migration for RSS prose.
+
+        Compatibility is derived from the same exact source/rights payload,
+        with only the reviewed body ABI added. A real XML/envelope contract
+        change alters both discovery digests and cannot find this old guard.
+        """
+        from downloader.news_fulltext import fulltext_feed_discovery_fingerprints
+
+        if not source.prior_fulltext_feed_data_fingerprint:
+            return False
+        for previous in fulltext_feed_discovery_fingerprints(source)[1:]:
+            old_marker = prefix + source.provider + ':' + previous
+            if not self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (old_marker,)).fetchone():
+                continue
+            marker = prefix + source.provider + ':' + parser
+            with self.db:
+                self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                    'new_discovery_fingerprint': parser, 'previous_migration_marker': old_marker,
+                    'jobs': [], 'previous_error': error, 'feed_body_only_capture_change': True,
+                    'xml_and_bulk_rights_contracts_unchanged': True,
+                    'source_capture_contract_changed': False, 'source_requests_or_acceptance_asserted': False,
+                    'article_or_source_outcomes_reset': False, 'http_refusals_requeued': False,
+                    'observed_at_utc': utc_now()}, sort_keys=True)))
+            return True
+        return False
+
     def recheck_rss_metadata_parser(self, *, skip_providers=()):
         """One retry of registered invalid XML jobs under the new discovery ABI.
 
@@ -2901,6 +3165,9 @@ class NewsQueue:
             parser = discovery_fingerprint(source)
             marker = 'rss_xml_controls_parser_recheck:' + source.provider + ':' + parser
             if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+                continue
+            if self.record_feed_body_only_discovery_guard('rss_xml_controls_parser_recheck:',
+                    source, parser, 'invalid_feed'):
                 continue
             if source.provider in skip_providers:
                 self.record_scheduling_only_discovery_guard(marker, source, parser, 'invalid_feed')
@@ -2943,6 +3210,9 @@ class NewsQueue:
             parser = discovery_fingerprint(source)
             marker = 'mixed_bulk_scope_continuation:' + source.provider + ':' + parser
             if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+                continue
+            if self.record_feed_body_only_discovery_guard('mixed_bulk_scope_continuation:',
+                    source, parser, 'bulk_response_contains_restricted_text'):
                 continue
             if source.provider in skip_providers:
                 self.record_scheduling_only_discovery_guard(marker, source, parser, 'bulk_response_contains_restricted_text')
@@ -3554,10 +3824,19 @@ class NewsQueue:
                 deadlines.append(max(min(earliest), provider_cooldowns.get(provider, 0)))
         return min(maximum, max(0.0, min(deadlines) - now)) if deadlines else maximum
 
-    def claim_url(self, url: str, lease_seconds: int, *, refresh: bool = False):
-        """Explicit article selection still respects persisted retry deadlines."""
+    def claim_url(self, url: str, lease_seconds: int, *, refresh: bool = False,
+                  expected_missing_head: dict | None = None):
+        """Respect retry deadlines and an optional exact retained-original fence."""
         url = normalize_url(url)
         source = self.registry.require(url)
+        if expected_missing_head is not None:
+            from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
+            if (not isinstance(expected_missing_head, dict)
+                    or set(expected_missing_head) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
+                    or expected_missing_head['url'] != url or expected_missing_head['provider'] != source.provider
+                    or expected_missing_head['state'] not in {'pending', 'retry', 'retry_cooldown'}
+                    or expected_missing_head['body_sha256'] is not None or refresh):
+                raise ValueError('invalid exact missing-head claim fence')
         if source.acquisition_mode == "finite":
             original = self.db.execute("SELECT 1 FROM finite_cohort_members WHERE provider=? AND url=?", (source.provider, url)).fetchone()
             supplement = source.allow_reviewed_supplements and self.db.execute(
@@ -3571,8 +3850,18 @@ class NewsQueue:
                 return None
             if row["body_sha256"] and row["state"] == "complete" and not refresh:
                 return None
-            self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=?",
-                            (self.owner, now + lease_seconds, row["id"]))
+            conditions, expected_values = '', ()
+            if expected_missing_head is not None:
+                if any(row[key] != value for key, value in expected_missing_head.items()):
+                    return None
+                # The UPDATE itself fences intervening writes, not only the
+                # earlier SELECT. Never consume an attempt over a new refusal.
+                conditions = ''.join(' AND '+field+' IS ?' for field in RETAINED_SUPPLEMENT_HEAD_FIELDS)
+                expected_values = tuple(expected_missing_head[field] for field in RETAINED_SUPPLEMENT_HEAD_FIELDS)
+            changed = self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=?"+conditions,
+                            (self.owner, now + lease_seconds, row["id"], *expected_values)).rowcount
+            if changed != 1:
+                return None
         self.metrics.count(row["provider"], "frontier_attempts_started")
         return self._bind_saved_validators(dict(row))
 
@@ -3710,6 +3999,10 @@ class NewsQueue:
         if not records:
             return
         for record in records:
+            if record.get('reviewed_native_head_json') is not None:
+                from downloader.news_fulltext_retained_native import reviewed_native_head_matches
+                if not reviewed_native_head_matches(self, record):
+                    raise ValueError('reviewed_native_head_changed_before_acceptance')
             if record.get('retained_metadata_head_json') is not None and not self._metadata_head_matches(record):
                 raise ValueError('retained_metadata_head_changed_before_acceptance')
             if record.get('retained_supplement_head_json') is not None and not self._supplement_head_matches(record):
@@ -3845,6 +4138,11 @@ class NewsQueue:
         metadata_heads, http_attempts = 0, 0
         with self.db:
             for record in records:
+                if record.get('reviewed_native_head_json') is not None:
+                    from downloader.news_fulltext_retained_native import reviewed_native_head_matches
+                    if not reviewed_native_head_matches(self, record):
+                        self.counter('reviewed_native_superseded_at_commit', 1)
+                        continue
                 if record.get('retained_failure_head_json') is not None and not self._failure_replay_head_matches(record):
                     self.counter('retained_failure_superseded_at_commit', 1)
                     continue
@@ -3895,6 +4193,7 @@ class NewsQueue:
             raise ValueError('bounded_batched_receipt_readers_required')
         observation = {'contract_version': 1, 'mode': 'adaptive' if read_ahead_workers is None else 'explicit',
             'adaptive_strategy_version': ADAPTIVE_RECEIPT_STRATEGY_VERSION,
+            'prefix_io_contract_version': RECEIPT_PREFIX_IO_VERSION,
             'chosen_readers': read_ahead_workers or 0, 'probes_checked': 0, 'last_probe': None,
             'receipts_decoded': 0, 'prefetched_inputs': 0, 'synchronous_inputs': 0, 'completed': False,
             'started_readers_after_receipts': 0 if read_ahead_workers else None,
@@ -3902,7 +4201,12 @@ class NewsQueue:
             'adaptive_prefetch_slice_receipts': RECEIPT_CHUNK * RECEIPT_PREFETCH_MAX_CHUNKS,
             # The owner can still hold its prior chunk while this iterator
             # transfers the next and two workers fill bounded pending chunks.
-            'maximum_prefetch_raw_bytes': 4 * (1 << 20) + 2, 'all_json_and_replay_on_owner': True}
+            'maximum_prefetch_raw_bytes': 4 * (1 << 20) + 2,
+            # Joining multiple short raw reads can temporarily retain their
+            # inputs beside the joined bytes, at most one prefix per reader.
+            # These are byte payload bounds, not whole-process/object RSS.
+            'maximum_prefix_join_scratch_bytes': 2 * ((1 << 20) + 1),
+            'all_json_and_replay_on_owner': True}
         self.acceptance_receipt_io = observation
         process_cpu_start = time.process_time()
 
@@ -4016,11 +4320,16 @@ class NewsQueue:
             provider_cooldowns = self.provider_cooldown_snapshot()
         provider_cooldowns = dict(provider_cooldowns or {})
         providers = {}
-        for provider, state, count, body_bytes in self.db.execute(
-                "SELECT provider,state,articles,body_bytes FROM state_metrics WHERE articles>0"):
-            item = providers.setdefault(provider, {"states": {}, "text_bytes": 0})
+        for provider, state, count, body_bytes, stored in self.db.execute(
+                "SELECT provider,state,articles,body_bytes,stored_body_urls FROM state_metrics WHERE articles>0"):
+            item = providers.setdefault(provider, {"states": {}, "text_bytes": 0,
+                "body_state_counts": {"missing": {}, "stored": {}}})
             item["states"][state] = count
             item["text_bytes"] += body_bytes or 0
+            if stored:
+                item['body_state_counts']['stored'][state] = stored
+            if count > stored:
+                item['body_state_counts']['missing'][state] = count - stored
         # Transactional head counters are O(providers), not an articles-table
         # scan per heartbeat. Rechecks/failures retain old bodies and must not
         # make their stored-body progress vanish with the complete state.
@@ -4037,6 +4346,7 @@ class NewsQueue:
         for provider, item in providers.items():
             source = self.registry.sources.get(provider)
             item["stored_body_urls"] = stored_heads.get(provider, 0)
+            item.setdefault('body_state_counts', {'missing': {}, 'stored': {}})
             item["configured"] = source is not None
             item["acquisition_mode"] = source.acquisition_mode if source else "unreviewed"
             if source and source.acquisition_mode == "finite":
@@ -4056,6 +4366,8 @@ class NewsQueue:
         for item in providers.values():
             totals.update(item["states"])
         eligible_remaining = sum(totals[s] for s in ("pending", "retry", "retry_cooldown", "inflight"))
+        eligible_missing = sum(item['body_state_counts']['missing'].get(state, 0) for item in providers.values()
+                               for state in ('pending', 'retry', 'retry_cooldown', 'inflight'))
         rate = accepted_this_run / run_seconds if run_seconds > 0 and accepted_this_run >= 3 else None
         origins = self.db.execute("SELECT count(*),coalesce(sum(rows),0),coalesce(sum(invalid_urls),0) FROM origins "
                                   "WHERE id IN (SELECT max(id) FROM origins WHERE id NOT IN "
@@ -4079,14 +4391,16 @@ class NewsQueue:
                     self.db, self.registry.sources.get('cnyes'), owner_start_epoch=index_clock - elapsed,
                     now_epoch=index_clock, activity=activity)
         for provider, item in providers.items():
-            observed = performance["providers"].get(provider, {}).get("counts", {}).get("durably_accepted_versions", 0)
+            observed = performance["providers"].get(provider, {}).get("counts", {}).get("durably_accepted_new_url_heads", 0)
             owner_rate = observed / elapsed if observed >= 10 and elapsed >= 60 else None
-            remaining = sum(item["states"].get(state, 0) for state in ("pending", "retry", "retry_cooldown", "inflight"))
+            remaining = sum(item['body_state_counts']['missing'].get(state, 0)
+                            for state in ('pending', 'retry', 'retry_cooldown', 'inflight'))
             item["observed_owner_articles_per_second"] = owner_rate
             item["remaining_eligible_estimate_seconds"] = remaining / owner_rate if owner_rate else None
-            item["eta_basis"] = "conditional projection from this owner's full wall time; includes waits, failures, ingestion and idle"
+            item["eta_basis"] = "queued missing bodies / new stored URL heads per owner wall time; retained-body rechecks excluded; includes waits, failures, ingestion and idle"
         eligible_provider_etas = [item["remaining_eligible_estimate_seconds"] for item in providers.values()
-                                 if any(item["states"].get(state, 0) for state in ("pending", "retry", "retry_cooldown", "inflight"))]
+                                 if any(item['body_state_counts']['missing'].get(state, 0)
+                                        for state in ('pending', 'retry', 'retry_cooldown', 'inflight'))]
         eta = max(eligible_provider_etas) if eligible_provider_etas and all(value is not None for value in eligible_provider_etas) else None
         enabled_bulk_pages, registered_bulk_pages = 0, 0
         # Project all scopes once per real endpoint, not one heartbeat entry per
@@ -4128,6 +4442,7 @@ class NewsQueue:
             "bulk_item_error_count_contract_version": BULK_ERROR_COUNT_CONTRACT_VERSION,
             "status_json_encoding": "compact_utf8",
             "provider_stored_body_counter_contract_version": 1,
+            "provider_body_state_counter_contract_version": ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION,
             "original_source_inventory": {key: value for key, value in original_sources.items() if key != 'sources'},
             "article_failure_observation_contract_version": FAILURE_OBSERVATION_CONTRACT_VERSION,
             "failure_diagnostic_budget_contract_version": FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION,
@@ -4194,6 +4509,8 @@ class NewsQueue:
             "counters": counters, "http_requests_this_run": requests_by_provider or {},
             "http_response_bytes_this_run": response_bytes,
             "eligible_remaining_articles": eligible_remaining, "observed_accepted_articles_per_second": rate,
+            "eligible_missing_body_articles": eligible_missing,
+            "eligible_stored_body_recheck_articles": eligible_remaining - eligible_missing,
             "eligible_eta_seconds": eta, "all_sources_eta_seconds": None,
             "eta_basis": "maximum conditional provider ETA using full owner wall time; unavailable when any eligible source lacks measured throughput",
             "historical_completeness_verified": False, "publish": False, "remote_training_export": False,

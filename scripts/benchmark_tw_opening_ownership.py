@@ -15,6 +15,7 @@ import copy
 from datetime import datetime, timedelta
 from functools import lru_cache
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 import shutil
@@ -54,8 +55,24 @@ def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
     new market observations or write the original receipt. The optional stall
     models storage tail latency, not a measured provider/network delay.
     """
+    # Function-only rebinding leaves column-view class methods pointing at the
+    # importing process's cache. Load the complete canonical implementation in
+    # isolation instead; neither its methods nor its helpers may read live/test
+    # globals belonging to a different trial.
+    name = f"_opening_cache_trial_{time.monotonic_ns()}"
+    spec = importlib.util.spec_from_file_location(name, quotes.__file__)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        return _cache_flush_trial_namespace(receipt, directory, enabled=enabled,
+                                             stall_ms=stall_ms, namespace=vars(module))
+    finally:
+        sys.modules.pop(name, None)
+
+
+def _cache_flush_trial_namespace(receipt, directory, *, enabled, stall_ms, namespace):
     directory.mkdir(parents=True, exist_ok=True)
-    namespace = dict(vars(quotes))
     baseline_sha = None
     if not enabled:
         code = subprocess.run(
@@ -69,15 +86,6 @@ def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
         if {node.name for node in nodes} != names:
             raise RuntimeError("pinned opening cache functions not found")
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-opening-cache>", "exec"), namespace)
-    else:
-        # Rebind the current functions to the same isolated globals, rather
-        # than mutate the importing process's live cache/locks.
-        import types
-        for name in ("seed_tw_opening_snapshot_cache", "persist_tw_opening_snapshot_cache",
-                     "fetch_tw_mis_opening_snapshot"):
-            fn = getattr(quotes, name)
-            namespace[name] = types.FunctionType(fn.__code__, namespace, fn.__name__, fn.__defaults__, fn.__closure__)
-            namespace[name].__kwdefaults__ = fn.__kwdefaults__
     day, symbols = receipt["session_date"], receipt["requested_symbols"]
     root = str((directory.parent / "offline-stocks").resolve())
     fixed = datetime.fromisoformat(day + "T12:00:00+08:00")
@@ -98,7 +106,7 @@ def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
     merge, flush = namespace["seed_tw_opening_snapshot_cache"], namespace["persist_tw_opening_snapshot_cache"]
     fallback = np.full(len(symbols), np.nan)
     entered, release, writes, syncs = threading.Event(), threading.Event(), [], []
-    original = quotes._persist_tw_mis_opening_receipt
+    original = namespace["_persist_tw_mis_opening_receipt"]
     original_fsync = quotes.os.fsync
 
     def writer(**kwargs):
@@ -161,12 +169,14 @@ def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
         fields = ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
                   "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms")
         result_hash = hashlib.sha256()
+        array_hashes = {}
         for name in fields:
             left, right = getattr(final, name), getattr(restored, name)
             if left.dtype != right.dtype or left.shape != right.shape or left.tobytes() != right.tobytes():
                 raise AssertionError(f"complete cold-restore mismatch: {name}")
             result_hash.update(name.encode())
             result_hash.update(left.tobytes())
+            array_hashes[name] = hashlib.sha256(left.tobytes()).hexdigest()
         committed["parquet_root"] = "<isolated-scope>"
         if set(committed["requested_symbols"]) != set(symbols):
             raise AssertionError("source receipt lost requested universe")
@@ -174,7 +184,10 @@ def cache_flush_trial(receipt, directory, *, enabled, stall_ms):
     return {"merge_during_flush_ms": merge_ms, "read_during_flush_ms": read_ms,
             "first_durable_flush_ms": flush_ms, "durable_write_count": len(writes),
             "file_and_directory_fsync_count": len(syncs), "restored_full_output_sha256": result_hash.hexdigest(),
-            "restored_row_count": len(committed["rows"]), "baseline_code_sha256": baseline_sha}
+            "restored_row_count": len(committed["rows"]), "baseline_code_sha256": baseline_sha,
+            "restored_array_sha256": array_hashes,
+            "receipt_field_sha256": {name: hashlib.sha256(json.dumps(value, sort_keys=True,
+                allow_nan=False).encode()).hexdigest() for name, value in committed.items()}}
 
 
 def run_cache_flush(receipt_path, output, *, repeats=3, stall_ms=100):
@@ -193,7 +206,10 @@ def run_cache_flush(receipt_path, output, *, repeats=3, stall_ms=100):
                 pair[name] = cache_flush_trial(receipt, Path(temp) / f"{index}-{name}",
                                               enabled=enabled, stall_ms=stall_ms)
             if pair["original"]["restored_full_output_sha256"] != pair["off_lock"]["restored_full_output_sha256"]:
-                raise AssertionError("full opening source/clock/coverage restore parity failed")
+                differences = {key: [name for name in set(pair["original"][key]) | set(pair["off_lock"][key])
+                    if pair["original"][key].get(name) != pair["off_lock"][key].get(name)]
+                    for key in ("restored_array_sha256", "receipt_field_sha256")}
+                raise AssertionError(f"full opening source/clock/coverage restore parity failed: {differences}")
             pairs.append(pair)
     result = {"contract": "opening_cache_flush_paired_offline_v1",
               "scope": "full_recorded_axis_merge_read_and_durable_restore_not_live_opening_slo",

@@ -7,13 +7,14 @@ bad finance time attribute is retained, not repaired or used as a timestamp.
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+from itertools import islice
 import json
 import re
 from urllib.parse import urljoin, urlsplit
 
 from bs4 import NavigableString, Tag
 
-from downloader.news_fulltext_policy import NewsError, _objects, normalize_url
+from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS, NewsError, _objects, normalize_url
 from downloader.news_fulltext_public_originals import _one, _visible
 from downloader.news_fulltext_metrics import ETTODAY_ATTRIBUTION_FAILURE_STAGES
 
@@ -106,9 +107,20 @@ _CLOCK = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+08:
 _REVISION_PLACEHOLDER = '1970-01-01T08:00:00+08:00'
 _REPORTER = re.compile(r'記者([\u3400-\u9fff]{2,8}(?:、[\u3400-\u9fff]{2,8}){0,3})／[\u3400-\u9fff]{1,12}報導')
 _BARE_REPORTER = re.compile(r'([\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')
+_BARE_REPORTER_PAIR = re.compile(r'([\u3400-\u9fff]{2,8}、[\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')
+_SEARCH_TEAM_NAMED_AUTHOR = re.compile(r'網搜小組／([\u3400-\u9fff]{2,8})報導')
+_HOUSE_ROLE_REPORTERS = (
+    ('實習記者', re.compile(r'實習記者([\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')),
+    ('網搜小組', _SEARCH_TEAM_NAMED_AUTHOR),
+)
 # Literal visible house signatures independently observed on 2026-10-18.
 # These are unnamed publisher desks, not people or a general Center grammar.
 _HOUSE_NEWSROOM_CREDITS = {'房產中心／綜合報導': '房產中心', '財經中心／台北報導': '財經中心'}
+# Separately reviewed literal native house signatures. Keep their admission
+# behind v32; updating this map must never change earlier capture contracts.
+_HOUSE_NEWSROOM_CREDITS_V32 = {**_HOUSE_NEWSROOM_CREDITS,
+    '財經中心／綜合報導': '財經中心', '消費中心／綜合報導': '消費中心', '房產中心／台北報導': '房產中心'}
+_HOUSE_ADVERTORIAL_MARKERS = frozenset(('【廣編特輯】', '【企劃特輯】'))
 _CREDIT_PREFIX = re.compile(r'^(?:記者|編輯|編譯|實習記者|財經中心|生活中心|社會中心|'
     r'政治中心|國際中心|ETtoday|ETTODAY|中央社|路透社|本文來源|來源[：:]|轉載|文[／/])')
 _AD_TEXT = '[廣告]請繼續往下閱讀...'
@@ -381,7 +393,7 @@ def _native_json(text, *, allow_literal_value_controls=False, allow_author_url_c
 
 def _schemas(soup, original, title, published, modified, names, *, adapter_contract_version=1,
              require_headline_witness=False, social_headline_key=None, native_bare_reporters=(),
-             native_newsroom=False):
+             native_newsroom=False, native_named_authors=()):
     declarations = []
     notices = []
     scripts = soup.select('script[type="application/ld+json"]')
@@ -400,7 +412,7 @@ def _schemas(soup, original, title, published, modified, names, *, adapter_contr
             # response hash lives in the shared capture receipt, not a hash
             # falsely labelled "original" after DOM normalization.
             notices.extend({'kind': kind, 'raw_evidence': 'shared_original_response_receipt'} for kind in anomalies)
-        if len(declarations) > 1 or require_headline_witness and len(declarations) != 1:
+        if len(declarations) > 1 or (require_headline_witness or native_bare_reporters or native_named_authors) and len(declarations) != 1:
             raise ValueError('ambiguous current article')
     except (ValueError, TypeError, RecursionError):
         raise NewsError('article_identity_not_verified') from None
@@ -424,7 +436,8 @@ def _schemas(soup, original, title, published, modified, names, *, adapter_contr
             # Bind either native name to this article's creator/name/id.
             # Never take an author name from Organization or an account alone.
             creator = article.get('creator')
-            if (len(native_bare_reporters) != 1 or not isinstance(creator, list) or len(creator) != 2
+            allowed_count = len(native_bare_reporters) == 1 or adapter_contract_version >= 30 and len(native_bare_reporters) == 2
+            if (not allowed_count or not isinstance(creator, list) or len(creator) != 2
                     or not isinstance(creator[1], str) or not re.fullmatch(r'[1-9][0-9]{0,9}', creator[1])
                     or creator[0] != creator[1] + '-' + native_bare_reporters[0]):
                 raise _attribution_failure('bare_reporter_creator_mismatch')
@@ -438,6 +451,11 @@ def _schemas(soup, original, title, published, modified, names, *, adapter_contr
         reporters = (len(authors) == len(names)
             and all(isinstance(a, dict) and a.get('@type') == 'Person' for a in authors)
             and [a.get('name') for a in authors] == names)
+        if native_named_authors and (not reporters or tuple(names) != native_named_authors):
+            # This visible named signature is independently corroborated by
+            # the same current article's Person author. A publisher/creator
+            # account, subset, desk name or inferred employment is not proof.
+            raise _attribution_failure('named_author_schema_mismatch')
         last_of_two = (len(names) == 2 and len(authors) == 1 and isinstance(authors[0], dict)
             and authors[0].get('@type') == 'Person' and authors[0].get('name') == names[-1])
         # The schema's author property is not an assertion that the visible
@@ -469,7 +487,51 @@ def _schemas(soup, original, title, published, modified, names, *, adapter_contr
     return notices
 
 
-def _house_image_caption_credit(node, *, allow_reporter=False, allow_trailing_caption_break=False):
+def _house_role_credit(text):
+    """Names come from the visible signature, never the creator account."""
+    for role, pattern in _HOUSE_ROLE_REPORTERS:
+        if match := pattern.fullmatch(text):
+            return match, {'kind': 'native_house_role_named_reporter_with_creator_witness',
+                'native_credit': text, 'native_role': role, 'native_reporter_names': [match[1]],
+                'same_article_creator_name_and_identifier_required': True,
+                'role_promoted_to_person_or_source_values_rewritten': False}
+    return None, None
+
+
+def _house_image_caption_only(node):
+    """The attested image/BR/STRONG prefix followed by a separate reporter P.
+
+    Nothing is inferred from an image's alt/title or a schema editor. Extra
+    prose, nested caption markup, missing following credit or hidden nodes
+    cannot be removed as a caption-only prelude.
+    """
+    children = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
+    if (len(children) < 3 or type(children[0]) is not Tag or children[0].name != 'img'
+            or type(children[-1]) is not Tag or children[-1].name != 'strong'
+            or any(type(c) is not Tag or c.name != 'br' or c.attrs or c.contents for c in children[1:-1])):
+        return None
+    caption = children[-1]
+    leaves = [c for c in caption.contents if not isinstance(c, NavigableString) or str(c).strip()]
+    if len(leaves) != 1 or type(leaves[0]) is not NavigableString:
+        return None
+    text = caption.get_text(' ', strip=True)
+    following = node.find_next_sibling()
+    if (not text.startswith('▲') or not text.endswith('）') or _REPORTER.search(text)
+            or following is None or following.name != 'p'):
+        return None
+    credit = following.get_text(' ', strip=True)
+    credit_leaves = [c for c in following.contents if not isinstance(c, NavigableString) or str(c).strip()]
+    if (not _REPORTER.fullmatch(credit) or len(credit_leaves) != 1
+            or type(credit_leaves[0]) is not NavigableString):
+        return None
+    _visible_text(node)
+    _visible(children[0])
+    _visible_text(following)
+    return text
+
+
+def _house_image_caption_credit(node, *, allow_reporter=False, allow_trailing_caption_break=False,
+                                allow_adjacent_caption_fragments=False, newsroom_credits=None):
     """The observed image/caption/credit-only first P, never sliced prose.
 
     Keep the original response intact. Only remove this verified prelude from
@@ -482,17 +544,22 @@ def _house_image_caption_credit(node, *, allow_reporter=False, allow_trailing_ca
             or type(children[-1]) is not NavigableString):
         return None
     credit = str(children[-1]).strip()
-    newsroom = _HOUSE_NEWSROOM_CREDITS.get(credit)
+    newsroom_credits = _HOUSE_NEWSROOM_CREDITS if newsroom_credits is None else newsroom_credits
+    newsroom = newsroom_credits.get(credit)
     reporter = _REPORTER.fullmatch(credit) if allow_reporter else None
     if not newsroom and not reporter:
         return None
     middle = children[1:-1]
     captions = [child for child in middle if isinstance(child, Tag) and child.name == 'strong']
-    if (len(captions) != 1 or any(type(child) is not Tag or child.name not in {'br', 'strong'} for child in middle)
+    adjacent = (allow_adjacent_caption_fragments and bool(reporter) and len(captions) == 2
+        and middle.index(captions[1]) == middle.index(captions[0]) + 1
+        and re.fullmatch(r'（圖／[^（）]{1,200}）', captions[1].get_text(' ', strip=True)) is not None
+        and all(type(c) is NavigableString for caption in captions for c in caption.contents))
+    if (len(captions) != 1 and not adjacent or any(type(child) is not Tag or child.name not in {'br', 'strong'} for child in middle)
             or not any(child.name == 'br' for child in middle[:middle.index(captions[0])])):
         raise _attribution_failure('image_credit_structure')
     caption = captions[0]
-    direct_break = any(child.name == 'br' for child in middle[middle.index(caption) + 1:])
+    direct_break = any(child.name == 'br' for child in middle[middle.index(captions[-1]) + 1:])
     caption_leaves = [child for child in caption.contents
         if not isinstance(child, NavigableString) or str(child).strip()]
     # The observed903852 keeps its caption/report separator inside STRONG.
@@ -509,8 +576,8 @@ def _house_image_caption_credit(node, *, allow_reporter=False, allow_trailing_ca
         raise _attribution_failure('image_caption_structure')
     if len([child for child in caption.contents if type(child) is NavigableString and str(child).strip()]) != 1:
         raise _attribution_failure('image_caption_structure')
-    text = caption.get_text(' ', strip=True)
-    if not text.startswith('▲') or _REPORTER.search(text) or any(c in text for c in _HOUSE_NEWSROOM_CREDITS):
+    text = ' '.join(c.get_text(' ', strip=True) for c in captions)
+    if not text.startswith('▲') or _REPORTER.search(text) or any(c in text for c in newsroom_credits):
         raise _attribution_failure('image_caption_ambiguous_credit')
     following = node.find_next_sibling()
     following_text = following.get_text(' ', strip=True) if following is not None and following.name == 'p' else ''
@@ -522,7 +589,8 @@ def _house_image_caption_credit(node, *, allow_reporter=False, allow_trailing_ca
     return newsroom, credit, text, native_trailing_break and not direct_break
 
 
-def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notices=None):
+def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notices=None,
+                          allow_house_named_roles=False, allow_house_caption_trailing_break=False):
     """Remove only the observed BR-delimited caption/byline prefix in place.
 
     Called on a visible caption paragraph immediately after its native image.
@@ -539,8 +607,17 @@ def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notic
         else:
             # Only direct BR boundaries and the observed inline vocabulary.
             # Nested BR/block/media/script layouts need their own evidence.
+            caption_leaves = ([c for c in child.contents if not isinstance(c, NavigableString) or str(c).strip()]
+                if allow_house_caption_trailing_break and isinstance(child, Tag) and child.name == 'strong' else [])
+            trailing_caption_break = (allow_house_caption_trailing_break and isinstance(child, Tag)
+                and child.name == 'strong' and len(caption_leaves) == 2
+                and type(caption_leaves[0]) is NavigableString
+                and str(caption_leaves[0]).strip().startswith('▲')
+                and type(caption_leaves[1]) is Tag and caption_leaves[1].name == 'br'
+                and not caption_leaves[1].attrs and not caption_leaves[1].contents)
             if isinstance(child, Tag) and (child.name not in {'strong', 'b', 'span', 'a', 'em', 'i', 'u'}
-                    or any(tag.name not in {'strong', 'b', 'span', 'a', 'em', 'i', 'u'} for tag in child.find_all(True))):
+                    or not trailing_caption_break and any(tag.name not in {'strong', 'b', 'span', 'a', 'em', 'i', 'u'}
+                        for tag in child.find_all(True))):
                 raise _attribution_failure('caption_credit_structure')
             if not isinstance(child, (Tag, NavigableString)) or type(child) not in (Tag, NavigableString):
                 raise _attribution_failure('caption_credit_structure')
@@ -555,6 +632,9 @@ def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notic
     credit_index = nonempty[1]
     credit = values[credit_index]
     match = _REPORTER.fullmatch(credit)
+    role_notice = None
+    if match is None and allow_house_named_roles:
+        match, role_notice = _house_role_credit(credit)
     leaves = [child for child in lines[credit_index] if not isinstance(child, NavigableString) or str(child).strip()]
     if (not match or len(leaves) != 1 or type(leaves[0]) is not NavigableString
             or any(_REPORTER.search(value) for index, value in enumerate(values) if index != credit_index)):
@@ -564,6 +644,8 @@ def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notic
     names = match[1].split('、')
     if len(set(names)) != len(names):
         raise _attribution_failure('caption_credit_duplicate_reporters')
+    if role_notice is not None and syntax_notices is not None:
+        syntax_notices.append(role_notice)
     if credit_only:
         # The attested native paragraph contains only the caption and reporter.
         # Require actual, visible, separate following prose; never manufacture
@@ -598,6 +680,48 @@ def _caption_break_credit(node, *, allow_caption_credit_only=False, syntax_notic
                 break
             boundaries += 1
     return names, credit, values[nonempty[0]]
+
+
+def _house_image_caption_prose_credit(node, syntax_notices, *, pure_desk_signatures=()):
+    """Reuse the BR parser after an attested image-only prefix, preserving prose.
+
+    Only the working-copy image and its empty separators are removed here.
+    The shared parser retains all original nodes after the plain byline's BR;
+    no flattened-text slicing or image-alt attribution is permitted.
+    """
+    children = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
+    if (len(children) < 7 or type(children[0]) is not Tag or children[0].name != 'img'
+            or type(children[-1]) is not NavigableString or not str(children[-1]).strip()):
+        return None
+    if str(children[-1]).strip() in pure_desk_signatures:
+        # v33: an image/caption followed only by a literal desk is not the
+        # reporter+prose grammar, even with extra empty BR separators. Do not
+        # destructively remove its image before the strict pure-prefix parser.
+        return None
+    captions = [c for c in children if type(c) is Tag and c.name == 'strong']
+    if len(captions) != 1:
+        return None
+    caption = captions[0]
+    position = children.index(caption)
+    if (position < 2 or any(type(c) is not Tag or c.name != 'br' or c.attrs or c.contents
+            for c in children[1:position])
+            or any(type(c) is Tag and c.name == 'br' and (c.attrs or c.contents) for c in children)
+            or any(type(c) is not NavigableString for c in caption.contents)):
+        return None
+    caption_text = caption.get_text(' ', strip=True)
+    if not caption_text.startswith('▲') or not caption_text.endswith('）') or _REPORTER.search(caption_text):
+        return None
+    _visible_text(node)
+    _visible(children[0])
+    for child in list(node.contents):
+        if child is caption:
+            break
+        child.extract()
+    names, credit, text = _caption_break_credit(node)
+    syntax_notices.append({'kind': 'native_house_image_caption_reporter_and_prose_same_paragraph',
+        'only_image_and_empty_separators_removed_before_shared_caption_parser': True,
+        'following_native_prose_nodes_preserved': True, 'source_values_rewritten': False})
+    return names, credit, text
 
 
 def _static_facebook_video_preview(body):
@@ -995,6 +1119,192 @@ def _strong_split_reporter_credit(node):
     return (credit, match) if match else None
 
 
+def _house_static_player_prefix(paragraphs, *, newsroom_credits=None):
+    """Separate the observed player/caption/desk prelude, never load media.
+
+    This is a literal native declaration, not a video transcript, attribution
+    or permission to visit the player. Require adjacent, unambiguous DOM
+    boundaries so no newsroom prose can disappear with a preview paragraph.
+    """
+    newsroom_credits = _HOUSE_NEWSROOM_CREDITS if newsroom_credits is None else newsroom_credits
+    if not paragraphs or not paragraphs[0].find('iframe'):
+        return None
+    if len(paragraphs) < 3:
+        raise NewsError('article_identity_not_verified')
+    preview, caption, credit = paragraphs[:3]
+    leaves = lambda node: [c for c in node.contents
+        if not isinstance(c, NavigableString) or str(c).strip()]
+    nodes, caption_nodes, credit_nodes = leaves(preview), leaves(caption), leaves(credit)
+    if (preview.attrs or caption.attrs or len(nodes) != 1 or type(nodes[0]) is not Tag
+            or nodes[0].name != 'iframe' or nodes[0].contents
+            or preview.find_next_sibling() is not caption or caption.find_next_sibling() is not credit
+            or len(caption_nodes) != 1 or type(caption_nodes[0]) is not Tag
+            or caption_nodes[0].name != 'strong' or caption_nodes[0].attrs
+            or len(leaves(caption_nodes[0])) != 1 or type(leaves(caption_nodes[0])[0]) is not NavigableString
+            or len(credit_nodes) != 1 or type(credit_nodes[0]) is not NavigableString
+            or credit.get_text(' ', strip=True) not in newsroom_credits):
+        raise NewsError('article_identity_not_verified')
+    frame = nodes[0]
+    attrs = {'allowfullscreen': 'true', 'frameborder': '0', 'height': '315',
+        'mozallowfullscreen': 'true', 'scrolling': 'no', 'webkitallowfullscreen': 'true', 'width': '560'}
+    src = frame.get('src')
+    if not isinstance(src, str) or len(src) > 4096 or frame.attrs != {**attrs, 'src': src}:
+        raise NewsError('article_identity_not_verified')
+    try:
+        route = urlsplit(src)
+    except ValueError:
+        raise NewsError('article_identity_not_verified') from None
+    if (route.scheme != 'https' or route.netloc != 'www.ettoday.net' or route.fragment
+            or not re.fullmatch(r'/tools/player/[1-9][0-9]{0,15}-[1-9][0-9]{0,15}', route.path)
+            or not re.fullmatch(r'title=[^&#\s]{1,3000}&bid=boba_preroll_web&show_ad=1&uccu=3', route.query)):
+        raise NewsError('article_identity_not_verified')
+    text = caption.get_text(' ', strip=True)
+    if not re.fullmatch(r'▲[^（）\r\n]{1,300}（影、圖／[^（）\r\n]{1,80}）', text):
+        raise NewsError('article_identity_not_verified')
+    for node in (preview, frame, caption, credit):
+        _visible_text(node)
+    notice = {'kind': 'native_house_static_player_caption_prefix',
+        'source_iframe_attributes': dict(frame.attrs), 'native_caption': text,
+        'caption_retained_separately': True, 'following_native_desk_required': True,
+        'media_requested_or_executed': False, 'media_content_accepted': False,
+        'media_title_promoted_to_prose_or_attribution': False, 'source_values_rewritten': False}
+    preview.clear()
+    caption.clear()
+    return text, notice
+
+
+def _house_static_youtube_desk_prefix(paragraphs, *, newsroom_credits):
+    """Retain the observed static player declaration, not its video or title.
+
+    Unlike the older publisher-player prefix this native layout has no caption:
+    the next paragraph is the desk credit and every following prose node stays.
+    """
+    if not paragraphs or not paragraphs[0].find('iframe'):
+        return None
+    preview = paragraphs[0]
+    frame = preview.find('iframe')
+    src = frame.get('src')
+    if not isinstance(src, str) or not src.startswith('https://www.youtube.com/embed/'):
+        return None
+    if len(paragraphs) < 3:
+        raise NewsError('article_identity_not_verified')
+    credit = paragraphs[1]
+    leaves = lambda node: [child for child in node.contents
+        if not isinstance(child, NavigableString) or str(child).strip()]
+    nodes, credit_nodes = leaves(preview), leaves(credit)
+    attrs = {'width': '560', 'height': '315', 'src': src, 'title': 'YouTube video player',
+        'frameborder': '0', 'allow': 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture',
+        'allowfullscreen': ''}
+    if (preview.attrs or len(nodes) != 1 or type(nodes[0]) is not Tag or nodes[0] is not frame
+            or frame.contents or frame.attrs != attrs
+            or not re.fullmatch(r'https://www[.]youtube[.]com/embed/[A-Za-z0-9_-]{11}', src)
+            or preview.find_next_sibling() is not credit or len(credit_nodes) != 1
+            or type(credit_nodes[0]) is not NavigableString
+            or credit.get_text(' ', strip=True) not in newsroom_credits):
+        raise NewsError('article_identity_not_verified')
+    for node in (preview, frame, credit):
+        _visible_text(node)
+    notice = {'kind': 'native_house_static_youtube_desk_prefix',
+        'source_iframe_attributes': dict(frame.attrs), 'following_native_desk_required': True,
+        'native_caption_present': False, 'all_following_native_prose_preserved': True,
+        'media_requested_or_executed': False, 'media_content_accepted': False,
+        'media_title_promoted_to_prose_or_attribution': False, 'source_values_rewritten': False}
+    preview.clear()
+    return notice
+
+
+def _finance_reviewed_external_credit(nodes, *, allow_moz_padding=False, allow_plain_mirror_credit=False):
+    """Visible, explicit source declarations; exclusion, never permission.
+
+    The independently observed v35 prefixes are one standalone supplied-credit
+    paragraph, or image/caption/source paragraphs. Inspect only the intact
+    first three nodes. Do not search prose for names or discard any source text.
+    """
+    leaves = lambda node: [child for child in node.contents
+        if not isinstance(child, NavigableString) or str(child).strip()]
+
+    def literal(node, *, strong=False):
+        if type(node) is not Tag or node.name != 'p':
+            return None
+        children = leaves(node)
+        if strong:
+            if (len(children) != 1 or type(children[0]) is not Tag or children[0].name != 'strong'
+                    or children[0].attrs):
+                return None
+            children = children[0].contents
+        return str(children[0]).strip() if len(children) == 1 and type(children[0]) is NavigableString else None
+
+    if nodes and literal(nodes[0]) == '圖、文／基金醫生提供':
+        _visible_text(nodes[0])
+        return True
+    if len(nodes) != 3 or any(type(node) is not Tag or node.name != 'p' for node in nodes):
+        return False
+    image, caption, credit = nodes
+    image_nodes, caption_nodes = leaves(image), leaves(caption)
+    if (len(image_nodes) != 1 or type(image_nodes[0]) is not Tag or image_nodes[0].name != 'img'
+            or image_nodes[0].contents or len(caption_nodes) != 1
+            or type(caption_nodes[0]) is not Tag or caption_nodes[0].name != 'strong'
+            or caption_nodes[0].attrs):
+        return False
+    parts = caption_nodes[0].contents
+    plain_caption = len(parts) == 1 and type(parts[0]) is NavigableString and bool(str(parts[0]).strip())
+    padded_caption = (len(parts) == 3 and type(parts[0]) is NavigableString and bool(str(parts[0]).strip())
+        and type(parts[1]) is Tag and parts[1].name == 'br' and not parts[1].contents
+        and (not parts[1].attrs or allow_moz_padding and parts[1].attrs == {'type': '_moz'})
+        and type(parts[2]) is NavigableString and bool(str(parts[2])) and not str(parts[2]).strip())
+    if not (plain_caption or padded_caption) or len(caption.get_text(' ', strip=True)) > 300:
+        return False
+    plain_credit = literal(credit)
+    strong_credit = literal(credit, strong=True)
+    allowed_plain = {'圖、文／大同公司提供', '圖、文／鏡週刊'}
+    if allow_plain_mirror_credit:
+        allowed_plain.add('圖文／鏡週刊')
+    if not (plain_caption and plain_credit in allowed_plain
+            or padded_caption and strong_credit == '圖文／鏡週刊'):
+        return False
+    for node in (image, caption, credit):
+        _visible_text(node)
+    _visible(image_nodes[0])
+    return True
+
+
+def _finance_third_party_prelude(body, *, reviewed_external_credits=False, reviewed_editor_padding=False,
+                               reviewed_ctwant_punctuation=False, reviewed_plain_mirror_credit=False):
+    """Recognize the observed visible, explicit external-source prefixes.
+
+    This is an exclusion, never a body or reporter admission. Check the intact
+    prefix before attribution dispatch can fail on its image caption. A quoted
+    source later in an own-reporter story, or a hidden/nested signature, is not
+    this native credit. No source paragraph is removed or rewritten.
+    v38 adds the observed literal '圖、文／CTWANT', not punctuation folding.
+    """
+    nodes = list(islice((node for node in body.children
+                        if not isinstance(node, NavigableString) or str(node).strip()), 3))
+    if reviewed_external_credits and _finance_reviewed_external_credit(nodes,
+            allow_moz_padding=reviewed_editor_padding, allow_plain_mirror_credit=reviewed_plain_mirror_credit):
+        return True
+    if len(nodes) < 3 or any(type(node) is not Tag or node.name != 'p' for node in nodes[:3]):
+        return False
+    image, caption, credit = nodes[:3]
+    leaves = lambda node: [child for child in node.contents
+                          if not isinstance(child, NavigableString) or str(child).strip()]
+    image_nodes, caption_nodes, credit_nodes = (leaves(node) for node in nodes[:3])
+    if (len(image_nodes) != 1 or type(image_nodes[0]) is not Tag or image_nodes[0].name != 'img'
+            or image_nodes[0].contents or len(caption_nodes) != 1
+            or type(caption_nodes[0]) is not Tag or caption_nodes[0].name != 'strong'
+            or len(caption_nodes[0].contents) != 1
+            or type(caption_nodes[0].contents[0]) is not NavigableString
+            or not caption.get_text(' ', strip=True).startswith('▲')
+            or len(credit_nodes) != 1 or type(credit_nodes[0]) is not NavigableString
+            or credit.get_text(' ', strip=True) not in (
+                {'圖文／CTWANT', '圖、文／CTWANT'} if reviewed_ctwant_punctuation else {'圖文／CTWANT'})):
+        return False
+    for node in (image, caption, credit):
+        _visible_text(node)
+    _visible(image_nodes[0])
+    return True
+
+
 def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur=False,
                    allow_static_threads=False, allow_caption_credit_only=False,
                    allow_multiple_threads=False, allow_split_reporter=False,
@@ -1002,7 +1312,10 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
                    allow_static_twitter_loader=False, allow_compact_threads=False,
                    allow_static_twitter_quote=False, allow_static_facebook_video=False,
                    allow_bare_reporter=False, allow_house_newsroom=False, allow_house_image_reporter=False,
-                   allow_house_native_report_signature=False):
+                   allow_house_native_report_signature=False, allow_house_native_credit_layouts=False,
+                   allow_house_native_prefixes=False, allow_house_static_player=False,
+                   allow_house_reviewed_desks=False, allow_house_pure_desk_dispatch=False,
+                   allow_native_bare_report_signature=False, allow_native_search_team_author=False):
     """Whole observed story, minus verified UI, credits and image captions.
 
     Caption/attribution are retained separately. Do not use image alt text,
@@ -1012,16 +1325,49 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
     captions, credit, names, credit_notices = [], None, [], []
     paragraphs = cleaned.find_all('p', recursive=False)
     newsroom = None
+    newsroom_credits = _HOUSE_NEWSROOM_CREDITS_V32 if allow_house_reviewed_desks else _HOUSE_NEWSROOM_CREDITS
+    if allow_house_native_credit_layouts and any(p.get_text(' ', strip=True) in _HOUSE_ADVERTORIAL_MARKERS
+            for p in paragraphs[:6]):
+        raise NewsError('article_rights_or_scope_excluded')
+    youtube = (_house_static_youtube_desk_prefix(paragraphs, newsroom_credits=newsroom_credits)
+        if allow_house_reviewed_desks else None)
+    if youtube is not None:
+        credit_notices.append(youtube)
+    player = _house_static_player_prefix(paragraphs, newsroom_credits=newsroom_credits) if allow_house_static_player else None
+    if player is not None:
+        caption, notice = player
+        captions.append(caption)
+        credit_notices.append(notice)
+    if allow_house_native_credit_layouts and paragraphs:
+        caption_only = _house_image_caption_only(paragraphs[0])
+        if caption_only is not None:
+            captions.append(caption_only)
+            paragraphs[0].clear()
+            credit_notices.append({'kind': 'native_house_image_caption_only_before_separate_reporter',
+                'native_caption': caption_only, 'reporter_is_following_plain_native_paragraph': True,
+                'caption_or_image_metadata_promoted_to_reporter': False, 'source_values_rewritten': False})
+    mixed_prefix = (_house_image_caption_prose_credit(paragraphs[0], credit_notices,
+        pure_desk_signatures=newsroom_credits if allow_house_pure_desk_dispatch else ())
+        if allow_house_native_prefixes and paragraphs else None)
+    if mixed_prefix is not None:
+        names, credit, caption = mixed_prefix
+        captions.append(caption)
     prelude = (_house_image_caption_credit(paragraphs[0], allow_reporter=allow_house_image_reporter,
-        allow_trailing_caption_break=allow_house_native_report_signature)
-        if (allow_house_newsroom or allow_house_image_reporter) and paragraphs else None)
-    image_reporter = prelude is not None and prelude[0] is None
+        allow_trailing_caption_break=allow_house_native_report_signature,
+        allow_adjacent_caption_fragments=allow_house_native_credit_layouts, newsroom_credits=newsroom_credits)
+        if credit is None and (allow_house_newsroom or allow_house_image_reporter) and paragraphs else None)
+    image_reporter = mixed_prefix is not None or prelude is not None and prelude[0] is None
     if prelude is not None:
         newsroom, credit, caption, trailing_caption_break = prelude
         names = [newsroom] if newsroom else _REPORTER.fullmatch(credit)[1].split('、')
         captions = [caption]
         if len(set(names)) != len(names):
             raise _attribution_failure('duplicate_reporters')
+        fragments = paragraphs[0].find_all('strong', recursive=False)
+        if allow_house_native_credit_layouts and len(fragments) == 2:
+            credit_notices.append({'kind': 'native_house_adjacent_caption_fragments',
+                'native_fragments': [fragment.get_text(' ', strip=True) for fragment in fragments],
+                'following_named_reporter_separated_by_direct_br': True, 'source_values_rewritten': False})
         paragraphs[0].clear()
         credit_notices.append({'kind': ('native_house_image_caption_reporter_prefix' if image_reporter
             else 'native_house_image_caption_newsroom_prefix'),
@@ -1041,17 +1387,48 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
         if (newsroom is not None or image_reporter) and re.match(r'^(?:中央社|路透社|本文來源|來源[：:]|轉載|文[／/])', text):
             raise NewsError('article_rights_or_scope_excluded')
         match = _REPORTER.fullmatch(text)
-        desk = _HOUSE_NEWSROOM_CREDITS.get(text) if allow_house_newsroom else None
+        desk = newsroom_credits.get(text) if allow_house_newsroom else None
         if desk:
             leaves = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
             if len(leaves) != 1 or type(leaves[0]) is not NavigableString:
                 raise _attribution_failure('newsroom_credit_markup')
+        if match is None and allow_house_native_credit_layouts:
+            match, role_notice = _house_role_credit(text)
+            if match is not None:
+                leaves = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
+                if len(leaves) != 1 or type(leaves[0]) is not NavigableString:
+                    raise _attribution_failure('unrecognized_precredit_paragraph')
+                credit_notices.append(role_notice)
+        if match is None and allow_native_search_team_author:
+            match = _SEARCH_TEAM_NAMED_AUTHOR.fullmatch(text)
+            if match is not None:
+                leaves = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
+                if len(leaves) != 1 or type(leaves[0]) is not NavigableString:
+                    raise _attribution_failure('unrecognized_precredit_paragraph')
+                credit_notices.append({'kind': 'native_search_team_named_author_with_person_schema_witness',
+                    'native_credit': text, 'native_role': '網搜小組', 'native_names': [match[1]],
+                    'same_article_exact_person_schema_required': True,
+                    'publisher_or_creator_promoted_to_person': False,
+                    'employment_or_reporter_title_inferred': False, 'source_values_rewritten': False})
         if match is None and allow_bare_reporter:
+            pair = _BARE_REPORTER_PAIR.fullmatch(text) if allow_house_native_prefixes else None
+            pair_names = pair[1].split('、') if pair else []
+            pair_leaves = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()] if pair else []
+            if (pair and len(set(pair_names)) == 2 and not any(name.endswith('中心') for name in pair_names)
+                    and len(pair_leaves) == 1 and type(pair_leaves[0]) is NavigableString
+                    and any('（圖／記者' + pair_names[0] + '攝）' in caption for caption in captions)):
+                match = pair
+                credit_notices.append({'kind': 'native_bare_reporter_pair_with_first_photo_and_creator_witness',
+                    'native_credit': text, 'native_reporter_names': pair_names,
+                    'first_name_has_preceding_visible_reporter_photo_and_matching_creator': True,
+                    'second_name_from_same_literal_plain_report_signature': True,
+                    'second_name_creator_identity_inferred': False, 'source_values_rewritten': False})
             bare = _BARE_REPORTER.fullmatch(text)
             photo_reporter = bare is not None and any('（圖／記者' + bare[1] + '攝）' in caption for caption in captions)
             leaves = [child for child in node.contents
                 if not isinstance(child, NavigableString) or str(child).strip()]
-            native_report_signature = (allow_house_native_report_signature and len(leaves) == 1
+            native_report_signature = ((allow_house_native_report_signature or allow_native_bare_report_signature)
+                and len(leaves) == 1
                 and type(leaves[0]) is NavigableString)
             if (bare and not _CREDIT_PREFIX.match(text) and not bare[1].endswith('中心')
                     and (photo_reporter or native_report_signature)):
@@ -1085,14 +1462,16 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
             raise NewsError('article_rights_or_scope_excluded')
         elif text.startswith('▲') and index and paragraphs[index - 1].find('img'):
             _visible_text(node)
-            editor_padding = allow_static_threads and _caption_editor_padding(
+            editor_padding = (allow_static_threads or allow_house_native_credit_layouts) and _caption_editor_padding(
                 node, allow_plain_break=allow_plain_caption_padding)
             if (allow_caption_break_credit and credit is None and node.find('br')
                     and not editor_padding):
                 if index > 5:
                     raise _attribution_failure('late_caption_credit')
                 names, credit, caption = _caption_break_credit(node,
-                    allow_caption_credit_only=allow_caption_credit_only, syntax_notices=credit_notices)
+                    allow_caption_credit_only=allow_caption_credit_only, syntax_notices=credit_notices,
+                    allow_house_named_roles=allow_house_native_credit_layouts,
+                    allow_house_caption_trailing_break=allow_house_native_credit_layouts)
                 captions.append(caption)
             else:
                 if editor_padding and allow_plain_caption_padding and not _caption_editor_padding(node):
@@ -1148,7 +1527,7 @@ def ettoday_verified_short_prose(body):
 
 
 def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow_house=False):
-    if type(adapter_contract_version) is not int or adapter_contract_version not in range(1, 29):
+    if type(adapter_contract_version) is not int or adapter_contract_version not in ETTODAY_LAYOUT_VERSIONS.values():
         raise NewsError('article_identity_not_verified')
     house_scope = adapter_contract_version >= 24 and allow_house is True
     identity = ettoday_request_identity(page_url, allow_finance_redirect_query=adapter_contract_version >= 16,
@@ -1207,11 +1586,17 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
         raise NewsError('article_identity_not_verified')
     _visible_text(heading)
     _visible(body)
+    if (adapter_contract_version >= 34 and host == ETTODAY_HOSTS[0]
+            and _finance_third_party_prelude(body, reviewed_external_credits=adapter_contract_version >= 35,
+                reviewed_editor_padding=adapter_contract_version >= 36,
+                reviewed_ctwant_punctuation=adapter_contract_version >= 38,
+                reviewed_plain_mirror_credit=adapter_contract_version >= 39)):
+        raise NewsError('article_rights_or_scope_excluded')
     cleaned, names, credit, captions, embed_notices = _original_body(body,
-        allow_caption_break_credit=adapter_contract_version >= 8 and host == ETTODAY_HOSTS[0],
+        allow_caption_break_credit=adapter_contract_version >= 8 and host == ETTODAY_HOSTS[0] or house and adapter_contract_version >= 29,
         allow_static_imgur=adapter_contract_version >= 9 and host == ETTODAY_HOSTS[0],
         allow_static_threads=adapter_contract_version >= 10 and host == ETTODAY_HOSTS[0],
-        allow_caption_credit_only=adapter_contract_version >= 11 and host == ETTODAY_HOSTS[0],
+        allow_caption_credit_only=adapter_contract_version >= 11 and host == ETTODAY_HOSTS[0] or house and adapter_contract_version >= 29,
         allow_multiple_threads=adapter_contract_version >= 12 and host == ETTODAY_HOSTS[0],
         allow_split_reporter=adapter_contract_version >= 13 and host == ETTODAY_HOSTS[0],
         allow_static_instagram=adapter_contract_version >= 14 and host == ETTODAY_HOSTS[0],
@@ -1220,20 +1605,31 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
         allow_compact_threads=adapter_contract_version >= 15 and host == ETTODAY_HOSTS[0],
         allow_static_twitter_quote=adapter_contract_version >= 19 and host == ETTODAY_HOSTS[0] or house_native_repairs,
         allow_static_facebook_video=adapter_contract_version >= 20 and host == ETTODAY_HOSTS[0],
-        allow_bare_reporter=house_native_repairs,
+        allow_bare_reporter=house_native_repairs or adapter_contract_version >= 37 and not house,
         allow_house_newsroom=house and adapter_contract_version >= 26,
         allow_house_image_reporter=house and adapter_contract_version >= 27,
-        allow_house_native_report_signature=house and adapter_contract_version >= 28)
+        allow_house_native_report_signature=house and adapter_contract_version >= 28,
+        allow_house_native_credit_layouts=house and adapter_contract_version >= 29,
+        allow_house_native_prefixes=house and adapter_contract_version >= 30,
+        allow_house_static_player=house and adapter_contract_version >= 31,
+        allow_house_reviewed_desks=house and adapter_contract_version >= 32,
+        allow_house_pure_desk_dispatch=house and adapter_contract_version >= 33,
+        allow_native_bare_report_signature=adapter_contract_version >= 37 and not house,
+        allow_native_search_team_author=adapter_contract_version >= 39 and host == ETTODAY_HOSTS[1])
     newsroom = next((n['native_newsroom'] for n in embed_notices
         if n['kind'] == 'native_publisher_newsroom_signature'), None)
+    named_authors = next((tuple(n['native_names']) for n in embed_notices
+        if n['kind'] == 'native_search_team_named_author_with_person_schema_witness'), ())
     published, modified, notices = _clocks(soup, scope, host, adapter_contract_version=adapter_contract_version)
     notices += _schemas(soup, original, title, published, modified, names,
         adapter_contract_version=adapter_contract_version, require_headline_witness=social_variant or native_channel_labels_distinct or house,
         social_headline_key=_key(social_title)[:-len(_key(suffix))] if social_variant else None,
         native_bare_reporters=next((tuple(n['native_reporter_names']) for n in embed_notices
             if n['kind'] in {'native_reporter_prefix_omitted_with_role_and_creator_witness',
-                'native_report_signature_with_matching_creator_witness'}), ()),
-        native_newsroom=newsroom is not None)
+                'native_report_signature_with_matching_creator_witness',
+                'native_house_role_named_reporter_with_creator_witness',
+                'native_bare_reporter_pair_with_first_photo_and_creator_witness'}), ()),
+        native_newsroom=newsroom is not None, native_named_authors=named_authors)
     notices += embed_notices
     if native_channel_labels_distinct:
         notices.append({'kind': 'native_subsection_and_social_channel_labels_distinct',
@@ -1246,7 +1642,8 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
             'native_headline': title, 'social_title': social_title,
             'identity_basis': 'same_literal_canonical_og_url_unique_current_schema_and_visible_story',
             'source_reason_inferred': False, 'source_titles_rewritten': False})
-    notices.append({'kind': 'native_newsroom_credit' if newsroom else 'native_reporter_credit', 'text': credit})
+    notices.append({'kind': ('native_newsroom_credit' if newsroom else
+        'native_named_author_credit' if named_authors else 'native_reporter_credit'), 'text': credit})
     if house:
         notice = _one(scope, ':scope > p.note', 'article_rights_or_scope_excluded')
         # Bind the native notice to the publisher's actual official policy
@@ -1273,6 +1670,13 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
                 if newsroom else 'visible_current_story_reporter_signature')} for name in names], ensure_ascii=False),
         'verified_image_captions_json': json.dumps(captions, ensure_ascii=False),
         'verified_article_notices_json': json.dumps(notices, ensure_ascii=False)}
+    if named_authors:
+        article['article_identity_basis'] = 'literal_host_path_canonical_og_microdata_headline_native_named_author_and_release'
+        article['body_completeness'] = 'verified_whole_native_story; source_named_author_captions_and_rights_notices_retained_separately'
+        article['author_attribution_detail_json'] = json.dumps([{'name': name, 'role': 'named_report_author',
+            'native_role': '網搜小組', 'native_credit': credit,
+            'basis': 'visible_current_story_named_signature_and_exact_person_schema',
+            'employment_or_reporter_title_inferred': False} for name in names], ensure_ascii=False)
     if any(n['kind'] == 'native_empty_static_imgur_declaration' for n in embed_notices):
         article['body_completeness'] += '; native_empty_imgur_declarations_separate; external_media_not_requested_or_transcribed'
     if any(n['kind'] == 'native_static_threads_preview_ui_declaration' for n in embed_notices):
@@ -1287,6 +1691,12 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
     if any(n['kind'] == 'native_static_facebook_video_preview_declaration' for n in embed_notices):
         article['body_completeness'] += ('; native_facebook_video_preview_separate; '
             'video_label_preserved_in_raw_not_newsroom_body; external_media_not_requested_or_transcribed')
+    if any(n['kind'] == 'native_house_static_player_caption_prefix' for n in embed_notices):
+        article['body_completeness'] += ('; native_house_player_preview_separate; '
+            'caption_retained_separately; media_not_requested_executed_or_transcribed')
+    if any(n['kind'] == 'native_house_static_youtube_desk_prefix' for n in embed_notices):
+        article['body_completeness'] += ('; native_house_youtube_preview_declaration_separate; '
+            'no_caption_or_transcript_inferred; media_not_requested_executed_or_transcribed')
     # Do not copy the whole subject and the story a second time. All metadata
     # was validated against the original document above; generic extraction
     # needs only its verified heading and one unchanged-order cleaned story.
@@ -1305,7 +1715,7 @@ def ettoday_validation_metadata(soup, *, page_url, adapter_contract_version=1, a
     """
     identity = ettoday_request_identity(page_url, allow_finance_redirect_query=adapter_contract_version >= 16,
         allow_house=adapter_contract_version >= 24 and allow_house is True)
-    facts = {'contract_version': 3 if adapter_contract_version >= 5 else 2,
+    facts = {'contract_version': 4 if adapter_contract_version >= 5 else 2,
         'literal_route_verified': identity is not None,
         'body_text_retained': False, 'raw_scope_or_article_acceptance_granted': False}
     if identity is None:
@@ -1389,7 +1799,8 @@ def ettoday_credit_anatomy(story):
         embedded = _REPORTER.search(text)
         compact = _REPORTER.fullmatch(re.sub(r'\s+', '', text))
         credit_prefix = bool(_CREDIT_PREFIX.match(text))
-        candidate = bool(exact or embedded or compact or credit_prefix)
+        named_author = _SEARCH_TEAM_NAMED_AUTHOR.fullmatch(text)
+        candidate = bool(exact or embedded or compact or credit_prefix or named_author)
         candidate_count += int(candidate)
         # Keep the initial structure even without a credit, plus a bounded
         # set of later leads. Do not emit source-controlled classes or text.
@@ -1407,14 +1818,15 @@ def ettoday_credit_anatomy(story):
             'embedded_reporter_signature': bool(embedded),
             'embedded_signature_starts_at_zero': embedded.start() == 0 if embedded else None,
             'whitespace_stripped_signature': bool(compact),
+            'native_search_team_named_author_signature': bool(named_author),
             'reporter_count': len((exact or embedded or compact)[1].split('、')) if candidate
                 and (exact or embedded or compact) else None,
             'line_breaks': len(node.find_all('br')),
             'text_sha256': hashlib.sha256(text.encode()).hexdigest()})
-    return {'contract_version': 1, 'paragraphs_examined': min(128, len(paragraphs)),
+    return {'contract_version': 2, 'paragraphs_examined': min(128, len(paragraphs)),
         'paragraph_scan_truncated': len(paragraphs) > 128,
         'candidate_paragraphs_examined': candidate_count, 'paragraph_shapes': rows,
         'candidate_rows_truncated': candidate_count > sum(bool(r['exact_reporter_signature']
             or r['embedded_reporter_signature'] or r['whitespace_stripped_signature']
-            or r['credit_prefix']) for r in rows),
+            or r['credit_prefix'] or r['native_search_team_named_author_signature']) for r in rows),
         'body_or_author_text_exported': False, 'attribution_verified_by_diagnostic': False}

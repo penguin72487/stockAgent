@@ -905,8 +905,16 @@ def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
         tmp_path / "features" / "tw_public_stock_daily.parquet"
     )
     assert commands[3][commands[3].index("--incremental-tail-days") + 1] == "14"
+    assert "--incremental-auto" in commands[3]
     assert "--allow-daily-publication-lag" in commands[1]
     assert "--allow-daily-publication-lag" in commands[3]
+
+
+def test_0830_explicit_full_rebuild_does_not_admit_incremental_proofs(tmp_path):
+    commands = run_tw_public_0830_check._derived_data_commands(
+        live_root=tmp_path, expected_latest="2026-08-21", public_feature_incremental_days=0)
+    assert "--incremental-auto" not in commands[-1]
+    assert "--incremental-tail-days" not in commands[-1]
 
 
 def test_0830_detects_same_date_source_content_revision(tmp_path: Path) -> None:

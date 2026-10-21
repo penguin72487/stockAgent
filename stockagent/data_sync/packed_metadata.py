@@ -311,6 +311,27 @@ class MetadataRows(Generic[T]):
         else:
             yield from self._query()
 
+    def in_census_order(self) -> Iterator[T]:
+        """Original portable scan order without retaining a second inventory.
+
+        Used only by explicitly observed private controls whose sealed sizes
+        can differ from the earlier census. SQLite's bounded FILE sorter keeps
+        this pass independent of source mutations and Python row count.
+        """
+        if self._db is None:
+            yield from sorted(self._rows, key=lambda value: self._encode(value)['census_order'])
+        else:
+            self._db.commit()
+            cursor = self._db.execute("SELECT data FROM entries ORDER BY CAST(json_extract(data,'$.census_order') AS INTEGER)")
+            self._cursors.add(cursor)
+            try:
+                for row, in cursor:
+                    yield self._decode(json.loads(row))
+            finally:
+                if cursor in self._cursors:
+                    self._cursors.remove(cursor)
+                    cursor.close()
+
     def update(self, value: T, *, changed_bucket: int | None = None):
         if self._db is None:
             # In-memory entries retain object identity and are mutated by the

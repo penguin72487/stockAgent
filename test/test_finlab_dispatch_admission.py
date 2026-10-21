@@ -1,15 +1,83 @@
 from datetime import UTC, datetime, timedelta
+import fcntl
 import json
 from pathlib import Path
 import os
 import shutil
 import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 from scripts.check_finlab_refresh_due import refresh_due
+from scripts import check_finlab_refresh_due as dispatch
 from stockagent.data.finlab_acquisition_contract import WORKLOAD_CONTRACT_VERSION
 from stockagent.data.finlab_acquisition_contract import intraday_progress, process_owner, process_owner_alive
 
 NOW = datetime(2026, 10, 4, 3, tzinfo=UTC)  # Sunday, not the account reset slot.
+
+
+@pytest.mark.parametrize("free,allowed", [(0, False), (25 * 1024**3 - 1, False),
+                                           (25 * 1024**3, True), (26 * 1024**3, True)])
+def test_intraday_disk_preflight_uses_collector_floor_without_import_or_scan(tmp_path, monkeypatch, free, allowed):
+    calls = []
+    def usage(path):
+        calls.append(path)
+        return SimpleNamespace(free=free)
+    monkeypatch.setattr(dispatch.shutil, "disk_usage", usage)
+    monkeypatch.setattr(dispatch, "refresh_due", lambda *_a, **_kw: pytest.fail("disk preflight used SDK admission"))
+    result = dispatch.intraday_disk_admission(tmp_path)
+    assert result["allowed"] is allowed
+    assert result["minimum_free_bytes"] == 25 * 1024**3
+    assert result["provider_calls"] == 0 and calls == [tmp_path / "data_finlab"]
+
+
+def test_intraday_disk_probe_failure_is_not_fake_completion(tmp_path, monkeypatch, capsys):
+    def fail(_path):
+        raise OSError("unavailable mount")
+    monkeypatch.setattr(dispatch.shutil, "disk_usage", fail)
+    assert dispatch.main(["--root", str(tmp_path), "--intraday-disk-only"]) == 2
+    assert json.loads(capsys.readouterr().out)["reason"] == "intraday_disk_probe_failed"
+
+
+@pytest.mark.parametrize("lock_mode", [fcntl.LOCK_SH, fcntl.LOCK_EX])
+def test_two_real_resource_blocks_skip_idle_sweep_but_resume_immediately(tmp_path, monkeypatch, lock_mode):
+    setup(tmp_path, remaining=1000)
+    write(tmp_path / "data_finlab/core_acquisition_status.json", {"minute_residual_allowed": True})
+    write(tmp_path / "data_finlab/intraday/market_status.json", {
+        "state": "disk_reserve_reached", "acquisition_mode": "minute_first_tick_residual",
+        "by_kind": {"tw_minute": {"remaining_partitions": 1}}})
+    public = tmp_path / "data_tw_public"
+    public.mkdir()
+    lock = tmp_path / ".locks/tw-public-refresh.lock"
+    lock.parent.mkdir()
+    monkeypatch.setattr(dispatch.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1))
+    with lock.open("a+") as owner:
+        fcntl.flock(owner, lock_mode | fcntl.LOCK_NB)
+        assert refresh_due(tmp_path, now=NOW) == (False, "intraday_disk_full_research_owner_busy")
+        monkeypatch.setattr(dispatch.shutil, "disk_usage", lambda _path: SimpleNamespace(free=26 * 1024**3))
+        assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+        monkeypatch.setattr(dispatch.shutil, "disk_usage", lambda _path: SimpleNamespace(free=1))
+        setup(tmp_path, pending=True, remaining=1000)
+        assert refresh_due(tmp_path, now=NOW) == (True, "general_work_due")
+        setup(tmp_path, remaining=1000)
+        assert refresh_due(tmp_path, now=NOW.replace(hour=0)) == (True, "reset_confirmation_window")
+    assert dispatch.research_owner_busy(tmp_path) is False
+    # Releasing the real owner permits the independent research branch even
+    # while minutes remain disk-blocked. No stale progress file can hold it.
+    assert refresh_due(tmp_path, now=NOW) == (True, "minute_first_residual_capacity")
+
+
+def test_unknown_or_redirected_research_lock_is_not_skip_evidence(tmp_path):
+    public = tmp_path / "data_tw_public"
+    public.mkdir()
+    assert dispatch.research_owner_busy(tmp_path) is None
+    lock = tmp_path / ".locks/tw-public-refresh.lock"
+    lock.parent.mkdir()
+    elsewhere = tmp_path / "unrelated-lock"
+    elsewhere.touch()
+    lock.symlink_to(elsewhere)
+    assert dispatch.research_owner_busy(tmp_path) is None
 
 
 def write(path, value):

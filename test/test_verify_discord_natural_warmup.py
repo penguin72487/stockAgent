@@ -8,8 +8,9 @@ from scripts import verify_discord_natural_warmup as verify
 NOW = datetime(2026, 10, 14, 0, 6, tzinfo=UTC)
 
 def controls(monkeypatch):
-    monkeypatch.setattr(verify.native.BOT, "_resolve_market", lambda _market: SimpleNamespace(timezone="Asia/Taipei"))
-    monkeypatch.setattr(verify.native.BOT, "_startup_gpu_prepare_minutes", lambda _cfg: 495)
+    bot = SimpleNamespace(_resolve_market=lambda _market: SimpleNamespace(timezone="Asia/Taipei"),
+                          _startup_gpu_prepare_minutes=lambda _cfg: 495)
+    monkeypatch.setattr(verify.native, "verification_cache", lambda: SimpleNamespace(discord_bot=bot))
     names = [f"mode-{number}" for number in range(5)]
     warm = {"status": "ready", "run_id": "current-native-owner", "model_cache_resident_ready": True,
             "ready_count": 5, "market_count": 5, "elapsed_seconds": 15.3,
@@ -32,6 +33,7 @@ def test_all_current_modes_must_finish_before_prepare_without_claiming_opening(m
 @pytest.mark.parametrize("phase", ["pending", "running"])
 def test_natural_wait_is_not_completion_or_failure(monkeypatch, phase):
     status, control = controls(monkeypatch)
+    monkeypatch.setattr(verify.native, "verification_cache", lambda: pytest.fail("waiting must not import inference"))
     status["startup_inference_warmup"] = {"status": phase}
     assert verify.warm_proof(status, control, NOW) == {"state": "waiting_natural_warmup", "phase": phase}
 

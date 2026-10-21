@@ -1240,7 +1240,9 @@ def _resolve_ownership_paths(paths: Sequence[Path]) -> list[str]:
     missing components and unusual roots use Path.resolve, not lexical guesses.
     Directory certificates are invocation-local and checked again before any
     result escapes; a concurrent namespace change fails closed, never a TTL hit.
-    No state is reused between batches or audits.
+    Unrelated sibling receipt publication can change directory timestamps, so
+    those batches also require the exact resolver oracle to agree. No state is
+    reused between batches or audits.
     """
     cwd = Path.cwd()
     directories: dict[Path, tuple[int, int, int, int, int] | None] = {}
@@ -1280,9 +1282,34 @@ def _resolve_ownership_paths(paths: Sequence[Path]) -> list[str]:
             continue
         resolved.append(str(path.resolve()) if stat.S_ISLNK(leaf.st_mode)
                         else str(absolute))
-    for path, certificate in directories.items():
-        if certificate is not None and identity(path.lstat()) != certificate:
-            raise RuntimeError(f"OpenBB ownership directory changed during batch: {path}")
+    def verify_directory_namespace() -> dict[Path, tuple[int, int, int, int, int]]:
+        observed = {}
+        for path, certificate in directories.items():
+            if certificate is None:
+                continue
+            try:
+                current = identity(path.lstat())
+            except OSError as exc:
+                raise RuntimeError(
+                    f"OpenBB ownership directory changed during batch: {path}"
+                ) from exc
+            if current[:3] != certificate[:3]:
+                raise RuntimeError(
+                    f"OpenBB ownership directory changed during batch: {path}"
+                )
+            observed[path] = current
+        return observed
+
+    observed = verify_directory_namespace()
+    if any(certificate != directories[path] for path, certificate in observed.items()):
+        # A parent can publish logs/status without changing any audited path.
+        # Never infer safety from inode identity alone: a leaf could have been
+        # replaced by a symlink. Re-resolve the entire bounded batch and reject
+        # any disagreement, then recheck ancestor identities after that oracle.
+        if _resolve_ownership_paths_reference(paths) != resolved:
+            raise RuntimeError("OpenBB ownership namespace changed during batch")
+        if verify_directory_namespace() != observed:
+            raise RuntimeError("OpenBB ownership directory changed during reference validation")
     return resolved
 
 

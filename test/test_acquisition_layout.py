@@ -77,6 +77,8 @@ def mount_page(browser, kind, width=1366):
       window.detailToggleCount = 0;
       const input = document.querySelector('input[type=search]');
       if (input) input.value = '保留搜尋';
+      window.originalSearchValues = new Map([...document.querySelectorAll('input[type=search]')]
+        .map(node => [node, node.value]));
     }""")
     page.add_script_tag(path=str(PUBLIC / "dashboard-core.js"))
     page.add_script_tag(path=str(PUBLIC / "dashboard-acquisition.js"))
@@ -115,7 +117,9 @@ def test_all_acquisition_pages_keep_nodes_and_foreground_summary(browser, kind, 
             assert page.locator("#dashboards > a").first.get_attribute("href") == "data-monitor/"
             assert page.locator("#strategy-dashboards > a").count() == 3
         else:
-            assert page.locator(".acq-metric").count() == 4
+            # FinLab already includes its separate tick estimate; presentation
+            # changes must preserve it rather than enforce a four-card ceiling.
+            assert page.locator(".acq-metric").count() == (5 if kind == "finlab" else 4)
             assert page.locator("main > details.acq-details").count() >= 3
             assert page.locator("details.acq-details[open]").count() == 0
             assert page.locator("#acq-overview").is_visible()
@@ -134,7 +138,10 @@ def test_all_acquisition_pages_keep_nodes_and_foreground_summary(browser, kind, 
             page.wait_for_function("document.querySelector('.acq-metric-value').textContent === '真實新值'")
             assert page.locator("details.acq-details[open]").count() == 1
             if page.locator("input[type=search]").count():
-                assert page.locator("input[type=search]").first.input_value() == "保留搜尋"
+                # Sections may move; preserve each actual input, not whichever
+                # becomes first after arranging the acquisition disclosures.
+                assert page.evaluate("""() => [...window.originalSearchValues]
+                  .every(([node,value]) => node.isConnected && node.value === value)""")
         assert page.evaluate("Math.max(0,document.documentElement.scrollWidth-innerWidth)") == 0
         assert not any("/api/" in path for path in requests)
         assert set(ids).issubset(set(page.locator("[id]").evaluate_all("nodes => nodes.map(node => node.id)")))
@@ -204,7 +211,8 @@ def test_layout_module_has_no_network_or_polling_owner():
     for kind, (_, directory, filename) in PAGES.items():
         html = (ROOT / "services" / directory / filename).read_text()
         assert f'data-acquisition-page="{kind}"' in html
-        assert "dashboard-acquisition.js?v=3" in html
+        version = re.search(r'dashboard-acquisition\.js\?v=(\d+)', html)
+        assert version and int(version.group(1)) >= 3
         assert "dashboard-acquisition.css?v=4" in html
     # Strategy pages keep their domain-specific presentation.
     # Day-trade and overnight deliberately share the same HTML / renderer.
