@@ -79,6 +79,11 @@ Use the section for the service being changed. Operational acceptance requires f
   official-close signal or a matching deployment's complete existing cache;
   this does not establish formal-history or broker-fill acceptance. See
   [2026-10-08 source-coherence repair](../tw_corporate_action_generation_repair_2026-10-08.md).
+  A pinned Discord-only `--code-admission-only` reload does not read panels or
+  assert data/GPU readiness, so it does not acquire this source lease. Its
+  control lease, exact engine ACK, disabled broker orders, ledger-prefix and
+  protected-owner gates still apply. Engine/GPU-ready or unpinned reloads retain
+  source admission; do not treat code-only acceptance as opening readiness.
 - The postclose path notification is a latency hint, not the only recovery
   mechanism: the canonical receipt-only retry controller also checks completed
   cache dependencies without importing Torch. Latest-close and full-history
@@ -203,8 +208,18 @@ Use the section for the service being changed. Operational acceptance requires f
   fresh official zero-volume/no-first-print evidence, and unknown source failures.
   The existing input quorum may count the first two as resolved observations;
   response rows alone, stale timestamps, or a ready flag cannot prove readiness.
-  Observed absence uses the existing zero-gap feature sentinel, never a fabricated
-  price. Positive-open completeness remains a separate, truthfully incomplete metric.
+  Proven absence uses `last_real_completed_trade_no_first_print_model_only_v2`:
+  carry the most recent finite positive completed-session close with positive
+  source volume, skipping zero-volume/reference-only days. Keep the source date
+  and carry marker; never fill raw opening, volume, executable price or ledger
+  fields with that model reference. Missing source evidence retains the feature
+  sentinel and cannot count toward readiness. `alive_mask` is panel observation
+  coverage, not evidence of a listing/delisting transition.
+  Live reads and recovery recheck absence evidence's own age (15 seconds by
+  default), not the latest merged row's receipt time. Later stale broker rows
+  cannot refresh an old MIS absence proof. Preserve historical proof clocks in
+  receipts and distinguish expired evidence from current no-first-print evidence.
+  Positive-open completeness remains a separate, truthfully incomplete metric.
   Preserve accepted opens and retry unknown inputs through the shared source owner.
   Full-market snapshot endpoints are single-flight across model deltas. FinMind
   uses a bounded one-second request-start cadence only in the first eleven
@@ -240,6 +255,18 @@ Use the section for the service being changed. Operational acceptance requires f
   and retry only unresolved deltas. Preserve conflicting raw observations and
   the complete requested universe. Shared IPC progress is cumulative, and native
   callback parsing/network waits stay outside the stock-cache and execution locks.
+  Avoided-query accounting runs outside the cache lock, after native Snapshot
+  submissions, so its durable I/O overlaps the existing callback wait without
+  extending the original timeout or dropping query accounting. Shared quote
+  responses may negotiate local-only `msgpack_v1`; legacy/unknown negotiation
+  and unavailable native codecs retain JSON. Preserve float64/non-finite
+  placeholders, signed zero, int64 clocks, flags and exact snapshot axes;
+  never use native-only type coercions, pickle or binary public/source receipts.
+  Client telemetry records the actual codec/bytes and read/decode/materialize
+  spans. Diagnostic `wait_idle` drains complete provider jobs, including input
+  fsync and final journal writes, not merely cleared network inflight flags;
+  that barrier does not delay the model's existing quorum return. See the
+  [latest-standard paired measurements](../tw_opening_latency_stages_2026-10-14.md#最新口徑重測與本機傳輸續修2026-10-22).
   The pre-open transport probes are also independent: one proven responding
   source may warm the model, but cannot bypass actual 09:00 source coverage,
   eligibility or execution evidence. Daily `*.acquisition.jsonl`, the scheduled

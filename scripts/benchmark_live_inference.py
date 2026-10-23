@@ -346,6 +346,8 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", type=Path)
+    parser.add_argument("--profile-cache-state", choices=("cold", "warm"), default="cold",
+                        help="Profile the first cold call or the first warm call; retain both in timing output")
     parser.add_argument("--compare-to", type=Path)
     parser.add_argument("--cpu-threads", type=int)
     parser.add_argument("--factorized-stream", choices=("0", "1"))
@@ -411,6 +413,7 @@ def main() -> None:
     forward_inventory = []
     forward_controls = []
     profiler = cProfile.Profile() if args.profile else None
+    profile_index = 0 if args.profile_cache_state == "cold" else 1
     expected = (json.loads(args.compare_to.read_text())["output_sha256"]
                 if args.compare_to else None)
     with ExitStack() as stack:
@@ -466,12 +469,12 @@ def main() -> None:
                 timed(name, getattr(signal_engine, name))))
         for index in range(args.repeats + 1):
             nested.clear()
-            if profiler is not None and index == 0:
+            if profiler is not None and index == profile_index:
                 profiler.enable()
             started = time.perf_counter()
             result = signal_engine.generate_live_signal(**kwargs)
             elapsed_ms = (time.perf_counter()-started)*1000
-            if profiler is not None and index == 0:
+            if profiler is not None and index == profile_index:
                 profiler.disable()
             digest = contract_digest(result)
             if expected is None:
@@ -525,7 +528,8 @@ def main() -> None:
         "output_sha256": expected, "exact_output_parity": True,
         "started_at_utc": started_at,
         "finished_at_utc": datetime.now(timezone.utc).isoformat(),
-        "profiled_first_call": profiler is not None,
+        "profiled_first_call": profiler is not None and profile_index == 0,
+        "profiled_cache_state": args.profile_cache_state if profiler is not None else None,
         "precision_contract": "unchanged_checkpoint_bf16_autocast_fp32_sensitive_blocks",
         "host": platform.node(), "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,

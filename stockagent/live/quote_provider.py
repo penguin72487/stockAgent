@@ -23,6 +23,7 @@ import numpy as np
 import requests
 
 from stockagent import private_json
+from stockagent.live.opening_price_journal import NO_FIRST_PRINT_PROOF_TTL_SECONDS
 from stockagent.live.shioaji_traffic_ledger import (
     QUERY_OBSERVATION_CONTRACT,
     record_avoided_query,
@@ -95,6 +96,9 @@ _TW_MIS_OPENING_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _TW_MIS_OPENING_DIRTY = False
 _TW_MIS_OPENING_REVISION = 0
 _TW_MIS_OPENING_REQUESTED: set[str] = set()
+# An absence observation is not an immutable opening fact. A later broker
+# response must not renew an old official no-first-print observation's age.
+_TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS = NO_FIRST_PRINT_PROOF_TTL_SECONDS
 # Row dictionaries are copy-on-write in the canonical cache. Memoize their
 # immutable numeric projection, not freshness or a consumer's fallback array.
 # The key also fences tests/owner replacement of the cache object itself.
@@ -189,16 +193,55 @@ def day_trade_quote_broker_request_dir(
     return requests_dir
 
 
-def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+_QUOTE_IPC_MSGPACK_MAGIC = b"StockAgentQuote\x00msgpack_v1\x00"
+
+
+def _atomic_write_quote_bytes(path: Path, body: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(
         f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
+    temporary.write_bytes(body)
     os.replace(temporary, path)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_quote_bytes(path, json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
+def _quote_ipc_response_format() -> str:
+    return "msgpack_v1" if private_json.native_available() else "json_v1"
+
+
+def _atomic_write_quote_response(path: Path, payload: dict[str, Any], response_format: str) -> None:
+    """Only negotiated local IPC uses binary; old peers retain exact JSON.
+
+    MessagePack preserves NaN/Inf, signed zero, int64 clocks and float64 bits.
+    JSON-only values are attested first: bytes/datetime coercions are forbidden,
+    and oversized integers/legacy values retain the stdlib writer. No pickle,
+    source receipt, public wire format or financial execution ABI is changed.
+    """
+    if response_format == "msgpack_v1" and _plain_finite_receipt_metadata(payload, finite_only=False):
+        try:
+            import msgspec
+            body = _QUOTE_IPC_MSGPACK_MAGIC + msgspec.msgpack.encode(payload)
+        except (ImportError, TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+            pass
+        else:
+            _atomic_write_quote_bytes(path, body)
+            return
+    _atomic_write_json(path, payload)
+
+
+def _decode_quote_ipc(body: bytes) -> dict[str, Any]:
+    if body.startswith(_QUOTE_IPC_MSGPACK_MAGIC):
+        import msgspec
+        payload = msgspec.msgpack.decode(body[len(_QUOTE_IPC_MSGPACK_MAGIC):])
+    else:
+        payload = json.loads(body)
+    if not isinstance(payload, dict):
+        raise ValueError("shared quote IPC envelope must be an object")
+    return payload
 
 
 def _price_snapshot_payload(snapshot: PriceSnapshot) -> dict[str, Any]:
@@ -2350,6 +2393,7 @@ def fetch_shared_day_trade_stock_snapshots(
             "requester_pid": os.getpid(),
             "purpose": normalized_purpose,
             "incremental": on_progress is not None,
+            "response_format": _quote_ipc_response_format(),
         },
     )
     request_published = time.perf_counter()
@@ -2366,11 +2410,14 @@ def fetch_shared_day_trade_stock_snapshots(
                 if identity == last_response_identity:
                     time.sleep(0.002 if on_progress is not None else 0.01)
                     continue
-                payload = json.loads(response_path.read_text(encoding="utf-8"))
+                response_body = response_path.read_bytes()
+                response_read_finished = time.perf_counter()
+                payload = _decode_quote_ipc(response_body)
+                response_decode_finished = time.perf_counter()
             except FileNotFoundError:
                 time.sleep(0.002 if on_progress is not None else 0.01)
                 continue
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError):
                 time.sleep(0.01)
                 continue
             if str(payload.get("request_id") or "") != request_id:
@@ -2381,7 +2428,9 @@ def fetch_shared_day_trade_stock_snapshots(
             snapshot_payload = payload.get("snapshot")
             if not isinstance(snapshot_payload, dict):
                 raise RuntimeError("shared day-trade quote response has no snapshot")
+            snapshot_started = time.perf_counter()
             snapshot = _price_snapshot_from_payload(snapshot_payload)
+            snapshot_finished = time.perf_counter()
             if payload.get("is_final") is False:
                 sequence = int(payload.get("sequence") or 0)
                 if on_progress is not None and sequence > last_sequence:
@@ -2421,6 +2470,19 @@ def fetch_shared_day_trade_stock_snapshots(
                     "client_response_read_decode_ms": round(
                         (response_observed - response_read_started) * 1000.0,
                         3,
+                    ),
+                    "client_response_read_ms": round(
+                        (response_read_finished - response_read_started) * 1000.0, 3,
+                    ),
+                    "client_ipc_decode_ms": round(
+                        (response_decode_finished - response_read_finished) * 1000.0, 3,
+                    ),
+                    "client_snapshot_materialize_ms": round(
+                        (snapshot_finished - snapshot_started) * 1000.0, 3,
+                    ),
+                    "client_response_bytes": len(response_body),
+                    "client_response_format": (
+                        "msgpack_v1" if response_body.startswith(_QUOTE_IPC_MSGPACK_MAGIC) else "json_v1"
                     ),
                     "client_round_trip_ms": round(
                         (response_observed - request_published) * 1000.0,
@@ -2573,9 +2635,11 @@ def serve_shared_day_trade_quote_requests(
         provider_fetch_ms = 0.0
         snapshot_serialize_ms = 0.0
         request_queue_ms: float | None = None
+        response_format = "json_v1"
         try:
             parse_started = time.perf_counter()
             request = json.loads(request_path.read_text(encoding="utf-8"))
+            response_format = str(request.get("response_format") or "json_v1")
             request_parse_ms = (time.perf_counter() - parse_started) * 1000.0
             request_purpose = str(
                 request.get("purpose") or "interactive"
@@ -2626,11 +2690,11 @@ def serve_shared_day_trade_quote_requests(
                     progress_sequence[0] += 1
                     # Cumulative full-universe progress avoids losing an early
                     # batch when the next callback arrives before client read.
-                    _atomic_write_json(response_path, {
+                    _atomic_write_quote_response(response_path, {
                         **response, "is_final": False, "sequence": progress_sequence[0],
                         "partial_symbols": partial_symbols,
                         "snapshot": _price_snapshot_payload(partial),
-                    })
+                    }, response_format)
 
                 progress_kwargs["on_progress"] = publish_progress
             snapshot = fetch_shioaji_stock_snapshots(
@@ -2663,13 +2727,14 @@ def serve_shared_day_trade_quote_requests(
             "server_request_parse_ms": round(request_parse_ms, 3),
             "server_provider_fetch_ms": round(provider_fetch_ms, 3),
             "server_snapshot_serialize_ms": round(snapshot_serialize_ms, 3),
+            "server_requested_response_format": response_format,
             "server_total_before_publish_ms": round(
                 (time.perf_counter() - server_started) * 1000.0,
                 3,
             ),
         }
         try:
-            _atomic_write_json(response_path, response)
+            _atomic_write_quote_response(response_path, response, response_format)
         finally:
             request_path.unlink(missing_ok=True)
         results.append(response)
@@ -2741,19 +2806,6 @@ def _fetch_shioaji_stock_snapshots_once(
         uncached_batches = (available_contracts + 499) // 500
         queried_batches = (len(missing_codes) + 499) // 500
         avoided_batches = max(0, uncached_batches - queried_batches)
-        if avoided_batches:
-            record_avoided_query(
-                consumer="stock_quote_provider",
-                method="snapshots",
-                asset_class="stock",
-                reason="process_cache_hit",
-                count=avoided_batches,
-                rows=max(0, available_contracts - len(missing_codes)),
-                details={
-                    "symbol_count": available_contracts,
-                    "cache_scope": "process",
-                },
-            )
 
         try:
             configured_snapshot_timeout_ms = int(
@@ -2784,6 +2836,22 @@ def _fetch_shioaji_stock_snapshots_once(
         request_contracts = {code: _SHIOAJI_STOCK_CONTRACTS.get(code) for code in requested}
         request_rows = {code: _SHIOAJI_STOCK_CACHE[code] for code in requested if code in _SHIOAJI_STOCK_CACHE}
         request_rows.update(stream_rows)
+
+    def record_avoided_batches() -> None:
+        if avoided_batches:
+            # This durable accounting is still completed on every path, but
+            # it is not a dependency of an external quote request. Submit all
+            # native batches first and overlap its I/O with callback delivery.
+            # In particular never hold the stock-cache lock during ledger I/O.
+            accounting_started = time.perf_counter()
+            record_avoided_query(consumer="stock_quote_provider", method="snapshots",
+                asset_class="stock", reason="process_cache_hit", count=avoided_batches,
+                rows=max(0, available_contracts - len(missing_codes)),
+                details={"symbol_count": available_contracts, "cache_scope": "process"})
+            snapshot_phases["avoided_query_record_ms"] = (time.perf_counter() - accounting_started) * 1000.
+
+    if not snapshot_batches:
+        record_avoided_batches()
 
     if snapshot_batches:
         # Shioaji accepts at most 500 contracts per Snapshot request. A
@@ -2899,34 +2967,37 @@ def _fetch_shioaji_stock_snapshots_once(
         ) as set_ledger_result:
             request_started = time.perf_counter()
             query_admission_ms = 0.0
-            for batch_index, contracts in enumerate(snapshot_batches):
-                callback = make_callback(batch_index)
-                try:
-                    admission_started = time.perf_counter()
-                    _wait_stock_quote_query_slot()
-                    query_admission_ms += (time.perf_counter() - admission_started) * 1000.0
-                    immediate = api.snapshots(
-                        contracts,
-                        timeout=0,
-                        cb=callback,
-                    )
-                except BaseException:
-                    # Native callbacks can outlive a failed submission.
-                    # Close this request generation before propagating so
-                    # late rows cannot mutate even its local aggregation.
-                    with condition:
-                        callbacks_open[0] = False
-                    raise
-                # The native API normally returns an empty placeholder in
-                # non-blocking mode. Preserve compatibility with a client
-                # that can complete synchronously without waiting twice.
-                if immediate:
-                    callback(immediate)
-
-            submissions_completed = time.perf_counter()
+            try:
+                for batch_index, contracts in enumerate(snapshot_batches):
+                    callback = make_callback(batch_index)
+                    try:
+                        admission_started = time.perf_counter()
+                        _wait_stock_quote_query_slot()
+                        query_admission_ms += (time.perf_counter() - admission_started) * 1000.0
+                        immediate = api.snapshots(
+                            contracts,
+                            timeout=0,
+                            cb=callback,
+                        )
+                    except BaseException:
+                        # Native callbacks can outlive a failed submission.
+                        # Close this request generation before propagating so
+                        # late rows cannot mutate even its local aggregation.
+                        with condition:
+                            callbacks_open[0] = False
+                        raise
+                    # The native API normally returns an empty placeholder in
+                    # non-blocking mode. Preserve compatibility with a client
+                    # that can complete synchronously without waiting twice.
+                    if immediate:
+                        callback(immediate)
+                submissions_completed = time.perf_counter()
+                callback_deadline = time.monotonic() + snapshot_timeout_ms / 1000.0
+            finally:
+                record_avoided_batches()
             snapshot_phases["query_admission_ms"] = query_admission_ms
             snapshot_phases["submit_ms"] = (submissions_completed - request_started) * 1000.0
-            deadline = time.monotonic() + snapshot_timeout_ms / 1000.0
+            deadline = callback_deadline
             if prefer_opening_stream:
                 with _SHIOAJI_STREAM_LOCK:
                     _SHIOAJI_OPENING_CONDITIONS.add(condition)
@@ -3491,35 +3562,48 @@ def fetch_futures_snapshot_prefer_stream(
     )
 
 
+def _symbol_map_generation(info) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@lru_cache(maxsize=16)
+def _load_symbol_yahoo_map_generation(path: str, generation: tuple[int, ...]) -> dict[str, str]:
+    """Memoize venue parsing, not official membership or a price observation."""
+    import csv
+
+    source = Path(path)
+    with source.open("r", encoding="utf-8", newline="") as handle:
+        if _symbol_map_generation(os.fstat(handle.fileno())) != generation:
+            raise OSError("symbol map changed before read")
+        output = {}
+        for row in csv.DictReader(handle):
+            code = str(row.get("code", "")).strip()
+            if not code:
+                continue
+            yahoo_symbol = str(row.get("yahoo_symbol", "")).strip()
+            if not yahoo_symbol:
+                venue = str(row.get("market", "")).strip().casefold()
+                if venue == "twse":
+                    yahoo_symbol = f"{code}.TW"
+                elif venue == "tpex":
+                    yahoo_symbol = f"{code}.TWO"
+            if yahoo_symbol:
+                output[code] = yahoo_symbol
+        if (_symbol_map_generation(os.fstat(handle.fileno())) != generation
+                or _symbol_map_generation(source.stat()) != generation):
+            raise OSError("symbol map changed during read")
+    return output
+
+
 def load_symbol_yahoo_map(parquet_root: str | Path) -> dict[str, str]:
     path = Path(parquet_root) / "symbols.csv"
-    if not path.exists():
-        return {}
     try:
-        import csv
-
-        with path.open("r", encoding="utf-8", newline="") as handle:
-            rows = csv.DictReader(handle)
-            output: dict[str, str] = {}
-            for row in rows:
-                code = str(row.get("code", "")).strip()
-                if not code:
-                    continue
-                yahoo_symbol = str(row.get("yahoo_symbol", "")).strip()
-                if not yahoo_symbol:
-                    # The canonical official symbol builder records venue, not
-                    # a provider-specific ticker.  Derive the unambiguous Yahoo
-                    # suffix so MIS can issue exactly one exchange channel per
-                    # security instead of probing both TWSE and TPEx.
-                    venue = str(row.get("market", "")).strip().casefold()
-                    if venue == "twse":
-                        yahoo_symbol = f"{code}.TW"
-                    elif venue == "tpex":
-                        yahoo_symbol = f"{code}.TWO"
-                if yahoo_symbol:
-                    output[code] = yahoo_symbol
-            return output
+        # Every retry checks the file generation, including inode and ctime:
+        # same-size replacements/restored mtimes cannot pin an obsolete venue.
+        # Return a detached map so an individual consumer cannot poison reuse.
+        return _load_symbol_yahoo_map_generation(str(path), _symbol_map_generation(path.stat())).copy()
     except Exception:
+        # Failures are not cached; the next source retry checks the file again.
         return {}
 
 
@@ -4010,32 +4094,51 @@ def _tw_mis_no_open_print_mask(snapshot: PriceSnapshot, session_date: str) -> np
 
 def tw_session_no_open_print_mask(
     snapshot: PriceSnapshot, *, session_date: str | None = None,
+    asof_timestamp_ms: int | None = None,
+    max_age_seconds: float = _TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS,
 ) -> np.ndarray:
     """Explicit source-published absence, kept distinct from unknown data.
 
-    The open-gap ABI already represents an absent opening print with its zero
-    sentinel. This proof permits that input state; it never permits sizing or
-    filling an order with a zero/carried/interpolated opening price.
+    A proven absence permits a model-only last-real-trade reference, never an
+    executable opening price. Without an as-of clock this describes retained
+    historical evidence, not current readiness. Live cache reads and receipt
+    audits additionally fence the proof's own age, not the row's last update.
     """
     size = len(snapshot.prices)
     date_text = session_date or datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
     stamps = snapshot.no_open_print_timestamps_ms
     if stamps is None:
-        return _tw_mis_no_open_print_mask(snapshot, date_text)
-    stamps = np.asarray(stamps, dtype=np.int64)
-    if stamps.shape != (size,):
-        raise ValueError("no-opening-print proof must have shape [symbols]")
-    observed = _tw_opening_timestamp_mask(stamps, date_text)
-    observed &= ~tw_session_open_observed_mask(snapshot, session_date=date_text)
-    if snapshot.available_mask is None:
-        observed[:] = False
+        observed = _tw_mis_no_open_print_mask(snapshot, date_text)
+        stamps = snapshot.timestamps_ms
     else:
-        observed &= np.asarray(snapshot.available_mask, dtype=bool)
+        stamps = np.asarray(stamps, dtype=np.int64)
+        if stamps.shape != (size,):
+            raise ValueError("no-opening-print proof must have shape [symbols]")
+        observed = _tw_opening_timestamp_mask(stamps, date_text)
+        observed &= ~tw_session_open_observed_mask(snapshot, session_date=date_text)
+        if snapshot.available_mask is None:
+            observed[:] = False
+        else:
+            observed &= np.asarray(snapshot.available_mask, dtype=bool)
+    if asof_timestamp_ms is not None:
+        if stamps is None:
+            observed[:] = False
+        else:
+            observed &= _tw_no_print_proof_fresh_mask(stamps, asof_timestamp_ms, max_age_seconds)
     return observed
+
+
+def _tw_no_print_proof_fresh_mask(stamps, asof_timestamp_ms: int, max_age_seconds: float) -> np.ndarray:
+    """Fence future and expired absence evidence without altering raw receipts."""
+    stamps = np.asarray(stamps, dtype=np.int64)
+    earliest = int(asof_timestamp_ms) - int(max(0., float(max_age_seconds)) * 1000)
+    return (stamps > 0) & (stamps >= earliest) & (stamps <= int(asof_timestamp_ms))
 
 
 def tw_opening_observation_diagnostics(
     symbols: list[str], snapshot: PriceSnapshot, *, session_date: str,
+    asof_timestamp_ms: int | None = None,
+    include_no_first_print_clock: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Explain the canonical input masks without changing their acceptance ABI.
 
@@ -4057,19 +4160,24 @@ def tw_opening_observation_diagnostics(
     if any(value.shape != (size,) for value in (available, opens, market, receipt, flags)):
         raise ValueError("opening diagnostic fields must have shape [symbols]")
     valid = tw_session_open_observed_mask(snapshot, session_date=session_date)
-    no_print = tw_session_no_open_print_mask(snapshot, session_date=session_date)
-    states = np.full(size, "missing_open_price", dtype="<U24")
+    no_print = tw_session_no_open_print_mask(snapshot, session_date=session_date,
+        asof_timestamp_ms=asof_timestamp_ms)
+    retained_no_print = (no_print if asof_timestamp_ms is None else
+        tw_session_no_open_print_mask(snapshot, session_date=session_date))
+    states = np.full(size, "missing_open_price", dtype="<U32")
     states[available & (market <= 0)] = "missing_market_time"
     states[available & (market > 0) & ~_tw_opening_timestamp_mask(market, session_date)] = "stale_or_preopen_time"
     states[available & (flags == 1)] = "trial_matching"
     states[~available] = "no_source_observation"
+    states[retained_no_print & ~no_print] = "stale_no_first_print_proof"
     states[no_print] = "observed_no_first_print"
     states[valid] = "valid_open"
     labels, counts = np.unique(states, return_counts=True)
     summary = {
-        "contract": "tw_opening_observation_diagnostics_v1",
+        "contract": "tw_opening_observation_diagnostics_v1" if asof_timestamp_ms is None else "tw_opening_observation_diagnostics_v2",
         "requested_count": size, "available_count": int(available.sum()),
         "valid_open_count": int(valid.sum()), "observed_no_print_count": int(no_print.sum()),
+        "stale_no_print_proof_count": int((retained_no_print & ~no_print).sum()),
         "unresolved_count": int((~(valid | no_print)).sum()),
         "unknown_trial_flag_count": int((available & (flags == -1)).sum()),
         "states": {str(label): int(count) for label, count in zip(labels, counts)},
@@ -4085,6 +4193,16 @@ def tw_opening_observation_diagnostics(
         for symbol, state, opening, finite, present, stamp, received, flag in zip(
             symbols, states.tolist(), opens.tolist(), np.isfinite(opens).tolist(),
             available.tolist(), market.tolist(), receipt.tolist(), flags.tolist())]
+    if asof_timestamp_ms is not None or include_no_first_print_clock:
+        # The lossless v2 source journal retains the absence clock separately
+        # from mutable row delivery. Legacy consumers retain their v1 schema.
+        proof_stamps = snapshot.no_open_print_timestamps_ms
+        if proof_stamps is None:
+            proof_stamps = np.where(retained_no_print, receipt, 0)
+        for row, proof in zip(rows, np.asarray(proof_stamps, dtype=np.int64).tolist()):
+            row["no_first_print_observed_timestamp_ms"] = proof or None
+            if asof_timestamp_ms is not None:
+                row["no_first_print_evidence_age_ms"] = int(asof_timestamp_ms) - proof if proof else None
     return summary, rows
 
 
@@ -4171,19 +4289,21 @@ def tw_mis_opening_receipt_status(
     }
 
 
-def _plain_finite_receipt_metadata(value: Any) -> bool:
-    """Admit only JSON-native finite metadata, never msgspec's coercions.
+def _plain_finite_receipt_metadata(value: Any, *, finite_only: bool = True) -> bool:
+    """Admit only plain JSON-native values, never msgspec's coercions.
 
     Native encoders also accept bytes/datetimes and map NaN to null. Those
     are NOT equivalent to this receipt's strict stdlib JSON contract. Unusual
     types, aliases/cycles and oversized integers use the original encoder.
+    Only negotiated MessagePack IPC opts out of the finite-float requirement;
+    strict persistent receipt callers keep the default unchanged.
     """
     pending, seen = [value], set()
     while pending:
         item = pending.pop()
         kind = type(item)
         if kind is float:
-            if not math.isfinite(item):
+            if finite_only and not math.isfinite(item):
                 return False
         elif kind is int:
             if not -(2 ** 63) <= item < 2 ** 64:
@@ -4626,12 +4746,13 @@ def repair_tw_opening_snapshot_receipt(
     if official_scope is not None:
         requested = official_scope["symbols"]
     missing = [symbol for symbol in requested if symbol not in rows or not _opening_row_has_open(rows[symbol][1], session_date)]
+    before_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
     resolved_before = {
         symbol for symbol in requested if symbol in rows and (
             _opening_row_has_open(rows[symbol][1], session_date)
-            or _same_taipei_open_timestamp(
-                int(rows[symbol][1].get("no_open_print_observed_ms") or 0), session_date,
-            )
+            or (_same_taipei_open_timestamp(int(rows[symbol][1].get("no_open_print_observed_ms") or 0), session_date)
+                and bool(_tw_no_print_proof_fresh_mask(rows[symbol][1].get("no_open_print_observed_ms") or 0,
+                    before_ms, _TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS)))
         )
     }
     if official_scope is not None:
@@ -4656,9 +4777,11 @@ def repair_tw_opening_snapshot_receipt(
         source_timing = refreshed.transport_timing or {}
         rows = _load_tw_mis_opening_receipt(parquet_root=root, session_date=session_date)
     remaining = [symbol for symbol in requested if symbol not in rows or not _opening_row_has_open(rows[symbol][1], session_date)]
+    after_ms = int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000)
     no_print = [symbol for symbol in remaining if symbol in rows and _same_taipei_open_timestamp(
         int(rows[symbol][1].get("no_open_print_observed_ms") or 0), session_date,
-    )]
+    ) and bool(_tw_no_print_proof_fresh_mask(rows[symbol][1].get("no_open_print_observed_ms") or 0,
+        after_ms, _TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS))]
     resolved_after = (set(requested) - set(remaining)) | set(no_print)
     return {
         "status": "awaiting_first_print" if remaining and len(no_print) == len(remaining) else "waiting_source" if remaining else "complete",
@@ -4954,6 +5077,7 @@ def _fetch_tw_mis_last_prices(
     on_progress: Callable[[list[str], PriceSnapshot], None] | None = None,
 ) -> PriceSnapshot:
     """Fetch Taiwan intraday prices from TWSE MIS and align them to panel symbols."""
+    fetch_started = time.perf_counter()
     request_timeout = max(
         0.25,
         float(request_timeout_seconds)
@@ -5007,7 +5131,7 @@ def _fetch_tw_mis_last_prices(
     minimum_coverage = float(minimum_response_coverage)
     if not 0.0 < minimum_coverage <= 1.0:
         raise ValueError("minimum_response_coverage must be in (0, 1]")
-    fetch_started = time.perf_counter()
+    preparation_ms = (time.perf_counter() - fetch_started) * 1000
     retry_attempts = max(
         0,
         int(empty_chunk_retry_attempts)
@@ -5071,6 +5195,7 @@ def _fetch_tw_mis_last_prices(
     def fetch_chunk(
         items: list[tuple[int, str]],
         enqueued_at: float | None = None,
+        request_index: int | None = None,
     ) -> list[
         tuple[
             int,
@@ -5100,7 +5225,11 @@ def _fetch_tw_mis_last_prices(
         response = None
         phase = "session_prepare"
         spans = {"worker_queue_ms": round((request_started - enqueued_at) * 1000, 3)
-                 if enqueued_at is not None else None}
+                 if enqueued_at is not None else None,
+                 "request_index": request_index,
+                 "enqueued_offset_ms": round((enqueued_at - fetch_started) * 1000, 3)
+                 if enqueued_at is not None else None,
+                 "request_started_offset_ms": round((request_started - fetch_started) * 1000, 3)}
         try:
             client = session()
             http_started = time.perf_counter()
@@ -5123,12 +5252,14 @@ def _fetch_tw_mis_last_prices(
                 stream=True,
             )
             headers_received = time.perf_counter()
+            spans["headers_received_offset_ms"] = round((headers_received - fetch_started) * 1000, 3)
             spans["http_headers_ms"] = round((headers_received - http_started) * 1000, 3)
             phase = "http_status"
             response.raise_for_status()
             phase = "body_read"
             body = getattr(response, "content", None)
             body_received = time.perf_counter()
+            spans["body_received_offset_ms"] = round((body_received - fetch_started) * 1000, 3)
             spans["body_read_ms"] = round((body_received - headers_received) * 1000, 3)
             spans["body_bytes"] = len(body) if isinstance(body, bytes) else None
             phase = "json_decode"
@@ -5152,7 +5283,8 @@ def _fetch_tw_mis_last_prices(
                     close()
             error_types = _tw_mis_transport_error_types(exc)
             failure = {"error_type": type(exc).__name__, "error_chain_types": error_types,
-                       "failure_phase": phase, **spans}
+                       "failure_phase": phase, **spans,
+                       "failed_offset_ms": round((time.perf_counter() - fetch_started) * 1000, 3)}
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status is None:
                 status = getattr(response, "status_code", None)
@@ -5270,6 +5402,7 @@ def _fetch_tw_mis_last_prices(
                 )
         observation["row_decode_ms"] = round((time.perf_counter() - row_decode_started) * 1000, 3)
         observation["request_to_decoded_rows_ms"] = round((time.perf_counter() - request_started) * 1000, 3)
+        observation["decoded_rows_ready_offset_ms"] = round((time.perf_counter() - fetch_started) * 1000, 3)
         return rows
 
     chunk_results: list[
@@ -5356,7 +5489,7 @@ def _fetch_tw_mis_last_prices(
                            and not stop_dispatch.is_set() and not cancelled.is_set()):
                         index = remaining.popleft()
                         submitted_indices.add(index)
-                        pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index], time.perf_counter())] = index
+                        pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index], time.perf_counter(), index)] = index
                     if not pending:
                         break
                     completed, _ = wait(pending, return_when=FIRST_COMPLETED)
@@ -5476,6 +5609,8 @@ def _fetch_tw_mis_last_prices(
         transport_timing={
             "mis_first_pass_ms": round(first_pass_ms, 3),
             "mis_total_ms": round((time.perf_counter() - fetch_started) * 1000.0, 3),
+            "mis_source_prepare_ms": round(preparation_ms, 3),
+            "mis_timing_boundary": "source_entry_including_venue_map_and_arrays_v2",
             "mis_retry_rounds": retry_rounds,
             "mis_failed_request_count": len(chunk_failures),
             "mis_failure_phase_counts": {phase: sum(item["failure_phase"] == phase for item in chunk_failures)
@@ -5532,7 +5667,7 @@ def fetch_tw_mis_opening_snapshot(
     *,
     parquet_root: str | Path,
     chunk_size: int = 80,
-    cache_ttl_seconds: float = 15.0,
+    cache_ttl_seconds: float = _TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS,
     max_parallel_requests: int = 16,
     allow_network: bool = True,
     force_missing_retry: bool = False,
@@ -5646,6 +5781,12 @@ def fetch_tw_mis_opening_snapshot(
         available = keep & columns.available
         stamps = np.where(keep[None, :], columns.timestamps, 0)
         timestamps_ms, open_timestamps_ms, no_open_print_timestamps_ms = stamps
+        # Row receipt freshness is not proof freshness: a just-received stale
+        # broker row must not turn an old MIS absence into current readiness.
+        proof_fresh = _tw_no_print_proof_fresh_mask(no_open_print_timestamps_ms,
+            int(datetime.now(ZoneInfo("Asia/Taipei")).timestamp() * 1000), ttl)
+        expired_no_print_count = int(np.count_nonzero((no_open_print_timestamps_ms > 0) & ~proof_fresh))
+        no_open_print_timestamps_ms = np.where(proof_fresh, no_open_print_timestamps_ms, 0)
         fields = np.where(keep[None, :], columns.fields, np.nan)
         arrays = dict(zip(_PRICE_SNAPSHOT_ARRAY_FIELDS, fields))
         positive_opens = np.isfinite(arrays["open_prices"]) & (arrays["open_prices"] > 0)
@@ -5699,6 +5840,7 @@ def fetch_tw_mis_opening_snapshot(
             "opening_requested_count": size,
             "opening_cache_hits": cache_hits,
             "opening_conflict_count": conflict_count,
+            "opening_stale_no_print_proof_count": expired_no_print_count,
             "opening_newly_requested_symbols": len(missing_indices) if allow_network else 0,
             "opening_missing_symbols": missing_open_symbols,
         },

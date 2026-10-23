@@ -498,6 +498,98 @@ test("missing performance observations stay unknown, while actual zeros and full
   assert.equal(metric.pointCount, 1200000);
 });
 
+function revisionPaintFixture() {
+  let clock = 100;
+  const frames = [];
+  const result = loadCore({globals: {performance: {now: () => clock},
+    requestAnimationFrame: callback => frames.push(callback)}});
+  let revision = {revision_token: "content:1:2026-10-22", engine_generation: "a".repeat(32), state_revision: 1};
+  const observer = result.core.createRevisionPaintObserver({getCurrentRevision: () => revision});
+  const row = {revision, action: "status_revision_paint", market: "tw_day_trade",
+    sessionDate: "2026-10-22", signalKey: "b".repeat(32)};
+  return {...result, observer, row, setTime: value => { clock = value; },
+    setRevision: value => { revision = value; }, frame: () => frames.splice(0).forEach(callback => callback()),
+    records: () => result.core.performanceHistorySnapshot().filter(metric => metric.eventType === "revision_applied")};
+}
+
+test("revision paint joins the earliest matching notice to applied foreground data, not duplicate notifications", () => {
+  const f = revisionPaintFixture();
+  f.observer.notice(f.row.revision, "sse");
+  f.setTime(110); f.observer.notice(f.row.revision, "poll");
+  f.setTime(120); assert.equal(f.observer.applied(f.row), true);
+  assert.equal(f.observer.applied(f.row), false);
+  f.setTime(130); f.frame(); assert.equal(f.records().length, 0);
+  f.setTime(140); f.frame();
+  const metric = f.records()[0];
+  assert.equal(metric.durationMs, 40);
+  assert.equal(metric.noticeToApplyMs, 20);
+  assert.equal(metric.applyToPaintMs, 20);
+  assert.equal(metric.correlation.signalKey, f.row.signalKey);
+  assert.equal(metric.correlation.trigger, "sse");
+  assert.equal(metric.correlation.viewEvidence, "status_mode_snapshot");
+  assert.equal(metric.correlation.updatePhase, "revision_change");
+  assert.match(metric.correlation.clockBasis, /not_physical_pixel/);
+  assert.equal(f.observer.applied(f.row), false);
+});
+
+test("unmatched initial revision measures only apply-to-paint and discloses narrower detail identity evidence", () => {
+  const f = revisionPaintFixture();
+  f.observer.notice({...f.row.revision, state_revision: 2});
+  f.observer.applied({...f.row, viewEvidence: "detail_signal_identity_only", updatePhase: "initial"});
+  f.setTime(110); f.frame(); f.setTime(120); f.frame();
+  const metric = f.records()[0];
+  assert.equal(metric.durationMs, 20);
+  assert.equal(metric.applyToPaintMs, 20);
+  assert.equal("noticeToApplyMs" in metric, false);
+  assert.equal(metric.correlation.trigger, "initial_or_unmatched");
+  assert.equal(metric.correlation.viewEvidence, "detail_signal_identity_only");
+  assert.equal(metric.correlation.updatePhase, "initial");
+});
+
+test("hidden, superseded, detached or selection-raced frames are never presented as displayed data", () => {
+  for (const kind of ["hidden", "hide_then_reveal", "revision", "selection"]) {
+    const f = revisionPaintFixture();
+    let current = true;
+    f.observer.applied({...f.row, stillCurrent: () => current});
+    f.frame();
+    if (kind === "revision") f.setRevision({...f.row.revision, state_revision: 2});
+    else if (kind === "selection") current = false;
+    else {
+      f.document.hidden = true;
+      f.document.dispatchEvent({type: "visibilitychange"});
+      if (kind === "hide_then_reveal") {
+        f.document.hidden = false; f.document.dispatchEvent({type: "visibilitychange"});
+      }
+    }
+    f.frame(); assert.equal(f.records().length, 0, kind);
+  }
+});
+
+test("missing paint API or incomplete revision cannot fabricate a completed display observation", () => {
+  const f = revisionPaintFixture();
+  f.document.hidden = true;
+  assert.equal(f.observer.applied(f.row), false);
+  f.document.hidden = false;
+  assert.equal(f.observer.applied({...f.row, revision: {...f.row.revision, engine_generation: null}}), false);
+  f.sandbox.requestAnimationFrame = null;
+  assert.equal(f.observer.applied(f.row), false);
+  assert.equal(f.records().length, 0);
+});
+
+test("performance correlation permits opaque keys and timings, never arbitrary prices or private identifiers", () => {
+  const {core} = loadCore();
+  const metric = core.recordPerformanceMetric({kind: "render", action: "status_revision_paint", durationMs: 1,
+    correlation: {market: "tw_day_trade", signalKey: "b".repeat(32), engineGeneration: "a".repeat(32),
+      stateRevision: 1, sessionDate: "2026-10-22", signal_id: "PRIVATE", price: 999,
+      revisionToken: "invalid/token?secret", clockBasis: "untrusted", viewEvidence: "not_allowed"}});
+  assert.equal(metric.correlation.signalKey, "b".repeat(32));
+  assert.equal("signal_id" in metric.correlation, false);
+  assert.equal("price" in metric.correlation, false);
+  assert.equal("revisionToken" in metric.correlation, false);
+  assert.equal("viewEvidence" in metric.correlation, false);
+  assert.match(metric.correlation.clockBasis, /foreground_double_raf/);
+});
+
 test("API history without Server-Timing does not invent a zero server duration", async () => {
   const {core} = loadCore();
   await core.fetchJson("/api/status");

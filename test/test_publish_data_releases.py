@@ -567,6 +567,83 @@ def test_source_parent_lock_binds_external_live_root_and_borrowed_descriptor(tmp
     assert not (repo / ".locks").exists()
 
 
+def test_tw_public_shared_publication_admits_model_reader_but_blocks_writer(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    source = tmp_path / "live/data_tw_public"
+    source.mkdir(parents=True)
+    entry = {"dataset": "tw-public", "source": str(source),
+             "source_coordination_lock": ".locks/tw-public-refresh.lock",
+             "source_coordination_lock_scope": "source_parent",
+             "source_coordination_lock_mode": "shared_read"}
+    lock = source.parent / entry["source_coordination_lock"]
+    with module._source_coordination_lock(entry) as fd:
+        with lock.open("a+") as reader:
+            fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            with module._source_coordination_lock(entry, inherited_fd=fd) as borrowed:
+                assert borrowed == fd
+            with lock.open("a+") as writer:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Borrowing must not unlock the original open file description.
+        with lock.open("a+") as writer:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with lock.open("a+") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_shared_source_borrow_never_downgrades_exclusive_parent_or_accepts_unlocked_fd(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    entry = {"dataset": "tw-public", "source_coordination_lock": "source.lock",
+             "source_coordination_lock_mode": "shared_read"}
+    lock = tmp_path / "source.lock"
+    with lock.open("a+") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with module._source_coordination_lock(entry, inherited_fd=owner.fileno()):
+            pass
+        with lock.open("a+") as reader:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    with lock.open("a+") as unlocked:
+        with pytest.raises(SnapshotError, match="no held flock"):
+            with module._source_coordination_lock(entry, inherited_fd=unlocked.fileno()):
+                pytest.fail("unlocked descriptor was admitted")
+
+
+def test_tw_public_shared_source_lease_survives_real_child_inheritance(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    entry = {"dataset": "tw-public", "source_coordination_lock": "source.lock",
+             "source_coordination_lock_mode": "shared_read"}
+    program = """import json, sys
+from pathlib import Path
+from scripts import publish_data_releases as publisher
+publisher.REPO_ROOT = Path(sys.argv[3])
+with publisher._source_coordination_lock(json.loads(sys.argv[1]), inherited_fd=int(sys.argv[2])):
+    print('inherited-shared-owner-verified', flush=True)
+"""
+    with module._source_coordination_lock(entry) as fd:
+        child = subprocess.run([sys.executable, "-c", program, json.dumps(entry), str(fd), str(tmp_path)],
+                               pass_fds=(fd,), capture_output=True, text=True, timeout=30)
+        assert child.returncode == 0, child.stderr
+        assert child.stdout.strip() == "inherited-shared-owner-verified"
+        with (tmp_path / "source.lock").open("a+") as writer:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@pytest.mark.parametrize("dataset,mode", [("bybit", "shared_read"), ("tw-public", "unknown")])
+def test_shared_source_lock_scope_is_explicit_not_a_global_policy(tmp_path, monkeypatch, dataset, mode):
+    module = _module()
+    monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
+    with pytest.raises(SnapshotError):
+        with module._source_coordination_lock({"dataset": dataset, "source_coordination_lock": "source.lock",
+                                               "source_coordination_lock_mode": mode}):
+            pytest.fail("unsupported read lease scope was admitted")
+
+
 def test_source_parent_lock_rejects_redirected_path_and_unknown_scope(tmp_path, monkeypatch):
     module = _module()
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path / "repo")
@@ -1127,3 +1204,94 @@ def test_publish_freshness_can_require_recent_catalog_check(tmp_path: Path) -> N
     receipt["catalog_checked_at_utc"] = datetime.now(UTC).isoformat()
     path.write_text(json.dumps(receipt))
     assert module._source_freshness(entry)["value"] == "2026-08-18"
+
+
+@pytest.mark.parametrize("expired,wrong_scope,expected_exit", [(True, False, 75), (True, True, 2)])
+def test_finlab_source_expiry_is_retryable_but_invalid_scope_is_not(
+    tmp_path, monkeypatch, capsys, expired, wrong_scope, expected_exit,
+):
+    from scripts.finlab_release_gate import CONTRACT
+    module = _module()
+    source = _source(tmp_path, "2026-08-18")
+    entry = {**_entry(source), "dataset": "tw-public-research-finlab-2014-v4",
+             "loose_threshold_mib": 8, "pack_buckets": 1}
+    receipt = source / "download_summary.json"
+    receipt.write_text(json.dumps({**json.loads(receipt.read_text()),
+        "catalog_scope_contract": 'wrong' if wrong_scope else CONTRACT,
+        "catalog_valid_until_utc": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+    }))
+    monkeypatch.setattr(module, "_load_catalog", lambda *_a: [entry])
+    status = module._status(entry, [])
+    assert not status["publish_ready"]
+    assert status.get("freshness_retryable", False) is (not wrong_scope)
+    cold = tmp_path / "cold"
+    result = tmp_path / "result.json"
+    assert module.main(["publish", entry["dataset"], "--sync-root", str(cold),
+                        "--node-id", "fixture", "--result-receipt", str(result)]) == expected_exit
+    assert not result.exists()
+    assert not list((cold / "heads").glob("**/*.json"))
+    if expected_exit == 75:
+        event = json.loads(capsys.readouterr().out)
+        assert event["reason"] == "source_freshness_expired" and event["retryable"]
+
+
+def test_finlab_expiry_at_final_commit_preserves_the_old_exact_head(tmp_path, monkeypatch, capsys):
+    from scripts.finlab_release_gate import CONTRACT
+    module = _module()
+    source = _source(tmp_path, "2026-08-18")
+    entry = {**_entry(source), "dataset": "tw-public-research-finlab-2014-v4",
+             "loose_threshold_mib": 8, "pack_buckets": 1}
+    now = datetime.now(UTC)
+    receipt = source / "download_summary.json"
+    receipt.write_text(json.dumps({**json.loads(receipt.read_text()),
+        "catalog_scope_contract": CONTRACT,
+        "catalog_valid_until_utc": (now + timedelta(minutes=10)).isoformat(),
+    }))
+    cold = tmp_path / "cold"
+    old = publish_packed_snapshot(cold, entry['dataset'], source, node_id='fixture')
+    before = old.head_path.read_bytes()
+    (source / "prices.csv").write_bytes(b"price\n-7\n")
+    checks = []
+
+    class AdvancingClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            checks.append(True)
+            return now + timedelta(minutes=20 if len(checks) >= 4 else 0)
+
+    monkeypatch.setattr(module, "datetime", AdvancingClock)
+    monkeypatch.setattr(module, "_load_catalog", lambda *_a: [entry])
+    assert module.main(["publish", entry['dataset'], "--sync-root", str(cold),
+                        "--node-id", "fixture", "--result-receipt", str(tmp_path / "result.json")]) == 75
+    assert len(checks) == 4
+    assert old.head_path.read_bytes() == before
+    assert not (tmp_path / "result.json").exists()
+    assert (source / "prices.csv").read_bytes() == b"price\n-7\n"
+    assert json.loads(capsys.readouterr().out)['reason'] == 'source_freshness_expired'
+    assert verify_packed_snapshot(cold, old, reconstruct_all=True)['independently_reconstructed_files'] == 2
+
+
+@pytest.mark.parametrize("root,dataset,chunked,enabled", [
+    ('/srv/stockagent-packed', 'tw-public-research-finlab-2014-v4', True, True),
+    ('/srv/stockagent-packed', 'prices', True, False),
+    ('/srv/stockagent-packed/.local-state/other', 'tw-public-research-finlab-2014-v4', True, False),
+    ('/srv/stockagent-packed', 'tw-public-research-finlab-2014-v4', False, False),
+])
+def test_finlab_native_reuse_dispatch_is_narrow_and_uses_the_original_publisher(
+    tmp_path, monkeypatch, root, dataset, chunked, enabled,
+):
+    from contextlib import nullcontext
+    module = _module()
+    source = _source(tmp_path, "2026-08-18")
+    entry = {**_entry(source), 'dataset': dataset, 'loose_threshold_mib': 8, 'pack_buckets': 1}
+    monkeypatch.setattr(module, '_publication_source_locks', lambda *_a, **_kw: nullcontext(
+        {'primary_fd': None, 'native_lock_fds': ()}))
+    monkeypatch.setattr(module, '_status', lambda *_a, **_kw: {'publish_ready': True, 'source_freshness': None})
+    monkeypatch.setattr(module, '_version_options', lambda *_a: {'file_chunk_bytes': 8388608} if chunked else {})
+    calls = []
+    monkeypatch.setattr(module, 'publish_packed_snapshot', lambda *a, **kw: calls.append((a, kw)))
+    args = module.build_parser().parse_args(['publish', dataset, '--sync-root', root, '--node-id', 'fixture'])
+    module._publish_entry(entry, args, Path(root))
+    assert len(calls) == 1 and calls[0][0][:3] == (Path(root), dataset, source)
+    assert calls[0][1].get('d_primary_native_chunk_reuse', False) is enabled
+    assert calls[0][1].get('d_primary_native_chunk_reuse_pipeline', False) is enabled

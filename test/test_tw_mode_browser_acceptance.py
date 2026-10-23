@@ -3,8 +3,59 @@ import pytest
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.verify_tw_day_trade_mode_browser import (
-    _expected_beacon_csp_denial, _is_cloudflare_beacon, _signal_url, _verify_signal_boundary,
+    _expected_beacon_csp_denial, _failed_viewport_evidence, _is_cloudflare_beacon, _prepare_output_dir,
+    _signal_url, _verify_signal_boundary,
 )
+
+
+def test_browser_run_atomically_reserves_a_fresh_evidence_directory(tmp_path):
+    directory = tmp_path / "nested" / "run"
+    assert _prepare_output_dir(directory) == directory / "receipt.json"
+    assert directory.is_dir()
+    with pytest.raises(FileExistsError, match="choose a new path"):
+        _prepare_output_dir(directory)
+
+
+def test_browser_run_does_not_overwrite_a_previous_failed_receipt(tmp_path):
+    receipt = tmp_path / "receipt.json"
+    original = b'{"status":"failed","error":"source timeout"}\n'
+    receipt.write_bytes(original)
+    with pytest.raises(FileExistsError, match="choose a new path"):
+        _prepare_output_dir(tmp_path)
+    assert receipt.read_bytes() == original
+
+
+def test_browser_run_rejects_an_existing_file_as_output_directory(tmp_path):
+    existing = tmp_path / "evidence"
+    existing.write_bytes(b"retained")
+    with pytest.raises(FileExistsError, match="choose a new path"):
+        _prepare_output_dir(existing)
+    assert existing.read_bytes() == b"retained"
+
+
+@pytest.mark.parametrize("state_error,screenshot_error", [(False, False), (True, False),
+                                                        (False, True), (True, True)])
+def test_failed_viewport_preserves_available_diagnostics_without_masking_the_failure(
+    tmp_path, state_error, screenshot_error,
+):
+    class Page:
+        def evaluate(self, script):
+            assert "signal_rows" in script
+            assert ".slice(0, 2000)" in script
+            if state_error:
+                raise RuntimeError("page already closed")
+            return {"signal_rows": 0, "signal_count": "request timed out"}
+
+        def screenshot(self, *, path, timeout):
+            assert path == str(tmp_path / "laptop_failed.png")
+            assert timeout == 10_000
+            if screenshot_error:
+                raise RuntimeError("screenshot unavailable")
+
+    proof = _failed_viewport_evidence(Page(), tmp_path, "laptop")
+    assert len(proof["diagnostic_errors"]) == int(state_error) + int(screenshot_error)
+    assert ("rendered_state" in proof) is not state_error
+    assert bool(proof["screenshots"]) is not screenshot_error
 
 
 def test_native_public_signal_request_keeps_the_query_separator():

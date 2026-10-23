@@ -596,11 +596,17 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         expected.add('peoplemedia')
     pocket = registry.sources.get('pocket')
     if pocket is not None and pocket.allowed:
-        from downloader.news_fulltext_pocket import POCKET_BODY_SELECTOR, POCKET_PATH_PATTERN
+        from downloader.news_fulltext_pocket import (
+            POCKET_BODY_SELECTOR, POCKET_PATH_PATTERN, POCKET_V10_PATH_PATTERN, POCKET_V11_PATH_PATTERN,
+        )
+        from downloader.news_fulltext_policy import POCKET_LAYOUT_VERSIONS
         assert pocket.acquisition_mode == 'continuous' and pocket.known_url_only
         assert pocket.domains == ('www.pocket.tw',)
-        assert pocket.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}
-        assert pocket.article_path_pattern == POCKET_PATH_PATTERN and pocket.selectors == (POCKET_BODY_SELECTOR,)
+        assert pocket.embedded_article_layout in POCKET_LAYOUT_VERSIONS
+        expected_path = (POCKET_V11_PATH_PATTERN if pocket.embedded_article_layout in {'pocket_visible_article_v11', 'pocket_visible_article_v12'} else
+                         POCKET_V10_PATH_PATTERN if pocket.embedded_article_layout == 'pocket_visible_article_v10'
+                         else POCKET_PATH_PATTERN)
+        assert pocket.article_path_pattern == expected_path and pocket.selectors == (POCKET_BODY_SELECTOR,)
         assert pocket.title_selector == 'h1' and not pocket.exclude_selectors
         assert pocket.require_configured_container and pocket.require_author_attribution
         assert pocket.authorization['kind'] == 'personal_research'
@@ -667,11 +673,24 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     if learning is not None and learning.allowed:
         from downloader.news_fulltext_cmoneylearning import (
             CMONEY_LEARNING_BODY_SELECTOR, CMONEY_LEARNING_PATH_PATTERN,
+            CMONEY_LEARNING_V2_PATH_PATTERN,CMONEY_LEARNING_V2_AUTH_SCOPE,
+            CMONEY_LEARNING_V3_PATH_PATTERN,CMONEY_LEARNING_V3_AUTH_SCOPE,
+            CMONEY_LEARNING_V4_PATH_PATTERN,CMONEY_LEARNING_V4_AUTH_SCOPE,
         )
         assert learning.acquisition_mode == 'finite' and not learning.known_url_only
         assert learning.domains == ('cmoneylearning.com.tw',)
-        assert learning.embedded_article_layout == 'cmoneylearning_visible_article_v1'
-        assert learning.article_path_pattern == CMONEY_LEARNING_PATH_PATTERN
+        assert learning.embedded_article_layout in {'cmoneylearning_visible_article_v1','cmoneylearning_visible_article_v2','cmoneylearning_visible_article_v3','cmoneylearning_visible_article_v4'}
+        if learning.embedded_article_layout.endswith('_v4'):
+            assert learning.article_path_pattern == CMONEY_LEARNING_V4_PATH_PATTERN
+            assert learning.authorization['scope'] == CMONEY_LEARNING_V4_AUTH_SCOPE and learning.allow_reviewed_supplements
+        elif learning.embedded_article_layout.endswith('_v3'):
+            assert learning.article_path_pattern == CMONEY_LEARNING_V3_PATH_PATTERN
+            assert learning.authorization['scope'] == CMONEY_LEARNING_V3_AUTH_SCOPE and learning.allow_reviewed_supplements
+        elif learning.embedded_article_layout.endswith('_v2'):
+            assert learning.article_path_pattern == CMONEY_LEARNING_V2_PATH_PATTERN
+            assert learning.authorization['scope'] == CMONEY_LEARNING_V2_AUTH_SCOPE and learning.allow_reviewed_supplements
+        else:
+            assert learning.article_path_pattern == CMONEY_LEARNING_PATH_PATTERN
         assert learning.selectors == (CMONEY_LEARNING_BODY_SELECTOR,)
         assert learning.title_selector == 'h1.articleContent__title' and not learning.exclude_selectors
         assert learning.require_configured_container and learning.require_author_attribution
@@ -679,6 +698,41 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert learning.authorization['evidence_url'] == 'https://www.cmoney.tw/member/tos.aspx'
         assert not learning.feeds and not learning.sitemaps and not learning.wordpress_apis and not learning.fulltext_feeds
         expected.add('cmoneylearning')
+    stockfeel = registry.sources.get('stockfeel')
+    if stockfeel and stockfeel.allowed:
+        from downloader.news_fulltext_stockfeel import STOCKFEEL_BODY_SELECTOR, STOCKFEEL_ORIGIN, STOCKFEEL_PATH_PATTERN, STOCKFEEL_LAYOUT_VERSIONS
+        assert stockfeel.known_url_only and stockfeel.acquisition_mode == 'continuous'
+        assert stockfeel.domains == ('www.stockfeel.com.tw',)
+        assert stockfeel.embedded_article_layout in STOCKFEEL_LAYOUT_VERSIONS
+        assert stockfeel.article_path_pattern == STOCKFEEL_PATH_PATTERN
+        assert stockfeel.selectors == (STOCKFEEL_BODY_SELECTOR,)
+        assert stockfeel.title_selector == 'h1' and not stockfeel.exclude_selectors
+        assert stockfeel.require_configured_container and stockfeel.require_author_attribution
+        assert not stockfeel.author_selectors and not stockfeel.allow_short_configured_body
+        assert stockfeel.authorization['kind'] == 'personal_research'
+        assert stockfeel.authorization['evidence_url'] == STOCKFEEL_ORIGIN + '/member/?view=copyright'
+        assert not any((stockfeel.feeds, stockfeel.sitemaps, stockfeel.wordpress_apis,
+            stockfeel.fulltext_feeds, stockfeel.metadata_feeds, stockfeel.index_pages))
+        expected.add('stockfeel')
+    taiwannews = registry.sources.get('taiwannews')
+    if taiwannews and taiwannews.allowed:
+        from downloader.news_fulltext_taiwannews import (
+            TAIWANNEWS_BODY_SELECTOR, TAIWANNEWS_PATH_PATTERN,
+        )
+        from downloader.news_fulltext_policy import TAIWANNEWS_LAYOUT_VERSIONS
+        assert taiwannews.known_url_only and taiwannews.acquisition_mode == 'continuous'
+        assert taiwannews.domains == ('www.taiwannews.com.tw',)
+        assert taiwannews.embedded_article_layout in TAIWANNEWS_LAYOUT_VERSIONS
+        assert taiwannews.article_path_pattern == TAIWANNEWS_PATH_PATTERN
+        assert taiwannews.selectors == (TAIWANNEWS_BODY_SELECTOR,)
+        assert taiwannews.title_selector == 'h1' and not taiwannews.exclude_selectors
+        assert taiwannews.require_configured_container and taiwannews.require_author_attribution
+        assert not taiwannews.author_selectors and not taiwannews.allow_short_configured_body
+        assert taiwannews.authorization['kind'] == 'personal_research'
+        assert taiwannews.authorization['evidence_url'] == 'https://www.taiwannews.com.tw/page/about-us'
+        assert not any((taiwannews.feeds, taiwannews.sitemaps, taiwannews.wordpress_apis,
+            taiwannews.fulltext_feeds, taiwannews.metadata_feeds, taiwannews.index_pages))
+        expected.add('taiwannews')
     videoland = registry.sources.get('videoland')
     if videoland and videoland.allowed:
         from downloader.news_fulltext_videoland import (
@@ -695,6 +749,188 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert videoland.authorization['evidence_url'] == VIDEOLAND_POLICY_EVIDENCE_URL
         assert not videoland.feeds and not videoland.sitemaps and not videoland.wordpress_apis and not videoland.fulltext_feeds
         expected.add('videoland')
+    bastille = registry.sources.get('bastillepost')
+    if bastille and bastille.allowed:
+        from downloader.news_fulltext_bastillepost import (
+            BASTILLE_BODY_SELECTOR, BASTILLE_ORIGIN, BASTILLE_PATH_PATTERN, BASTILLE_TITLE_SELECTOR,
+        )
+        assert bastille.known_url_only and bastille.acquisition_mode == 'continuous'
+        assert bastille.domains == ('www.bastillepost.com',)
+        from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS
+        assert bastille.embedded_article_layout in BASTILLE_LAYOUT_VERSIONS
+        assert bastille.article_path_pattern == BASTILLE_PATH_PATTERN
+        assert bastille.selectors == (BASTILLE_BODY_SELECTOR,)
+        assert bastille.title_selector == BASTILLE_TITLE_SELECTOR and not bastille.exclude_selectors
+        assert bastille.require_configured_container and bastille.require_author_attribution
+        assert not bastille.author_selectors and not bastille.allow_short_configured_body
+        assert bastille.authorization['kind'] == 'personal_research'
+        assert bastille.authorization['evidence_url'] == BASTILLE_ORIGIN + '/hongkong/terms'
+        assert not bastille.feeds and not bastille.sitemaps and not bastille.wordpress_apis and not bastille.fulltext_feeds
+        expected.add('bastillepost')
+    gvm = registry.sources.get('gvm')
+    if gvm is not None and gvm.allowed:
+        from downloader.news_fulltext_gvm import (
+            GVM_LAYOUT, GVM_PATH_PATTERN, GVM_BODY_SELECTOR, GVM_AUTHOR_SELECTOR,
+            GVM_EXCLUSIONS, GVM_REVIEWED_AUTHORS, GVM_FINITE_HTTP_BINDING,
+        )
+        assert gvm.acquisition_mode == 'finite' and not gvm.allow_reviewed_supplements
+        assert gvm.domains == ('www.gvm.com.tw',) and gvm.embedded_article_layout == GVM_LAYOUT
+        assert gvm.article_path_pattern == GVM_PATH_PATTERN and gvm.selectors == (GVM_BODY_SELECTOR,)
+        assert gvm.author_selectors == (GVM_AUTHOR_SELECTOR,) and gvm.exclude_selectors == GVM_EXCLUSIONS
+        assert gvm.permitted_author_names == GVM_REVIEWED_AUTHORS
+        assert gvm.require_configured_container and gvm.require_author_attribution
+        assert gvm.authorization['kind'] == 'personal_research'
+        assert gvm.authorization['evidence_url'] == 'https://www.gvm.com.tw/copyright'
+        assert gvm.finite_article_urls == (
+            'https://www.gvm.com.tw/article/132737', 'https://www.gvm.com.tw/article/76333')
+        assert gvm.authorization['original_author_scope_evidence_urls'] == list(gvm.finite_article_urls)
+        assert (gvm.data_fingerprint, gvm.authorization_fingerprint,
+                gvm.http_capacity_source_fingerprint, gvm.http_capacity_authorization_fingerprint) == GVM_FINITE_HTTP_BINDING
+        assert not gvm.feeds and not gvm.sitemaps and not gvm.wordpress_apis and not gvm.fulltext_feeds
+        expected.add('gvm')
+    cw = registry.sources.get('cw')
+    if cw is not None and cw.allowed:
+        from downloader.news_fulltext_cw import (
+            CW_AUTHOR_SELECTOR, CW_BODY_SELECTOR, CW_EDITOR, CW_EXCLUSIONS,
+            CW_FINITE_HTTP_BINDING, CW_LAYOUT, CW_PATH_PATTERN,
+        )
+        assert cw.acquisition_mode == 'finite' and not cw.allow_reviewed_supplements
+        assert cw.domains == ('www.cw.com.tw',) and cw.embedded_article_layout == CW_LAYOUT
+        assert cw.article_path_pattern == CW_PATH_PATTERN and cw.selectors == (CW_BODY_SELECTOR,)
+        assert cw.author_selectors == (CW_AUTHOR_SELECTOR,) and cw.exclude_selectors == CW_EXCLUSIONS
+        assert cw.permitted_author_names == (CW_EDITOR,)
+        assert cw.require_configured_container and cw.require_author_attribution
+        assert cw.authorization['kind'] == 'personal_research'
+        assert cw.authorization['evidence_url'] == 'https://www.cw.com.tw/copyright'
+        assert cw.finite_article_urls == ('https://www.cw.com.tw/article/5140783',)
+        assert cw.authorization['original_author_scope_evidence_urls'] == list(cw.finite_article_urls)
+        assert (cw.data_fingerprint, cw.authorization_fingerprint,
+                cw.http_capacity_source_fingerprint, cw.http_capacity_authorization_fingerprint) == CW_FINITE_HTTP_BINDING
+        assert not any((cw.feeds, cw.sitemaps, cw.wordpress_apis, cw.fulltext_feeds,
+            cw.metadata_feeds, cw.index_pages, cw.cnyes_apis))
+        expected.add('cw')
+    wealth = registry.sources.get('businessweekly_wealth')
+    if wealth is not None and wealth.allowed:
+        from downloader.news_fulltext_businessweekly import (
+            WEALTH_LAYOUT, WEALTH_ORIGIN, WEALTH_PATH_PATTERN, WEALTH_BODY_SELECTOR,
+            WEALTH_AUTHOR_SELECTOR, WEALTH_EXCLUSIONS, WEALTH_FINITE_HTTP_BINDING,
+        )
+        assert wealth.acquisition_mode == 'finite' and not wealth.allow_reviewed_supplements
+        assert wealth.domains == ('wealth.businessweekly.com.tw',) and wealth.embedded_article_layout == WEALTH_LAYOUT
+        assert wealth.article_path_pattern == WEALTH_PATH_PATTERN and wealth.selectors == (WEALTH_BODY_SELECTOR,)
+        assert wealth.author_selectors == (WEALTH_AUTHOR_SELECTOR,) and wealth.exclude_selectors == WEALTH_EXCLUSIONS
+        assert wealth.require_configured_container and wealth.require_author_attribution
+        assert wealth.permitted_author_names == ('湯名潔',)
+        assert wealth.finite_article_urls == (WEALTH_ORIGIN + '/GArticle.aspx?id=ARTL003020265',)
+        assert (wealth.data_fingerprint, wealth.authorization_fingerprint,
+                wealth.http_capacity_source_fingerprint, wealth.http_capacity_authorization_fingerprint) == WEALTH_FINITE_HTTP_BINDING
+        assert not any((wealth.feeds, wealth.sitemaps, wealth.wordpress_apis, wealth.fulltext_feeds,
+                        wealth.metadata_feeds, wealth.index_pages, wealth.cnyes_apis))
+        expected.add('businessweekly_wealth')
+    knews = registry.sources.get('knews')
+    if knews is not None and knews.allowed:
+        from downloader.news_fulltext_knews import (
+            KNEWS_AUTHOR_SELECTOR, KNEWS_BODY_SELECTOR, KNEWS_EXCLUSIONS, KNEWS_FINITE_HTTP_BINDING,
+            KNEWS_LAYOUT, KNEWS_PATH_PATTERN, KNEWS_REVIEWED_HEADER_AUTHORS, KNEWS_REVIEWED_URLS,
+        )
+        assert knews.acquisition_mode == 'finite' and not knews.allow_reviewed_supplements
+        assert knews.domains == ('www.knews.com.tw',) and knews.embedded_article_layout == KNEWS_LAYOUT
+        assert knews.article_path_pattern == KNEWS_PATH_PATTERN and knews.selectors == (KNEWS_BODY_SELECTOR,)
+        assert knews.author_selectors == (KNEWS_AUTHOR_SELECTOR,) and knews.exclude_selectors == KNEWS_EXCLUSIONS
+        assert knews.permitted_author_names == KNEWS_REVIEWED_HEADER_AUTHORS
+        assert knews.require_configured_container and knews.require_author_attribution
+        assert knews.authorization['kind'] == 'personal_research'
+        assert knews.authorization['evidence_url'] == 'https://www.knews.com.tw/'
+        assert knews.finite_article_urls == KNEWS_REVIEWED_URLS
+        assert knews.authorization['original_author_scope_evidence_urls'] == list(KNEWS_REVIEWED_URLS)
+        assert (knews.data_fingerprint, knews.authorization_fingerprint,
+                knews.http_capacity_source_fingerprint, knews.http_capacity_authorization_fingerprint) == KNEWS_FINITE_HTTP_BINDING
+        assert not any((knews.feeds, knews.sitemaps, knews.wordpress_apis, knews.fulltext_feeds,
+                        knews.metadata_feeds, knews.index_pages, knews.cnyes_apis))
+        expected.add('knews')
+    setn = registry.sources.get('setn')
+    if setn is not None and setn.allowed:
+        from downloader.news_fulltext_setn import (
+            SETN_AUTHOR_SELECTOR, SETN_BODY_SELECTOR, SETN_FINITE_HTTP_BINDING,
+            SETN_LAYOUT, SETN_PATH_PATTERN, SETN_REVIEWED_URLS,
+        )
+        assert setn.acquisition_mode == 'finite' and not setn.allow_reviewed_supplements
+        assert setn.domains == ('www.setn.com',) and setn.embedded_article_layout == SETN_LAYOUT
+        assert setn.article_path_pattern == SETN_PATH_PATTERN and setn.selectors == (SETN_BODY_SELECTOR,)
+        assert setn.author_selectors == (SETN_AUTHOR_SELECTOR,) and not setn.exclude_selectors
+        assert setn.require_configured_container and setn.require_author_attribution
+        assert not setn.permitted_author_names and not setn.allow_short_configured_body
+        assert setn.authorization['kind'] == 'personal_research'
+        assert setn.authorization['evidence_url'] == 'https://www.setn.com/'
+        assert setn.finite_article_urls == SETN_REVIEWED_URLS
+        assert setn.authorization['original_author_scope_evidence_urls'] == list(SETN_REVIEWED_URLS)
+        assert (setn.data_fingerprint, setn.authorization_fingerprint,
+                setn.http_capacity_source_fingerprint, setn.http_capacity_authorization_fingerprint) == SETN_FINITE_HTTP_BINDING
+        assert not any((setn.feeds, setn.sitemaps, setn.wordpress_apis, setn.fulltext_feeds,
+                        setn.metadata_feeds, setn.index_pages, setn.cnyes_apis))
+        expected.add('setn')
+    inews = registry.sources.get('setn_inews_scope')
+    if inews is not None and inews.allowed:
+        from downloader.news_fulltext_setn import (
+            INEWS_AUTHOR_SELECTOR, INEWS_BODY_SELECTOR, INEWS_V8_BODY_SELECTOR, INEWS_HTTP_BINDING,
+            INEWS_LAYOUT_VERSIONS, INEWS_PROVIDER, INEWS_TITLE_SELECTOR, SETN_PATH_PATTERN,
+            INEWS_V2_HTTP_BINDING, INEWS_V3_HTTP_BINDING,
+            INEWS_V4_AUTHOR_SELECTOR, INEWS_V4_HTTP_BINDING, INEWS_V5_HTTP_BINDING, INEWS_V6_HTTP_BINDING,
+            INEWS_V7_HTTP_BINDING, INEWS_V8_HTTP_BINDING,
+        )
+        assert inews.known_url_only and inews.acquisition_mode == 'continuous'
+        assert inews.domains == ('inews.setn.com',) and inews.embedded_article_layout in INEWS_LAYOUT_VERSIONS
+        assert inews.article_path_pattern == SETN_PATH_PATTERN
+        assert inews.selectors == ((INEWS_V8_BODY_SELECTOR,) if
+            INEWS_LAYOUT_VERSIONS[inews.embedded_article_layout]>=8 else (INEWS_BODY_SELECTOR,))
+        assert inews.title_selector == INEWS_TITLE_SELECTOR
+        assert inews.author_selectors == ((INEWS_V4_AUTHOR_SELECTOR if
+            INEWS_LAYOUT_VERSIONS[inews.embedded_article_layout] >= 4 else INEWS_AUTHOR_SELECTOR),)
+        assert inews.require_configured_container and inews.require_author_attribution
+        assert not inews.exclude_selectors and not inews.permitted_author_names and not inews.allow_short_configured_body
+        assert inews.authorization['kind'] == 'personal_research'
+        assert inews.authorization['evidence_url'] == 'https://inews.setn.com/'
+        assert inews.authorization['additional_evidence_urls'] == ['https://blogs.iset.com.tw/setn/archives/9']
+        assert not inews.finite_article_urls and not inews.allow_reviewed_supplements
+        assert (inews.data_fingerprint, inews.authorization_fingerprint,
+                inews.http_capacity_source_fingerprint, inews.http_capacity_authorization_fingerprint) == (
+                    {1:INEWS_HTTP_BINDING,2:INEWS_V2_HTTP_BINDING,3:INEWS_V3_HTTP_BINDING,4:INEWS_V4_HTTP_BINDING,5:INEWS_V5_HTTP_BINDING,6:INEWS_V6_HTTP_BINDING,7:INEWS_V7_HTTP_BINDING,8:INEWS_V8_HTTP_BINDING}[
+                        INEWS_LAYOUT_VERSIONS[inews.embedded_article_layout]])
+        assert not any((inews.feeds, inews.sitemaps, inews.wordpress_apis, inews.fulltext_feeds,
+                        inews.metadata_feeds, inews.index_pages, inews.cnyes_apis))
+        expected.add(INEWS_PROVIDER)
+    upmedia = registry.sources.get('upmedia')
+    if upmedia is not None and upmedia.allowed:
+        from downloader.news_fulltext_upmedia import (
+            UPMEDIA_AUTHOR_SELECTOR, UPMEDIA_AUTHOR_SELECTOR_V2, UPMEDIA_AUTHOR_SELECTOR_V3,
+            UPMEDIA_BODY_SELECTOR, UPMEDIA_EXCLUSIONS, UPMEDIA_HTTP_BINDING,
+            UPMEDIA_V2_HTTP_BINDING, UPMEDIA_V3_HTTP_BINDING, UPMEDIA_V4_HTTP_BINDING,
+            UPMEDIA_LAYOUT, UPMEDIA_LAYOUT_V2, UPMEDIA_LAYOUT_V3, UPMEDIA_LAYOUT_V4, UPMEDIA_PATH_PATTERN,
+        )
+        reviewed_layouts = {
+            UPMEDIA_LAYOUT: (UPMEDIA_AUTHOR_SELECTOR, UPMEDIA_HTTP_BINDING, None),
+            UPMEDIA_LAYOUT_V2: (UPMEDIA_AUTHOR_SELECTOR_V2, UPMEDIA_V2_HTTP_BINDING[1:], UPMEDIA_V2_HTTP_BINDING[0]),
+            UPMEDIA_LAYOUT_V3: (UPMEDIA_AUTHOR_SELECTOR_V3, UPMEDIA_V3_HTTP_BINDING[1:], UPMEDIA_V3_HTTP_BINDING[0]),
+            UPMEDIA_LAYOUT_V4: (UPMEDIA_AUTHOR_SELECTOR_V3, UPMEDIA_V4_HTTP_BINDING[1:], UPMEDIA_V4_HTTP_BINDING[0]),
+        }
+        assert upmedia.known_url_only and upmedia.acquisition_mode == 'continuous'
+        assert upmedia.domains == ('www.upmedia.mg',) and upmedia.embedded_article_layout in reviewed_layouts
+        author_selector, http_binding, prior_capture = reviewed_layouts[upmedia.embedded_article_layout]
+        assert upmedia.article_path_pattern == UPMEDIA_PATH_PATTERN and upmedia.selectors == (UPMEDIA_BODY_SELECTOR,)
+        assert upmedia.author_selectors == (author_selector,)
+        assert upmedia.exclude_selectors == UPMEDIA_EXCLUSIONS
+        assert upmedia.require_configured_container and upmedia.require_author_attribution
+        assert not upmedia.permitted_author_names and not upmedia.allow_short_configured_body
+        assert upmedia.authorization['kind'] == 'personal_research'
+        assert upmedia.authorization['evidence_url'] == 'https://www.upmedia.mg/'
+        assert not upmedia.finite_article_urls and not upmedia.allow_reviewed_supplements
+        assert (upmedia.data_fingerprint, upmedia.authorization_fingerprint,
+                upmedia.http_capacity_source_fingerprint, upmedia.http_capacity_authorization_fingerprint) == http_binding
+        if prior_capture is not None:
+            assert upmedia.parser_repair_prior_capture_fingerprint == prior_capture
+        assert not any((upmedia.feeds, upmedia.sitemaps, upmedia.wordpress_apis, upmedia.fulltext_feeds,
+                        upmedia.metadata_feeds, upmedia.index_pages, upmedia.cnyes_apis))
+        expected.add('upmedia')
     assert {p.provider for p in registry.sources.values() if p.allowed} == expected
     events = registry.sources['eventsinfocus']
     assert events.acquisition_mode == 'finite'

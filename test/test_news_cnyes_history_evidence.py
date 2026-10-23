@@ -1,5 +1,7 @@
 """List completeness needs actual IDs/dates, not a queued child or one page."""
+from contextlib import closing
 from copy import deepcopy
+from datetime import datetime, timezone
 import hashlib
 import json
 import time
@@ -582,6 +584,218 @@ def test_new_source_total_rechecks_only_conflicting_page_once_until_actual_sourc
     capture(queue, first, source_payload(range(1, 31), epoch=low, total=32))
     assert head(queue, first)['state'] == 'list_complete'
     assert queue.db.execute('SELECT 1 FROM cnyes_history_scope_proofs WHERE proof_sha256=?', (old,)).fetchone()
+
+
+@pytest.fixture
+def unresolved_successful_conflict(queue, monkeypatch):
+    """An actual-shaped pre-fix dead end, not a failed/unfinished HTTP job."""
+    import downloader.news_fulltext as main
+    import downloader.news_fulltext_cnyes_history as history
+    clock = [time.time()]
+    stamp = lambda: datetime.fromtimestamp(clock[0], timezone.utc).isoformat()
+    monkeypatch.setattr(history.time, 'time', lambda: clock[0])
+    monkeypatch.setattr(history, 'now', stamp)
+    monkeypatch.setattr(main, 'utc_now', stamp)
+    low = 1388534400
+    first = cnyes_url(BASE, start=low, end=low + 100)
+    second = cnyes_url(BASE, 2, start=low, end=low + 100)
+
+    def old_one_shot(value, url, source, *, scope, evidence_sha, confirmed_at):
+        return history.schedule_original_page_check(value, url,
+            reason='contradictory_list_page_evidence', evidence_sha=evidence_sha)
+
+    def successful_but_still_conflicting():
+        # Real acceptance code produces new page-confirmation and job clocks.
+        # Retain v1 scheduling during seeding to model the old owner exactly.
+        with monkeypatch.context() as old:
+            old.setattr(history, 'schedule_consistency_recheck', old_one_shot)
+            for url, ids, page, total in ((first, range(1, 31), 1, 31), (second, [31, 32], 2, 32)):
+                clock[0] += 1
+                capture(queue, url, source_payload(ids, epoch=low, page=page, total=total))
+
+    successful_but_still_conflicting()
+    successful_but_still_conflicting()
+    assert head(queue, first)['state'] == 'inconsistent_source_snapshot'
+    scope = cnyes_scope(first)
+    source = queue.registry.sources['cnyes']
+    stable = 'cnyes_history_consistency_recheck_v2:' + history.digest((
+        first, history.cnyes_bulk_fingerprint(source), source.authorization_fingerprint))
+    return {'first': first, 'second': second, 'scope': scope, 'source': source,
+        'stable': stable, 'clock': clock, 'capture': successful_but_still_conflicting}
+
+
+def consistency_control(queue, conflict):
+    row = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (conflict['stable'],)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def test_still_conflicting_success_recovers_only_unfinished_page_preserving_v1_body_and_clock(queue, unresolved_successful_conflict):
+    conflict = unresolved_successful_conflict
+    original = [tuple(r) for r in queue.db.execute("SELECT * FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%' ORDER BY key")]
+    bodies = [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    healthy = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['second'],)).fetchone())
+    old = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone())
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+    control = consistency_control(queue, conflict)
+    job = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone())
+    assert control['attempts'] == 1 and control['spacing_seconds'] == conflict['source'].discovery_interval_seconds
+    assert control['next_due_epoch'] == max(conflict['clock'][0],
+        datetime.fromisoformat(old['last_checked_at_utc']).timestamp() + control['spacing_seconds'])
+    assert {k: v for k, v in job.items() if k not in {'due', 'etag', 'last_modified'}} == {
+        k: v for k, v in old.items() if k not in {'due', 'etag', 'last_modified'}}
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['second'],)).fetchone()) == healthy
+    assert [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')] == bodies
+    assert [tuple(r) for r in queue.db.execute("SELECT * FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%' ORDER BY key")] == original
+    assert head(queue, conflict['first'])['state'] == 'inconsistent_source_snapshot'
+
+
+def test_consistency_recheck_needs_new_response_not_restart_or_proof_change(queue, unresolved_successful_conflict):
+    from downloader.news_fulltext_cnyes_history import schedule_consistency_recheck
+    conflict = unresolved_successful_conflict
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+    control = consistency_control(queue, conflict)
+    with queue.db:
+        queue.db.execute('UPDATE discovery SET due=9e9 WHERE url=?', (conflict['first'],))
+    confirmed = queue.db.execute('SELECT last_confirmed_at_utc FROM cnyes_history_page_heads WHERE scope_url=? AND page=1', (conflict['scope'],)).fetchone()[0]
+    assert not schedule_consistency_recheck(queue, conflict['first'], conflict['source'],
+        scope=conflict['scope'], evidence_sha='changed-proof-without-source-response', confirmed_at=confirmed)
+    queue.close()  # A restart releases the existing owner, never opens a second collector.
+    with closing(NewsQueue(queue.root, queue.registry)) as resumed:
+        assert repair_incomplete_scopes(resumed, max_seconds=10)['page_checks_scheduled'] == 0
+        assert consistency_control(resumed, conflict) == control
+        # A new successful job clock alone (e.g.304) cannot masquerade as a new
+        # source-page confirmation. No actual body/list evidence was replaced.
+        with resumed.db:
+            resumed.db.execute('UPDATE discovery SET last_checked_at_utc=? WHERE url=?',
+                (datetime.fromtimestamp(conflict['clock'][0] + 600, timezone.utc).isoformat(), conflict['first']))
+        assert repair_incomplete_scopes(resumed, max_seconds=10)['page_checks_scheduled'] == 0
+        assert consistency_control(resumed, conflict) == control
+
+
+def test_repeated_successful_conflicts_back_off_at_source_cadence_not_permanent_one_shot(queue, unresolved_successful_conflict):
+    conflict = unresolved_successful_conflict
+    original = [tuple(r) for r in queue.db.execute("SELECT * FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%' ORDER BY key")]
+    for count, factor in enumerate((1, 2, 4, 8, 16, 16), 1):
+        assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+        control = consistency_control(queue, conflict)
+        assert control['attempts'] == count
+        assert control['spacing_seconds'] == factor * conflict['source'].discovery_interval_seconds
+        assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+        conflict['clock'][0] = control['next_due_epoch'] + 1
+        conflict['capture']()
+    assert [tuple(r) for r in queue.db.execute("SELECT * FROM queue_settings WHERE key LIKE 'cnyes_history_direct_page_recheck_v1:%' ORDER BY key")] == original
+
+
+@pytest.mark.parametrize('gate', ['http_403', 'http_429', 'transport_retry', 'attempts', 'split', 'due',
+    'provider', 'kind', 'raw_hash', 'scope_complete', 'stale_contract', 'unconfirmed', 'disabled', 'before_first_recheck'])
+def test_recurring_consistency_repair_never_overrides_other_source_evidence_or_schedules(queue, unresolved_successful_conflict, gate):
+    from dataclasses import replace
+    from downloader.news_fulltext_cnyes_history import schedule_consistency_recheck
+    conflict = unresolved_successful_conflict
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+    prior_control = consistency_control(queue, conflict)
+    conflict['clock'][0] = prior_control['next_due_epoch'] + 1
+    conflict['capture']()
+    source = conflict['source']
+    with queue.db:
+        if gate.startswith(('http_', 'transport_')):
+            queue.db.execute('UPDATE discovery SET error_code=? WHERE url=?', (gate, conflict['first']))
+        elif gate in {'attempts', 'due', 'kind', 'provider', 'raw_hash'}:
+            field, value = {'attempts': ('attempts', 1), 'due': ('due', 0), 'kind': ('kind', 'index'),
+                'provider': ('provider', 'not-cnyes'), 'raw_hash': ('response_sha256', 'unproven-hash')}[gate]
+            queue.db.execute('UPDATE discovery SET ' + field + '=? WHERE url=?', (value, conflict['first']))
+        elif gate == 'split':
+            queue.db.execute('UPDATE discovery SET superseded_by_windows_json=? WHERE url=?', ('[]', conflict['first']))
+        elif gate == 'scope_complete':
+            queue.db.execute("UPDATE cnyes_history_scope_heads SET state='list_complete' WHERE scope_url=?", (conflict['scope'],))
+        elif gate == 'stale_contract':
+            queue.db.execute("UPDATE cnyes_history_scope_heads SET source_bulk_fingerprint='other-contract' WHERE scope_url=?", (conflict['scope'],))
+        elif gate == 'unconfirmed':
+            queue.db.execute('UPDATE cnyes_history_page_heads SET last_confirmed_at_utc=? WHERE scope_url=? AND page=1',
+                (prior_control['page_confirmed_at_utc'], conflict['scope']))
+        elif gate == 'before_first_recheck':
+            original = json.loads(queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
+                (prior_control['prior_v1_marker'],)).fetchone()[0])
+            queue.db.execute('UPDATE cnyes_history_page_heads SET last_confirmed_at_utc=? WHERE scope_url=? AND page=1',
+                (original['changed_at_utc'], conflict['scope']))
+        elif gate == 'disabled':
+            source = replace(source, allowed=False)
+    job = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone())
+    confirmed = queue.db.execute('SELECT last_confirmed_at_utc FROM cnyes_history_page_heads WHERE scope_url=? AND page=1', (conflict['scope'],)).fetchone()[0]
+    assert not schedule_consistency_recheck(queue, conflict['first'], source,
+        scope=conflict['scope'], evidence_sha='a-new-proof-cannot-reset-gates', confirmed_at=confirmed)
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone()) == job
+    assert consistency_control(queue, conflict) == prior_control
+
+
+@pytest.mark.parametrize('corrupt', ['empty_list', 'empty_dict', 'bad_json', 'negative_count', 'zero_count', 'bool_count',
+    'wrong_url', 'wrong_scope', 'wrong_version', 'missing_prior', 'changed_prior', 'naive_clock'])
+def test_corrupt_consistency_witness_cannot_mint_new_retry_budget(queue, unresolved_successful_conflict, corrupt):
+    conflict = unresolved_successful_conflict
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+    control = consistency_control(queue, conflict)
+    conflict['clock'][0] = control['next_due_epoch'] + 1
+    conflict['capture']()
+    value = deepcopy(control)
+    with queue.db:
+        if corrupt == 'missing_prior':
+            queue.db.execute('DELETE FROM queue_settings WHERE key=?', (control['prior_v1_marker'],))
+        elif corrupt == 'changed_prior':
+            old = json.loads(queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (control['prior_v1_marker'],)).fetchone()[0])
+            old['prior_job']['url'] = 'https://example.invalid/another-source'
+            queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?', (json.dumps(old), control['prior_v1_marker']))
+        else:
+            if corrupt == 'empty_list': value = []
+            elif corrupt == 'empty_dict': value = {}
+            elif corrupt == 'negative_count': value['attempts'] = -1
+            elif corrupt == 'zero_count': value['attempts'] = 0
+            elif corrupt == 'bool_count': value['attempts'] = True
+            elif corrupt == 'wrong_url': value['url'] = conflict['second']
+            elif corrupt == 'wrong_scope': value['scope_url'] = 'not-this-scope'
+            elif corrupt == 'wrong_version': value['contract_version'] = 999
+            elif corrupt == 'naive_clock': value['page_confirmed_at_utc'] = '2026-10-23T00:00:00'
+            queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?',
+                ('{' if corrupt == 'bad_json' else json.dumps(value), conflict['stable']))
+    old = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone())
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone()) == old
+
+
+def test_source_convergence_closes_scope_without_revisiting_healthy_pages_or_erasing_old_control(queue, unresolved_successful_conflict):
+    conflict = unresolved_successful_conflict
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 1
+    control = consistency_control(queue, conflict)
+    proof = head(queue, conflict['first'])['proof_sha256']
+    conflict['clock'][0] = control['next_due_epoch'] + 1
+    capture(queue, conflict['first'], source_payload(range(1, 31), epoch=bounds(conflict['first'])[0], total=32))
+    assert head(queue, conflict['first'])['state'] == 'list_complete'
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+    assert consistency_control(queue, conflict) == control
+    assert queue.db.execute('SELECT 1 FROM cnyes_history_scope_proofs WHERE proof_sha256=?', (proof,)).fetchone()
+
+
+def test_source_page_count_growth_rechecks_contradictory_old_pages_while_new_pages_missing(queue, unresolved_successful_conflict):
+    conflict = unresolved_successful_conflict
+    old_proof = head(queue, conflict['first'])['proof_sha256']
+    # Real source growth changes a seven-page contradiction into an incomplete
+    # eleven-page scope. The smaller fixture preserves that exact dependency.
+    conflict['clock'][0] += 1
+    low, high = bounds(conflict['first'])
+    capture(queue, conflict['second'], source_payload(range(31, 61), epoch=low, page=2, total=92))
+    assert head(queue, conflict['first'])['state'] == 'waiting_page_evidence'
+    assert queue.db.execute('SELECT due FROM discovery WHERE url=?', (conflict['first'],)).fetchone()[0] <= conflict['clock'][0]
+    assert queue.db.execute('SELECT due FROM discovery WHERE url=?',
+        (cnyes_url(BASE, 3, start=low, end=high),)).fetchone()[0] <= conflict['clock'][0]
+    capture(queue, conflict['first'], source_payload(range(1, 31), epoch=low, total=92))
+    healthy = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone())
+    assert repair_incomplete_scopes(queue, max_seconds=10)['page_checks_scheduled'] == 0
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (conflict['first'],)).fetchone()) == healthy
+    for page, ids in ((3, range(61, 91)), (4, [91, 92])):
+        conflict['clock'][0] += 1
+        capture(queue, cnyes_url(BASE, page, start=low, end=high), source_payload(ids, epoch=low, page=page, total=92))
+    assert head(queue, conflict['first'])['state'] == 'list_complete'
+    assert json.loads(head(queue, conflict['first'])['member_ids_json']) == list(range(1, 93))
+    assert queue.db.execute('SELECT 1 FROM cnyes_history_scope_proofs WHERE proof_sha256=?', (old_proof,)).fetchone()
 
 
 def test_repair_frontier_rotates_past_unresolved_scope_and_stops_without_cursor_mutation(queue):

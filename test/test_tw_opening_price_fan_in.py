@@ -57,6 +57,193 @@ def fetch(owner, tmp_path, symbols, providers, **kwargs):
     return owner.fetch(symbols, fallback, parquet_root=tmp_path, providers=providers, minimum_coverage=kwargs.pop("minimum_coverage", 0.9), cache_reader=lambda: quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=tmp_path, allow_network=False), **kwargs)
 
 
+def test_wait_idle_includes_final_durable_source_journal(owner, tmp_path, monkeypatch):
+    finishing, release = threading.Event(), threading.Event()
+    original = acquisition._record_source_event
+
+    def blocked_finished(key, provider, event, details):
+        if event == "finished":
+            finishing.set()
+            assert release.wait(3)
+        return original(key, provider, event, details)
+
+    monkeypatch.setattr(acquisition, "_record_source_event", blocked_finished)
+    try:
+        result = fetch(owner, tmp_path, ["A"], {"source": lambda *_: snapshot([100.])})
+        assert result.transport_timing["opening_quorum_ready"]
+        assert finishing.wait(2)
+        assert not owner.wait_idle(timeout_seconds=.02), "network completion is not durable job completion"
+    finally:
+        release.set()
+    assert owner.wait_idle(timeout_seconds=2)
+    assert all(not state.jobs for state in owner._sessions.values())
+
+
+def test_fan_in_rechecks_expired_absence_from_a_custom_cache_reader(owner, tmp_path):
+    stamp = int(acquisition.datetime.now(TAIPEI).timestamp() * 1000)
+    value = snapshot([np.nan], source="opening:shared_opening_snapshot")
+    value.no_open_print_timestamps_ms = np.array([stamp - 15001])
+    calls = []
+
+    def source(*_args):
+        calls.append(True)
+        return snapshot([np.nan])
+
+    result = owner.fetch(["A"], np.array([99.]), parquet_root=tmp_path, providers={"source": source},
+        minimum_coverage=1., cache_reader=lambda: value, timeout_seconds=.1)
+    assert owner.wait_idle(timeout_seconds=2)
+    assert calls == [True]
+    assert not result.transport_timing["opening_quorum_ready"]
+    assert result.transport_timing["opening_resolved_count"] == 0
+
+
+def test_bulk_observation_journal_is_lossless_strict_and_keeps_extra_fields(owner, tmp_path):
+    from stockagent.live.opening_price_journal import observation_values, pack_observation_details
+    stamp = int(acquisition.datetime.now(TAIPEI).timestamp() * 1000)
+    rows = [{"symbol": f"code-{i}", "state": "valid_open", "source": "試驗:source",
+        "open_price": np.nextafter(100., np.inf).item(), "available": True,
+        "market_timestamp_ms": 2 ** 53 + 1 + i, "received_timestamp_ms": stamp,
+        "simtrade": None} for i in range(128)]
+    details = {"job_id": "full", "observations": rows}
+    original = json.dumps(details, allow_nan=False)
+    key = (str(tmp_path), acquisition.datetime.now(TAIPEI).date().isoformat())
+    assert acquisition._record_source_event(key, "source", "observations_delta", details)
+    path = quotes._tw_mis_opening_receipt_path(key[1]).with_suffix(".acquisition.jsonl")
+    event = json.loads(path.read_text())
+    assert event["schema_version"] == 2 and len(event["observations"]) == 128
+    assert list(observation_values(event)) == list(observation_values(details))
+    assert list(observation_values(event, ("symbol", "state"))) == [(row["symbol"], row["state"]) for row in rows]
+    assert json.dumps(details, allow_nan=False) == original
+    extra = {**details, "observations": [{**row, "extra_proof": "must-survive"} for row in rows]}
+    assert pack_observation_details(extra) is extra
+    assert pack_observation_details({**details, "observations": rows[:127]})["observations"] == rows[:127]
+    size = path.stat().st_size
+    bad = {**details, "observations": [{**row, "open_price": float("nan")} for row in rows]}
+    assert not acquisition._record_source_event(key, "source", "observations_delta", bad)
+    assert path.stat().st_size == size, "strict invalid events must not leave a partial journal row"
+
+
+def test_bulk_v2_keeps_original_absence_clock_and_v1_consumers():
+    from stockagent.live.opening_price_journal import observation_values, pack_observation_details
+    row = {"symbol": "ZERO", "state": "observed_no_first_print", "source": "twse_tpex:mis",
+        "open_price": None, "available": True, "market_timestamp_ms": 1,
+        "received_timestamp_ms": 200, "simtrade": None, "no_first_print_observed_timestamp_ms": 100}
+    event = pack_observation_details({"observations": [row] * 128})
+    assert event["observation_encoding"].endswith("v2")
+    assert list(observation_values(event))[0] == ("ZERO", "observed_no_first_print", "twse_tpex:mis", None, True, 1, 200, None)
+    assert list(observation_values(event, ("symbol",), optional_fields=("no_first_print_observed_timestamp_ms",)))[0] == ("ZERO", 100)
+    old = {key: value for key, value in row.items() if key != "no_first_print_observed_timestamp_ms"}
+    legacy = pack_observation_details({"observations": [old] * 128})
+    assert list(observation_values(legacy, ("symbol",), optional_fields=("no_first_print_observed_timestamp_ms",)))[0] == ("ZERO", None)
+
+
+def test_unchanged_no_first_state_records_only_real_proof_refreshes(owner, tmp_path):
+    stamp = int(acquisition.datetime.now(TAIPEI).timestamp() * 1000)
+    def provider(names, values, progress):
+        value = snapshot([np.nan])
+        value.volumes = np.zeros(1)
+        value.no_open_print_timestamps_ms = np.array([stamp])
+        progress(names, value)
+        refresh = snapshot([np.nan])
+        refresh.volumes = np.zeros(1)
+        refresh.no_open_print_timestamps_ms = np.array([stamp + 1])
+        progress(names, refresh)
+        return refresh
+    fetch(owner, tmp_path, ["ZERO"], {"source": provider})
+    assert owner.wait_idle(timeout_seconds=2)
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat()).with_suffix(".acquisition.jsonl")
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [row for event in events if event["event"] == "observations_delta" for row in event["observations"]]
+    assert [row["no_first_print_observed_timestamp_ms"] for row in rows] == [stamp, stamp + 1]
+
+
+@pytest.mark.parametrize("corrupt", ["unknown_encoding", "wrong_columns", "wrong_count", "short_row", "long_row"])
+def test_bulk_observation_reader_rejects_unknown_or_truncated_evidence(corrupt):
+    from stockagent.live.opening_price_journal import OBSERVATION_FIELDS, observation_values, pack_observation_details
+    row = dict(zip(OBSERVATION_FIELDS, ("A", "valid_open", "fixture", 100., True, 1, 2, None)))
+    event = pack_observation_details({"observations": [row] * 128})
+    if corrupt == "unknown_encoding":
+        event["observation_encoding"] = "unknown"
+    elif corrupt == "wrong_columns":
+        event["observation_columns"] = list(reversed(OBSERVATION_FIELDS))
+    elif corrupt == "wrong_count":
+        event["observation_row_count"] -= 1
+    elif corrupt == "short_row":
+        event["observations"][0].pop()
+    else:
+        event["observations"][0].append("extra")
+    with pytest.raises(ValueError):
+        list(observation_values(event))
+
+
+@pytest.mark.parametrize("durable", [False, True])
+@pytest.mark.parametrize("result_job", ["source:1", "source:2"])
+def test_merged_journal_references_only_durable_matching_source_details(durable, result_job):
+    transport = {"mis_requests": [{"elapsed_ms": 12.5, "error_type": "ReadTimeout"}]}
+    completed = {"job_id": "source:1", "transport_timing": transport,
+                 "state": "failed", "http_status": 403, "valid_open_count": 0}
+    metric = {"state": "failed", "http_status": 403, "attempts": 2,
+              "last_result_job_id": result_job, "transport_timing": transport,
+              "last_completed_job": completed}
+    original = json.dumps(metric, sort_keys=True)
+    compact = acquisition._journal_provider_metrics(
+        {"source": metric}, {"source": "source:1"} if durable else {})["source"]
+    assert json.dumps(metric, sort_keys=True) == original
+    assert compact["state"] == "failed" and compact["http_status"] == 403
+    if not durable:
+        assert compact == metric
+    else:
+        ref = {"event": "finished", "job_id": "source:1", "owner_pid": os.getpid()}
+        assert compact["completed_job_ref"] == ref
+        assert "last_completed_job" not in compact
+        if result_job == "source:1":
+            assert compact["transport_timing_ref"] == ref
+            assert "transport_timing" not in compact
+        else:
+            assert compact["transport_timing"] == transport
+            assert "transport_timing_ref" not in compact
+
+
+@pytest.mark.parametrize("durable", [False, True])
+def test_provider_journal_compaction_preserves_dto_and_complete_failure_evidence(
+        owner, tmp_path, monkeypatch, durable):
+    original = acquisition._record_source_event
+
+    def record(key, provider, event, details):
+        success = original(key, provider, event, details)
+        return success and (durable or event != "finished")
+
+    def partial(symbols, fallback, progress):
+        result = snapshot([100., np.nan])
+        result.transport_timing = {"mis_requests": [{"elapsed_ms": 4., "error_type": "ReadTimeout"}]}
+        return result
+
+    monkeypatch.setattr(acquisition, "_record_source_event", record)
+    fetch(owner, tmp_path, ["A", "B"], {"source": partial}, minimum_coverage=1.)
+    # Drain the finite test jobs, including their final fsync. A read-only
+    # no-provider pass below must not create a replacement source request.
+    owner._pool.shutdown(wait=True)
+    result = fetch(owner, tmp_path, ["A", "B"], {}, minimum_coverage=1.)
+    metric = result.transport_timing["opening_providers"]["source"]
+    assert metric["last_completed_job"]["transport_timing"]["mis_requests"][0]["error_type"] == "ReadTimeout"
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    merged = [row for row in events if row["provider"] == "merged"][-1]
+    summary = merged["providers"]["source"]
+    finished = [row for row in events if row["event"] == "finished" and row["provider"] == "source"]
+    assert len(finished) == 1
+    assert finished[0]["transport_timing"] == metric["transport_timing"]
+    assert merged["provider_metric_layout"] == "inline_until_durable_finished_reference_v1"
+    if durable:
+        assert summary["completed_job_ref"]["job_id"] == finished[0]["job_id"]
+        assert summary["transport_timing_ref"] == summary["completed_job_ref"]
+        assert "last_completed_job" not in summary and "transport_timing" not in summary
+    else:
+        assert summary == metric
+    assert result.transport_timing["opening_resolved_count"] == 1
+    assert not result.transport_timing["opening_quorum_ready"]
+
+
 def test_every_provider_starts_and_slow_loser_does_not_delay_quorum(owner, tmp_path):
     barrier, release = threading.Barrier(3), threading.Event()
     starts = []
@@ -132,12 +319,76 @@ def test_failed_dispatch_telemetry_does_not_cancel_provider_or_erase_failure(own
     monkeypatch.setattr(acquisition, "_record_source_event", journal)
     result = fetch(owner, tmp_path, ["A"], {"source": lambda *args: snapshot([100.])})
     assert quotes.tw_session_open_observed_mask(result).all()
+    # Quorum return can precede source completion. Closing here would fence
+    # its unfinished generation, deliberately cancelling the source flush.
+    assert owner.wait_idle(timeout_seconds=1)
     owner.close()
     path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
     events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
     metric = next(row for row in events if row["provider"] == "source" and row["event"] == "finished")
     assert metric["dispatch_telemetry_recorded"] is False
     assert metric["input_flush"]["captured_row_count"] == 1
+
+
+@pytest.mark.parametrize("empty_response", [False, True])
+def test_no_observation_source_does_not_flush_but_consumer_retains_complete_scope(
+        owner, tmp_path, monkeypatch, empty_response):
+    original = quotes.persist_tw_opening_snapshot_cache
+    flush_threads = []
+
+    def flush(**kwargs):
+        flush_threads.append(threading.current_thread().name)
+        return original(**kwargs)
+
+    def unavailable(names, fallback, progress):
+        if empty_response:
+            return quotes.PriceSnapshot(prices=fallback.copy(), source="empty:fixture",
+                available_mask=np.zeros(len(names), dtype=bool), available_count=0)
+        raise PermissionError("fixture; must not be recorded")
+
+    monkeypatch.setattr(quotes, "persist_tw_opening_snapshot_cache", flush)
+    result = fetch(owner, tmp_path, list("AB"), {"unavailable": unavailable})
+    owner.close()
+    assert flush_threads == [threading.current_thread().name]
+    assert not result.transport_timing["opening_quorum_ready"]
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    receipt = json.loads(path.read_bytes())
+    assert receipt["requested_symbols"] == list("AB") and receipt["rows"] == {}
+    finished = next(row for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()
+                    if (row := json.loads(line))["event"] == "finished")
+    assert finished["input_flush_policy"] == "no_source_observations_consumer_retains_scope_barrier_v1"
+    assert "input_flush" not in finished
+    assert finished["state"] == ("waiting_source" if empty_response else "failed")
+
+
+def test_partial_source_flushes_accepted_inputs_even_after_failure(owner, tmp_path, monkeypatch):
+    original = quotes.persist_tw_opening_snapshot_cache
+    flush_threads = []
+
+    def flush(**kwargs):
+        flush_threads.append(threading.current_thread().name)
+        return original(**kwargs)
+
+    def partial(names, fallback, progress):
+        value = snapshot([100., np.nan])
+        value.available_mask[1], value.available_count = False, 1
+        progress(names, value)
+        raise ConnectionError("fixture; accepted partial input must survive")
+
+    monkeypatch.setattr(quotes, "persist_tw_opening_snapshot_cache", flush)
+    result = fetch(owner, tmp_path, list("AB"), {"partial": partial}, minimum_coverage=1.)
+    owner._pool.shutdown(wait=True)
+    assert any(name.startswith("tw-opening-source") for name in flush_threads)
+    path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
+    receipt = json.loads(path.read_bytes())
+    assert receipt["requested_symbols"] == list("AB") and receipt["valid_open_count"] == 1
+    assert receipt["rows"]["A"]["open_prices"] == 100.
+    assert not result.transport_timing["opening_quorum_ready"]
+    finished = next(row for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()
+                    if (row := json.loads(line))["event"] == "finished")
+    assert finished["state"] == "failed" and finished["input_observation_received"]
+    assert finished["input_flush"]["captured_row_count"] == 1
+    assert "input_flush_policy" not in finished
 
 
 def test_repeated_full_scope_jobs_retain_independent_coverage_without_duplicate_prices(owner, tmp_path):
@@ -1696,7 +1947,11 @@ def test_native_timestamp_units_preserve_taipei_wall_clock(owner, unit):
     assert result["exchange_ms"] == int(now.timestamp() * 1000)
 
 
-def test_shared_ipc_delivers_cumulative_partial_before_final(owner, monkeypatch, tmp_path):
+@pytest.mark.parametrize("response_format", ["json_v1", "msgpack_v1"])
+def test_shared_ipc_delivers_cumulative_partial_before_final(owner, monkeypatch, tmp_path, response_format):
+    if response_format == "msgpack_v1":
+        pytest.importorskip("msgspec")
+    monkeypatch.setattr(quotes, "_quote_ipc_response_format", lambda: response_format)
     started, partial_observed, release = threading.Event(), threading.Event(), threading.Event()
     received_counts = []
 
@@ -1762,6 +2017,30 @@ def test_all_failed_transport_probes_fail_closed(owner, tmp_path):
     with pytest.raises(RuntimeError, match="no configured opening source"):
         owner.warm_transports(parquet_root=tmp_path, session_date="2026-10-08", probes={"bad": lambda: {"ready": False}})
     assert not quotes._TW_MIS_OPENING_CACHE
+
+
+def test_transport_prewarm_parses_venue_map_without_seeding_prices(owner, tmp_path, monkeypatch):
+    import csv
+
+    path = tmp_path / "symbols.csv"
+    path.write_text("code,market\n2330,twse\n", encoding="utf-8")
+    reader, parses = csv.DictReader, []
+
+    def counted(*args, **kwargs):
+        parses.append(1)
+        return reader(*args, **kwargs)
+
+    monkeypatch.setattr(csv, "DictReader", counted)
+    result = owner.warm_transports(parquet_root=tmp_path, session_date="2026-10-08",
+        probes={"test_transport": lambda: {"ready": True}})
+    assert result["local_preparation"]["venue_mapping_count"] == 1
+    assert result["local_preparation"]["venue_mapping_ms"] >= 0
+    assert quotes.load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TW"}
+    assert parses == [1]
+    assert not quotes._TW_MIS_OPENING_CACHE and not quotes._TW_MIS_OPENING_REQUESTED
+    path.write_text("code,market\n2330,tpex\n", encoding="utf-8")
+    assert quotes.load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TWO"}
+    assert parses == [1, 1]
 
 
 def test_opening_mis_does_not_wait_for_optional_bootstrap(owner, monkeypatch, tmp_path):

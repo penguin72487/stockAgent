@@ -46,6 +46,23 @@ MEASUREMENT_CONTRACT_VERSION = 11
 TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION = 3
 COMPLETION_OBSERVATION_CONTRACT_VERSION = 1
 COMPLETION_OBSERVATION_SECONDS = 45
+ACCESS_REFUSAL_RECOVERY_CONTRACT_VERSION = 1
+
+
+def _valid_access_refusal_recovery(value):
+    """A local retry target, never an inferred publisher rate limit."""
+    return bool(isinstance(value, dict)
+        and type(value.get('contract_version')) is int
+        and value['contract_version'] == ACCESS_REFUSAL_RECOVERY_CONTRACT_VERSION
+        and all(type(value.get(key)) in {int, float} and math.isfinite(value[key]) and value[key] >= 0
+                for key in ('established_at_epoch', 'source_not_before_epoch', 'hold_until_epoch'))
+        and all(type(value.get(key)) in {int, float} and math.isfinite(value[key])
+                and 0.01 <= value[key] <= 3600
+                for key in ('interval_seconds', 'refused_interval_seconds'))
+        and type(value.get('refused_parallelism')) is int and value['refused_parallelism'] >= 1
+        and type(value.get('parallelism')) is int and value['parallelism'] == 1
+        and type(value.get('legacy_checkpoint_adopted')) is bool
+        and value.get('basis') == 'conservative_client_recovery_not_source_rate_limit')
 
 
 def _valid_candidate(candidate, maximum):
@@ -292,6 +309,19 @@ class PublisherCapacity:
                            for k, v in state["best_by_workload"].items())):
                 state["best_by_workload"] = {}
             state["capacity_fingerprint"] = self.provider_fingerprints[provider]
+            recovery = state.get('access_refusal_recovery')
+            if recovery is not None and not _valid_access_refusal_recovery(recovery):
+                state.pop('access_refusal_recovery')
+            if (not state.get('access_refusal_recovery')
+                    and state.get('state') == 'waiting_source' and state.get('reason') == 'http_access_refusal'
+                    and max(state['next_search_epoch'], http.provider_not_before.get(provider, 0)) > self.epoch()):
+                # Adopt an already refused checkpoint once, without extending
+                # its source deadline/search hold or discarding old samples.
+                self._record_access_refusal(provider, legacy=True)
+            recovery = self._active_access_refusal_recovery(provider)
+            if recovery:
+                state['interval_seconds'] = max(state['interval_seconds'], recovery['interval_seconds'])
+                state['parallelism'] = 1
             http.set_client_capacity(provider, state["interval_seconds"], state["parallelism"])
             state["interval_seconds"] = http.effective_interval(provider)
         self.tick(force=True)
@@ -311,6 +341,7 @@ class PublisherCapacity:
                 "completion_window_owner_contract_version": 1,
                 "completion_observation_contract_version": COMPLETION_OBSERVATION_CONTRACT_VERSION,
                 "transport_resume_selection_contract_version": TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION,
+                "access_refusal_recovery_contract_version": ACCESS_REFUSAL_RECOVERY_CONTRACT_VERSION,
                 "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
                 "clock_basis": "independent publisher windows, including validation/fsync and waits; no fabricated source quota",
                 "providers": providers, "official_maximum_claimed": False}
@@ -362,6 +393,9 @@ class PublisherCapacity:
         self.baselines[provider] = (now, deepcopy(metrics.get("counts", {})))
 
     def _set(self, provider, interval, slots, state, reason):
+        recovery = self._active_access_refusal_recovery(provider)
+        if recovery:
+            interval, slots = max(interval, recovery['interval_seconds']), 1
         self.http.set_client_capacity(provider, interval, slots)
         item = self.states[provider]
         item.pop('pending_observation', None)
@@ -369,6 +403,37 @@ class PublisherCapacity:
                     state=state, reason=reason, stable_samples=0, transport_stable_samples=0)
         if state in {"warming", "verifying", "ramping"}:
             item["transport_recovery_active"] = False
+
+    def _active_access_refusal_recovery(self, provider):
+        recovery = self.states[provider].get('access_refusal_recovery')
+        return recovery if recovery and recovery['hold_until_epoch'] > self.epoch() else None
+
+    def _record_access_refusal(self, provider, *, legacy=False):
+        """Coalesce a refused in-flight burst, then retry at lower client pressure.
+
+        401/403/451/challenges do not establish a numeric rate limit. Preserve
+        the independent HTTP refusal, REP and 429 floors. The existing bounded
+        search hold keeps old fast samples from immediately undoing recovery.
+        """
+        item, now = self.states[provider], self.epoch()
+        deadline = self.http.provider_not_before.get(provider, 0)
+        previous = item.get('access_refusal_recovery')
+        if previous and previous['source_not_before_epoch'] > now:
+            previous['source_not_before_epoch'] = max(previous['source_not_before_epoch'], deadline)
+            previous['hold_until_epoch'] = max(previous['hold_until_epoch'], deadline)
+            return
+        source = self.http.registry.sources[provider]
+        refused = item['interval_seconds']
+        item['access_refusal_recovery'] = dict(
+            contract_version=ACCESS_REFUSAL_RECOVERY_CONTRACT_VERSION,
+            established_at_epoch=now, source_not_before_epoch=deadline,
+            hold_until_epoch=max(deadline, item.get('next_search_epoch', 0),
+                                 now if legacy else now + self.policy['recheck_seconds']),
+            refused_interval_seconds=refused, refused_parallelism=item['parallelism'],
+            interval_seconds=min(3600.0, max(source.interval_seconds, 2 * refused)), parallelism=1,
+            legacy_checkpoint_adopted=legacy,
+            basis='conservative_client_recovery_not_source_rate_limit')
+        self.http.metrics.count(provider, 'access_refusal_conservative_recoveries')
 
     def _transport_resume_candidate(self, provider, workload):
         """Reuse pressure, not an old throughput estimate or permission grant.
@@ -378,6 +443,8 @@ class PublisherCapacity:
         same workload/cadence/slots; mixed, metadata and cached work cannot
         establish this proof. Current HTTP floors/circuits remain authoritative.
         """
+        if self._active_access_refusal_recovery(provider):
+            return None  # Old fast-body samples cannot undo a current refusal recovery.
         now = self.epoch()
         return recent_transport_resume(self.states[provider], self.policy, workload=workload,
             maximum=self.http.maximum_parallelism[provider], floor=self.http.hard_interval_floor(provider), now=now,
@@ -442,6 +509,8 @@ class PublisherCapacity:
                 if item["state"] != "waiting_source" or throttled or refusals:
                     if throttled or refusals:
                         item["transport_recovery_active"] = False
+                    if refusals:
+                        self._record_access_refusal(provider)
                     item["refused_interval_seconds"] = item["interval_seconds"] if throttled else None
                     selected = item.get("best") if not refusals else None
                     interval = max(self.http.effective_interval(provider), selected["interval_seconds"]) if selected else self.http.effective_interval(provider)

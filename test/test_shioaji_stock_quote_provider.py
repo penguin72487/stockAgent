@@ -5,6 +5,7 @@ from collections import deque
 from datetime import date
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -105,6 +106,55 @@ def _reset_shioaji_connection_state(monkeypatch):
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_RETRY_AFTER", 0.0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LOGIN_FAILURES", 0)
     monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_LAST_LOGIN_ERROR", None)
+
+
+@pytest.mark.parametrize("submission_fails", [False, True])
+def test_avoided_accounting_is_outside_cache_lock_after_native_submission(monkeypatch, submission_fails):
+    _reset_shioaji_connection_state(monkeypatch)
+    symbols = [str(1000 + i) for i in range(600)]
+    contracts = {code: SimpleNamespace(code=code, reference=100., limit_up=110., limit_down=90.)
+                 for code in symbols}
+    submitted, accounting = [], []
+
+    class API(_FakeApi):
+        def snapshots(self, contracts, timeout=30000, cb=None):
+            submitted.append(len(contracts))
+            if submission_fails:
+                raise RuntimeError("controlled native submission failure")
+            return super().snapshots(contracts, timeout=timeout, cb=cb)
+
+    api = API(contracts)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CONTRACTS", contracts)
+    row = {"price": 100., "open": 100., "received_ms": int(time.time()*1000)}
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_CACHE",
+        {code: (time.monotonic(), dict(row)) for code in symbols[:500]})
+    monkeypatch.setattr(quote_provider, "_load_prepared_tw_price_limits", lambda *_: ({}, None))
+
+    def record(**kwargs):
+        assert submitted == [100], "cache accounting must not delay native request submission"
+        # A different thread must acquire the lock: an RLock on this same
+        # thread would not detect accidental I/O inside the cache critical section.
+        acquired = threading.Event()
+        def probe():
+            with quote_provider._SHIOAJI_STOCK_LOCK:
+                acquired.set()
+        thread = threading.Thread(target=probe)
+        thread.start()
+        assert acquired.wait(1), "durable accounting still holds the stock cache lock"
+        thread.join()
+        accounting.append(kwargs)
+
+    monkeypatch.setattr(quote_provider, "record_avoided_query", record)
+    if submission_fails:
+        with pytest.raises(RuntimeError, match="submission failure"):
+            quote_provider._fetch_shioaji_stock_snapshots_once(symbols, np.full(600, 99.),
+                api=api, cache_ttl_seconds=100.)
+    else:
+        result = quote_provider._fetch_shioaji_stock_snapshots_once(symbols, np.full(600, 99.),
+            api=api, cache_ttl_seconds=100.)
+        assert result.available_count == 600
+        assert result.transport_timing["snapshot_avoided_query_record_ms"] >= 0
+    assert len(accounting) == 1 and accounting[0]["count"] == 1 and accounting[0]["rows"] == 500
 
 
 def test_stock_snapshot_does_not_wait_for_quota_observations(monkeypatch, tmp_path):

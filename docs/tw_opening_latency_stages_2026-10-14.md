@@ -2092,3 +2092,1216 @@ unknown=0，仍標示 `awaiting_first_print`；122 檔不能冒充有真實開�
 獨立讀回的首個工程命令誤用了「盤前自然暖機」validator 的不相容 control schema，
 保留其 `KeyError` 失敗收據；改用本次盤中 qualified reload 對應的現有 `native_ready`，
 沒有放寬共享 verifier、延長暖機窗口或重新啟動 owner。
+
+## 晚間續修：盤前準備與逐請求時間軸（2026-10-21–22）
+
+本段是上一節的續修，不覆寫 10/21 原始十一秒失敗，也不以重播或離峰樣本宣稱開盤達標。
+目前取價流程為「盤前資料／連線準備 → 三路並行取價 → 逐批驗證合併 → durable input
+receipt → 各模式推論 → 模擬進場／畫面」，不同完成邊界不得混算。
+
+### 此次新增的實作
+
+- `load_symbol_yahoo_map` 依檔案 device、inode、size、mtime、ctime 重用解析結果，
+  每次使用仍檢查檔案版本；回傳獨立字典，不讓單一 consumer 汙染後續請求。
+  讀取前後再次核對版本，缺檔／無法解析／讀取中更新不快取失敗，下次正常重試。
+  此處僅是交易所路由映射，不能取代官方當日交易清冊或改小市場分母。
+- 沿用既有 `OpeningPriceFanIn.warm_transports` 在盤前解析映射，新增
+  `local_preparation` 計時；不新增下載／服務 owner、不建立永豐登入、不 seed 價格。
+  開盤後若檔案變動，仍重新解析。來源 transport readiness 不等於名冊或價格就緒。
+- MIS 原 `mis_total_ms` 起點在映射與陣列準備之後，會漏算這段成本；現在從來源函式入口
+  計時，另記 `mis_source_prepare_ms`，並以
+  `source_entry_including_venue_map_and_arrays_v2` 明示新邊界。新舊局部計時不直接互比。
+- 每個 MIS 請求增加同一 monotonic clock 下的排隊、實際送出、headers、body、列解碼完成
+  與失敗 offset。未抵達的階段保持缺席，不填零；日常 audit 只保留封閉白名單的安全數值。
+  不記錄 URL、Cookie、Token 或任意錯誤文字。這些 spans 可重疊，不能全部相加當總耗時。
+
+### 離峰網路實測：快不等於完整或穩定
+
+2026/10/21 23:48–23:51，從空的隔離 receipt 對官方 **2,308 檔**範圍測試 MIS，包含來源
+驗證、合併、落盤與獨立讀回；沒有額外永豐登入、券商下單、訊號發布或正式帳本修改。
+下列併發數為個別測試參數，**沒有修改正式預設值 4**。
+
+| 樣本 | 來源完成與獨立讀回 | 真開盤／官方無首筆／未知 | 請求失敗 |
+| --- | --- | --- | --- |
+| [4 路首次](../artifacts/operations/tw_opening_latency_20261021/evening_v4/mis_network.json) | 2,672.586 ms | 2,282／26／0 | 0 |
+| [8 路兩次](../artifacts/operations/tw_opening_latency_20261021/evening_v4/mis_network_eight.json) | 442.665、282.970 ms | 各 2,282／26／0 | 各 0 |
+| [4 路再測](../artifacts/operations/tw_opening_latency_20261021/evening_v4/mis_network_four_repeat.json) | 1,241.603、1,046.565 ms | 2,282／26／0；1,032／8／1,268 | 0；4 |
+| [16 路兩次](../artifacts/operations/tw_opening_latency_20261021/evening_v4/mis_network_sixteen.json) | 488.755、317.942 ms | 各 0／0／2,308 | 各 16 |
+
+16 路失敗鏈為 `ConnectionError → ProtocolError → RemoteDisconnected`，發生在收到
+headers 之前，沒有 HTTP 錯誤碼。這可證明本次 response 尚未取得，不能單憑它斷言是
+來源限流、TLS、ISP 或特定網路節點。測試後停止加壓；沒有繞過拒絕或用最快樣本提高預設。
+這些是不同時間的離峰觀察，不是併發設定的受控制因果比較，也不是 09:00 的數據。
+
+26 檔「官方無首筆」只使模型輸入解析完成，不能稱為 26 個真開盤價或可執行成交。
+因此成功樣本為 `resolved_complete=true`、`data_complete=false`；失敗樣本仍保留
+`resolved_complete=false`。外部未發布首筆、回傳昨日資料與拒絕連線，仍是獨立限制。
+
+### 對照測速與測試邊界
+
+[最終完整本機 ABBA](../artifacts/operations/tw_opening_latency_20261021/evening_v4/delivery_abba.json)
+用原始 10/16 的 **2,301 檔、29 份回應**，驗證原回應 SHA、原交換時鐘與當時清冊契約，
+凍結比較用本機時鐘，從空隔離 cache 跑五輪。含解析、合併、journal、真 fsync、owner drain
+與獨立 durable readback；金融欄位／時鐘及 durable rows hash 全部一致，沒有真實網路請求。
+這個 corpus 的 2,301 不是現在的 2,308，不能據此變更正式分母。
+
+本次全段中位數為 **177.851 → 169.293 ms**；另外的
+[相同版本 AA 對照](../artifacts/operations/tw_opening_latency_20261021/evening_v4/aa_control.json)
+仍出現 **331.443 → 283.141 ms** 的環境／執行順序波動，因此不宣稱全段已可靠提高某個百分比。
+可以單獨確認的是：最終對照的映射解析原每次 **4.713–8.752 ms**；候選首次仍花
+**7.548 ms**，同版本後續重用為 **0.085–0.131 ms**。這是省下重複解析，不是略過冷讀、
+官方清冊或冒充熱開盤報價。盤前準備另由語意測試驗證，沒有算入此 corpus 的來源完成成績。
+
+[HTTP 5 ms／consumer 20 ms 延遲注入](../artifacts/operations/tw_opening_latency_20261021/evening_v4/overlap_injection.json)
+也保持所有價格、時鐘、完整請求與落盤列一致；合成延遲僅驗證 pipeline 重疊／完整性，
+不當作實際 API 延遲。最終交付檔 SHA 已在 `delivery_abba.json` 保留。
+
+[擴大語意回歸](../artifacts/operations/agent-workflow/runs/opening-1021-evening-broad-final-20261021T155804-4764b049/run.log)
+為 **812 passed in 49.53s**；run 的完整命令含匯入／啟動耗時為 **53.820 秒**。
+涵蓋 MIS transport、共享永豐、並行 fan-in、stream/IPC、官方清冊、來源鎖、日曆、
+Discord 準備與 cadence、失敗恢復、持久化、訊號／執行計時及 namespace，沒有宣稱全庫通過。
+新測試包括同大小／mtime 仍須失效、讀取中換檔、consumer 隔離、盤前映射重用、
+來源準備計時不可漏算，以及失敗請求不得產生未抵達的時間點。
+
+### 採用狀態與剩餘工作
+
+10/21 23:58 時，本節新增修正仍在工作區，Discord 使用前一節的唯讀 source release；
+當時未重啟任何服務，也未宣稱新時間軸已在正式 owner 記錄。使用者 10/22 明確要求立即
+部署後，依下節固定版本並驗收採用，以下保留切換前觀察，不以其冒充切換後狀態。
+
+23:58 的唯讀觀察：Discord、當沖引擎與公開面板均 active，PID 分別為 2944796、2773600、
+3122280；Discord connected/core ready，六模式暖機紀錄為 6/6，
+但 `model_cache_resident_ready=false`，不據此宣稱下一個開盤 GPU／模型已駐留。
+既有 audit timer 排定 10/22 08:55，盤中獨立取價測速為 10/22 10:30。
+
+### 10/22 最新版本部署與獨立讀回
+
+- 經既有 `scripts/freeze_discord_code_release.py` 固定 **1,599** 個檔案，
+  [準備收據](../artifacts/operations/tw_opening_latency_20261022/source_release_preparation_v1.json)
+  對應 release `20261021T162054Z-121a0c4854ca`，source SHA256 為
+  `e70743446dba83a68ffb0b268721e2fac5b13b669390bce89ded6672dd663fe4`。
+  不將憑證、資料集或模型複製進 release，仍保留原生 live config 掛載。
+- 在同一候選版本的唯讀 namespace 重跑前述回歸，另納入此次共享依賴的 private JSON、
+  completed cache 與 signal helpers 測試；
+  [結果](../artifacts/operations/agent-workflow/runs/opening-1022-frozen-regression-20261021T162150-2fbcdfae/run.log)
+  為 **1,010 passed in 50.50s**，完整受監督命令 **54.212 秒、exit 0**。
+  沒有宣稱全庫測試通過。
+- qualified reload 先 plan，重新確認空倉、無待辦下單、來源鎖與 coherent ACK 後，執行
+  `--discord-only --code-admission-only --source-release ... --apply`。
+  [採用收據](../artifacts/operations/tw_opening_latency_20261022/source_adoption_v1.json)
+  於 **10/22 00:24:35 +08:00** 回報 `accepted_code_admission_only`；僅切換 Discord，
+  新原生 run 為 `3558289-1792599867604918119`，loaded code SHA256 為
+  `87c6112aa7247dc96ff99f6524c15ed26c31081288b5a30aca1ce94009bf0395`。
+- **00:25:04** 的另一個
+  [獨立讀回](../artifacts/operations/tw_opening_latency_20261022/independent_readback_v1.json)
+  重新確認原生程序實際唯讀掛載 **1,599** 檔，直接讀取 `/proc/<pid>/root` 下取價、fan-in、
+  audit 與 benchmark 四檔 SHA；六模式訊號與引擎原 revision 完全 ACK，**lag 0**。
+  Gateway connected/core ready，當次 invocation 已完成 command sync 或明確 deferred，
+  無 watchdog/fatal 訊息；不使用舊 heartbeat 或環境變數標籤作為載入證明。
+- 執行引擎 run 保持 `e08e40180894479e85db16f9439e5b52`，受保護六個服務 owner 未變。
+  兩次核對 events/orders/fills 既有前綴 SHA，長度分別 **2,300,465／427,342,677／424,218,829
+  bytes**，切換與讀回均未改寫帳本；沒有額外行情登入、行情請求或券商下單。
+
+這是 **loaded-code／Gateway／ACK 採用**，不是盤前 GPU 暖機或 09:00 取價達標。
+離峰新 owner 的暖機為 `pending`，由既有準備時鐘負責，不用手動暖機改寫成即時就緒。
+盤後 artifact maintenance 的 Factorized、MGDA 兩項原告警仍如實為 `degraded`；
+這次沒有刪除失敗收據或把它們偽裝成已修復，亦不將它們等同 Gateway 中斷。
+
+後續仍須在真實交易日核對第一筆、全量已解析輸入、全真開盤、各模型原始訊號與全部模擬
+進場的各自時間。既有 10/22 08:55 audit 與 10:30 盤中測速 timer 均保留；沒有新增競爭
+行情 owner。尚未達到「只剩 API 限制」或一秒／零錯誤保證；目前可控成本的進展與外部
+拒絕均如實保留，任務繼續維持 active，不把後來資料回填成準時成績。
+
+### 10/22 原生開盤失敗與等待路徑減負
+
+今日官方可交易名冊為 **2,309 檔**。依逐筆來源時鐘重建的
+[11 秒觀察](../artifacts/operations/tw_opening_latency_20261022/morning_native_audit/2026-10-22/first_assessment_11000ms.json)
+只有 **434 個真開盤價、0 個已證明尚未首筆、1,875 個未知**；其中永豐 428、FinMind 188，
+兩者有重疊，不可直接相加。這份盤中另建 audit 的模式名冊不是盤前部署證明；
+不能用稍後回放、補齊資料或這次部署，改寫今日準時訊號與成交失敗的事實。
+
+完整取價的關鍵路徑是「每檔取所有可用來源中最早的合格觀測，再取全名冊最晚那檔」，
+不是最早一個 HTTP 200，也不是各來源總耗時相加。沒有首筆成交時，真開盤價尚不存在；
+已有證據的 model-only 沿用參考、未知來源失敗及可執行成交仍分開。
+平行 fan-in 可消除慢來源阻擋快來源，但不能使未發布的觀測提早出現；
+本機 merge、推論、發布與模擬進場也仍須逐段量測，不能宣稱已只剩 API 成本。
+
+- MIS 首輪四個實際請求在 HTTP 回應前逾時，約 4.2 秒後進入既有斷路／探測流程；
+  未發出的頻道不是已查詢成功。盤中單檔診斷的 TCP／TLS 可完成，但接著在回應前斷線，
+  仍不足以歸因為特定 ISP、官方限流或本機錯誤，不以增加併發宣稱修復。
+- Fugle 回覆 403，維持權限錯誤退避，不能用重試創造資料授權。
+- 永豐與 FinMind 部分回覆仍屬前一交易日，不能把非今日回覆當真開盤價，
+  亦不能把來源失敗當成官方零成交證明。各來源第一輪已平行啟動；這不是全部等待的終點。
+
+本輪確認一項可控成本：六模式等待覆蓋時，反覆將相同來源的完整逐請求測速、
+`last_completed_job` 與 transport 明細序列化並 fsync。現在只有該 owner 的完整
+`finished` 事件已成功落盤後，後續 merged 事件才改為 `owner_pid + job_id` 引用；
+新 transport 必須另外對應同一完成 job 才可引用。寫入失敗、未完成與不同 job 的資料仍 inline。
+完整來源事件、錯誤、時間戳及回傳消費端的完整 DTO 不變；不放鬆價格或帳本契約。
+
+[固定原始日誌前綴的四輪 ABBA](../artifacts/operations/tw_opening_latency_20261022/morning_journal_projection.json)
+驗證 **298 個 merged 事件、1,455 個可解析引用**，還原全部 provider metrics 完全相等。
+編碼量 **7,966,640 → 1,907,087 bytes（減少約 76%）**，projection 加 JSON 編碼中位耗時
+**150.3925 → 47.1535 ms（約 3.19 倍）**。這沒有測網路、fsync 或完整 09:00 流程，
+不能解讀為開盤取價加快三倍。沒有新增行情請求、券商下單或操作員帳本寫入。
+
+[共享來源／恢復回歸](../artifacts/operations/agent-workflow/runs/opening-1022-source-regression-20261022T010626-52c6da68/run.log)
+為 **572 passed in 42.83s**；另增加完成引用、寫入失敗保留明細、不同 job 與完整 DTO 的測試。
+候選版本另走固定 source、同版本回歸、qualified Discord-only plan/apply 與獨立讀回；
+部署結果以下載入收據為準，持倉中的交易引擎不重啟。
+
+同版本 [較大範圍回歸](../artifacts/operations/agent-workflow/runs/opening-1022-morning-frozen-regr-20261022T010932-7096cb13/run.log)
+完成 **1,034 passed in 78.35s**；不是全庫測試完成。固定版本
+`20261022T010738Z-76f0e78551af` 含 **1,602** 個程式檔案，source SHA256 為
+`1e42f35481148222d17b7fd7735f0ee03e18448651fe604a5d5ccd73dda59b3b`。
+
+第一次 apply 被另一個 coordinator 的 OS lease 拒絕；第二次偵測到公開面板 owner 已更新，
+於重啟前拒絕。兩份拒絕收據均保留，沒有強制解鎖或移除保護。重新通過同一套 admission 後，
+[09:14:01 的正式採用](../artifacts/operations/tw_opening_latency_20261022/morning_source_adoption_stable.json)
+回報 `accepted_code_admission_only`，Discord run 為 `409506-1792631630921857686`，
+loaded code SHA256 為 `923338d39f183078d9ed7b3b34e5e675a5c58012e40950789b039da4b42515e0`。
+
+[09:14:20 獨立讀回](../artifacts/operations/tw_opening_latency_20261022/morning_independent_readback.json)
+再次核對原生程序唯讀掛載 **1,602 檔**及 `/proc/<pid>/root` 下四個相關程式檔 SHA，
+六模式 ACK 精確匹配、lag 0；Gateway/core ready，當次 journal 沒有 watchdog/fatal。
+當沖引擎 run `391d8564a80448c3b4889e229521c8c3` 與六個受保護 owner 不變。
+events/orders/fills 的 **2,309,932／427,484,995／424,324,970 bytes** 既有前綴 SHA 全部通過。
+只有 Discord／取價端重啟，沒有操作員帳本寫入或額外行情請求。
+
+此驗收只證明固定版本、Gateway、ACK 與帳本保護，不證明 GPU 暖機或開盤 SLO。
+MIS 來源前回應失敗、Fugle 403、來源實際發布時鐘與未首筆標的仍未解；
+下一交易日仍由既有原生 audit 與分時來源測速核對，保留第一筆、全量解析、真開盤、
+各模式發布與全目標模擬成交的獨立時間。沒有宣稱零錯誤、全市場一秒或所有本機成本已移除。
+
+### 10/22 三時段來源清冊與完整本機處理續修
+
+目前完整 provider／權限／容量清冊與開盤特有故障的方案更新在
+[來源規劃最新查核](tw_opening_provider_plan_2026-10-13.md#最新查核2026-10-22)。
+仍採正式 2,309 軸，保留原生開盤失敗，不換模型、不降低原本 quorum、不改帳本。
+只有來源已發生且可取得的觀測，才可能以軟體最佳化提早交付；
+`max(每檔所有合格來源最早可得時間)` 是完整 coverage 的下界，另有耐久保存、模型與執行成本。
+
+這次在原 canonical fan-in／journal／audit 修正三點：
+
+1. 完全沒有觀察的失敗／空來源不再搶寫完整輸入收據。消費端仍強制完整 scope／fsync；
+   部分成功後失敗仍保存已觀察資料。來源錯誤、配額退避與未知狀態沒有消失。
+2. 大批 `observations_delta` 共用欄名，以 row-values 無損保存所有標的數值、來源、
+   整數時鐘與 flag；小批及舊格式保持可讀。共享純 parser 同供 audit 與獨立完整 readback，
+   不新增 collector／quote cache，仍同步 strict JSON／fsync。非法 count／欄位／列寬拒絕，
+   NaN 不會留下部分 journal。超過 2^53 的整數時鐘與 nextafter 浮點亦有逐值測試。
+3. 三時段 audit v3 分別記錄 raw response、validated observation、真開盤與 resolved 的
+   首筆及 50／90／95／99／100%。保留失敗的 P50／P95／P99 和權限、配額、無 HTTP 回應、
+   body／schema 錯誤分類。job 完成但請求部分失敗仍告警；merged 事件不可冒充來源價格。
+
+[同一真實 FinMind 回應的完整本機 ABBA](../artifacts/operations/tw_opening_latency_20261022/combined_local_abba.json)
+使用 1,032,677 bytes、2,309 軸與兩個明示的受控失敗來源，四輪交錯比較
+ingestion→驗證→完整來源 journal→輸入耐久保存。中位耗時 **149.184 → 109.671 ms**，
+減少 **26.5%（約 1.36×）**；journal 約 **508 → 257 KB**，實際 input receipt write **2 → 1**。
+所有 financial arrays、時鐘、durable rows 與還原完整 observation journal SHA 一致；
+該固定 payload 為 2,060 真開盤／249 未解，沒有縮 scope 或用快取冒充全量。
+分別測試的兩個局部 ABBA 不相乘外推。另測 native JSON＋通用遞迴驗證較慢
+（22.24 vs 原 strict stdlib 16.26 ms），因此未採用。
+
+真實網路與離線比較不同：09:49／09:58 的完整 probe 為 1.459／1.391 秒，
+但 MIS 當時單檔失敗，不能稱全量成功。[10:05 新測試](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-22/intraday_100524023512.json)
+MIS 已有部分回覆，單檔預熱 **1,361 ms**、完整來源內 HTTP 流程約 **7,893 ms**，
+29 請求有 5 個在回應前失敗；合併最終 2,087 真開盤／178 已證未首筆／44 未解。
+90% quorum 雖 **976.097 ms**，完整排空與獨立空快取 readback 至報告寫入前為
+**9,624.638 ms**。不能挑前面較快但缺更多資料的測試來宣稱開盤變快。
+最近已完成的盤後是 **10/21**：2.134 秒、2,282／2,308 真開盤、26 未解；
+今日 13:40 仍待原生排程，不以盤中樣本代替。
+
+[Fugle 單檔 WebSocket 能力測試](../artifacts/operations/tw_opening_latency_20261022/fugle_stream_capability.json)
+以既有 key 成功認證、訂閱並在冷連線 **166.557 ms** 收到 2330 snapshot，隨即關閉。
+REST 403 不能推論所有介面均無權限；但單檔成功也不是全市場容量或開盤 SLA。
+該來源載今日 2330 開盤成交事件為 **09:00:08.980736**；尚未發生的真實成交不可能
+在 +1 秒取得。這是 provider 事件鐘，未證實交易所發布與網路傳送的獨立時間。
+預開足額全市場串流、完整訂閱 ACK 與 gap 恢復，仍需授權容量與原生開盤實測。
+
+三時段沿用既有 08:55 roster、原生開盤被動 audit、10:30／13:40 非券商完整來源 probe，
+及 10:31／15:10 audit timer。它們已核對 active，但 timer active 不代表未來資料齊全。
+開盤不額外登入永豐／輪詢 snapshots；行情展示權限隔離不變。
+
+固定版本 `20261022T020943Z-a7638bdaca9f` 的
+[842 項整合測試](../artifacts/operations/agent-workflow/runs/opening-1022-adoption-tests-20261022T021109-dfaf2a2e/run.log)
+全部通過，耗時 43.50 秒。較早一次用了兩個不存在的測試路徑而沒有收集測試，
+該失敗仍保留，不能列入成功數；本輪也沒有宣稱全庫測試通過。
+新加的共享 journal helper 僅為既有 writer／audit 共用的可重用 source，
+本機行情 payload、benchmark／release artifacts 沒有加入版本控制。
+
+一份 plan 和第一次 apply 遇到其他 coordinator 的 OS lease，均在重啟前拒絕。
+沒有強制解鎖；重新執行相同 admission 後，[10:13:54 採用收據](../artifacts/operations/tw_opening_latency_20261022/phase_adoption_deploy_retry.json)
+回報 `accepted_code_admission_only`，source SHA256 為
+`1c6b6350111cfae52ba33e1fb3bb65edf3b8cd18063b2f05189e3ed0555fa285`，
+載入 code SHA256 `7088534a41fd3d9883d4117585097a6897c7e431a354e4a29514fffdc0f6f78d`。
+[10:14:29 獨立讀回](../artifacts/operations/tw_opening_latency_20261022/phase_independent_readback.json)
+再次核對原生唯讀 source **1,603 檔**與 `/proc/<pid>/root` 下六個相關檔案 SHA，
+六模式精確 ACK、lag 0；Discord run `536373-1792635223892501897`，Gateway/core ready。
+當沖引擎 run `391d8564a80448c3b4889e229521c8c3` 與六個受保護 owner 不變。
+events/orders/fills 各 **2,311,454／428,520,344／425,249,658 bytes** 的既有前綴 SHA
+全部通過，允許交易引擎繼續正常 append，沒有操作員帳本寫入或券商委託。
+獨立讀回沒有額外行情請求、沒有服務重啟；當次 journal 沒有 watchdog/fatal。
+
+此驗收不證明 GPU 暖機、資料齊備或原生開盤 SLO；原先 Factorized／MGDA
+artifact maintenance 仍為 `degraded`，沒有用 Gateway ready 掩蓋。
+今天盤後與下一交易日開盤仍須原生排程驗收；需要完整串流授權的候選沒有擅自購買，
+MIS 間歇斷線與 44 未解也沒有被改寫為成功。尚未達只剩 API 限制／全量一秒／零錯誤，
+原工程任務維持 active，下一階段先驗收足額全市場串流，再對實際最慢階段進行配對重測。
+
+### 最新口徑重測與本機傳輸續修：2026-10-22
+
+本輪仍是完整官方 **2,309 檔**，不縮分母、不降低 quorum、不刪價格驗證。
+同日真正首筆優先；只有有效且未過期的無首筆證據，才可使用最後真實成交作
+模型參考。未知、過期／未來的 absence proof、模型參考與可執行價分開。
+
+#### 原因與共用修正
+
+- 舊診斷只等 8 秒便關閉來源 owner，11:29 實測 MIS 約 10.218 秒，後到的觀察
+  因而被診斷本身的 close fence 排除。舊數字保留為失敗證據，不當完整來源基線。
+- `inflight=false` 發生在 worker 的 input fsync／finished journal 之前，不能表示
+  工作持久完成。`wait_idle` 現在跟蹤完整 Future；診斷預設最多等 90 秒，逾時
+  `all_sources_complete_ms=null` 並顯示 deadline exceeded。這不延長模型 quorum。
+- 自訂 cache reader 的 quorum／重新派工也檢查 absence 證據本身的 15 秒年齡，
+  不讓另一筆新行情替舊證據續期。報告在 quorum 當下及 canonical 空程序快取
+  回讀後各算一次；resolved observation 不冒充模型輸入完整或成交能力。
+- 永豐 avoided-query 記錄原本在 cache lock 內、native submission 之前。
+  現在移到鎖外、所有原生請求提交後，與原有 callback 等待重疊；沒有少記帳、
+  多登入、提高查詢頻率，也不延長 callback 原始截止時間。
+- 完整 source DTO 的本機 IPC 可協商 MessagePack，維持舊 client／server JSON
+  相容與可選套件缺席 fallback。只有已驗證的 plain JSON 值可走新格式，保留
+  float64／NaN／Inf／有號零、int64 時鐘、旗標及缺值；超界整數／legacy 型別
+  沿用原 JSON 語義，bytes／datetime 不被悄悄轉換。不影響公開 API、來源收據
+  或交易帳本格式，不使用 pickle。新增實際 codec、bytes、讀取／解碼／陣列
+  materialize 計時；舊的合計時計仍保留。
+
+#### 可歸因的完整軸本機比較
+
+[最終 10 組交錯配對測速](../artifacts/operations/tw_opening_latest_standard_20261022/ipc_serialization_final_abba.json)
+採相同 autonomous owner、相同 frozen scope、零人工延遲；含所有 snapshot 陣列、
+缺值／非有限浮點、精確 int64 及逐欄 dtype／shape／位元 SHA 驗證。
+不包含實網、模型或成交；沒有 API／生產收據／帳本寫入。
+
+| 中位數 | JSON | 協商 MessagePack |
+| --- | ---: | ---: |
+| 完整請求至逐欄驗證完成 | 31.769 ms | 21.706 ms |
+| client request 至完整 DTO 回傳 | 28.463 ms | 16.266 ms |
+| response 編碼與原子發布 | 12.256 ms | 3.941 ms |
+| client response 解碼 | 4.857 ms | 0.739 ms |
+| response bytes | 348,658 | 298,912 |
+
+[前一組](../artifacts/operations/tw_opening_latest_standard_20261022/ipc_serialization_abba.json)
+完整請求至驗證為 25.891→17.298 ms，方向一致、絕對值隨系統負載變動；不稱 P99、
+理論極限或真實開盤一秒。輸出數值／旗標／整數時間完全一致。
+
+[避免記錄阻擋提交的配對](../artifacts/operations/tw_opening_latest_standard_20261022/accounting_overlap_abba.json)
+顯式注入 accounting 100 ms、response 100 ms，完整 callback→來源持久回讀
+293.864→233.114 ms，所有來源陣列／進度／持久 row SHA 相同；這是受控等待，
+不是實際網路加速倍數。[無人工延遲對照](../artifacts/operations/tw_opening_latest_standard_20261022/accounting_no_delay_abba.json)
+只有 104.760→101.110 ms，小收益照實保留。
+[無 profile 的完整 FinMind 本機比較](../artifacts/operations/tw_opening_latest_standard_20261022/finmind_unprofiled_abba.json)
+保留原 1,032,677 bytes、2,309 軸、2,060 有效開盤及全部原始時鐘；來源、收據及
+journal parity 通過。142.093／124.106 ms 的中位數含初次 scope 驗證與程序快取
+次序差異，**不把這個差值歸因為新的 FinMind 演算法加速**。
+
+#### 實網、負向證據與未完成邊界
+
+[13:53 實網重測](../artifacts/operations/tw_opening_latest_standard_20261022/postclose_network.json)：
+原 90% quorum 767.602 ms，全部 provider 工作與持久 journal 完成 1,320.166 ms，
+probe 入口至最後報告寫入前 1,442.906 ms。canonical 空程序快取回讀只有
+**2,275 真開盤＋0 有效無首筆證據＋34 未知**，仍為 partial；不是完整市場取價。
+MIS 單檔 prewarm 為 `ConnectionError → ProtocolError → RemoteDisconnected`，
+約 1.307 秒；沒有繼續送全市場 burst。Fugle TSE／OTC 仍 403。
+
+較早 [8 workers scout](../artifacts/operations/tw_opening_latest_standard_20261022/mis_workers8_scout.json)
+8／8 請求 ReadTimeout，無有效回覆；[4 workers control](../artifacts/operations/tw_opening_latest_standard_20261022/mis_workers4_control.json)
+29 批有 2 個失敗、保留 27 個成功原始 body，仍非完整回放語料。兩者不同時點，
+不宣稱併發必然導致失敗，也不採用 8 workers。來源恢復、完整全量授權仍未完成。
+
+[今日原生整鏈稽核](../artifacts/operations/tw_opening_latest_standard_20261022/native_opening_audit.json)
+仍保留 09:00 第 1 秒 3／2,309、第 11 秒 434／2,309；六模式全數發布為
+**09:04:47.162969**。今天是可追溯回放，不算即時成交達標。成功嘗試仍有
+準備、排隊、Factorized 推論約 8.018 秒等內部成本；本輪沒有證明只剩 API 延遲。
+
+[唯讀重載計畫](../artifacts/operations/tw_opening_latest_standard_20261022/reload_plan.json)
+被 `engine is nonflat or has pending orders: 17/0` 拒絕。沒有強制解鎖、重啟服務或
+操作帳本；新 IPC 尚未完成常駐 owner 部署／真實開盤驗收。當前 Gateway ready、
+engine ledger integrity ready／divergence 0，不能代替未平倉或資料完整性驗收。
+工程任務 `tw-opening-latest-standard-latency-20261022` 保持 active；下一步在原有
+flat／ACK／code admission gate 通過後部署，再由原生 09:00 日誌驗收整段，並優先
+剖析完整準備／推論／發布的最慢段，不用下午或局部毫秒結果冒稱開盤 SLA。
+
+[最終回歸收據](../artifacts/operations/agent-workflow/runs/latest-standard-final-regression-20261022T060054-be67365e/run.json)：
+**1,256 passed in 45.02s**，涵蓋取價、官方清冊、最新最後成交參考、重試、等待
+持久完成、過期證據、TP／SL 進場防護、模擬執行、公開價格政策、code admission、
+新舊 IPC、可選套件缺席／非法型別、原始 body 保存與診斷預算邊界。相關檔案 Ruff
+與 `git diff --check` 通過；不是全庫測試。最終測速與回歸之 quote owner SHA256
+一致：`d513fc6dff880ca36bf3e6c7eceaa74acb3d8f901b45a5601b2c05d0f2e704ba`。
+初次 benchmark 的靜態巢狀 `with` SyntaxError、超界輪數拒絕均保留原 run／log，
+由後續成功同範圍測試在 task 裡標記 superseded，沒有把失敗改寫為成功。
+
+重測入口（零下單；`--runtime` 只讀原生紀錄，不重跑模型）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tw_opening_ownership.py \
+  --receipt artifacts/operations/tw_opening_latest_standard_20261022/frozen_scope_receipt.json \
+  --ipc-serialization --repeats 10 \
+  --output artifacts/operations/tw_opening_latest_standard_20261022/ipc_recheck.json
+run_fintech_python scripts/audit_tw_opening_latency.py \
+  --session-date 2026-10-22 --runtime \
+  --output artifacts/operations/tw_opening_latest_standard_20261022/opening_recheck.json
+```
+
+### 完整六模式準備／推論續測：2026-10-22 15:38
+
+這輪延續最新開盤參考、官方清冊、缺值及成交證據邊界，改量先前尚未分清的
+本機準備／推論／發布成本。不是增加 quorum、刪除特徵或改寫缺價；模型、
+checkpoint、FP32／BF16 原設定、完整標的軸與交易帳本不變。
+
+#### 根因與修正
+
+- **指定日期未傳入 Factorized 讀取邊界**：BASE 已到 10/22，但特徵仍到 10/21。
+  指定 10/21 的重測也附加了 10/22，因覆蓋不足而失敗。現在將明確的輸入日期
+  傳到共用 attachment，在驗證 coverage 前截取；以原始 base owner＋日期＋
+  全部成員版本作快取鍵。未指定日期的最新資料仍須完整 coverage，不能用舊日期
+  假裝最新資料已就緒；共用 base 不被修改。
+- **每次重複解析深層目錄**：3,287 個成員各自 `Path.resolve()`；一次 cProfile
+  掃描 640.918 ms，其中 resolve 約 378 ms。改為單次掃描內共用已解析父目錄，
+  每檔仍重新 lstat，最終 symlink 仍解析實際 target；掃描後重新檢查父目錄路徑
+  與 inode／mtime／ctime。沒有跨請求 TTL，也沒有略過首次完整 SHA 驗證、
+  attachment 前後版本比對或 canonical source read lease。
+- **測速環境不能冒充正式設定**：改走正式 effective market 解析，並載入 MGDA
+  原本的 `tw_day_trade_unit_mgda_fold10_runtime.env`。早先指紋不符是測速漏載
+  sparse-adjoint 設定，不是選錯 checkpoint；沒有切換 fold 或放寬相容性檢查。
+- 可變工作樹的完整測試曾被 `LoadedImplementationChanged` 拒絕；改用既有
+  readonly canonical-path namespace 固定程式，不清除或重綁 admission。
+  原失敗、fixture 缺欄位、未指定日期的 coverage 失敗均保留 run／log。
+
+#### 無剖析器的固定輸入交錯實測
+
+[最終完整六模式比較](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round2/pipeline_final_abba.json)
+採相同收據、10/21 特徵、相同六 checkpoint，順序 A/B/B/A 重複兩組，共四對；
+沒有 HTTP、Discord 訊息、券商委託或生產帳本／訊號寫入。A 只還原舊逐檔 resolve，
+B 用新版本檢查；其餘流程相同。每次實際執行模型，完整權重、決策及模型解釋
+SHA 一致；兩側都完成 rich artifacts，檢查 Parquet 存在與完成指標，沒有跳過報表。
+
+| 中位數 | 舊逐檔 resolve | 新掃描內共用父目錄 |
+| --- | ---: | ---: |
+| 六模式全部發布 | 4,228.148 ms | 2,874.829 ms |
+| 六模式完整產物完成 | 5,214.239 ms | 3,604.687 ms |
+
+本組全部發布中位數減少 **32.0%**，完整產物減少 **30.9%**。四對中三對較快，
+一對 control 2,692.828／candidate 2,760.665 ms，保留這項負向樣本；系統有其他
+服務負載，不能宣稱每次皆快 32%、P99 或理論極限，也不把其他四模型的波動
+全部歸因於只影響 Factorized 的目錄修正。
+
+[單獨十對全成員掃描](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round2/member_signature_final_abba.json)
+中位數 **419.267 → 108.509 ms**，全部 3,287 筆 canonical path、device、inode、
+size、mtime、ctime tuple 完全相同；不是只量少數 shard。
+[最終輸入準備探針](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round2/inputs_final.json)
+六模式第一次 6,629.273 ms，後兩輪仍 2,879.018／2,025.851 ms；沒有 GPU、模型
+或 HTTP。這組與最初 15,647.632 ms 的不同時點測試並非受控 A/B，不能把差值
+全算成加速。舊 Path 版本的 profile 與中間結果亦完整保留於同一 evidence root。
+
+完整推論 benchmark 現在另存兩輪暖機及每模式階段，不把它們丟掉。最終執行的
+首次六模式約 **80.939 秒**（包含新私人 panel cache 的來源重建），第二輪約
+**4.136 秒**；不是磁碟／OS 全冷啟動保證。較早固定版本的 Factorized 首次
+推論 7.502 秒、暖機約 0.3～0.4 秒，證明開盤前的版本一致與實際暖機仍必要，
+下午暖快取不等於明天開盤達標。
+
+#### 部署、驗收與剩餘順序
+
+[655 項相關回歸](../artifacts/operations/agent-workflow/runs/latest-standard-final-regression-20261022T072950-4533c971/run.json)
+通過（45.29 秒），涵蓋輸入／cache、日期邊界、成員同大小修改、缺檔、final／
+parent symlink 變更、六模式測速、最新無首筆參考、來源恢復、公開價格及 pinned
+code；不是全庫測試。相關 Ruff 與 `git diff --check` 通過。
+
+最新唯讀部署計畫已由先前 17 筆未平轉為 **0 未平／0 pending**，本輪未強制沖銷。
+[正式採用收據](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round2/discord_adoption.json)
+只重載 Discord owner；新 run `470700-1792654562409463796`，原生唯讀程式共
+1,608 個檔案驗證、code admission 與六模式精確 ACK 通過，revision lag 0。
+引擎 run `4ee29549d68149058397e8cb90f05744` 不變，其餘受保護 owner 未重啟。
+events／orders／fills 原有前綴 SHA 通過，沒有操作員帳本寫入或券商下單。
+
+[部署後獨立稽核](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round2/post_adoption_audit.json)
+確認 Gateway／core ready、引擎 ledger integrity ready、divergence 0；盤後引擎
+health 為 waiting。GPU warmup 仍 pending，未將 code-only admission 當作 GPU
+ready。Factorized／MGDA 的盤後 artifact maintenance 仍 degraded，不能以這輪
+歷史日期推論成功掩蓋；實網來源缺口與真正 09:00 整鏈尚未完成新版本驗收。
+
+下一步按已量到的關鍵路徑：先修復兩個模式的最新盤後特徵與相容產物、驗收
+開盤前六模式同版本暖機／final arm；再量原生並行輸入準備、序列 GPU 與持久
+發布。約 5.20 GB 的每個 Factorized 全形狀輸入、格式化及來源等待各有成本，
+不能未驗證就換算成一秒。維持既有每日原生 observer 記錄來源首筆／quorum／
+全量、各模型準備／排隊／推論／發布、引擎註冊及真正 paper fill 時計。
+
+新增重測入口（私人暫存產物；需可用 CUDA；不實際下單）：
+
+```bash
+source scripts/runtime_env.sh
+set -a
+source configs/deployments/tw_day_trade_unit_mgda_fold10_runtime.env
+set +a
+run_fintech_python scripts/benchmark_opening_preparation.py \
+  --compare-member-signatures --repeats 10 --output artifacts/operations/member_scan_recheck.json
+run_fintech_python scripts/benchmark_opening_signal_pipeline.py \
+  --receipt artifacts/live/tw_opening_snapshots/2026-10-22.json \
+  --feature-date 2026-10-21 --repeats 4 --defer-reports --compare-member-signatures \
+  --output artifacts/operations/pipeline_recheck.json
+```
+
+若工作樹仍有並行修改，沿用 `service_code_release.freeze_source/run_in_namespace`
+固定版本後執行，不能清除 admission 繼續跑。工程任務保持 active；未宣稱全市場
+即時取價／六模式成交一秒、零錯誤或已達只剩外部 API 的極限。
+
+### 開盤延遲續測與契約範圍精簡：2026-10-22 晚間
+
+本輪保留完整六模式、同一 10/22 報價收據及 10/21 特徵，不改 checkpoint、
+價格／缺值語意、TP/SL、持股或成交證據。所有比較均在 canonical-path readonly
+source release 內執行；HTTP 被拒絕，報表和私人模擬產物仍完整建置。
+
+#### 保留未採用的結果
+
+[Candle 診斷四對 ABBA](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round3/coherent/pipeline_candle_abba.json)
+核對六個真實模型的完整 forward，只有明確列舉的未使用診斷 tensor 可不配置；
+其餘 tensor bytes、完整訊號與解釋一致。但全部發布中位數為
+**3,507.996 → 3,808.021 ms**，完整產物為 **4,354.923 → 4,779.702 ms**。
+本組未證明整段改善，已撤回即時路徑的候選，不部署。首次私人 panel-cache
+來源建置的六模式合計 **95,278.909 ms** 亦保留，不能冒充暖快取或 OS 全冷。
+
+首個比較曾遇到正式 source writer，讀租約拒絕，沒有停止 writer 或忽略鎖。
+後續離線比較使用原有 canonical shared read lease 固定全程來源；它可能延後
+writer，所以不能用這組比較宣稱真實開盤的來源更新／鎖等待已消失。
+
+#### 精簡即時契約建置，不精簡驗證
+
+`checkpoint_contract.build_inference_checkpoint_manifest` 沿用同一 canonical builder，
+schema 4 的即時驗證只建會消費的 `data_schema`、`model` 與其歷史相容候選。
+每次仍重建當下模型／特徵／有序標的／環境語意，沒有快取「已通過」決定。
+schema 1–3、manifestless、未知格式仍走原完整 builder；未知格式仍被 validator
+拒絕。部分 expected manifest 明確拒絕訓練續跑／產物驗收，也不得套到舊 schema。
+完整 checkpoint 儲存、指紋與訓練 ABI 不變。
+
+新欄位 `checkpoint_contract_build_ms`、`checkpoint_contract_validate_ms` 同時寫入
+訊號摘要及正式開盤 latency journal。兩者是準備階段的子 span：未預取時位於
+pre-quote，有效平行預取後則位於 pre-inference，不重複加入總耗時；缺欄位維持
+未知，不填零。共用 validator 也修正相容候選缺 key 時的
+`None == None` 誤命中，避免不完整資料變成 KeyError。
+
+[首輪四對完整比較](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/pipeline_contract_entry_abba.json)
+另接獨立私人 canonical 模擬引擎，含原資格、整張、費用、價格邊界、append 及
+持久化；一張報價簿為明確合成測試資料。部分目標仍未全成交，不能把 registration
+或最後一筆模擬事件當成全目標成交。
+
+| 首輪中位數（ms） | 完整契約 control | model-scope candidate |
+| --- | ---: | ---: |
+| 六模式契約建置合計 | 265.696 | 95.174 |
+| 六模式全部發布 | 3,962.268 | 4,008.574 |
+| 最後私人註冊／持久化完成 | 5,652.861 | 5,587.784 |
+| 完整產物完成 | 6,522.371 | 6,837.709 |
+
+契約建置減少約 64.2%，但這組整段中位數尚無穩定改善；保留全部樣本，不把
+階段收益推成端到端加速。首次私人 panel-cache 使用 **92,131.322 ms**，第二
+完整輪 **3,636.275 ms**。模擬註冊約 345–453 ms／模式，1 億模式約 1,183 ms；
+這是待剖析成本，不是外部 API 延遲，也不能刪訊號、fsync 或成交限制來達標。
+
+#### 更接近正式排程的測速邊界
+
+首輪仍是序列準備的對照，正式 Discord 已有平行唯讀預取、序列模型 owner。
+測速新增 `--parallel-inputs`，讓同一比較兩側都使用正式排程形狀；新增的
+`--compare-model-contract` 則只改契約建置範圍。兩者均保留每次完整權重、決策、
+解釋 SHA 與 rich-artifact completion 核對。
+
+同時修正一個測速誤差：預取存在不代表被採用。過期或 key 不符時正式邏輯會
+回退，發布 offset 現在依結果中的 `quote_prefetched_outside_model_lock` 選擇
+真正 origin，不會沿用較早預取時點而少算 GPU 排隊。測例涵蓋採用、回退、
+舊欄位未知及缺失 origin；沒有改正式 freshness gate。
+
+[正式平行形狀的六對 ABBA](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/parallel/pipeline_contract_entry_abba.json)
+兩側皆平行唯讀預取、序列 GPU、獨立模擬引擎，72／72 次實際採用預取，六模型
+current／compatible 指紋與完整訊號核對通過。全部發布 **5,971.968 → 5,882.061 ms**，
+私人註冊完成 **7,017.521 → 7,072.208 ms**，完整產物 **8,146.843 → 8,198.672 ms**；
+契約建置合計 **259.240 → 111.803 ms**。發布五對較快、一對較慢，但整鏈仍未
+證明數量級收益，也不能把平行 span 加總當作 wall time。首次私人來源建置
+**87,064.295 ms**、第二完整輪 **3,533.266 ms** 均保留。
+
+這組不能直接與不同時點的序列組相減當作平行化效果，但足以顯示剩餘本機成本
+不只 checkpoint。下一個獨立候選僅協調預取的 CPU 檔案驗證／組裝；來源呼叫、
+quorum 等待、同請求 future join、各 provider pool 全部維持原本並行。其完整
+交錯比較先通過才考慮採用，不新增全域 rate limit，也不把來源失敗的等待放進
+CPU slot。CPU 準備排隊另列 `quote_preparation_queue_ms`，不重複加總。
+
+#### 真實開盤與原生服務，不用離線結果代替
+
+[19:22 原生稽核的精簡 SHA 收據](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/native_summary.json)
+指向保留的 63,640,701-byte 完整稽核。官方當日軸為 **2,309 檔**；來源驗證事件
+於 1 秒只有 **3** 個真正開盤價，11 秒 **434** 個，30 秒 **1,256** 個，同時點
+並無已證實的無首筆資料，未知不得任意轉成昨收或成交。這不是回填當時清冊，
+也不是 durable quorum 或可成交報價的時間。
+
+六模式實際首個發布 **09:04:31.992519**，全數發布 **09:04:47.162969**；原生
+registration 投影最終 **09:15:59.412730**，全目標成交 SLO 仍 incomplete。
+1 億模式 ready-to-ledger 約 672.498 秒，其中 source recovery 約 670.278 秒；
+Factorized 該次模型推論約 8.018 秒、原生模式排隊約 10.436 秒。這些都不能用
+下午的暖推論中位數覆蓋。仍需逐一分離來源／模型冷載入／排程／執行回補成本。
+
+當時 Gateway／core ready，盤後 artifact maintenance **6／6 ready**，引擎休市
+health waiting，GPU warmup 及 postclose resident cache pending。這些是獨立狀態；
+不把磁碟產物 ready 改稱 GPU 已 resident，也不把 waiting 當作服務中斷。
+既有 `stockagent-tw-opening-audit.timer` 已啟用，下一次為 **10/23 08:55**，沿用
+原生 collector／observer 紀錄交易日首筆、全量與執行 clocks，不另造平行下載器。
+
+最後整合相關回歸集合 **1,079 項**通過（52.98 秒），不代表全庫測試。擴充日期測例初版的
+fixture 缺欄位／誤用真 manifest 失敗均保留，修正測例後重跑完整相關集合，
+正式 feature-source gate 不變。平行測速首個 source freeze 也曾因其他工作樹
+變動拒絕；保留未發布 source 與失敗 run，重試固定版本後才測，沒有清除 admission。
+
+#### CPU 準備協調：保留中位數改善，也保留長尾
+
+[六對完整比較](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/cpu_preparation/retry_after_source/pipeline_cpu_preparation_abba.json)
+沿用固定 source `20261022T113630Z-f87c68b5bc5d`、同一報價收據、六個原模型與
+獨立私人模擬引擎。來源 writer 完成前的 **20,405.067 ms** 等待另存，不混入
+timed samples；期間沒有繞過鎖。全部 12 輪的完整訊號／解釋 SHA 相同、快取
+均已暖，七個正式 owner 未變，沒有外部請求或正式帳本寫入。
+
+| 中位數（ms） | 無 CPU 準備額度 control | 兩個 CPU 準備額度 candidate |
+| --- | ---: | ---: |
+| 六模式全部發布 | 7,110.731 | 5,889.434 |
+| 最後私人註冊／持久化完成 | 9,153.803 | 8,720.279 |
+| 完整產物完成 | 10,655.860 | 10,539.739 |
+
+發布中位數降低約 17.2%，六對中四對改善、兩對退步；但最大發布時間反而由
+**22,483.560 → 42,462.558 ms**。兩側各只有 31／36 次預取符合原有 5 秒
+freshness gate；回退保持完整取價與驗證，不延長 TTL 來掩蓋。candidate 慢輪
+MGDA 推論 **10,223.132 ms**，V8 推論後整理 **18,435.511 ms**，無任何外部
+行情請求，因此不能把長尾歸因給 API。此候選尚未據此部署，先做函式級
+cProfile、主執行緒／程序 CPU、換頁、context switch、系統 PSI 與 GC 診斷。
+剖析會增加開銷，絕對耗時不得與上述未剖析樣本直接相減。
+
+本組首次私人 panel-cache 建置 **99,050.886 ms**、第二完整輪 **2,554.103 ms**
+同樣保留；不是 OS 全冷證明，也不是開盤即時來源或全目標成交驗收。
+
+[後續四對剖析](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/cpu_preparation/profile_after_source/pipeline_cpu_preparation_abba.json)
+與[資源診斷](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/cpu_preparation/profile_after_source/resource_diagnostics.json)
+保留原訊號 SHA；剖析版發布中位數為 **7,125.819 → 7,366.390 ms**，完整產物
+**9,173.778 → 10,256.065 ms**，未重現 42 秒 timed sample，但也未確認穩定收益。
+因此**撤回兩個 CPU 準備額度的正式預設，維持原本無上限並行**；僅由離線
+`--compare-prefetch-preparation` 注入實驗 guard，來源／quorum 仍不占用它。
+`quote_preparation_queue_ms` 保留為實測欄位，舊欄位缺失仍未知。
+
+診斷確實觀察到資源等待與一次約 **1,129.528 ms** 的 GC；但首次使用、暖機
+timed rounds 與重疊 span 必須分開，不能用系統 PSI 的整機計數、跨執行緒
+cProfile cumulative time 或後一輪 GC 倒推已證實原 42 秒的唯一根因。該長尾
+仍保留為未閉合問題，沒有改標正常。契約精簡則保留完整相容驗證與既有
+六模型 parity，不把這次不穩定的 CPU 排程結果一起上線。
+
+共用測速摘要另增加全部／暖快取樣本的 min、max，以及逐模型預取採用、
+回退、未知數；`fully_warm` 只說明四種應用快取，不再讓讀者把它當成全部
+預取通過。所有樣本仍保留，不計算沒有足夠樣本支持的 P99 保證。
+
+#### 上線流程修正與 20:14 原生獨立讀回
+
+先前數次更新在重啟前被維護控制鎖或官方 source writer 擋下，失敗收據均保留，
+沒有搶鎖、停掉 producer、忽略 admission 或重啟迴圈。另有一次只讀 plan 的
+receipt 路徑誤植，亦未執行重啟；它不是正式服務故障。
+
+canonical `reload_tw_day_trade_services_if_flat.py` 增加選用的
+`--control-wait-seconds`（0–120，預設仍為 0），使用原 OS lease 有界等待，
+並記錄 `control_wait_ms`。官方來源讀租約移到三份帳本初始雜湊之前，來源忙碌
+就先拒絕，免做約 **858.72 MB** 的無效掃描；完整前綴驗證、fresh ACK、
+code／owner fences、唯讀 namespace 與重啟後獨立讀回全部保留。維持
+**control → source** 的鎖順序，不在外層持有 source lease 等待控制鎖。
+231 項操作／維護測試通過；與原 848 項一起整合重跑為 **1,079 passed**。
+新增測例也證明 source 更新中時，不讀帳本前綴、不安裝 drop-in、不重啟。
+
+[原生更新收據](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/discord_final_apply_wait_accepted.json)
+於 **20:14:21** 完成一次 Discord-only code admission，當次獲鎖 **8.021 ms**；
+這不是宣稱先前忙碌的鎖已被量成零等待或已消除所有 contention。
+[獨立讀回](../artifacts/operations/tw_opening_latest_standard_20261022/preparation_round4/native_final_readback.json)
+於 **20:14:37** 再驗證：
+
+- source release：`20261022T121126Z-677d4f188859`，source SHA
+  `7391c91dc4027dac7cbb6f165ea3d271786e4d8e11b00a5d11d9c560f5a84980`。
+- 原生 Python PID `1042034`，實際 namespace **1,610 檔**逐檔與唯讀掛載核對通過。
+  admitted code SHA `f5d0f67a92f0faffa044d95580618d110dc384a0b229d6941c295a7e576fd410`；
+  Gateway connected、core ready，六模式訊號／engine ACK 同一 revision **63,696**。
+- 交易引擎仍為 `05aa07b6342f481ba1cbb20c68d28b96`；受保護 owner 全部未變。
+  實際空倉、待委託均為 **0**。events／orders／fills 合計 **858,722,532 bytes**
+  前綴 SHA 與長度未變；沒有券商下單或操作員帳本寫入。
+- 盤後 artifact maintenance ready；GPU startup warmup、postclose resident cache
+  仍 pending。驗收範圍明確為 loaded code／Gateway／exact ACK，**不是 GPU
+  resident、真實 09:00 來源覆蓋或全目標成交 SLO**。
+
+未解事項仍是原生開盤的來源覆蓋、首次私人建置約 99 秒、實際模型冷載入／排隊、
+執行 source recovery 約 670 秒與未閉合的 42 秒長尾；不能宣稱已達一秒或只剩
+外部 API 延遲。工程任務保持 active，不以本輪 code admission 結束整個目標。
+
+既有每日獨立 observer 已核對為啟用：08:55、09:00:11、09:00:31、09:01、
+10:31、13:40、15:10（Asia/Taipei）。下一次為 **2026-10-23 08:55**，讀原生
+來源／訊號／執行日誌並保留 deadline assessment；不發行情請求、不下單，也
+不把補跑當成原來 deadline 成功。下一交易日仍須以該原生證據驗收實際改善。
+
+## 全步驟重新測速與重疊來源讀取合併（2026-10-22 夜間）
+
+本輪將官方範圍／來源、輸入準備、冷暖模型、排隊、不可變發布、獨立紙上執行、
+HTTP、SSE 與真實瀏覽器分開驗收。官方當日清冊為 **2,309 檔**；清冊、
+真開盤、官方無首筆證據、模型參考價、可執行報價與成交仍是不同欄位。
+不刪分鐘、不縮分母、不放寬 15 秒無首筆證據時效、TP／SL 進場區間或整張規則。
+以下夜間實測均不能冒充 09:00 原生行情或券商成交。
+
+### 全鏈基線與尚未解決的瓶頸
+
+| 步驟／邊界 | 本輪讀回／實測 | 解讀 |
+| --- | --- | --- |
+| 今日原生開盤來源 | 第 11 秒 434 真開盤／1,875 未知；第 30 秒 1,256／1,053 | 分母 2,309；未知不是零成交量，不能直接沿用昨收。 |
+| 今日原生訊號發布 | 首模式 271,992.519 ms；六模式全部 287,162.969 ms | 保留原始失敗；不能把夜間回放當成改善後的今日開盤。 |
+| 今日原生紙上執行 | 首／末帳本登記 283,924.753／959,412.730 ms | 100m ready→登記 672,497.813 ms，其中來源補查 670,278.018 ms；未取得六模式全目標成交完成證據。 |
+| 空私人 panel cache 六模式首次準備＋模型 | 91,356.389 ms；第二完整暖機 3,424.505 ms | 是新私人 cache，不是作業系統全冷或正式服務重開機的測速。首次 Factorized 46,740.210 ms，前置處理占 40,733.277 ms。 |
+| 既有正式版本六模式暖輸入→發布 | 中位 6,089.746 ms；完整報表＋獨立私人執行 7,640.248 ms | 六次、36／36 預取通過；所有模型與完整產物保留。 |
+| 夜間真實多源查詢→quorum | 2,146.365 ms | FinMind 首個有效輸入 1,896.233 ms；不是 09:00 成績。 |
+| 夜間所有 provider＋持久證據完成 | 8,547.211 ms；獨立讀回 8,691.893 ms | 2,275 真開盤＋34 官方無首筆＝2,309 已解析，不是 2,309 個真開盤價。 |
+| 一般本機 API | 暖中位多為 2–5 ms | 跨日期 signals 首次觀察仍 24,196.952 ms；全分鐘歷史首次 2,331.996 ms／暖中位 195.412 ms，沒有清 server／OS cache。 |
+| 隔離 receipt 更新→本機 SSE consumer | 中位 4.110 ms、最大 4.418 ms，5 次 | 真 inotify／SSE，但不是交易訊號到瀏覽器畫面的全鏈。 |
+| 真實瀏覽器初始資料就緒 | 本機 1,653.100 ms／公網 8,735.800 ms | 新 temporary tab、瀏覽器 HTTP cache 關閉；server／OS cache 未控制。 |
+| 全分鐘歷史載入／畫面完成 | 本機 1,314.900 ms／公網 4,256.400 ms | **477,628 點、9 series**，Canvas 重建一致、無畫面錯誤、SSE 持續；使用 2D profile，不宣稱 WebGL／GPU 驗收。 |
+
+原生首輪各模式皆為 `TWOpeningInputCoveragePending`；不是模型已完成卻只差畫面。
+成功輪仍有 4.15–20.83 秒模式 dispatch queue、Factorized 約 8.02 秒推論及
+前置重複掃描。這些 spans 有包含與重疊關係，不能逐欄相加為總延遲。
+夜間 FinMind headers／body／JSON／全市場驗證為
+391.628／1,410.592／18.430／20.576 ms；MIS 29 chunks、4 workers、
+8,481.314 ms、零請求失敗。Fugle 兩市場均為 permission 403，仍列不可用，
+不靠高併發繞過拒絕，也不再次採用先前全失敗的 16 路設定。
+HTTP benchmark 中受保護路由的 403 保留為權限拒絕，不當成正常業務回應。
+
+證據：
+[原生 audit](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/native_audit.json)、
+[完整私人 pipeline](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/pipeline_full_current.json)、
+[低擾動階段診斷](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/pipeline_stage_diagnostics.json)、
+[HTTP／SSE](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/dashboard_http.json)、
+[夜間來源](../artifacts/operations/tw_quote_phase_benchmarks/2026-10-22/postclose_214018429545.json)、
+[本機瀏覽器](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/browser_navigation_retry/browser_local.json)、
+[公網瀏覽器](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/browser_navigation_retry/browser_public.json)。
+
+### 本輪實作與驗證方法
+
+- canonical source read guard 只在**同一 OS shared lease 的重疊讀者**之間，
+  single-flight 共用不可變股票 member generation。每個 reader 仍持有自己的
+  真 OS lease，最後 reader 離開就捨棄結果；不是 TTL／目錄 mtime 快取。
+  外層操作員／benchmark lease 預設不延長這個重用週期。
+- 外部 feature、corporate-action 與 sentinel 仍逐次重新檢查；未受該鎖保護的
+  來源不能搭便車。完整來源雜湊、模型輸出、權重、價格、解釋與 rich artifacts
+  皆與 control 核對，沒有建立第二套來源或模型路徑。
+- `benchmark_opening_signal_pipeline.py --compare-source-scans` 保留原 scanner
+  為 control，以六對 ABBA、同 source release／receipt／完整六模式作整鏈對照。
+  actual scanner 計時只加 observer，不改讀取內容；並行 spans 不加總作牆鐘。
+- browser benchmark 修正 WWW→apex／HTTPS 轉址後仍在舊 execution context
+  等待的競態；等待真正主文件後才驗證畫面，navigation/readiness 失敗另留收據。
+  原失敗 run 不刪除，重測兩個網址都通過，沒有放寬 CSP 或修改頁面來遷就測試。
+- **1,151 項 Python 語意回歸通過（66.78 秒）**，包含來源鎖、多讀者、原異常傳遞、
+  lease 結束不得重用、外部原地修改即失效、source epoch 更換、checkpoint ABI、
+  Discord、報價、執行、發布與 code admission；不是全 repository 全測試宣稱。
+
+第一輪完整對照發布中位 **9,005.546→6,920.521 ms**、完整產物
+**11,506.307→9,066.863 ms**；最大發布仍有 **33,986.943／12,469.585 ms**。
+該輪有同時進行的回歸工作與既有背景負載，全部樣本保留；不可只挑最快數字。
+來源大掃描每輪確實由 **12 次減為 6 次**，其他 sentinel 檢查未減。
+第二輪使用同份凍結版本，且不另啟回歸測試，再驗證整鏈，結果另保留於
+[獨立重測](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/scan_recheck/pipeline_scan_abba.json)。
+
+獨立重測仍是每組六次、全部 warm，兩組皆 31／36 預取通過；發布中位
+**7,868.860→6,894.584 ms（少 12.38%）**，完整報表＋獨立私人執行
+**10,131.046→8,509.686 ms（少 16.00%）**。但最大發布為
+**9,665.599→10,133.815 ms**、最大完整產物為
+**11,895.663→12,892.537 ms**，所以只接受可重現的中位改善與減少重複工作，
+不宣稱長尾、P99 或一秒保證。背景 producer／備份／其他工程負載未被停掉，
+這不是隔離硬體的最大吞吐實驗。兩輪各自的六模型完整契約 SHA 相同；
+兩次都驗證七個正式 owner 不變、零正式寫入／零券商下單。
+
+另以同 source release 的新程序、**保留既有持久 cache** 讀取全部六模式輸入，
+不請行情、不初始化 CUDA、不 forward、不發布訊號：首次 **10,137.269 ms**，
+後續完整重驗 **1,174.775／904.920 ms**。Factorized／MGDA 首次共用的完整
+member 驗證約 **7,411／7,373 ms**（重疊等待，不能加成 14 秒），並非重建
+全部歷史。這把「私人空 cache 91 秒」與「現存持久 cache 的新程序 10 秒」
+明確分開；兩者均不是物理冷開機或 GPU 冷載入驗收。
+見[完整輸入收據](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/persistent_input_preparation/input_preparation.json)。
+
+下一步優先順序：先確認重疊掃描的整鏈改善可重現，再經 flat／idle、來源鎖、
+exact ACK 與唯讀 namespace admission 上線；接著分解持久冷恢復、前置轉換／排隊、
+Factorized 5.20 GB 邏輯輸入的原樣重建與帳本來源補查。已否決的兩個 CPU slot 與
+刪診斷 tensor 方案不重推。獨立 observer 延用既有每日排程，下一交易日原生來源、
+六模式發布與**全目標紙上成交**必須各自驗收，仍未達一秒，亦未證明只剩 API 延遲。
+
+### 22:08 採用與 22:09 獨立讀回
+
+先前只讀 plan 的 heartbeat freshness 拒絕、以及更新中 source writer 的
+pre-restart 拒絕均保留，沒有鬆開 freshness、搶鎖或改寫來源狀態。
+外層等候來源 **131,380.541 ms** 後即釋放探測用 shared lease，再按
+**control→source** 順序重新做完整 admission；實際 control 等待 **12.185 ms**。
+只重啟 Discord 一次，沒有 restart loop。
+
+[canonical apply](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/discord_apply_after_source.json)
+於 **22:08:56** 接受 code-only admission；
+[獨立讀回](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/native_final_readback.json)
+於 **22:09:56** 確認：
+
+- source release `20261022T134638Z-e8906f8b30bf`，source SHA
+  `53537d648e5a61d45f9cfe72fd1b976efb7ea21a98ef3415e9a34bf42b526a8f`；
+  Python PID **1347079** 實際 namespace **1,614 檔**逐檔與唯讀掛載驗證通過。
+- admitted code SHA
+  `11c8e37f173e11a1dadb634dc011413bf65ee979e5d1b13743aefd640d48dd83`；
+  Gateway connected、core ready，exact ACK revision **63,808**、lag **0**。
+- 引擎仍為 `05aa07b6342f481ba1cbb20c68d28b96`，受保護六個服務 owner 不變；
+  空倉、待委託各 **0**。三份帳本共 **858,722,532 bytes**，長度與完整前綴 SHA
+  均與更新前相同，零操作員帳本寫入／零券商下單。
+- startup GPU warmup、postclose resident cache 仍 **pending**；盤後 maintenance
+  為 **waiting_source**，原生原因 `tw_public_refresh_in_progress`、failed count **0**。
+  這是對當下來源工作的等候，不改寫成全部 ready；code acceptance 不等於 GPU、
+  全資料就緒或下一交易日 09:00 SLO。
+
+Browser benchmark 另新增 DNS／connect／TLS／request／response、H2／H3、
+靜態資源 bytes 與各資源瀑布原始時鐘。重用連線或跨來源重導的隱藏階段保留原值，
+**不把 0 認定為真實零網路成本**。它只是觀測工具，沒有放寬網站 CSP。
+[新增計時公網讀回](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/browser_network_phases/browser_public.json)
+為初始 **7,845.200 ms**、全分鐘歷史 **3,315.200 ms**；同輪
+[本機讀回](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/browser_network_phases/browser_local.json)
+為 **1,848.700／6,999.200 ms**。兩者仍有 477,628 點、9 series、SSE、
+Canvas 一致與零畫面錯誤；但本機全歷史這次更慢，不能只報第一次的 1.31 秒。
+不是受控 UI 前後 ABBA，不據此宣稱頁面快了某個比例。
+公網該次主文件 responseStart **3,813.800 ms**、responseEnd **3,824 ms**、
+DOMContentLoaded **5,241.200 ms**，證明傳輸／載入仍需另查，不能全歸於繪圖。
+
+[小型證據索引](../artifacts/operations/tw_opening_latest_standard_20261022/all_stages_round5/summary.json)
+保留各完整收據的長度／SHA、三組六模型契約相同、兩輪全部樣本分布、cold/warm
+邊界與實際採用狀態。每日 observer 仍 enabled／active，下一次為
+**2026-10-23 08:55**。工程任務維持 active：長尾、首次完整恢復、HTTP 歷史快取
+失效成本、來源補查及真實開盤全目標完成仍未閉合，未宣稱優化已到理論極限。
+
+## 09:00→全目標紙上成交→畫面的完整規劃（2026-10-22 22:40）
+
+本節先固定整體方案，再實作／測速。沿用同一工程任務與 canonical collector、
+inference、executor、唯讀 gateway、共用瀏覽器測速，不另開行情登入或交易路徑。
+正式帳本、既有成交及模型語意不在這次效能修改的寫入範圍。
+
+### 清冊、時鐘與驗收
+
+| 邊界 | 真值與關聯 | 要量的時間／失敗 |
+| --- | --- | --- |
+| 09:00 到點／scheduler | 當日官方 session、原生 opening attempt | 第一個喚醒、input job dispatch、重試；不能用回放時間代替實際時鐘。 |
+| 每個 provider／每檔價格 | acquisition journal、官方 dated universe、原始 receipt | request queue、headers/body/decode、首筆／全量有效價；逐檔保留錯日、缺資料、試撮、失敗與 permission。 |
+| 模型輸入→訊號發布 | market＋session＋signal_id＋immutable publication | 完整 input prep、模型鎖／forward、格式化與發布；冷持久恢復、暖機、暖執行分列。 |
+| 訊號→paper executor | 同 signal_id、engine_run_id、state_revision | discovery、source recovery、quote、計算、fsync；首筆成交與**全部原目標成交**分列。 |
+| commit→網站資料 | 同 engine run／revision、SSE、status/detail response | 通知、cache rebuild、HTTP headers/body/parse；拒絕、stale response 與失敗不能記為成功。 |
+| 網站資料→顯示 | 同 session／mode／signal_id／revision 的實際已套用資料 | DOM 更新後前景 double-rAF 作 paint opportunity 代理；signal/detail 分開，非實體像素掃描證明。 |
+
+所有程序內 duration 使用 monotonic clock。跨程序保留原 wall clock 與 clock basis；
+遠端瀏覽器時鐘未校準，不把 client/server wall 差值稱精確網路延遲。
+瀏覽器休眠、隱藏、跨篩選／新 revision 淘汰、尚未載入的分頁都不能算已顯示。
+僅首屏實際資料可證明首屏顯示；完整訊號表分頁未下載，不冒充全表呈現。
+紙上無委託、未定量、TP／SL 拒絕、部分成交、回放、恢復後才發現成交均另列。
+
+價格分析覆蓋完整官方軸及 1／5／10／11／20／30 秒等 deadline，不只分析收盤剩餘
+40 檔；後來成功也保留早先未達標。首筆真成交固定 opening；fresh 官方無首筆證據
+最多 15 秒，只有 model reference 可沿用上次真成交；網路錯誤絕不推論零成交或下市。
+逐來源範圍只有 hash 而無標的清單時，僅列來源／job 層錯誤，不能猜哪一檔請求失敗。
+官方觀測時間、歷史訊號時鐘及後驗比較範圍都明示，不偷換分母。
+
+### 依證據排序的實作／優化
+
+1. **先補觀測缺口與失敗清冊**：擴充既有 symbol audit，以一次串流讀 journal
+   重建逐檔 deadline 狀態、首次有效時間、後續恢復、provider rejection／job 失敗。
+   既有 bulk/legacy observation reader、canonical masks 與 15 秒 TTL 都保留。
+   原生 daily observer 重用結果／摘要；不在每個 consumer 重複掃全歷史。
+2. **接通 commit→真正套用畫面**：擴充既有 browser-local performance records，
+   只允許 signal/session/revision 和耗時，不蒐集價格／帳密、不新增公開寫入 API。
+   browser benchmark 保存完整關聯，而非只數 SSE messages；過時與背景樣本拒收。
+3. **逐一剖軟體成本**：先查 100m 670 秒 source recovery、六模式 dispatch queue、
+   持久 member 驗證與 status/history cache 重建；只有已證明冗餘／可安全 overlap 的
+   工作才移除或並行。來源配額、permission 和首筆尚未發生屬外部邊界，不能以
+   更短 timeout、假價格、跳過驗證或提高併發冒充優化。
+4. **同輸入驗證後採用**：control/candidate 使用同 source release、六模式輸出／
+   價格／費用／股數／完整 artifacts oracle；ABBA 保留每輪及負面長尾。共用契約
+   回歸與真實 browser readback 依變更範圍執行。只讀 observer／靜態 UI 可獨立上線；
+   trading owner 的版本切換仍需 canonical flat/idle admission、exact ACK 及 rollback。
+5. **真開盤再驗收**：既有 timer 於 10/23 08:55 固定 scope，開盤採原生 clock，
+   每模式 publication/full-target commit 和前景瀏覽器顯示各自驗收。夜間只能做
+   真網路盤後測速及明示 private replay；不能承諾未實測的一秒、零錯誤或理論極限。
+
+本輪開始時（22:34）Gateway/core ready、引擎與公開 gateway owner 未更動；盤後
+maintenance 已由先前 waiting_source 轉為 ready（22:26:09），不是人工改寫健康狀態。
+這仍不等於 09:00 覆蓋、GPU resident readiness 或全目標成交成功。
+
+### 本輪實作、測速與獨立讀回（2026-10-22 23:34）
+
+計畫先於本節實作固定。沿用工程任務
+`tw-opening-latest-standard-latency-20261022`，完整證據在
+[`end_to_end_round6`](../artifacts/operations/tw_opening_latest_standard_20261022/end_to_end_round6/)。
+本輪不修改正式帳本、訊號／成交時鐘、模型權重、TP／SL 或券商委託。
+
+#### 原生開盤：不是 HTTP 成功就有有效價格
+
+新逐檔分析一次固定讀取當日 journal 的 **221,825,705 bytes／65,460 行**，
+完整前綴 SHA `36a3a9e46e359ca76eb1e55383b539de8a5577ff24fde8587fbd0753bcbcfb43`；
+inode 未換、無損毀行。官方交易軸 **2,309 檔**，fingerprint
+`a3c1fcd3e809ac0a7ac3eefd1026a76994307c1c25c9fdb323bcc2561d888d4f`，
+觀測時間 **08:45:26.577294**；沒有以後來成功的標的縮小早先分母。
+
+| 09:00 後 | 有效首筆開盤價 | 尚未證實有效／無首筆 |
+| --- | ---: | ---: |
+| 1 秒 | 3 | 2,306 |
+| 5 秒 | 57 | 2,252 |
+| 10／11 秒 | 434 | 1,875 |
+| 20 秒 | 1,070 | 1,239 |
+| 30 秒 | 1,256 | 1,053 |
+
+第 11 秒的 **1,874 檔**共同原因是永豐 shared row 仍為
+`stale_or_preopen_time`、FinMind `rejected:other_session_rows`、MIS
+`no_source_observation`；另外 **1 檔**的 MIS 也是 stale/preopen。
+這是「沒有當下有效證據」，不是判定股票無成交、停牌或下市。
+FinMind HTTP 成功、其他日期價格及昨天成交量不能冒充今天首筆成交。
+無完整請求軸的 provider job 失敗僅留 job 層原因，不猜分配到每個 symbol。
+
+後來完整快照是 **2,269 真開盤價＋40 fresh 官方無首筆證據**、未知 **0**；
+40 檔的代碼、正式名稱與交易所均留在
+[完整逐檔收據](../artifacts/live/tw_day_trade_simulation/opening_audits/2026-10-22/first_postclose_symbols.json)。
+這不能倒推第 11 秒完整，也不把 40 檔排除或捏造成可成交量。
+另有 **1,194 筆**舊版 absence events 缺 proof clock，保守維持未知。
+
+六模式原生最後發布仍是 **09:04:47.162969**；第一個／最後一個 executor
+登錄是 **09:04:43.924753／09:15:59.412730**。100m 其中約
+**670,278 ms** 落在 missed-opening 歷史價格恢復；這屬錯過開盤後的
+09:01 反事實重建，不是正常即時進場的延遲，也不能拿登錄當全目標完成。
+同訊號、因果全目標成交 SLO 仍為 **0／6 已驗證達標**，不是宣稱完全沒有成交。
+原生階段與 provider job 分布仍見前節 `all_stages_round5/summary.json`。
+
+#### 已完成的觀測與一致性修正
+
+- `audit_tw_opening_symbol_status.py` 新增完整逐檔 deadline timeline，先完整驗證
+  bulk／legacy event 才採用、保留未完成尾端／錯日／freshness／provider 原因，
+  首筆真成交不被後續 stale row 覆蓋。projected decoder 與 full decoder 的
+  **2 組 ABBA、8 樣本整份輸出 hash 相同**，中位數 **10,846.951→9,726.694 ms**。
+  約 **10.3%** 僅是盤後逐檔鑑識加速，沒有搬到 09:00 熱路徑冒充開盤提速。
+- `audit_tw_opening_latency.py` 在當日 13:35 後由原生 observer 保存一次
+  `first_postclose_symbols.json`，後續重用原日期／原 SHA；壞收據顯式失敗而不覆寫。
+  這次正式收據於 **23:13:41.733893** 保存，來源 clock **13:29:59**，
+  收據 SHA `696329b4873cbb231daecd9558567f34dfbe6d9f1471cc89761b4fc3cb8bef24`。
+- backend／TW 與隔日沖共用前端加入 opaque `public_signal_key`、engine generation
+  和 state revision。共用 observer 只接納目前篩選、實際套用、前景 double-rAF
+  的資料；revision 被淘汰、頁面隱藏、重複回應均不算已顯示。
+  模式卡資料與明細 identity 是不同證據；沒有把頁面 identity 當成交 commit。
+- `benchmark_dashboard_browser.mjs` 保存每筆 `.updates.jsonl`、HTTP／parse／render
+  原始 spans，區分 initial 與真正 revision change；summary 有上限及 drop count，
+  不是靜默丟事件。缺 capability／backend identity／可見關聯即驗收失敗。
+  新 canonical `benchmark_dashboard_browser.py` 管理唯一 CDP 瀏覽器、限定輸出不覆寫、
+  timeout／失敗 sidecar 與確實關閉；CPU-2D 明示，不冒充 GPU/WebGL 測速。
+  watch 可在尚無訊號時啟動，不強制載全歷史、不接行情／下單／公開寫入 API。
+- benchmark 現在明確載入 canonical MGDA sparse runtime profile 並驗 hash／鍵名；
+  profile 缺漏提早失敗，不再誤把 benchmark 的 ABI 缺漏當正式 checkpoint 壞掉。
+
+#### 真正發現並修掉的公網舊資源問題
+
+第一次公網 browser 只有 **0 筆**可見關聯（本機有 2 筆）。查到 gateway 的
+`project_html` 把每個新版共用 JS URL 都重寫成固定 `access-v2`，導致公網拿到舊版
+immutable cached core：encoded **12,384 bytes**，本機新版 **13,705 bytes**。
+因此不能只看 HTML/App 已更新就宣稱整套前端生效。
+
+已改為共用 core **實際內容 SHA** 的 URL；HTML 靜態快取也依賴 core 檔案身份，
+只換 core、不換 HTML（包括原子替換／相同大小與恢復 mtime）仍可失效。
+重用既有 static cache／ETag，不增加每請求整檔 hashing。預設不再重寫宣告版號，
+版本字元嚴格驗證，public／member／owner 過濾與私有欄位遮蔽不變。
+正式讀回實際 URL 為
+`/dashboard-core.js?v=core-464d13fc3393cef495135299379d460bea5abf304ce2b54e61f127d779a0a595`。
+
+只讀 gateway 本輪共重載 **2 次**，第二次載入上述根因修正：
+`opening-display-gateway-rollout-20261022T151505-8a7ff83e`、
+`opening-display-content-hash-rol-20261022T152150-91eb66b1` 均 succeeded。
+Gateway 現 PID **1535963**、Invocation `6e9e706ab6ef4aa2805ea64603f93a44`。
+Discord、當沖／隔日沖、Shioaji top200／TAIFEX bidask／dashboard、cloudflared
+**7 個受保護 owner 的 MainPID／InvocationID 均與更新前相同**；沒重啟交易引擎。
+
+#### 同輸入六模式 ABBA：保留完整工作，不把隔離測試當真開盤
+
+[無 profiler 的 8 樣本收據](../artifacts/operations/tw_opening_latest_standard_20261022/end_to_end_round6/pipeline_unprofiled_abba.json)
+來自 run `opening-latest-unprofiled-retry-20261022T151704-336ce033`。
+固定同一來源／feature date／六模型、2 組平衡 ABBA、每 variant **4 輪**；
+訊號、權重、價格／費用／股數及完整 artifact oracle 相同。
+沒有網路請求／正式寫入。進場是私有 **synthetic one-lot order book fixture**，
+不是今天全部原目標、交易所成交或券商回報。
+
+| 完整工作／中位數 | 各模式重複掃來源 | 同 generation 共用掃描 | 改善 |
+| --- | ---: | ---: | ---: |
+| 六模式訊號全部發布 | 5,578.349 ms | 5,024.320 ms | 9.93% |
+| 含隔離進場與完整 artifacts | 7,971.239 ms | 6,962.215 ms | 12.66% |
+| 發布 min～max | 5,130.403～6,457.680 | 4,072.444～5,247.744 | 保留全分布 |
+| 完整工作 min～max | 7,840.857～9,719.425 | 5,641.796～7,406.912 | 保留全分布 |
+
+這是重測先前已實作／部署的 shared-generation 掃描，不把它重複計為本輪新改進。
+私有 fresh-cache warmup **98,847.935 ms** 另留；8 個計時樣本均 fully warm，
+不能把這組稱來源冷啟動／首次恢復。48／48 mode prefetch 都採納，fallback **0**。
+第一次重跑被 canonical `TWPublicSourceUpdatePending` admission 擋下，保留 failed
+run，等原生 writer 自行完成後才重試，沒有停 writer、搶鎖或混來源 generation。
+較早 cProfile 兩輪發布 8.32／8.78 秒、Factorized 曾 2 次 prefetch 過期，也保留；
+不能與無 profiler 樣本直接當前後 ABBA。未延長 **5 秒** prefetched mutable quote
+TTL，因其中有 bid／ask／volume／no-first 證據，放寬會以正確性換速度。
+
+#### 已上線的瀏覽器與 HTTP 讀回
+
+`opening-display-hashed-public-ac-20261022T152234-2fc6250b` succeeded。
+fresh CPU-2D browser、browser HTTP cache disabled；server／OS cache 不受控：
+
+| 範圍 | 首屏 ready | 完整歷史 load | 歷史／繪圖驗收 |
+| --- | ---: | ---: | --- |
+| 本機 | 1,158.8 ms | 3,054.1 ms | 477,628 點、9 series、Canvas 相同、無錯誤／溢位 |
+| 公網 | 6,814.5 ms | 5,336.8 ms | 同完整資料／Canvas／無錯誤；4 筆前景 identity |
+
+這次 **matchedRevisionUpdateSamples=0**：是初始顯示觀測，不是夜間造一筆訊號
+當 09:00 更新。公網舊版那輪 17,364 ms 與這輪也不是受控 network ABBA，
+不宣稱保證加速倍數。整檔 canonical source 失效的 canary 曾 ready timeout，
+失敗證據與持久快取成功路徑各自保留，沒有用後者冒充真正 source-cold 恢復。
+
+最終 HTTP 每 route **first＋3 repeats**，signals／positions 均完整保留首查成本：
+
+| API | 本機 first／中位 ms | 公網 first／中位 ms | 公網 app median ms |
+| --- | ---: | ---: | ---: |
+| status | 8.101／11.561 | 396.113／220.149 | 1.379 |
+| revision | 5.036／27.832 | 302.887／236.057 | 1.373 |
+| signals（100 筆，排除零目標） | 423.332／6.149 | 611.534／263.580 | 1.610 |
+| positions（100 筆） | 178.420／5.464 | 471.602／226.173 | 1.565 |
+
+本機／apex 公網各 5 routes 無錯誤，但樣本量僅 3，不據此作長期 p99 保證。
+最初用 WWW HTTP probe 不跟 redirect，遇 **308 共 20 次**而失敗；這是正常
+WWW→apex 導向，不是網站中斷。保留失敗後，以 apex 重測 succeeded；browser
+本來會跟導向，其整段時間也包含在公網讀回，不把該成本刪去。
+
+#### 測試、下一次原生證據與尚未閉合的成本
+
+最終統一 run `opening-all-stages-final-regress-20261022T152910-7706b926`：
+**529 Python tests passed／66.15 秒＋59 Node tests passed**，ruff 與 Node syntax
+checks 通過。這是受影響的 audit、public access/cache、完整行情顯示、revision、
+重啟／rollover、benchmark 與共用前端契約，不是全庫測試通過。
+中途過期的 static token assertion 曾 **1 failed／211 passed**，修正 expected
+TW core 版本後獨立 **38 passed**，並納入上述統一回歸；失敗 log 未刪。
+
+既有 persistent opening audit timer **active**，下一次 **10/23 08:55**；
+另外已啟動一次性 systemd timer **10/23 08:58:30**，由 canonical agent workflow
+執行公網 browser watch **600 秒**，只讀並保留逐筆更新：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_dashboard_browser.py \
+  --url https://www.penguin72487.dpdns.org/tw-day-trade/ \
+  --watch-ms 600000 \
+  --output artifacts/operations/tw_opening_latest_standard_20261022/end_to_end_round6/native_open_20261023_public.json
+```
+
+已用 3 秒 smoke 證實可以在 initial signal rows **0** 時 armed，正常保存 launch／
+updates sidecars；不是宣稱產生新交易。這個 browser timer 定義在 `/run`，
+**不保證 WSL／Windows 實體重啟後仍存在**；persistent 原生 audit 是另一路證據。
+下一交易日必須真的執行、當日官方分母固定、同 signal／engine revision 相符、
+原目標全數完成且前景顯示才驗收；只有 timer active 不算達標。
+
+23:28 原生 Discord maintenance **ready／6 markets／failed 0**，但 startup GPU
+resident warmup **pending**；公開整體仍 **degraded**，沒有改寫正常。
+本輪保留的下一步優先序：**09:00 價格新鮮度與 MIS 外部等待→六模式 dispatch／
+input preparation→來源版本／持久 member 驗證與可證明重用→model／formatting→
+missed-opening 歷史恢復→公網傳輸與真正 revision paint**。
+來源 permission／首筆未發生無法由本機消除；但暖路徑仍有約 **4～5 秒**內部發布
+成本及 private fresh warmup，不能宣稱只剩外部 API、11 秒／一秒保證或理論極限。
+工程任務維持 active，下一次原生觀測與上述剩餘熱路徑尚未完成。
+
+**23:35:27 獨立末次讀回**：
+`opening-round6-final-readback-20261022T153523-c620862e` succeeded；逐一比對 7 個
+受保護 owner 的實際 MainPID／InvocationID 全相同且 active，兩個觀測 timer active，
+最終回歸／apex HTTP run succeeded，public 完整歷史／關聯證據及本節連結存在性
+再次驗證。這仍明確保留 `browser_current_native_opening_proof=false`。
+
+## 無首筆沿用最近成交價：新標準重測規劃（2026-10-22 23:45）
+
+使用者重申：盤前備齊前一交易日收盤／最近真實成交價及可事先準備資料；
+09:00 後拿到無首筆證據即沿用，不等首筆才推論。本節於修改程式前固定方案，
+沿用原工程任務，不把上一輪「真首筆」數當此新標準的輸入就緒率。
+
+### 全流程清冊與口徑
+
+1. **盤前**：官方交易軸／資格／價格界線、已完成資料與 feature panel、normalizer、
+   checkpoint／GPU model、layout、來源版本驗證，以及每檔最近有正成交量的完成日
+   Close／來源日期。一般為前一交易日；該日零成交則往前找最後真成交，不用
+   日曆昨日或試撮價。原生無行情 `price_source=panel, write=False` 暖機驗證這些
+   工作；不偷用開盤後快照作盤前準備。準備耗時與開盤耗時分列。
+2. **到點→取價**：原生 09:00 gate、request queue／來源回覆／解析／input fsync。
+   每檔分為「真首筆」「已證無首筆且前值可用」「無首筆但前值缺漏」「來源未知」。
+   前兩者合計才是新標準 model input readiness；無首筆當下直接用盤前前值，
+   不因沒有 positive open 繼續等。timeout／其他日資料不是無首筆證據。
+3. **輸入→訊號**：同官方 scope／模型、來源觀測與沿用價格／日期／標記完整保存；
+   分別記 prepare、模型排隊、forward、format、durable publish。首個開盤推論與
+   已跑過開盤資料的 steady 重複輪分列，避免「二次熱快取」冒充盤前準備效益。
+4. **訊號→模擬成交**：沿用價只解模型參考；可執行 Bid／Ask／量、原 TP／SL、
+   因果時鐘與未成交目標仍照 canonical executor。首筆、部分、全部原目標、
+   waiting_source／bracket rejection／清倉時段拒絕分列，不把模型補價當成交。
+5. **commit→網站**：重用 opaque signal／engine／revision→SSE／HTTP→實際套用→
+   前景 paint opportunity；完整歷史、首屏、分頁與不同 clock basis 照舊分開。
+   原生 10/23 audit＋公網 watch 仍保留；夜間重建只稱可追溯 replay。
+
+### 已找到的具體缺口與依序實作
+
+- canonical `_last_completed_trade_reference` 已在 panel 暖機建立／快取；先重用，
+  不再做一份平行價格來源。新增盤前準備／實際沿用清冊與測速證據。
+- 目前 compact journal 的 v1 observation 不含無首筆 proof clock，timeline 消費端
+  也只投影 symbol／state，無法正確驗收沿用價。擴充 lossless 版本與相容讀取，
+  保存 proof 自身時鐘及必要刷新；不能拿任意新 broker row 刷新舊 MIS absence。
+  舊資料僅於原始 direct MIS observation 有足夠時鐘／狀態證據時解析，否則保留未知。
+- 逐檔 audit 明列新標準 resolved count、無首筆及缺前值原因，保留真首筆獨立欄。
+  允許從 pinned journal prefix 產生指定 deadline 的私有診斷價格視圖，來源原值／
+  時鐘保留、不反寫原 receipt／帳本；只用該 clock 已知的事件，拒絕未來證據。
+- benchmark 新增真正無行情盤前準備與第一輪開盤階段；採 receipt／journal 的
+  原始觀測時鐘驗證 absence freshness，不再把午後 absence 放到 09:00 合成 clock
+  然後錯判 future。所有 fixture／clock 與真實來源等待分列，禁止網路與正式寫入。
+- 依新的分階段剖析只消除可證明的重複掃描／配置／序列化；固定輸入 ABBA／完整
+  金融輸出 oracle 後才採用。若 source writer 在更新，保留拒絕並等原 owner 完成。
+
+### 重測中新增的阻塞與修復方案（23:58）
+
+原生 `stockagent-tw-public-cold-publish.service` PID 1611024 在沒有修改來源的
+packing／publication 階段持有 `tw-public-refresh.lock` 的 WRITE lease；本輪
+benchmark admission 與 qualified reload 都被真鎖拒絕。只讀發布需要排除來源
+writer，並不需要排除同 generation 的模型 reader。修復順序為：明確在既有
+catalog 登錄 TW public 的 shared-read source lease；wrapper 與 canonical child
+一致使用該契約，繼承 FD 只驗證既有持鎖而不改變父程序鎖種類；其他資料與真正
+writer 仍維持 exclusive。完整 hash／來源前後 fence、唯一冷發布 owner、D commit
+及 strict audit 不變。以真正 flock 及 child inheritance 測試驗收 readers 可併行、
+writers／未持鎖 FD 仍拒絕。不動執行中的 owner／鎖；下一次原生啟動才載入。
+
+只切換已固定的 Discord code namespace、且明確使用 `--code-admission-only`
+時，驗收對象是載入程式、Gateway 與未變更引擎的精確 ACK，不是來源／GPU
+warmup。該狹義路徑不應讀取 panel 或等待來源發布；保留 control lease、所有
+帳本 prefix／owner／order-disabled 與 ACK gates，明示不做資料 readiness claim。
+正常 GPU-ready、engine 或未固定來源的 reload 仍先取得 source read admission。
+
+先做 focused schema／mask／cache／benchmark tests，再整合六模式、paper executor、
+public DTO／瀏覽器回歸。部署交易 owner 前仍做 canonical plan→flat/idle admission→
+apply→載入版本／ACK／帳本前綴 verify；未通過就不宣稱新版本已生效。
+一秒是全鏈目標；資料未到、未成交、背景頁面或未知證據均不以零耗時算成功。
+
+### 新標準實作與重測結果（2026-10-23 00:25）
+
+本輪以既有 canonical 前值 resolver／來源 fan-in／模型／paper executor 為唯一
+實作路徑，不另設下載器，不修改訊號權重、TP／SL、成交容量、費率或正式帳本。
+沿用價仍只解模型輸入；真首筆、可執行盤口與模擬成交保持不同契約。
+
+已修正：
+
+- 無首筆 journal v2 保留 proof 自身時鐘；相同價格／狀態但新的實際 absence
+  證據也會刷新紀錄。後來的 broker delivery 不得替舊 absence 更新時鐘。
+  bulk row-values 仍 lossless、維持既有同步 fsync，舊版原始資料不回寫。
+- 完整官方 2,309 檔逐檔 audit 與私有 deadline projection 分開「真首筆」、
+  「有效無首筆＋前值候選」及「未知」。只從原始 direct MIS receive clock
+  解釋有充分證據的舊 absence，不能把 timeout／其他交易日當作零成交。
+- 每日 native audit 新增 `last_trade_reference_standard`：按 deadline 與 proof
+  TTL 計算 fresh candidates，並明示尚未核對模型前值庫；舊「曾觀察到」統計
+  另列 boundary。共用純時鐘 helper／TTL，不初始化 provider／Discord／GPU。
+- benchmark 使用真正 `price_source=panel, write=False` 的無行情盤前準備，
+  保留來源原始 clock，分開第一個開盤推論與 steady repeats；跨午夜仍用原始
+  交易日執行完整 registry 驗證，不降低 quorum、不放寬 source guard。
+  新增 config／checkpoint／panel fingerprint／alignment／取價與驗證分段，
+  並輸出 hash-bound 小 manifest；全量逐檔證據仍完整保留。
+- TW public 只讀冷發布改為明確登錄的 shared-read source lease，讀者可同時
+  工作，真正 writer 仍 exclusive。繼承 FD 驗證不改變父鎖，其他 dataset 不變。
+  本輪遇到的舊 owner 自行完成，未解鎖或中止。scope 僅 code-only 的固定版本
+  Discord 切換不讀 panel／不聲稱 GPU-ready；真心跳過期只等新心跳，不延長 TTL。
+
+#### 原生 10/22：失敗價格與來源瓶頸
+
+證據：[完整逐檔／原始 clock](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/native_prices.json)。
+官方 axis 2,309 不變；數字是全市場 source candidates，尚不是各模型實際前值驗收。
+
+| 09:00 後 | 真首筆 | fresh 無首筆候選 | 未知 | 可用參考候選合計 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 秒 | 3 | 0 | 2,306 | 3 |
+| 5 秒 | 57 | 0 | 2,252 | 57 |
+| 11 秒 | 434 | 0 | 1,875 | 434 |
+| 30 秒 | 1,256 | 0 | 1,053 | 1,256 |
+| 32 秒 | 1,261 | 150 | 898 | 1,411 |
+| 59 秒 | 1,280 | 320 | 709 | 1,600 |
+
+首批原生 absence event 到達約 09:00:31.010447。第 11 秒仍未知的 1,875 檔：
+Shioaji 全是 stale/preopen time；FinMind 全是 other-session rows；MIS 1,874
+檔沒有 source observation，1 檔也是 stale/preopen。這些來源狀態可以重疊，
+不是額外三組股票，也不是下市／停牌／已證無成交。來源錯誤另有 permission
+或 subscription、連線／回應標頭前失敗、少量 5xx；沒有 scope proof 的 job
+錯誤不任意分派到個股。所有個股與 job 原始原因均保留在完整 artifact。
+
+59 秒私有 projection 的第一個受測模型為 1,272 真首筆＋319 前值＝1,591／
+2,291，低於原門檻 2,062，正確拒絕；全市場 320 中的一檔不在該模型 scope。
+不能把剩餘未知 709 檔直接標成無首筆來製造成功。舊 journal 去重沒有保留每次
+absence clock 刷新，因此後續歷史 freshness 也有證據缺口；新 writer 已補記。
+
+#### 六模式固定輸入：盤前準備、首輪與重複輪
+
+完整來源重測原始觀測是 **10/22 13:29:59**，2,269 真首筆＋40 fresh absence。
+不是把午後行情冒充 09:00。六模式官方清冊交集為 2,291–2,302；每模式都實際
+沿用 40 筆有效前值，缺前值 **0**。5 份 aligned panel 前值庫全部在無行情盤前
+建立；opening 階段 144 次 resolver 呼叫均重用同一份 reference 物件。來源日期
+與原值完整留存，零成交日會往前找最近真實成交，而非硬填日曆昨日。
+
+證據：[ABBA manifest](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/pipeline_original_clock_abba.manifest.json)，
+[分段 trace manifest](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/pipeline_stage_trace.manifest.json)。
+
+| 邊界 | 重測結果 | 不可推論的結論 |
+| --- | ---: | --- |
+| 全新 process 無行情盤前完整準備 | 106,824.32 ms | 不計作盤後熱快取，也不是開盤等待 |
+| 盤前準備後第一次六模式 durable publication | 6,499.46 ms | 此第一輪是 independent-scan control；沒有候選冷首輪配對 |
+| ABBA 共享 scan 六模式發布中位數（4 輪） | 6,332.98 ms | 已跑過開盤輸入的 steady，不是 09:00 原生完成 |
+| ABBA 獨立 scan 發布中位數（4 輪） | 6,995.25 ms | 相同固定來源／全金融輸出，不能換成不同負載比較 |
+| 共享 scan 全部 rich artifacts 中位數 | 7,717.43 ms | 完整 artifact boundary，不等於全部成交 |
+| 獨立 scan 全部 rich artifacts 中位數 | 8,604.70 ms | hash／決策／解釋／weights parity 全數驗收 |
+| 第二個細分 trace：首輪／steady 發布 | 5,546.29／3,712.02 ms | 不同負載、兩樣本，不能宣稱新的 ABBA speedup |
+
+ABBA 同 process 相同來源下，共享 scan 發布中位數改善約 **9.47%**；保留全部
+8 個樣本與尾端惡化（共享 scan 最慢 8,252.82 ms），不刪慢輪。
+細分 trace 首輪仍有 config load 66.85–228.92 ms／model、panel fingerprint
+120.72–899.03 ms、Factorized／MGDA attachment 759.74–773.57 ms。這些階段會
+平行重疊，不能直接相加。六個 forward 首輪合計 1,230.00 ms、steady 合計
+930.84 ms，另有格式化、契約／來源檢查及 durable publication；所以尚不能
+聲稱只剩外部 API，也不能保證目前六模式全鏈一秒。
+
+#### 成交、網站與部署驗收的邊界
+
+完整來源原始 clock 已是 13:29:59；canonical executor 正確拒絕晚盤新進場。
+本輪測到的是 eligibility＋registration/rejection／持久化工程成本，而不是
+全部目標成交；synthetic one-lot book 亦不是真實盤口。沒有改原 clock、沒有
+把沿用價變成成交、沒有為測速填滿帳本。10/22 六模式原生最後發布仍為
+09:04:47.162969，最後 registration 09:15:59.412730；全目標 SLO 仍需逐筆證據。
+
+夜間公網新瀏覽器首屏 **2,989.2 ms**，6 張模式 identity／100 筆訊號，JS
+errors 0、水平 overflow 0；2 筆前景 paint identity 是 initial 更新，非開盤
+revision-change，不能拼接成假的完整 09:00→畫面。證據：
+[公網回讀](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/public_visible.json)。
+
+887 項 focused Python 測試及 Ruff 已通過，涵蓋來源／無首筆／前值／最新 audit、
+benchmark、paper／code-only reload、namespace／ACK、source flock／child
+inheritance／發布與瀏覽器量測；不是全 repository suite。原生開盤 observer
+已持久排程 10/23 08:55 及各 deadline，公網 browser watch 已排 08:58:30。
+後者仍是 `/run` transient timer，未證明重開機後存在；不能把排程 active 當成
+原生開盤驗收。本輪首個 qualified code-only reload accepted，engine／行情／
+公網 owners 未換、3 份帳本 prefix hash 未變；固定版本與最終回讀另見 receipt。
+
+下一個可量化工作：同一負載重測剩餘 config／member proof 成本，僅採用保持完整
+source fence 與金融 parity 的變更；接著在真正 09:00 按來源逐檔 readiness、
+各模式 durable pointer、完整原目標 fill commit、前景畫面 identity 分別驗收。
+有未知／缺證／未成交時保留失敗，不以縮小 scope、造價、補成交或改 clock 達標。
+
+最終固定版本於 00:27 驗收 `accepted_code_admission_only`：code SHA
+`67a466045e36dffcab7187d97a8d9fd82a8d8d8992f037ded40592dab22306c6`，
+native Python PID 1708813、1,616 個唯讀 namespace 檔案驗證；引擎 run
+`05aa07b6342f481ba1cbb20c68d28b96` 未換，revision 63941 精確 ACK、lag 0。
+Discord Gateway／core ready，交易引擎、隔日沖、Shioaji 行情及公網 owners
+均保持原 invocation；3 份 ledger prefix 的 size／SHA 均相同，operator ledger
+writes／broker orders 皆 0。夜間 GPU warmup pending 是另一本契約，未冒充已暖機。
+證據：[最終 qualified plan/apply 回讀](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/reload_proof_final_apply.json)，
+[每日新標準獨立回讀](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/native_audit_new_standard_summary.json)。
+
+最終切換後再用另一個 fresh browser 回讀：首屏 **2,684.9 ms**、6 模式、
+100 筆訊號、errors 0、水平 overflow 0，4 筆 visible identity 仍均為 initial
+而非開盤 revision-change；不得與前一次 uncontrolled server/OS cache 的 2,989.2 ms
+直接當作優化對照。證據：
+[最終公網瀏覽器驗收](../artifacts/operations/tw_opening_latest_standard_20261022/prepared_carry_round7/public_visible_final.json)。

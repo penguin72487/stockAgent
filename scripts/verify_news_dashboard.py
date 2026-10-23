@@ -22,7 +22,8 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from scripts.probe_browser_runtime import browser_profile_launch_options  # noqa: E402
 
-BODY_PROGRESS_SELECTOR = 'progress.news-provider-progress.mini-progress-track:not([data-news-manifest-progress])'
+BODY_PROGRESS_SELECTOR = ('progress.news-provider-progress.mini-progress-track'
+                          ':not([data-news-manifest-progress]):not([data-news-reference-progress])')
 
 
 def require_owner_transport(headers):
@@ -352,6 +353,11 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             displayed_feed_counts: Object.fromEntries([...card.querySelectorAll('[data-news-feed-count]')]
                                 .map(node => [node.dataset.newsFeedCount, node.textContent])),
                             body_coverage: source.body_coverage,
+                            publisher_reference_coverage: source.publisher_reference_coverage,
+                            displayed_reference_count: card.querySelector('[data-news-verified-references]')?.textContent,
+                            displayed_reference_unresolved: card.querySelector('[data-news-unresolved-references]')?.textContent,
+                            displayed_reference_inactive: card.querySelector('[data-news-inactive-references]')?.textContent,
+                            displayed_reference_ratio: card.querySelector('[data-news-reference-progress]')?.value,
                             displayed_missing_body_urls: card.querySelector('[data-news-missing-body-urls]')?.textContent,
                             displayed_queued_missing: card.querySelector('[data-news-queued-missing]')?.textContent,
                             displayed_queued_retained: card.querySelector('[data-news-queued-retained]')?.textContent,
@@ -379,6 +385,16 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     }""", {"id": provider, "bodyProgressSelector": BODY_PROGRESS_SELECTOR})
                     assert checked["displayed_counts"] == [checked["stored_heads"], checked["known_urls"]], checked
                     assert checked["displayed_ratio"] == checked["progress_ratio"], checked
+                    reference = checked['publisher_reference_coverage']
+                    if reference is not None:
+                        for label, key in (('displayed_reference_count', 'verified_reference_urls'),
+                            ('displayed_reference_unresolved', 'unresolved_url_heads'),
+                            ('displayed_reference_inactive', 'inactive_reference_urls')):
+                            assert int(checked[label].replace(',', '')) == reference[key]
+                        assert checked['displayed_reference_ratio'] == reference['resolved_url_progress_ratio']
+                        assert reference['stored_body_urls'] == checked['stored_heads']
+                        assert reference['new_article_bodies'] == 0 and not reference['all_history_complete']
+                        expect(card).to_contain_text('不新增文章、不複製正文或原頁')
                     checked['verification_role'] = role
                     feed = checked.get('fulltext_feed_inventory')
                     if feed is not None:

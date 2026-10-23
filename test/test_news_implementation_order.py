@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from downloader.artifact_io import atomic_write_json, sha256_file
+from scripts import plan_news_sources as planner
 from scripts.plan_news_sources import plan_sources
 
 
@@ -152,3 +154,189 @@ def test_invalid_or_ambiguous_order_rejected(field, value):
 def test_no_ignored_policy_or_missing_semantic_fields(bad):
     with pytest.raises(ValueError):
         plan_sources(inventory(), work_order=bad)
+
+
+def test_completed_review_is_reused_without_hiding_missing_bodies_or_partial_review():
+    before = inventory()
+    original = deepcopy(before)
+    reviews = {
+        'large': {'capture_decision': 'permission_required'},
+        'medium': {'capture_decision': 'review_incomplete'},
+        'small': {'capture_decision': 'private_public_candidate'},
+        'all_stored': {'capture_decision': 'reviewed_existing_scope'},
+        'literal': {'capture_decision': 'permission_required'},
+        'cna': {'capture_decision': 'authorized_api_configuration_required'},
+    }
+    result = plan_sources(before, reviews=reviews, work_order=PARALLEL_POLICY)
+    by_name = {r['provider']: r for r in result['sources']}
+    assert result['review_resume_contract_version'] == 2
+    assert by_name['large']['implementation_state'] == 'waiting_source_permission'
+    assert by_name['large']['strategy'] == 'retain_completed_review_wait_for_source_permission'
+    assert by_name['large']['missing_body_urls'] == 999
+    assert by_name['large']['source_review_work_state'] == 'completed_waiting_permission'
+    assert by_name['large']['recorded_review_stage_complete']
+    assert by_name['medium']['source_review_work_state'] == 'partially_completed'
+    assert not by_name['medium']['recorded_review_stage_complete']
+    assert by_name['small']['strategy'] == 'verify_remaining_adapter_within_recorded_scope'
+    assert by_name['small']['implementation_action'] == 'verify_remaining_shared_adapter_within_recorded_scope'
+    assert by_name['literal']['implementation_state'] == 'waiting_source_permission'
+    assert not by_name['large']['body_downloader_candidate']
+    assert 'large' in result['implementation_order']  # Still unfinished, never silently removed.
+    assert 'large' not in result['actionable_implementation_order']
+    assert 'large' not in result['body_downloader_implementation_order']
+    assert result['waiting_source_permission_keys'] == ['large', 'literal']
+    assert result['remaining_source_review_order'][0] == 'medium'
+    for key in ('small', 'all_stored', 'large', 'literal', 'cna', 'redirect', 'platform'):
+        assert key not in result['remaining_source_review_order']
+    assert result['completed_review_is_not_completed_body_history']
+    assert not result['all_history_complete']
+    assert all(not r['review_annotation_grants_capture_access'] for r in result['sources'])
+    assert before == original
+
+
+def test_only_unfinished_questions_are_projected_without_promoting_partial_source_completion():
+    reviews = {'medium': {'capture_decision': 'review_incomplete', 'current_scope_review': {
+        'completed_questions': ['headline index is not a full article'],
+        'remaining_questions': ['current actual archive and permitted export'],
+    }}}
+    original = deepcopy(reviews)
+    result = plan_sources(inventory(), reviews=reviews, work_order=PARALLEL_POLICY)
+    rows = {r['provider']: r for r in result['sources']}
+    row = rows['medium']
+    assert result['review_resume_contract_version'] == 2
+    assert row['review_question_inventory_available']
+    assert json.loads(row['completed_review_questions_json']) == ['headline index is not a full article']
+    assert json.loads(row['remaining_review_questions_json']) == ['current actual archive and permitted export']
+    assert not row['review_questions_are_exhaustive_body_work']
+    assert row['source_review_work_state'] == 'partially_completed'
+    assert not row['recorded_review_stage_complete'] and not row['review_annotation_grants_capture_access']
+    assert row['missing_body_urls'] == 301 and 'medium' in result['remaining_source_review_order']
+    assert not rows['large']['review_question_inventory_available']
+    assert json.loads(rows['large']['remaining_review_questions_json']) == []
+    assert rows['large']['source_review_work_state'] == 'not_started'
+    assert not result['all_history_complete'] and reviews == original
+
+
+@pytest.mark.parametrize('scope', [
+    None, [], {'completed_questions': 'not a list'}, {'remaining_questions': [True]},
+    {'remaining_questions': ['']}, {'remaining_questions': [' ']},
+    {'remaining_questions': ['private\nquestion']}, {'remaining_questions': ['x' * 801]},
+    {'remaining_questions': [str(i) for i in range(65)]},
+    {'completed_questions': ['same', 'same']},
+    {'remaining_questions': ['same', 'same']},
+    {'completed_questions': ['same'], 'remaining_questions': ['same']},
+])
+def test_ambiguous_or_unbounded_review_question_inventory_fails_without_private_error_text(scope):
+    with pytest.raises(ValueError, match='^invalid recorded source review questions$'):
+        planner.review_resume_plan({}, {'capture_decision': 'review_incomplete', 'current_scope_review': scope})
+
+
+def test_review_observations_never_disable_existing_collector_or_reopen_completed_work():
+    before = inventory()
+    result = plan_sources(before, reviews={
+        'cnyes': {'capture_decision': 'permission_required'},
+        'all_stored': {'capture_decision': 'permission_required'},
+    }, work_order=PARALLEL_POLICY)
+    by_name = {r['provider']: r for r in result['sources']}
+    assert by_name['cnyes']['implementation_state'] == 'repair_or_backfill_known_urls'
+    assert by_name['cnyes']['implementation_action'] == 'reuse_existing_pipeline'
+    assert by_name['cnyes']['enabled'] and result['actionable_implementation_order'][0] == 'cnyes'
+    assert by_name['all_stored']['implementation_state'] == 'maintenance_only'
+    assert 'all_stored' not in result['actionable_implementation_order']
+    assert 'all_stored' not in result['waiting_source_permission_keys']
+    assert not result['running_collectors_stopped']
+
+
+def _cli_inputs(tmp_path):
+    config = tmp_path / 'config.json'
+    catalog = tmp_path / 'catalog.json'
+    reviews = tmp_path / 'reviews.json'
+    observed = tmp_path / 'inventory.json'
+    output = tmp_path / 'plan.json'
+    atomic_write_json(config, {'providers': [], 'provider_catalog': 'catalog.json'})
+    atomic_write_json(catalog, {'contract_version': 1, 'providers': [],
+                              'planning_review_ledger': 'reviews.json'})
+    atomic_write_json(reviews, {'contract_version': 1, 'providers': {
+        'large': {'capture_decision': 'permission_required',
+                  'evidence_urls': ['https://publisher.test/terms'],
+                  'reviewed_at_utc': '2026-10-20T14:00:00Z'}}})
+    atomic_write_json(observed, inventory())
+    return config, catalog, reviews, observed, output
+
+
+def test_cli_automatically_reuses_catalog_ledger_with_inputs_bound_and_no_source_io(tmp_path, monkeypatch):
+    import httpx
+    import sqlite3
+    config, catalog, reviews, observed, output = _cli_inputs(tmp_path)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('read-only snapshot planning must not open HTTP or SQLite')
+    monkeypatch.setattr(httpx, 'Client', forbidden)
+    monkeypatch.setattr(sqlite3, 'connect', forbidden)
+    before = {str(p): sha256_file(p) for p in (config, catalog, reviews, observed)}
+    assert planner.main(['--config', str(config), '--inventory', str(observed),
+                         '--output', str(output)]) == 0
+    result = json.loads(output.read_bytes())
+    by_name = {r['provider']: r for r in result['sources']}
+    assert result['review_ledger_selection'] == 'configured_catalog'
+    assert by_name['large']['source_policy_review'] == 'permission_required'
+    assert 'large' in result['completed_review_source_keys']
+    assert 'large' not in result['remaining_source_review_order']
+    assert result['planning_inputs_sha256'][str(reviews)] == before[str(reviews)]
+    producer = Path(planner.__file__).resolve()
+    assert result['planning_inputs_sha256'][str(producer)] == sha256_file(producer)
+    assert result['input_sha256'] == before[str(observed)]
+    assert before == {str(p): sha256_file(p) for p in (config, catalog, reviews, observed)}
+    assert output.with_suffix('.csv').is_file()
+
+
+def test_explicit_review_snapshot_override_remains_explicit_and_bound(tmp_path):
+    config, _, _, observed, output = _cli_inputs(tmp_path)
+    explicit = tmp_path / 'other-review.json'
+    atomic_write_json(explicit, {'contract_version': 1, 'providers': {
+        'large': {'capture_decision': 'review_incomplete', 'evidence_urls': []}}})
+    assert planner.main(['--config', str(config), '--reviews', str(explicit),
+                         '--inventory', str(observed), '--output', str(output)]) == 0
+    result = json.loads(output.read_bytes())
+    assert result['review_ledger_selection'] == 'explicit'
+    assert result['planning_inputs_sha256'][str(explicit)] == sha256_file(explicit)
+    assert next(r for r in result['sources'] if r['provider'] == 'large')[
+        'source_review_work_state'] == 'partially_completed'
+
+
+@pytest.mark.parametrize('invalid', ['missing', 'malformed', 'outside_catalog'])
+def test_bad_configured_review_never_silently_becomes_unreviewed_work(tmp_path, invalid):
+    config, catalog, reviews, observed, output = _cli_inputs(tmp_path)
+    if invalid == 'missing':
+        reviews.unlink()
+    elif invalid == 'malformed':
+        atomic_write_json(reviews, {'contract_version': 1, 'providers': []})
+    else:
+        atomic_write_json(catalog, {'contract_version': 1, 'providers': [],
+                                  'planning_review_ledger': '../outside.json'})
+    with pytest.raises(ValueError):
+        planner.main(['--config', str(config), '--inventory', str(observed), '--output', str(output)])
+    assert not output.exists() and not output.with_suffix('.csv').exists()
+
+
+def test_review_changed_during_planning_is_rejected_before_publication(tmp_path, monkeypatch):
+    config, _, reviews, observed, output = _cli_inputs(tmp_path)
+    original = planner.plan_sources
+    def changed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        value = json.loads(reviews.read_bytes())
+        value['providers']['large']['capture_decision'] = 'review_incomplete'
+        atomic_write_json(reviews, value)
+        return result
+    monkeypatch.setattr(planner, 'plan_sources', changed)
+    with pytest.raises(ValueError, match='review ledger changed'):
+        planner.main(['--config', str(config), '--inventory', str(observed), '--output', str(output)])
+    assert not output.exists()
+
+
+def test_legacy_cli_without_catalog_keeps_unknown_review_explicit(tmp_path):
+    _, _, _, observed, output = _cli_inputs(tmp_path)
+    assert planner.main(['--inventory', str(observed), '--output', str(output)]) == 0
+    result = json.loads(output.read_bytes())
+    assert result['review_ledger_selection'] == 'none'
+    assert next(r for r in result['sources'] if r['provider'] == 'large')[
+        'source_review_work_state'] == 'not_started'

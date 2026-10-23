@@ -1,6 +1,7 @@
 """Exact incremental versions shared by every file-backed provider, not news-only."""
 from __future__ import annotations
 
+import hashlib
 import pytest
 
 import stockagent.data_sync.packed_snapshots as packed
@@ -20,6 +21,211 @@ def publish(root, source, dataset="provider"):
 
 def objects(release):
     return {item["sha256"] for item in release.manifest["archive"]["objects"]}
+
+
+@pytest.mark.parametrize('pipeline', [False, True])
+def test_native_existing_chunk_reuse_batches_only_full_hash_proofs_and_preserves_versions(tmp_path, monkeypatch, pipeline):
+    from stockagent.data_sync import windows_cold_io as native
+    source, cold = tmp_path / 'source', tmp_path / 'cold'
+    source.mkdir()
+    blocks = [bytes([index]) * 16 for index in range(18)]
+    original = b''.join([blocks[0], blocks[0], *blocks[1:]])
+    (source / 'large.bin').write_bytes(original)
+    (source / 'receipt.json').write_bytes(b'{}')
+    publish(cold, source, dataset='seed')
+    calls, authorities = [], []
+    def hash_batch(paths):
+        calls.append(list(paths))
+        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    monkeypatch.setattr(native, 'hash_many', hash_batch)
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_REUSE_BYTES', 0)
+    monkeypatch.setattr(packed, '_check_native_pack_read_authority', authorities.append)
+    candidate = publish_packed_snapshot(cold, 'candidate', source, node_id='test',
+        loose_file_threshold_bytes=16, file_chunk_bytes=16, pack_buckets=2,
+        d_primary_native_chunk_reuse=True, d_primary_native_chunk_reuse_pipeline=pipeline)
+    reference = publish(cold, source, dataset='reference')
+    assert authorities == [cold]
+    assert [len(batch) for batch in calls] == [16, 2]
+    assert len({path for batch in calls for path in batch}) == 18
+    assert candidate.manifest['archive']['inventory']['sha256'] == reference.manifest['archive']['inventory']['sha256']
+    proof = verify_packed_snapshot(cold, candidate, reconstruct_all=True)
+    assert proof['independently_reconstructed_files'] == 2
+    assert proof['independently_reconstructed_bytes'] == len(original) + 2
+    (source / 'large.bin').write_bytes(original + b'new extent')
+    revised = publish_packed_snapshot(cold, 'candidate', source, node_id='test',
+        loose_file_threshold_bytes=16, file_chunk_bytes=16, pack_buckets=2,
+        d_primary_native_chunk_reuse=True, d_primary_native_chunk_reuse_pipeline=pipeline)
+    for number, (selected, expected) in enumerate(((candidate, original), (revised, original + b'new extent'))):
+        assert verify_packed_snapshot(cold, selected, reconstruct_all=True)['independently_reconstructed_files'] == 2
+        restored = fetch_packed_snapshot(cold, tmp_path / f'hot-{number}', selected)
+        assert (restored / 'large.bin').read_bytes() == expected
+        assert (restored / 'receipt.json').read_bytes() == b'{}'
+
+
+@pytest.mark.parametrize('fault', ['wrong_sha', 'missing_proof', 'extra_proof', 'changed_chunk', 'changed_source', 'batch_error'])
+@pytest.mark.parametrize('pipeline', [False, True])
+def test_native_existing_chunk_reuse_rejects_damage_without_committing_head(tmp_path, monkeypatch, fault, pipeline):
+    from stockagent.data_sync import windows_cold_io as native
+    source, cold = tmp_path / 'source', tmp_path / 'cold'
+    source.mkdir()
+    path = source / 'large.bin'
+    original = b'a' * 16 + b'b' * 16
+    path.write_bytes(original)
+    seed = publish(cold, source, dataset='seed')
+    head = cold / 'heads/seed/test.json'
+    before = head.read_bytes()
+    def damaged(paths):
+        result = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+        if fault == 'wrong_sha':result[paths[0]] = '0' * 64
+        elif fault == 'missing_proof':result.pop(paths[0])
+        elif fault == 'extra_proof':result[tmp_path / 'unrequested'] = '0' * 64
+        elif fault == 'changed_chunk':paths[0].write_bytes(b'corrupt'.ljust(16, b'!'))
+        elif fault == 'changed_source':path.write_bytes(original + b'changed')
+        else:raise SnapshotError('native batch rejected')
+        return result
+    monkeypatch.setattr(native, 'hash_many', damaged)
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_REUSE_BYTES', 0)
+    monkeypatch.setattr(packed, '_check_native_pack_read_authority', lambda root: None)
+    with pytest.raises(SnapshotError):
+        publish_packed_snapshot(cold, 'candidate', source, node_id='test',
+            loose_file_threshold_bytes=16, file_chunk_bytes=16,
+            d_primary_native_chunk_reuse=True, d_primary_native_chunk_reuse_pipeline=pipeline)
+    assert not list((cold / 'heads/candidate').glob('*.json'))
+    assert head.read_bytes() == before
+    assert resolve_packed_snapshot_id(cold, 'seed', seed.manifest['snapshot_id']).manifest_sha256 == seed.manifest_sha256
+
+
+@pytest.mark.parametrize('enabled', [True, 1, 'true'])
+def test_native_existing_chunk_reuse_requires_explicit_policy_and_original_authority(tmp_path, enabled):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'large.bin').write_bytes(b'exact source')
+    with pytest.raises(SnapshotError, match='canonical D|explicit boolean'):
+        publish_packed_snapshot(tmp_path / 'cold', 'candidate', source,
+                                d_primary_native_chunk_reuse=enabled)
+
+
+def test_native_existing_chunk_reuse_keeps_small_tail_in_the_original_reader(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io as native
+    source, cold = tmp_path / 'source', tmp_path / 'cold'
+    source.mkdir()
+    (source / 'large.bin').write_bytes(b'a' * 16 + b'b' * 16)
+    publish(cold, source, dataset='seed')
+    monkeypatch.setattr(packed, '_check_native_pack_read_authority', lambda root: None)
+    monkeypatch.setattr(native, 'hash_many', lambda *_: pytest.fail('native startup for a small tail'))
+    candidate = publish_packed_snapshot(cold, 'candidate', source, node_id='test',
+        loose_file_threshold_bytes=16, file_chunk_bytes=16, d_primary_native_chunk_reuse=True)
+    assert verify_packed_snapshot(cold, candidate, reconstruct_all=True)['independently_reconstructed_bytes'] == 32
+
+
+def test_native_chunk_pipeline_batches_across_files_and_restores_exact_versions(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io as native
+    source, cold = tmp_path / 'source', tmp_path / 'cold'
+    source.mkdir()
+    for index in range(20):
+        (source / f'{index:02}.bin').write_bytes(bytes([index * 2]) * 16 + bytes([index * 2 + 1]) * 16)
+    # Repeated extents across different originals need one full cold proof,
+    # but remain repeated in their own original SHA/length and inventory.
+    (source / 'repeated.bin').write_bytes((source / '00.bin').read_bytes())
+    publish(cold, source, dataset='seed')
+    calls = []
+    def hashing(paths):
+        calls.append(list(paths))
+        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    monkeypatch.setattr(native, 'hash_many', hashing)
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_REUSE_BYTES', 0)
+    monkeypatch.setattr(packed, '_check_native_pack_read_authority', lambda root: None)
+    options = dict(node_id='test', loose_file_threshold_bytes=16, file_chunk_bytes=16, pack_buckets=2,
+        d_primary_native_chunk_reuse=True, d_primary_native_chunk_reuse_pipeline=True)
+    first = publish_packed_snapshot(cold, 'candidate', source, **options)
+    assert [len(batch) for batch in calls] == [16, 16, 8]
+    assert len({path for batch in calls for path in batch}) == 40
+    reference = publish(cold, source, dataset='reference')
+    assert first.manifest['archive']['inventory']['sha256'] == reference.manifest['archive']['inventory']['sha256']
+    old_bytes = (source / '00.bin').read_bytes()
+    (source / '00.bin').write_bytes(b'x' * 16 + b'y' * 16)
+    (source / '01.bin').unlink()
+    second = publish_packed_snapshot(cold, 'candidate', source, **options)
+    for number, release in enumerate((first, second)):
+        proof = verify_packed_snapshot(cold, release, reconstruct_all=True)
+        assert proof['independently_reconstructed_files'] == 21 - number
+        restored = fetch_packed_snapshot(cold, tmp_path / f'restored-{number}', release)
+        assert (restored / '00.bin').read_bytes() == (old_bytes if not number else b'x' * 16 + b'y' * 16)
+        assert (restored / '01.bin').exists() is (not number)
+
+
+def test_native_chunk_pipeline_overlaps_source_work_but_never_admits_early(tmp_path, monkeypatch):
+    from threading import Event
+    from stockagent.data_sync import windows_cold_io as native
+    entered, release = Event(), Event()
+    def hashing(paths):
+        entered.set()
+        assert release.wait(5), 'bounded test reader was not released'
+        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    monkeypatch.setattr(native, 'hash_many', hashing)
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_REUSE_BYTES', 0)
+    created = {}
+    with packed._PipelinedChunkReuse(created) as pipeline:
+        try:
+            for index in range(17):
+                path = tmp_path / str(index)
+                path.write_bytes(str(index).encode())
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                pipeline.add(digest, path, path.lstat(), {'sha256': digest})
+            assert entered.wait(5)
+            assert created == {}
+            assert len(pipeline.inflight[0]) == 16 and len(pipeline.pending) == 1
+        finally:
+            release.set()
+    assert len(created) == 17 and pipeline.inflight is None and pipeline.pending == {}
+
+
+def test_native_chunk_pipeline_drains_on_source_failure_without_admitting_pending_proofs(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io as native
+    monkeypatch.setattr(packed, 'MIN_NATIVE_CHUNK_REUSE_BYTES', 0)
+    monkeypatch.setattr(native, 'hash_many', lambda paths: {
+        path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths})
+    created = {}
+    with pytest.raises(SnapshotError, match='source rejected'):
+        with packed._PipelinedChunkReuse(created) as pipeline:
+            for index in range(16):
+                path = tmp_path / str(index)
+                path.write_bytes(str(index).encode())
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                pipeline.add(digest, path, path.lstat(), {'sha256': digest})
+            raise SnapshotError('source rejected')
+    assert created == {}
+    assert all(not thread.is_alive() for thread in pipeline.executor._threads)
+
+
+@pytest.mark.parametrize('enabled,native_reuse', [(1, True), ('true', True), (True, False)])
+def test_native_chunk_pipeline_requires_explicit_reuse_policy(tmp_path, enabled, native_reuse):
+    source = tmp_path / 'source'
+    source.mkdir()
+    with pytest.raises(SnapshotError, match='explicit boolean|requires explicit native chunk reuse'):
+        publish_packed_snapshot(tmp_path / 'cold', 'candidate', source,
+            d_primary_native_chunk_reuse=native_reuse, d_primary_native_chunk_reuse_pipeline=enabled)
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_native_private_chunk_reads_reuse_exact_local_only_authority_guard(monkeypatch, changed):
+    from pathlib import Path
+    from stockagent.data_sync import dataset_migration as migration
+    primary = Path('/srv/stockagent-packed')
+    private = primary / '.local-state/private-history'
+    seen = []
+    def admitted(root, policy, *, initialize):
+        seen.append((root, policy, initialize))
+        return primary / 'foreign' if changed else private
+    monkeypatch.setattr(migration, 'private_history_root', admitted)
+    if changed:
+        with pytest.raises(SnapshotError, match='private pack read authority'):
+            packed._check_native_pack_read_authority(private)
+    else:
+        packed._check_native_pack_read_authority(private)
+    assert seen == [(primary, {'private_history': {'enabled': True,
+        'relative_root': '.local-state/private-history', 'shared_export': False,
+        'nas_export': False, 'source_retirement': False}}, False)]
 
 
 def test_changed_large_file_only_installs_new_extents_and_each_version_restores(tmp_path):

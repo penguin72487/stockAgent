@@ -21,9 +21,10 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from urllib.parse import urlsplit
 from unittest.mock import patch
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -276,8 +277,14 @@ def profile_inventory(root, repeats, reference=None):
                 self.observation = path.stat()
             except OSError:
                 self.observation = None
+            self.name = path.name
+            self.identity = (current._source_file_identity(path, self.observation)
+                             if self.observation is not None else None)
 
         def __str__(self):
+            return self.path
+
+        def __fspath__(self):
             return self.path
 
         def stat(self):
@@ -286,6 +293,7 @@ def profile_inventory(root, repeats, reference=None):
             return self.observation
 
     frozen = {key: [ObservedPath(path) for path in paths] for key, paths in selected.items()}
+    identities = {str(path): path.identity for paths in frozen.values() for path in paths}
     observed_at = time.perf_counter()
     modules = {"current": current}
     if reference is not None:
@@ -301,7 +309,12 @@ def profile_inventory(root, repeats, reference=None):
     for repeat in range(repeats):
         for name in (list(modules) if repeat % 2 == 0 else list(reversed(modules))):
             module = modules[name]
-            with patch.object(module, "_read_json", return_value=payload), patch.object(module, "_selected_files", return_value=frozen):
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(module, "_read_json", return_value=payload))
+                stack.enter_context(patch.object(module, "_selected_files", return_value=frozen))
+                if hasattr(module, "_source_file_identity"):
+                    stack.enter_context(patch.object(module, "_source_file_identity",
+                        side_effect=lambda path, metadata: identities[str(path)]))
                 start = time.perf_counter()
                 result = module.build_feature_inventory(root)
                 samples[name].append((time.perf_counter() - start) * 1000)
@@ -313,6 +326,7 @@ def profile_inventory(root, repeats, reference=None):
             "inputs": {"decode_ms": (decoded_at-started)*1000,
                        "discovery_ms": (discovered_at-decoded_at)*1000,
                        "stat_ms": (observed_at-discovered_at)*1000,
+                       "stat_includes_partition_proof": True,
                        "files": sum(map(len, frozen.values())),
                        "payload_sha256": hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()},
             "implementations": {name: {"timing": summarize(samples[name]), "samples_ms": samples[name],
@@ -462,7 +476,8 @@ def measure_http(base_url, paths, *, repeats, concurrency, timeout):
 
 
 def profile_history(
-    state_dir, repeats, *, source_rebuild=False, full_source_rebuild=False
+    state_dir, repeats, *, source_rebuild=False, full_source_rebuild=False,
+    source_reference=None, wire=False,
 ):
     """Profile the canonical builder in this fresh CLI process, not the service.
 
@@ -476,6 +491,22 @@ def profile_history(
         OVERNIGHT_HISTORY_FILENAME,
         build_dashboard_history_snapshot,
     )
+    from stockagent.live import tw_day_trade_dashboard
+    import resource
+
+    source_path = Path(tw_day_trade_dashboard.__file__)
+    source = source_path.read_bytes()
+    if source_reference is not None:
+        source = Path(source_reference).read_bytes()
+        module = types.ModuleType("_dashboard_history_benchmark_reference")
+        module.__file__ = str(source_path)
+        sys.modules[module.__name__] = module
+        exec(compile(source, str(source_path), "exec"), module.__dict__)
+        build_dashboard_history_snapshot = module.build_dashboard_history_snapshot
+    if wire:
+        import gzip
+        from stockagent.live.public_dashboards import sanitize_tw_history
+        from scripts.serve_public_dashboards import _prepared
 
     root = state_dir.resolve(strict=True)
     index_cache_dir = os.environ.get("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", "").strip()
@@ -489,6 +520,7 @@ def profile_history(
         "benchmark_history.json",
         "benchmark_marks.jsonl",
         OVERNIGHT_HISTORY_FILENAME,
+        "state.json",
     }
 
     def inventory():
@@ -501,16 +533,12 @@ def profile_history(
                 result[name] = metadata_signature(path.stat())
             except FileNotFoundError:
                 continue
-        try:
-            state = json.loads((root / "state.json").read_text(encoding="utf-8"))
-            result["state.product"] = str(state.get("product") or "tw_day_trade")
-        except (OSError, ValueError, AttributeError):
-            result["state.product"] = "invalid"
         return result
     before = inventory()
     samples = []
     for _ in range(repeats):
         started = time.perf_counter()
+        cpu_started = time.process_time()
         build_options = dict(
             state_dir=root,
             range_key="all",
@@ -524,9 +552,30 @@ def profile_history(
         payload = build_dashboard_history_snapshot(**build_options)
         elapsed = (time.perf_counter() - started) * 1000
         body = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-        samples.append({"build_ms": elapsed, "sha256": hashlib.sha256(body).hexdigest(),
-                        "decoded_bytes": len(body), "point_count": payload.get("returned_points"),
-                        "series_count": len(payload.get("minute_series", []))})
+        sample = {"build_ms": elapsed, "sha256": hashlib.sha256(body).hexdigest(),
+                  "decoded_bytes": len(body), "point_count": payload.get("returned_points"),
+                  "series_count": len(payload.get("minute_series", []))}
+        if wire:
+            projected = sanitize_tw_history(payload, private_prices=True)
+            encoded = (json.dumps(projected, ensure_ascii=False, separators=(",", ":"),
+                                  allow_nan=False) + "\n").encode()
+            response = _prepared(encoded, content_type="application/json; charset=utf-8",
+                                 cache_control="no-cache")
+            represented_at = time.perf_counter()
+            decoded = gzip.decompress(response.gzip_body)
+            if decoded != response.body or json.loads(decoded) != projected:
+                raise ValueError("complete HTTP representation readback differs")
+            sample.update(
+                representations_ms=(represented_at - started) * 1000 - elapsed,
+                independent_readback_ms=(time.perf_counter() - represented_at) * 1000,
+                http_sha256=hashlib.sha256(response.body).hexdigest(),
+                gzip_sha256=hashlib.sha256(response.gzip_body).hexdigest(),
+                http_bytes=len(response.body), gzip_bytes=len(response.gzip_body),
+            )
+        sample.update(workflow_ms=(time.perf_counter() - started) * 1000,
+                      cpu_seconds=time.process_time() - cpu_started,
+                      peak_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024)
+        samples.append(sample)
     signature_samples = []
     for name in sorted(source_names & before.keys()):
         path = root / name
@@ -565,6 +614,11 @@ def profile_history(
             "session_projection_enabled": session_projection_enabled,
             "index_cache_dir": index_cache_dir or None,
             "state_dir": str(root), "source_stable": stable, "samples": samples,
+            "source_sha256": hashlib.sha256(source).hexdigest(),
+            "source_reference": str(source_reference) if source_reference is not None else None,
+            "wire_and_independent_readback": bool(wire),
+            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "inputs": before,
             "outputs_identical": len({s["sha256"] for s in samples}) == 1,
             "signature": signature_samples}
 
@@ -626,6 +680,9 @@ def main():
     parser.add_argument("--path", action="append", help="Repeat to select routes; default covers all 39 finite dashboard routes")
     parser.add_argument("--skip-notification", action="store_true")
     parser.add_argument("--profile-history", type=Path, help="Optional canonical state directory; profile all-minute history locally, no service restart")
+    parser.add_argument("--profile-history-reference", type=Path, help="Frozen dashboard module; retains its canonical repository path for imports")
+    parser.add_argument("--profile-history-wire", action="store_true", help="Include canonical public JSON/gzip and independent complete readback")
+    parser.add_argument("--local-only", action="store_true", help="Run selected local profiles without HTTP requests or notification fixtures")
     parser.add_argument(
         "--profile-history-source-rebuild",
         action="store_true",
@@ -649,6 +706,12 @@ def main():
     parser.add_argument("--profile-shioaji-monitor", action="store_true", help="Compare sequential/parallel local monitor I/O (no broker API calls)")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.output and args.output.exists():
+        parser.error("output receipt must be new")
+    if (args.profile_history_reference or args.profile_history_wire) and not args.profile_history:
+        parser.error("history reference/wire requires --profile-history")
+    if args.local_only and not (args.profile_history or args.profile_inventory or args.profile_shioaji_monitor):
+        parser.error("--local-only requires a local profile")
     if args.profile_inventory_reference and not args.profile_inventory:
         parser.error("--profile-inventory-reference requires --profile-inventory")
     if args.profile_history_source_rebuild and not args.profile_history:
@@ -678,7 +741,7 @@ def main():
                           "requests_per_second includes worker connection setup; it is achieved client throughput, not server capacity",
                           "p95/p99 are nearest-rank estimates; small samples are not SLA evidence",
                           "SSE benchmark uses isolated synthetic receipts, not trading or broker latency"],
-              "notification": None if args.skip_notification else capture_measurement(lambda: isolated_notification(args.repeats))}
+              "notification": None if args.skip_notification or args.local_only else capture_measurement(lambda: isolated_notification(args.repeats))}
     if args.profile_history:
         result["local_history"] = capture_measurement(
             lambda: profile_history(
@@ -686,6 +749,8 @@ def main():
                 min(args.repeats, 3),
                 source_rebuild=args.profile_history_source_rebuild,
                 full_source_rebuild=args.profile_history_full_source_rebuild,
+                source_reference=args.profile_history_reference,
+                wire=args.profile_history_wire,
             )
         )
     if args.profile_inventory:
@@ -698,8 +763,9 @@ def main():
         )
     if args.profile_services:
         result["services_before"] = capture_measurement(service_snapshot)
-    result["http"] = measure_http(args.base_url, paths, repeats=args.repeats,
-                                  concurrency=args.concurrency, timeout=args.timeout)
+    result["http"] = [] if args.local_only else measure_http(
+        args.base_url, paths, repeats=args.repeats,
+        concurrency=args.concurrency, timeout=args.timeout)
     if args.profile_services:
         result["services_after"] = capture_measurement(service_snapshot)
         result["services"] = service_deltas(result["services_before"], result["services_after"])

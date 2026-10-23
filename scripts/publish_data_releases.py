@@ -5,6 +5,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, date, datetime, timedelta
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -37,10 +38,23 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
 DEFAULT_CATALOG = REPO_ROOT / "configs" / "data_sync" / "packed_datasets.json"
 DEFAULT_RETENTION_CONFIG = REPO_ROOT / "configs" / "data_sync" / "packed_retention.json"
 SOURCE_LOCK_WAIT_SECONDS = 180.0
+CATALOG_PUBLICATION_CONTRACT = "catalog_entry_publication_v1"
+
+
+def catalog_publication_identity(entry: Mapping[str, Any]) -> str:
+    """Bind the exact enrolled scope/rights/gates, not a moving source clock."""
+    return hashlib.sha256(json.dumps(
+        {"contract": CATALOG_PUBLICATION_CONTRACT, "entry": dict(entry)},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode()).hexdigest()
 
 
 class SourceCoordinationLockTimeout(SnapshotError):
     """The bounded wait expired while another source owner held the lock."""
+
+
+class SourceFreshnessExpired(SnapshotError):
+    """A valid source proof reached its retry clock; never admit a stale head."""
 
 
 def _native_source_lock_entries(entry: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -207,6 +221,13 @@ def _source_coordination_lock(
     it must neither unlock nor close that descriptor on context exit.
     """
     configured = entry.get("source_coordination_lock")
+    mode = entry.get("source_coordination_lock_mode", "exclusive")
+    if mode not in {"exclusive", "shared_read"}:
+        raise SnapshotError("invalid source coordination lock mode")
+    if mode == "shared_read" and (entry.get("dataset") != "tw-public"
+            or entry.get("completed_forward_key") is not None or not configured):
+        raise SnapshotError("shared source read lease is enrolled only for TW public publication")
+    operation = fcntl.LOCK_SH if mode == "shared_read" else fcntl.LOCK_EX
     if not configured:
         if inherited_fd is not None:
             raise SnapshotError("inherited source lock requires a catalogued lock")
@@ -254,9 +275,20 @@ def _source_coordination_lock(
                 raise SnapshotError("inherited source lock must be a regular file")
             if (held.st_dev, held.st_ino) != (expected.st_dev, expected.st_ino):
                 raise SnapshotError("inherited source lock does not match the catalog lock")
-            # A distinct open file description held by another process must
-            # fail immediately; the owner's inherited description is reentrant.
-            fcntl.flock(inherited_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if mode == "shared_read":
+                # Never convert the parent's lock: an EX owner must retain
+                # EX, while reasserting EX on a shared lease would exclude
+                # model readers (and a failed conversion can lose the lease).
+                # Linux fdinfo proves THIS open description owns the flock;
+                # another reader of the same inode is not sufficient proof.
+                info = Path(f"/proc/self/fdinfo/{inherited_fd}").read_text()
+                if not any(line.startswith("lock:") and "FLOCK" in line.split()
+                           and {"READ", "WRITE"}.intersection(line.split())
+                           for line in info.splitlines()):
+                    raise SnapshotError("inherited shared source descriptor has no held flock")
+            else:
+                # The original exclusive-owner contract remains unchanged.
+                fcntl.flock(inherited_fd, operation | fcntl.LOCK_NB)
             current = path.stat()
             if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
                 raise SnapshotError("catalog source lock changed while borrowing it")
@@ -289,7 +321,7 @@ def _source_coordination_lock(
             raise SnapshotError("source coordination lock must be an owned single-link regular file")
         while True:
             try:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, operation | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -477,9 +509,10 @@ def _source_freshness(entry: Mapping[str, Any]) -> dict[str, Any] | None:
             valid_until = datetime.fromisoformat(str(payload["catalog_valid_until_utc"]).replace("Z", "+00:00"))
         except (KeyError, TypeError, ValueError) as exc:
             raise SnapshotError("FinLab release lacks its canonical source-expiry proof") from exc
-        if (payload.get("catalog_scope_contract") != FINLAB_GATE_CONTRACT
-                or valid_until.tzinfo is None or datetime.now(UTC) >= valid_until.astimezone(UTC)):
+        if payload.get("catalog_scope_contract") != FINLAB_GATE_CONTRACT or valid_until.tzinfo is None:
             raise SnapshotError("FinLab general-history release proof has expired or changed scope")
+        if datetime.now(UTC) >= valid_until.astimezone(UTC):
+            raise SourceFreshnessExpired("FinLab general-history release proof has expired or changed scope")
     return {
         "field": field,
         "format": "iso-date",
@@ -525,11 +558,13 @@ def _status(
     admitted = {(row["pid"], row["pattern"]) for row in waiters}
     blockers = [row for row in blockers if (row["pid"], row["pattern"]) not in admitted]
     freshness_error: str | None = None
+    freshness_retryable = False
     try:
         source_freshness = _source_freshness(entry)
     except SnapshotError as exc:
         source_freshness = None
         freshness_error = str(exc)
+        freshness_retryable = isinstance(exc, SourceFreshnessExpired)
     cold_freshness = _latest_cold_freshness(
         sync_root, str(entry["dataset"])
     )
@@ -572,6 +607,7 @@ def _status(
         "latest_cold_freshness": cold_freshness,
         "freshness_non_regression": non_regression,
         "freshness_error": freshness_error,
+        **({"freshness_retryable": True} if freshness_retryable else {}),
         "note": entry["note"],
         **({"publication_family": entry["publication_family"],
             "requires_explicit_completed_forward_key": requires_key}
@@ -672,6 +708,15 @@ def _publish_entry(
                     freshness_guard()
                 if forward_proof is not None:
                     forward_proof.guard()
+        version_options = _version_options(entry, args)
+        if (sync_root == Path('/srv/stockagent-packed')
+                and entry['dataset'] == 'tw-public-research-finlab-2014-v4'
+                and version_options.get('file_chunk_bytes')):
+            # Same fully guarded D authority and publisher, not a TTL bypass.
+            # Existing research chunks otherwise pay a second full DrvFS read
+            # inside their short original source-check admission window.
+            version_options.update(d_primary_native_chunk_reuse=True,
+                                   d_primary_native_chunk_reuse_pipeline=True)
         resolved = publish_packed_snapshot(
             sync_root,
             str(entry["dataset"]),
@@ -679,7 +724,7 @@ def _publish_entry(
             node_id=args.node_id,
             loose_file_threshold_bytes=_loose_threshold_bytes(entry),
             pack_buckets=int(entry["pack_buckets"]),
-            **_version_options(entry, args),
+            **version_options,
             excluded_subtrees=[
                 str(value) for value in entry.get("excluded_subtrees", [])
             ],
@@ -688,6 +733,8 @@ def _publish_entry(
             metadata={
                 "role": str(entry["role"]),
                 "catalog_schema": "1",
+                "catalog_publication_contract": CATALOG_PUBLICATION_CONTRACT,
+                "catalog_entry_sha256": catalog_publication_identity(entry),
                 **parquet_proof.metadata,
                 **(forward_proof.metadata if forward_proof is not None else {}),
                 **({'source_validation_contract': str(validation['contract']),
@@ -994,6 +1041,8 @@ def main(argv: list[str] | None = None) -> int:
                     skipped.append(status)
                     checkpoint_batch("running")
                     continue
+                if status.get('freshness_retryable'):
+                    raise SourceFreshnessExpired(status['freshness_error'])
                 raise SnapshotError(
                     f"dataset {entry['dataset']} is not publish-ready: "
                     f"publish={entry['publish']} source_exists={status['source_exists']} "
@@ -1050,6 +1099,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    except SourceFreshnessExpired as exc:
+        print(json.dumps({'event': 'source_publication_deferred', 'reason': 'source_freshness_expired',
+                          'retryable': True, 'error': str(exc),
+                          'committed_head_outcome': 'unknown_check_current_head'}), flush=True)
+        return 75
     except (OSError, SnapshotError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

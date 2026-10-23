@@ -170,7 +170,7 @@ finlab_refresh_research() {
         finlab_research_exit=$?
         if [[ "$finlab_research_exit" == "75" ]]; then
           echo "$finlab_stage_result"
-          echo "[finlab] public source writer busy at staging; no publication, minute queue continues"
+          echo "[finlab] publication dependency not current at staging; no publication, minute queue continues"
           return 0
         fi
         return "$finlab_research_exit"
@@ -201,7 +201,16 @@ finlab_refresh_research() {
           finlab_publish_options+=(--defer-scan)
           finlab_defer_scan=1
         fi
-        stockagent-data publish tw-public-research-finlab-2014-v4 "${finlab_publish_options[@]}"
+        if stockagent-data publish tw-public-research-finlab-2014-v4 "${finlab_publish_options[@]}"; then
+          :
+        else
+          finlab_publication_exit=$?
+          if [[ "$finlab_publication_exit" == "75" ]]; then
+            echo "[finlab] publication source check expired; keep original evidence/head, independent minute queue continues"
+            return 0
+          fi
+          return "$finlab_publication_exit"
+        fi
         if (( finlab_defer_scan )); then
           if ! systemctl start --no-block stockagent-d-cold-scan-retry.service; then
             echo "[finlab] cold release committed; scan intent retained for the existing retry timer" >&2

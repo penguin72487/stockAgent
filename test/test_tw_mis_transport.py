@@ -109,6 +109,52 @@ def test_reported_source_error_never_becomes_a_price_or_no_first_trade(monkeypat
     assert snapshot.transport_timing["mis_failure_types"] == ["ValueError"]
 
 
+@pytest.mark.parametrize("failed", [False, True])
+def test_request_timeline_uses_one_clock_and_keeps_failure_boundary(monkeypatch, tmp_path, failed):
+    def get(params, _timeout):
+        if failed:
+            raise requests.ReadTimeout("private endpoint must not be recorded")
+        return response([row(params["ex_ch"].split("_")[1].split(".")[0])])
+
+    install_session(monkeypatch, get)
+    result = quotes.fetch_tw_mis_last_prices(["2330", "2317"], np.ones(2),
+        parquet_root=tmp_path, chunk_size=1, max_parallel_requests=1,
+        empty_chunk_retry_attempts=0, on_progress=lambda *_: None)
+    timeline = sorted(result.transport_timing["mis_requests"], key=lambda item: item["request_index"])
+    assert [item["request_index"] for item in timeline] == [0, 1]
+    for item in timeline:
+        assert 0 <= item["enqueued_offset_ms"] <= item["request_started_offset_ms"]
+        assert item["worker_queue_ms"] >= 0
+        if failed:
+            assert item["failed_offset_ms"] >= item["request_started_offset_ms"]
+            assert "headers_received_offset_ms" not in item
+            assert "body_received_offset_ms" not in item
+            assert "decoded_rows_ready_offset_ms" not in item
+        else:
+            assert (item["request_started_offset_ms"] <= item["headers_received_offset_ms"]
+                <= item["body_received_offset_ms"] <= item["decoded_rows_ready_offset_ms"])
+            assert "failed_offset_ms" not in item
+    assert "private endpoint" not in str(result.transport_timing)
+
+
+def test_source_timing_includes_venue_preparation(monkeypatch, tmp_path):
+    clock, offset = quotes.time.perf_counter, [0.]
+
+    def prepare(_root):
+        offset[0] += .2
+        return {"2330": "2330.TW"}
+
+    monkeypatch.setattr(quotes.time, "perf_counter", lambda: clock() + offset[0])
+    monkeypatch.setattr(quotes, "load_symbol_yahoo_map", prepare)
+    install_session(monkeypatch, lambda *_: response([row("2330")]))
+    result = quotes.fetch_tw_mis_last_prices(["2330"], np.ones(1),
+        parquet_root=tmp_path, empty_chunk_retry_attempts=0)
+    timing = result.transport_timing
+    assert timing["mis_timing_boundary"] == "source_entry_including_venue_map_and_arrays_v2"
+    assert timing["mis_total_ms"] >= timing["mis_source_prepare_ms"] >= 200
+    assert timing["mis_requests"][0]["enqueued_offset_ms"] >= timing["mis_source_prepare_ms"]
+
+
 def test_transport_timeout_resets_only_broken_session_and_retains_other_rows(monkeypatch, tmp_path):
     calls = []
     sessions, closed = [], []

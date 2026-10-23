@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import sys
+import time
 from urllib.parse import urlencode, urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,41 @@ def _verify_signal_boundary(payload, *, market, day, private_features=False):
             "research_notice_required": research_notice_required}
 
 
+def _prepare_output_dir(path: Path) -> Path:
+    """Reserve a fresh run directory without overwriting previous evidence."""
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as exc:
+        raise FileExistsError(f"browser evidence directory already exists; choose a new path: {path}") from exc
+    return path / "receipt.json"
+
+
+def _failed_viewport_evidence(page, output_dir: Path, name: str):
+    """Read the failed UI before closing it; diagnostics never mask its error."""
+    proof = {"diagnostic_errors": [], "screenshots": []}
+    try:
+        proof["rendered_state"] = page.evaluate("""() => ({
+            mode: document.querySelector('#mode-filter')?.value,
+            start_date: document.querySelector('#detail-start-date')?.value,
+            end_date: document.querySelector('#detail-end-date')?.value,
+            signal_rows: document.querySelectorAll('#signal-body tr[data-signal-key]').length,
+            signal_count: document.querySelector('#signal-count')?.innerText,
+            signal_table: document.querySelector('#signal-body')?.innerText.slice(0, 2000),
+            position_table: document.querySelector('#position-body')?.innerText.slice(0, 2000),
+            alert: document.querySelector('#alert')?.innerText,
+            health: document.querySelector('#health')?.innerText
+        })""")
+    except Exception as exc:
+        proof["diagnostic_errors"].append(f"rendered_state: {exc}")
+    try:
+        screenshot = output_dir / f"{name}_failed.png"
+        page.screenshot(path=str(screenshot), timeout=10_000)
+        proof["screenshots"].append(str(screenshot))
+    except Exception as exc:
+        proof["diagnostic_errors"].append(f"screenshot: {exc}")
+    return proof
+
+
 def main():
     from playwright.sync_api import sync_playwright
 
@@ -72,15 +108,15 @@ def main():
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--expect-private-features", action="store_true")
     parser.add_argument("--browser-profile", choices=("default", "cpu-2d"), default="default")
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True,
+                        help="Fresh evidence directory; an existing path is never overwritten.")
     args = parser.parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output = _prepare_output_dir(args.output_dir)
     receipt = {"schema_version": 1, "observed_at_utc": datetime.now(UTC).isoformat(),
                "url": args.url, "market": args.market, "status": "running",
                "browser_profile": args.browser_profile,
                "gpu_webgl_verified": False,
                "broker_execution_verified": False, "viewports": []}
-    output = args.output_dir / "receipt.json"
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(**browser_profile_launch_options(args.browser_profile))
@@ -92,9 +128,20 @@ def main():
                 ):
                     context = browser.new_context(viewport={"width": width, "height": height},
                                                   device_scale_factor=ratio)
+                    viewport_started = time.perf_counter()
+                    stage = "create_page"
+                    page = None
+                    network_events = []
+                    errors, aborted, blocked_beacons = [], [], []
+                    def trace(kind, url, **fields):
+                        if len(network_events) < 256 and "/api/" in urlsplit(url).path:
+                            network_events.append({"kind": kind, "url": url,
+                                "elapsed_seconds": time.perf_counter() - viewport_started, **fields})
                     try:
                         page = context.new_page()
-                        errors, aborted, blocked_beacons = [], [], []
+                        page.on("request", lambda req: trace("request", req.url))
+                        page.on("response", lambda res: trace("response", res.url, status=res.status))
+                        page.on("requestfailed", lambda req: trace("request_failed", req.url, error=req.failure))
                         page.on("pageerror", lambda exc: errors.append(str(exc)))
                         page.on("console", lambda msg: (
                             blocked_beacons if _expected_beacon_csp_denial(msg.text) else errors
@@ -105,6 +152,7 @@ def main():
                         ).append(f"{req.url}: {req.failure}"))
                         page.on("response", lambda response: errors.append(f"HTTP {response.status}: {response.url}")
                                 if response.status >= 400 else None)
+                        stage = "public_status"
                         status_response = context.request.get(urljoin(args.url, "api/status"), timeout=60_000)
                         if not status_response.ok:
                             raise ValueError(f"public status HTTP {status_response.status}")
@@ -112,6 +160,7 @@ def main():
                         modes = {row["market"]: row for row in status.get("modes", [])}
                         if set(modes) != set(args.expected_market):
                             raise ValueError("public enabled-mode set differs")
+                        stage = "native_identity"
                         identity_response = context.request.get(args.identity_url, timeout=60_000)
                         if not identity_response.ok:
                             raise ValueError("trusted runtime identity endpoint unavailable")
@@ -126,6 +175,7 @@ def main():
                             raise ValueError("disclosed public checkpoint identity differs")
                         if not (status.get("simulation_only") is True and status.get("production_order_possible") is False):
                             raise ValueError("not an exclusively paper dashboard")
+                        stage = "first_last_signal_boundaries"
                         boundaries = []
                         for day in dict.fromkeys((args.start_date, args.end_date)):
                             response = context.request.get(
@@ -134,6 +184,7 @@ def main():
                                 raise ValueError(f"public signal boundary HTTP {response.status}")
                             boundaries.append(_verify_signal_boundary(response.json(), market=args.market,
                                 day=day, private_features=args.expect_private_features))
+                        stage = "navigation"
                         page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
                         page.locator(f'#mode-filter option[value="{args.market}"]').wait_for(state="attached", timeout=60_000)
                         if page.locator("#mode-cards article").count() != len(args.expected_market):
@@ -143,12 +194,14 @@ def main():
                         page.locator("#detail-start-date").press("Tab")
                         page.locator("#detail-end-date").fill(args.end_date)
                         page.locator("#detail-end-date").press("Tab")
+                        stage = "filtered_signal_rows"
                         page.locator("#signal-body tr[data-signal-key]").first.wait_for(timeout=60_000)
                         # Inspect rendered state, never synthesize a click or bypass actionability.
                         page.wait_for_function("""market => {
                             const rows = [...document.querySelectorAll('#signal-body tr[data-signal-key]')];
                             return rows.length > 0 && rows.every(r => r.dataset.signalKey.includes(market));
                         }""", arg=args.market, timeout=60_000)
+                        stage = "signal_feature_detail"
                         page.locator("#signal-body tr[data-signal-key]").first.click()
                         page.locator("#signal-feature-panel").wait_for(state="visible")
                         if args.expect_private_features:
@@ -157,6 +210,7 @@ def main():
                         if any(proof["research_notice_required"] for proof in boundaries):
                             page.wait_for_function("""() => document.querySelector('#signal-feature-empty')
                                 ?.textContent.includes('歷史資料未證明完整 point-in-time')""", timeout=60_000)
+                        stage = "chart_and_legend"
                         page.locator("#chart-legend button[data-series-id]").first.wait_for(timeout=60_000)
                         page.wait_for_function("""() => {
                             const host = document.querySelector('#equity-chart');
@@ -173,6 +227,7 @@ def main():
                         button.click()
                         if button.get_attribute("aria-pressed") != pressed:
                             raise ValueError("legend restore failed")
+                        stage = "layout_and_screenshots"
                         dimensions = page.evaluate("""() => ({width: innerWidth,
                             root: document.documentElement.scrollWidth, body: document.body.scrollWidth,
                             chart: document.querySelector('#equity-chart').getBoundingClientRect().toJSON()})""")
@@ -194,8 +249,23 @@ def main():
                             "public_first_last_signal_boundaries": boundaries,
                             "signal_count": page.locator("#signal-count").inner_text(),
                             "blocked_optional_third_party_beacons": blocked_beacons,
-                            "intentional_request_aborts": aborted, "screenshots": [str(chart_image), str(cards_image)]})
+                            "intentional_request_aborts": aborted, "screenshots": [str(chart_image), str(cards_image)],
+                            "elapsed_seconds": time.perf_counter() - viewport_started,
+                            "network_events": network_events})
                         _atomic_json(output, receipt)
+                    except Exception as exc:
+                        failure = {"name": name, "css_width": width, "height": height,
+                            "device_pixel_ratio": ratio, "status": "failed", "stage": stage,
+                            "error_type": type(exc).__name__, "error": str(exc),
+                            "elapsed_seconds": time.perf_counter() - viewport_started,
+                            "network_events": network_events, "browser_errors": errors,
+                            "intentional_request_aborts": aborted,
+                            "blocked_optional_third_party_beacons": blocked_beacons}
+                        if page is not None:
+                            failure.update(_failed_viewport_evidence(page, args.output_dir, name))
+                        receipt["viewports"].append(failure)
+                        _atomic_json(output, receipt)
+                        raise
                     finally:
                         context.close()
             finally:

@@ -1,0 +1,23 @@
+# Same v4 actor/account; extend receipt-backed stock/futures history to 2011.
+# Features, dated carry rules and both execution clocks must pass preparation.
+base_config: tw_stock_futures_carry_0845_openref_20261021_v4.yaml
+experiment_name: tw-stock-futures-carry-0845-history2011-20261021-v5
+data:
+  panel_start_date: '2011-01-03'
+  factorized_feature_manifest: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/features/factorized_manifest.json
+  tw_public_feature_path: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/features/execution_rules.parquet
+  panel_cache_root: artifacts/cache/tw_stock_futures_history2011_20261021_v5/base_panel
+trading:
+  tw_futures_portfolio_data_path: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/financial/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/financial/release/rules/rules.parquet
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_history2011_20261021_v5/clocks/0845/opening_reference.parquet
+training:
+  pretrained_initialization_root: null
+  warm_start_from_previous_fold: false
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_history2011_20261021_v5/clock__0845
+  resume: false
+walk_forward:
+  expected_first_year: 2011
+  split_start_year: 2011

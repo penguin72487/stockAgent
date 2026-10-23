@@ -20,17 +20,37 @@ SOURCE = 'finmind_futures_tick_contract_day_v1'
 SCHEMA_VERSION = 1
 BULK_SOURCE = 'finmind_whole_market_stock_prints_v1'
 BULK_PRICE_POLICY = 'unique_dated_legal_quote_with_identical_float32_encoding_raw_retained_v1'
+BULK_INVENTORY = 'finmind_whole_market_tick_inventory_v1'
 
 
 def pin_bulk_tick_inventory(root: Path, dates: list[date]) -> list[dict]:
-    """Pin the collector's active daily objects, never glob historical versions."""
+    """Pin active collector objects or their exact, portable raw-source inventory.
+
+    The portable inventory carries original receipts, never a fabricated copy
+    of the collector's mutable queue. Full object readback remains in the
+    shared reader on the consuming node.
+    """
     import sqlite3
     root = Path(root).resolve()
     wanted = {str(d) for d in dates}
-    with sqlite3.connect((root / 'queue.sqlite3').as_uri() + '?mode=ro', uri=True) as db:
-        tasks = {d: (state, path) for d, state, path in db.execute(
-            "SELECT partition,state,receipt_path FROM tasks "
-            "WHERE dataset='TaiwanFuturesTick' AND data_id='' ORDER BY partition") if d in wanted}
+    inventory = None
+    if root.is_file():
+        inventory_path = root
+        inventory_sha = sha256_file(inventory_path)
+        document = json.loads(inventory_path.read_text())
+        if document.get('contract') != BULK_INVENTORY or document.get('dataset') != 'TaiwanFuturesTick':
+            raise ValueError('invalid portable bulk tick inventory')
+        objects = document['objects']
+        inventory = {item['date']: item for item in objects}
+        if len(inventory) != len(objects):
+            raise ValueError('duplicate portable bulk tick date')
+        root = inventory_path.parent
+        tasks = {day: ('complete', item['receipt_path']) for day, item in inventory.items() if day in wanted}
+    else:
+        with sqlite3.connect((root / 'queue.sqlite3').as_uri() + '?mode=ro', uri=True) as db:
+            tasks = {d: (state, path) for d, state, path in db.execute(
+                "SELECT partition,state,receipt_path FROM tasks "
+                "WHERE dataset='TaiwanFuturesTick' AND data_id='' ORDER BY partition") if d in wanted}
     if set(tasks) != wanted or any(state != 'complete' for state, _ in tasks.values()):
         raise ValueError('global tick inventory lacks a complete selected date')
     sources = []
@@ -47,12 +67,24 @@ def pin_bulk_tick_inventory(root: Path, dates: list[date]) -> list[dict]:
         path = (root / receipt['parquet_path']).resolve()
         if not path.is_relative_to(root):
             raise ValueError('unsafe bulk tick member path')
-        sources.append(dict(date=day, path=str(path), sha256=receipt['sha256'],
+        item = dict(date=day, path=str(path), sha256=receipt['sha256'],
             receipt_path=str(receipt_path), receipt_sha256=hashlib.sha256(payload).hexdigest(),
             rows=receipt['rows'], bytes=receipt['parquet_size_bytes'],
             fetched_at_utc=receipt.get('fetched_at_utc'),
             historical_point_in_time=receipt.get('historical_point_in_time'),
-            source_order=receipt.get('request', {}).get('source_order')))
+            source_order=receipt.get('request', {}).get('source_order'))
+        if inventory is not None:
+            expected = inventory[day]
+            for key in ('date', 'sha256', 'receipt_sha256', 'rows', 'bytes',
+                        'fetched_at_utc', 'historical_point_in_time', 'source_order'):
+                if item[key] != expected[key]:
+                    raise ValueError('portable bulk tick receipt differs from pinned inventory')
+            if path != (root / expected['path']).resolve():
+                raise ValueError('portable bulk tick original path differs')
+            item.update(inventory_path=str(inventory_path), inventory_sha256=inventory_sha)
+        sources.append(item)
+    if inventory is not None and sha256_file(inventory_path) != inventory_sha:
+        raise ValueError('portable bulk tick inventory changed during pinning')
     return sources
 
 

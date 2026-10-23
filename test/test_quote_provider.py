@@ -6,6 +6,7 @@ from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 import json
+import os
 import sys
 from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlparse
@@ -48,9 +49,79 @@ def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:
     }
 
 
+def test_symbol_yahoo_map_reuses_parse_but_returns_detached_mapping(tmp_path, monkeypatch):
+    import csv
+
+    path = tmp_path / "symbols.csv"
+    path.write_text("code,market\n2330,twse\n", encoding="utf-8")
+    reader, calls = csv.DictReader, []
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return reader(*args, **kwargs)
+
+    monkeypatch.setattr(csv, "DictReader", counted)
+    first = load_symbol_yahoo_map(tmp_path)
+    first["2330"] = "not-the-source"
+    assert load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TW"}
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("replace_file", [False, True])
+def test_symbol_yahoo_map_invalidates_same_size_and_mtime_update(tmp_path, replace_file):
+    path = tmp_path / "symbols.csv"
+    path.write_text("code,market\n2330,twse\n", encoding="utf-8")
+    original = path.stat()
+    assert load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TW"}
+    updated = tmp_path / "replacement.csv" if replace_file else path
+    updated.write_text("code,market\n2330,tpex\n", encoding="utf-8")
+    os.utime(updated, ns=(original.st_atime_ns, original.st_mtime_ns))
+    if replace_file:
+        os.replace(updated, path)
+    assert path.stat().st_size == original.st_size
+    assert path.stat().st_mtime_ns == original.st_mtime_ns
+    assert load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TWO"}
+
+
+def test_symbol_yahoo_map_does_not_cache_missing_or_invalid_file(tmp_path):
+    path = tmp_path / "symbols.csv"
+    assert load_symbol_yahoo_map(tmp_path) == {}
+    path.write_bytes(b"\xff")
+    assert load_symbol_yahoo_map(tmp_path) == {}
+    path.write_text("code,yahoo_symbol,market\n2330,explicit.TW,tpex\n", encoding="utf-8")
+    assert load_symbol_yahoo_map(tmp_path) == {"2330": "explicit.TW"}
+    path.unlink()
+    assert load_symbol_yahoo_map(tmp_path) == {}
+
+
+def test_symbol_yahoo_map_rejects_file_changed_during_parse(tmp_path, monkeypatch):
+    import csv
+
+    path = tmp_path / "symbols.csv"
+    path.write_text("code,market\n2330,twse\n", encoding="utf-8")
+    reader = csv.DictReader
+
+    def changing(*args, **kwargs):
+        for record in reader(*args, **kwargs):
+            path.write_text("code,market\n2330,tpex\n", encoding="utf-8")
+            yield record
+
+    with monkeypatch.context() as change:
+        change.setattr(csv, "DictReader", changing)
+        assert load_symbol_yahoo_map(tmp_path) == {}
+    assert load_symbol_yahoo_map(tmp_path) == {"2330": "2330.TWO"}
+
+
+@pytest.mark.parametrize("response_format,legacy_server", [("json_v1", False), ("msgpack_v1", False), ("msgpack_v1", True)])
 def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, response_format, legacy_server
 ) -> None:
+    if response_format == "msgpack_v1":
+        pytest.importorskip("msgspec")
+    monkeypatch.setattr(quote_provider, "_quote_ipc_response_format", lambda: response_format)
+    if legacy_server:
+        monkeypatch.setattr(quote_provider, "_atomic_write_quote_response", lambda path, payload, _format:
+            quote_provider._atomic_write_json(path, payload))
     expected = PriceSnapshot(
         prices=np.array([101.0, 202.0]),
         source="shioaji:stock_snapshot",
@@ -117,6 +188,72 @@ def test_shared_day_trade_quote_broker_reuses_serving_process_snapshot(
     assert timing["client_total_ms"] >= timing["client_round_trip_ms"]
     assert timing["snapshot_request_body_ms"] == 12.5
     assert timing["snapshot_usage_before_ms"] == 0.0
+    assert timing["client_response_format"] == ("json_v1" if legacy_server else response_format)
+    assert timing["client_response_bytes"] > 0
+    assert timing["client_response_read_ms"] >= 0
+    assert timing["client_ipc_decode_ms"] >= 0
+    assert timing["client_snapshot_materialize_ms"] >= 0
+    assert timing["client_response_read_decode_ms"] + .003 >= sum(timing[name] for name in (
+        "client_response_read_ms", "client_ipc_decode_ms", "client_snapshot_materialize_ms"))
+
+
+def test_quote_ipc_binary_preserves_all_float_bits_int64_flags_and_nulls(tmp_path):
+    pytest.importorskip("msgspec")
+    floats = np.array([0., -0., np.nan, np.inf, -np.inf, np.nextafter(100., 101.)])
+    clocks = np.array([0, 2 ** 53 + 1, 2 ** 63 - 1], dtype=np.int64)
+    payload = {"snapshot": {"prices": floats.tolist(), "timestamps_ms": clocks.tolist(),
+        "simtrade_flags": [-1, 0, 1], "optional": None, "available_mask": [False, True]}, "label": "永豐・本機 IPC"}
+    target = tmp_path / "response.json"
+    quote_provider._atomic_write_quote_response(target, payload, "msgpack_v1")
+    body = target.read_bytes()
+    assert body.startswith(quote_provider._QUOTE_IPC_MSGPACK_MAGIC)
+    result = quote_provider._decode_quote_ipc(body)
+    assert np.asarray(result["snapshot"]["prices"], dtype=np.float64).tobytes() == floats.tobytes()
+    assert np.asarray(result["snapshot"]["timestamps_ms"], dtype=np.int64).tobytes() == clocks.tobytes()
+    assert result["snapshot"]["simtrade_flags"] == [-1, 0, 1]
+    assert result["snapshot"]["optional"] is None
+    assert result["snapshot"]["available_mask"] == [False, True]
+    assert result["label"] == payload["label"]
+
+
+@pytest.mark.parametrize("value", [2 ** 64, -(2 ** 63) - 1, (1, 2), {1: "legacy key"}])
+def test_quote_ipc_unattested_legacy_values_keep_exact_json_bytes(tmp_path, value):
+    target = tmp_path / "response.json"
+    payload = {"legacy": value}
+    quote_provider._atomic_write_quote_response(target, payload, "msgpack_v1")
+    assert target.read_bytes() == json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+    assert quote_provider._decode_quote_ipc(target.read_bytes()) == json.loads(target.read_bytes())
+
+
+@pytest.mark.parametrize("value", [b"not JSON", datetime(2026, 10, 22), {1, 2}])
+def test_quote_ipc_forbids_native_only_type_coercion(tmp_path, value):
+    with pytest.raises(TypeError):
+        quote_provider._atomic_write_quote_response(tmp_path / "response.json", {"value": value}, "msgpack_v1")
+    assert not (tmp_path / "response.json").exists()
+
+
+@pytest.mark.parametrize("response_format", ["json_v1", "unknown_future_version", ""])
+def test_quote_ipc_old_or_unknown_negotiation_is_exact_legacy_json(tmp_path, response_format):
+    payload = {"prices": [np.nan, -0.], "timestamp": 2 ** 53 + 1}
+    target = tmp_path / "response.json"
+    quote_provider._atomic_write_quote_response(target, payload, response_format)
+    assert target.read_bytes() == json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+
+
+def test_quote_ipc_optional_native_absence_keeps_json(monkeypatch, tmp_path):
+    monkeypatch.setattr(quote_provider.private_json, "native_available", lambda: False)
+    monkeypatch.setitem(sys.modules, "msgspec", None)
+    assert quote_provider._quote_ipc_response_format() == "json_v1"
+    target = tmp_path / "response.json"
+    quote_provider._atomic_write_quote_response(target, {"prices": [100.]}, "msgpack_v1")
+    assert quote_provider._decode_quote_ipc(target.read_bytes()) == {"prices": [100.]}
+    assert not target.read_bytes().startswith(quote_provider._QUOTE_IPC_MSGPACK_MAGIC)
+
+
+@pytest.mark.parametrize("body", [b"[1, 2]", b"null", b"{truncated", quote_provider._QUOTE_IPC_MSGPACK_MAGIC + b"\xc1"])
+def test_quote_ipc_rejects_invalid_envelopes(body):
+    with pytest.raises(ValueError):
+        quote_provider._decode_quote_ipc(body)
 
 
 def test_price_snapshot_payload_preserves_exchange_time_and_simtrade() -> None:
@@ -183,6 +320,7 @@ def test_shared_quote_broker_prioritizes_opening_request_in_protected_window(
     assert (requests_dir / "a-interactive.json").exists()
     assert not (requests_dir / "b-opening.json").exists()
     assert (responses_dir / "b-opening.json").exists()
+    assert not (responses_dir / "b-opening.json").read_bytes().startswith(quote_provider._QUOTE_IPC_MSGPACK_MAGIC)
 
 
 def test_historical_0901_vwap_uses_only_0900_minute_ticks(monkeypatch) -> None:

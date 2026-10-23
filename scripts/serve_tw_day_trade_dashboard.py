@@ -308,12 +308,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if path == "/api/signals":
             try:
                 query = parse_qs(parsed.query)
+                display_filter = query.get("hide_zero_targets", ["0"])
+                if len(display_filter) != 1 or display_filter[0] not in {"0", "1"}:
+                    raise ValueError("hide_zero_targets must be 0 or 1")
                 self._json(
                     HTTPStatus.OK,
                     self.server.signal_page(
                         mode=str(query.get("mode", [""])[0]),
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
+                        hide_zero_targets=display_filter[0] == "1",
                         session_date=str(query.get("date", [""])[0]) or None,
                         start_date=str(query.get("start_date", [""])[0]) or None,
                         end_date=str(query.get("end_date", [""])[0]) or None,

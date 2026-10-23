@@ -37,6 +37,7 @@ from stockagent.live.public_dashboards import (
     sanitize_tw_positions,
     sanitize_tw_signals,
     sanitize_tw_status,
+    public_paper_signal_key,
 )
 
 
@@ -91,6 +92,26 @@ def test_public_projections_fail_closed_on_non_simulation_payload() -> None:
         )
     with pytest.raises(UnsafePublicDashboardPayload):
         sanitize_tw_status({"simulation_only": True, "production_order_possible": True})
+
+
+def test_public_signal_correlation_is_stable_scoped_opaque_and_not_an_upstream_override():
+    from copy import deepcopy
+    row = {"market": "tw_day_trade", "session_date": "2026-10-22", "signal_id": "private-internal-id",
+        "public_signal_key": "untrusted", "symbol": "2330", "signal_source_path": "/private/path"}
+    original = deepcopy(row)
+    envelope = {"simulation_only": True, "production_order_possible": False}
+    key = public_paper_signal_key(row)
+    assert re.fullmatch(r"[a-f0-9]{32}", key)
+    signal = sanitize_tw_signals({**envelope, "rows": [row]})["rows"][0]
+    position = sanitize_tw_positions({**envelope, "rows": [row]})["rows"][0]
+    mode = sanitize_tw_status({**envelope, "modes": [row]})["modes"][0]
+    assert signal["public_signal_key"] == position["public_signal_key"] == mode["public_signal_key"] == key
+    assert row == original
+    assert not ({"signal_id", "signal_source_path"} & (_keys(signal) | _keys(position) | _keys(mode)))
+    for field in ("market", "session_date", "signal_id"):
+        different = {**row, field: "2026-10-21" if field == "session_date" else "different"}
+        assert public_paper_signal_key(different) != key
+        assert public_paper_signal_key({k: v for k, v in row.items() if k != field}) is None
 
 
 def test_tw_status_keeps_opening_timing_history_without_repeating_mode_receipts() -> None:
@@ -728,6 +749,43 @@ def test_public_signal_query_accepts_dashboard_date_contract() -> None:
         PublicDashboardHandler._event_query("date=2026-08-13&unknown=true")
 
 
+def test_signal_display_filter_is_strict_and_not_a_position_filter() -> None:
+    query = ("date=2026-08-13&start_date=2026-08-13&end_date=2026-08-14"
+             "&mode=all&symbol=&status=all&offset=0&limit=250&hide_zero_targets=1")
+    normalized = PublicDashboardHandler._signal_query(query, allow_hide_zero_targets=True)
+    assert "hide_zero_targets=1" in normalized
+    assert "hide_zero_targets=0" in PublicDashboardHandler._signal_query(
+        "hide_zero_targets=0", allow_hide_zero_targets=True,
+    )
+    for invalid in ("hide_zero_targets=true", "hide_zero_targets=", "hide_zero_targets=2",
+                    "hide_zero_targets=1&hide_zero_targets=0"):
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._signal_query(invalid, allow_hide_zero_targets=True)
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._signal_query(query)
+
+
+@pytest.mark.parametrize("product", ["tw-day-trade", "tw-overnight"])
+def test_both_public_signal_routes_forward_zero_target_display_filter(monkeypatch, product):
+    from scripts import serve_public_dashboards as public_server
+
+    calls = []
+    monkeypatch.setattr(public_server, "build_dashboard_signal_page",
+                        lambda **kwargs: calls.append(kwargs) or {})
+    monkeypatch.setattr(public_server, "sanitize_tw_signals", lambda payload, **kwargs: payload)
+    handler = PublicDashboardHandler.__new__(PublicDashboardHandler)
+    handler.server = SimpleNamespace(
+        repo_root=Path("/test"), content_token=lambda *args: "revision",
+        cached_local_json=lambda **kwargs: kwargs["builder"](),
+        public_quote_source=None, is_owner=False,
+    )
+    for value in ("1", "0"):
+        handler._api_response(f"/{product}/api/signals", f"hide_zero_targets={value}")
+        assert calls[-1]["hide_zero_targets"] is (value == "1")
+    handler._api_response(f"/{product}/api/signals", "")
+    assert calls[-1]["hide_zero_targets"] is False
+
+
 def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
@@ -1085,8 +1143,9 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f"dashboard-core.css?v={core_version}" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        assert 'dashboard-core.js?v=15" defer' in html
-        assert html.index("dashboard-core.js?v=15") < html.index(
+        script_version = 16 if relative == "tw_day_trade_dashboard/index.html" else 15
+        assert f'dashboard-core.js?v={script_version}" defer' in html
+        assert html.index(f"dashboard-core.js?v={script_version}") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
         )
         assert '<meta name="theme-color" content="#071019">' in html

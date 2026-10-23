@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import datetime, timedelta
 import json
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -38,6 +39,42 @@ def receipts():
             "production_order_possible": False, "ledger_integrity_ready": True, "state_revision": 100,
             "modes": {"tw_day_trade_100m": {"signal_id": "immutable"}}}
     return state, bot, sync
+
+
+def test_ack_preflight_waits_for_a_real_fresh_heartbeat_without_extending_ttl(monkeypatch):
+    _state, bot, sync = receipts()
+    stale = {**sync, "heartbeat_at": (NOW - timedelta(seconds=11)).isoformat()}
+    current = {**sync, "heartbeat_at": NOW.isoformat()}
+    observed, sleeps = iter((stale, current)), []
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+    monkeypatch.setattr(reload, "datetime", Clock)
+    monkeypatch.setattr(reload, "read_service_ack_pair", lambda *_a, **_kw:
+                        (next(observed), bot, {"matched": True}))
+    monkeypatch.setattr(reload.time, "sleep", sleeps.append)
+    actual, _bot, _ack = reload.read_fresh_ack_pair()
+    assert actual["heartbeat_at"] == NOW.isoformat()
+    assert len(sleeps) == 1
+    with pytest.raises(ValueError, match="stale or future receipt"):
+        reload.fresh_native_pair(bot, stale, NOW)
+
+
+def test_ack_preflight_does_not_accept_a_persistently_stale_pair(monkeypatch):
+    _state, bot, sync = receipts()
+    sync["heartbeat_at"] = (NOW - timedelta(seconds=11)).isoformat()
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+    ticks = iter((0., .001, .003))
+    monkeypatch.setattr(reload, "datetime", Clock)
+    monkeypatch.setattr(reload.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(reload, "read_service_ack_pair", lambda *_a, **_kw:
+                        (sync, bot, {"matched": True}))
+    with pytest.raises(ValueError, match="stale or future receipt"):
+        reload.read_fresh_ack_pair(timeout_seconds=.002)
 
 
 def test_discord_can_reload_with_positions_and_pending_engine_orders():
@@ -130,6 +167,53 @@ def test_engine_still_requires_offsession_flat_and_no_pending_orders():
         reload.reload_plan(state, bot, sync, now=closed, discord_only=False)
     mode["pending_entry_orders"].clear()
     assert len(reload.reload_plan(state, bot, sync, now=closed, discord_only=False)["services"]) == 2
+
+
+@pytest.mark.parametrize("change", [None, "working", "unknown_contract", "wrong_reason", "inside_price",
+                                    "wrong_session", "wrong_signal", "missing_clock", "future_clock", "unsized", "open_position"])
+def test_only_proven_entry_bracket_cancellations_are_terminal(change):
+    from stockagent.live.tw_day_trade_simulation import ENTRY_PRICE_GUARD_CONTRACT
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    mode["positions"].clear()
+    mode["session_date"] = NOW.date().isoformat()
+    order = {
+        "status": "cancelled_entry_price_guard", "sizing_pending": False,
+        "remaining_shares": 2000, "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+        "last_wait_reason": "entry_price_at_or_beyond_take_profit", "rejected_entry_price": 1100.,
+        "cancelled_at": NOW.isoformat(), "last_quote_at": NOW.isoformat(),
+        "position": {"signal_id": "immutable", "session_date": NOW.date().isoformat(),
+                     "side": "long", "take_profit_price": 1100., "stop_trigger_price": 900.},
+    }
+    mode["pending_entry_orders"] = {"2330": order}
+    closed = NOW.replace(hour=14)
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = closed.isoformat()
+    if change == "working":
+        order["status"] = "working"
+    elif change == "unknown_contract":
+        order["entry_price_guard_contract"] = "unknown"
+    elif change == "wrong_reason":
+        order["last_wait_reason"] = "marketable_depth_unavailable"
+    elif change == "inside_price":
+        order["rejected_entry_price"] = 1000.
+    elif change == "wrong_session":
+        order["position"]["session_date"] = "2026-10-14"
+    elif change == "wrong_signal":
+        order["position"]["signal_id"] = "other"
+    elif change == "missing_clock":
+        order.pop("cancelled_at")
+    elif change == "future_clock":
+        order["cancelled_at"] = (closed + timedelta(seconds=1)).isoformat()
+    elif change == "unsized":
+        order["sizing_pending"] = True
+    elif change == "open_position":
+        mode["positions"] = {"2330": {"signed_shares": 1000}}
+    if change is None:
+        plan = reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
+        assert plan["pending_orders"] == plan["nonflat_count"] == 0
+    else:
+        with pytest.raises(ValueError, match="nonflat|pending orders"):
+            reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
 
 
 @pytest.mark.parametrize("change", ["in_session", "position", "pending_entry", "pending_reduction"])
@@ -325,14 +409,39 @@ def test_cli_default_is_plan_not_restart(tmp_path, monkeypatch):
     assert result["status"] == "planned" and not result["restart_requested"]
 
 
+@pytest.mark.parametrize("wait", ["-1", "121", "nan", "inf"])
+def test_control_wait_rejects_invalid_bounds_before_any_lock(wait, monkeypatch):
+    monkeypatch.setattr(reload, "control_lease", lambda **_: pytest.fail("invalid wait must not acquire a lease"))
+    monkeypatch.setattr("sys.argv", ["reload", "--control-wait-seconds", wait])
+    with pytest.raises(SystemExit):
+        reload.main()
+
+
+def test_control_wait_uses_existing_lease_and_never_restarts_when_busy(tmp_path, monkeypatch):
+    calls = []
+    def busy(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("paper service control is held by another coordinator")
+    monkeypatch.setattr(reload, "control_lease", busy)
+    monkeypatch.setattr(reload, "read_service_ack_pair", lambda *a, **kw: pytest.fail("busy lease must not inspect or restart"))
+    output = tmp_path / "busy.json"
+    monkeypatch.setattr("sys.argv", ["reload", "--control-wait-seconds", "2.5", "--apply", "--output", str(output)])
+    assert reload.main() == 75
+    assert calls == [{"owner": "qualified-paper-service-reload", "timeout_seconds": 2.5}]
+    result = json.loads(output.read_bytes())
+    assert result["status"] == "blocked" and not result["restart_requested"]
+    assert result["control_wait_ms"] >= 0 and result["broker_orders"] == 0
+
+
 @pytest.mark.parametrize("engine_only,code_only", [(False, False), (True, False), (False, True)])
 @pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("failure", [None, "prefix_changed", "protected_changed", "not_ready", "accounting_changed",
                                     "preexisting_old_code", "preexisting_old_entrypoint", "malformed_admission",
                                     "reported_current_code", "journal_fatal", "journal_pending", "slow_prefix_check",
-                                    "code_changed_during_start", "pinned_changed_during_start", "pin_install_failed"])
+                                    "code_changed_during_start", "pinned_changed_during_start", "pin_install_failed",
+                                    "source_update_pending"])
 def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned):
-    from contextlib import nullcontext
+    from contextlib import contextmanager, nullcontext
     from types import SimpleNamespace
     from scripts import audit_tw_day_trade_restart as audit
     from stockagent.live import completed_inference_cache as cache, market_config, tw_public_source_guard
@@ -405,7 +514,25 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     paths[1].write_text(json.dumps(bot))
     monkeypatch.setattr(market_config, "load_market_config", lambda _: SimpleNamespace(config_path="qualified.yaml"))
     monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(data=SimpleNamespace(parquet_root="source")))
-    monkeypatch.setattr(tw_public_source_guard, "live_tw_public_source_read_guard", lambda _: nullcontext())
+    source_held, prefix_calls = [False], []
+    source_exempt = bool(pinned and code_only and not engine_only)
+    @contextmanager
+    def source_guard(_):
+        if failure == "source_update_pending":
+            raise tw_public_source_guard.TWPublicSourceUpdatePending(Path("source"), Path("source.lock"))
+        source_held[0] = True
+        try:
+            yield
+        finally:
+            source_held[0] = False
+    monkeypatch.setattr(tw_public_source_guard, "live_tw_public_source_read_guard", source_guard)
+    real_prefix = audit.prefix_sha256
+    def prefix(path, size):
+        if len(prefix_calls) < 3:
+            assert source_held[0] or source_exempt, "data-reading reload must admit the source before scanning"
+        prefix_calls.append((path, size))
+        return real_prefix(path, size)
+    monkeypatch.setattr(audit, "prefix_sha256", prefix)
     restarts = []
     selected = reload.SERVICES[int(engine_only)]
 
@@ -466,8 +593,16 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     accepted = accepted or (pinned and failure == "code_changed_during_start")
     accepted = accepted or (not pinned and failure == "pinned_changed_during_start")
     accepted = accepted or (failure == "pin_install_failed" and (not pinned or engine_only))
+    accepted = accepted or (failure == "source_update_pending" and source_exempt)
     assert reload.main() == (0 if accepted else 75)
     result = json.loads(output.read_bytes())
+    assert result["control_wait_ms"] >= 0
+    if failure == "source_update_pending" and not source_exempt:
+        assert not prefix_calls and not restarts and not result["restart_requested"]
+        assert result["status"] == "blocked" and result["error_type"] == "TWPublicSourceUpdatePending"
+        return
+    assert result["source_read_admission_required"] is not source_exempt
+    assert result["data_or_gpu_readiness_claim"] is not code_only
     if engine_only and preflight_mismatch or code_only and failure == "reported_current_code":
         assert not restarts and not result["restart_requested"]
         assert result["status"] == "blocked" and ("code admission" in result["error"] or "code drift" in result["error"])
@@ -601,5 +736,5 @@ def test_plan_uses_original_coherent_pair_not_three_independent_reads(tmp_path, 
     output = tmp_path / "plan.json"
     monkeypatch.setattr("sys.argv", ["reload", "--discord-only", "--code-admission-only", "--output", str(output)])
     assert reload.main() == (0 if matched else 75)
-    assert len(observations) == 1 and observations[0][1]["timeout_seconds"] == 5.
+    assert len(observations) == 1 and 0 < observations[0][1]["timeout_seconds"] <= 5.
     assert json.loads(output.read_text())["restart_requested"] is False

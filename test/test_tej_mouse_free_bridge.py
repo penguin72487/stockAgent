@@ -47,6 +47,18 @@ def test_native_code_cache_binds_code_compiler_runtime_and_never_reuses_query_st
         assert forbidden not in cache
 
 
+def test_runtime_hash_still_reads_every_byte_with_owned_sequential_buffer():
+    digest = BRIDGE.split('function Digest-File(',1)[1].split('$bridgeHash=',1)[0]
+    for proof in ('[IO.FileStream]::new', '[IO.FileMode]::Open', '[IO.FileAccess]::Read',
+                  '[IO.FileShare]::Read,1048576,[IO.FileOptions]::SequentialScan',
+                  '$sha.ComputeHash($stream)', '$stream.Dispose()', '$sha.Dispose()'):
+        assert proof in digest
+    fixture = (REPO/'scripts/verify_tej_native_cache.ps1').read_text()
+    assert "@('baseline','candidate','candidate','baseline')" in fixture
+    assert "$node.Name -ceq 'Digest-File'" in fixture
+    assert "throw 'Comparator file digest differs'" in fixture
+
+
 
 @pytest.mark.parametrize('source', [BRIDGE, CATALOG])
 @pytest.mark.parametrize('forbidden', ['SetCursorPos', 'mouse_event', 'SendInput', 'WM_LBUTTON', 'pyautogui'])
@@ -81,8 +93,8 @@ def test_no_input_focus_refusal_is_availability_not_an_exhaustible_keyboard_bug(
     focus=BRIDGE.split('public static long FocusDate',1)[1].split('public static string[] WriteDateText',1)[0]
     assert focus.count('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')==4
     assert 'SendWait(' not in focus
-    outcomes=BRIDGE.split(".Contains('DATE_INPUT_BEFORE_QUERY:')",1)[1].split(".Contains('LOCAL_SELECTION_BEFORE_QUERY:')",1)[0]
-    assert "Contains('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')" in outcomes
+    outcomes=BRIDGE.split('function Get-TejPreparationFailureCode',1)[1].split('\ntry {',1)[0]
+    assert 'DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:' in outcomes
     assert "'desktop_foreground_unavailable_before_preview'" in outcomes
     # An actual unacknowledged digit/caret remains a local-input defect, not
     # availability or permission to carry on typing/replay a provider query.
@@ -149,9 +161,11 @@ def test_query_uses_exact_pinned_workbook_not_users_active_excel_view():
         assert proof in binding
     for forbidden in ('$excel.ActiveWorkbook', '$book.Activate()', '$excel.Hwnd -ne'):
         assert forbidden not in binding
-    outcome=BRIDGE.split(".Contains('DESKTOP_CONTEXT_BEFORE_QUERY:')",1)[1].split(".Contains('DATE_INPUT_BEFORE_QUERY:')",1)[0]
-    assert 'market_data_query_submission_possible=$false' in outcome
-    assert "error_code='desktop_context_unavailable_before_preview'" in outcome
+    outcome=BRIDGE.split('function Get-TejPreparationFailureCode',1)[1].split('\ntry {',1)[0]
+    assert "return 'desktop_context_unavailable_before_preview'" in outcome
+    catch=BRIDGE.split('# The durable negative proof covers EVERY',1)[1].split("if($requestDoc.action -eq 'plan'",1)[0]
+    assert 'market_data_query_submission_possible=$false' in catch
+    assert 'error_code=(Get-TejPreparationFailureCode $failureText $noticesAbsent)' in catch
 
 
 @pytest.mark.parametrize('code',['desktop_foreground_unavailable_before_preview','desktop_context_unavailable_before_preview'])
@@ -240,6 +254,23 @@ def test_current_binding_readback_reads_selected_combo_not_the_entire_menu():
     selection=BRIDGE.split('function Select-Combo',1)[1].split('function Click-Button',1)[0]
     assert 'ExactComboIndex($ExpectedWindow,$h,$name)' in selection
     assert selection.count('NotifyBinding(')==1 and 'Items $h $true' not in selection
+
+
+def test_combo_lookup_keeps_exact_current_names_and_rejects_unaccepted_cache_optimization():
+    control = BRIDGE.split('function Control(', 1)[1].split('function Message(', 1)[0]
+    for proof in ('Assert-Scope $parent', 'Assert-Scope $found',
+                  "Native-Controls $group 'WindowsForms10.COMBOBOX.'", '$_.Current.Name',
+                  '.Trim() -ceq $name', '$matches.Count -ne 1',
+                  'IsChild([IntPtr]$parent,[IntPtr]$found)', 'IsWindowVisible'):
+        assert proof in control
+    assert 'AccessibleName(' not in control and '.Cached.' not in control
+    assert '[Windows.Automation.CacheRequest]::new()' not in control
+    benchmark = (REPO/'scripts/benchmark_tej_control_lookup.ps1').read_text()
+    assert "@('baseline','candidate','candidate','baseline')" in benchmark
+    assert "Definition $entry[1] 'Control'" in benchmark
+    assert 'exact_handle_parity=$true' in benchmark
+    assert "@('duplicate','case','hidden')" in benchmark
+    assert 'source_selection_unchanged=$true' in benchmark
 
 
 def test_native_combo_lookup_keeps_case_sensitive_unicode_and_duplicate_safety():

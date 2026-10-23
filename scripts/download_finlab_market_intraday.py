@@ -959,7 +959,14 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         cursor = {"base": base, "newest": width, "oldest": 0,
                   "former": 0,
                   "recent_queue": [{"day": days[-1].isoformat(), "next": 0}],
-                  "bootstrapped": cursor.get("bootstrapped") is True}
+                  "bootstrapped": cursor.get("bootstrapped") is True,
+                  # A universe/range frontier change does not invalidate the
+                  # same index's completed one-time local Tick replay. Newly
+                  # acquired Tick partitions already record their minutes via
+                  # _record_tick_and_minute. Losing this independent flag made
+                  # every universe change replay the whole history, often
+                  # timing out before the new frontier could be checkpointed.
+                  "derived_bootstrapped": cursor.get("derived_bootstrapped") is True}
     cursor["day_count"] = len(days)
     cursor["last_day"] = days[-1].isoformat()
     cursor.setdefault("former", 0)

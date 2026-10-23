@@ -108,6 +108,151 @@ def test_429_backoff_uses_refused_runtime_cadence_and_survives_restart(config, t
         resumed.close()
 
 
+@pytest.mark.parametrize('signal', [401, 403, 451, 'challenge'])
+def test_access_refusal_has_local_slower_recovery_not_an_inferred_rate_limit(config, tmp_path, signal):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=2)
+    try:
+        controller._set('publisher', .1, 2, 'ramping', 'test fast candidate')
+        deadline = clock.value + 900
+        http.provider_not_before['publisher'] = deadline
+        http.metrics.count('publisher', 'content_access_refusals' if signal == 'challenge' else 'http_status_' + str(signal))
+        controller.tick(force=True)
+        item = controller.states['publisher']
+        recovery = item['access_refusal_recovery']
+        assert (item['interval_seconds'], item['parallelism']) == (1, 1)
+        assert recovery['refused_interval_seconds'] == .1 and recovery['refused_parallelism'] == 2
+        assert recovery['basis'] == 'conservative_client_recovery_not_source_rate_limit'
+        assert recovery['hold_until_epoch'] == item['next_search_epoch']
+        assert http.provider_not_before['publisher'] == deadline
+        assert 'publisher' not in http.rate_refusal_intervals and http.hard_interval_floor('publisher') == 0
+        assert controller.snapshot()['official_maximum_claimed'] is False
+        assert controller.snapshot()['access_refusal_recovery_contract_version'] == 1
+        controller._set('publisher', .01, 3, 'verifying', 'old fast candidate must not erase recovery')
+        assert (item['interval_seconds'], item['parallelism']) == (1, 1)
+        assert controller._transport_resume_candidate('publisher', 'article_html') is None
+        clock.value = recovery['hold_until_epoch'] + 1
+        controller._set('publisher', .1, 2, 'verifying', 'bounded hold expired; higher capacity still needs proof')
+        assert (item['interval_seconds'], item['parallelism']) == (.1, 2)
+    finally:
+        http.close()
+
+
+def test_same_refused_inflight_burst_is_coalesced_but_later_refusal_reduces_again(config, tmp_path):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=2)
+    try:
+        controller._set('publisher', .1, 2, 'ramping', 'test')
+        http.provider_not_before['publisher'] = clock.value + 900
+        http.metrics.count('publisher', 'http_status_403')
+        controller.tick(force=True)
+        first = deepcopy(controller.states['publisher']['access_refusal_recovery'])
+        clock.value += 1
+        http.provider_not_before['publisher'] += 1
+        http.metrics.count('publisher', 'http_status_403')
+        controller.tick(force=True)
+        second = controller.states['publisher']['access_refusal_recovery']
+        assert second['interval_seconds'] == 1 and second['established_at_epoch'] == first['established_at_epoch']
+        assert second['hold_until_epoch'] == first['hold_until_epoch']
+        assert second['source_not_before_epoch'] == first['source_not_before_epoch'] + 1
+        clock.value = http.provider_not_before['publisher'] + 1
+        http.provider_not_before['publisher'] = clock.value + 900
+        http.metrics.count('publisher', 'http_status_403')
+        controller.tick(force=True)
+        assert controller.states['publisher']['interval_seconds'] == 2
+        assert controller.states['publisher']['access_refusal_recovery']['refused_interval_seconds'] == 1
+        assert 'publisher' not in http.rate_refusal_intervals
+    finally:
+        http.close()
+
+
+def test_legacy_access_checkpoint_adoption_preserves_deadline_history_fingerprints_and_restart_hold(config, tmp_path):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=2)
+    try:
+        observe(http, controller, clock)
+        history = deepcopy(controller.states['publisher']['history'])
+        deadline, hold = clock.value + 900, clock.value + 3600
+        http.provider_not_before['publisher'] = deadline
+        controller._set('publisher', .1, 2, 'waiting_source', 'http_access_refusal')
+        controller.states['publisher']['next_search_epoch'] = hold
+        controller.tick(force=True)
+        fingerprint = controller.provider_fingerprints['publisher']
+        controller_fingerprint = controller.fingerprint
+        restored = PublisherCapacity(http, config, clock=clock, epoch=clock)
+        state = restored.states['publisher']
+        assert state['access_refusal_recovery']['legacy_checkpoint_adopted']
+        assert (state['interval_seconds'], state['parallelism']) == (1, 1)
+        assert state['history'] == history
+        assert restored.fingerprint == controller_fingerprint and restored.provider_fingerprints['publisher'] == fingerprint
+        assert http.provider_not_before['publisher'] == deadline
+        recovery = deepcopy(state['access_refusal_recovery'])
+        clock.value += 10
+        again = PublisherCapacity(http, config, clock=clock, epoch=clock)
+        assert again.states['publisher']['access_refusal_recovery'] == recovery
+        assert again.states['publisher']['next_search_epoch'] == hold
+        assert again.states['publisher']['history'] == history
+    finally:
+        http.close()
+
+
+def test_generic_source_pause_is_not_relabelled_as_access_or_rate_refusal(config, tmp_path):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=2)
+    try:
+        controller._set('publisher', .1, 2, 'ramping', 'test')
+        http.provider_not_before['publisher'] = clock.value + 900
+        controller.tick(force=True)
+        item = controller.states['publisher']
+        assert item['reason'] == 'source_circuit' and 'access_refusal_recovery' not in item
+        assert (item['interval_seconds'], item['parallelism']) == (.1, 2)
+        assert 'publisher' not in http.rate_refusal_intervals
+    finally:
+        http.close()
+
+
+def test_access_response_restart_keeps_exact_source_checkpoint_and_peer_capacity(config, tmp_path, monkeypatch):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=2)
+    monkeypatch.setattr('downloader.news_fulltext_http.time.time', clock)
+    try:
+        peer = {p: (state['interval_seconds'], state['parallelism'], state['capacity_fingerprint'])
+                for p, state in controller.states.items() if p != 'publisher'}
+        controller._set('publisher', .1, 2, 'ramping', 'test')
+        with pytest.raises(NewsError, match='source_access_denied'):
+            http._response_status('publisher', 403, {'retry-after': '1200'})
+        checkpoint = (tmp_path/'cooldowns/publisher.json').read_bytes()
+        http.metrics.count('publisher', 'http_status_403')
+        controller.tick(force=True)
+        recovery = deepcopy(controller.states['publisher']['access_refusal_recovery'])
+        assert (tmp_path/'cooldowns/publisher.json').read_bytes() == checkpoint
+        assert peer == {p: (s['interval_seconds'], s['parallelism'], s['capacity_fingerprint'])
+                        for p, s in controller.states.items() if p != 'publisher'}
+    finally:
+        http.close()
+    resumed, _ = http_fixture(config, tmp_path, {})
+    try:
+        restored = PublisherCapacity(resumed, config, clock=clock, epoch=clock)
+        assert restored.states['publisher']['access_refusal_recovery'] == recovery
+        assert (restored.states['publisher']['interval_seconds'], restored.states['publisher']['parallelism']) == (1, 1)
+        assert (tmp_path/'cooldowns/publisher.json').read_bytes() == checkpoint
+        assert resumed.provider_not_before['publisher'] == clock.value + 1200
+        assert resumed.hard_interval_floor('publisher') == 0  # Not a source rate-limit claim.
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize('bad', [None, [], {'contract_version': 1}, {'contract_version': True}])
+def test_bad_access_recovery_does_not_discard_other_valid_calibration(config, tmp_path, bad):
+    http, controller, clock = controller_fixture(config, tmp_path)
+    try:
+        observe(http, controller, clock)
+        prior = controller.snapshot()
+        prior['providers']['publisher']['access_refusal_recovery'] = bad
+        atomic_write_json(tmp_path/'rate_calibration.json', prior)
+        restored = PublisherCapacity(http, config, clock=clock, epoch=clock)
+        assert restored.states['publisher']['history'] == prior['providers']['publisher']['history']
+        assert restored.states['publisher']['interval_seconds'] == prior['providers']['publisher']['interval_seconds']
+        assert not restored.states['publisher'].get('access_refusal_recovery')
+    finally:
+        http.close()
+
+
 def test_zero_requests_or_only_metadata_do_not_escalate(config, tmp_path):
     http, controller, clock = controller_fixture(config, tmp_path)
     try:

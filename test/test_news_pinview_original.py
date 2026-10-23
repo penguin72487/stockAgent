@@ -212,7 +212,7 @@ def test_empty_envelope_retry_does_not_override_refusal_mime_or_actual_redirect(
 
 def test_empty_envelope_change_does_not_reclassify_other_source_contracts():
     source = SimpleNamespace(source_not_found_paths=(), article_path_pattern=None,
-        pdf_path_pattern=None, embedded_article_layout='other_source_v1')
+        provider='other', pdf_path_pattern=None, embedded_article_layout='other_source_v1')
     assert _require_article_response(Response(URL, 200, {'content-type':'text/html'}, b''), source) is False
 
 

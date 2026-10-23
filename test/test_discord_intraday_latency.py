@@ -17,6 +17,11 @@ from stockagent.live import quote_provider, signal_engine
 from stockagent.live.completed_inference_cache import LoadedImplementationChanged
 
 
+def test_production_prefetch_cpu_preparation_has_no_concurrency_cap():
+    from contextlib import nullcontext
+    assert isinstance(signal_engine._LIVE_QUOTE_PREPARATION_SLOTS, nullcontext)
+
+
 def test_changed_loaded_code_rejects_before_uncancellable_prewarm_source_builder(monkeypatch):
     def changed():
         raise LoadedImplementationChanged()
@@ -653,15 +658,25 @@ def test_scheduled_prefetched_quote_is_revalidated_by_canonical_model_owner(monk
     ) == "same-canonical-validation"
 
 
-def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_path):
-    config = SimpleNamespace(data=SimpleNamespace(), trading=SimpleNamespace(execution_mode="tw_day_trade"), runner=SimpleNamespace(output_dir=str(tmp_path)), training=SimpleNamespace(lookback=1))
+@pytest.mark.parametrize("factorized", [False, True])
+def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_path, factorized):
+    import threading
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(signal_engine, "_LIVE_QUOTE_PREPARATION_SLOTS", slots)
+    config = SimpleNamespace(data=SimpleNamespace(factorized_feature_manifest="manifest.json" if factorized else None), trading=SimpleNamespace(execution_mode="tw_day_trade"), runner=SimpleNamespace(output_dir=str(tmp_path)), training=SimpleNamespace(lookback=1))
     panel = SimpleNamespace(features=np.zeros((1, 1, 1)))
     request = dict(source="tw", symbols=["2330"], fallback_prices=np.array([99.0]), require_official_tw_session_open=True)
     calls = []
     monkeypatch.setattr(signal_engine, "load_config", lambda *args: config)
+    monkeypatch.setattr(signal_engine, "require_live_feature_source", lambda data: None)
     monkeypatch.setattr(signal_engine, "_resolve_checkpoint", lambda *args: (11, tmp_path / "checkpoint.pt"))
     monkeypatch.setattr(signal_engine, "_cached_checkpoint", lambda *args: ({"model_state_dict": {}}, "original-checkpoint", True))
-    monkeypatch.setattr(signal_engine, "_build_panel", lambda *args, **kwargs: (panel, True, "memory"))
+    def build_panel(*args, **kwargs):
+        assert not slots.acquire(blocking=False), "CPU preparation must hold its coordination slot"
+        assert kwargs["panel_end_date"] == ("2026-10-21" if factorized else None)
+        return panel, True, "memory"
+
+    monkeypatch.setattr(signal_engine, "_build_panel", build_panel)
     monkeypatch.setattr(signal_engine, "_cached_aligned_panel", lambda *args, **kwargs: (panel, True))
     monkeypatch.setattr(signal_engine, "_resolve_usable_panel_index", lambda *args: (0, None))
 
@@ -670,14 +685,17 @@ def test_session_open_prefetch_uses_the_same_validated_request(monkeypatch, tmp_
         return request
 
     def source(**kwargs):
+        assert slots.acquire(blocking=False), "network/quorum must not hold the CPU preparation slot"
+        slots.release()
         calls.append(kwargs)
         return quote_provider.PriceSnapshot(prices=np.array([100.0]), source="fixture:opening")
 
     monkeypatch.setattr(signal_engine, "_live_quote_request", quote_request)
     monkeypatch.setattr(signal_engine, "_price_snapshot", source)
-    result = signal_engine.prefetch_live_signal_prices(config_path=tmp_path / "model.yaml", day_trade_model_observation="session_open", price_source="tw")
+    result = signal_engine.prefetch_live_signal_prices(config_path=tmp_path / "model.yaml", day_trade_model_observation="session_open", price_source="tw", panel_date="2026-10-21")
     assert result.request_key == signal_engine._live_quote_request_key(request)
     assert result.snapshot.source == "fixture:opening"
+    assert result.preparation_queue_ms is not None and result.preparation_queue_ms >= 0
     assert len(calls) == 1 and calls[0]["require_official_tw_session_open"] is True
 
 
@@ -708,6 +726,22 @@ def test_opening_prefetch_rejects_pending_quorum_with_exact_mode_mask(monkeypatc
             request, sample, workflow_started_utc=now, requested_at_utc=now,
             received_at_utc=now, pre_quote_prepare_ms=2., quote_fetch_ms=3.,
         )
+
+
+def test_prefetch_validation_failure_releases_the_cpu_preparation_slot(monkeypatch):
+    import threading
+    slots = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(signal_engine, "_LIVE_QUOTE_PREPARATION_SLOTS", slots)
+    monkeypatch.setattr(signal_engine, "load_config", lambda *args: SimpleNamespace(data=object()))
+
+    def rejected(data):
+        raise ValueError("unverified feature source")
+
+    monkeypatch.setattr(signal_engine, "require_live_feature_source", rejected)
+    with pytest.raises(ValueError, match="unverified feature source"):
+        signal_engine.prefetch_live_signal_prices(config_path="mock.yaml")
+    assert slots.acquire(blocking=False)
+    slots.release()
 
 
 def test_pending_prefetch_records_source_wait_before_any_model_execution(monkeypatch):

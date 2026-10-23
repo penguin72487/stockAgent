@@ -138,14 +138,28 @@ def test_float32_input_and_legacy_index_api_keep_existing_contract():
         np.array([12345.]), product_codes="TMF",
     ).item() == 1.
     assert TW_DERIVATIVE_PRICE_CONTRACT_VERSION == 2
-    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 2
+    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 3
 
 
-def test_earlier_registry_extension_is_limited_to_reviewed_tx_mtx():
+def test_earlier_registry_extension_keeps_unreviewed_index_and_etf_periods_closed():
     for product in ["TX", "MTX"]:
         assert taifex_futures_tick_size_numpy(np.array([9001.]), "2011-01-03",
             product_codes=product, asset_classes="index_future").item() == 1.
-    for product, kind in [("TE", "index_future"), ("DFF", "stock_future"), ("NYF", "etf_future")]:
+    for product, kind in [("TE", "index_future"), ("NYF", "etf_future")]:
         with pytest.raises(ValueError, match="historical window"):
             taifex_futures_tick_size_numpy(np.array([100.]), "2019-01-03",
                 product_codes=product, asset_classes=kind)
+
+
+def test_2011_stock_futures_keep_historical_bands_and_dated_day_session():
+    prices = np.array([9.99, 10.05, 50.1, 100.5, 501., 1005.])
+    assert taifex_futures_tick_size_numpy(prices, "2011-01-03",
+        product_codes="CDF", asset_classes="stock_future").tolist() == [.01, .05, .1, .5, 1., 5.]
+    assert price_on_taifex_futures_tick_grid_numpy(np.array([1005., 1001.]), "2011-01-03",
+        product_codes="CDF", asset_classes="stock_future").tolist() == [True, False]
+    assert taifex_futures_day_session_minutes("2011-01-03", product_code="CDF",
+        asset_class="stock_future") == (525, 825)
+    assert taifex_futures_day_session_minutes("2011-01-19", product_code="CDF",
+        asset_class="stock_future", is_last_trading_day=True) == (525, 810)
+    with pytest.raises(ValueError, match="historical window"):
+        taifex_futures_day_session_minutes("2010-12-31", product_code="CDF", asset_class="stock_future")

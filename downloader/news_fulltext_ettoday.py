@@ -22,6 +22,37 @@ from downloader.news_fulltext_metrics import ETTODAY_ATTRIBUTION_FAILURE_STAGES
 ETTODAY_BODY_SELECTOR = ':scope > .story[itemprop="articleBody"]'
 ETTODAY_PATH_PATTERN = r'^(?:/news/[1-9][0-9]*|/news/[0-9]{8}/[1-9][0-9]*[.]htm)$'
 ETTODAY_HOSTS = ('finance.ettoday.net', 'www.ettoday.net')
+ETTODAY_BOUNDARY_QUESTION = 'ettoday_current_native_editor_identity_credit_relations_v1'
+
+
+def ettoday_resident_source(source):
+    """Exact reviewed current source; a question grants no new capture scope."""
+    return bool(source.provider == 'ettoday' and source.allowed and source.request_enabled
+        and source.embedded_article_layout == 'ettoday_visible_article_v39'
+        and source.known_url_only and source.acquisition_mode == 'continuous'
+        and source.domains == ('ettoday.net',) and source.html_parser == 'lxml'
+        and source.authorization.get('kind') == 'personal_research'
+        and source.article_path_pattern == ETTODAY_PATH_PATTERN
+        and source.selectors == (ETTODAY_BODY_SELECTOR,) and source.title_selector == 'h1'
+        and not source.exclude_selectors
+        and set(source.reviewed_article_subsites) <= {'house.ettoday.net'}
+        and source.require_author_attribution and source.require_configured_container)
+
+
+def ettoday_literal_diagnostic_url(url, *, allow_house=False):
+    """No alias, redirect parameter, port, normalization or unreviewed subsite."""
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return bool(parts.scheme == 'https' and not parts.query and not parts.fragment
+        and (parts.netloc in ETTODAY_HOSTS or allow_house and parts.netloc == 'house.ettoday.net')
+        and url == 'https://' + parts.netloc + parts.path
+        and ettoday_request_identity(url, allow_house=allow_house) is not None)
+
+
 # The three old clock-cohort failures independently replayed on 2026-10-18.
 # This is a bounded retry witness, not a general source-identity waiver.
 ETTODAY_V5_PROVED_LITERAL_CONTROL_URLS = (
@@ -1713,13 +1744,20 @@ def ettoday_validation_metadata(soup, *, page_url, adapter_contract_version=1, a
     clock declarations and credit/schema shapes only, never prose, names,
     scripts, raw HTML, credentials or permission to retain a failed article.
     """
+    facts, _ = _ettoday_validation_facts(soup, page_url=page_url,
+        adapter_contract_version=adapter_contract_version, allow_house=allow_house)
+    return facts
+
+
+def _ettoday_validation_facts(soup, *, page_url, adapter_contract_version, allow_house):
+    """Share the bounded schema read; normal persisted failure ABI is unchanged."""
     identity = ettoday_request_identity(page_url, allow_finance_redirect_query=adapter_contract_version >= 16,
         allow_house=adapter_contract_version >= 24 and allow_house is True)
     facts = {'contract_version': 4 if adapter_contract_version >= 5 else 2,
         'literal_route_verified': identity is not None,
         'body_text_retained': False, 'raw_scope_or_article_acceptance_granted': False}
     if identity is None:
-        return facts
+        return facts, []
     compact_hash = lambda value: hashlib.sha256(_key(value).encode()).hexdigest() if isinstance(value, str) else None
     safe_clock = lambda value: value if isinstance(value, str) and _CLOCK.fullmatch(value) else None
     stories = soup.select('.subject_article > .story[itemprop="articleBody"]')
@@ -1775,6 +1813,63 @@ def ettoday_validation_metadata(soup, *, page_url, adapter_contract_version=1, a
         declared_author_types=[[a.get('@type') if isinstance(a, dict) and a.get('@type') in {'Person', 'Organization'}
             else 'unknown' for a in (obj.get('author') if isinstance(obj.get('author'), list)
                 else [obj.get('author')])[:8]] for obj in declarations[:8]])
+    return facts, [] if schema_error else declarations
+
+
+def ettoday_resident_boundary_metadata(soup, *, page_url, allow_house=False):
+    """Current editor/identity relationships, not another accepting parse.
+
+    One JSON decode per declaration, bounded structural output, no literal
+    names/prose/HTML or source-controlled attribute strings. An occurrence or
+    matching identity is a diagnostic lead, never an attribution/body grant.
+    """
+    facts, declarations = _ettoday_validation_facts(soup, page_url=page_url,
+        adapter_contract_version=39, allow_house=allow_house)
+    for obj in declarations:
+        if obj.get('isAccessibleForFree') is not None and obj['isAccessibleForFree'] is not True:
+            raise NewsError('paywall_or_login')
+    headings = soup.select('.subject_article > header > h1')
+    heading = _key(headings[0].get_text(' ', strip=True)) if len(headings) == 1 else None
+    canonical = soup.select('head > link[rel="canonical"]')
+    og_urls = soup.select('head > meta[property="og:url"]')
+    stories = soup.select('.subject_article > .story[itemprop="articleBody"]')
+    bindings = []
+    for obj in declarations[:8]:
+        main = obj.get('mainEntityOfPage')
+        if isinstance(main, dict):
+            main = main.get('@id')
+        bindings.append({'url_equals_literal_request': obj.get('url') == page_url,
+            'main_entity_equals_literal_request': main == page_url,
+            'headline_equals_single_native_heading': heading is not None
+                and isinstance(obj.get('headline'), str) and _key(obj['headline']) == heading})
+    shapes = []
+    known_tags = {'p','div','span','h2','h3','h4','figure','figcaption','ul','ol','li',
+        'blockquote','iframe','script','style','img','strong','b','a','br','table','section','aside'}
+    for story in stories[:2]:
+        children = story.find_all(recursive=False, limit=65)
+        blocks = []
+        for index, node in enumerate(children[:64]):
+            text = node.get_text(' ', strip=True)
+            try:
+                _visible_text(node)
+                visible = True
+            except NewsError:
+                visible = False
+            blocks.append({'index':index, 'tag':node.name if node.name in known_tags else 'other',
+                'text_characters':len(text), 'text_sha256':hashlib.sha256(text.encode()).hexdigest(),
+                'visible':visible, 'starts_caption_marker':text.startswith('▲'),
+                'direct_tag_children':sum(1 for _ in node.find_all(recursive=False)),
+                'has_hidden_attribute':node.has_attr('hidden'),
+                'has_inline_style':node.has_attr('style'),
+                'has_native_itemprop':node.has_attr('itemprop')})
+        shapes.append({'blocks':blocks, 'scan_truncated':len(children) > 64})
+    facts.update(question=ETTODAY_BOUNDARY_QUESTION, current_parser_replayed=False,
+        native_heading_count=len(headings), schema_identity_relations=bindings,
+        canonical_equals_literal_request=len(canonical) == 1 and canonical[0].get('href') == page_url,
+        og_url_equals_literal_request=len(og_urls) == 1 and og_urls[0].get('content') == page_url,
+        native_editor_shapes=shapes, editor_scan_truncated=len(stories) > 2,
+        body_or_author_text_exported=False, attribution_verified_by_diagnostic=False,
+        whole_body_verified_by_diagnostic=False)
     return facts
 
 

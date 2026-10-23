@@ -43,6 +43,19 @@ Guidelines:
   minute execution, and live paper execution must use this same independent
   per-symbol contract.
 
+- TW day-trade paper entry admission (user correction, 2026-10-22) uses
+  `strict_inside_original_take_profit_stop_loss_v1`. Resolve the original
+  TP/SL before filling: long requires `SL < Ask < TP`, short requires
+  `TP < Bid < SL`. Equality or crossing either boundary rejects additions;
+  missing/inverted brackets fail closed. Apply the same predicate to initial
+  entries, restored/unsized targets, remaining-order retries and newly built
+  counterfactual replays (using their declared execution price). Never move a
+  bracket to admit the price. Cancel only the remaining addition, not existing
+  inventory or reduction/stop/closing orders. Retain the model row and explicit
+  reason. Version new paper fills/receipts; do not relabel old fills, retrain a
+  checkpoint or rewrite/promote history implicitly. See
+  [the scoped repair and adoption boundary](../tw_day_trade_entry_price_guard_2026-10-22.md).
+
 - Day-trade historical minute-curve repair is local-first. Search the ordered
   receipt-backed one-minute KBar chunks, materialized `trade_date` research
   partitions, and retained local minute cache before starting any Shioaji

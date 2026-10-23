@@ -8,7 +8,8 @@ const labels = {running:"正在匯出",backfilling:"歷史回補中",pending_dis
 const order = {running:0,backfilling:1,pending_discovery:2,query_grid_exported:3,query_scope_checked:3,needs_review:4,stalled_requires_recovery:4,empty_query_axis_unverified:5,empty_field_menu:6};
 const errors={vendor_metadata_allocation_failed_deferred:"來源選單配置失敗 · 已隔離，仍待修復",metadata_preparation_failed_deferred:"選單準備失敗 · 已隔離，未冒充清點完成",unknown_outcome_no_auto_retry:"結果未明 · 禁止自動重送",source_validation_failed:"資料鍵／schema 驗證未過 · 原始檔保留",date_input_prequery_needs_review:"日期輸入需檢查 · 未送 Preview",list_selection_prequery_needs_review:"欄位／公司／日期選取需檢查 · 未送 Preview",query_activation_prequery_needs_review:"查詢視窗啟用需檢查 · 未送 Preview",source_binding_prequery_needs_review:"來源選單尚未載入 · 自動修復，未送 Preview",query_preparation_prequery_needs_review:"查詢準備失敗 · 有界重試，未送 Preview",preview_column_limit_repartition_required:"預覽超過 30 欄 · 已拒絕，待安全分片",source_key_layout_replan_required:"來源鍵格式不符 · 未送 Preview，待保留粒度重排"};
 const waitLabels={waiting_recovery:"等待安全恢復",recovering_response:"自動核對原查詢結果 · 不重送",replaying_authorized:"依使用者授權核對／重排 · 保留原紀錄",waiting_storage:"等待磁碟空間",waiting_owner:"等待桌面操作鎖",waiting_desktop:"等待互動桌面",waiting_metadata:"等待本機中繼資料寫入",waiting_local_retry:"等待本機輸入重試",waiting_queue:"待命 · 暫無到期工作",between_tasks:"工作間隔",executing:"正在核對工作",starting:"自動排程啟動中"};
-const stageLabels={awaiting_progress:"工作執行中 · 等待步驟回報",preparing_scope:"核對並準備查詢範圍",awaiting_preview:"等待來源回覆",reading_preview:"讀回來源資料格",response_saved:"原始回覆已保存 · 待驗證",validating_and_saving:"驗證與寫入資料／收據"};
+const stageLabels={awaiting_progress:"工作執行中 · 等待步驟回報",initializing_runtime:"開始啟動桌面橋接／驗證執行環境",preparing_scope:"核對並準備查詢範圍",awaiting_preview:"等待來源回覆",reading_preview:"讀回來源資料格",response_saved:"原始回覆已保存 · 待驗證",validating_and_saving:"驗證與寫入資料／收據"};
+const scopePhaseLabels={context_and_source_binding:"核對查詢視窗與資料表",field_selection:"核對與選取欄位",company_universe_and_lookup:"讀取公司名單與精確搜尋",date_model_and_lookup:"設定日期範圍與搜尋",company_selection_and_verification:"選取並核對公司",date_selection_and_verification:"選取並核對日期",final_source_and_preview_guards:"送出前最後核對"};
 errors.source_validation_failed_deferred="來源結果驗證未過 · 此表隔離，其他表可續抓；原始檔保留";
 labels.waiting_local_retry="此表等待重試 · 其他表可續抓";
 order.waiting_local_retry=2;
@@ -19,6 +20,7 @@ errors.prequery_failure_deferred="已證明未送查詢 · 此表排定重試";
 errors.metadata_preparation_requires_recovery="目錄準備失敗 · 正在自動核對介面，未送資料查詢";
 errors.metadata_retry_scheduled="目錄故障已核對 · 此表排定重試，其他表繼續下載";
 waitLabels.recovering_metadata="自動修復目錄介面 · 未送資料查詢";
+waitLabels.refreshing_priorities="更新本機資料價值排序 · 未送來源查詢";
 errors.unknown_outcome_no_auto_retry="原查詢結果未明 · 核對後依授權重排";
 const int = new Intl.NumberFormat("zh-TW",{maximumFractionDigits:0});
 function num(v){return v===null||v===undefined||v===""?null:Number.isFinite(Number(v))?Number(v):null;}
@@ -44,7 +46,8 @@ function renderActivity(data){
   const available=a.contract==="tej_download_activity_v1";
   text("active-table",current?.table_name||(available?"目前沒有正在下載的資料表":"下載現況暫不可讀"));
   text("active-task",current?`${current.phase} · ${current.kind==="discover"?"歷史軸清點":"歷史回補"} · 本次工作 ${count(current.query_work_rows)} 格點（非預估結果列數）`:scheduler.alive?`${waitLabels[scheduler.state]||"狀態待核實"}${errors[scheduler.paused_reason]?` · ${errors[scheduler.paused_reason]}`:""}`:"下載器未運行；既有資料與收據保留");
-  text("active-stage",current?stageLabels[current.stage]||"步驟尚未回報":scheduler.alive?waitLabels[scheduler.state]||"狀態待核實":"未執行");
+  const scopePhase=current?.stage==="preparing_scope"&&Object.hasOwn(scopePhaseLabels,current.scope_phase)?scopePhaseLabels[current.scope_phase]:null;
+  text("active-stage",current?`${stageLabels[current.stage]||"步驟尚未回報"}${scopePhase?` · ${scopePhase}`:""}`:scheduler.alive?waitLabels[scheduler.state]||"狀態待核實":"未執行");
   text("active-elapsed",current?`本次已耗 ${count(num(current.elapsed_seconds)===null?null:Math.floor(current.elapsed_seconds))} 秒 · ${current.progress_stale?"步驟回報較舊；不延長工作截止時間 · ":""}步驟觀測 ${time(current.progress_observed_at_utc||current.started_at_utc)}`:scheduler.next_check_at_utc?`下次本機檢查 ${time(scheduler.next_check_at_utc)}（不是重新送查詢）`:"尚未排定新的查詢時間");
   text("completed-downloads",count(a.completed_download_tasks));
   text("completed-discoveries",`累計清點成功 ${count(a.completed_discovery_tasks)} 次；成功下載包含明確來源空回，不等於全歷史完成`);

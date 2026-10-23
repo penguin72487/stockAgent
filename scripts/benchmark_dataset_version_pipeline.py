@@ -118,7 +118,7 @@ def native_stream_fixture(cold, *, batched, counts, portable_reference=False):
 
 
 def run_trial(inputs, proofs, *, reference, fused_recovery=None, native_stream_batch=None, cold_parent=None,
-              portable_stream_reference=False):
+              portable_stream_reference=False, file_chunking="fixed-v1", chunk_bytes=8 * 1024**2):
     started = time.perf_counter()
     cpu_started = time.process_time()
     phases, inventories, previous = [], [], {}
@@ -145,7 +145,8 @@ def run_trial(inputs, proofs, *, reference, fused_recovery=None, native_stream_b
                     raise ValueError("private fixture copy differs from its source")
                 stamp = time.perf_counter()
                 release = packed.publish_packed_snapshot(cold, "benchmark", source, node_id="test",
-                    loose_file_threshold_bytes=8 * 1024**2, file_chunk_bytes=8 * 1024**2,
+                    loose_file_threshold_bytes=8 * 1024**2, file_chunk_bytes=chunk_bytes,
+                    file_chunking=file_chunking,
                     pack_buckets=2, batch_directory_fsync=True)
                 publish_seconds = time.perf_counter() - stamp
                 inventories.append(release.manifest['archive']['inventory']['sha256'])
@@ -176,7 +177,8 @@ def run_trial(inputs, proofs, *, reference, fused_recovery=None, native_stream_b
                 selected.append((release, proofs[index]["sha256"]))
             stamp = time.perf_counter()
             noop = packed.publish_packed_snapshot(cold, "benchmark", source, node_id="test",
-                loose_file_threshold_bytes=8 * 1024**2, file_chunk_bytes=8 * 1024**2,
+                loose_file_threshold_bytes=8 * 1024**2, file_chunk_bytes=chunk_bytes,
+                file_chunking=file_chunking,
                 pack_buckets=2, batch_directory_fsync=True)
             if noop.manifest_sha256 != selected[-1][0].manifest_sha256:
                 raise ValueError("unchanged version advanced its semantic head")

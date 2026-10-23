@@ -27,6 +27,17 @@ from downloader.tej_desktop_attempts import (
     interrupted_stage_write_proof,
 )
 from scripts.audit_tej_history import audit
+from stockagent.live.tej_dashboard import SCHEMA_VERSION
+
+
+def validate_live_dashboard(status: dict) -> None:
+    """Use the canonical ABI; do not reject a valid new progress schema."""
+    if (status.get('schema_version') != SCHEMA_VERSION or status.get('read_only') is not True
+            or status.get('raw_values_exposed') is not False
+            or status.get('scheduler', {}).get('alive') is not True
+            or status.get('scheduler', {}).get('paused_reason') is not None
+            or status.get('scheduler', {}).get('metadata_recovery', {}).get('enabled') is not True):
+        raise ValueError('Live safe dashboard progress and installed recovery policy required')
 
 
 def validate_boot_tasks(windows: dict, launcher_sha256: str) -> None:
@@ -227,6 +238,9 @@ def main(argv=None):
                 REPO/'downloader/tej_metadata_recovery.py',REPO/'scripts/tej_smart_wizard_bridge.ps1',
                 REPO/'downloader/tej_operation_clock.py',REPO/'downloader/tej_desktop_attempts.py',
                 REPO/'downloader/tej_planning.py',REPO/'downloader/tej_startup.py',
+                REPO/'downloader/tej_windows_transport.py',REPO/'downloader/tej_value_priority.py',
+                REPO/'scripts/build_tej_smart_wizard_inventory.py',
+                REPO/'stockagent/live/tej_dashboard.py',REPO/'services/tej_dashboard/app.js',
                 REPO/'scripts/start_tej_desktop.ps1',
                 REPO/'configs/tej_history.json')},
             'latest_download':{k:recent[0][k] for k in ('task_id','completed_at_utc','actual_rows')} if recent else None}
@@ -282,11 +296,7 @@ def main(argv=None):
         if len(body)>4*1024**2:
             raise ValueError('Bounded owner-only status required')
         status=json.loads(body)
-        if (status.get('schema_version')!=16 or status.get('read_only') is not True
-                or status.get('raw_values_exposed') is not False or status['scheduler'].get('alive') is not True
-                or status['scheduler'].get('paused_reason') is not None
-                or status['scheduler'].get('metadata_recovery',{}).get('enabled') is not True):
-            raise ValueError('Live safe dashboard progress and installed recovery policy required')
+        validate_live_dashboard(status)
         interactive_transport(root)  # Independent birth-pinned Windows relay check.
         service=subprocess.check_output(['systemctl','show','stockagent-tej-history.service','-p','ActiveState','-p','SubState'],text=True,timeout=10)
         if 'ActiveState=active' not in service or 'SubState=running' not in service:
@@ -295,6 +305,7 @@ def main(argv=None):
             original_failure_evidence_preserved=True,receipts_audited=8,
             source_rows=audited['exported_rows'],source_non_null_cells=audited['exported_non_null_cells'],
             original_cells_checked=audited['original_source_cells_checked'],
+            dashboard_schema_version=status['schema_version'],
             dashboard_state=status['state'],scheduler_state=status['scheduler']['state'])
     atomic_write_json(output,result,durable=True)
     print(json.dumps({k:result[k] for k in ('mode','observed_at_utc','blocked_tasks')}

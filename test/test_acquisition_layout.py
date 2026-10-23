@@ -15,6 +15,7 @@ PAGES = {
     "shioaji": ("/shioaji/", "shioaji_api_dashboard", "index.html"),
     "finlab": ("/finlab/", "finlab_dashboard", "index.html"),
     "finmind": ("/finmind/", "finmind_dashboard", "index.html"),
+    "news": ("/news/", "news_dashboard", "index.html"),
     "tej": ("/tej/", "tej_dashboard", "index.html"),
     "openbb": ("/openbb/", "openbb_archive_dashboard", "index.html"),
     "data-monitor": ("/data-monitor/", "data_monitor_dashboard", "index.html"),
@@ -44,13 +45,25 @@ def browser():
         instance.close()
 
 
-def mount_page(browser, kind, width=1366):
+def mount_page(browser, kind, width=1366, *, delay_hash_notifications=False):
     route, directory, filename = PAGES[kind]
     html = (ROOT / "services" / directory / filename).read_text()
     original_ids = re.findall(r'\bid="([^"]+)"', html)
     # The actual source apps own network/data. Test only the shared presentation.
     html = re.sub(r'<script\b[^>]*>.*?</script>', '', html, flags=re.S)
     page = browser.new_page(viewport={"width": width, "height": 844})
+    if delay_hash_notifications:
+        # Deterministic version of the retained native trace: the hash task
+        # arrives after a newer keyboard disclosure action. Only notification
+        # delivery is delayed; clicks, focus, history and details stay native.
+        page.add_init_script("""(() => {
+          window.delayedHashNotifications = [];
+          const listen = window.addEventListener.bind(window);
+          window.addEventListener = (kind, callback, options) => {
+            if (kind !== 'hashchange') return listen(kind, callback, options);
+            return listen(kind, event => window.delayedHashNotifications.push(() => callback(event)), options);
+          };
+        })();""")
     requests = []
     errors = []
     page.on("console", lambda msg: errors.append(msg.text) if msg.type == "error" else None)
@@ -178,6 +191,96 @@ def test_old_and_new_deep_links_open_the_actual_target(browser):
         page.wait_for_function("document.querySelector('#acq-progress').open")
         page.evaluate("window.StockAgentAcquisition.reveal('download-eta-milestones')")
         assert page.locator("#download-eta-milestones").locator("xpath=ancestor::table").is_visible()
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("kind", ["news", "finmind"])
+def test_delayed_hash_notification_cannot_undo_newer_native_disclosure_action(browser, kind):
+    from playwright.sync_api import expect
+
+    page, requests, errors, _ = mount_page(browser, kind, delay_hash_notifications=True)
+    try:
+        page.locator('a[href="#acq-quota"]').click()
+        expect(page.locator('#traffic')).to_be_visible()
+        page.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
+        summary = page.locator('#acq-quota > summary')
+        summary.focus()
+        summary.press('Enter')
+        expect(page.locator('#traffic')).not_to_be_visible()
+        delivered = page.evaluate("""() => {
+          const pending = window.delayedHashNotifications.splice(0);
+          for (const notify of pending) notify();
+          return pending.length;
+        }""")
+        assert page.locator('#acq-quota').get_attribute('open') is None, delivered
+        assert not errors and not any('/api/' in path for path in requests)
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("kind", ["news", "finmind"])
+def test_native_anchor_history_same_hash_reopen_keyboard_and_back_forward(browser, kind):
+    from playwright.sync_api import expect
+
+    page, requests, errors, _ = mount_page(browser, kind)
+    try:
+        page.evaluate("history.replaceState({retained: 'other-owner-state'}, '')")
+        quota = page.locator('a[href="#acq-quota"]')
+        quota.focus()
+        quota.press('Enter')
+        expect(page.locator('#traffic')).to_be_visible()
+        page.wait_for_function("location.hash === '#acq-quota'")
+        length = page.evaluate('history.length')
+        summary = page.locator('#acq-quota > summary')
+        summary.focus()
+        summary.press('Enter')
+        expect(page.locator('#traffic')).not_to_be_visible()
+        quota.click()
+        expect(page.locator('#traffic')).to_be_visible()
+        assert page.evaluate('history.length') == length
+        assert page.evaluate('history.state') == {'retained': 'other-owner-state'}
+        page.locator('a[href="#acq-catalog"]').click()
+        expect(page.locator('#pipelines')).to_be_visible()
+        page.go_back(wait_until='domcontentloaded')
+        page.wait_for_function("location.hash === '#acq-quota'")
+        expect(page.locator('#traffic')).to_be_visible()
+        summary.focus()
+        summary.press('Enter')
+        expect(page.locator('#traffic')).not_to_be_visible()
+        page.go_forward(wait_until='domcontentloaded')
+        page.wait_for_function("location.hash === '#acq-catalog'")
+        expect(page.locator('#pipelines')).to_be_visible()
+        assert page.locator('#acq-quota').get_attribute('open') is None
+        assert not errors and not any('/api/' in path for path in requests)
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("excluded", ["ctrlKey", "metaKey", "shiftKey", "altKey", "middle", "download", "new-tab", "cancelled", "foreign-base"])
+def test_nonlocal_modified_and_cancelled_links_do_not_reveal_current_disclosure(browser, excluded):
+    page, requests, errors, _ = mount_page(browser, "news")
+    try:
+        observed = page.evaluate("""excluded => {
+          const link = document.querySelector('a[href="#acq-quota"]');
+          const options = {bubbles:true,cancelable:true,button:0};
+          if (excluded.endsWith('Key')) options[excluded] = true;
+          if (excluded === 'middle') options.button = 1;
+          if (excluded === 'download') link.download = 'export';
+          if (excluded === 'new-tab') link.target = '_blank';
+          if (excluded === 'foreign-base') {
+            const base = document.createElement('base'); base.href = 'https://other.example.net/';
+            document.head.prepend(base);
+          }
+          if (excluded === 'cancelled') document.addEventListener('click', event => event.preventDefault(), {capture:true,once:true});
+          // Unit guard only: suppress the browser default *after* the real
+          // component listener, so no test popup/download/network is created.
+          document.addEventListener('click', event => event.preventDefault(), {once:true});
+          link.dispatchEvent(new MouseEvent('click', options));
+          return {open:document.getElementById('acq-quota').open,hash:location.hash};
+        }""", excluded)
+        assert observed == {'open': False, 'hash': ''}
+        assert not errors and not any('/api/' in path for path in requests)
     finally:
         page.close()
 

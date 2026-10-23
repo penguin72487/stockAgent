@@ -22,6 +22,23 @@ class _BufferWriter:
         self.payload += payload
 
 
+def test_private_signal_route_forwards_zero_target_display_filter() -> None:
+    handler = object.__new__(DashboardHandler)
+    calls, responses = [], []
+    handler.server = SimpleNamespace(
+        signal_page=lambda **kwargs: calls.append(kwargs) or {"rows": []},
+    )
+    handler._json = lambda status, payload: responses.append((status, payload))
+    for value in ("1", "0"):
+        handler.path = f"/api/signals?hide_zero_targets={value}"
+        handler.do_GET()
+        assert responses[-1][0] == HTTPStatus.OK
+        assert calls[-1]["hide_zero_targets"] is (value == "1")
+    handler.path = "/api/signals?hide_zero_targets=true"
+    handler.do_GET()
+    assert responses[-1][0] == HTTPStatus.BAD_REQUEST
+
+
 def test_json_response_reports_preparation_and_serialization_timing() -> None:
     handler = object.__new__(DashboardHandler)
     handler.headers = {}

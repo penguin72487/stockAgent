@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import threading
 import time
 import uuid
@@ -80,7 +81,7 @@ from stockagent.models.temporal_basis_fit import (
 )
 from stockagent.training.inference_contract import (
     align_panel_to_checkpoint_universe,
-    build_checkpoint_manifest,
+    build_inference_checkpoint_manifest,
     checkpoint_manifest_symbols,
     configure_inference_runtime,
     validate_checkpoint_manifest,
@@ -145,10 +146,15 @@ class PrefetchedLiveQuote:
     quote_finished: float
     requested_at_utc: datetime
     received_at_utc: datetime
+    preparation_queue_ms: float | None = None
 
 
 _LIVE_QUOTE_INFLIGHT: dict[str, Future[PrefetchedLiveQuote]] = {}
 _LIVE_QUOTE_INFLIGHT_LOCK = threading.Lock()
+# Unbounded in production. Frozen benchmarks can inject a CPU-only guard;
+# source calls, quorum waits and provider workers never hold that guard.
+# The two-slot experiment did not establish a stable full-flow/tail benefit.
+_LIVE_QUOTE_PREPARATION_SLOTS = nullcontext()
 _LIVE_PUBLICATION_LOCK = threading.Lock()
 
 
@@ -182,6 +188,8 @@ _LIVE_MODEL_INPUT_CACHE: OrderedDict[
     str, tuple[weakref.ReferenceType[np.ndarray], np.ndarray]
 ] = OrderedDict()
 _LIVE_MODEL_INPUT_CACHE_LOCK = threading.Lock()
+OPENING_LAST_TRADE_REFERENCE_CONTRACT = "last_real_completed_trade_no_first_print_model_only_v2"
+_LIVE_LAST_TRADE_REFERENCE_CACHE: OrderedDict = OrderedDict()
 _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
     tuple[int, str], tuple[PanelData, PanelData]
 ] = OrderedDict()
@@ -275,6 +283,7 @@ def clear_live_panel_memory_cache() -> None:
         _LIVE_ALIGNED_PANEL_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE.clear()
+        _LIVE_LAST_TRADE_REFERENCE_CACHE.clear()
     with _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK:
         if _LIVE_RAW_TAIL_SOURCE_CACHE is not None:
             # Increment its epoch too: an in-flight decode may return to its
@@ -482,6 +491,7 @@ def _live_panel_cache_key(
     *,
     live_tail_rows: int,
     panel_kwargs: dict[str, Any],
+    source_read_generation=None,
 ) -> str:
     from stockagent.data import partitioned_parquet
     from stockagent.live.completed_inference_cache import _parquet_source_generations
@@ -522,8 +532,22 @@ def _live_panel_cache_key(
                     directory / "tw_corporate_action_entitlements.summary.json",
                 ]
             )
-    for path, generation in _parquet_source_generations(
-            sentinel_paths, feature_roots=(root, root / "_hot_tail")):
+    if source_read_generation is None:
+        members = _parquet_source_generations(
+            sentinel_paths, feature_roots=(root, root / "_hot_tail"))
+    else:
+        # Only stock members covered by this canonical OS read lease may be
+        # shared. External feature/sentinel paths still get fresh per-call
+        # checks; a source outside the locked tree is not part of its epoch.
+        features = source_read_generation.get(
+            ("stock_feature_generations_v1", str(root)),
+            lambda: tuple(_parquet_source_generations(
+                (), feature_roots=(root, root / "_hot_tail"))),
+        )
+        generations = dict(features)
+        generations.update(_parquet_source_generations(sentinel_paths))
+        members = sorted(generations.items())
+    for path, generation in members:
         digest.update(str(path).encode("utf-8"))
         if generation is None:
             digest.update(b":missing")
@@ -837,10 +861,21 @@ def _build_panel(
     # Fence the cache fingerprint AND every source read, not just the final
     # entitlement load. An exclusive updater can replace several individually
     # atomic files; those intermediate files are not a published generation.
-    with live_tw_public_source_read_guard(config.data.parquet_root):
+    with live_tw_public_source_read_guard(
+        config.data.parquet_root, share_generation=True,
+    ) as source_read_generation:
         panel, hit, tier = _build_panel_from_stable_source(
-            config, live_tail=live_tail, progress_callback=progress_callback
+            config, live_tail=live_tail, progress_callback=progress_callback,
+            source_read_generation=source_read_generation,
         )
+        if str(panel_end_date or "").strip().lower() in {"", "latest", "last"}:
+            panel_end_date = None
+        if config.data.factorized_feature_manifest:
+            # Cache the bounded attachment against the original base owner,
+            # not a fresh slice object whose id changes on every retry.
+            panel = _cached_factorized_live_panel(
+                panel, config, progress_callback, panel_end_date=panel_end_date)
+            return panel, hit, tier
         if panel_end_date is not None:
             # Historical opening inference needs only t-1. A newer daily base
             # publication must not require a not-yet-built t feature projection.
@@ -848,12 +883,10 @@ def _build_panel(
             from stockagent.data.panel import slice_panel_end
 
             panel = slice_panel_end(panel, panel_end_date)
-        if config.data.factorized_feature_manifest:
-            panel = _cached_factorized_live_panel(panel, config, progress_callback)
         return panel, hit, tier
 
 
-def _cached_factorized_live_panel(panel, config, progress_callback=None):
+def _cached_factorized_live_panel(panel, config, progress_callback=None, *, panel_end_date=None):
     """Retain one verified attachment/cache across warmup and quote prefetch.
 
     The entire immutable-member identity belongs in the flight/cache key, not
@@ -863,12 +896,15 @@ def _cached_factorized_live_panel(panel, config, progress_callback=None):
     from stockagent.data.factorized_panel import attach_factorized_live_features
     path = Path(config.data.factorized_feature_manifest).resolve(strict=True)
     signatures = _factorized_member_signatures(path)
-    key = (id(panel), str(path), config.data.factorized_host_cache_bytes, signatures)
+    key = (id(panel), str(path), config.data.factorized_host_cache_bytes,
+           str(panel_end_date) if panel_end_date is not None else None, signatures)
 
     def build(progress):
         progress("factorized_attachment", 0, 1)
+        from stockagent.data.panel import slice_panel_end
+        bounded = slice_panel_end(panel, panel_end_date) if panel_end_date is not None else panel
         attached = attach_factorized_live_features(
-            panel, path, host_cache_bytes=config.data.factorized_host_cache_bytes,
+            bounded, path, host_cache_bytes=config.data.factorized_host_cache_bytes,
             progress_callback=progress,
         )
         after = _factorized_member_signatures(path)
@@ -889,9 +925,41 @@ def _cached_factorized_live_panel(panel, config, progress_callback=None):
 def _factorized_member_signatures(manifest_path: Path) -> tuple:
     from stockagent.data.factorized_panel import factorized_member_proofs
     manifest = json.loads(manifest_path.read_text())
-    members = [manifest_path, *[manifest_path.parent / p["path"] for p in factorized_member_proofs(manifest)]]
-    return tuple((str(path.resolve()), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-                 for path in members for s in [path.stat()])
+    root = os.fspath(manifest_path.parent)
+    members = [os.fspath(manifest_path), *[os.path.join(root, p["path"])
+                                          for p in factorized_member_proofs(manifest)]]
+    # Immutable shards share a few deep directories. Resolve those parents
+    # once per scan, NOT once per member or once per process. Every member is
+    # still stat-ed on every call; no TTL may bless a changed source generation.
+    parents: dict[str, tuple[str, tuple[int, ...]]] = {}
+
+    def directory_generation(path):
+        info = os.stat(path)
+        return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
+
+    signatures = []
+    for path in members:
+        directory, name = os.path.split(path)
+        entry = parents.get(directory)
+        if entry is None:
+            parent = os.path.realpath(directory, strict=True)
+            entry = parents[directory] = (parent, directory_generation(parent))
+        parent = entry[0]
+        target = os.path.join(parent, name)
+        info = os.lstat(target)
+        if stat.S_ISLNK(info.st_mode) or name in {"", ".", ".."}:
+            # Final-component symlinks retain the original resolved target
+            # identity, including rejection of missing targets.
+            target = os.path.realpath(target, strict=True)
+            info = os.stat(target)
+        signatures.append((target, info.st_dev, info.st_ino, info.st_size,
+                           info.st_mtime_ns, info.st_ctime_ns))
+    # Source owners hold a read lease around attachment. Also fence parent
+    # retargeting within this scan instead of reusing an old resolved ancestor.
+    if any(os.path.realpath(path, strict=True) != resolved or directory_generation(resolved) != generation
+           for path, (resolved, generation) in parents.items()):
+        raise RuntimeError("factorized member parent changed during generation scan")
+    return tuple(signatures)
 
 
 def _build_panel_from_stable_source(
@@ -899,6 +967,7 @@ def _build_panel_from_stable_source(
     *,
     live_tail: bool = False,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    source_read_generation=None,
 ) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
@@ -932,6 +1001,7 @@ def _build_panel_from_stable_source(
             config,
             live_tail_rows=live_tail_rows,
             panel_kwargs=panel_kwargs,
+            source_read_generation=source_read_generation,
         )
         panel, hit, tier = _shared_live_panel_build(
             cache_key,
@@ -1472,8 +1542,8 @@ def _require_day_trade_opening_coverage(
     *, live_session: bool, active: int, opens: int, responses: int,
     required: int, model_observation: str, no_prints: int = 0,
 ) -> None:
-    # A source-proven absence uses yesterday's panel close provisionally:
-    # log(previous_close / previous_close) == 0 in the existing gap ABI. An
+    # A source-proven absence with a verified last-trade reference can resolve
+    # a model input. Callers exclude missing reference provenance. An
     # unknown/failed source row never counts as a resolved model input, and
     # this provisional model basis is never an observed opening/fill price.
     inputs = responses if model_observation == "latest_quote" else opens + no_prints
@@ -2403,6 +2473,56 @@ def _snapshot_local_timestamp(
     return parsed.astimezone(_display_zone(timezone_name)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _last_completed_trade_reference(panel: PanelData, panel_idx: int) -> tuple[np.ndarray, np.ndarray]:
+    """Last real completed-session close, not an auction reference or midpoint.
+
+    Resolve once per immutable panel/row (including preopen warmup), scan only
+    unresolved symbols backwards. ``alive_mask`` is observation coverage, not
+    proof of listing/delisting; a missing day must not erase the last trade.
+    Missing volume cannot prove a trade. No quote/fill/source row is modified.
+    """
+    closes = panel.close_prices
+    volumes = getattr(panel, "daily_volumes", None)
+    alive = getattr(panel, "alive_mask", None)
+    dates = panel.dates
+    sources = (closes, volumes, alive, dates)
+    key = (*map(id, sources), int(panel_idx))
+    with _LIVE_MODEL_INPUT_CACHE_LOCK:
+        entry = _LIVE_LAST_TRADE_REFERENCE_CACHE.get(key)
+        if entry is not None and all(ref() is source for ref, source in zip(entry[0], sources)):
+            _LIVE_LAST_TRADE_REFERENCE_CACHE.move_to_end(key)
+            return entry[1]
+    size = panel.num_symbols
+    prices = np.full(size, np.nan, dtype=np.float64)
+    trade_dates = np.full(size, np.datetime64("NaT"), dtype="datetime64[D]")
+    if volumes is not None and alive is not None:
+        if (np.shape(closes) != np.shape(volumes) or np.shape(alive) != np.shape(closes)
+                or np.shape(closes) != (len(dates), size) or not 0 <= panel_idx < len(dates)):
+            raise ValueError("last-trade reference requires aligned completed panel rows")
+        pending = np.ones(size, dtype=bool)
+        for row in range(panel_idx, -1, -1):
+            indices = np.flatnonzero(pending)
+            if not indices.size:
+                break
+            values = np.asarray(closes[row])[indices]
+            quantities = np.asarray(volumes[row])[indices]
+            good = (np.asarray(alive[row], dtype=bool)[indices] & np.isfinite(values)
+                    & (values > 0.) & np.isfinite(quantities) & (quantities > 0.))
+            selected = indices[good]
+            prices[selected] = values[good]
+            trade_dates[selected] = np.datetime64(dates[row], "D")
+            pending[selected] = False
+    prices.flags.writeable = trade_dates.flags.writeable = False
+    result = (prices, trade_dates)
+    if all(isinstance(source, np.ndarray) for source in sources):
+        with _LIVE_MODEL_INPUT_CACHE_LOCK:
+            _LIVE_LAST_TRADE_REFERENCE_CACHE[key] = (tuple(weakref.ref(source) for source in sources), result)
+            _LIVE_LAST_TRADE_REFERENCE_CACHE.move_to_end(key)
+            while len(_LIVE_LAST_TRADE_REFERENCE_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES:
+                _LIVE_LAST_TRADE_REFERENCE_CACHE.popitem(last=False)
+    return result
+
+
 def _day_trade_live_model_window(
     panel: PanelData,
     *,
@@ -2416,7 +2536,7 @@ def _day_trade_live_model_window(
 ) -> tuple[np.ndarray | FactorizedLiveWindow, str, str, bool, np.ndarray]:
     """Build a same-session observation without inventing a completed daily bar.
 
-    ``session_open`` is the executable 09:00 day-trade contract.  The explicit
+    ``session_open`` is the 09:00 model observation contract, not a fill. The explicit
     ``latest_quote`` mode replaces the live gap input with the freshly observed
     last-price gap.  It remains non-opening for the day-trade executor, while a
     distinct close-to-next-open paper adapter may consume it at its own 13:25
@@ -2455,6 +2575,9 @@ def _day_trade_live_model_window(
         )
     feature_cutoff = _date_string(panel.dates[panel_idx])
     source = str(price_snapshot.source or "").strip().lower()
+    # Warm the small provenance projection before 09:00 as well as reusing it
+    # after quotes arrive. It is separate from model feature normalization.
+    last_trades = _last_completed_trade_reference(panel, panel_idx)[0] if observation == "session_open" else None
     if source.startswith("panel"):
         return base, feature_cutoff, feature_cutoff, False, np.zeros((panel.num_symbols,), dtype=bool)
 
@@ -2474,7 +2597,9 @@ def _day_trade_live_model_window(
         else price_snapshot.prices
     )
     if observed_prices is None:
-        return base, feature_cutoff, decision_time, True, observed_open
+        # Explicit no-first-print evidence may still carry a reference when
+        # the provider has no opening-price column at all.
+        observed_prices = np.full(panel.num_symbols, np.nan)
     observed_prices_np = np.asarray(observed_prices, dtype=np.float64)
     if observed_prices_np.shape != (panel.num_symbols,):
         raise ValueError(
@@ -2533,10 +2658,10 @@ def _day_trade_live_model_window(
         gap_idx = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
     except ValueError:
         return base, feature_cutoff, decision_time, True, observed_open
-    # Verified no-first-print rows provisionally use the previous session's
-    # close, hence a zero gap. Unknown rows retain the ABI sentinel too, but
-    # do NOT count toward readiness; the coverage gate distinguishes them.
-    # Never write this model-only basis into the raw opening quote or mask.
+    # A source-proven no-first-print carries the LAST REAL completed trade,
+    # which can predate yesterday. A zero-volume adjusted reference/midpoint
+    # is not a trade. Unknown source rows retain the missing-feature sentinel
+    # and do not acquire a carry proof or readiness/execution eligibility.
     gap = np.zeros((panel.num_symbols,), dtype=np.float32)
     gap[observed_open] = np.log(
         observed_prices_np[observed_open] / closes_np[observed_open]
@@ -2544,6 +2669,10 @@ def _day_trade_live_model_window(
         np.float32,
         copy=False,
     )
+    if observation == "session_open":
+        carried = tw_session_no_open_print_mask(price_snapshot, session_date=decision_time[:10]) & np.isfinite(last_trades)
+        base_prices = np.where(np.isfinite(closes_np) & (closes_np > 0.), closes_np, last_trades)
+        gap[carried] = np.log(last_trades[carried] / base_prices[carried]).astype(np.float32)
     # Taiwan's ordinary daily limit is far below this bound. Extreme values
     # indicate a stale quote, corporate action, or mismatched symbol mapping.
     gap[~np.isfinite(gap) | (np.abs(gap) > 0.5)] = 0.0
@@ -2834,6 +2963,11 @@ def _build_decision_rows(
     for idx, symbol in enumerate(symbols):
         current_weight = float(current_weights[idx])
         target_weight = float(target_weights[idx])
+        model_weight = float(model_weights[idx])
+        current_price = _finite_float_or_none(current_prices[idx])
+        tradable = bool(tradable_mask[idx])
+        can_buy = bool(can_buy_mask[idx])
+        can_sell = bool(can_sell_mask[idx])
         delta_weight = float(target_weight - current_weight)
         action = classify_rebalance_action(current_weight, target_weight, delta_weight=delta_weight)
         score = _finite_float_or_none(score_arr[idx]) if score_arr is not None else None
@@ -2844,9 +2978,9 @@ def _build_decision_rows(
         )
         raw_price_return = _finite_float_or_none(price_returns[idx])
         constraint = _constraint_note(
-            tradable=bool(tradable_mask[idx]),
-            can_buy=bool(can_buy_mask[idx]),
-            can_sell=bool(can_sell_mask[idx]),
+            tradable=tradable,
+            can_buy=can_buy,
+            can_sell=can_sell,
             current_weight=current_weight,
             target_weight=target_weight,
         )
@@ -2857,32 +2991,32 @@ def _build_decision_rows(
                 "symbol": str(symbol),
                 "name": str(symbol_names.get(str(symbol), "")),
                 "action": action,
-                "decision_reason": _decision_reason(action, score, float(model_weights[idx]), constraint),
+                "decision_reason": _decision_reason(action, score, model_weight, constraint),
                 "constraint": constraint,
                 "score": score,
                 "raw_score": raw_score,
                 "abs_score_rank": int(score_ranks[idx]),
                 "abs_raw_score_rank": int(raw_score_ranks[idx]),
-                "model_weight": float(model_weights[idx]),
+                "model_weight": model_weight,
                 "current_weight": current_weight,
                 "target_weight": target_weight,
                 "delta_weight": delta_weight,
                 "abs_delta_weight": abs(delta_weight),
                 "abs_target_rank": int(target_ranks[idx]),
-                "trade_price": _finite_float_or_none(current_prices[idx]),
-                "current_price": _finite_float_or_none(current_prices[idx]),
+                "trade_price": current_price,
+                "current_price": current_price,
                 "base_price": _finite_float_or_none(base_prices[idx]),
                 "price_return": raw_price_return,
                 "stock_return": _position_stock_return(current_weight, raw_price_return),
                 "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
-                "tradable": bool(tradable_mask[idx]),
-                "can_buy": bool(can_buy_mask[idx]),
-                "can_sell": bool(can_sell_mask[idx]),
+                "tradable": tradable,
+                "can_buy": can_buy,
+                "can_sell": can_sell,
                 "position_status": _position_status(
-                    tradable=bool(tradable_mask[idx]),
+                    tradable=tradable,
                     current_weight=current_weight,
                     target_weight=target_weight,
-                    model_weight=float(model_weights[idx]),
+                    model_weight=model_weight,
                 ),
                 "stock_market_gate": _finite_float_or_none(gate[idx]) if gate is not None else None,
                 "market_delta_norm": _finite_float_or_none(market_delta_norm[idx]) if market_delta_norm is not None else None,
@@ -3350,34 +3484,41 @@ def prefetch_live_signal_prices(
         _emit_progress(progress_callback, label="opening_input", step=done,
                        total=total, message=phase)
 
-    report("config_load", 0)
-    config = load_config(config_path)
-    require_live_feature_source(config.data)
-    execution_mode = _require_supported_live_execution(config.trading.execution_mode)
-    if execution_mode != "tw_day_trade" or day_trade_model_observation not in {"session_open", "latest_quote"}:
-        raise ValueError("quote prefetch is restricted to TW day-trade opening/quote inputs")
-    root = Path(output_dir if output_dir is not None else config.runner.output_dir)
-    resolved_fold, checkpoint = _resolve_checkpoint(root, fold_id, checkpoint_path)
-    report("checkpoint_load", 0)
-    payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
-    report("panel_fingerprint", 0)
-    panel, _hit, _tier = _build_panel(config, live_tail=True, progress_callback=report)
-    report("panel_alignment", 0)
-    panel, _hit = _cached_aligned_panel(
-        panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
-        state_dict=payload["model_state_dict"],
-        fold_dir=root / f"fold_{resolved_fold:02d}", context="quote prefetch",
-        progress_callback=report,
-    )
-    index, _notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
-    report("quote_request_prepare", 0)
-    request = _live_quote_request(
-        config=config, panel=panel, panel_idx=index, execution_mode=execution_mode,
-        observation=day_trade_model_observation, price_source=price_source,
-        prices_csv=prices_csv, yahoo_chunk_size=yahoo_chunk_size,
-        tw_latest_quote_cache_seconds=tw_latest_quote_cache_seconds,
-        tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
-    )
+    report("input_preparation_queue", 0)
+    preparation_requested = time.perf_counter()
+    with _LIVE_QUOTE_PREPARATION_SLOTS:
+        preparation_queue_ms = (time.perf_counter() - preparation_requested) * 1000.0
+        report("config_load", 0)
+        config = load_config(config_path)
+        require_live_feature_source(config.data)
+        execution_mode = _require_supported_live_execution(config.trading.execution_mode)
+        if execution_mode != "tw_day_trade" or day_trade_model_observation not in {"session_open", "latest_quote"}:
+            raise ValueError("quote prefetch is restricted to TW day-trade opening/quote inputs")
+        root = Path(output_dir if output_dir is not None else config.runner.output_dir)
+        resolved_fold, checkpoint = _resolve_checkpoint(root, fold_id, checkpoint_path)
+        report("checkpoint_load", 0)
+        payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
+        report("panel_fingerprint", 0)
+        panel, _hit, _tier = _build_panel(
+            config, live_tail=True,
+            panel_end_date=panel_date if config.data.factorized_feature_manifest else None,
+            progress_callback=report)
+        report("panel_alignment", 0)
+        panel, _hit = _cached_aligned_panel(
+            panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
+            state_dict=payload["model_state_dict"],
+            fold_dir=root / f"fold_{resolved_fold:02d}", context="quote prefetch",
+            progress_callback=report,
+        )
+        index, _notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
+        report("quote_request_prepare", 0)
+        request = _live_quote_request(
+            config=config, panel=panel, panel_idx=index, execution_mode=execution_mode,
+            observation=day_trade_model_observation, price_source=price_source,
+            prices_csv=prices_csv, yahoo_chunk_size=yahoo_chunk_size,
+            tw_latest_quote_cache_seconds=tw_latest_quote_cache_seconds,
+            tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
+        )
     key = _live_quote_request_key(request)
     with _LIVE_QUOTE_INFLIGHT_LOCK:
         future = _LIVE_QUOTE_INFLIGHT.get(key)
@@ -3403,6 +3544,7 @@ def prefetch_live_signal_prices(
         result = PrefetchedLiveQuote(
             key, snapshot, started, started_utc,
             quote_started, quote_finished, requested, received,
+            preparation_queue_ms=preparation_queue_ms,
         )
         future.set_result(result)
         return result
@@ -3764,6 +3906,7 @@ def generate_live_signal(
         panel, panel_cache_hit, panel_cache_tier = _build_panel(
             config,
             live_tail=True,
+            panel_end_date=panel_date if config.data.factorized_feature_manifest else None,
             progress_callback=(
                 (lambda phase, done, total: _emit_progress(
                     progress_callback,
@@ -3795,12 +3938,19 @@ def generate_live_signal(
         raise RuntimeError(
             f"checkpoint fold mismatch: path requests {resolved_fold_id}, payload contains {saved_fold_id}"
         )
+    checkpoint_contract_started = time.perf_counter()
+    expected_checkpoint_manifest = build_inference_checkpoint_manifest(
+        panel, config, checkpoint=checkpoint_payload,
+    )
+    checkpoint_contract_build_ms = (time.perf_counter() - checkpoint_contract_started) * 1000.0
+    checkpoint_validation_started = time.perf_counter()
     validate_checkpoint_manifest(
         checkpoint_payload,
-        build_checkpoint_manifest(panel, config, include_data_content=False),
+        expected_checkpoint_manifest,
         checkpoint_path=checkpoint,
         scope="model",
     )
+    checkpoint_contract_validate_ms = (time.perf_counter() - checkpoint_validation_started) * 1000.0
     _emit_progress(progress_callback, label=progress_name, step=5, total=progress_total, message="universe aligned")
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx, panel_fallback_notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
@@ -3933,6 +4083,8 @@ def generate_live_signal(
     day_trade_open_coverage: float | None = None
     day_trade_quote_coverage: float | None = None
     day_trade_active_no_print_count = 0
+    day_trade_no_print_observed_count = 0
+    day_trade_no_print_reference_mask = np.zeros((panel.num_symbols,), dtype=bool)
     if execution_mode == "tw_day_trade":
         base_model_window = _cached_normalized_model_window(
             panel,
@@ -3969,9 +4121,11 @@ def generate_live_signal(
             day_trade_active_open_count = int(
                 np.count_nonzero(active_mask & observed_open)
             )
-            day_trade_active_no_print_count = int(np.count_nonzero(
-                active_mask & tw_session_no_open_print_mask(price_snapshot)
-            ))
+            no_print_proof = tw_session_no_open_print_mask(price_snapshot)
+            last_trade_prices, _last_trade_dates = _last_completed_trade_reference(panel, panel_idx)
+            day_trade_no_print_reference_mask = no_print_proof & np.isfinite(last_trade_prices)
+            day_trade_no_print_observed_count = int(np.count_nonzero(active_mask & no_print_proof))
+            day_trade_active_no_print_count = int(np.count_nonzero(active_mask & day_trade_no_print_reference_mask))
             quote_observed = (
                 day_trade_observed_model_price
                 if normalized_day_trade_observation == "latest_quote"
@@ -4002,6 +4156,8 @@ def generate_live_signal(
             partial_summary["opening_input_coverage"] = {
                 "active": day_trade_active_symbol_count, "opens": day_trade_active_open_count,
                 "no_prints": day_trade_active_no_print_count,
+                "no_prints_observed": day_trade_no_print_observed_count,
+                "no_print_reference_unavailable": day_trade_no_print_observed_count - day_trade_active_no_print_count,
                 "responses": day_trade_active_quote_count, "required": day_trade_required_quote_count,
                 "basis": normalized_day_trade_observation,
             }
@@ -4498,6 +4654,11 @@ def generate_live_signal(
     weights_rows: list[dict[str, Any]] = []
     raw_score_ranks = _abs_rank(raw_score_values, panel.num_symbols)
     tw_session_no_print = tw_session_no_open_print_mask(price_snapshot)
+    if execution_mode == "tw_day_trade" and day_trade_live_session:
+        last_trade_prices, last_trade_dates = _last_completed_trade_reference(panel, panel_idx)
+    else:
+        last_trade_prices = np.full(panel.num_symbols, np.nan)
+        last_trade_dates = np.full(panel.num_symbols, np.datetime64("NaT"), dtype="datetime64[D]")
     opening_prices = (
         np.asarray(price_snapshot.open_prices, dtype=np.float64)
         if price_snapshot.open_prices is not None
@@ -4559,8 +4720,25 @@ def generate_live_signal(
                 "open_price": float(opening_prices[idx]) if np.isfinite(opening_prices[idx]) else None,
                 "model_input_price_basis": (
                     normalized_day_trade_observation if day_trade_observed_model_price[idx]
-                    else "previous_close_provisional_no_first_print" if tw_session_no_print[idx]
+                    else "last_real_trade_carried_no_first_print" if tw_session_no_print[idx]
+                    and np.isfinite(last_trade_prices[idx])
+                    and normalized_day_trade_observation == "session_open"
+                    else "last_trade_reference_unavailable" if tw_session_no_print[idx]
                     and normalized_day_trade_observation == "session_open" else "unresolved_source"
+                ) if execution_mode == "tw_day_trade" and day_trade_live_session else None,
+                "model_input_price": (
+                    _finite_float_or_none(opening_prices[idx] if normalized_day_trade_observation == "session_open" else current_prices[idx])
+                    if day_trade_observed_model_price[idx] else _finite_float_or_none(last_trade_prices[idx])
+                    if tw_session_no_print[idx] and normalized_day_trade_observation == "session_open" else None
+                ) if execution_mode == "tw_day_trade" and day_trade_live_session else None,
+                "model_input_price_is_carry": bool(
+                    tw_session_no_print[idx] and np.isfinite(last_trade_prices[idx])
+                    and normalized_day_trade_observation == "session_open"
+                ) if execution_mode == "tw_day_trade" and day_trade_live_session else None,
+                "model_input_price_source_date": (
+                    str(last_trade_dates[idx]) if normalized_day_trade_observation == "session_open"
+                    and tw_session_no_print[idx] and np.isfinite(last_trade_prices[idx])
+                    else panel_date_str if day_trade_observed_model_price[idx] else None
                 ) if execution_mode == "tw_day_trade" and day_trade_live_session else None,
                 "price_return": raw_price_return,
                 "stock_return": _position_stock_return(current_weight, raw_price_return),
@@ -4658,7 +4836,7 @@ def generate_live_signal(
             quote_requested_at=quote_requested_at_text,
             quote_received_at=quote_received_at_text,
             signal_ready_at=signal_ready_at_text,
-            no_print_mask=active_mask if normalized_day_trade_observation == "session_open" else None,
+            no_print_mask=active_mask & day_trade_no_print_reference_mask if normalized_day_trade_observation == "session_open" else None,
         )
         if execution_mode == "tw_day_trade"
         and day_trade_live_session
@@ -4752,11 +4930,13 @@ def generate_live_signal(
         "official_trading_universe": quote_request.get("tw_trading_universe"),
         "opening_coverage_denominator_contract": "official_current_trading_symbols_in_model_v1" if quote_request.get("tw_trading_universe") is not None else "panel_alive_mask_v1",
         "opening_no_print_active_count": day_trade_active_no_print_count,
+        "opening_no_print_observed_count": day_trade_no_print_observed_count,
+        "opening_no_print_reference_unavailable_count": day_trade_no_print_observed_count - day_trade_active_no_print_count,
         "opening_input_resolved_count": day_trade_active_open_count + day_trade_active_no_print_count,
         "opening_input_required_count": day_trade_required_quote_count,
-        "opening_absent_print_feature_policy": "existing_zero_gap_sentinel_not_an_opening_price",
-        "opening_no_print_model_price_policy": "previous_session_close_provisional_log_gap_zero_not_executable_v1",
-        "opening_no_print_model_price_reference_field": "panel_price",
+        "opening_absent_print_feature_policy": "carry_last_real_trade_model_only_unknown_keeps_missing_sentinel",
+        "opening_no_print_model_price_policy": OPENING_LAST_TRADE_REFERENCE_CONTRACT,
+        "opening_no_print_model_price_reference_field": "model_input_price",
         "opening_model_inputs_ready": True if execution_mode == "tw_day_trade" and day_trade_live_session else None,
         "opening_source_complete": day_trade_active_open_count == day_trade_active_symbol_count if execution_mode == "tw_day_trade" and day_trade_live_session else None,
         "opening_all_symbols_complete": day_trade_active_open_count == day_trade_active_symbol_count,
@@ -4776,7 +4956,10 @@ def generate_live_signal(
             "model_cache_hit": bool(model_cache_hit),
             "completed_forward_cache": completed_forward_cache,
             "alignment_cache_hit": bool(alignment_cache_hit),
+            "checkpoint_contract_build_ms": round(checkpoint_contract_build_ms, 3),
+            "checkpoint_contract_validate_ms": round(checkpoint_contract_validate_ms, 3),
             "quote_prefetched_outside_model_lock": quote_prefetched,
+            "quote_preparation_queue_ms": getattr(_prefetched_quote, "preparation_queue_ms", None) if quote_prefetched else None,
             "pre_quote_prepare_ms": round(
                 float((quote_started - signal_started) * 1000.0), 3
             ),

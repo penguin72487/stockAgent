@@ -10,6 +10,57 @@ from downloader import tej_windows_transport as transport
 from test_tej_history import registry
 
 
+@pytest.mark.parametrize(('returncode', 'stdout', 'accepted'), [
+    (0, b'\xef\xbb\xbf1', True), (0, b'2', False), (88, b'1', False),
+])
+def test_namespace_probe_requires_exact_live_session(tmp_path, monkeypatch, returncode, stdout, accepted):
+    from downloader import tej_startup
+    from scripts import verify_tej_windows_transport as audit
+    calls = []
+    monkeypatch.setattr(tej_startup, 'interactive_transport', lambda _: {
+        'windows_session_id': 1, 'interop_socket': '/run/WSL/123_interop'})
+    def launch(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess([], returncode, stdout=stdout)
+    monkeypatch.setattr(audit.transport, 'run_guarded_windows', launch)
+    root, output = tmp_path/'probe', tmp_path/'receipt.json'
+    receipt = audit.probe(root, output, tmp_path/'live')
+    assert receipt['accepted'] is accepted
+    assert receipt['outcome'] == ('exact_interactive_session' if accepted else 'admitted_probe_failed')
+    assert receipt['provider_queries_sent'] == receipt['desktop_actions_sent'] == 0
+    assert receipt['tej_or_excel_connected'] is False
+    assert json.loads(output.read_text()) == receipt
+    assert len(calls) == 1 and 'SessionId' in calls[0][0]
+    assert calls[0][1]['windows_session_id'] == 1
+    assert calls[0][1]['interop_socket'] == '/run/WSL/123_interop'
+    assert len(list((root/'requests').glob('*.json'))) == 1
+    with pytest.raises(FileExistsError):
+        audit.probe(root, output, tmp_path/'live')
+
+
+@pytest.mark.parametrize('unpermitted', [True, False])
+def test_namespace_probe_distinguishes_unpermitted_and_admitted_timeout(tmp_path, monkeypatch, unpermitted):
+    from downloader import tej_startup
+    from scripts import verify_tej_windows_transport as audit
+    monkeypatch.setattr(tej_startup, 'interactive_transport', lambda _: {
+        'windows_session_id': 1, 'interop_socket': '/run/WSL/123_interop'})
+    calls, validated = [], []
+    evidence = tmp_path/'exact-negative.json'
+    def launch(*args, **kwargs):
+        calls.append(kwargs['request'])
+        if unpermitted:
+            raise transport.UnpermittedWindowsLaunch(evidence)
+        raise subprocess.TimeoutExpired('session-only diagnostic', 30)
+    monkeypatch.setattr(audit.transport, 'run_guarded_windows', launch)
+    monkeypatch.setattr(audit.transport, 'validate_unpermitted', lambda *args: validated.append(args))
+    root, output = tmp_path/'probe', tmp_path/'receipt.json'
+    receipt = audit.probe(root, output, tmp_path/'live')
+    assert receipt['accepted'] is False and len(calls) == 1
+    assert receipt['outcome'] == ('proven_unpermitted' if unpermitted else 'admitted_timeout')
+    assert validated == ([(root.resolve(), calls[0], evidence)] if unpermitted else [])
+    assert json.loads(output.read_text()) == receipt
+
+
 @pytest.fixture
 def launch_request(tmp_path):
     path = tmp_path/'data_tej'/'requests'/('a'*24+'-'+'b'*32+'.json')
@@ -85,6 +136,13 @@ def test_failed_relay_then_ready_relay_invokes_one_bridge_only(launch_request, m
     assert result.returncode == 0 and len(calls) == 2
     assert not calls[0].permit.exists() and calls[1].permit.exists()
     assert not list((request.parent.parent/'launches').glob('*-unpermitted.json'))
+    timing = result.bridge_launch_timing
+    assert timing['contract'] == 'tej_monotonic_guarded_transport_timing_v1'
+    assert timing['launches'] == 2
+    assert timing['total_transport_seconds'] >= timing['admission_seconds'] >= 0
+    assert timing['admitted_execution_seconds'] >= 0 and timing['permit_write_seconds'] >= 0
+    import hashlib
+    assert timing['request_sha256'] == hashlib.sha256(request.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize('timeout', [False, True])
@@ -142,14 +200,34 @@ def test_invalid_gui_session_never_launches_windows(launch_request, monkeypatch,
         transport.run_guarded_windows('SOURCE_ACTION',request=launch_request,windows_path=str,windows_session_id=session)
 
 
-def test_exhausted_transport_returns_pending_without_input_bug_retry_budget(registry,monkeypatch):
+@pytest.mark.parametrize('progress_available', [False, True])
+def test_exhausted_transport_returns_pending_without_input_bug_retry_budget(registry,monkeypatch,progress_available):
     from contextlib import closing
     from downloader.tej_history import DesktopBridge, connect, run_one
     from test_tej_history import FakeBridge
     _,root,_,_ = registry
     run_one(root,FakeBridge())
     monkeypatch.setattr(DesktopBridge,'windows_path',staticmethod(str))
-    monkeypatch.setattr(transport.subprocess,'Popen',lambda argv,**_:Process(argv[-1],acknowledgement=False))
+    import downloader.tej_history as history
+    original_write=history.atomic_write_json
+    def write(path, value, **kwargs):
+        if str(path).endswith('.progress.json') and not progress_available:
+            raise OSError('Display telemetry unavailable')
+        return original_write(path,value,**kwargs)
+    monkeypatch.setattr(history,'atomic_write_json',write)
+    def launch(argv, **kwargs):
+        worker=json.loads((root/'worker_status.json').read_text())
+        path=root/'progress'/(worker['bridge_attempt_id']+'.json.progress.json')
+        if progress_available:
+            value=json.loads(path.read_text())
+            assert value['stage']=='initializing_runtime'
+            assert value['attempt_id']==worker['bridge_attempt_id'] and value['task_id']==worker['task_id']
+            assert value['contract']=='tej_native_readback_progress_v1'
+            assert 'scanned_row_slots' not in value
+        else:
+            assert not path.exists()
+        return Process(argv[-1],acknowledgement=False)
+    monkeypatch.setattr(transport.subprocess,'Popen',launch)
     bridge = DesktopBridge(Path(__file__).resolve().parents[1],dict(TejProcessId=1,ExpectedWindow=2,ExpectedTitle='test',ExpectedWorkbook='test',ExpectedExcelWindow=3))
     assert run_one(root,bridge) == 'desktop_unavailable'
     with closing(connect(root)) as con:

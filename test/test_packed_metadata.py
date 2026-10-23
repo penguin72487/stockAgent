@@ -134,6 +134,50 @@ def test_census_order_survives_spill_and_releases_early_closed_cursor(limit):
         assert not rows._cursors
 
 
+@pytest.mark.parametrize('limit', [1, 100])
+def test_object_paths_preserve_order_updates_unicode_and_cursor_lifecycle(limit):
+    with MetadataRows(dict, dict, memory_rows=limit) as rows:
+        paths = ['雪', 'a', 'é', 'surrogate\udcff', 'zero']
+        rows.extend(record(path, storage={'kind': 'pack', 'object_sha256': 'one'}) for path in paths)
+        rows.sort(key=lambda row: row['path'])
+        assert list(rows.object_paths('one')) == sorted(paths)
+        assert list(rows.object_paths('missing')) == []
+        row = next(iter(rows.object_rows('one')))
+        row['storage']['object_sha256'] = 'two'
+        rows.update(row)
+        assert list(rows.object_paths('two')) == ['a']
+        assert list(rows.object_paths('one')) == sorted(set(paths) - {'a'})
+        iterator = rows.object_paths('one')
+        assert next(iterator) == 'surrogate\udcff'
+        assert bool(rows._cursors) is rows.spilled
+        iterator.close()
+        assert not rows._cursors
+
+
+def test_spilled_object_paths_use_covering_index_without_decoding_payload(monkeypatch):
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        rows.extend(record(path, payload='large original metadata' * 1024,
+                           storage={'kind': 'pack', 'object_sha256': 'one'}) for path in ['b', 'a'])
+        def reject_decode(_):
+            raise AssertionError('names-only lookup must not decode a data payload')
+        monkeypatch.setattr(rows, '_decode', reject_decode)
+        assert list(rows.object_paths('one')) == ['a', 'b']
+        plan = rows._db.execute('EXPLAIN QUERY PLAN SELECT path FROM entries WHERE object_sha=? ORDER BY path',
+                                ('one',)).fetchall()
+        assert any('COVERING INDEX object_entries' in row[-1] for row in plan)
+        assert not rows._cursors
+
+
+def test_object_path_cursor_can_be_closed_by_metadata_owner():
+    rows = MetadataRows(dict, dict, memory_rows=1)
+    rows.extend(record(path, storage={'kind': 'pack', 'object_sha256': 'one'}) for path in ['a', 'b'])
+    iterator = rows.object_paths('one')
+    assert next(iterator) == 'a'
+    rows.close()
+    iterator.close()
+    assert not rows._cursors and rows._db is None
+
+
 @pytest.mark.parametrize("limit", [1, 100])
 def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit):
     with MetadataRows(dict, dict, memory_rows=limit) as rows:
@@ -154,6 +198,61 @@ def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit):
             assert scratch.parent == Path("/var/tmp") and scratch.stat().st_mode & 0o777 == 0o700
     if scratch:
         assert not scratch.exists()
+
+
+@pytest.mark.parametrize('limit', [1, 100])
+def test_routed_group_bulk_update_preserves_buckets_sizes_objects_and_order(limit):
+    with MetadataRows(dict, dict, memory_rows=limit) as rows:
+        rows.extend(record(path) for path in ['雪', 'a', 'é', 'surrogate\udcff'])
+        rows.sort(key=lambda row: row['path'])
+        for index, row in enumerate(rows):
+            rows.update(row, changed_bucket=index % 2)
+        assert rows.changed_groups() == [(0, 2, 14), (1, 2, 14)]
+        # Build both indexes and exercise an open changed-group cursor while
+        # the already consumed members receive their new storage mappings.
+        assert list(rows.object_paths('new')) == []
+        iterator = rows.changed(0)
+        first = next(iterator)
+        first['size'] = 11  # A captured mutable control can change size.
+        first['storage'] = {'kind': 'pack', 'object_sha256': 'new'}
+        rows.update_many(iter([first]))
+        remaining = list(iterator)
+        assert len(remaining) == 1 and remaining[0]['path'] != first['path']
+        remaining[0]['storage'] = {'kind': 'pack', 'object_sha256': 'new'}
+        rows.update_many(remaining)
+        assert rows.changed_groups() == [(0, 2, 18), (1, 2, 14)]
+        assert list(rows.object_paths('new')) == sorted([first['path'], remaining[0]['path']])
+        assert not rows._cursors
+        rows.update_many(iter(()))
+
+
+def test_spilled_bulk_updates_reject_missing_census_members():
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        rows.extend([record('a'), record('b')])
+        with pytest.raises(ValueError, match='every census member'):
+            rows.update_many(iter([record('a'), record('unknown')]))
+        assert len(rows) == 2  # Never insert a missing source to hide failure.
+
+
+def test_storage_only_sql_does_not_rewrite_the_routing_index():
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        rows.extend([record('a'), record('b')])
+        for row in rows:
+            rows.update(row, changed_bucket=0)
+        rows.changed_groups()
+        trace = []
+        rows._db.set_trace_callback(trace.append)
+        rows.update_many(rows.changed(0))
+        rows.update(next(iter(rows)))
+        updates = [sql for sql in trace if sql.startswith('UPDATE')]
+        assert len(updates) == 3 and all('bucket=' not in sql for sql in updates)
+        candidate = 'UPDATE entries SET kind=?,size=?,object_sha=?,data=? WHERE path=?'
+        reference = ('UPDATE entries SET kind=?,size=?,object_sha=?,'
+                     'bucket=COALESCE(?,bucket),data=? WHERE path=?')
+        parameters = ('file', 7, None, '{}', b'a')
+        operations = lambda sql, values: [row[1] for row in rows._db.execute('EXPLAIN ' + sql, values)]
+        assert 'IdxDelete' not in operations(candidate, parameters)
+        assert 'IdxDelete' in operations(reference, (*parameters[:3], None, *parameters[3:]))
 
 
 def test_spill_failure_cleans_only_its_disposable_metadata(monkeypatch):

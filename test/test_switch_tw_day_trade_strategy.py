@@ -430,10 +430,242 @@ def test_discord_sync_never_accepts_a_stale_ready_receipt(monkeypatch):
         return {"updated_at": "2000-01-01T00:00:00+08:00" if len(calls) == 1 else datetime.now(strategy_switch.TAIPEI).isoformat(),
                 "run_id": "new-owner", "discord_connected": True, "core_health": "ready",
                 "scheduled_day_trade_markets": ["target"], "engine_run_id": "current-engine",
-                "startup_inference_warmup": {"status": "ready", "ready_count": 1,
-                    "markets": [{"market": "target", "checkpoint_fingerprint": "exact"}]}}
+                "startup_inference_warmup": {"status": "ready", "ready_count": 1, "run_id": "new-owner",
+                    "markets": [{"market": "target", "checkpoint_fingerprint": "exact", "status": "ready"}]}}
     monkeypatch.setattr(strategy_switch, "_object", read)
     monkeypatch.setattr(strategy_switch.wall_time, "sleep", lambda _seconds: None)
     result = strategy_switch._wait_discord_ready(expected_engine_run_id="current-engine", expected_markets={"target"},
         target_market="target", checkpoint_fingerprint="exact", previous_run_id="old-owner", timeout_seconds=1)
     assert len(calls) == 2 and result["run_id"] == "new-owner"
+
+
+@pytest.mark.parametrize("defect", ["old_warm_owner", "missing_warm_owner", "failed_mode",
+                                  "extra_mode", "missing_mode", "duplicate_mode", "wrong_checkpoint",
+                                  "wrong_engine", "disconnected", "old_scheduled_modes"])
+def test_discord_sync_requires_complete_current_owner_proof(monkeypatch, defect):
+    from copy import deepcopy
+    from datetime import datetime
+    valid = {"updated_at": datetime.now(strategy_switch.TAIPEI).isoformat(),
+             "run_id": "new-owner", "discord_connected": True, "core_health": "ready",
+             "scheduled_day_trade_markets": ["target"], "engine_run_id": "current-engine",
+             "startup_inference_warmup": {"status": "ready", "ready_count": 1, "run_id": "new-owner",
+                 "markets": [{"market": "target", "checkpoint_fingerprint": "exact", "status": "ready"}]}}
+    broken = deepcopy(valid)
+    warm = broken["startup_inference_warmup"]
+    if defect == "old_warm_owner":
+        warm["run_id"] = "old-owner"
+    elif defect == "missing_warm_owner":
+        warm.pop("run_id")
+    elif defect == "failed_mode":
+        warm["markets"][0]["status"] = "failed"
+    elif defect == "extra_mode":
+        warm["markets"].append({"market": "other", "status": "ready"})
+    elif defect == "missing_mode":
+        warm["markets"] = []
+    elif defect == "duplicate_mode":
+        warm["markets"] *= 2
+    elif defect == "wrong_checkpoint":
+        warm["markets"][0]["checkpoint_fingerprint"] = "other"
+    elif defect == "wrong_engine":
+        broken["engine_run_id"] = "old-engine"
+    elif defect == "disconnected":
+        broken["discord_connected"] = False
+    else:
+        broken["scheduled_day_trade_markets"] = ["other"]
+    reads = []
+    def read(_path):
+        reads.append(_path)
+        return broken if len(reads) == 1 else valid
+    monkeypatch.setattr(strategy_switch, "_object", read)
+    monkeypatch.setattr(strategy_switch.wall_time, "sleep", lambda _seconds: None)
+    result = strategy_switch._wait_discord_ready(expected_engine_run_id="current-engine", expected_markets={"target"},
+        target_market="target", checkpoint_fingerprint="exact", previous_run_id="old-owner", timeout_seconds=1)
+    assert len(reads) == 2 and result is valid
+
+
+@pytest.fixture
+def consumer_recovery(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from stockagent.live import day_trade_maintenance
+    live, run = tmp_path / "live", tmp_path / "run"
+    live.mkdir()
+    run.mkdir()
+    args = SimpleNamespace(live_dir=live, operations_root=tmp_path / "operations")
+    plan = {"operation": "add_independent_mode", "active_markets": ["target"],
+            "current_deployment": {"matches": True},
+            "replacement": {"stable_market_id": "target", "checkpoint_fingerprint": "exact"},
+            "history": {"start_date": "2026-01-02", "end_date": "2026-10-21",
+                        "expected_strategy_minute_rows": 270}}
+    previous = {"status": "failed_retryable", "promotion_completed": True, "plan": plan,
+                "run_dir": str(run), "error": "original readonly environment failure"}
+    promotion = {"acceptance": {"minute_curve_validation": {"validated_rows": 270}},
+                 "rollback_directory": str(tmp_path / "rollback")}
+    (live / "promotion_receipt.json").write_text(json.dumps(promotion))
+    status_path = args.operations_root / "target" / "status.json"
+    status_path.parent.mkdir(parents=True)
+    status_path.write_text(json.dumps(previous))
+    discord_path = tmp_path / "discord.json"
+    discord_path.write_text(json.dumps({"run_id": "current-owner"}))
+    monkeypatch.setattr(strategy_switch, "DISCORD_STATUS_PATH", discord_path)
+    events, writes = [], []
+    lease = {"held": False}
+    @contextmanager
+    def control_lease(**_kwargs):
+        assert not lease["held"]
+        lease["held"] = True
+        events.append("lease")
+        try:
+            yield
+        finally:
+            lease["held"] = False
+            events.append("release")
+    monkeypatch.setattr(day_trade_maintenance, "control_lease", control_lease)
+    save = strategy_switch._atomic_json
+    def write(path, payload):
+        writes.append((path, lease["held"]))
+        save(path, payload)
+    monkeypatch.setattr(strategy_switch, "_atomic_json", write)
+    monkeypatch.setattr(strategy_switch, "_flat_live_state", lambda *_args: events.append("flat"))
+    monkeypatch.setattr(strategy_switch, "_wait_engine_sync", lambda *_args: {"engine_run_id": "engine"})
+    monkeypatch.setattr(strategy_switch, "_ensure_discord_deployment_schedule", lambda *_a, **_k: {"market": "target"})
+    def restart(service):
+        events.append(service)
+        return {"service": service, "active": True}
+    monkeypatch.setattr(strategy_switch, "_restart_and_wait_active", restart)
+    monkeypatch.setattr(strategy_switch, "_wait_active", lambda *_a, **_k: None)
+    monkeypatch.setattr(strategy_switch, "_verify_dashboard", lambda **_kwargs: {"local_status": {"operational_issues": []}})
+    return SimpleNamespace(args=args, plan=plan, previous=previous, events=events, writes=writes,
+                           lease=lease, status_path=status_path, run=run, live=live)
+
+
+@pytest.mark.parametrize("already_ready", [True, False])
+def test_promoted_consumer_recovery_reuses_only_admitted_current_owner(consumer_recovery, monkeypatch, already_ready):
+    fixture = consumer_recovery
+    waits = []
+    def wait(**kwargs):
+        waits.append(kwargs)
+        if not already_ready and len(waits) == 1:
+            raise RuntimeError("not ready")
+        return {"run_id": "current-owner" if already_ready else "new-owner", "startup_inference_warmup": {"status": "ready"}}
+    monkeypatch.setattr(strategy_switch, "_wait_discord_ready", wait)
+    result = strategy_switch._recover_promoted_consumers(fixture.args, fixture.plan, fixture.previous)
+    assert result["status"] == "complete"
+    assert result["second_ledger_promotion_performed"] is False
+    assert (strategy_switch.DISCORD_SERVICE in fixture.events) is not already_ready
+    assert strategy_switch.PUBLIC_SERVICE not in fixture.events
+    assert result["public_restart"]["restarted"] is False
+    assert len(waits) == (1 if already_ready else 2)
+    assert waits[0]["previous_run_id"] == "" and waits[0]["timeout_seconds"] == 1
+    if already_ready:
+        assert result["discord"]["restart"]["restarted"] is False
+    else:
+        assert waits[1]["previous_run_id"] == "current-owner"
+    assert fixture.events[0:2] == ["lease", "flat"]
+    assert fixture.events[-1] == "release"
+    assert all(held for _, held in fixture.writes)
+    assert json.loads(fixture.status_path.read_text()) == result
+    assert json.loads(Path(result["consumer_recovery_receipt"]).read_text())["status"] == "complete"
+
+
+@pytest.mark.parametrize("stage", ["flat_and_engine_sync", "promoted_minute_scope", "schedule_update",
+                                 "discord_warmup", "public_restart", "dashboard_acceptance"])
+def test_consumer_recovery_failure_keeps_current_error_and_promoted_ledger(consumer_recovery, monkeypatch, stage):
+    fixture = consumer_recovery
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"current {stage} failure")
+    monkeypatch.setattr(strategy_switch, "_wait_discord_ready", lambda **_kwargs: {"run_id": "current-owner"})
+    if stage == "flat_and_engine_sync":
+        monkeypatch.setattr(strategy_switch, "_flat_live_state", fail)
+    elif stage == "promoted_minute_scope":
+        (fixture.live / "promotion_receipt.json").write_text(json.dumps({"acceptance": {"minute_curve_validation": {"validated_rows": 0}}}))
+    elif stage == "schedule_update":
+        monkeypatch.setattr(strategy_switch, "_ensure_discord_deployment_schedule", fail)
+    elif stage == "discord_warmup":
+        monkeypatch.setattr(strategy_switch, "_wait_discord_ready", fail)
+    elif stage == "public_restart":
+        monkeypatch.setattr(strategy_switch, "_verify_dashboard", fail)
+        monkeypatch.setattr(strategy_switch, "_restart_and_wait_active", fail)
+    else:
+        monkeypatch.setattr(strategy_switch, "_verify_dashboard", fail)
+    message = "minute scope differs" if stage == "promoted_minute_scope" else f"current {stage} failure"
+    with pytest.raises(RuntimeError, match=message):
+        strategy_switch._recover_promoted_consumers(fixture.args, fixture.plan, fixture.previous)
+    failed = json.loads(fixture.status_path.read_text())
+    assert message in failed["error"]
+    assert failed["previous_consumer_failure"] == fixture.previous["error"]
+    assert failed["consumer_recovery"]["stage"] == stage
+    assert failed["promotion_completed"] is True and failed["second_ledger_promotion_performed"] is False
+    assert json.loads(Path(failed["consumer_recovery_receipt"]).read_text())["status"] == "failed_retryable"
+    assert all(held for _, held in fixture.writes)
+    assert fixture.events[-1] == "release"
+    if stage in {"flat_and_engine_sync", "promoted_minute_scope", "schedule_update"}:
+        assert strategy_switch.PUBLIC_SERVICE not in fixture.events
+        assert strategy_switch.DISCORD_SERVICE not in fixture.events
+
+
+def test_consumer_recovery_without_lease_never_overwrites_another_owner(consumer_recovery, monkeypatch):
+    from contextlib import contextmanager
+    from stockagent.live import day_trade_maintenance
+    fixture = consumer_recovery
+    @contextmanager
+    def refused_lease(**_kwargs):
+        raise RuntimeError("another owner holds the control lease")
+        yield
+    monkeypatch.setattr(day_trade_maintenance, "control_lease", refused_lease)
+    with pytest.raises(RuntimeError, match="another owner"):
+        strategy_switch._recover_promoted_consumers(fixture.args, fixture.plan, fixture.previous)
+    assert json.loads(fixture.status_path.read_text()) == fixture.previous
+    assert fixture.status_path not in [path for path, _held in fixture.writes]
+    assert fixture.events == []
+
+
+def test_consumer_recovery_retains_truthful_dashboard_gaps(consumer_recovery, monkeypatch):
+    fixture = consumer_recovery
+    monkeypatch.setattr(strategy_switch, "_wait_discord_ready", lambda **_kwargs: {"run_id": "current-owner"})
+    monkeypatch.setattr(strategy_switch, "_verify_dashboard", lambda **_kwargs: {"local_status": {"operational_issues": ["source gap"]}})
+    result = strategy_switch._recover_promoted_consumers(fixture.args, fixture.plan, fixture.previous)
+    assert result["status"] == result["consumer_recovery"]["status"] == "complete_with_data_gaps"
+
+
+@pytest.mark.parametrize("failure", ["inactive", "unverified_api"])
+def test_consumer_recovery_restarts_unaccepted_public_owner_once(consumer_recovery, monkeypatch, failure):
+    fixture = consumer_recovery
+    monkeypatch.setattr(strategy_switch, "_wait_discord_ready", lambda **_kwargs: {"run_id": "current-owner"})
+    checks = []
+    def active(*_args, **_kwargs):
+        if failure == "inactive":
+            raise RuntimeError("public service is inactive")
+    def dashboard(**_kwargs):
+        checks.append("read")
+        if failure == "unverified_api" and len(checks) == 1:
+            raise RuntimeError("public ledger mode set differs")
+        return {"local_status": {"operational_issues": []}}
+    monkeypatch.setattr(strategy_switch, "_wait_active", active)
+    monkeypatch.setattr(strategy_switch, "_verify_dashboard", dashboard)
+    result = strategy_switch._recover_promoted_consumers(fixture.args, fixture.plan, fixture.previous)
+    assert result["status"] == "complete"
+    assert fixture.events.count(strategy_switch.PUBLIC_SERVICE) == 1
+    assert strategy_switch.DISCORD_SERVICE not in fixture.events
+    assert len(checks) == (1 if failure == "inactive" else 2)
+    assert result["consumer_recovery"]["public_initial_acceptance_error"]
+    assert all(held for _, held in fixture.writes)
+
+
+@pytest.mark.parametrize("defect", ["operation", "unpromoted", "current_identity", "checkpoint", "history"])
+def test_consumer_recovery_cannot_admit_another_operation(consumer_recovery, defect):
+    from copy import deepcopy
+    fixture = consumer_recovery
+    plan, previous = deepcopy(fixture.plan), deepcopy(fixture.previous)
+    if defect == "operation":
+        plan["operation"] = "replace_strategy"
+    elif defect == "unpromoted":
+        previous["promotion_completed"] = False
+    elif defect == "current_identity":
+        plan["current_deployment"]["matches"] = False
+    elif defect == "checkpoint":
+        plan["replacement"]["checkpoint_fingerprint"] = "other"
+    else:
+        plan["history"]["end_date"] = "2026-10-22"
+    with pytest.raises(ValueError, match="exact already-promoted"):
+        strategy_switch._recover_promoted_consumers(fixture.args, plan, previous)
+    assert fixture.events == [] and fixture.writes == []

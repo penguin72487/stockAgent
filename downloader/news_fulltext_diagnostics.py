@@ -28,7 +28,8 @@ from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_metrics import (
     CNYES_NATIVE_BODY_FAILURE_OBSERVATION_CONTRACT_VERSION, CNYES_NATIVE_BODY_FAILURE_STAGES,
 )
-from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS, NewsError, normalize_url
+from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, ETTODAY_LAYOUT_VERSIONS, NewsError, normalize_url
+from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS
 from downloader.news_fulltext_failure_focus import RECEIPT_CONTRACT_VERSION as FOCUS_RECEIPT_CONTRACT_VERSION
 from downloader.news_fulltext_failure_focus import METADATA_UPGRADE_RECEIPT_CONTRACT_VERSION
 
@@ -200,6 +201,22 @@ def retain_identity_metadata(queue, row, error, context):
                                            for selector in source.selectors[:16]]}
         if error.code == 'article_license_not_verified':
             facts['native_article_license_validation'] = article_license_validation_metadata(soup, source)
+        if source.embedded_article_layout in INEWS_LAYOUT_VERSIONS:
+            from downloader.news_fulltext_setn import inews_boundary_metadata, inews_validation_context
+            facts['inews_native_boundary'] = inews_boundary_metadata(soup,page_url=context.response.url)
+            # Same received failure and same persisted budget. Do not re-run
+            # the accepting parser or refill a bucket to obtain richer facts.
+            facts['inews_native_validation_context'] = inews_validation_context(soup,page_url=context.response.url)
+        if provider == 'upmedia':
+            from downloader.news_fulltext_upmedia import UPMEDIA_LAYOUT_VERSIONS, upmedia_boundary_metadata
+            from downloader.news_fulltext_candidates import extraction_failure_location
+            version = UPMEDIA_LAYOUT_VERSIONS.get(source.embedded_article_layout)
+            if version:
+                # Diagnose this exact received failure; do not run the accepting
+                # adapter a second time, refill a budget or make another GET.
+                facts['upmedia_native_boundary'] = upmedia_boundary_metadata(soup,
+                    adapter_contract_version=version, raw_payload=context.response.body)
+                facts['failure_location'] = extraction_failure_location(error)
         if provider == 'maxfinanciallife':
             # Reuse this already-received envelope and the existing budget.
             # Native clock drift should not require another publisher fetch;
@@ -215,6 +232,10 @@ def retain_identity_metadata(queue, row, error, context):
         if provider == 'peoplemedia':
             from downloader.news_fulltext_peoplemedia import peoplemedia_validation_metadata
             facts['peoplemedia_native_validation'] = peoplemedia_validation_metadata(soup, page_url=context.response.url)
+        if source.embedded_article_layout in BASTILLE_LAYOUT_VERSIONS:
+            from downloader.news_fulltext_bastillepost import bastillepost_validation_metadata
+            facts['bastillepost_native_validation'] = bastillepost_validation_metadata(soup, page_url=context.response.url,
+                adapter_contract_version=BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout])
         if provider == 'mitrade':
             from downloader.news_fulltext_mitrade import mitrade_validation_metadata
             facts['mitrade_native_validation'] = mitrade_validation_metadata(soup, page_url=context.response.url)
@@ -640,7 +661,7 @@ def _diagnostic_unique_object(pairs):
     return value
 
 
-def _licensed_globalvoices_scope(context, source):
+def _licensed_globalvoices_scope(context, source, *, return_document=False):
     """Prove current article rights independently of its failed body parser."""
     if (source.provider != 'globalvoices' or context.response.status != 200
             or normalize_url(context.response.url) != normalize_url(context.requested_url)
@@ -659,7 +680,7 @@ def _licensed_globalvoices_scope(context, source):
         for node in _objects(json.loads(script.get_text())):
             if str(node.get('isAccessibleForFree', 'true')).lower() == 'false':
                 return False
-    return True
+    return soup if return_document else True
 
 
 def _index_failure_context(queue, task, error):

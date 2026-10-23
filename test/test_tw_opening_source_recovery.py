@@ -280,6 +280,29 @@ def test_mis_zero_volume_with_no_open_is_waiting_print_not_transport_failure(mon
     assert result["resolved_input_count"] == 1 and result["recovered_input_count"] == 0
 
 
+@pytest.mark.parametrize("proof_age_ms,accepted", [(10_000, True), (15_000, True), (15_001, False), (-1_000, False)])
+def test_broker_refresh_cannot_renew_official_absence_proof_age(monkeypatch, tmp_path, proof_age_ms, accepted):
+    no_print = snapshot([np.nan])
+    no_print.volumes = np.zeros(1)
+    no_print.timestamps_ms -= proof_age_ms
+    quotes.seed_tw_opening_snapshot_cache(["A"], no_print, parquet_root=tmp_path)
+    stale_broker = snapshot([np.nan], source="shioaji:stock_snapshot", exchange_ms=1)
+    quotes.seed_tw_opening_snapshot_cache(["A"], stale_broker, parquet_root=tmp_path)
+    cached = quotes.fetch_tw_mis_opening_snapshot(["A"], np.array([99.]), parquet_root=tmp_path, allow_network=False)
+    assert quotes.tw_session_no_open_print_mask(cached).tolist() == [accepted]
+    assert np.isnan(cached.open_prices[0]), "a carry reference must never manufacture an opening print"
+    assert cached.available_mask.tolist() == [True], "row transport evidence remains separate"
+    assert cached.transport_timing["opening_stale_no_print_proof_count"] == int(not accepted)
+    session = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    original_proof = int(no_print.timestamps_ms[0])
+    receipt = json.loads(quotes._tw_mis_opening_receipt_path(session).read_text())
+    assert receipt["rows"]["A"]["no_open_print_observed_ms"] == original_proof
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", lambda *a, **k: stale_broker)
+    repaired = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
+    assert repaired["status"] == ("awaiting_first_print" if accepted else "waiting_source")
+    assert repaired["reported_no_open_print_count"] == int(accepted)
+
+
 def test_new_no_first_print_is_input_progress_without_becoming_an_execution_price(monkeypatch, tmp_path):
     quotes.seed_tw_opening_snapshot_cache(
         ["A", "B"], snapshot([100.0, np.nan], available=[True, False]), parquet_root=tmp_path,

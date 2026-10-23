@@ -138,6 +138,61 @@ def watchmedia_article_id(url, *, requested=False):
     return None
 
 
+def watchmedia_credit_boundary_metadata(soup, *, page_url):
+    """Own header versus recommendation credits; hashes/counts, never prose.
+
+    This fixed diagnostic question does not grant attribution or body scope.
+    In particular a Person in a recommendation cannot fill a missing byline.
+    Reuse only the resident owner's received document, with bounded schema
+    declarations and at most eight sampled headers/profiles.
+    """
+    digest = lambda value: hashlib.sha256(value.encode()).hexdigest() if isinstance(value, str) else None
+    scopes = soup.select('body > div.elementor-location-single')
+    headings = [node for scope in scopes for node in scope.select(_TITLE)]
+    all_credits = [node for scope in scopes for node in scope.select(
+        '.elementor-widget-post-info [itemprop=author]')]
+    headers = [heading.parent.parent.parent for heading in headings[:8]]
+    own_credits = [node for header in headers for node in header.select(
+        '.elementor-widget-post-info [itemprop=author]')]
+    own_ids = {id(node) for node in own_credits}
+    try:
+        objects = _declarations(soup)
+        if len(objects) > 2048:
+            raise NewsError('unbounded_validation_metadata')
+    except NewsError:
+        objects, schema_error = [], True
+    else:
+        schema_error = False
+    articles = [obj for obj in objects if obj.get('@type') == 'NewsArticle']
+    persons = [obj for obj in objects if obj.get('@type') == 'Person']
+    declarations = []
+    for article in articles[:8]:
+        author = article.get('author')
+        author = author if isinstance(author, dict) else {}
+        profile = author.get('@id')
+        matching = [obj for obj in persons if isinstance(profile, str) and obj.get('@id') == profile]
+        declarations.append({'author_type': type(article.get('author')).__name__,
+            'author_id_sha256': digest(profile), 'author_name_sha256': digest(author.get('name')),
+            'matching_person_count': len(matching),
+            'matching_person_name_present': [isinstance(obj.get('name'), str) and bool(obj['name'].strip())
+                                             for obj in matching[:8]],
+            'matching_person_works_for_publisher': [obj.get('worksFor') == {'@id': WATCHMEDIA_ORIGIN+'/#organization'}
+                                                   for obj in matching[:8]]})
+    return {'contract_version': 1, 'question': 'watchmedia_own_credit_boundary_v1',
+        'current_native_url_recognized': watchmedia_article_id(page_url) is not None,
+        'single_scope_count': len(scopes), 'heading_count': len(headings),
+        'headers_sampled': len(headers), 'headers_truncated': len(headings) > 8,
+        'all_post_info_credit_count': len(all_credits), 'own_header_credit_count': len(own_credits),
+        'non_header_credit_count': sum(id(node) not in own_ids for node in all_credits),
+        'own_header_credit_sha256': [digest(node.get_text(' ', strip=True)) for node in own_credits[:8]],
+        'own_header_credits_truncated': len(own_credits) > 8,
+        'schema_error': schema_error, 'article_schema_count': len(articles),
+        'person_schema_count': len(persons), 'article_author_declarations': declarations,
+        'article_author_declarations_truncated': len(articles) > 8,
+        'source_or_author_acceptance_granted': False, 'body_or_names_exported': False,
+        'additional_requests': 0}
+
+
 def watchmedia_response_identity(request_url, response, title, metadata_title):
     """One actual legacy301 + original metadata title, not a generated alias.
 

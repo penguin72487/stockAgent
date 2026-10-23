@@ -342,11 +342,40 @@ class MetadataRows(Generic[T]):
             self._objects = None
         else:
             path, kind, size, digest, bucket, payload = self._record(value, changed_bucket)
-            result = self._db.execute("UPDATE entries SET kind=?,size=?,object_sha=?,"
-                                      "bucket=COALESCE(?,bucket),data=? WHERE path=?",
-                                      (kind, size, digest, bucket, payload, path))
+            if changed_bucket is None:
+                # Merely naming bucket in SET makes SQLite maintain the large
+                # changed_entries index, even when COALESCE retains its value.
+                # Packing changes storage, not the already selected grouping.
+                result = self._db.execute("UPDATE entries SET kind=?,size=?,object_sha=?,data=? WHERE path=?",
+                                          (kind, size, digest, payload, path))
+            else:
+                result = self._db.execute("UPDATE entries SET kind=?,size=?,object_sha=?,bucket=?,data=? WHERE path=?",
+                                          (kind, size, digest, bucket, payload, path))
             if result.rowcount != 1:
                 raise ValueError("metadata update does not identify one census member")
+
+    def update_many(self, values: Iterable[T]):
+        """Update an already-routed group without touching its bucket index.
+
+        Consume records one at a time in SQLite's existing transaction; no
+        second inventory, commit or durability authority is introduced. A
+        missing path still rejects the publication, as individual updates do.
+        """
+        if self._db is None:
+            for value in values:
+                self.update(value)
+            return
+        count = 0
+        def records():
+            nonlocal count
+            for value in values:
+                path, kind, size, digest, _, payload = self._record(value)
+                count += 1
+                yield kind, size, digest, payload, path
+        result = self._db.executemany("UPDATE entries SET kind=?,size=?,object_sha=?,data=? WHERE path=?",
+                                      records())
+        if result.rowcount != count:
+            raise ValueError("metadata updates do not identify every census member")
 
     def changed_groups(self) -> list[tuple[int, int, int]]:
         if self._db is not None:
@@ -403,6 +432,32 @@ class MetadataRows(Generic[T]):
                     if object_sha is not None:
                         self._objects.setdefault(object_sha, []).append(value)
             yield from self._objects.get(digest, ())
+
+    def object_paths(self, digest: str) -> Iterator[str]:
+        """Read names from the covering index, not full JSON payload rows.
+
+        ZIP membership checks need only ordered names. Decoding every complete
+        inventory row here, then again for full original recovery, needlessly
+        doubles row reads/JSON work on multi-million-file releases. The same
+        disposable index and exact UTF-8/surrogate ordering remain authoritative
+        only for this pass; original SHA/CRC recovery is unchanged.
+        """
+        if self._db is None:
+            for value in self.object_rows(digest):
+                yield self._encode(value)['path']
+            return
+        if not self._object_index:
+            self._db.execute("CREATE INDEX object_entries ON entries(object_sha,path)")
+            self._object_index = True
+        cursor = self._db.execute("SELECT path FROM entries WHERE object_sha=? ORDER BY path", (digest,))
+        self._cursors.add(cursor)
+        try:
+            for (path,) in cursor:
+                yield path.decode('utf-8', errors='surrogatepass')
+        finally:
+            if cursor in self._cursors:
+                self._cursors.remove(cursor)
+                cursor.close()
 
     def chunked_rows(self) -> Iterator[T]:
         rows = self._query("WHERE kind='file' AND object_sha IS NULL") if self._db is not None else iter(self)

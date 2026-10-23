@@ -57,8 +57,9 @@ TW_CURRENT_RULE_ORDINAL = int(np.iinfo(np.int64).max)
 # A bounded historical registry for the selected all-futures intraday archive.
 # This is deliberately not a latest-specification fallback for arbitrary dates.
 # Sources, product identity and limits: docs/tw_futures_price_grid_evidence_2026-09-27.md.
-TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 2
+TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 3
 TAIFEX_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2020-03-23", "D")
+TAIFEX_STOCK_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2011-01-03", "D")
 TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH = np.datetime64("2026-09-27", "D")
 # product: (tick, first verified date, exclusive end or None).  For products
 # already trading in 2020 the lower bound is this archive's scope, not listing.
@@ -270,16 +271,18 @@ def _taifex_futures_history_metadata(
     products = np.char.upper(np.char.strip(
         np.broadcast_to(np.asarray(product_codes).astype(str), shape)
     ))
-    # Only TX/MTX received the earlier-source review. Do not accidentally extend
-    # the remaining index, stock or ETF contracts when expanding this registry.
-    first = np.where(np.isin(products, ["TX", "MTX"]),
-                     int(np.datetime64("2011-01-03", "D").astype(np.int64)),
-                     int(TAIFEX_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)))
-    if np.any((ordinals < first) | (ordinals > int(TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)))):
-        raise ValueError("TAIFEX futures date outside verified historical window (TX/MTX 2011+, other products 2020+)")
     kinds = np.broadcast_to(np.asarray(asset_classes).astype(str), shape)
     if not np.all(np.isin(kinds, ["stock_future", "etf_future", "index_future"])):
         raise ValueError("unsupported TAIFEX futures asset class")
+    # The launch-era official stock-futures booklet establishes the six tick
+    # bands and 08:45 day session. Keep unrelated index/ETF periods bounded.
+    # Listing, adjusted contract units and expiry still need the dated master.
+    earlier = np.isin(products, ["TX", "MTX"]) | (kinds == "stock_future")
+    first = np.where(earlier,
+                     int(TAIFEX_STOCK_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)),
+                     int(TAIFEX_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)))
+    if np.any((ordinals < first) | (ordinals > int(TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)))):
+        raise ValueError("TAIFEX futures date outside verified historical window (TX/MTX/stock 2011+, other products 2020+)")
     if np.any(np.isin(products, ["", "NONE", "NAN"])):
         raise ValueError("historical TAIFEX futures product code is required")
     index_product = np.isin(products, list(_TAIFEX_INDEX_HISTORY))
@@ -307,7 +310,7 @@ def _taifex_futures_history_metadata(
 def taifex_futures_tick_size_numpy(
     price: np.ndarray, dates: Any, *, product_codes: Any, asset_classes: Any,
 ) -> np.ndarray:
-    """Dated ordinary outright ticks: TX/MTX 2011+, other products 2020+.
+    """Dated outright ticks: TX/MTX/stock 2011+, other products 2020+.
 
     Index grids are product-specific. Stock and ETF grids reuse ``tick_size_numpy``
     including the stock-futures 2026-07-06 amendment. The dated contract master,

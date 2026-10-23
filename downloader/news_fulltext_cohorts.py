@@ -257,6 +257,10 @@ def sync_cohorts(queue, *, freeze_new=True):
                     or count != header["urls"] or count != receipt.get("urls")
                     or digest != header["urls_sha256"] or digest != receipt.get("urls_sha256")):
                 raise ValueError("finite news cohort receipt/membership mismatch: " + source.provider)
+            if source.finite_article_urls:
+                expected = hashlib.sha256(''.join(url+'\n' for url in source.finite_article_urls).encode()).hexdigest()
+                if count != len(source.finite_article_urls) or digest != expected:
+                    raise ValueError('explicit finite article scope differs from immutable cohort')
         else:
             if not freeze_new:
                 # An explicit enqueue/fetch still has its complete selected
@@ -264,11 +268,20 @@ def sync_cohorts(queue, *, freeze_new=True):
                 # but do not freeze the few old rows before that batch arrives.
                 continue
             with queue.db:
-                from downloader.news_fulltext_urls import seed_unfrozen_finite_originals
-                if not seed_unfrozen_finite_originals(queue, source):
-                    continue  # Never freeze a partial large-scope routing prefix.
-                queue.db.execute("INSERT INTO finite_cohort_members SELECT provider,id,url FROM articles WHERE provider=?",
-                                 (source.provider,))
+                if source.finite_article_urls:
+                    placeholders = ','.join('?' for _ in source.finite_article_urls)
+                    selection = 'provider=? AND url IN ('+placeholders+')'
+                    binds = (source.provider, *source.finite_article_urls)
+                    found = queue.db.execute('SELECT count(*) FROM articles WHERE '+selection, binds).fetchone()[0]
+                    if found != len(source.finite_article_urls):
+                        continue  # Never freeze an incomplete explicit selection.
+                    queue.db.execute('INSERT INTO finite_cohort_members SELECT provider,id,url FROM articles WHERE '+selection, binds)
+                else:
+                    from downloader.news_fulltext_urls import seed_unfrozen_finite_originals
+                    if not seed_unfrozen_finite_originals(queue, source):
+                        continue  # Never freeze a partial large-scope routing prefix.
+                    queue.db.execute("INSERT INTO finite_cohort_members SELECT provider,id,url FROM articles WHERE provider=?",
+                                     (source.provider,))
                 count, digest = membership_digest(queue.db, source.provider)
                 if not count:
                     continue  # Do not freeze an empty pre-ingest universe.

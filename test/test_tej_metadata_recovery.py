@@ -11,7 +11,8 @@ from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import (DESKTOP_INPUT_CONTRACT, DesktopBridge, MetadataPreparationError,
                                     configure_runtime_policy, connect, run_one, task_request)
 from downloader.tej_metadata_recovery import (
-    CONTRACT, RETRY_SCHEDULED, failed_plan_proof, metadata_recovery_policy, recover_failed_metadata,
+    CONTRACT, LEGACY_REQUEUE_CONTRACT, RETRY_SCHEDULED, failed_plan_proof, metadata_recovery_policy,
+    recover_failed_metadata, requeue_legacy_metadata,
 )
 from downloader.tej_scheduler import watch_queue
 from test_tej_history import FakeBridge, MetadataRecoveryBridge, registry, runtime_notice
@@ -80,6 +81,133 @@ def expire_probe(root, task):
         con.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(saved), key))
 
 
+def legacy_plan(fixture):
+    _, root, task, prepared, outcome, manifest, _ = fixture
+    manifest.unlink()  # This early plan really lacks immutable launch evidence.
+    with closing(connect(root)) as con, con:
+        con.execute("UPDATE tasks SET last_error_code='metadata_preparation_failed_deferred' WHERE task_id=?",
+                    (task['task_id'],))
+    return root, task['task_id'], prepared, outcome
+
+
+def test_explicit_legacy_metadata_retry_preserves_failure_and_uses_normal_collector(failed_metadata):
+    root, task_id, prepared, outcome = legacy_plan(failed_metadata)
+    original = prepared.read_bytes(), outcome.read_bytes()
+    bridge = FreshBridge()
+    # No new authority leaks into negative-proof automatic recovery.
+    assert recover_failed_metadata(root, bridge, policy=metadata_recovery_policy(CONFIG)) is None
+    assert bridge.calls == []
+    with closing(connect(root)) as con:
+        before = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone())
+        original_events = [tuple(r) for r in con.execute('SELECT * FROM traffic')]
+    result = requeue_legacy_metadata(root, task_id, bridge, prepared, acknowledge_unknown_usage=True)
+    assert result['state'] == RETRY_SCHEDULED
+    assert bridge.calls == ['inspect_notices', 'confirm_metadata_error_cleared']
+    audit_path = root/result['audit_path']
+    audit = json.loads(audit_path.read_text())
+    assert audit['contract'] == LEGACY_REQUEUE_CONTRACT and audit['state'] == 'committed'
+    assert audit['original_task'] == before
+    assert audit['old_query_proven_unsent'] is False and audit['unknown_original_usage_acknowledged'] is True
+    assert audit_path.stat().st_mode & 0o777 == 0o600
+    assert (prepared.read_bytes(), outcome.read_bytes()) == original
+    with closing(connect(root)) as con:
+        after = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone())
+        assert [tuple(r) for r in con.execute('SELECT * FROM traffic')] == original_events
+    assert {k: v for k, v in after.items() if k not in {'state','last_error_code','next_attempt_at_utc'}} == {
+        k: v for k, v in before.items() if k not in {'state','last_error_code','next_attempt_at_utc'}}
+    with pytest.raises(ValueError):
+        requeue_legacy_metadata(root, task_id, bridge, prepared, acknowledge_unknown_usage=True)
+    assert len(bridge.calls) == 2  # Repeating a consumed one-shot cannot touch the desktop.
+    assert run_one(root, FakeBridge(), kind='discover') == 'completed_task'
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task_id,)).fetchone()[0] == 'complete'
+
+
+@pytest.mark.parametrize('fault', ['no_grant', 'unknown', 'download', 'wrong_scope', 'active_attempt',
+    'source_output', 'stage', 'changed_request', 'failed_clock', 'duplicate_event', 'stale_interface'])
+def test_legacy_metadata_one_shot_refuses_unknown_or_changed_scope(failed_metadata, fault):
+    root, task_id, prepared, outcome = legacy_plan(failed_metadata)
+    bridge = FreshBridge(stale=fault == 'stale_interface')
+    with closing(connect(root)) as con, con:
+        updates = {'unknown': ('last_error_code', 'unknown_outcome_no_auto_retry'),
+                   'download': ('kind', 'download'), 'wrong_scope': ('scope_contract', 'foreign'),
+                   'active_attempt': ('active_attempt_id', 'a'*24+'-'+'b'*32)}
+        if fault in updates:
+            column, value = updates[fault]
+            con.execute(f'UPDATE tasks SET {column}=? WHERE task_id=?', (value, task_id))
+        if fault == 'failed_clock':
+            con.execute('UPDATE traffic SET completed_at_utc=?', ((datetime.now(UTC)+timedelta(hours=2)).isoformat(),))
+        if fault == 'duplicate_event':
+            con.execute("INSERT INTO traffic SELECT 'duplicate',action,started_at_utc,completed_at_utc,state FROM traffic")
+        before = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone())
+    if fault == 'source_output': atomic_write_json(root/'raw'/prepared.name, {})
+    if fault == 'stage': atomic_write_json(root/'raw'/(prepared.name+'.stage.json'), {})
+    if fault == 'changed_request':
+        doc = json.loads(prepared.read_text()); doc['table'] = 'foreign'; atomic_write_json(prepared, doc)
+    with pytest.raises((ValueError, KeyError)):
+        requeue_legacy_metadata(root, task_id, bridge, prepared, acknowledge_unknown_usage=fault != 'no_grant')
+    with closing(connect(root)) as con:
+        assert dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()) == before
+    if fault != 'stale_interface': assert bridge.calls == []
+
+
+@pytest.mark.parametrize('fault', ['queue_changed', 'request_changed', 'source_output', 'audit_write_failed'])
+def test_legacy_metadata_rechecks_after_interface_and_requires_durable_intent(failed_metadata, monkeypatch, fault):
+    from downloader import tej_history, tej_metadata_recovery
+    root, task_id, prepared, _ = legacy_plan(failed_metadata)
+    isolate = tej_history.isolate_failed_metadata
+
+    def changed(*args, **kwargs):
+        result = isolate(*args, **kwargs)
+        if fault == 'queue_changed':
+            with closing(connect(root)) as con, con:
+                con.execute('UPDATE tasks SET priority=priority+1 WHERE task_id=?', (task_id,))
+        elif fault == 'request_changed':
+            doc = json.loads(prepared.read_text()); doc['table'] = 'changed'
+            atomic_write_json(prepared, doc)
+        elif fault == 'source_output':
+            atomic_write_json(root/'raw'/prepared.name, {'retained':True})
+        return result
+
+    monkeypatch.setattr(tej_history, 'isolate_failed_metadata', changed)
+    if fault == 'audit_write_failed':
+        def fail(*_args, **_kwargs): raise OSError('Owned audit disk fault')
+        monkeypatch.setattr(tej_metadata_recovery, 'atomic_write_bytes', fail)
+    with pytest.raises(OSError if fault == 'audit_write_failed' else ValueError):
+        requeue_legacy_metadata(root, task_id, FreshBridge(), prepared, acknowledge_unknown_usage=True)
+    with closing(connect(root)) as con:
+        task = con.execute('SELECT state,last_error_code FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+        assert tuple(task) == ('blocked', 'metadata_preparation_failed_deferred')
+        assert con.execute('SELECT COUNT(*) FROM desktop_retry_windows').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('fault', [None, 'no_acknowledgement', 'no_evidence', 'multiple', 'preview_selector'])
+def test_cli_legacy_metadata_requeue_requires_explicit_exact_single_plan(failed_metadata, monkeypatch, fault):
+    from downloader import download_tej_history as cli, tej_metadata_recovery
+    root, task_id, prepared, _ = legacy_plan(failed_metadata)
+    config, session = root/'config.json', root/'desktop_session.json'
+    atomic_write_json(config, CONFIG); atomic_write_json(session, {})
+    argv = ['retry-metadata', '--root', str(root), '--config', str(config), '--session', str(session),
+            '--task-id', task_id]
+    if fault != 'no_acknowledgement': argv.append('--acknowledge-unknown-usage')
+    if fault != 'no_evidence': argv.extend(['--evidence', str(prepared)])
+    if fault == 'multiple': argv.extend(['--max-tasks', '2'])
+    if fault == 'preview_selector': argv.extend(['--response', 'preview'])
+    calls = []
+    monkeypatch.setattr(cli, 'DesktopBridge', lambda *_args: 'exact session bridge')
+    def requeue(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {'state':RETRY_SCHEDULED}
+    monkeypatch.setattr(tej_metadata_recovery, 'requeue_legacy_metadata', requeue)
+    if fault:
+        with pytest.raises(SystemExit) as caught: cli.main(argv)
+        assert caught.value.code == 2 and not calls
+    else:
+        assert cli.main(argv) == 0
+        assert calls == [((root, task_id, 'exact session bridge', prepared),
+                         {'acknowledge_unknown_usage':True, 'acknowledge_known_notices':True})]
+
+
 def test_timeout_is_rechecked_after_restart_without_preview_or_lost_evidence(failed_metadata):
     _, root, task, prepared, outcome, _, _ = failed_metadata
     original = prepared.read_bytes(), outcome.read_bytes()
@@ -99,6 +227,65 @@ def test_timeout_is_rechecked_after_restart_without_preview_or_lost_evidence(fai
         assert con.execute("SELECT state FROM traffic WHERE event_id='original'").fetchone()[0] == "failed"
         assert con.execute("SELECT count(*) FROM desktop_attempts").fetchone()[0] == 0
     assert run_one(root, FreshBridge()) == "idle"  # Not due; never re-run plan immediately.
+
+
+@pytest.mark.parametrize('fault', ['syntax', 'array', 'null', 'scalar', 'bytes', 'oversized',
+                                  'missing_clock', 'invalid_clock', 'naive_clock', 'excessive_clock'])
+def test_corrupt_retry_hint_is_preserved_and_deferred_without_crashing_or_early_retry(failed_metadata, fault):
+    _, root, task, prepared, outcome, _, _ = failed_metadata
+    original_evidence = prepared.read_bytes(), outcome.read_bytes()
+    hint = {'contract': CONTRACT, 'attempted_at_utc': task['attempted_at_utc'], 'failures': 7,
+            'next_check_at_utc': (datetime.now(UTC)+timedelta(seconds=60)).isoformat()}
+    raw = {'syntax': '{broken', 'array': '[]', 'null': 'null', 'scalar': '17',
+           'bytes': b'bad-sqlite-value', 'oversized': 'x'*65537}.get(fault)
+    if raw is None:
+        if fault == 'missing_clock': hint.pop('next_check_at_utc')
+        if fault == 'invalid_clock': hint['next_check_at_utc'] = 'bad-clock'
+        if fault == 'naive_clock': hint['next_check_at_utc'] = '2026-10-22T01:00:00'
+        if fault == 'excessive_clock': hint['next_check_at_utc'] = '9999-01-01T00:00:00+00:00'
+        raw = json.dumps(hint)
+    key = 'metadata_recovery.'+task['task_id']
+    with closing(connect(root)) as con, con:
+        con.execute('INSERT INTO meta VALUES (?,?)', (key, raw))
+    bridge = FreshBridge()
+    before = datetime.now(UTC)
+    policy = metadata_recovery_policy(CONFIG)
+    assert recover_failed_metadata(root, bridge, policy=policy) is None
+    assert recover_failed_metadata(root, bridge, policy=policy) is None  # Survives a process restart too.
+    assert bridge.calls == []
+    with closing(connect(root)) as con:
+        repaired = json.loads(con.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()[0])
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()[0] == 'blocked'
+    assert repaired['failure_reason_code'] == 'local_retry_hint_quarantined'
+    assert datetime.fromisoformat(repaired['next_check_at_utc']) >= before+timedelta(seconds=900)
+    archive = root/repaired['preserved_hint_path']
+    assert archive.read_bytes() == (raw if isinstance(raw, bytes) else raw.encode('utf-8'))
+    assert hashlib.sha256(archive.read_bytes()).hexdigest() == repaired['preserved_hint_sha256']
+    assert archive.stat().st_mode & 0o777 == 0o600
+    assert len(list((root/'diagnostics').glob('retry-hint-*'))) == 1
+    expire_probe(root, task)
+    assert recover_failed_metadata(root, bridge, policy=policy)['state'] == RETRY_SCHEDULED
+    assert bridge.calls == ['inspect_notices', 'confirm_metadata_error_cleared']
+    assert (prepared.read_bytes(), outcome.read_bytes()) == original_evidence
+
+
+def test_repaired_local_hint_cannot_substitute_for_missing_source_proof(failed_metadata):
+    _, root, task, _, outcome, _, _ = failed_metadata
+    # A malformed non-critical local hint is isolated. It must not be used to
+    # bypass a truly unknown source action or clear the global interface gate.
+    key = 'metadata_recovery.'+task['task_id']
+    with closing(connect(root)) as con, con:
+        con.execute("UPDATE tasks SET last_error_code='metadata_preparation_failed_deferred' WHERE task_id=?", (task['task_id'],))
+        con.execute('INSERT INTO meta VALUES (?,?)', (key, '[]'))
+    outcome.unlink()
+    bridge = FreshBridge()
+    policy = metadata_recovery_policy(CONFIG)
+    assert recover_failed_metadata(root, bridge, policy=policy) is None
+    expire_probe(root, task)
+    assert recover_failed_metadata(root, bridge, policy=policy) is None
+    assert bridge.calls == []
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()[0] == 'blocked'
 
 
 def test_completed_metadata_retry_releases_window_for_new_downloads(failed_metadata):

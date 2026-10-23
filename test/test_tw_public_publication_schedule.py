@@ -1221,6 +1221,8 @@ def test_cold_publish_holds_canonical_refresh_lock(tmp_path: Path, monkeypatch: 
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         with lock_path.open("a+", encoding="utf-8") as other:
+            fcntl.flock(other.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with lock_path.open("a+", encoding="utf-8") as other:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         calls.append(command)
@@ -1392,6 +1394,8 @@ def test_cold_commit_releases_source_lease_before_waking_scan_retry(
         fd = int(command[command.index("--source-lock-fd") + 1])
         assert kwargs["pass_fds"] == (fd,)
         assert os.fstat(fd).st_ino == lock_path.stat().st_ino
+        with lock_path.open("a+") as reader:
+            fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
         with lock_path.open("a+") as other:
             with pytest.raises(BlockingIOError):
                 fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -99,6 +99,7 @@
       "serverMs", "paintMs", "domContentLoadedMs", "loadMs", "fcpMs",
       "lcpMs", "viewportWidth", "viewportHeight",
       "prepareMs", "drawMs", "pointCount", "seriesCount",
+      "noticeToApplyMs", "applyToPaintMs",
     ];
     for (const field of numericFields) {
       const maximum = field === "pointCount" || field === "seriesCount"
@@ -109,6 +110,23 @@
     const status = Number(row.status);
     if (Number.isInteger(status) && status >= 100 && status <= 599) {
       metric.status = status;
+    }
+    const correlation = row.correlation;
+    if (correlation && typeof correlation === "object") {
+      const safe = {};
+      for (const key of ["market", "revisionToken"]) {
+        if (typeof correlation[key] === "string" && /^[A-Za-z0-9_.:-]{1,256}$/.test(correlation[key])) safe[key] = correlation[key];
+      }
+      for (const key of ["engineGeneration", "signalKey"]) {
+        if (/^[a-f0-9]{32}$/.test(correlation[key] || "")) safe[key] = correlation[key];
+      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(correlation.sessionDate || "")) safe.sessionDate = correlation.sessionDate;
+      if (Number.isSafeInteger(correlation.stateRevision) && correlation.stateRevision > 0) safe.stateRevision = correlation.stateRevision;
+      if (["sse", "poll", "initial_or_unmatched"].includes(correlation.trigger)) safe.trigger = correlation.trigger;
+      if (["status_mode_snapshot", "detail_signal_identity_only"].includes(correlation.viewEvidence)) safe.viewEvidence = correlation.viewEvidence;
+      if (["initial", "revision_change"].includes(correlation.updatePhase)) safe.updatePhase = correlation.updatePhase;
+      safe.clockBasis = "browser_monotonic_foreground_double_raf_opportunity_not_physical_pixel";
+      metric.correlation = Object.freeze(safe);
     }
     return Object.freeze(metric);
   }
@@ -223,6 +241,54 @@
       return;
     }
     global.requestAnimationFrame(() => global.requestAnimationFrame(callback));
+  }
+
+  function createRevisionPaintObserver({getCurrentRevision}) {
+    // Reuse browser-local bounded history; no public POST or market-data I/O.
+    // Match the status that was actually APPLIED, not a newer SSE notification.
+    const notices = new Map(), recorded = new Set(), pending = new Set();
+    let visibilityGeneration = 0;
+    global.document?.addEventListener("visibilitychange", () => { visibilityGeneration += 1; });
+    const identity = revision => {
+      const token = revision?.revision_token, generation = revision?.engine_generation, number = revision?.state_revision;
+      if (typeof token !== "string" || !/^[A-Za-z0-9_.:-]{1,256}$/.test(token) || !/^[a-f0-9]{32}$/.test(generation || "")
+          || !Number.isSafeInteger(number) || number <= 0) return null;
+      return JSON.stringify([token, generation, number]);
+    };
+    const trim = (collection, maximum) => {
+      while (collection.size > maximum) collection.delete(collection.keys().next().value);
+    };
+    return Object.freeze({
+      notice(revision, trigger = "sse") {
+        const key = identity(revision);
+        if (!key || global.document?.hidden || notices.has(key)) return;
+        notices.set(key, {at: now(), trigger: trigger === "poll" ? "poll" : "sse"});
+        trim(notices, 16);
+      },
+      applied({revision, action, market, sessionDate, signalKey, viewEvidence = "status_mode_snapshot", updatePhase = "revision_change", stillCurrent = () => true}) {
+        const key = identity(revision);
+        if (!key || global.document?.hidden || typeof global.requestAnimationFrame !== "function"
+            || !/^[a-f0-9]{32}$/.test(signalKey || "")) return false;
+        const sampleKey = JSON.stringify([key, action, market, sessionDate, signalKey]);
+        if (recorded.has(sampleKey) || pending.has(sampleKey) || pending.size >= 128) return false;
+        pending.add(sampleKey);
+        const appliedAt = now(), notice = notices.get(key), visible = visibilityGeneration;
+        global.requestAnimationFrame(() => global.requestAnimationFrame(() => {
+          pending.delete(sampleKey);
+          if (global.document?.hidden || visible !== visibilityGeneration
+              || identity(getCurrentRevision()) !== key || !stillCurrent()) return;
+          recorded.add(sampleKey); trim(recorded, 128);
+          const paintedAt = now();
+          recordPerformanceMetric({kind: "render", action, eventType: "revision_applied",
+            durationMs: paintedAt - (notice?.at ?? appliedAt), applyToPaintMs: paintedAt - appliedAt,
+            noticeToApplyMs: notice ? appliedAt - notice.at : null,
+            correlation: {market, sessionDate, signalKey, viewEvidence, updatePhase, revisionToken: revision.revision_token,
+              engineGeneration: revision.engine_generation, stateRevision: revision.state_revision,
+              trigger: notice?.trigger || "initial_or_unmatched"}});
+        }));
+        return true;
+      },
+    });
   }
 
   function activeInteractionContext(at = now()) {
@@ -973,7 +1039,7 @@
           if (source !== active || disposed) return;
           try {
             const payload = validateJsonRoot(JSON.parse(event.data), "object");
-            onRevision(payload);
+            onRevision(payload, {transport: "sse"});
           } catch (_error) { opened = false; }
         });
       } catch (_error) { disconnect(); }
@@ -1043,6 +1109,7 @@
     performanceHistorySnapshot,
     clearPerformanceHistory,
     recordPerformanceMetric,
+    createRevisionPaintObserver,
     createFetch,
     createJsonFetcher,
     createLatestRequest,

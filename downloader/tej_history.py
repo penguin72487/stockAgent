@@ -167,6 +167,10 @@ def connect(root: Path) -> sqlite3.Connection:
         con.execute('ALTER TABLE tables ADD COLUMN source_key_mode INTEGER')
     con.execute("CREATE INDEX IF NOT EXISTS tasks_timing_sample ON tasks(state,kind,timing_basis,completed_at_utc DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_metadata ON tasks(scope_contract,table_id,kind,state,expected_rows,actual_rows,actual_bytes)")
+    # The monitor's latest receipt is independent of timing_basis.  Without
+    # this ordering SQLite scans/sorts every completed task while holding a
+    # reader lock, potentially starving this same collector's commit.
+    con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_latest ON tasks(scope_contract,state,kind,completed_at_utc DESC,task_id,table_id,actual_rows,actual_bytes)")
     con.execute("CREATE INDEX IF NOT EXISTS tasks_scope_work_metadata ON tasks(scope_contract,state,table_id,kind,work_expected_rows,expected_rows,actual_rows,actual_bytes)")
     # Inventory/audit counts must scan metadata, not 600k superseded request
     # blobs while a DELETE-journal writer waits for the reader transaction.
@@ -238,12 +242,20 @@ def expand_request(request: dict, definition: dict, table_id: str) -> dict:
     return full
 
 
-def task_request(root: Path, task: dict) -> dict:
+def task_request(root: Path, task: dict, *, connection: sqlite3.Connection | None = None) -> dict:
+    """Expand the exact registered schema, reusing a caller's transaction.
+
+    Opening a schema-initializing connection while that caller already holds
+    a write lock can deadlock against our own transaction in DELETE mode.
+    """
     request = json.loads(task["request_json"])
     if "_fields_ref" not in request:
         return request
-    with closing(connect(root)) as con:
-        definition = con.execute("SELECT * FROM tables WHERE table_id=?", (task["table_id"],)).fetchone()
+    if connection is None:
+        with closing(connect(root)) as con:
+            definition = con.execute("SELECT * FROM tables WHERE table_id=?", (task["table_id"],)).fetchone()
+    else:
+        definition = connection.execute("SELECT * FROM tables WHERE table_id=?", (task["table_id"],)).fetchone()
     if definition is None:
         raise ValueError("Missing registered schema definition")
     return expand_request(request, dict(definition), task["table_id"])
@@ -1002,6 +1014,7 @@ class DesktopBridge:
         return release,digest
 
     def execute(self, root: Path, task: dict) -> tuple[dict, Path, float]:
+        execute_started = time.monotonic()
         name = task["task_id"] + "-" + uuid.uuid4().hex
         request = root / "requests" / (name + ".json")
         output = root / "raw" / (name + ".json")
@@ -1039,6 +1052,17 @@ class DesktopBridge:
                 atomic_write_json(worker_path, {**worker, 'bridge_attempt_id': name}, durable=False)
             except OSError:
                 pass
+        try:
+            # Initialization can be slower than the provider query. Report it
+            # BEFORE launching Windows; this is telemetry, never a submission
+            # witness, liveness renewal, retry permission or completed-row count.
+            atomic_write_json(root/'progress'/(name+'.json.progress.json'), {
+                'contract':'tej_native_readback_progress_v1', 'task_id':task['task_id'],
+                'attempt_id':name, 'stage':'initializing_runtime',
+                'observed_at_utc':datetime.now(UTC).isoformat(),
+            }, durable=False)
+        except OSError:
+            pass
         preentry_proof=json.dumps({'contract_version':CONTRACT_VERSION,'provider':'tej_smart_wizard',
             'task_id':task['task_id'],'query_attempt_id':name,**{k:wire_request.get(k) for k in ('type','smart_id','table')},
             'action':wire_request.get('action'),'market_data_query_submission_possible':False,
@@ -1067,10 +1091,15 @@ class DesktopBridge:
                 "('StockAgent\\TEJSmartWizard\\worker-'+[Guid]::NewGuid().ToString('N'));"
                 "[void](New-Item -ItemType Directory -Path $d);$p=Join-Path $d 'bridge.ps1';"
                 "Copy-Item -LiteralPath $s -Destination $p;")
-        command = ("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$bridgeEntered=$false;try{$s=" + source + ";"+staging+
+        command = ("$ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+                   "$tejBridgeWrapperClock=[Diagnostics.Stopwatch]::StartNew();"
+                   "$tejBridgeWrapperTiming=@{contract='tej_monotonic_prebridge_timing_v1'};"
+                   "$bridgeEntered=$false;try{$s=" + source + ";"+staging+
+                   "$tejBridgeWrapperTiming.script_staging_seconds=$tejBridgeWrapperClock.Elapsed.TotalSeconds;"
                    "if((Get-FileHash -LiteralPath $p).Hash.ToLowerInvariant() -cne "+self.quote(script_digest)+"){throw 'Script copy mismatch'};"
                    "$tokens=$null;$parseErrors=$null;[void][Management.Automation.Language.Parser]::ParseFile($p,[ref]$tokens,[ref]$parseErrors);"
                    "if($parseErrors.Count -ne 0){throw 'Pinned bridge syntax invalid; no invocation'};"
+                   "$tejBridgeWrapperTiming.hash_and_parse_seconds=$tejBridgeWrapperClock.Elapsed.TotalSeconds-$tejBridgeWrapperTiming.script_staging_seconds;"
                    f"$bridgeEntered=$true;& $p {args} -Request {self.quote(self.windows_path(request))} -Output {self.quote(self.windows_path(output))}}}"
                    "catch{if(-not $bridgeEntered){$proof="+self.quote(preentry_proof)+"|ConvertFrom-Json;"
                    "$proof|Add-Member -NotePropertyName observed_at_utc -NotePropertyValue ([DateTime]::UtcNow.ToString('o'));"
@@ -1108,6 +1137,7 @@ class DesktopBridge:
                             'preparation_stage':'verified_interactive_relay_unavailable', 'bridge_invoked':False})
                         finish_attempt(root,name,'proven_not_submitted')
                     raise BeforeDataQueryError('desktop_context_unavailable_before_preview') from None
+            local_prelaunch_seconds = time.monotonic()-execute_started
             result = run_guarded_windows(command, request=request, windows_path=self.windows_path,
                                 **launch_options,
                                 # A complete bounded MSAA grid is read across
@@ -1141,6 +1171,19 @@ class DesktopBridge:
             # TimeoutExpired renders its command line; keep session paths and
             # vendor diagnostics out of public/logged operator error messages.
             raise RuntimeError("desktop_bridge_deadline_exceeded_requires_recovery") from None
+        # Publish from Linux, not another Windows/UNC write in the critical
+        # path. This timing is optional and cannot turn an unknown attempt
+        # into an unsent one or cause any source operation to be repeated.
+        launch_timing = getattr(result, 'bridge_launch_timing', None)
+        if isinstance(launch_timing, dict):
+            try:
+                atomic_write_json(root/'progress'/(name+'.json.transport.json'), {
+                    **launch_timing, 'task_id': task['task_id'], 'attempt_id': name,
+                    'local_prelaunch_seconds': local_prelaunch_seconds,
+                    'observed_at_utc': datetime.now(UTC).isoformat(),
+                }, durable=False)
+            except OSError:
+                pass
         if result.returncode or not output.is_file():
             if is_preview:
                 from downloader.tej_desktop_attempts import finish_attempt
@@ -1449,6 +1492,43 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
     if (req.get('action') != 'plan' or req.get('contract_version') != CONTRACT_VERSION
             or not prepared_request_matches(original,req,task)):
         raise ValueError('Original request is not the exact reviewed metadata-only plan')
+    payload, output, evidence_paths, codes = restore_owned_metadata_interface(
+        root, task, req, bridge, acknowledge_known_notices=acknowledge_known_notices,
+        require_fresh_evidence=require_fresh_evidence, mark_disabled_barrier=True)
+    code = 'vendor_metadata_allocation_failed_deferred' if codes else 'metadata_preparation_failed_deferred'
+    audit = {'contract':METADATA_RECOVERY_CONTRACT,'contract_version':CONTRACT_VERSION,'task_id':task_id,
+             'state':code,'observed_at_utc':datetime.now(UTC).isoformat(),
+             'source_error_codes':codes,'metadata_only_plan':True,'failed_plan_retried':False,
+             'data_query_repeated':False,'source_axes_adopted':False,'failed_table_still_blocked':True,
+             'prepared_request_sha256':hashlib.sha256(prepared_request.read_bytes()).hexdigest(),
+             'readback_evidence_sha256':[hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence_paths]}
+    audit_path = root/'diagnostics'/(task_id+'-metadata_isolation-'+uuid.uuid4().hex+'.json')
+    atomic_write_json(audit_path,audit,durable=True)
+    if classify_failure:
+        with closing(connect(root)) as con,con:
+            con.execute("UPDATE tasks SET last_error_code=? WHERE task_id=? AND kind='discover' AND state='blocked'",(code,task_id))
+            con.execute("UPDATE tables SET state='needs_review',last_error_code=? WHERE table_id=?",(code,task['table_id']))
+        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':code,
+                                                   'observed_at_utc':audit['observed_at_utc'],'task_id':task_id})
+    return {'state':code,'failed_table_still_blocked':True,'data_query_repeated':False,'source_axes_adopted':False,
+            'audit_path':str(audit_path.relative_to(root))}
+
+
+def restore_owned_metadata_interface(root: Path, task: dict, req: dict, bridge: Any, *,
+                                     acknowledge_known_notices: bool = False,
+                                     require_fresh_evidence: bool = True,
+                                     mark_disabled_barrier: bool = False,
+                                     check_action: str = 'confirm_metadata_error_cleared') -> tuple:
+    """Share only owned UI repair, never failed-plan/download classification.
+
+    Callers must prove their original action finished before entering. Only the
+    two existing exact runtime notices may be acknowledged. Unknown, auth/quota,
+    foreign and disabled-without-notice states remain barriers; no Preview,
+    replacement axes, process restart or credential access is performed here.
+    """
+    if check_action not in {'confirm_metadata_error_cleared', 'repair_source_binding'}:
+        raise ValueError('Unreviewed metadata interface verification action')
+    task_id = task['task_id']
     known = {'MySql:malloc':'vendor_mysql_allocation_failed',
              'Cannot find table 0.':'vendor_source_table_unresolved'}
     evidence_paths, codes = [], []
@@ -1468,6 +1548,7 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
         inspection = {**req, 'action':'inspect_notices'}
         payload, output, _ = execute_checked(inspection)
         if (payload.get('action') != 'inspect_notices' or payload.get('contract_version') != CONTRACT_VERSION
+                or payload.get('provider') != 'tej_smart_wizard'
                 or payload.get('task_id') != task_id or payload.get('notice_acknowledged') is not False
                 or payload.get('data_query_repeated') is not False or payload.get('credentials_read') is not False
                 or not isinstance(payload.get('notices'),list)):
@@ -1476,8 +1557,9 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
         notices = payload['notices']
         if not notices:
             if payload.get('root_enabled') is False or payload.get('root_automation_enabled') is False:
-                from downloader.tej_query_lifecycle import mark_interface_barrier
-                mark_interface_barrier(root,reason='vendor_query_disabled_without_known_notice',evidence=output)
+                if mark_disabled_barrier:
+                    from downloader.tej_query_lifecycle import mark_interface_barrier
+                    mark_interface_barrier(root,reason='vendor_query_disabled_without_known_notice',evidence=output)
                 raise RuntimeError('desktop_interface_recovery_required')
             break
         if not acknowledge_known_notices or attempt >= 2 or len(notices) != 1:
@@ -1501,7 +1583,7 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
                 or payload.get('credentials_read') is not False):
             raise ValueError('Exact runtime acknowledgement was not verified')
         evidence_paths.append(output); codes.append(code)
-    check = {**req, 'action':'confirm_metadata_error_cleared'}
+    check = {**req, 'action':check_action}
     payload, output, _ = execute_checked(check)
     if (payload.get('contract_version') != CONTRACT_VERSION or payload.get('provider') != 'tej_smart_wizard'
             or payload.get('action') != check['action'] or payload.get('task_id') != task_id
@@ -1511,23 +1593,7 @@ def isolate_failed_metadata(root: Path, task_id: str, bridge: Any, prepared_requ
             or payload.get('market_data_query_submitted') is not False or payload.get('credentials_read') is not False):
         raise ValueError('Shared source interface not verified stable; keep the barrier')
     evidence_paths.append(output)
-    code = 'vendor_metadata_allocation_failed_deferred' if codes else 'metadata_preparation_failed_deferred'
-    audit = {'contract':METADATA_RECOVERY_CONTRACT,'contract_version':CONTRACT_VERSION,'task_id':task_id,
-             'state':code,'observed_at_utc':datetime.now(UTC).isoformat(),
-             'source_error_codes':codes,'metadata_only_plan':True,'failed_plan_retried':False,
-             'data_query_repeated':False,'source_axes_adopted':False,'failed_table_still_blocked':True,
-             'prepared_request_sha256':hashlib.sha256(prepared_request.read_bytes()).hexdigest(),
-             'readback_evidence_sha256':[hashlib.sha256(p.read_bytes()).hexdigest() for p in evidence_paths]}
-    audit_path = root/'diagnostics'/(task_id+'-metadata_isolation-'+uuid.uuid4().hex+'.json')
-    atomic_write_json(audit_path,audit,durable=True)
-    if classify_failure:
-        with closing(connect(root)) as con,con:
-            con.execute("UPDATE tasks SET last_error_code=? WHERE task_id=? AND kind='discover' AND state='blocked'",(code,task_id))
-            con.execute("UPDATE tables SET state='needs_review',last_error_code=? WHERE table_id=?",(code,task['table_id']))
-        atomic_write_json(root/'worker_status.json',{'contract_version':CONTRACT_VERSION,'state':code,
-                                                   'observed_at_utc':audit['observed_at_utc'],'task_id':task_id})
-    return {'state':code,'failed_table_still_blocked':True,'data_query_repeated':False,'source_axes_adopted':False,
-            'audit_path':str(audit_path.relative_to(root))}
+    return payload, output, evidence_paths, codes
 
 
 def recover_desktop_response(root: Path, task_id: str, bridge: Any, *, response: str,
@@ -1933,6 +1999,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'desktop_input_contract':DESKTOP_INPUT_CONTRACT,
               'download_burst':config.get('download_burst_between_discoveries',4),
               'download_table_locality_burst':config.get('download_table_locality_burst',1),
+              'local_planning_batch_size':config.get('local_planning_batch_size',1),
               'auto_key3_replanning':config.get('auto_key3_replanning',False),
               'auto_snapshot_replanning':config.get('auto_snapshot_replanning',False),
               'auto_month_period_replanning':config.get('auto_month_period_replanning',False),
@@ -1952,6 +2019,8 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
             or not 1 <= policy['download_burst'] <= 20
             or type(policy['download_table_locality_burst']) is not int
             or not 1 <= policy['download_table_locality_burst'] <= 8
+            or type(policy['local_planning_batch_size']) is not int
+            or not 1 <= policy['local_planning_batch_size'] <= 32
             or any(not isinstance(policy[k],bool) for k in
                    ('metadata_failure_isolation','acknowledge_known_metadata_runtime_notices','auto_key3_replanning','auto_snapshot_replanning','auto_month_period_replanning','auto_preview_capacity_replanning','source_validation_isolation','prequery_failure_isolation'))):
         raise ValueError('Unreviewed desktop runtime policy')
@@ -2014,6 +2083,39 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
         if rotated is not None:
             return rotated
     return download
+
+
+def _prepare_ready_task(con, root: Path, now: str, kind: str | None, policy: dict,
+                        table_id: str | None) -> tuple[sqlite3.Row | None, str | None]:
+    """Amortize local-only queue commits, without claiming a desktop attempt.
+
+    Each transition still uses its original durable intent and exact proof.
+    Re-select by the SAME priority rules after each change. Yield after at most
+    one second/32 transitions, and never combine a source call with a preceding
+    local mutation: the next invocation rechecks every source/recovery barrier.
+    """
+    from downloader.tej_planning import SELECTOR_CONTRACT, repartition_selector_pending, defer_planned_company_hint
+    from downloader.tej_api_ownership import repartition_pending
+    size = policy.get('local_planning_batch_size', 1)
+    if type(size) is not int or not 1 <= size <= 32:
+        raise ValueError('Bounded local planning batch required')
+    deadline = time.monotonic()+1
+    result = None
+    for _ in range(size):
+        row = _ready_task(con, now, kind, policy, table_id)
+        if row is None or row['kind'] != 'download':
+            return row, result
+        if policy.get('query_selector_contract') == SELECTOR_CONTRACT and repartition_selector_pending(con, root, row):
+            result = 'selector_scope_repartitioned'
+        elif repartition_pending(con, root, row):
+            result = 'api_scope_repartitioned'
+        elif policy.get('prequery_failure_isolation') is True and defer_planned_company_hint(con, root, dict(row)):
+            result = 'selector_scope_repartitioned'
+        else:
+            return row, result
+        if time.monotonic() >= deadline:
+            break
+    return None, result
 
 
 def mark_metadata_busy(root: Path) -> None:
@@ -2121,23 +2223,11 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
             from downloader.tej_planning import refill_ready_plans
             refill_ready_plans(con)
         if replay is None:
-            row = _ready_task(con,now,kind,policy,table_id)
+            row, local_result = _prepare_ready_task(con, root, now, kind, policy, table_id)
+            if local_result is not None:
+                return local_result
         if not row:
             return "idle"
-        if replay is None and row['kind']=='download':
-            from downloader.tej_planning import SELECTOR_CONTRACT, repartition_selector_pending
-            if policy.get('query_selector_contract') == SELECTOR_CONTRACT and repartition_selector_pending(con,root,row):
-                return 'selector_scope_repartitioned'
-            from downloader.tej_api_ownership import repartition_pending
-            if repartition_pending(con, root, row):
-                # This is a source-allocation transition, not a desktop query
-                # or successful Wizard export. The next normal iteration runs
-                # only the exact remaining scope; all old receipts stay intact.
-                return 'api_scope_repartitioned'
-            if policy.get('prequery_failure_isolation') is True:
-                from downloader.tej_planning import defer_planned_company_hint
-                if defer_planned_company_hint(con,root,dict(row)):
-                    return 'selector_scope_repartitioned'
         task = dict(row)
         if replay is not None:
             con.execute('UPDATE desktop_replays SET consumed_at_utc=? WHERE authorization_id=?', (now,retry_authorization_id))
@@ -2207,7 +2297,8 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
                     try:
                         state=defer_unsent_prequery(root,task['task_id'],bridge,
                             base_seconds=policy['prequery_retry_base_seconds'],
-                            max_seconds=policy['prequery_retry_max_seconds'],allow_company_partition=True)['state']
+                            max_seconds=policy['prequery_retry_max_seconds'],allow_company_partition=True,
+                            acknowledge_known_notices=policy['acknowledge_known_metadata_runtime_notices'])['state']
                     except (ValueError,OSError,RuntimeError,subprocess.SubprocessError):
                         pass  # No proof/interface acknowledgement means the existing barrier stays.
             atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": state,

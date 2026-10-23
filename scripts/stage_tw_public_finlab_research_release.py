@@ -40,6 +40,18 @@ STAGED_ROOT = Path("/srv/stockagent-live/data_tw_public_research_finlab_2014_v4"
 STOCK_CHANNELS = 20
 
 
+class FinLabCatalogExpired(RuntimeError):
+    """A source check is due again, not permission to publish stale evidence."""
+
+
+def catalog_deferral(readiness: dict, reason: str) -> int:
+    print(json.dumps({"event": "finlab_research_stage_deferred", "reason": reason,
+                      "retryable": True,
+                      **{key: readiness[key] for key in ("missing", "stale", "invalid", "catalog_fresh")}}),
+          flush=True)
+    return 75
+
+
 @contextmanager
 def stage_source_guards(staged_root: Path, live_root: Path):
     """Write only this derived source; formal inputs need a shared read lease.
@@ -65,7 +77,7 @@ def catalog_completion_fields(readiness: dict) -> dict:
         raise RuntimeError("FinLab release requires complete current source and hash evidence")
     valid_until = datetime.fromisoformat(str(readiness["valid_until_utc"]))
     if valid_until.tzinfo is None or datetime.now(UTC) >= valid_until.astimezone(UTC):
-        raise RuntimeError("FinLab catalog source-expiry proof elapsed before release seal")
+        raise FinLabCatalogExpired("FinLab catalog source-expiry proof elapsed before release seal")
     return {"catalog_scope_contract": CATALOG_SCOPE, "catalog_latest_verified": True,
             "catalog_total": readiness["catalog_total"],
             "catalog_general_history_total": readiness["general_history_total"],
@@ -141,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             return 75
         readiness = catalog_readiness(args.finlab_root, verify_hashes=True)
         if not readiness["ready"]:
+            if not readiness["invalid"]:
+                # The original account owner must refresh due sources. Do not
+                # extend their expiry or abort independent minute acquisition.
+                return catalog_deferral(readiness, "finlab_catalog_not_current")
             raise RuntimeError(
                 "FinLab catalog not current; private packaging blocked "
                 f"(missing={readiness['missing']}, stale={readiness['stale']}, "
@@ -193,7 +209,10 @@ def main(argv: list[str] | None = None) -> int:
             and all(sha256_file(args.staged_root / member) == expected for member, expected in action_hashes.items())
         ):
             formal.verify()
-            refreshed = refresh_unchanged_completion(previous_path, previous, readiness)
+            try:
+                refreshed = refresh_unchanged_completion(previous_path, previous, readiness)
+            except FinLabCatalogExpired:
+                return catalog_deferral(readiness, "finlab_catalog_expired_before_seal")
             print(json.dumps({"event": "finlab_research_stage_unchanged", "rows": rows,
                               "channels": previous["model_channels"], "completion_proof_refreshed": refreshed}))
             return 0
@@ -208,6 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         for member, expected in action_hashes.items():
             original = args.live_root / member
             _stage_copy(original, args.staged_root / member, expected)
+        try:
+            completion = catalog_completion_fields(readiness)
+        except FinLabCatalogExpired:
+            return catalog_deferral(readiness, "finlab_catalog_expired_before_seal")
         release = {
             "schema_version": 1 if formal.identity["kind"] == "file" else 2,
             "status": "complete",
@@ -224,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             "finlab_value_channels": finlab_count,
             "stock_value_channels": STOCK_CHANNELS,
             "model_channels": STOCK_CHANNELS + 2 * (public_count + finlab_count),
-            **catalog_completion_fields(readiness),
+            **completion,
             "staged_files_sha256": staged_hashes,
             "formal_action_members_sha256": action_hashes,
             "source_revision_policy": "current_revision_only",

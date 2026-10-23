@@ -55,6 +55,23 @@ def test_huge_workload_does_not_materialize_requests():
     assert queries > 10**12 and rows > 10**14
 
 
+@pytest.mark.parametrize('keys',[1,2,3])
+def test_independent_scope_geometry_and_forecast_fingerprint(keys):
+    from downloader.tej_planning import SCOPE_BUDGET_CONTRACT,apply_scope_budget
+    config={**CONFIG,'max_scope_rows_per_export':50000,'query_scope_contract':SCOPE_BUDGET_CONTRACT}
+    request={'fields':['a'],'max_rows':100,'max_cells':2000}
+    if keys!=2:
+        request.update(source_key_mode=keys,key_layout_contract=KEY1_CONTRACT if keys==1 else KEY3_CONTRACT)
+    request=apply_scope_budget(request,config)
+    dates=[] if keys==1 else [str(i) for i in range(500)]
+    plan=build_plan(request,[str(i) for i in range(16)],dates,config,[])
+    assert query_geometry(16,len(dates),1,keys,config)==(plan['total_queries'],plan['total_work_rows'])
+    assert request['max_rows']==100
+    updated=build_staged_eta([table()],[sample()],config,observed=NOW,cutoff='2026-10-01',alive=False)
+    assert updated['input_sha256']!=forecast([table()],[sample()])['input_sha256']
+    assert any('回退成本' in line for line in updated['assumptions'])
+
+
 def test_empty_response_cost_is_service_work_not_downloaded_values():
     result=forecast([table()], [sample(seconds=10),sample(seconds=20)])
     assert result['global_scenarios']['middle']['remaining_seconds']==170

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the nullable, common/individual panel on its training node.
+"""Build the nullable, common/individual stock context on its training node.
 
 Observations are immutable coordinate tables (unobserved coordinates = NULL).
 The causal training view carries only already-released states, with availability,
@@ -40,11 +40,44 @@ from stockagent.data.tw_native_panel_features import mops_native, mops_admission
 from stockagent.data.tw_public_release_schedule import RULES, schedule_lookup, next_session, max_carry_days
 from stockagent.data.tw_public_cross_source_fill import MAPPINGS, normalize_finmind, missing_only
 from stockagent.data.tw_feature_semantic_report import semantic_role, write_factorized_feature_report
-from stockagent.data.walkforward import build_expanding_year_folds
+from stockagent.data.walkforward import build_expanding_year_folds, year_boundary_offset_sessions
+from stockagent.training.dataset import execution_feature_lag
 from train import _build_panel_kwargs
 
 BASE_FEATURES=["open_raw","high_raw","low_raw","close_raw","trading_volume_raw","next_session_open_gap_logret"]
 OBS_SCHEMA={"date":pl.Date,"symbol":pl.String,"feature":pl.String,"value":pl.Float64,"period":pl.String}
+
+
+def stock_context_preparation_contract(config):
+    """Separate a stock observation calendar from the traded product's rules.
+
+    Cash day-trade eligibility begins later than the stock observations needed
+    by a futures actor. Never extend cash eligibility to admit older context.
+    """
+    mode = config.trading.execution_mode
+    if mode not in {"tw_day_trade", "tw_stock_context_futures_portfolio"}:
+        raise ValueError("factorized stock preparation requires a supported lag-one stock context")
+    if execution_feature_lag(mode) != 1 or config.runner.resume:
+        raise ValueError("fresh canonical lag-one stock context required")
+    futures = mode == "tw_stock_context_futures_portfolio"
+    if futures:
+        if config.data.use_tw_public_rules:
+            raise ValueError("futures stock context must not apply cash day-trade eligibility")
+        gap = "next_session_open_gap_logret"
+        if gap not in config.data.feature_zero_fill or gap not in config.data.feature_shift_next_session:
+            raise ValueError("paired futures stock context requires the cash opening gap to remain neutral")
+    return {"contract": "stock_context_for_dated_futures_v1" if futures else "cash_day_trade_stock_context_v1",
+            "execution_mode": mode, "feature_lag": 1, "futures_context_only": futures}
+
+
+def stock_context_source_sessions(raw_dates, *, end, context):
+    """Retain real pre-panel observations so the first training row has history."""
+    sessions = sorted({d for d in raw_dates if d <= end})
+    if not context["futures_context_only"]:
+        sessions = [d for d in sessions if d >= date(2013, 1, 1)]
+    if not sessions:
+        raise ValueError("stock context has no observed source sessions")
+    return sessions
 
 
 def quarter_clock(table, sessions, uploads=None):
@@ -469,12 +502,16 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
             block=[];block_bytes=0
 
 
-def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snapshot_id: str,
+def prepare(source: Path, out: Path, base_config: Path, minute_root: Path | None, snapshot_id: str,
             *, max_block_bytes=128*1024**2, base_panel_cache_root: Path | None=None,
             model_channel_policy="value_available_age_updated", runtime_cache_root: Path | None=None):
     out = admit_output(out, "prepared")
     if model_channel_policy not in {"value_only", "value_available_age_updated"}:
         raise ValueError("unknown factorized model channel policy")
+    base = load_config(base_config)
+    context = stock_context_preparation_contract(base)
+    if not context["futures_context_only"] and minute_root is None:
+        raise ValueError("cash day-trade preparation requires its minute source")
     channel_count = 1 if model_channel_policy == "value_only" else 4
     started=time.perf_counter();manifest=verify_sources(source);source_sha=sha256(source/"source_manifest.json")
     if out.exists():raise FileExistsError("new ABI requires a fresh panel/output root")
@@ -491,7 +528,7 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
     generated={"base_config":str(base_config.resolve()),"experiment_name":"tw-day-trade-nullable-factorized-panel-20261004-v1",
         "runner":{"output_dir":str(node_root(ROOT)/"artifacts/markets"/out.parent.name/"training"),"resume":False,"post_train_infer":False},
         "data":{"parquet_root":str((source/"stocks").resolve()),"tw_public_feature_path":str(rule_path.resolve()),
-            "day_trade_physical_public_feature_path":str(public.resolve()),"day_trade_minute_execution_root":str(minute_root.resolve()),
+            "day_trade_physical_public_feature_path":str(public.resolve()),"day_trade_minute_execution_root":str(minute_root.resolve()) if minute_root is not None else None,
             "day_trade_minute_execution_cache_dir":str(admit_output(runtime_cache_root,"cache") if runtime_cache_root is not None else node_root(ROOT)/"artifacts/cache"/out.parent.name/"runtime-cache/physical-source"),
             "panel_cache_root":str((base_panel_cache_root or out/"base_panel_cache").resolve()),"factorized_feature_manifest":str((out/"factorized_manifest.json").resolve()),
             "feature_include":BASE_FEATURES,"feature_exclude":[],"feature_zero_fill":[],
@@ -499,18 +536,26 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
         "training":{"pretrained_initialization_root":None,"cache_train_tensors_on_gpu":False,
             "cache_eval_tensors_on_gpu":False,"curve_plot_async":False,
             "financial_transformer":{"feature_bottleneck_dim":0,"temporal_basis_fp32_contraction":True}}}
+    if context["futures_context_only"]:
+        generated["data"].update(use_tw_public_rules=False,
+            day_trade_physical_public_feature_path=None, day_trade_minute_execution_root=None,
+            feature_zero_fill=list(base.data.feature_zero_fill),
+            feature_shift_next_session=list(base.data.feature_shift_next_session))
     config_path=out/"training.yaml";config_path.write_text(yaml.safe_dump(generated,allow_unicode=True,sort_keys=False))
     config=load_config(config_path)
-    if config.trading.execution_mode!="tw_day_trade" or config.runner.resume:raise ValueError("fresh canonical TW lag-one experiment required")
+    if stock_context_preparation_contract(config) != context:
+        raise ValueError("generated preparation changed its stock-context contract")
     panel=build_panel(config.data.parquet_root,**_build_panel_kwargs(config))
     dates=[date.fromisoformat(str(d)[:10]) for d in panel.dates];symbols=list(panel.symbols)
     folds=build_expanding_year_folds(panel.dates,min_train_years=config.walk_forward.min_train_years,
         val_years=config.walk_forward.val_years,require_future_test_year=config.walk_forward.require_future_test_year,
-        split_start_year=config.walk_forward.split_start_year)
+        split_start_year=config.walk_forward.split_start_year,
+        year_boundary_offset_sessions=year_boundary_offset_sessions(config))
     if not folds:raise ValueError("canonical walk-forward has no training-owned dates")
     training_cutoff=max(dates[int(f.train_indices[-1])] for f in folds)
-    sessions=sorted(pl.read_parquet(source/"twse_taiex_ohlc.parquet",columns=["date"])["date"].cast(pl.Date).unique().to_list())
-    sessions=[d for d in sessions if date(2013,1,1)<=d<=date.fromisoformat(manifest["end_date"])]
+    sessions=stock_context_source_sessions(
+        pl.read_parquet(source/"twse_taiex_ohlc.parquet",columns=["date"])["date"].cast(pl.Date).to_list(),
+        end=date.fromisoformat(manifest["end_date"]),context=context)
     uploads=None
     if (source/"finlab/known_uploads.parquet").exists():
         uploads=pl.read_parquet(source/"finlab/known_uploads.parquet").unpivot(index="source_index",variable_name="symbol",value_name="known_upload_on")
@@ -694,7 +739,8 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
         if name not in finite:excluded.append({"feature":name,"reason":"no_non_null_training_owned_observation_in_any_canonical_fold"});del definitions[name]
     individual=sorted((d for d in definitions.values() if rule_from_spec(d).scope=="stock"),key=lambda d:d["feature"])
     common=sorted((d for d in definitions.values() if rule_from_spec(d).scope=="market"),key=lambda d:d["feature"])
-    events=AnnualObservationEvents(list(annual_paths.values()))
+    events=AnnualObservationEvents(list(annual_paths.values()),
+        cache_root=(runtime_cache_root/"annual-events") if runtime_cache_root is not None else None)
     channels=lambda defs:[channel for d in defs for channel in ((d["feature"],) if channel_count == 1 else (d["feature"],d["feature"]+"__available",d["feature"]+"__age_days",d["feature"]+"__updated"))]
     # Lifecycle starts follow the current ordinary stock source's explicit
     # episode key, including pre-panel history, not first observation of X.
@@ -728,6 +774,7 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path, snaps
         for scope,defs,counts in [("stock",individual,individual_counts),("market",common,common_counts)] for d,count in zip(defs,counts)])
     result={"contract":VALUE_ONLY_CONTRACT if channel_count == 1 else CONTRACT,"status":"complete","source_snapshot_id":snapshot_id,"source_manifest_sha256":source_sha,
         "model_channel_policy":model_channel_policy,
+        "stock_context_preparation":context,"source_calendar_start":str(sessions[0]),
         "research_only":True,"historical_point_in_time":False,"live_eligible":False,"use_restriction":PRIVATE_USE,
         "feature_lag":1,"raw_missingness":"NULL; coordinate table absent rows are not fabricated observations",
         "training_missingness":("last already published finite value; missing input encoded as neutral zero; observation metadata excluded from model" if channel_count == 1 else "last already published finite value + availability + age")+"; NULL report barriers, TTL, report and issuer lifecycle reset",
@@ -773,8 +820,8 @@ def main():
         from stockagent.data.factorized_panel_projection import project_factorized_values
         result=project_factorized_values(a.project_prepared_manifest,a.output_root)
     else:
-        if any(v is None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id)):
-            p.error("source-root, base-config, minute-root and snapshot-id are required for a new source build")
+        if any(v is None for v in (a.source_root,a.base_config,a.snapshot_id)):
+            p.error("source-root, base-config and snapshot-id are required for a new source build")
         result=prepare(a.source_root,a.output_root,a.base_config,a.minute_root,a.snapshot_id,
             max_block_bytes=a.max_block_mib*1024**2,base_panel_cache_root=a.base_panel_cache_root,
             model_channel_policy=a.model_channel_policy,runtime_cache_root=a.runtime_cache_root)

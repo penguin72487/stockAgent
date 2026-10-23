@@ -166,7 +166,7 @@
       const mark = liquidation(row, signedShares);
       if (product === "tw_overnight") {
         const openStatus = row.opening_exit_order_status || "尚未送出";
-        return `<tr>
+        return `<tr data-public-signal-key="${esc(row.public_signal_key || "")}">
           <td><strong>${esc(strategyLabel(row))}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.session_date)} · ${esc(row.symbol)} ${esc(row.name || "")}</small></td>
           <td><strong>${pct(row.target_weight)}</strong><small>收盤成交 ${number(row.filled_shares)}／目標 ${number(row.requested_shares)} 股</small><small>剩餘 ${number(Math.abs(signedShares))} 股</small></td>
           <td><strong>收盤進 ${quoteText(row, "entry_price")}</strong><small>${shortTime(row.entry_exchange_at || row.entry_at)}</small><small>${mark.label} ${quoteText(row, mark.fields)} · ${shortTime(mark.at)}</small>${priceDistanceText(row, mark.fields)}</td>
@@ -175,7 +175,7 @@
           <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
         </tr>`;
       }
-      return `<tr>
+      return `<tr data-public-signal-key="${esc(row.public_signal_key || "")}">
         <td><strong>${esc(strategyLabel(row))}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.session_date)} · ${esc(row.symbol)} ${esc(row.name || "")}</small></td>
         <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>未平倉 ${number(Math.abs(signedShares))} 股${Number(row.target_unsubmitted_shares || 0) > 0 ? ` · 目標缺口 ${number(row.target_unsubmitted_shares)} 股` : ""}</small></td>
         <td><strong>進 ${quoteText(row, "entry_price")}</strong><small>${esc(row.counterfactual_open_replay ? replayTimingText(row, row.entry_at) : shortTime(row.entry_at))}</small><small>${mark.label} ${quoteText(row, mark.fields)} · ${shortTime(mark.at)}</small>${priceDistanceText(row, mark.fields)}</td>
@@ -233,7 +233,7 @@
         const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
           ? Number(positionPnl.total) / modeTotalEquity * 100
           : null;
-        return `<tr data-signal-key="${esc(signalRowKey(row))}" class="signal-row${selected}">
+        return `<tr data-signal-key="${esc(signalRowKey(row))}" data-public-signal-key="${esc(row.public_signal_key || "")}" class="signal-row${selected}">
           <td><strong>${esc(strategyLabel(row))}</strong><small>${shortTime(row.signal_at)}</small></td>
           <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
           <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(signalReasonLabel(row.reason || row.status))}</small></td>
@@ -242,7 +242,7 @@
           <td><strong class="${pnlClass(positionPnl?.total)}">佔模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>${historical ? "進場前權益" : "模式總權益"} ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${historical ? "歷史反事實 · 無交易所成交證據" : "當沖模型暫時轉接 · 非隔夜訓練"}</small></td>
         </tr>`;
       }
-      return `<tr data-signal-key="${esc(signalRowKey(row))}" class="signal-row${selected}">
+      return `<tr data-signal-key="${esc(signalRowKey(row))}" data-public-signal-key="${esc(row.public_signal_key || "")}" class="signal-row${selected}">
         <td><strong>${esc(strategyLabel(row))}</strong><small>${esc(signalTimingText(row))}</small></td>
         <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
         <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(reasonText)}</small></td>

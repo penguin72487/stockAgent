@@ -16,7 +16,7 @@ import sqlite3
 import subprocess
 import uuid
 
-from downloader.artifact_io import atomic_write_json
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json
 from downloader.tej_operation_clock import CONTRACT as CLOCK_CONTRACT, OperationClockError, source_operation_clock
 
 CONTRACT = "exact_metadata_only_table_retry_window_v1"
@@ -27,6 +27,105 @@ FAILURE_CODES = (
     REQUIRES_RECOVERY, "unknown_outcome_no_auto_retry",
     "metadata_preparation_failed_deferred", "vendor_metadata_allocation_failed_deferred",
 )
+LEGACY_REQUEUE_CONTRACT = 'explicit_exact_legacy_metadata_requeue_v1'
+
+
+def requeue_legacy_metadata(root: Path, task_id: str, bridge, prepared: Path, *,
+                           acknowledge_unknown_usage: bool = False,
+                           acknowledge_known_notices: bool = False) -> dict:
+    """Operator-authorized migration, NOT an invented historical unsent proof.
+
+    Caller holds .download.lock. Early isolated plans predate immutable bridge
+    manifests; automatic negative-proof recovery must continue rejecting them.
+    An explicit grant may schedule ONE matching metadata plan after fresh owned
+    interface verification. The normal collector executes it and future failures
+    then have current immutable evidence and the existing finite retry policy.
+    This never retries a data Preview, adopts axes or erases a failed event.
+    """
+    if acknowledge_unknown_usage is not True or type(acknowledge_known_notices) is not bool:
+        raise ValueError('Explicit one-shot legacy metadata usage acknowledgement required')
+    from downloader.tej_history import SOURCE_SCOPE_CONTRACT, connect, isolate_failed_metadata, task_request
+    from downloader.tej_desktop_attempts import prepared_request_matches
+
+    def original_task(con):
+        row = con.execute('SELECT * FROM tasks WHERE task_id=?', (task_id,)).fetchone()
+        if (row is None or row['kind'] != 'discover' or row['state'] != 'blocked'
+                or row['last_error_code'] not in {
+                    'metadata_preparation_failed_deferred', 'vendor_metadata_allocation_failed_deferred'}
+                or row['scope_contract'] != SOURCE_SCOPE_CONTRACT or row['active_attempt_id'] is not None
+                or any(row[k] is not None for k in ('actual_rows', 'receipt_path', 'completed_at_utc'))):
+            raise ValueError('Only an exact isolated legacy metadata plan may be explicitly requeued')
+        if (con.execute("SELECT 1 FROM tasks WHERE state='running' OR "
+                "(state='blocked' AND last_error_code='unknown_outcome_no_auto_retry') LIMIT 1").fetchone()
+                or con.execute("SELECT 1 FROM meta WHERE key='source_period_replan_required'").fetchone()):
+            raise ValueError('Unresolved shared source action blocks legacy metadata requeue')
+        events = con.execute("SELECT * FROM traffic WHERE action='discover' AND started_at_utc=?",
+                             (row['attempted_at_utc'],)).fetchall()
+        if (len(events) != 1 or events[0]['state'] != 'failed'
+                or con.execute('SELECT 1 FROM desktop_attempts WHERE task_id=?', (task_id,)).fetchone()):
+            raise ValueError('One finished isolated metadata event, never a Preview attempt, required')
+        return dict(row), dict(events[0])
+
+    with closing(connect(root)) as con:
+        task, event = original_task(con)
+        request = task_request(root, task, connection=con)
+    started, finished = _clock(event['started_at_utc']), _clock(event['completed_at_utc'])
+    if not 0 <= (finished-started).total_seconds() <= 1200:
+        raise ValueError('Original metadata failure must have a finite completed window')
+    if (prepared.is_symlink() or prepared.parent.resolve() != (root/'requests').resolve()
+            or not re.fullmatch(re.escape(task_id)+r'-[0-9a-f]{32}\.json', prepared.name)
+            or not started.timestamp() <= prepared.stat().st_mtime <= finished.timestamp()):
+        raise ValueError('Exact original legacy metadata request required')
+    original = _read(prepared)
+    if (request.get('action') != 'plan' or original.get('action') != 'plan'
+            or original.get('query_attempt_id') is not None
+            or not prepared_request_matches(original, request, task)):
+        raise ValueError('Legacy metadata source scope differs from the registered plan')
+    raw = root/'raw'/prepared.name
+    if raw.exists() or raw.with_suffix('.json.stage.json').exists():
+        raise ValueError('Reconcile retained source output before explicit metadata requeue')
+    digest = hashlib.sha256(prepared.read_bytes()).hexdigest()
+    # Keep the canonical owner/notices/clock verifier. Its fresh readback is
+    # current interface readiness, never proof of the old invocation's cost.
+    isolated = isolate_failed_metadata(root, task_id, bridge, prepared,
+        acknowledge_known_notices=acknowledge_known_notices,
+        require_fresh_evidence=True, classify_failure=False)
+    now = datetime.now(UTC).isoformat()
+    audit_path = root/'diagnostics'/(prepared.stem+'-explicit-metadata-requeue-'+uuid.uuid4().hex+'.json')
+    audit = {'contract': LEGACY_REQUEUE_CONTRACT, 'state': 'prepared',
+             'task_id': task_id, 'table_id': task['table_id'], 'observed_at_utc': now,
+             'original_task': task, 'original_traffic': event,
+             'prepared_request_path': str(prepared.resolve().relative_to(root.resolve())),
+             'prepared_request_sha256': digest,
+             'interface_isolation_audit_path': isolated['audit_path'],
+             'interface_isolation_audit_sha256': hashlib.sha256((root/isolated['audit_path']).read_bytes()).hexdigest(),
+             'unknown_original_usage_acknowledged': True, 'old_query_proven_unsent': False,
+             'source_rows_adopted': False, 'data_preview_replayed': False,
+             'original_evidence_preserved': True, 'next_attempt_at_utc': now}
+    atomic_write_bytes(audit_path, json.dumps(audit, ensure_ascii=False).encode(), durable=True, mode=0o600)
+    with closing(connect(root)) as con, con:
+        current, current_event = original_task(con)
+        if (current != task or current_event != event or prepared.is_symlink()
+                or hashlib.sha256(prepared.read_bytes()).hexdigest() != digest
+                or raw.exists() or raw.with_suffix('.json.stage.json').exists()):
+            raise ValueError('Original metadata task or evidence changed during explicit acknowledgement')
+        previous = con.execute('SELECT consecutive_failures FROM desktop_retry_windows WHERE table_id=?',
+                               (task['table_id'],)).fetchone()
+        con.execute('INSERT OR REPLACE INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+            (task['table_id'], task_id, prepared.stem, previous[0]+1 if previous else 1,
+             now, RETRY_SCHEDULED, str(audit_path.relative_to(root))))
+        con.execute("UPDATE tasks SET state='pending',last_error_code=?,next_attempt_at_utc=? WHERE task_id=?",
+                    (RETRY_SCHEDULED, now, task_id))
+        con.execute("UPDATE tables SET state='waiting_local_retry',last_error_code=? WHERE table_id=?",
+                    (RETRY_SCHEDULED, task['table_id']))
+    audit['state'] = 'committed'
+    try:
+        atomic_write_bytes(audit_path, json.dumps(audit, ensure_ascii=False).encode(), durable=True, mode=0o600)
+    except OSError:
+        pass  # Durable intent + committed queue; a display failure cannot grant a second replay.
+    return {'contract': LEGACY_REQUEUE_CONTRACT, 'state': RETRY_SCHEDULED, 'task_id': task_id,
+            'audit_path': str(audit_path.relative_to(root)), 'next_attempt_at_utc': now,
+            'data_preview_replayed': False, 'source_rows_adopted': False}
 
 
 def metadata_recovery_policy(config: dict) -> dict | None:
@@ -235,6 +334,61 @@ def reconcile_uncommitted_plan_failure(root: Path) -> bool:
     return True
 
 
+def _retry_hint(root: Path, con, candidate: dict, policy: dict, now: datetime) -> dict | None:
+    """Quarantine a broken local hint, never the source proof or whole queue.
+
+    A corrupt clock is not permission to retry immediately. Preserve its exact
+    SQLite value before replacement, wait one maximum window, and still require
+    the original negative outcome and a fresh interface check when that expires.
+    None means skip this candidate for this cycle, not clear a safety barrier.
+    """
+    key = 'metadata_recovery.' + candidate['task_id']
+    saved = con.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+    if not saved:
+        return {}
+    previous = {}
+    try:
+        if not isinstance(saved[0], str) or len(saved[0]) > 65536:
+            raise ValueError('Bounded JSON retry hint required')
+        previous = json.loads(saved[0])
+        if not isinstance(previous, dict):
+            raise ValueError('Object retry hint required')
+        if (previous.get('contract') == CONTRACT
+                and previous.get('attempted_at_utc') == candidate['attempted_at_utc']):
+            due = _clock(previous['next_check_at_utc'], future=True)
+            if due > now + timedelta(seconds=policy['max_seconds']):
+                raise ValueError('Retry clock exceeds its bounded window')
+            same_validator = (previous.get('state') != 'metadata_evidence_requires_review'
+                              or previous.get('evidence_clock_contract') == CLOCK_CONTRACT)
+            if same_validator and now < due:
+                return None
+        return previous
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        original = saved[0]
+        raw = (original if isinstance(original, bytes) else original.encode('utf-8')
+               if isinstance(original, str) else json.dumps(original).encode('utf-8'))
+        archive = root/'diagnostics'/('retry-hint-' + candidate['task_id'] + '-' + uuid.uuid4().hex + '.bin')
+        atomic_write_bytes(archive, raw, durable=True, mode=0o600)
+        count = previous.get('failures', 0) if isinstance(previous, dict) else 0
+        count = count if type(count) is int and 0 <= count <= 100000 else 0
+        repaired = {'contract': CONTRACT, 'state': 'waiting_metadata_interface',
+                    'task_id': candidate['task_id'], 'attempted_at_utc': candidate['attempted_at_utc'],
+                    'observed_at_utc': now.isoformat(), 'failures': count,
+                    'next_check_at_utc': (now + timedelta(seconds=policy['max_seconds'])).isoformat(),
+                    'failure_reason_code': 'local_retry_hint_quarantined',
+                    'preserved_hint_path': str(archive.relative_to(root)),
+                    'preserved_hint_sha256': hashlib.sha256(raw).hexdigest(),
+                    'preserved_sqlite_value_type': type(original).__name__,
+                    'data_query_repeated': False, 'source_rows_adopted': False}
+        if isinstance(previous, dict) and isinstance(previous.get('attempt_id'), str):
+            repaired['attempt_id'] = previous['attempt_id']
+        with con:
+            con.execute('UPDATE meta SET value=? WHERE key=?', (json.dumps(repaired), key))
+        if candidate['last_error_code'] in {REQUIRES_RECOVERY, 'unknown_outcome_no_auto_retry'}:
+            atomic_write_json(root/'metadata_recovery_status.json', repaired, durable=True)
+        return None
+
+
 def recover_failed_metadata(root: Path, bridge, *, policy: dict | None,
                             task_id: str | None = None) -> dict | None:
     """One bounded recovery per cycle; bad evidence never licenses UI mutation."""
@@ -268,16 +422,9 @@ def recover_failed_metadata(root: Path, bridge, *, policy: dict | None,
         for row in rows:
             candidate = dict(row)
             key = "metadata_recovery." + candidate["task_id"]
-            saved = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-            previous = json.loads(saved[0]) if saved else {}
-            if previous.get("contract") == CONTRACT and previous.get("attempted_at_utc") == candidate["attempted_at_utc"]:
-                # Recheck an old LOCAL validation failure once after the clock
-                # validator changes. Source/UI failures retain their cooldown;
-                # a code upgrade is not permission to reset a source retry.
-                same_validator = (previous.get("state") != "metadata_evidence_requires_review"
-                                  or previous.get("evidence_clock_contract") == CLOCK_CONTRACT)
-                if same_validator and now < _clock(previous["next_check_at_utc"], future=True) <= now + timedelta(seconds=policy["max_seconds"]):
-                    continue
+            previous = _retry_hint(root, con, candidate, policy, now)
+            if previous is None:
+                continue
             try:
                 proof = failed_plan_proof(root, candidate)
             except (ValueError, OSError, KeyError, TypeError) as exc:

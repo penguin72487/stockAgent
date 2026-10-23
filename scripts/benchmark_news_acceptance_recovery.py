@@ -23,6 +23,9 @@ import time
 from types import SimpleNamespace
 from urllib.parse import quote
 
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext_queue import NewsQueue, source_path, utc_now
 from downloader import news_fulltext_queue as queue_module
@@ -38,6 +41,46 @@ def _buffered_receipt_prefix(path, limit):
     """Prior exact bounded input primitive; only the benchmark selects it."""
     with path.open('rb') as stream:
         return stream.read(limit)
+
+
+def _single_allocation_receipt_prefix(path, limit):
+    """Prior v2 unbuffered primitive, retained only as an exact comparator."""
+    with path.open('rb', buffering=0) as stream:
+        first = stream.read(limit)
+        remaining = limit - len(first)
+        if not remaining or not first:
+            return first
+        parts = [first]
+        while remaining:
+            part = stream.read(remaining)
+            if part == b'':
+                break
+            parts.append(part)
+            remaining -= len(part)
+        return first if len(parts) == 1 else b''.join(parts)
+
+
+def _geometric_receipt_prefix(path, limit):
+    """Rejected 4-KiB-start experiment; never selected by production reads."""
+    with path.open('rb', buffering=0) as stream:
+        request = min(limit, 4096)
+        first = stream.read(request)
+        remaining = limit - len(first)
+        if not remaining or not first:
+            return first
+        parts = [first]
+        if len(first) == request:
+            request *= 4
+        while remaining:
+            size = min(remaining, request)
+            part = stream.read(size)
+            if part == b'':
+                break
+            parts.append(part)
+            remaining -= len(part)
+            if len(part) == size:
+                request *= 4
+        return first if len(parts) == 1 else b''.join(parts)
 
 
 def _binary_recovery(queue, paths):
@@ -109,7 +152,7 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
               batched_read_ahead_workers=0, adaptive_read_ahead=False, path_identity_only=False,
               adaptive_reprobe_only=False, seed_wait_bound_prefix=False,
               cohort_sampling='prefix', reference_batched_read_ahead_workers=0,
-              prefix_io_only=False, prefix_io_readers=None):
+              prefix_io_only=False, prefix_io_readers=None, prefix_chunk_only=False):
     if type(maximum_receipts) is not int or not 1 <= maximum_receipts <= 8192:
         raise ValueError('bounded_receipt_cohort_required')
     if type(cycles) is not int or not 1 <= cycles <= 3:
@@ -131,14 +174,14 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
         raise ValueError('explicit_adaptive_receipt_reading_required')
     if type(path_identity_only) is not bool:
         raise ValueError('explicit_receipt_path_comparison_required')
-    if (type(prefix_io_only) is not bool or prefix_io_readers is not None
-            and (not prefix_io_only or type(prefix_io_readers) is not int or not 0 <= prefix_io_readers <= 2)):
+    if (type(prefix_io_only) is not bool or type(prefix_chunk_only) is not bool or prefix_io_readers is not None
+            and (not (prefix_io_only or prefix_chunk_only) or type(prefix_io_readers) is not int or not 0 <= prefix_io_readers <= 2)):
         raise ValueError('explicit_bounded_prefix_io_comparison_required')
     if (type(adaptive_reprobe_only) is not bool or type(seed_wait_bound_prefix) is not bool
-            or seed_wait_bound_prefix and not (adaptive_reprobe_only or prefix_io_only and prefix_io_readers is None)):
+            or seed_wait_bound_prefix and not (adaptive_reprobe_only or (prefix_io_only or prefix_chunk_only) and prefix_io_readers is None)):
         raise ValueError('explicit_adaptive_reprobe_comparison_required')
     if (type(evict_receipt_pages) is not bool or type(binary_read_only) is not bool
-            or sum((json_decode_only, bool(read_ahead_workers), binary_read_only, bool(batched_read_ahead_workers), adaptive_read_ahead, path_identity_only, adaptive_reprobe_only, prefix_io_only)) > 1):
+            or sum((json_decode_only, bool(read_ahead_workers), binary_read_only, bool(batched_read_ahead_workers), adaptive_read_ahead, path_identity_only, adaptive_reprobe_only, prefix_io_only, prefix_chunk_only)) > 1):
         raise ValueError('separate_receipt_io_and_decode_comparisons_required')
     if evict_receipt_pages and not (hasattr(os, 'posix_fadvise') and hasattr(os, 'POSIX_FADV_DONTNEED')):
         raise ValueError('receipt_only_page_advice_unavailable')
@@ -175,20 +218,22 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
     before = [sha256_file(path) for path in paths]
     decode_parity = None
     prefix_parity = None
-    if prefix_io_only:
-        prefix_parity = all(_buffered_receipt_prefix(path, receipt_io_module.RECEIPT_CHUNK_BYTES + 1)
-            == receipt_io_module._read_prefix(path, receipt_io_module.RECEIPT_CHUNK_BYTES + 1) for path in paths)
+    if prefix_io_only or prefix_chunk_only:
+        reference_prefix = _single_allocation_receipt_prefix if prefix_chunk_only else _buffered_receipt_prefix
+        candidate_prefix = _geometric_receipt_prefix if prefix_chunk_only else receipt_io_module._read_prefix
+        prefix_parity = all(reference_prefix(path, receipt_io_module.RECEIPT_CHUNK_BYTES + 1)
+            == candidate_prefix(path, receipt_io_module.RECEIPT_CHUNK_BYTES + 1) for path in paths)
         if not prefix_parity:
             raise ValueError('exact_bounded_receipt_prefix_required')
-    if json_decode_only or binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only:
+    if json_decode_only or binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only or prefix_chunk_only:
         # Outside timed recovery: compare all fields, not only parquet_path,
         # and bind the equality proof to the unchanged full receipt bytes.
         semantic_hashes, mismatches = [], []
         for path in paths:
             text = path.read_text()
-            reference = json.dumps(private_json.loads(text) if binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only else json.loads(text),
+            reference = json.dumps(private_json.loads(text) if binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only or prefix_chunk_only else json.loads(text),
                                    sort_keys=True, ensure_ascii=True)
-            candidate = json.dumps(private_json.loads(_binary_receipt_input(path) if binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only else text),
+            candidate = json.dumps(private_json.loads(_binary_receipt_input(path) if binary_read_only or batched_read_ahead_workers or adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only or prefix_chunk_only else text),
                                    sort_keys=True, ensure_ascii=True)
             semantic_hashes.append(hashlib.sha256(reference.encode()).hexdigest())
             if reference != candidate:
@@ -231,7 +276,8 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
     original_choose = queue_module.adaptive_receipt_readers
     original_prefix = receipt_io_module._read_prefix
     path_parity = None
-    reference_mode, candidate_mode = (('buffered_prefix', 'unbuffered_prefix') if prefix_io_only else
+    reference_mode, candidate_mode = (('single_allocation_prefix', 'geometric_small_prefix') if prefix_chunk_only else
+                                      ('buffered_prefix', 'unbuffered_prefix') if prefix_io_only else
                                       (f'binary_batched_prefetch_{reference_batched_read_ahead_workers}',
                                        f'binary_batched_prefetch_{batched_read_ahead_workers}') if reference_batched_read_ahead_workers else
                                       ('sticky_batched_prefetch', 'periodic_batched_prefetch') if adaptive_reprobe_only else
@@ -263,8 +309,8 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
                         calls['committed_lookup_statements'] += 1
                 queue.db.set_trace_callback(trace)
                 cpu, wall = time.process_time(), time.perf_counter()
-                if prefix_io_only:
-                    receipt_io_module._read_prefix = original_prefix if mode == candidate_mode else _buffered_receipt_prefix
+                if prefix_io_only or prefix_chunk_only:
+                    receipt_io_module._read_prefix = candidate_prefix if mode == candidate_mode else reference_prefix
                     if seed_wait_bound_prefix:
                         first_probe = [True]
                         def choose(probe):
@@ -321,7 +367,7 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
                 results.append({'cycle': cycle + 1, 'mode': mode,
                     'wall_seconds': time.perf_counter() - wall, 'cpu_seconds': time.process_time() - cpu,
                     'receipt_json_reads': len(paths), **calls,
-                    'receipt_io': dict(queue.acceptance_receipt_io) if adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only else None,
+                    'receipt_io': dict(queue.acceptance_receipt_io) if adaptive_read_ahead or path_identity_only or adaptive_reprobe_only or prefix_io_only or prefix_chunk_only else None,
                     'sqlite_changes': queue.db.total_changes - changes})
         query_plan = [row[-1] for row in queue.db.execute('EXPLAIN QUERY PLAN SELECT receipt_path,path '
             'FROM accepted_batches INDEXED BY accepted_batches_receipt_path WHERE receipt_path IN (?)', (pairs[0][1],))]
@@ -344,7 +390,7 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
         len(paths) if r['mode'] == 'legacy' else (len(paths) + 127) // 128) for r in results)
     implementation_after = {str(path): sha256_file(path) for path in implementation_paths}
     accepted = accepted and implementation_before == implementation_after
-    return {'contract_version': 10 if prefix_io_only else 9 if cohort_sampling != 'prefix' or reference_batched_read_ahead_workers else 8 if adaptive_reprobe_only else 7 if path_identity_only else 6 if adaptive_read_ahead else 5 if batched_read_ahead_workers else 4 if binary_read_only else 3 if read_ahead_workers else 2 if json_decode_only else 1,
+    return {'contract_version': 11 if prefix_chunk_only else 10 if prefix_io_only else 9 if cohort_sampling != 'prefix' or reference_batched_read_ahead_workers else 8 if adaptive_reprobe_only else 7 if path_identity_only else 6 if adaptive_read_ahead else 5 if batched_read_ahead_workers else 4 if binary_read_only else 3 if read_ahead_workers else 2 if json_decode_only else 1,
         'accepted': accepted, 'observed_at_utc': utc_now(),
         'scope': 'AB/BA instrumented fixed committed-receipt stage in isolated SQLite; not live boot or publisher maximum',
         'cohort_receipts': len(paths), 'cohort_sha256': hashlib.sha256(json.dumps(
@@ -370,6 +416,7 @@ def benchmark(root, *, maximum_receipts=4096, cycles=2, json_decode_only=False,
         'candidate_path_identity_only': path_identity_only,
         'path_identity_parity': path_parity,
         'candidate_prefix_io_only': prefix_io_only,
+        'candidate_prefix_chunk_only': prefix_chunk_only,
         'prefix_io_readers': prefix_io_readers,
         'prefix_input_parity': prefix_parity,
         'receipt_json_reads_basis': 'complete logical JSON inputs decoded, not physical reads; oversized prefetched inputs fall back to the full owner read',
@@ -412,6 +459,8 @@ def main(argv=None):
                         help='Seed initial wait admission equally for a warm-tail regression scenario; not physical cold boot')
     parser.add_argument('--prefix-io-only', action='store_true',
                         help='Compare bounded buffered/unbuffered prefixes in the same canonical recovery')
+    parser.add_argument('--prefix-chunk-only', action='store_true',
+                        help='Benchmark-only rejected geometric-read experiment against prior v2; never enables production reads')
     parser.add_argument('--prefix-io-readers', type=int, choices=(0, 1, 2),
                         help='Optional fixed reader count only for prefix I/O; default retains natural adaptive admission')
     parser.add_argument('--evict-receipt-pages', action='store_true',
@@ -425,7 +474,8 @@ def main(argv=None):
                        path_identity_only=args.path_identity_only, adaptive_reprobe_only=args.adaptive_reprobe_only,
                        seed_wait_bound_prefix=args.seed_wait_bound_prefix, cohort_sampling=args.cohort_sampling,
                        reference_batched_read_ahead_workers=args.reference_batched_read_ahead_workers,
-                       prefix_io_only=args.prefix_io_only, prefix_io_readers=args.prefix_io_readers)
+                       prefix_io_only=args.prefix_io_only, prefix_io_readers=args.prefix_io_readers,
+                       prefix_chunk_only=args.prefix_chunk_only)
     atomic_write_json(args.output, result)
     print(json.dumps({k: result[k] for k in ('accepted', 'cohort_receipts', 'medians', 'wall_speedup', 'publisher_requests')}))
     return 0 if result['accepted'] else 1

@@ -132,16 +132,21 @@ def _collect_implementation_identity(
             for end in range(1, len(parts) + 1):
                 enqueue(repo.joinpath(*parts[:end], "__init__.py"))
             enqueue(repo.joinpath(*parts).with_suffix(".py"))
-    # Watch directory membership as well as consumed file generations. Missing
-    # parent directories are included: creating a namespace/package later must
-    # not evade the closure simply because it was absent at first admission.
-    watch_paths = set(identities)
+    # Watch consumed files and every existing candidate ancestor. Directory
+    # membership detects a previously absent import or namespace appearing;
+    # rebuilding then installs watches for its new descendants. Stat-ing every
+    # absent hypothetical path on every signal adds no independent proof.
+    watch_paths = {repo, *identities}
     for candidate in candidates:
         watch_paths.update(parent for parent in candidate.parents
                            if parent == repo or repo in parent.parents)
     for name in import_roots:
         watch_paths.update((repo / name, repo / f"{name}.py"))
-    watch = {path: _dependency_generation(path) for path in watch_paths}
+    # A dangling symlink may become importable when its external target is
+    # created, without changing any repository directory. Retain that absent
+    # target watch as well; ordinary absent paths use their existing ancestor.
+    watch = {path: generation for path in watch_paths
+             if (generation := _dependency_generation(path)) is not None or path.is_symlink()}
     if (any(list(file_generation(Path(identity["path"]))) != identity["generation"]
            or (str(path) != identity["path"] and file_identity(path) != identity)
             for path, identity in identities.items())

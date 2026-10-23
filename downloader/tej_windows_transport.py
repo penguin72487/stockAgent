@@ -77,6 +77,7 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
                         readiness_seconds: float = 20,
                         windows_session_id: int | None = None,
                         interop_socket: str | None = None) -> subprocess.CompletedProcess:
+    transport_started = time.monotonic()
     request = request.resolve()
     if not re.fullmatch(r'[0-9a-f]{24}-[0-9a-f]{32}\.json', request.name):
         raise ValueError('Exact canonical bridge request required')
@@ -123,7 +124,9 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
                 if _ready(ready, token, digest):
                     # This is the irrevocable submission boundary. Everything
                     # after it, including a communicate timeout, is unknown.
+                    acknowledged = time.monotonic()
                     atomic_write_bytes(permit, token.encode('ascii'))
+                    permitted = time.monotonic()
                     try:
                         stdout, stderr = process.communicate(timeout=max(1, timeout-(time.monotonic()-started)))
                     except subprocess.TimeoutExpired:
@@ -132,6 +135,17 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
                         raise  # Durable permit means unknown, never another launch.
                     completed = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
                     completed.windows_interop_socket = (environment or os.environ).get('WSL_INTEROP')
+                    # Optional diagnostics, never a permission/submission proof.
+                    # Separate process startup/ACK from admitted execution; an
+                    # active process alone cannot explain a bridge-entry gap.
+                    completed.bridge_launch_timing = {
+                        'contract': 'tej_monotonic_guarded_transport_timing_v1',
+                        'request_sha256': digest, 'launches': slot+1,
+                        'admission_seconds': acknowledged-started,
+                        'permit_write_seconds': permitted-acknowledged,
+                        'admitted_execution_seconds': time.monotonic()-permitted,
+                        'total_transport_seconds': time.monotonic()-transport_started,
+                    }
                     return completed
                 time.sleep(.05)
         stderr = _stop_unpermitted(process) if process is not None else b''

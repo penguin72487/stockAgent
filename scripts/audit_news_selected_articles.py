@@ -23,7 +23,7 @@ from scripts.benchmark_cnyes_acquisition import verify_batches
 from stockagent.data.news_source_catalog import configuration_paths
 
 
-CONTRACT_VERSION = 10
+CONTRACT_VERSION = 11
 
 
 def _replay_feed_envelope(payload, request_url, registry, source, *, body_contract_version=1):
@@ -140,7 +140,7 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                                     raise ValueError("canonical_resolution_source_replay_mismatch")
                                 item.update(canonical_resolution_source_replay_verified=True,
                                             canonical_resolution_evidence=evidence)
-                            if (any(replay.get(k) != record.get(k) for k in ("body_sha256", "title", "published_at_raw", "modified_at_raw", "declared_canonical_url"))
+                            if (any(replay.get(k) != record.get(k) for k in ("body_sha256", "title", "published_at_raw", "modified_at_raw", "declared_canonical_url", "source_title_declarations_json"))
                                     or json.loads(replay["authors_json"]) != json.loads(record["authors_json"])):
                                 raise ValueError("current_source_replay_changed_body_title_author_or_clock")
                             if replay.get('verified_article_notices_json') != record.get('verified_article_notices_json'):

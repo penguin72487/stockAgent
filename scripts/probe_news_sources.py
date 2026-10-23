@@ -11,6 +11,7 @@ import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime
 import hashlib
 from itertools import islice
@@ -31,12 +32,34 @@ from lxml import etree
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, table_from_records, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_http import NewsHTTP
-from downloader.news_fulltext_policy import ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, _objects, _plain_text_node, extract_article
+from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, _objects, _plain_text_node, extract_article
+from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS
+from downloader.news_fulltext_bastillepost import BASTILLE_RESIDENT_EVIDENCE_VERSIONS
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_candidates import (
     compare_native_candidate, ettoday_candidate_source, extraction_failure_location,
     max_candidate_source, videoland_candidate_source,
+    native_candidate_source,
 )
+
+
+def scoped_primary_document_text(payload, selector, *, parser='lxml'):
+    """Inspect a declared non-article document without deleting its ancestor.
+
+    Malformed publisher HTML can place a policy section inside a header/nav.
+    Select its explicit, unique scope *before* ignoring boilerplate. Never
+    mutate the whole document, use a whole-page fallback or treat this private
+    policy text as an accepted article, access grant or publication clock.
+    The caller still owns source scope, REP/transport and denial checks.
+    """
+    if (not isinstance(payload, bytes) or len(payload) > 1 << 20
+            or not isinstance(selector, str) or not selector or len(selector) > 256):
+        raise ValueError('bounded_explicit_primary_document_scope_required')
+    soup = BeautifulSoup(payload, parser)
+    scopes = soup.select(selector)
+    if len(scopes) != 1 or scopes[0].name in {'html', 'body', 'script', 'style'}:
+        raise ValueError('unique_nonarticle_document_scope_required')
+    return _plain_text_node(scopes[0], parser=parser)
 
 
 def require_diagnostic_owner_scope(config, registry, canonical_config, canonical_registry, repo):
@@ -98,6 +121,7 @@ FAILURE_PROBE_CODES = (
     'invalid_bulk_publication_clock', 'article_rights_or_scope_excluded',
     'article_license_not_verified',
     'redirect_not_article',
+    'unsupported_article_path',
 )
 
 
@@ -368,23 +392,54 @@ def globalvoices_public_identity_shape(soup, source, *, page_url):
         'article_durably_accepted': False, 'automatic_profile_requests': 0}
 
 
-def probe_provider(http, urls, *, retain=False, output_root=None, candidate_source=None):
+def probe_provider(http, urls, *, retain=False, output_root=None, candidate_source=None, metadata_only=False):
+    # A representation question must not need a deliberately invalid selector
+    # (and a misleading body_not_found) to avoid article extraction. This opt-in
+    # mode keeps the same HTTP/REP/clock path and bounded structural metadata,
+    # but cannot retain raw responses or validate an article/parser candidate.
+    if metadata_only and (retain or candidate_source is not None):
+        raise ValueError('metadata_only_probe_cannot_retain_or_validate_candidates')
+    if candidate_source is not None and retain:
+        raise ValueError('metadata_only_same_source_candidate_required')
+    if retain:
+        if output_root is None:
+            raise ValueError('private_diagnostic_directory_required')
+        output_root = Path(output_root)
+        output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Keep the whole write/rename window private, not just the final
+        # permissions. Do not silently broaden or chmod an existing directory.
+        if output_root.is_symlink() or output_root.stat().st_mode & 0o077:
+            raise ValueError('private_diagnostic_directory_required')
+    metadata_contract = ({'source_probe_contract_version': 3,
+                          'diagnostic_mode': 'representation_metadata_only',
+                          'article_extraction': 'not_run',
+                          'article_durably_accepted': False} if metadata_only else {})
     results = []
     for url in urls:
         source = http.registry.require(url)
         if candidate_source is not None and (source.provider not in {'maxfinanciallife', 'ettoday', 'videoland'}
                 or candidate_source.provider != source.provider
-                or candidate_source.authorization_fingerprint != source.authorization_fingerprint or retain):
+                or candidate_source.authorization_fingerprint != source.authorization_fingerprint):
             raise ValueError('metadata_only_same_source_candidate_required')
         if http.provider_not_before.get(source.provider, 0) > time.time():
-            results.append({"url": url, "provider": source.provider, "error": "persisted_provider_cooldown", "sent": False})
+            results.append({"url": url, "provider": source.provider, "error": "persisted_provider_cooldown", "sent": False,
+                            **metadata_contract})
             break
         start = time.monotonic()
-        item = {"url": url, "provider": source.provider}
+        item = {"url": url, "provider": source.provider, **metadata_contract}
         try:
             response = http.get(url)
             item.update(status=response.status, final_url=response.url, bytes=len(response.body),
-                        response_sha256=hashlib.sha256(response.body).hexdigest())
+                        response_sha256=hashlib.sha256(response.body).hexdigest(),
+                        source_probe_contract_version=3 if metadata_only else 2, article_durably_accepted=False)
+            from downloader.news_fulltext_diagnostics import _display_url
+            item['actual_redirects'] = [{**asdict(hop),
+                'from_url': _display_url(hop.from_url), 'to_url': _display_url(hop.to_url),
+                'location': _display_url(hop.location),
+                'URL_query_and_fragment_omitted_in_display': True,
+                **{name+'_raw_sha256': hashlib.sha256(getattr(hop, name).encode()).hexdigest()
+                   for name in ('from_url', 'to_url', 'location')}}
+                for hop in getattr(response, 'redirects', ())]
             if response.status == 200 and "html" in response.headers.get("content-type", ""):
                 soup = BeautifulSoup(response.body, "lxml")
                 if source.provider == 'globalvoices':
@@ -393,6 +448,9 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                 if source.provider == 'watchmedia':
                     from downloader.news_fulltext_watchmedia import watchmedia_validation_metadata
                     item['watchmedia_native_validation'] = watchmedia_validation_metadata(soup, page_url=response.url)
+                if source.embedded_article_layout in INEWS_LAYOUT_VERSIONS:
+                    from downloader.news_fulltext_setn import inews_validation_context
+                    item['inews_native_validation_context'] = inews_validation_context(soup, page_url=response.url)
                 if source.provider == 'pocket':
                     from downloader.news_fulltext_pocket import pocket_identity_metadata
                     item['pocket_native_validation'] = pocket_identity_metadata(soup, page_url=response.url)
@@ -403,6 +461,10 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                 if source.provider == 'peoplemedia':
                     from downloader.news_fulltext_peoplemedia import peoplemedia_validation_metadata
                     item['peoplemedia_native_validation'] = peoplemedia_validation_metadata(soup, page_url=response.url)
+                if source.embedded_article_layout in BASTILLE_LAYOUT_VERSIONS:
+                    from downloader.news_fulltext_bastillepost import bastillepost_validation_metadata
+                    item['bastillepost_native_validation'] = bastillepost_validation_metadata(soup, page_url=response.url,
+                        adapter_contract_version=BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout])
                 if source.provider == 'mitrade':
                     from downloader.news_fulltext_mitrade import mitrade_validation_metadata
                     item['mitrade_native_validation'] = mitrade_validation_metadata(
@@ -638,13 +700,14 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                                            for node in soup.select("#post-header-credit, [rel=author], .contributor-name")][:10]
                 item["links"] = [{"href": a.get("href"), "title": a.get_text(" ", strip=True)[:120]}
                                   for a in soup.select("#article a[href], #content a[href]")][:200]
-                try:
-                    article = extract_article(response.body, source, page_url=response.url)
-                    item["extracted"] = {k: article.get(k) for k in ("title", "authors_json", "published_at_raw", "body_sha256", "body_completeness", "extraction_method", "declared_license_urls_json")}
-                    item["body_characters"] = len(article["body"])
-                except NewsError as error:
-                    item["extraction_error"] = error.code
-                    item['extraction_failure_location'] = extraction_failure_location(error)
+                if not metadata_only:
+                    try:
+                        article = extract_article(response.body, source, page_url=response.url)
+                        item["extracted"] = {k: article.get(k) for k in ("title", "authors_json", "published_at_raw", "body_sha256", "body_completeness", "extraction_method", "declared_license_urls_json")}
+                        item["body_characters"] = len(article["body"])
+                    except NewsError as error:
+                        item["extraction_error"] = error.code
+                        item['extraction_failure_location'] = extraction_failure_location(error)
                 if candidate_source is not None:
                     item['candidate_parser'] = compare_native_candidate(
                         response.body, source, candidate_source, page_url=response.url)
@@ -666,18 +729,27 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                         "authorization_json": json.dumps(source.authorization, ensure_ascii=False),
                         "captured_at_utc": utc_now(), "diagnostic_only": True, "accepted_as_article": False, "publish": False}]),
                         compression="zstd", compression_level=9, durable=True)
-                    atomic_write_json(path.with_suffix('.receipt.json'), {"sha256": sha256_file(path), "path": str(path),
-                        "response_sha256": item["response_sha256"], "diagnostic_only": True, "accepted_as_article": False, "publish": False})
+                    path.chmod(0o600)
+                    receipt_path = path.with_suffix('.receipt.json')
+                    atomic_write_json(receipt_path, {"sha256": sha256_file(path), "path": str(path),
+                        "response_sha256": item["response_sha256"], "diagnostic_only": True, "accepted_as_article": False, "publish": False},
+                        durable=True)
+                    receipt_path.chmod(0o600)
                     item["private_diagnostic_path"] = str(path)
             elif response.status == 200 and ("xml" in response.headers.get("content-type", "") or response.body.lstrip().startswith(b"<?xml")):
+                xml_parser = etree.XMLParser(resolve_entities=False, no_network=True)
                 try:
-                    tree = etree.fromstring(response.body, etree.XMLParser(resolve_entities=False, no_network=True))
+                    tree = etree.fromstring(response.body, xml_parser)
                 except etree.XMLSyntaxError as error:
                     # A broken source document must not abort diagnosis of
                     # other endpoints. Retain locations/types, not rejected
                     # body text or a forgiving parse promoted to completeness.
+                    # The exception's error_log can include earlier parses on
+                    # this worker thread. Only this parser owns this response.
+                    item['xml_error_log_contract_version'] = 2
+                    item['xml_parse_error_scope'] = 'current_response_parser'
                     item['xml_parse_errors'] = [{'type': e.type_name, 'domain': e.domain_name,
-                        'line': e.line, 'column': e.column} for e in error.error_log[-8:]]
+                        'line': e.line, 'column': e.column} for e in xml_parser.error_log[-8:]]
                     controls = re.findall(rb'[\x00-\x08\x0b\x0c\x0e-\x1f]', response.body)
                     item['xml_invalid_ascii_controls'] = {f'U+{code[0]:04X}': controls.count(code)
                         for code in sorted(set(controls))}
@@ -703,9 +775,10 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                 item["xml_creator_samples"] = [n.text for n in tree.xpath("//*[local-name()='item']/*[local-name()='creator']")][:6]
                 if response.url.split('?', 1)[0] in source.fulltext_feeds:
                     from downloader.news_fulltext_feed import feed_records
-                    records, errors = feed_records(response, http, source)
-                    item['feed_valid_body_rows'] = len(records)
-                    item['feed_item_errors'] = errors
+                    if not metadata_only:
+                        records, errors = feed_records(response, http, source)
+                        item['feed_valid_body_rows'] = len(records)
+                        item['feed_item_errors'] = errors
                     # Diagnose the location of rights flags without retaining
                     # an unreviewed/mixed raw feed or logging article bodies.
                     item['feed_rights_markers'] = []
@@ -756,14 +829,15 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                         "content_has_markup": "<" in post["content"] if isinstance(post.get("content"), str) else None,
                         "source": str(post.get("source") or "")[:160],
                     } for post in posts[:30] if isinstance(post, dict)] if isinstance(posts, list) else []
-                    try:
-                        cnyes_pagination(response)
-                        rows, errors = cnyes_records(response, http, source)
-                        item["bulk_validated_body_rows"] = len(rows)
-                        item["bulk_item_errors"] = errors
-                    except NewsError as error:
-                        item["bulk_validation_error"] = error.code
-                        item["bulk_validation_reason"] = str(error.__cause__)[:200] if isinstance(error.__cause__, ValueError) else None
+                    if not metadata_only:
+                        try:
+                            cnyes_pagination(response)
+                            rows, errors = cnyes_records(response, http, source)
+                            item["bulk_validated_body_rows"] = len(rows)
+                            item["bulk_item_errors"] = errors
+                        except NewsError as error:
+                            item["bulk_validation_error"] = error.code
+                            item["bulk_validation_reason"] = str(error.__cause__)[:200] if isinstance(error.__cause__, ValueError) else None
                     if retain and isinstance(posts, list) and posts and all(
                             isinstance(post, dict) and type(post.get("payment")) is int and post["payment"] == 0 for post in posts):
                         capture_key = hashlib.sha256(json.dumps([source.provider, url, response.url,
@@ -775,11 +849,14 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                             "captured_at_utc": utc_now(), "diagnostic_only": True,
                             "accepted_as_article": False, "publish": False,
                         }]), compression="zstd", compression_level=9, durable=True)
-                        atomic_write_json(path.with_suffix(".receipt.json"), {
+                        path.chmod(0o600)
+                        receipt_path = path.with_suffix(".receipt.json")
+                        atomic_write_json(receipt_path, {
                             "path": str(path), "sha256": sha256_file(path),
                             "response_sha256": item["response_sha256"], "url": url,
                             "diagnostic_only": True, "accepted_as_article": False, "publish": False,
                         }, durable=True)
+                        receipt_path.chmod(0o600)
                         item["private_diagnostic_path"] = str(path)
         except NewsError as error:
             item.update(error=error.code, retry=error.retry, delay=error.delay)
@@ -823,21 +900,30 @@ def main(argv=None):
     selection.add_argument('--candidate-request-status', help='Read a resident-owner candidate request; no HTTP or owner lock')
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
     parser.add_argument('--enqueue-candidate', action='store_true',
-        help='Submit one reviewed metadata-only candidate to the resident owner; do not stop it or issue HTTP here')
-    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2), default=1,
-        help='Resident finite evidence: v1 candidate; v2 reviewed Videoland native credit/clock formats')
+        help='Submit one reviewed finite candidate to the resident owner; do not stop it or issue HTTP here')
+    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2, 6, 7, 8, 9, 10, 11, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33), default=1,
+        help='Resident finite evidence: v1 candidate; v2 Videoland credit/clock; v6 Watchmedia legacy credit; v7 Pocket non-School boundary; v8 Bastille written boundary; v9 private native short original; v10 Bastille resource/body relationships; v11 private Bastille two-container original; v24 current iNEWS editor/credit shapes; v25 private printed-credit original after completed v24; v26 private named-header editor original after completed v24; v27 current ETtoday editor/identity/credit relations, metadata only; v28 private WWW leading-credit original after completed v27; v29 private inline-credit original after completed v28 scope refusal; v30 private visible reporter/Person/clock original after completed v29 scope refusal, with bounded refusal-stage facts')
     parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
                         help='Explicit observed missing-article failure; validation diagnosis is metadata-only')
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--retain-reviewed-response", action="store_true", help="Retain private public diagnostics, not accepted bodies or denied/member responses")
+    parser.add_argument('--metadata-only', action='store_true',
+                        help='Explicit representation probes only: skip article extraction/body validation; never retain raw responses')
     parser.add_argument("--trace-access", action="store_true", help="Record private bounded redirect/header/robots structure through the same HTTP path")
     parser.add_argument('--require-current-missing-body-failure', action='store_true',
                         help='Read-only exact-head preflight; reject saved, leased, denied, undated or not-yet-due selections')
     parser.add_argument('--candidate-embedded-layout', choices=[
         *[name for name, version in MAX_LAYOUT_VERSIONS.items() if version >= 4],
-        'ettoday_visible_article_v39', 'videoland_visible_article_v4'],
-        help='Compare one reviewed MAX, ETtoday or Videoland candidate using the same received envelope; metadata-only, no acceptance/requeue')
+        'ettoday_visible_article_v39', 'videoland_visible_article_v4', 'watchmedia_visible_article_v3', 'pocket_visible_article_v12',
+        *INEWS_LAYOUT_VERSIONS,
+        *(k for k, v in BASTILLE_LAYOUT_VERSIONS.items() if v >= 2)],
+        help='One reviewed candidate or current Watchmedia/Pocket structural question; same envelope, metadata only, no acceptance/requeue')
     args = parser.parse_args(argv)
+    if args.metadata_only and (not args.probe or args.current_failure_provider or args.candidate_request_status
+            or args.require_current_missing_body_failure or args.retain_reviewed_response
+            or args.candidate_embedded_layout or args.enqueue_candidate or args.candidate_evidence_contract != 1
+            or args.failure_code != 'body_not_found'):
+        parser.error('metadata-only requires explicit probes without retention, failed-body assertions or parser candidates')
     if args.failure_code != 'body_not_found' and (
             not (args.current_failure_provider or args.require_current_missing_body_failure)
             or args.retain_reviewed_response):
@@ -856,9 +942,38 @@ def main(argv=None):
         return 0
     if args.enqueue_candidate and not args.candidate_embedded_layout:
         parser.error('resident_candidate_requires_reviewed_candidate_layout')
+    if args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33} and (
+            not args.enqueue_candidate or args.candidate_embedded_layout != 'ettoday_visible_article_v39'):
+        parser.error('reviewed_ETtoday_current_resident_boundary_evidence_required')
+    if (args.candidate_evidence_contract in {24, 25, 26} or args.candidate_embedded_layout in INEWS_LAYOUT_VERSIONS) and (
+            not args.enqueue_candidate or args.candidate_evidence_contract not in {24, 25, 26}
+            or args.candidate_embedded_layout not in INEWS_LAYOUT_VERSIONS):
+        parser.error('reviewed_inews_resident_shape_evidence_required')
     if args.candidate_evidence_contract == 2 and (not args.enqueue_candidate
             or args.candidate_embedded_layout != 'videoland_visible_article_v4'):
         parser.error('reviewed_Videoland_resident_credit_clock_evidence_required')
+    if args.candidate_evidence_contract == 6 and (not args.enqueue_candidate
+            or args.candidate_embedded_layout != 'watchmedia_visible_article_v3'):
+        parser.error('reviewed_Watchmedia_resident_legacy_credit_evidence_required')
+    if args.candidate_evidence_contract == 7 and (not args.enqueue_candidate
+            or args.candidate_embedded_layout != 'pocket_visible_article_v12'):
+        parser.error('reviewed_Pocket_resident_non_school_evidence_required')
+    if args.candidate_evidence_contract == 8 and (not args.enqueue_candidate
+            or BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) < 2):
+        parser.error('reviewed_Bastille_resident_written_boundary_evidence_required')
+    if args.candidate_evidence_contract == 9 and (not args.enqueue_candidate
+            or BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) < 2
+            or args.failure_code != 'body_not_found'):
+        parser.error('reviewed_Bastille_resident_private_short_original_required')
+    if args.candidate_evidence_contract == 10 and (not args.enqueue_candidate
+            or BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) < 2):
+        parser.error('reviewed_Bastille_resident_resource_boundary_evidence_required')
+    if args.candidate_evidence_contract == 11 and (not args.enqueue_candidate
+            or BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) < 6
+            or args.failure_code != 'body_not_found'):
+        parser.error('reviewed_Bastille_resident_private_continuation_original_required')
+    if BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) >= 2 and args.candidate_evidence_contract not in BASTILLE_RESIDENT_EVIDENCE_VERSIONS:
+        parser.error('reviewed_Bastille_resident_written_boundary_evidence_required')
     if args.current_failure_provider:
         try:
             args.probe = select_current_failure_urls(repo / config['root'], args.current_failure_provider, registry,
@@ -885,11 +1000,18 @@ def main(argv=None):
     candidate = None
     if args.candidate_embedded_layout:
         candidate_provider = ('videoland' if args.candidate_embedded_layout == 'videoland_visible_article_v4'
+            else 'setn_inews_scope' if args.candidate_embedded_layout in INEWS_LAYOUT_VERSIONS
+            else 'watchmedia' if args.candidate_embedded_layout == 'watchmedia_visible_article_v3'
+            else 'bastillepost' if BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) >= 2
+            else 'pocket' if args.candidate_embedded_layout == 'pocket_visible_article_v12'
             else 'ettoday' if args.candidate_embedded_layout in ETTODAY_LAYOUT_VERSIONS else 'maxfinanciallife')
         if (set(groups) != {candidate_provider} or len(args.probe) != 1 or args.retain_reviewed_response
-                or not args.require_current_missing_body_failure or args.failure_code == 'body_not_found'):
+                or not args.require_current_missing_body_failure
+                or args.failure_code == 'body_not_found' and args.candidate_evidence_contract not in BASTILLE_RESIDENT_EVIDENCE_VERSIONS):
             parser.error('one_current_reviewed_validation_failure_metadata_only_candidate_required')
         factory = (videoland_candidate_source if candidate_provider == 'videoland'
+            else native_candidate_source if candidate_provider in {'watchmedia', 'pocket', 'bastillepost', 'setn_inews_scope'}
+                or candidate_provider == 'ettoday' and args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33}
             else ettoday_candidate_source if candidate_provider == 'ettoday' else max_candidate_source)
         candidate = factory(config, registry, repo, args.candidate_embedded_layout)
     failure_grant = None
@@ -932,11 +1054,15 @@ def main(argv=None):
     try:
         with ThreadPoolExecutor(max_workers=min(len(groups), config["workers"])) as pool:
             options = {'retain': args.retain_reviewed_response, 'output_root': diagnostics}
+            if args.metadata_only:
+                options['metadata_only'] = True
             if candidate is not None:
                 options['candidate_source'] = candidate
             results = list(pool.map(lambda urls: probe_provider(http, urls, **options), groups.values()))
-        result = {"observed_at_utc": utc_now(), "probes": [r for group in results for r in group],
+        result = {"source_probe_contract_version": 3 if args.metadata_only else 2, "observed_at_utc": utc_now(), "probes": [r for group in results for r in group],
                   "performance": http.metrics.snapshot(), "official_rate_limit": None}
+        if args.metadata_only:
+            result['diagnostic_mode'] = 'representation_metadata_only'
         if failure_grant is not None:
             result['current_failed_missing_body_preflight'] = failure_grant
             result['failure_probe_code'] = args.failure_code

@@ -32,8 +32,9 @@ import pyarrow.parquet as pq
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file, table_from_records
 from downloader.news_fulltext_metrics import (
     NewsMetrics, CNYES_NATIVE_BODY_FAILURE_STAGES, ETTODAY_ATTRIBUTION_FAILURE_STAGES,
+    ARTICLE_RESPONSE_ENVELOPE_CONTRACT_VERSION,
 )
-from downloader.news_fulltext_policy import (CONTRACT_VERSION, ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, normalize_url,
+from downloader.news_fulltext_policy import (CONTRACT_VERSION, ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, BASTILLE_LAYOUT_VERSIONS, NewsError, PolicyRegistry, normalize_url,
                                             REQUEST_DEFERRAL_CONTRACT_VERSION, REQUEST_DEFERRAL_CODES)
 from stockagent.private_json import loads as decode_private_json
 from downloader.news_receipt_io import (
@@ -72,6 +73,7 @@ ARTICLE_RECHECK_DAY_CONTRACT_VERSION = 1
 CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION = 2
 CNYES_UNKNOWN_IDENTITY_RECHECK_CONTRACT_VERSION = 1
 CNYES_UNKNOWN_BODY_RECHECK_SECONDS = 300
+CNYES_RETAINED_VALIDATION_RECHECK_CONTRACT_VERSION = 1
 ARTICLE_PATH_ADMISSION_CONTRACT_VERSION = 1
 ACCEPTANCE_RECEIPT_DECODE_VERSION = 2
 ACCEPTANCE_RECEIPT_INPUT_VERSION = 1
@@ -274,13 +276,18 @@ def ettoday_literal_value_parser_repair(source, previous_capture):
 
 
 def native_body_only_layout(source):
+    from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS
     return bool(source and (
         source.provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v6'
-        or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'))
+        or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'
+        or source.provider == 'setn_inews_scope'
+            and INEWS_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2
+        or source.provider == 'upmedia' and source.embedded_article_layout in {
+            'upmedia_public_modern_article_v2', 'upmedia_public_modern_article_v3', 'upmedia_public_modern_article_v4'}))
 
 
 _NATIVE_TEXT_REPAIR_SPECS = {
-    'pocket': (frozenset({'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}), ('article_identity_not_verified', 'invalid_bulk_publication_clock')),
+    'pocket': (frozenset({'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7', 'pocket_visible_article_v8', 'pocket_visible_article_v9'}), ('article_identity_not_verified', 'invalid_bulk_publication_clock')),
     'watchmedia': (frozenset({'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}), ('article_identity_not_verified',)),
     'pinview': (frozenset({'pinview_visible_article_v2'}), ('article_rights_or_scope_excluded',)),
     'peoplemedia': (frozenset({'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3'}),
@@ -289,6 +296,8 @@ _NATIVE_TEXT_REPAIR_SPECS = {
     'idn': (frozenset({'idn_visible_article_v2', 'idn_visible_article_v3'}),
             ('invalid_bulk_publication_clock', 'article_rights_or_scope_excluded')),
     'videoland': (frozenset({'videoland_visible_article_v2', 'videoland_visible_article_v3', 'videoland_visible_article_v4'}), ('article_attribution_not_verified',)),
+    'bastillepost': (frozenset(k for k, v in BASTILLE_LAYOUT_VERSIONS.items() if v >= 2),
+                     ('body_not_found', 'invalid_bulk_publication_clock', 'unsupported_article_path')),
 }
 
 
@@ -859,6 +868,9 @@ class NewsQueue:
             self.close()
             raise
         self.migrate_cnyes_endpoint_circuits()
+        from downloader.news_fulltext_references import initialize as initialize_publisher_references
+        with self.metrics.measure('publisher_reference_recovery'):
+            initialize_publisher_references(self)
         with self.db:
             self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('current_owner_id',?)", (self.owner,))
         if self.lifecycle is not None:
@@ -1274,6 +1286,42 @@ class NewsQueue:
                 'accepted_as_bodies': False}, sort_keys=True)))
             self.metrics.count('cnyes', 'pinned_native_v16_declaration_rechecks', len(selected))
 
+    def _activate_authorized_metadata(self, host, source):
+        """Apply the same namespace gate as new metadata, before dispatch.
+
+        Enabling a provider must not temporarily turn its non-article links
+        into missing-body work. Historical observations, stored heads, leases
+        and failures are not pristine metadata and are never reclassified.
+        Literal finite selections still grant no same-host bulk admission.
+        The caller owns the policy-reconciliation transaction.
+        """
+        selection = source.finite_article_urls
+        if not source.article_path_pattern:
+            clause = (' AND url IN (' + ','.join('?' for _ in selection) + ')') if selection else ''
+            self.db.execute("UPDATE articles SET state='pending',due=0,error_code=NULL "
+                            "WHERE host=? AND state='awaiting_authorization'" + clause,
+                            (host, *selection))
+            return
+        pattern = re.compile(source.article_path_pattern)
+        selected = frozenset(selection)
+        rows = self.db.execute("SELECT id,url FROM articles WHERE host=? AND state='awaiting_authorization'",
+                               (host,)).fetchall()
+        included, excluded = [], []
+        for key, url in rows:
+            if not pattern.search(urlsplit(url).path):
+                excluded.append((key,))
+            elif not selected or url in selected:
+                included.append((key,))
+        self.db.executemany("UPDATE articles SET state='pending',due=0,error_code=NULL WHERE id=?", included)
+        # Keep every pre-existing capture/transport/failure fact. Only a
+        # never-requested metadata head can get this local scope outcome.
+        self.db.executemany("UPDATE articles SET state='unsupported_article_path',"
+            "error_code='unsupported_article_path' WHERE id=? AND attempts=0 AND due=0 "
+            "AND error_code IS NULL AND body_sha256 IS NULL AND coalesce(body_bytes,0)=0 "
+            "AND parquet_path IS NULL AND captured_at_utc IS NULL AND last_checked_at_utc IS NULL "
+            "AND authorization_fingerprint IS NULL AND etag IS NULL AND last_modified IS NULL "
+            "AND validator_url IS NULL AND lease_owner IS NULL AND lease_until IS NULL", excluded)
+
     def reconcile_policy(self):
         self.migrate_cnyes_window_dispatch()
         # Policy/expiry is evaluated by the registry on every owner start.
@@ -1324,6 +1372,7 @@ class NewsQueue:
         self.recheck_mitrade_reviewed_profile_scope(prior_sources.get('source_capture_fingerprint:mitrade'))
         for provider in _NATIVE_TEXT_REPAIR_SPECS:
             self.recheck_native_text_parser(provider, prior_sources.get('source_capture_fingerprint:' + provider))
+        self.recheck_pocket_article_request_routes(prior_sources.get('source_capture_fingerprint:pocket'))
         self.recheck_ettoday_social_headlines(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_ettoday_break_credits(prior_sources.get('source_capture_fingerprint:ettoday'))
         self.recheck_ettoday_static_imgur(prior_sources.get('source_capture_fingerprint:ettoday'))
@@ -1364,6 +1413,7 @@ class NewsQueue:
             self.migrate_parser_repair_lanes()
             self.migrate_unknown_cnyes_body_rechecks()
             self.migrate_unknown_cnyes_identity_rechecks()
+            self.migrate_cnyes_retained_validation_rechecks()
             return
         hosts = self.db.execute("SELECT host,provider FROM hosts").fetchall()
         with self.metrics.measure("policy_reconciliation"), self.db:
@@ -1381,11 +1431,28 @@ class NewsQueue:
                     self.db.execute("UPDATE articles SET provider=? WHERE host=?", (target, host))
                     self.db.execute("UPDATE hosts SET provider=? WHERE host=?", (target, host))
                 if source and source.allowed:
+                    if source.finite_article_urls:
+                        # A literal reviewed selection is not permission to
+                        # activate all the same-host metadata or old failures.
+                        self._activate_authorized_metadata(host, source)
+                        continue
                     self.db.execute("UPDATE articles SET metadata_order_day=substr(metadata_date_raw,1,10) WHERE host=? "
                                     "AND metadata_order_day IS NULL AND metadata_date_raw LIKE '____-__-__%'", (host,))
-                    self.db.execute("UPDATE articles SET state='pending',due=0,error_code=NULL "
-                                    "WHERE host=? AND state='awaiting_authorization'", (host,))
+                    if not ((source.provider == 'stockfeel'
+                            and source.embedded_article_layout in {'stockfeel_visible_original_v2', 'stockfeel_visible_original_v3', 'stockfeel_visible_original_v4', 'stockfeel_visible_original_v5', 'stockfeel_visible_original_v6', 'stockfeel_visible_original_v7'})
+                            or (source.provider == 'taiwannews'
+                                and source.embedded_article_layout in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'})):
+                        # Role separation grants no new access/authorization.
+                        # Only an explicitly witnessed missing-head repair may
+                        # enter the shared mailbox, never every old failure.
+                        self._activate_authorized_metadata(host, source)
                     if (parser_changed and source.provider != 'cnyes'
+                            # Static/native body revisions grant no bulk
+                            # reset of historical failure/permission state.
+                            and not (source.provider == 'taiwannews'
+                                     and source.embedded_article_layout in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'})
+                            and not (source.provider == 'stockfeel'
+                                     and source.embedded_article_layout in {'stockfeel_visible_original_v2', 'stockfeel_visible_original_v3', 'stockfeel_visible_original_v4', 'stockfeel_visible_original_v5', 'stockfeel_visible_original_v6', 'stockfeel_visible_original_v7'})
                             and not ftnn_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ftnn'))
                             and not (source.provider == 'ftnn'
                                      and source.embedded_article_layout in {'ftnn_visible_article_v2', 'ftnn_visible_article_v3', 'ftnn_visible_article_v4', 'ftnn_visible_article_v5', 'ftnn_visible_article_v6'})
@@ -1397,6 +1464,8 @@ class NewsQueue:
                             and not native_body_only_layout(source)
                             and not (source.provider in _NATIVE_TEXT_REPAIR_SPECS
                                      and source.embedded_article_layout in _NATIVE_TEXT_REPAIR_SPECS[source.provider][0])
+                            and not (source.provider == 'pocket'
+                                     and source.embedded_article_layout in {'pocket_visible_article_v10', 'pocket_visible_article_v11', 'pocket_visible_article_v12'})
                             and not (source.provider == 'maxfinanciallife'
                                      and MAX_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2)
                             and not (source.provider == 'ettoday'
@@ -1515,8 +1584,12 @@ class NewsQueue:
                             # reviewed native routes. A parser rollout must not
                             # reset their original due/attempt/error/lease before
                             # that migration can record and preserve evidence.
-                            if state == 'body_not_found' and self.unknown_cnyes_body_recheck_allowed(
-                                    source, {'provider': 'cnyes', 'url': url, 'body_sha256': body_sha256}):
+                            if state == 'body_not_found' and (body_sha256 is not None
+                                    or self.unknown_cnyes_body_recheck_allowed(
+                                        source, {'provider': 'cnyes', 'url': url, 'body_sha256': None})):
+                                # Saved validation failures have their own
+                                # bounded migration. Incomplete saved heads
+                                # must not get an unfenced attempts/due reset.
                                 continue
                             if state == "article_attribution_not_verified" and (host not in {"news.cnyes.com", "m.cnyes.com"}
                                     or not re.fullmatch(r"/news/print/[0-9]+", urlsplit(url).path)):
@@ -1536,6 +1609,7 @@ class NewsQueue:
         self.migrate_parser_repair_lanes()
         self.migrate_unknown_cnyes_body_rechecks()
         self.migrate_unknown_cnyes_identity_rechecks()
+        self.migrate_cnyes_retained_validation_rechecks()
 
     def recheck_max_native_clocks(self, previous_capture):
         source = self.registry.sources.get('maxfinanciallife')
@@ -1688,15 +1762,93 @@ class NewsQueue:
                 'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
             self.metrics.count(source.provider, f'native_layout_rechecks_v{version}', len(repaired))
 
+    def recheck_pocket_article_request_routes(self, previous_capture):
+        """Once-only witnessed route/body repair, not an authority reset.
+
+        Retain attempts, due dates, clocks, failures and all completed bodies.
+        Only the finite observed, previously unsaved source-ID requests may
+        re-enter normal dispatch. Aliases of local originals stay lower-priority
+        unresolved URLs; no metadata observation is itself body acceptance.
+        """
+        source = self.registry.sources.get('pocket')
+        if (not source or not source.allowed
+                or source.embedded_article_layout not in {'pocket_visible_article_v10', 'pocket_visible_article_v11', 'pocket_visible_article_v12'}
+                or source.data_fingerprint != source.parser_repair_capture_fingerprint
+                or not isinstance(previous_capture, str) or not re.fullmatch(r'[0-9a-f]{64}', previous_capture)
+                or previous_capture != source.parser_repair_prior_capture_fingerprint
+                or previous_capture == source.data_fingerprint):
+            return
+        from downloader.news_fulltext_pocket import (
+            POCKET_V10_NEW_ARTICLE_REQUESTS, POCKET_V11_NEW_ARTICLE_REQUESTS,
+            POCKET_V12_NEW_BODY_REQUESTS, pocket_article_id,
+        )
+        version = int(source.embedded_article_layout.rsplit('_v', 1)[1])
+        urls = {10: POCKET_V10_NEW_ARTICLE_REQUESTS, 11: POCKET_V11_NEW_ARTICLE_REQUESTS,
+                12: POCKET_V12_NEW_BODY_REQUESTS}[version]
+        kind = {10: 'numeric', 11: 'literal_opaque', 12: 'native_linked_figure_clock'}[version]
+        marker = f'pocket_{kind}_request_recheck_v{version}:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        repaired, now = [], time.time()
+        with self.db:
+            saved_ids = {pocket_article_id(row['validator_url'] or row['url'], requested=True,
+                                          adapter_contract_version=version)
+                         for row in self.db.execute('SELECT url,validator_url FROM articles '
+                             "WHERE provider='pocket' AND body_sha256 IS NOT NULL")}
+            for url in urls:
+                identity = pocket_article_id(url, requested=True, adapter_contract_version=version)
+                if identity is None or identity in saved_ids:
+                    continue
+                row = self.db.execute('SELECT id,url,state,error_code,attempts,due,last_checked_at_utc '
+                    "FROM articles WHERE provider='pocket' AND host='www.pocket.tw' AND url=? "
+                    "AND error_code=state AND attempts>0 AND due<=? "
+                    'AND body_sha256 IS NULL AND parquet_path IS NULL AND lease_owner IS NULL '
+                    'AND lease_until IS NULL AND last_checked_at_utc IS NOT NULL', (url, now)).fetchone()
+                if row is None:
+                    continue
+                allowed_errors = (('article_identity_not_verified',) if url in POCKET_V12_NEW_BODY_REQUESTS[:2]
+                    else ('unsupported_article_path', 'invalid_bulk_publication_clock')) if version == 12 else ('unsupported_article_path',)
+                if row['state'] not in allowed_errors:
+                    continue
+                try:
+                    observed = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                    if observed.utcoffset() is None or observed.timestamp() > now + 2:
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if self.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row['id'],)).rowcount != 1:
+                    raise ValueError('pocket_article_request_head_changed_during_repair')
+                repaired.append({key: row[key] for key in row.keys() if key != 'id'})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': version, 'old_source_fingerprint': previous_capture,
+                'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
+                'previous_state': ('per_exact_URL_native_body_or_clock_failure' if version == 12
+                    else 'unsupported_article_path'), 'target_state': 'retry', 'rows': repaired,
+                'attempts_due_error_and_observation_preserved': True,
+                'reviewed_numeric_request_scope_not_a_body_parser_retry': version == 10,
+                'reviewed_literal_opaque_scope_not_a_numeric_alias': version == 11,
+                'reviewed_exact_original_linked_figure_and_calendar_only': version == 12,
+                'already_saved_article_ID_aliases_requeued': False,
+                'saved_heads_leases_refusals_or_unproved_failures_changed': False,
+                'accepted_as_bodies': False}, sort_keys=True)))
+            self.metrics.count(source.provider, f'{kind}_request_rechecks_v{version}', len(repaired))
+
     def recheck_native_text_parser(self, provider, previous_capture):
         """Retry the source's declared missing native predecessor failures once.
 
-        Accepted bodies, leases, access refusals, unsupported routes, attempts,
+        Accepted bodies, leases, access refusals, unreviewed routes, attempts,
         deadlines and original failure/observation evidence remain untouched.
         A normal canonical fetch must still establish and commit the body.
         """
         source = self.registry.sources.get(provider)
         if not native_text_parser_repair(source, previous_capture):
+            return
+        if (provider == 'bastillepost' and BASTILLE_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 3
+                and BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout] != 4):
+            # These repairs select only the reviewed unfinished cohort via the
+            # EXISTING reviewed-repair mailbox. Do not retry the known double
+            # container/unretained shape or erase attempts through a generic
+            # parser reset. New ordinary incremental articles use the current ABI.
             return
         if provider == 'pocket':
             from downloader.news_fulltext_pocket import pocket_article_id as article_id
@@ -1712,11 +1864,23 @@ class NewsQueue:
             from downloader.news_fulltext_idn import idn_article_id as article_id
         elif provider == 'videoland':
             from downloader.news_fulltext_videoland import videoland_article_id as article_id
+        elif provider == 'bastillepost':
+            from downloader.news_fulltext_bastillepost import bastillepost_article_id
+            bastille_version = BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout]
+            def article_id(url, requested=False):
+                if bastille_version == 4 and bastillepost_article_id(
+                        url, requested=requested, adapter_contract_version=3) is not None:
+                    return None  # v4 automatic repair is only newly recognized literal query views.
+                return bastillepost_article_id(url, requested=requested, adapter_contract_version=bastille_version)
         else:
             from downloader.news_fulltext_watchmedia import watchmedia_article_id as article_id
         errors = _NATIVE_TEXT_REPAIR_SPECS[provider][1]
         if provider == 'idn' and source.embedded_article_layout == 'idn_visible_article_v3':
             errors = ('article_attribution_not_verified',)
+        elif provider == 'bastillepost' and source.embedded_article_layout == 'bastillepost_visible_article_v4':
+            # Short prose uses the explicit reviewed mailbox. Only a due,
+            # empty newly recognized literal category URL retries at cutover.
+            errors = ('unsupported_article_path',)
         elif provider == 'videoland' and source.embedded_article_layout == 'videoland_visible_article_v3':
             errors = ('body_not_found',)
         elif provider == 'videoland' and source.embedded_article_layout == 'videoland_visible_article_v4':
@@ -1729,7 +1893,7 @@ class NewsQueue:
             # Native nonprose/media/embedded block boundaries only. Neither
             # missing clocks, paths nor rights/refusal states are a v4 retry.
             errors = ('article_identity_not_verified',)
-        elif provider == 'pocket' and source.embedded_article_layout in {'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
+        elif provider == 'pocket' and source.embedded_article_layout in {'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7', 'pocket_visible_article_v8', 'pocket_visible_article_v9'}:
             # Native heading/adjacent-account-CTA interpretation only. Observed
             # identity errors may retry; clocks, paths and refusals stay intact.
             errors = ('article_identity_not_verified',)
@@ -1739,12 +1903,18 @@ class NewsQueue:
             return
         repaired = []
         with self.db:
+            # Only the attested native defect can reconsider a still-empty,
+            # due Bastille head. Neither the unknown active
+            # body shapes nor a stored/partially-written/future head is replayed.
+            extra_guard = (' AND body_bytes=0 AND captured_at_utc IS NULL AND due<=?'
+                           if provider == 'bastillepost' else '')
             rows = self.db.execute(
                 'SELECT id,url,state,error_code,attempts,due,last_checked_at_utc FROM articles INDEXED BY dispatch '
                 'WHERE provider=? AND state IN (' + ','.join('?' for _ in errors) + ') '
                 'AND error_code=state AND body_sha256 IS NULL AND parquet_path IS NULL '
                 'AND last_checked_at_utc IS NOT NULL AND lease_owner IS NULL AND lease_until IS NULL '
-                'ORDER BY url', (provider, *errors)).fetchall()
+                + extra_guard + ' ORDER BY url',
+                (provider, *errors, *((time.time(),) if extra_guard else ()))).fetchall()
             for row in rows:
                 if article_id(row['url'], requested=True) is None:
                     continue
@@ -1761,7 +1931,11 @@ class NewsQueue:
                 'new_source_fingerprint': source.data_fingerprint, 'observed_at_utc': utc_now(),
                 'target_state': 'retry', 'rows': repaired,
                 'attempts_due_error_and_observation_preserved': True,
-                'stored_heads_leases_refusals_unsupported_paths_changed': False,
+                **({'stored_heads_leases_refusals_or_unreviewed_paths_changed': False,
+                    'only_reviewed_literal_current_cat_view_route_reconsidered': True,
+                    'numeric_id_hint_is_not_body_equivalence': True}
+                   if provider == 'bastillepost' else
+                   {'stored_heads_leases_refusals_unsupported_paths_changed': False}),
                 'all_failures_assumed_repairable': False, 'accepted_as_bodies': False}, sort_keys=True)))
         self.metrics.count(provider, f'native_parser_rechecks_v{version}', len(repaired))
 
@@ -3013,6 +3187,78 @@ class NewsQueue:
         self._migrate_unknown_cnyes_parser_rechecks(
             error_code='body_not_found', lane='body', version=CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION)
 
+    @staticmethod
+    def cnyes_retained_validation_recheck_allowed(source, row):
+        """A saved article is not proof that its latest failed check is final.
+
+        Reuse the ongoing native-route gate, without widening the missing-only
+        ABI. Require a complete saved reference under the current authorization.
+        This is scheduling eligibility, not body durability or freshness proof;
+        the real subsequent response must pass the normal extractor/writer.
+        """
+        if not NewsQueue.unknown_cnyes_body_recheck_allowed(source, {**row, 'body_sha256': None}):
+            return False
+        try:
+            captured = datetime.fromisoformat(row['captured_at_utc'].replace('Z', '+00:00'))
+            checked = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+            return bool(isinstance(row['body_sha256'], str) and re.fullmatch('[0-9a-f]{64}', row['body_sha256'])
+                and type(row['body_bytes']) is int and row['body_bytes'] > 0
+                and type(row['attempts']) is int and row['attempts'] >= 0
+                and isinstance(row['parquet_path'], str)
+                and re.fullmatch(r'bodies/[0-9]{8}/[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}[.]parquet', row['parquet_path'])
+                and row['authorization_fingerprint'] == source.authorization_fingerprint
+                and captured.tzinfo is not None and checked.tzinfo is not None
+                and captured <= checked and checked.timestamp() <= time.time())
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+            return False
+
+    def migrate_cnyes_retained_validation_rechecks(self):
+        """Recover only terminal saved-body parser checks, once per source ABI.
+
+        Search the failure-state index, never millions of complete/pending
+        articles. Keep old errors, attempts, deadlines, source clocks, body
+        references and authorization; do not re-materialize an old body or
+        turn a review into a new observation. Source/rights refusals stay final.
+        """
+        source = self.registry.sources.get('cnyes')
+        if not source or not source.allowed or source.acquisition_mode == 'finite':
+            return
+        version = CNYES_RETAINED_VALIDATION_RECHECK_CONTRACT_VERSION
+        marker = f'retained_cnyes_validation_rechecks_v{version}:' + source.data_fingerprint
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        now = time.time()
+        with self.metrics.measure('retained_validation_recheck_migration', 'cnyes'), self.db:
+            candidates = self.db.execute(
+                "SELECT * FROM articles INDEXED BY dispatch WHERE provider='cnyes' "
+                "AND state IN ('body_not_found','article_identity_not_verified') AND state=error_code "
+                "AND body_sha256 IS NOT NULL AND last_checked_at_utc IS NOT NULL "
+                "AND lease_owner IS NULL AND lease_until IS NULL").fetchall()
+            repaired = []
+            for candidate in candidates:
+                row = dict(candidate)
+                if not self.cnyes_retained_validation_recheck_allowed(source, row):
+                    continue
+                previous_due = row['due']
+                if type(previous_due) not in (int, float) or not 0 <= previous_due < float('inf'):
+                    continue
+                clock = datetime.fromisoformat(row['last_checked_at_utc'].replace('Z', '+00:00'))
+                due = max(now, previous_due, clock.timestamp() + CNYES_UNKNOWN_BODY_RECHECK_SECONDS)
+                self.db.execute("UPDATE articles SET state='retry_cooldown',due=? WHERE id=?", (due, row['id']))
+                repaired.append({'url': row['url'], 'previous_state': row['state'],
+                    'previous_error_code': row['error_code'], 'previous_due': previous_due, 'due': due,
+                    'previous_last_checked_at_utc': row['last_checked_at_utc'], 'attempts_preserved': row['attempts'],
+                    'stored_head': {key: row[key] for key in ('body_sha256', 'body_bytes', 'parquet_path',
+                        'captured_at_utc', 'etag', 'last_modified', 'validator_url', 'authorization_fingerprint')}})
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': version, 'source_fingerprint': source.data_fingerprint,
+                'authorization_fingerprint': source.authorization_fingerprint, 'observed_at_utc': utc_now(),
+                'target_state': 'retry_cooldown', 'recheck_minimum_seconds': CNYES_UNKNOWN_BODY_RECHECK_SECONDS,
+                'rows': repaired, 'accepted_as_bodies': False, 'source_freshness_verified': False,
+                'body_payloads_references_and_original_clocks_changed': False,
+                'source_refusals_leases_and_finite_cohorts_changed': False}, sort_keys=True)))
+            self.metrics.count('cnyes', 'retained_validation_failures_scheduled_for_recheck', len(repaired))
+
     def migrate_unknown_cnyes_identity_rechecks(self):
         # A current native page may later recover its own declarations. Keep
         # a mismatch negative until a new complete response passes every gate;
@@ -3825,16 +4071,22 @@ class NewsQueue:
         return min(maximum, max(0.0, min(deadlines) - now)) if deadlines else maximum
 
     def claim_url(self, url: str, lease_seconds: int, *, refresh: bool = False,
-                  expected_missing_head: dict | None = None):
+                  expected_missing_head: dict | None = None, reviewed_native_record: dict | None = None):
         """Respect retry deadlines and an optional exact retained-original fence."""
         url = normalize_url(url)
         source = self.registry.require(url)
+        reviewed_title = False
+        if reviewed_native_record is not None:
+            from downloader.news_fulltext_retained_native import reviewed_native_missing_head_allowed
+            reviewed_title = reviewed_native_missing_head_allowed(self, reviewed_native_record, expected_missing_head)
+            if not reviewed_title:
+                raise ValueError('invalid reviewed native missing-head claim')
         if expected_missing_head is not None:
             from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
             if (not isinstance(expected_missing_head, dict)
                     or set(expected_missing_head) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
                     or expected_missing_head['url'] != url or expected_missing_head['provider'] != source.provider
-                    or expected_missing_head['state'] not in {'pending', 'retry', 'retry_cooldown'}
+                    or (expected_missing_head['state'] not in {'pending', 'retry', 'retry_cooldown'} and not reviewed_title)
                     or expected_missing_head['body_sha256'] is not None or refresh):
                 raise ValueError('invalid exact missing-head claim fence')
         if source.acquisition_mode == "finite":
@@ -3884,14 +4136,16 @@ class NewsQueue:
             self.registry.sources.get(row['provider']), row))
         unknown_identity = (error.code == 'article_identity_not_verified' and self.unknown_cnyes_body_recheck_allowed(
             self.registry.sources.get(row['provider']), row))
-        recoverable = error.retry or unknown_body or unknown_identity
+        retained_validation = (error.code in {'body_not_found', 'article_identity_not_verified'}
+            and self.cnyes_retained_validation_recheck_allowed(self.registry.sources.get(row['provider']), row))
+        recoverable = error.retry or unknown_body or unknown_identity or retained_validation
         retry = recoverable and (deferred or attempts < max_attempts)
         # Bound immediate retries, not the lifetime of a recoverable network
         # failure. Exhausted bursts cool down for an hour, then start a new
         # bounded burst. Permanent source/rights outcomes are not reset.
         cooldown = recoverable and not retry
         state = "retry" if retry else "retry_cooldown" if cooldown else error.code
-        delay = max(error.delay, CNYES_UNKNOWN_BODY_RECHECK_SECONDS if unknown_body or unknown_identity else 0,
+        delay = max(error.delay, CNYES_UNKNOWN_BODY_RECHECK_SECONDS if unknown_body or unknown_identity or retained_validation else 0,
                     0 if deferred else 3600 if cooldown else min(900, 15 * 2 ** min(attempts, 6)))
         # Preserve the pre-claim failure burst when a verified source gate or
         # graceful stop postpones this request. Never reset old errors/deadlines
@@ -3930,6 +4184,8 @@ class NewsQueue:
             self.metrics.count('cnyes', 'unknown_body_failure_rechecks_deferred')
         if unknown_identity:
             self.metrics.count('cnyes', 'unknown_identity_failure_rechecks_deferred')
+        if retained_validation:
+            self.metrics.count('cnyes', 'retained_validation_failure_rechecks_deferred')
         if getattr(error, 'failure_response', None) is not None:
             from downloader.news_fulltext_diagnostics import retain_failure_response
             retain_failure_response(self, row, error)
@@ -4336,6 +4592,9 @@ class NewsQueue:
         stored_heads = dict(self.db.execute("SELECT provider,heads FROM stored_body_metrics"))
         with self.metrics.measure('status_original_source_inventory'):
             original_sources = original_source_inventory(self.db, self.registry)
+        from downloader.news_fulltext_references import progress as publisher_reference_progress
+        with self.metrics.measure('status_publisher_references'):
+            publisher_references = publisher_reference_progress(self.db, self.registry)
         for provider, evidence in original_sources['sources'].items():
             item = providers.setdefault(provider, {"states": {}, "text_bytes": 0})
             item['original_metadata'] = {
@@ -4346,6 +4605,8 @@ class NewsQueue:
         for provider, item in providers.items():
             source = self.registry.sources.get(provider)
             item["stored_body_urls"] = stored_heads.get(provider, 0)
+            if provider in publisher_references:
+                item['publisher_body_references'] = publisher_references[provider]
             item.setdefault('body_state_counts', {'missing': {}, 'stored': {}})
             item["configured"] = source is not None
             item["acquisition_mode"] = source.acquisition_mode if source else "unreviewed"
@@ -4458,6 +4719,7 @@ class NewsQueue:
             "cnyes_window_partition_contract_version": CNYES_WINDOW_PARTITION_CONTRACT_VERSION,
             "cnyes_query_day_offset_seconds": CNYES_QUERY_DAY_OFFSET_SECONDS,
             "article_request_deferral_contract_version": REQUEST_DEFERRAL_CONTRACT_VERSION,
+            "article_response_envelope_contract_version": ARTICLE_RESPONSE_ENVELOPE_CONTRACT_VERSION,
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "discovery_failure_observation_contract_version": DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION,
             "discovery_status_projection_contract_version": DISCOVERY_STATUS_PROJECTION_CONTRACT_VERSION,
@@ -4466,6 +4728,7 @@ class NewsQueue:
             "article_recheck_day_contract_version": ARTICLE_RECHECK_DAY_CONTRACT_VERSION,
             "cnyes_unknown_body_recheck_contract_version": CNYES_UNKNOWN_BODY_RECHECK_CONTRACT_VERSION,
             "cnyes_unknown_identity_recheck_contract_version": CNYES_UNKNOWN_IDENTITY_RECHECK_CONTRACT_VERSION,
+            "cnyes_retained_validation_recheck_contract_version": CNYES_RETAINED_VALIDATION_RECHECK_CONTRACT_VERSION,
             "cnyes_work_dispatch_contract_version": work_version,
             "cnyes_index_failure_scope_contract_version": FAILURE_SCOPE_CONTRACT_VERSION,
             "cnyes_index_failure_deadline_contract_version": FAILURE_DEADLINE_CONTRACT_VERSION,

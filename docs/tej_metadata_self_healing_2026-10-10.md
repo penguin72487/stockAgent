@@ -671,3 +671,663 @@ API timer 正常等待列數配額，與 Wizard 繼續抓取是兩條不同狀�
 **22 個舊隔離工作**仍保留：17 個目錄工作、5 個來源期間驗證工作。缺公司標籤
 的片段也仍在分母內；不刪除年份、不把空回當新增列、不放寬原值與 scope 驗證。
 canonical 任務維持 active，後續優先處理稀疏查詢幾何、缺公司片段及逐表來源證據。
+
+## 2026 年 10 月 21 日 傍晚鏈路修正
+
+17:14 的正式排程並非完全停止，17:13 仍有新收據；但一筆來源明確空回耗時
+240.43 秒，其中 185.13 秒花在執行環境檔案指紋，來源查詢只有 1.79 秒。
+編譯快取已命中，不能把這個等待誤判為每筆都重新編譯。
+[`before32.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/before32.json)
+保存當時 32 筆完整鏈路樣本，中位數 23.64 秒，全部為明確空回、沒有新增資料列。
+
+### 執行環境驗證與可見進度
+
+`Initialize-TejNativeHelper` 仍逐位元雜湊 compiler、runtime references、bridge
+及 DLL；檔案讀取改用 1 MiB 緩衝及 `SequentialScan`，不以修改時間／大小代替
+內容驗證，不跨 worker 重用可變的查詢狀態。這是
+[FileStream 緩衝與讀取選項](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.-ctor?view=netframework-4.8.1)
+的使用；[循序掃描提示](https://learn.microsoft.com/en-us/dotnet/api/system.io.fileoptions?view=netframework-4.8.1)
+並不保證固定倍數的加速。
+
+- [`fingerprint_abba.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/fingerprint_abba.json)
+  與 [`fingerprint_abba_repeat.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/fingerprint_abba_repeat.json)
+  在真實 Windows 中擷取新舊 bridge 的原函式，按 A/B/B/A 對相同六個執行環境
+  檔案量測；全部 SHA256 一致，沒有連接 TEJ／Excel。首輪舊方法的首次合計
+  約 44.14 秒，最後一次卻只剩約 0.125 秒，存在明顯快取／主機狀態影響。
+  重複輪的舊／新方法各兩次合計為 0.1672／0.1572 秒；不能將首輪差異當成
+  正式下載倍數。
+- [`native_cache_fixture.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/native_cache_fixture.json)
+  通過 11 項實際 Windows 檢查：來源或環境不符、DLL 損壞、路徑轉向均拒絕舊
+  generation 並重建，保留原證據；也核對 NTFS／WSL UNC 的完整原子發布。
+- Linux owner 在啟動 Windows 之前就寫入綁定本次 task／attempt 的
+  `initializing_runtime` 進度，網站顯示「開始啟動桌面橋接／驗證執行環境」。
+  顯示失敗不影響下載；進度不授權重試、不延長工作期限，也不計為已下載列數。
+- `profile_tej_acquisition.py` 的 v4 報告新增指紋、準備／編譯與載入驗證三段
+  allowlist 耗時；SQLite 讀取有兩秒進度中止預算，仍不呼叫來源。
+
+### 本機排程小批次
+
+大量 `selector_scope_repartitioned` 是本機處理缺公司標籤等分片，不是 API
+請求。原本每片各自開啟、檢查與提交資料庫；現在沿用同一組 canonical 分片
+函式，正式設定 `local_planning_batch_size=8`，攤提連線與外層整備成本，不合併
+各片的提交證明。每片仍先保存自己的 durable intent，按原優先順序重新選工作，
+片間核對一秒預算後讓出；設定上限為 32。
+批次不包含來源查詢；下一次呼叫仍重新通過 unknown、介面及來源安全守門。
+
+[`local_batch_abba.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/local_batch_abba.json)
+以相同八片有限 fixture、完整 intent／佇列提交作 A/B/B/A 比較：逐片平均
+0.2701 秒，八片批次平均 0.1534 秒，這段本機準備少 43.19% 耗時。
+canonical 呼叫由八次降為一次，全部範圍、原重試時間及來源呼叫數均相同。
+這是本機整備量測，不代表網路、Windows UI 或全歷史下載快 43%。
+
+### 部署與驗證
+
+最後版本在 **17:50:49** 由正式 service 安全接手；SIGTERM 先等待原查詢完成，
+沒有強制終止 Windows 查詢、重設 unknown 或啟動第二個桌面 writer。
+[`deployment_active_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/deployment_active_final.json)
+核對新 owner、程式 SHA 及已載入的八片批次設定。
+
+- 最後完整 TEJ 回歸 **1,968 passed，113.04 秒**，另 **18 項前端測試通過**。
+  新測試包括批次數量／時間預算、每片範圍／重試時間／證據不變、unknown／
+  running／介面守門，以及初始化進度不計為下載成果。
+- [`rendered_dashboard/rendered_acceptance.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/rendered_dashboard/rendered_acceptance.json)
+  通過 1440px 桌面與 390px 手機實際瀏覽器顯示，無 JS 錯誤或橫向溢出。
+  獨立 response fixture 驗證初始化、等待來源、讀回、提交、HTTP 失敗及恢復
+  狀態切換；保留篩選與焦點，沒有 TEJ 查詢。
+- [`boot_readback_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/boot_readback_final.json)
+  重新讀回開機／登入兩個 Windows 工作、pinned launcher、每分鐘 watchdog、
+  正式 service／API timer 與互動 relay。Linux service 的既有漸進重啟策略也仍
+  生效，不會因短期多次失敗永久耗盡 start limit。GUI 仍須 Windows 使用者登入，
+  本次沒有重開整台電腦，實體冷開機驗證仍為 false。
+- **17:58:18** 的
+  [`production_acceptance_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/production_acceptance_final.json)
+  獨立稽核八份在最後換載後才開始的新收據，request／raw／Parquet／receipt
+  綁定通過，原始失敗證據雜湊未變。八份均為來源明確空回，新增列數為零，
+  不能作為新增非空值證明；另以相同 capture／ingest 程式核對既有五列、55 個
+  原始儲存格的
+  [`retained_values_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/retained_values_final.json)，
+  明確區分「本輪新收據」與「既有非空值的獨立驗證」。
+
+### 主機壓力與剩餘限制
+
+[`windows_resources.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/windows_resources.json)
+在 **17:29:32** 量到 Windows 僅剩約 **1.24 GiB** 可用實體 RAM，`vmmemWSL`
+working set 約 **91.06 GiB**。這與不規則長等待相容，但單次觀察不能單獨證明
+因果。既有回收器只處理 registered backfill 的已丟棄頁；該 cgroup 當時沒有
+運行，不能把它擴成任意清理其他下載器／交易服務的全域快取。
+
+本次未更動全域 WSL 記憶體上限、停止其他下載器或強制清快取。
+[`final_profile16.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/final_profile16.json)
+的後續 16 筆中位數 20.71 秒，仍全部明確空回；它與前 32 筆不是同範圍配對，
+且含批次最後部署前工作，不能拿兩者相除宣稱整體加速。
+缺公司標籤、22 個舊隔離工作、稀疏事件查詢幾何與大表讀回仍各有待解範圍；
+全歷史未完成，canonical 任務維持 active，不宣稱已達理論極限。
+本輪完整證據索引與未解項目存於
+[`release_summary_final.json`](../artifacts/data_quality/tej_resilience_2026-10-21-evening/release_summary_final.json)，
+封存時最新完成收據為 **17:59:36**；服務仍由同一正式 owner 持續執行。
+
+## 2026-10-22：交易自鎖、分片重試與稀疏查詢範圍
+
+時間皆為台北時間。不能以 service active 代替下載證明：本輪先確認舊 owner
+仍有完成收據，再以正式換載暴露並修復兩個會使進度停止的既有邊界問題。
+沒有重設 unknown、刪除原始資料或開第二個桌面 writer。
+
+### 根因與處理
+
+- `proved_unsent_prequery` 已收到原交易連線，卻經 `task_request` 另開會初始化
+  schema 的連線。當同一輪 lazy refill 已持有寫鎖時，第二條連線會等自己的鎖，
+  形成 `local_metadata_busy`、回滾、重做的迴圈。現以可選的 `connection`
+  沿用原交易，仍由相同的 canonical schema／指紋驗證展開 request。
+  新測試在真實 SQLite 寫入交易內禁止另開連線，核對舊負面證據與新佇列工作。
+- `repartition_selector_pending` 把同表另一片的「缺公司標籤」重試窗口當成全表
+  互斥限制，拋出 `Another original fragment owns the table retry window`，
+  導致 service 重啟後再撞同一片。現在僅允許這個已定義的 company-fragment
+  類型與獨立分片並存，原窗口逐欄不變；其他全表冷卻仍拒絕繞過。
+- 效率稽核原本在 SQLite `BEGIN` 中跑全部表的 CPU 規劃，約 150 秒的長讀鎖
+  可阻塞 DELETE-journal collector 提交。改成每表擷取有兩秒 SQL 預算的
+  一致快照，先 rollback 再解析／規劃。測試在慢規劃中由獨立連線取得
+  EXCLUSIVE 寫鎖；[同時期的新收據](../artifacts/data_quality/tej_resilience_2026-10-22/during_nonblocking_audit.json)
+  也確認稽核沒有讓下載停止。
+
+### 查詢幾何與效能
+
+`bounded_scope_geometry_independent_native_readback_v1` 分開定義「公司×日期的
+潛在查詢範圍」與「實際原生讀回列數」。Key=2 的潛在範圍最多 50,000 組，
+仍受 400,000-cell 與 selector 邊界約束；實際 capture／ingest 維持 **10,000
+列**，不是提高官方 API 配額。快照與 Key=3 原生多紀錄表不擴大此範圍。
+
+來源若以本次 exact attempt 的新鮮 Preview 證明超量，保存原 request、attempt、
+response 與 plan，交 canonical capacity replanner 縮回小分批；規劃本身發送零次
+來源查詢。不將潛在組數當實際筆數、不補假列，也不將未知結果視為未送出。
+已證明密集的表保留 backoff 標記，後續維護不能又套回大範圍。
+
+- [正式遷移及換載](../artifacts/data_quality/tej_resilience_2026-10-22/deployment_active_verified.json)
+  優化 **92 張表**，該批剩餘查詢由 **1,234,241 → 710,283**，少 **523,958**
+  次；原完成範圍、原計畫備份及收據保留。這是固定範圍計畫的呼叫數改善，
+  不是實測整體下載倍數或無限制裝箱的理論最優。
+- 遷移初次遇到舊完成計數不一致時完整拒絕並恢復服務；修正後只保留該表原狀，
+  不讓獨立有效表一起失敗。31 張未套用此遷移：6 張快照維持原設定、5 張已有
+  來源隔離、18 張需舊鍵範圍調和、2 張需完成範圍調和。它們不等於 31 張都
+  無法下載，也不是已修好歷史覆蓋；差額是工作組數，不是缺失實際觀測筆數。
+- `build_plan` 將完成範圍按公司建立索引，不再對每個公司反覆掃全部完成證據。
+  [A/B/B/A 對照](../artifacts/data_quality/tej_resilience_2026-10-22/planner_abba.json)
+  的完整序列化 plan／指紋一致，規劃平均 **0.6609 → 0.3234 秒**，這段 CPU
+  工作少約 51.07%；來源查詢、資料量與全鏈路延遲不可套用這個倍數。
+- 真實 Windows 的 20,000×12 控件 fixture 完整讀回逾五分鐘期限，候選被拒絕，
+  沒有把實際讀回上限改為 50,000 或單純拉長期限。
+  [最終 1,000×12 fixture](../artifacts/data_quality/tej_resilience_2026-10-22/native_fixture_final.json)
+  通過完整字串雜湊一致及七項異常／穩定性檢查；這不是 TEJ 來源資料。
+
+### 正式驗收與持續恢復
+
+最後正式 owner 在 **01:38:35** 接手；相同的單一桌面 writer 繼續下載。
+TEJ 37 個測試檔 **1,996 passed，53.22 秒**；另 **18 項前端測試**及
+[七項實際 Windows parser／範圍守門檢查](../artifacts/data_quality/tej_resilience_2026-10-22/native_scope_guard.json)
+通過。這不是整個 repository 的全套測試。
+
+[01:40:08 的獨立正式驗收](../artifacts/data_quality/tej_resilience_2026-10-22/production_acceptance_verified.json)
+核對八份在最後換載後才開始的新收據、request／raw／Parquet 綁定與原失敗證據
+雜湊。八份均為來源明確空回，新增零列；另以相同 capture／ingest 程式
+[重驗既有五列、55 個原始格](../artifacts/data_quality/tej_resilience_2026-10-22/retained_values_recovery.json)，
+不把舊非空值算成本輪新增。22 個舊隔離工作仍保留，沒有放寬證據門檻。
+後續 [01:42:05 的非空正式驗收](../artifacts/data_quality/tej_resilience_2026-10-22/production_acceptance_nonempty.json)
+另核對最近八份新收據，實際新增 **20 列、220 個原始格**（180 個非空特徵格），
+不是沿用上述舊五列；request／raw／Parquet 與原始儲存字串核對通過。
+[換載後另一組八筆 profiling](../artifacts/data_quality/tej_resilience_2026-10-22/final_profile8_verified.json)
+中位數 7.36 秒，含兩筆非空回、共 15 列；與前 128 筆不是相同範圍配對，
+不能拿中位數相除宣稱整體加速，亦不與後續非空驗收的 20 列混算。
+[面板讀回](../artifacts/data_quality/tej_resilience_2026-10-22/owner_status_final.json)
+也顯示排程存活、執行中且無全域暫停；面板只讀，不藉顯示呼叫來源。
+本輪未重啟共用 dashboard owner；已規劃數量讀取新佇列，新的 scope ETA 假設
+與未驗證表外推程式已有測試，但其共用後端換載仍須另行驗證。
+
+[開機／登入讀回](../artifacts/data_quality/tej_resilience_2026-10-22/boot_readback_final.json)
+確認兩個 Windows 工作、pinned launcher、每分鐘互動 watchdog、enabled Linux
+owner 與 API timer。既有失敗自動重啟採 30–120 秒漸進等待，沒有有限次失敗後
+永久停掉的 start-limit。GUI 仍須 Windows 使用者登入；本輪未實體重開機，
+`current_code_cold_boot_verified=false`。全歷史及理論極限均尚未驗收，任務維持
+active；未為速度縮減來源範圍、跳過驗證或變更全域 WSL／GPU 資源。
+
+## 2026-10-22 上午續修：送出前恢復與監控讀鎖
+
+### 本次確實發生的停止
+
+舊 owner 雖然 active，但最後完成時間停在 **03:01:08**。原工作
+`5e5307759a835a43f5b6e175` 在 **03:03:22** 明確失敗於 Preview 送出前，
+兩次本機準備重試後進入 `query_preparation_prequery_needs_review`。
+後續每分鐘是介面確認，不是每分鐘重新送出市場資料查詢。直到 **08:58:54**
+舊 owner 的一次介面讀回成功，才自行解除這筆阻擋；不能以該 process 一直存活
+宣稱這六小時正常下載。
+
+原診斷只記錄 notice／disabled root 阻擋 source selection，沒有當時通知原文。
+因此不能倒推一定是 MySql 配置失敗或找不到資料表。原 request／負面 outcome
+與既有恢復紀錄的雜湊核對一致，另與較早三份失敗證據合併保存於
+[`morning_failure_baseline.json`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_failure_baseline.json)。
+09:05:46 第一次安全換載後，原阻擋工作在 **09:07:20** 完成，來源明確空回零列，
+不是非空新增或完整歷史證明。
+
+### 自我修復的共同實作
+
+- 把既有 metadata 的 owned-notice 恢復抽成
+  `restore_owned_metadata_interface`，供已證明未送出的 download 共用。
+  健康路徑仍只有原本一次確認；失敗且既有明確設定啟用，才額外診斷。
+  僅允許精確 owned 的 `MySql:malloc` 與 `Cannot find table 0.`，最多確認兩次，
+  確認後重新讀回穩定狀態。未知、帳號、權限、配額與外來視窗仍拒絕自動確認。
+  不送 Preview，不改公司／日期／欄位，不動登入或其他 Excel。
+- 排程恢復與即時失敗處理沿用同一條既有政策。原負面證據、finished attempt、
+  bounded clock 與預算驗證保留；恢復失敗新增私有 0600 診斷，公開摘要不帶
+  原始錯誤文字。成功確認只排回原範圍，不把未知結果改成「未送出」。
+- Windows 準備失敗現在先分類，再將同一精確類型寫入 outcome 與 stderr
+  attestation。先前 generic 類型可能早於較精確 outcome 寫出；UNC 寫入失敗時
+  transport fallback 便可能丟失 list-selection／公司集合證據。本次也讓集合雜湊
+  在兩個傳輸通道一致。原生 Windows 純分類檢查 **12 項**通過，未操作 TEJ／
+  Excel、未發送來源查詢；它不是實際製造 vendor 錯誤的測試。
+
+### 監控不能阻塞下載
+
+正式驗收另外發現 `/tej/api/status` 超過 15 秒，而 collector 回報
+`local_metadata_busy`。實際 reader 持有 DELETE-journal 資料庫；最新完成收據
+查詢使用 `tasks_scope_state_counts` 後再建立 temporary sort。
+[`morning_monitor_profile.json`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_monitor_profile.json)
+的一次完整只讀狀態建置為 1.321 秒，其中 latest SQL 執行已佔 0.819 秒；冷資料
+與競爭下更慢，不把這一次熱讀時間當成最壞上限。
+
+在 canonical schema 增加 `tasks_scope_latest` covering index，依 scope／state／
+kind／完成時間排序，保留不同 `timing_basis` 的最新收據，不以 ETA 的 fresh-only
+樣本偷換活動狀態。監控每條連線另有兩秒 monotonic SQL 執行預算（lock wait
+另限 0.25 秒）；超時關閉連線並回報 metadata unavailable，不顯示部分統計。
+SQLite progress handler 不是可中止核心磁碟 I/O 的硬即時期限。
+新測試核對無 temporary sort、跨 timing basis 最新值，以及中斷後獨立 writer
+仍可取得 EXCLUSIVE 鎖。索引安裝在已完成當前工作的安全邊界，未刪除資料。
+
+[`固定快照 A/B/B/A`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_monitor_index_abba.json)
+保留當時舊 planner 選用的索引為 A，新 covering index 為 B；四次結果 SHA 完全
+一致，平均 **0.696964 → 0.0000696425 秒**。這只證明 latest-receipt SQL，
+不能當成整體下載倍數。一次性 schema 安裝連同該測試用時 219.20 秒；不是每筆
+查詢都重新建索引。全鏈路仍有 source preparation、來源等待及完整讀回。
+另一次[完整只讀狀態建置](../artifacts/data_quality/tej_resilience_2026-10-22/morning_monitor_profile_final.json)
+用時 0.929 秒，與先前樣本不是相同時點的全輸入配對，不作倍數宣稱。
+
+共用唯讀 gateway 已在 **09:12:33** 換載，未重啟交易引擎。這取代凌晨「尚未換載
+共用後端」的當時狀態；舊失敗驗收因 HTTP timeout 拒絕，沒有抹掉失敗。
+正式 collector 最後在 **09:15:44** 換載。之後觀測到啟動時約一分鐘用於價值排序
+更新：`install_priorities.scope_identity` 對全 scope 的 request 做前後兩次 SHA。
+此完整性檢查尚未優化，沒有拿掉它來改善計時；下一輪須先建立相同範圍的保真
+替代驗證，再縮短這段本機維護，而不是誤認為正在送出來源查詢。
+
+最終變更的 TEJ 37 個 Python 測試檔 **2,011 passed，112.40 秒**；共用監控
+**200 passed，78.15 秒**，前端另 **18 passed**，跨 timing basis 與讀鎖測試
+補驗 **30 passed，4.14 秒**。範圍不是整個 repository 全套測試。
+[`桌面／手機實際瀏覽器驗收`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_dashboard_browser/rendered_acceptance.json)
+另核對篩選／焦點保留與每五秒更新；其中錯誤／恢復狀態切換使用獨立 HTTP fixture，
+不是在正式資料庫注入故障或新增資料。
+[`最後開機工作讀回`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_boot_final.json)
+確認原雙工作、launcher SHA、互動 relay、enabled Linux owner 與 API timer。
+仍未實體重開機，GUI 仍需登入，`current_code_cold_boot_verified=false`。
+
+### 最後正式讀回與未解邊界
+
+[**09:19:53 正式驗收**](../artifacts/data_quality/tej_resilience_2026-10-22/morning_production_final.json)
+通過最後換載之後才開始的八份新收據；request／raw／Parquet 與七份原失敗
+artifact 雜湊不變。這八筆全部為來源明確空回，**本次新增零列**，不可當成
+非空資料取得或原生歷史完整率。另以最後相同 capture／ingest code
+[核對既有五列、55 個原始格](../artifacts/data_quality/tej_resilience_2026-10-22/morning_values_final.json)，
+不把這五列算成本次新增。
+
+[`最後八筆完整鏈路 profile`](../artifacts/data_quality/tej_resilience_2026-10-22/morning_verified_profile8.json)
+同樣都是最後換載後工作，中位數 15.30 秒，送出前中位數 13.84 秒；來源準備
+仍是值得測量的下一個主要階段。與先前 32 筆不同範圍，不作全鏈路加速倍數
+比較，也不為改善空回率而刪除待抓的公司／日期／欄位範圍。
+
+正式排程與網站驗收時均為執行中、無全域暫停；**22 個舊隔離工作仍保留**，
+個別公司缺標籤亦沿既有範圍保存、分片等待重試。全歷史、未知來源限制下的
+理論吞吐上限與實機 cold boot 都未驗收。工程任務維持 active，正式服務續跑；
+本輪沒有刪除來源值／收據、清空未知工作、跳過原始格驗證或調整交易服務。
+
+## 2026-10-22 晚間：排序長停頓、恢復證據與查詢前細部進度
+
+本節接續同一個 `tej-resilience-throughput-20261017` 工程任務。白天的成功
+收據不是晚間仍正常的證據；本輪重新從正式程序、執行堆疊、排程、原始失敗
+artifact、Windows transport 到網頁讀回核對。這不是全歷史完成報告。
+
+### 原因與本輪實作
+
+**19:06:16（臺北）** 的[正式程序堆疊](../artifacts/data_quality/tej_resilience_2026-10-22/evening_priority_stall_stack.txt)
+停在 `scope_identity → install_priorities → refresh_if_due`。舊實作每次更新
+資料價值排序，都在 writer transaction 內對 **109,364** 個工作 request
+做前後兩次解析、序列化與 SHA；當時最新收據停在 19:03:34。排序 snapshot
+產生於 19:03:59.855，舊刷新狀態直到 19:06:36.225 才寫完，下一份收據於
+19:07:01 完成。這段間隔還包括排名建置及後續來源工作，不能全部算成雜湊成本。
+
+本輪保留相同排序及原始範圍，改由 SQLite authorizer 在執行前限制可寫集合：
+
+- 只允許 `tasks.priority`、`download_plans.priority` 與排名 metadata；
+  source request、cursor、狀態、收據、流量、原始內容均不可改。
+- trigger／外鍵連帶來源修改、DDL、危險函式與一般 `meta` 修改皆拒絕。
+  固定字面 key 的排名 metadata 寫入只有獨立、限時能力，不授權任意控制狀態。
+- SAVEPOINT 包住本次套用；失敗回復本次變更，不替 caller commit 或撤銷其先前工作。
+  相同 priority 不再重寫；不再於正式刷新讀取歷史 request payload。
+- 只在真正到期時發布 `refreshing_priorities`，另記錄本機清冊、各通道套用及
+  總刷新耗時。監控顯示「更新本機資料價值排序 · 未送來源查詢」，不冒充下載。
+
+新增的 [固定輸入 A/B/B/A 工具](../scripts/benchmark_tej_value_priority.py)
+使用隔離合成佇列，每通道 10,000 個工作及每工作 8 KiB payload；比較原始
+Git 模組與候選，在計時外以獨立全欄位 oracle 核對 source identity、排名與
+最終選取順序。測試另外涵蓋 cached statement、惡意 trigger／FK、失敗 rollback
+及 caller transaction。沒有為加速而取消完整性邊界。
+
+| 同一輸入的排名套用與 commit | 原版平均 | 新版平均 | 此步驟加速 |
+| --- | ---: | ---: | ---: |
+| Smart Wizard | 1.534136 秒 | 0.026194 秒 | 58.57 倍 |
+| API | 1.249048 秒 | 0.025440 秒 | 49.10 倍 |
+
+[最終 ABBA 收據](../artifacts/data_quality/tej_resilience_2026-10-22/evening_priority_abba_final.json)
+全部 oracle 一致。另一次在正式 `.download.lock` 保護、collector 已排空的
+[本機套用](../artifacts/data_quality/tej_resilience_2026-10-22/evening_ranking_apply/application.json)
+為 Smart Wizard **0.316 秒**、API **0.174 秒**；包含清冊建置與 CSV 輸出的
+完整維護命令仍為 **19.80 秒**。上述倍數只適用排名 installer，不是 TEJ
+全鏈路、冷啟動或來源吞吐倍數。
+
+本輪同時修復兩個可重現的健壯性／可觀測性缺口：
+
+1. **壞掉的本機 retry hint 不應拖垮全部工作**：對單一 hint 做型別、大小、
+   時區與期限驗證；先以 mode 0600 保留原始 SQLite bytes／SHA，再修復本機
+   重試 metadata。僅該候選沿用既有最長 900 秒窗口，其他可下載工作續跑。
+   到期仍須原未送出證據與新的 owned interface readback；不把來源未知當成空回，
+   不憑壞 hint 重送。正式庫未證實有此損壞；這是故障注入驗證的預防修復。
+2. **準備階段不再是一個黑盒**：橋接 best-effort 發布七個 allowlist 子階段：
+   綁定來源、欄位、公司名單／精確搜尋、日期模型、公司選取驗證、日期選取驗證、
+   最後來源／Preview 守門。只寫狀態，不新增 UI 操作、查詢或期限續租。
+   Dashboard ABI 升至 17；未知／過期階段不顯示，開始等待來源後清除舊子階段。
+   原生 cache fixture 驗證七個階段、外來 attempt 拒絕及寫入鎖住時不重送。
+
+### Windows 失敗恢復與未證實的原因
+
+第一輪重新啟動後，曾有 Windows worker 在取得許可前無 ACK 的失敗，均留下
+`market_data_query_submission_possible=false` 的精確負證據，沒有來源查詢。
+既有 bounded recovery 後來自行完成新的工作；最後 collector 換載於
+**19:15:49**。未因此放寬 systemd 安全設定、刪除失敗 artifact 或盲目重排未知工作。
+
+為區分 Linux shell 能啟動 Windows 與正式 service 能啟動 Windows，延伸既有
+[`verify_tej_windows_transport.py`](../scripts/verify_tej_windows_transport.py)，以實際
+relay、Session ID 與 caller mount namespace 執行「只回報 Windows Session ID」
+的隔離 probe，完全不接觸 TEJ／Excel。相同 hardened namespace 成功 **2.52 秒**、
+外部 namespace 成功 **3.15 秒**；完整正式限制與 canonical gate 路徑亦成功。
+因此目前證據**不能歸因**於 mount namespace、systemd 保護、PID 上限或 RAM。
+短暫無 ACK 的底層根因仍未確證，沒有把推測寫成已修復的根因。
+
+[正式 Windows transport 四模式驗收](../artifacts/data_quality/tej_resilience_2026-10-22/evening_transport_final.json)
+確認：首 relay 失敗後只容許一個 worker；全部未取得許可可安全等待；已取得
+許可後出錯或逾時不啟動第二個 worker。原 fixture 用一秒判定 Windows 啟動，
+實際注入了錯誤的「未取得許可」故障，該次失敗收據保留；修正為五秒 admission、
+十秒總期限與明確超時的純 fixture 命令後四項通過，**未更動正式查詢期限**。
+另一次[橋接入口故障測試](../artifacts/data_quality/tej_resilience_2026-10-22/evening_bridge_entry_fixture/entry_gate_acceptance.json)
+涵蓋 cache hit／miss、進入橋接前後的分類；沒有送出來源查詢。
+
+### 正式資料、網頁與剩餘瓶頸
+
+[19:21:57 正式驗收](../artifacts/data_quality/tej_resilience_2026-10-22/evening_production_abi17.json)
+核對最後換載後才開始的八份 request／raw／Parquet／收據，原七份失敗 artifact
+雜湊不變，排程存活且沒有全域暫停。**這八筆都是來源明確空回，新增零列**。
+另以本輪相同 capture／ingest code
+[獨立重驗既有五列、55 格](../artifacts/data_quality/tej_resilience_2026-10-22/evening_values_reference.json)，
+不把既有值當成新增下載。驗收腳本原硬寫 ABI 16，曾正確拒絕新版 17；已改由
+canonical `SCHEMA_VERSION` 核對，仍拒絕不同 ABI、非唯讀、洩漏原值、dead、
+paused 或停用 metadata recovery 的狀態，沒有降低安全門檻換取通過。
+
+[晚間八筆完整鏈路 profile](../artifacts/data_quality/tej_resilience_2026-10-22/evening_current_profile8.json)
+中位數 **14.03 秒**，送出前 **12.74 秒**，仍以 Windows／來源準備為主要成本。
+同輪前段 32 筆中位數為 7.79 秒，後段另 32 筆為 12.46 秒；工作範圍與競爭負載
+不同，不把 installer 加速外推成整體加速，也**不能宣稱已達理論上限**。
+下一步應對固定相同 scope 的準備子階段分別量測與配對，不跳過來源守門、完整
+讀回、資料驗證，亦不以縮小公司／年份／欄位範圍來美化速度。
+
+### 追加：跨來源清冊的全域排序成本
+
+新版自動刷新於 **19:25:35** 真正完成；
+[獨立保留的刷新收據](../artifacts/data_quality/tej_resilience_2026-10-22/evening_automatic_refresh.json)
+顯示總耗時 **35.524 秒**，其中本機清冊 **34.680 秒**，Smart Wizard／API
+套用各 **0.581／0.137 秒**，兩者都未解析歷史 task payload。這證明前述 installer
+修正已在正式排程生效，同時暴露下一個本機瓶頸，沒有把所有軟體等待歸給來源。
+
+接著對完整 `build_ranking` 做唯讀 cProfile，34.47 秒中 `local_features`
+佔 23.33 秒，兩個 FinMind `fetchall` 合計 15.48 秒。原查詢以
+`ROW_NUMBER(PARTITION BY dataset...)` 排序所有完成工作的 receipt path，
+實際目的卻只是每個 dataset 選一份代表收據。
+
+在既有 `local_features` 共用入口改為 `finmind_local_metadata`：同一 read
+snapshot 中取得相同完整工作首末日期，利用既有 dataset 索引，逐 dataset
+`ORDER BY ... LIMIT 1` 選相同最新非 NULL 收據。完整工作的無收據日期仍計入
+首末範圍；NULL 日期、相同排序鍵、空字串 receipt、非 complete 工作均保留原語義。
+不新增 FinMind 索引／writer、不掃原始數值、不做可能過期的快取。
+
+[`--inventory-root` 固定快照 ABBA](../artifacts/data_quality/tej_resilience_2026-10-22/evening_inventory_abba.json)
+從原 Git revision 提取原 SQL，逐通道固定同一唯讀 snapshot，對完整日期界限及
+**精確選中 receipt path** 做獨立 SHA oracle；105 個 dataset 的四輪結果一致。
+
+| 完整日期界限及代表收據 SQL | 原版平均 | 新版平均 | 此查詢加速 |
+| --- | ---: | ---: | ---: |
+| sponsor，57 datasets | 0.416898 秒 | 0.150828 秒 | 2.76 倍 |
+| complement，48 datasets | 13.439790 秒 | 2.544359 秒 | 5.28 倍 |
+
+較早零等待維護因桌面 readiness 持有同一 lock 而被正確拒絕，未刪 lock、未搶寫。
+保留該失敗 run，改為有界等待既有 lock 的
+[最後本機套用](../artifacts/data_quality/tej_resilience_2026-10-22/evening_inventory_apply_retry/application.json)，
+完整命令 **16.394 秒**，檢查 **9,433** 個本機特徵、排名 **47,352** 欄；佇列
+套用 Smart Wizard **0.139 秒**、API **0.033 秒**，來源 scope／狀態不變。
+完整命令與前次自動刷新不是相同輸入／I/O 工作量，不能用兩者宣稱全鏈路倍數。
+collector 最後於 **19:33:36** 換載這個跨來源查詢修正，並繼續正式下載。
+
+### 工程驗收與限制
+
+最後全部 37 個 TEJ Python 測試檔 **2,076 passed，91.71 秒**；TEJ 前端與
+共用 dashboard core 合計 **52 passed**。共用 gateway 另 **173 passed**。
+這不是 repository 維護全套測試。原生 helper 的
+[11 項 cache／progress 檢查、9 個 fresh process](../artifacts/data_quality/tej_resilience_2026-10-22/evening_native_cache_fixture.json)
+通過，七個子階段 NTFS fixture 寫入／讀回約 0.078–0.121 秒；不能當成正式 UNC
+路徑的相同成本。
+
+[最後桌面／手機 rendered 驗收](../artifacts/data_quality/tej_resilience_2026-10-22/evening_rendered_handoff/rendered_acceptance.json)
+通過 1440／390px、真實來源狀態與 feature 翻頁／篩選、焦點保留及五秒更新；
+另外使用隔離 HTTP fixture 驗證七階段、安全 scope 子階段、原始格未入庫不算完成、
+HTTP 失敗與恢復。實際檢視 desktop／mobile PNG，mobile 另要求子階段在 viewport
+內，不能僅用 CSS visible 當成截圖有拍到。前兩次瀏覽器驗收失敗仍保留；重現
+相同篩選可成功，移除驗收中早於實際內容等待期限的多餘五秒空列斷言，另保留
+失敗時 scope／request／位置診斷，不改來源或放寬內容、分頁驗證。
+
+[最後開機工作讀回](../artifacts/data_quality/tej_resilience_2026-10-22/evening_boot_handoff.json)
+只證明兩個 enabled Windows 工作、固定 launcher、live interactive relay、Linux
+owner 與 API timer；**仍未實機 cold boot**，GUI 仍需要登入。
+
+Smart Wizard 的 **22 個舊隔離工作**與局部公司缺標籤證據保留，不把「已知未送出」
+延伸成所有未知都能重送。API trial 則是獨立 oneshot／timer；19:13 的本機
+保守計量已達每日 **50,000 列**、13 calls，原因 `waiting_quota`，不是 collector
+崩潰。26 個既有 API `query_rejected` 也尚未於本輪重新查證，不能稱為權限或來源
+資料錯誤已確認；本輪沒有為測試超過其資料配額或清空 blocked 狀態。
+
+本輪修復已完成範圍內的排序長停頓與壞 hint 隔離，且正式工作持續前進；
+**全歷史、全部舊來源錯誤、Windows 短暫無 ACK 根因、完整 cold boot 及理論吞吐
+上限仍未驗收**。工程任務維持 active，後續應優先固定 scope 量測 source
+preparation 與逐表處理原隔離；本輪沒有刪除來源資料、捏造發布日／數值、降低
+驗證、開第二個桌面 writer 或更動交易服務。
+
+### 最後換載驗收：19:38:29（臺北）
+
+[`evening_final_release.json`](../artifacts/data_quality/tej_resilience_2026-10-22/evening_final_release.json)
+確認 **19:33:36 最後換載之後才開始的八筆**皆完成 request／raw／Parquet／收據
+獨立稽核；原失敗證據不變、排程 `executing`、沒有全域暫停。此時正式服務
+PID **942194**，active／running。這取代上面 19:21 的中途驗收；不能以舊 PID
+或換載前收據作最後版本的證明。
+
+這八筆依然全部是來源明確空回，**新增零列**。
+[本輪相同 capture／ingest 的非空參考重驗](../artifacts/data_quality/tej_resilience_2026-10-22/evening_values_handoff.json)
+另驗既有五列、55 格，不列入新增資料。
+[最後八筆 profile](../artifacts/data_quality/tej_resilience_2026-10-22/evening_final_release_profile8.json)
+全鏈路中位數 **10.73 秒**、送出前 **9.67 秒**，SQL 選樣 **0.00249 秒**。
+同輪較早兩筆曾為 **19.54／74.28 秒**，其中一筆 Windows bridge 本身約
+19.24 秒，仍有橋接外的等待，並非只有來源查詢。這些都是不同工作／負載的
+觀測；保留慢樣本，不用最後中位數宣稱已消除所有瓶頸。
+
+重現本輪兩種固定輸入比較：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/benchmark_tej_value_priority.py --baseline-ref 8b0664773fe60f44abb5aec7b6154d863d09d259 --output /tmp/new-tej-priority-abba.json
+run_fintech_python scripts/benchmark_tej_value_priority.py --baseline-ref 8b0664773fe60f44abb5aec7b6154d863d09d259 --inventory-root /root/stockAgent --output /tmp/new-tej-inventory-abba.json
+```
+
+輸出必須不存在；若重跑請換新檔名，不覆寫舊證據。第二個命令只讀兩個 FinMind
+metadata queue，單通道 snapshot 限 120 秒；不會下載或修改任何 provider 資料。
+
+## 2026-10-22 晚間續修：舊清冊隔離遷移與完整鏈路測速
+
+### 根因不是服務是否 active
+
+[20:18 的 32 筆基線](../artifacts/data_quality/tej_resilience_2026-10-22/night_baseline32.json)
+全部是來源明確空回，新增零列；全鏈路中位數 8.72 秒、送出前 7.85 秒。
+其中一筆 64.35 秒，Windows 初始化即占 45.40 秒，不能把這種長尾全部歸因於
+供應者 API。原先橋接外等待也缺少分段證據。
+
+[舊 metadata 稽核](../artifacts/data_quality/tej_resilience_2026-10-22/night_metadata_proofs.json)
+找出 17 筆早期 `discover` 隔離：7 筆使用舊輸入契約，且 17 筆都沒有新版
+immutable bridge manifest。自動恢復仍正確拒絕；但相同不可補回的舊證據已反覆
+檢查數百次，其中一筆 hint 為 880 次。單純縮短 cooldown 無法解決。
+
+### 明確授權的一次性遷移，不偽造「當年沒送出」
+
+在既有 `tej_metadata_recovery.py` 與 canonical CLI 新增 `retry-metadata`，
+契約為 `explicit_exact_legacy_metadata_requeue_v1`：
+
+- 限一筆原先隔離的 metadata plan，必須明確接受舊執行可能已耗流量；不接受
+  download、未知 Preview、執行中的工作、外來 scope 或已留存正向輸出。
+- 核對原請求、唯一失敗事件、完成時窗、來源 scope、無進行中共享操作；重新
+  讀取目前精確視窗與來源穩定證據，只允許既有白名單 notice 恢復。
+- 先寫 mode 0600 durable intent，保留完整舊 task／traffic、原請求 SHA 與目前
+  介面稽核；交易內再次核對，再轉回原 queue，沒有執行 Preview 或採納來源列。
+- 原 request／outcome／traffic 不刪改；新嘗試仍由原 collector 執行。後續失敗
+  會留下目前版本的證據，沿用已驗證的 60–900 秒有界重試，不新增桌面 writer。
+- 舊 `failed_plan_proof` 的自動門檻沒有放寬；原結果未知仍是未知。
+
+[20:34–20:37 遷移收據](../artifacts/data_quality/tej_resilience_2026-10-22/night_legacy_metadata_requeue.json)
+確認 **17/17 重新排入、原失敗事件與檔案 SHA 不變、零資料 Preview**；隔離數由
+22 降為 5。這是已恢復排程，不是 17 表已下載完成；仍依原資料價值優先級執行，
+不把排程 metadata 當成數值或全歷史覆蓋率。
+
+需要處理另一筆相同類型的舊工作時，只使用這個既有入口；先讓正式 writer
+完成當前工作，持同一把鎖操作，不批次猜測 task／日期／來源別名：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python -m downloader.download_tej_history retry-metadata \
+  --root data_tej --task-id EXACT_TASK_ID \
+  --evidence data_tej/requests/EXACT_ORIGINAL_REQUEST.json \
+  --acknowledge-unknown-usage
+```
+
+### 控制項查找：局部改善沒有通過整體效能驗收，已撤回
+
+曾實作候選：`Control` 的 combo 分支每次建立、即時丟棄的 UIA `CacheRequest`，在同一次
+跨程序讀取取得 Name／NativeWindowHandle。完整名稱與大小寫、所有候選中的
+重複項目、原生可見性、PID／視窗／父子歸屬仍會驗證；不是快取選取結果或許可。
+此方法沿用 [Microsoft 的批次屬性讀取介面](https://learn.microsoft.com/en-us/dotnet/framework/ui-automation/caching-in-ui-automation-clients)。
+**完整鏈路測試未改善，最終 production 已撤回這個候選**，回到原生列舉及即時
+UIA 名稱核對，並保留回傳前的新歸屬／可見性 guard，不留下未採用的 runtime flag。
+候選原碼仍在 immutable bridge release
+`698ba0e2b08a7af52bb8737cfde4692ee693440bc6f0b2b3bc5841ddc25503df`，可重測而不覆蓋原證據。
+
+新增可重用的 `scripts/benchmark_tej_control_lookup.py`／`.ps1`，AST 取出原始及
+候選的真正 production 函式，固定相同三個控制項，ABBA 各 30 次 lookup，檢查
+前後選取與 HWND 完全一致；不送按鍵、來源查詢或修改 queue。
+
+[實際 Wizard 比較](../artifacts/data_quality/tej_resilience_2026-10-22/night_control_live.json)：
+baseline 平均 0.31275 秒，candidate 0.24970 秒，這一段約 **1.25×／減少 20.2%**。
+[獨立 fixture](../artifacts/data_quality/tej_resilience_2026-10-22/night_control_fixture_final.json)
+另通過重複、大小寫、隱藏、錯誤 PID／標題／父層拒絕及停用項目的讀取一致性。
+
+保留兩個反例，不能用局部數字宣稱通用極限：
+
+- MSAA `accName` 不一定等於 UIA `Name`，曾直接替換失敗；已撤回此候選，保留
+  [原始反例](../artifacts/data_quality/tej_resilience_2026-10-22/night_control_fixture_v3.json)。
+- 同程序 fixture 的候選反而較慢，最後一次約 2.88×；也觀察到 provider 在修改
+  原生文字後可能繼續回舊 UIA Name。fixture 改為重建自己擁有的 widget，確認
+  故障確實生效後才驗拒絕；不把失敗的故障注入誤認成 production 錯誤。
+
+### 補上 Windows 外的等待分解
+
+`run_guarded_windows` 新增 monotonic ACK admission／permit 寫入／獲准執行／總傳輸
+計時，Windows wrapper 另拆 script staging 與 hash／parse。Linux 在既有 progress
+目錄 best-effort 寫小型 sidecar，不多開一次 Windows I/O。
+`profile_tej_acquisition.py` 契約升為
+`tej_bounded_acquisition_timing_profile_v5_transport_and_prebridge`，只有 exact task／
+attempt／prepared SHA 相符、有限且白名單內的耗時可顯示；壞 telemetry 不影響
+數據採納，也不提供新重試、未送出證明或 heartbeat 續期權限。
+
+[20:39 的八筆觀測](../artifacts/data_quality/tej_resilience_2026-10-22/night_postrestart_profile.json)
+全鏈路中位數 5.73 秒、送出前 5.13 秒；其中一筆 8.53 秒的分解為 admission
+1.81 秒、script staging／parse 0.32 秒、Windows 初始化 0.31 秒、scope 準備
+4.09 秒、來源回應 0.92 秒。這與先前基線不是相同 scopes／負載，**不能相除
+當成全鏈路加速率**；45 秒初始化長尾是否已消失也尚未證明。
+
+### 本輪驗證與續跑邊界
+
+- 候選撤回前的 TEJ 37 個 Python 測試檔 **2,124 passed**，前端 **52 passed**；
+  [同一 run 的完整 log](../artifacts/operations/agent-workflow/runs/tej-1022-final-regression-20261022T123506-92446a46/run.log)。
+- [實體 Windows 傳輸注入](../artifacts/data_quality/tej_resilience_2026-10-22/night_transport_acceptance.json)
+  通過先失敗 relay／全部未獲准／獲准後錯誤／獲准後 timeout；
+  [入口注入](../artifacts/data_quality/tej_resilience_2026-10-22/night_entry_gate/entry_gate_acceptance.json)
+  通過 cache hit／miss 前後邊界：進入前才是 proven-not-submitted，進入後未知不重送。
+- [原生編譯快取](../artifacts/data_quality/tej_resilience_2026-10-22/night_native_cache.json)
+  11 項真實 Windows 檢查通過，含損壞 DLL／環境／路徑／版本、原代次保留、
+  fresh mutable state、NTFS／WSL UNC 原子寫入失敗及 progress 故障不重送來源。
+- [20:37 換載後八筆正式驗收](../artifacts/data_quality/tej_resilience_2026-10-22/night_production_acceptance.json)
+  核對原失敗證據及新 request／raw／Parquet／receipt，均是來源明確空回、零新增列；
+  [非空參考](../artifacts/data_quality/tej_resilience_2026-10-22/night_nonempty_reference.json)
+  另核對舊五列、55 原始格，不能算新取得。
+- [啟動登錄讀回](../artifacts/data_quality/tej_resilience_2026-10-22/night_boot_readback.json)
+  確認既有 boot／interactive logon tasks、正式服務與有效 relay；未執行實體重開機。
+
+較大價格表及非空事件的完整 ABBA 使用既有 `benchmark_tej_full_flow.py`，保留
+查詢、全量讀取、正規化、Parquet、收據及獨立 audit。測試持原鎖，正式服務先
+正常 drain；本次維護另有 bounded resume guard，在該次 comparison 結束後只
+重啟原服務，不清除未知結果或來源 barrier。其結果與最後續跑驗收接續記於下節。
+
+### 完整 ABBA 的負面結果，以及下一個真瓶頸
+
+[完整比較](../artifacts/data_quality/tej_resilience_2026-10-22/night_full_flow_abba/acceptance.json)
+包含固定事件 scope（5 列／9 feature）、四家公司 2024-01-01 至 2026-09-25 的
+價格 scope（2,648 列／28 feature），以及同一價格表的 metadata discovery。
+每版跑兩遍，ABBA 共 8 次資料查詢及 5 次 metadata plan；每版輸出 **5,306 列**，
+同 scope 全部數值與 axes 的 semantic SHA 一致，production 收據沒有修改。
+
+| 計時邊界 | baseline | UIA cache 候選 |
+| --- | ---: | ---: |
+| 六個 canonical 任務／版，含其抓取與落地 | 125.13 秒 | 193.66 秒 |
+| 兩條完整 chain／版，另含獨立 audit 等工作 | 153.84 秒 | 215.62 秒 |
+
+共同的一次性 discovery setup 為 14.83 秒，另計；最初等待原 writer 鎖為 98.16 秒，
+正常 drain 後才取得。完整 chain 的候選約慢 **40.2%**，因此沒有採為正式加速，
+也沒有剔除 77 秒慢樣本、用價格表局部較快或 microbenchmark 來取代整體結果。
+這次比較不能單獨證明每一秒差異由 CacheRequest 造成；撤回的理由是沒有通過
+所要求的完整效能驗收，而不是宣稱已證明此 API 必然較慢。
+
+[77 秒樣本細分](../artifacts/data_quality/tej_resilience_2026-10-22/night_full_flow_slow_candidate_profile.json)
+可明確看到：Windows script staging 17.24 秒、hash／parse 1.10 秒、初始化
+29.58 秒（其中 helper fingerprint 8.17 秒）、scope 準備 21.54 秒、來源查詢
+1.22 秒、完整讀回 1.09 秒。初始化仍有超過 fingerprint 的未細分等待，不可
+稱成供應者限流或硬體理論極限。
+
+為排除「慢在 Python 數據轉檔」的猜測，另用已驗證且不再變動的兩份原始輸出，
+在獨立 artifact 根目錄重跑原 `ingest_export`，不呼叫來源、不更動原始檔／收據。
+[cProfile 與完整 readback](../artifacts/data_quality/tej_resilience_2026-10-22/night_local_ingestion_profile.json)
+結果：5 列為 0.676 秒（含首次套件載入），2,648 列為 0.687 秒；分別核對
+55／79,440 個原始格。這只排除該次固定本機輸入下轉檔的主瓶頸，不抹除正式流程
+曾有約 10 秒落地前等待的證據，也不省略 fsync 或正規化／收據驗證。
+
+仍需繼續定位的是 Windows 啟動／本機檔案 I/O 長尾及跨表 source preparation；
+較大表的完整原生讀回約 14–18 秒。既有 exact lookup、有限同表 locality 及
+四個唯讀 MTA worker 保留；不藉由第二個 UI writer、省略完整值驗證、猜公司別名
+或把缺席股票標成空資料來縮短時間。**全歷史、所有來源錯誤與理論速度極限尚未完成。**
+
+### 最後換載與獨立讀回：20:54–20:58
+
+撤回 CacheRequest 候選後，正式 bridge SHA 為
+`b7d70b6783024adca85427b7da783fbb92c2949cd7ea0ea6ff981ff358d9878a`。
+這次保留的是排程恢復、回傳前新歸屬 guard 與細分計時，**不是上述局部 20.2%
+改善的候選**。原始值、欄位／公司／日期 scope、單一 UI writer、未知送出邊界及
+完整收據驗證都未縮減。
+
+- [最終回歸 log](../artifacts/operations/agent-workflow/runs/tej-1022-release-regression-20261022T125104-26c514e8/run.log)：
+  **2,124 項 Python 通過（67.41 秒）、52 項前端通過**。
+- [最終 Windows 控制項 fixture](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_control_fixture.json)：
+  exact handle／選取一致，重複、大小寫、隱藏、錯誤 PID／標題／父層等 9 項拒絕
+  檢查通過；沒有來源查詢或 production queue 修改。
+- [同 SHA 的原生快取故障測試](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_native_cache.json)：
+  **11 項通過**，沒有來源查詢。
+- `stockagent-tej-history.service` 於 **20:54:26（12:54:26 UTC）** 啟動，PID
+  `1161690`；網頁 owner schema 17 讀回為 running／executing。
+  [開機／登入登錄讀回](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_boot_readback.json)
+  確認既有 boot service、API timer、interactive relay；仍需 Windows 使用者登入，
+  未以實體重開機驗收目前版本。
+- [換載後完整驗收](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_production_acceptance_readback.json)
+  核對 **8 筆換載後才開始的新工作**，request／raw／Parquet／receipt 相符，
+  原失敗證據 SHA 不變。八筆都是來源明確空回，**新增 0 列**；
+  [目前程式的非空參考驗證](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_nonempty_reference.json)
+  另核對舊 5 列、55 個原始格，不計為新下載。前一次唯讀驗收因第八筆尚未落地
+  而拒絕，原失敗 run 保留；核對已有 11 筆新收據後才重新驗收，沒有重送來源。
+
+[換載後八筆計時](../artifacts/data_quality/tej_resilience_2026-10-22/night_release_profile.json)
+總任務時間 118.10 秒、中位數 7.68 秒、送出前中位數 6.82 秒。第一筆仍有
+54.54 秒長尾：script staging 0.46 秒、初始化 1.62 秒、scope 準備 37.59 秒
+（欄位選取 15.98 秒、context 綁定 12.03 秒）、來源回應 3.99 秒。
+這與較早樣本／ABBA scope 不同，不能宣稱全鏈路加速或長尾已消失。
+
+20:57 的驗收快照包含一筆短暫 blocked 的公司標籤缺席工作，隨後服務自行完成
+`selector_scope_repartitioned`，20:57:50 又完成下一筆；獨立讀回回到原本 **5 筆
+`source_validation_failed_deferred`**。這五筆原生回應的期間超出選取 scope，仍需
+精確期間模型或新來源證據，不能當成壞資料已修好。17 筆本輪重新排入的舊目錄
+工作仍按資料價值優先級等待；重新排入、空回完成、非空採納是三種不同進度。
+
+可重用的新檔只有控制項 ABBA runner／Windows fixture；測試原始函式、固定
+scope 與故障，不複製下載器。私有輸出、fixture 暫存與實測收據留在既有 artifact
+根目錄，未加入 Git。下一個工程範圍為 Windows 啟動／檔案 I/O 長尾、跨表準備與
+大表 MSAA 讀回；目前只交付已驗證的恢復修正，不把工作標為全體優化完成。

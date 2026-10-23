@@ -97,7 +97,7 @@ def test_admission_changes_only_state_and_retains_durable_input(queue):
     ({"captured_at_utc": "2026-01-01T00:00:00+00:00"}, "stored_head_protected"),
     ({"lease_owner": "other"}, "leased_head_protected"),
     ({"lease_until": 1}, "leased_head_protected"),
-    ({"due": time.time() + 86400}, "future_or_invalid_deadline"),
+    ({"due": lambda: time.time() + 86400}, "future_or_invalid_deadline"),
     ({"due": float("inf")}, "future_or_invalid_deadline"),
     ({"due": -1}, "future_or_invalid_deadline"),
     ({"attempts": -1}, "invalid_attempts"),
@@ -107,6 +107,7 @@ def test_admission_changes_only_state_and_retains_durable_input(queue):
     ({"error_code": "http_403"}, "not_semantic_parser_failure"),
 ])
 def test_protected_heads_never_mutated_or_submitted(queue, changes, expected):
+    changes = {key: value() if callable(value) else value for key, value in changes.items()}
     before = failure(queue, **changes)
     result = submit(queue)
     assert not result["submitted"] and result["excluded"] == [{"url": URL, "reason": expected}]
@@ -281,10 +282,13 @@ def test_original_abi1_cannot_be_used_to_submit_new_scope_failure(mitrade_queue)
     ({"due": 1}, "head_changed_since_review"),
     ({"last_checked_at_utc": "2026-02-01T00:00:00+00:00"}, "head_changed_since_review"),
     ({"body_sha256": "b" * 64}, "stored_head_protected"),
-    ({"due": time.time() + 900}, "future_or_invalid_deadline"),
+    ({"due": lambda: time.time() + 900}, "future_or_invalid_deadline"),
     ({"lease_owner": "live"}, "leased_head_protected"),
 ])
 def test_head_race_is_rechecked_by_owner(queue, changes, expected):
+    # Collection can precede this test by more than 15 minutes in the full suite.
+    # Relative deadlines must start at execution, not at module import.
+    changes = {key: value() if callable(value) else value for key, value in changes.items()}
     failure(queue)
     submit(queue)
     with queue.db:

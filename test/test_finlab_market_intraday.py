@@ -156,6 +156,40 @@ def test_wall_clock_budget_exits_before_request_and_keeps_candidate(tmp_path):
     assert json.loads((output / "intraday/market_cursor.json").read_text())["recent_queue"][0]["next"] == 0
 
 
+@pytest.mark.parametrize('already_replayed', [False, True])
+def test_universe_frontier_reset_retains_completed_tick_replay_but_runs_unfinished_bootstrap(
+        tmp_path, monkeypatch, already_replayed):
+    from scripts import download_finlab_market_intraday as module
+    public, output = tmp_path / 'public', tmp_path / 'finlab'
+    public.mkdir()
+    _fixture(public)
+    (output / 'intraday').mkdir(parents=True)
+    cursor = output / 'intraday/market_cursor.json'
+    old_base = ['2003-08-01', 2462, 'previous-universe', 'tick_only_v1']
+    cursor.write_text(json.dumps({'base': old_base, 'bootstrapped': True,
+                                 'derived_bootstrapped': already_replayed}))
+    # Original history/index facts survive a changed universe and an empty
+    # bounded dispatch. No account quota, source fetch or database reset.
+    database = output / 'intraday/market_index.sqlite3'
+    with _open_index(database) as index:
+        _record(index, 'tw_tick', '2330', date(2026, 8, 19), 'verified_no_trade', 0, 0)
+        before = index.execute('SELECT * FROM partitions ORDER BY kind,symbol,trade_date').fetchall()
+    bootstraps = []
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_bootstrap_derived', lambda *_a: bootstraps.append(True))
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: pytest.fail('budget guard must precede API'))
+    summary = module.sync_market(output, public, start=date(2026, 9, 24), end=date(2026, 9, 24),
+        limit=3, reserve_mb=50, minimum_free_gb=0, now=datetime.now(UTC), max_run_seconds=180,
+        fetch=lambda *_a, **_k: pytest.fail('no source fetch after budget guard'))
+    after_cursor = json.loads(cursor.read_bytes())
+    assert after_cursor['base'] != old_base
+    assert after_cursor['bootstrapped'] is True and after_cursor['derived_bootstrapped'] is True
+    assert len(bootstraps) == (0 if already_replayed else 1)
+    assert summary['state'] == 'run_time_budget_reached' and summary['attempted_this_run'] == 0
+    with _open_index(database) as index:
+        assert index.execute('SELECT * FROM partitions ORDER BY kind,symbol,trade_date').fetchall() == before
+
+
 @pytest.fixture(autouse=True)
 def required_work_completed_for_partition_tests():
     # Partition/cursor tests isolate their subject from the account-wide gate.

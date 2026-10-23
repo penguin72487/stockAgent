@@ -9,6 +9,7 @@ healthy unchanged Discord owner to reacquire evicted off-hours GPU models.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, time as wall_time
 import json
 from pathlib import Path
@@ -68,6 +69,34 @@ def fresh_native_pair(bot, sync, now):
         raise ValueError("heartbeat must follow the exact acknowledged ledger commit")
 
 
+def read_fresh_ack_pair(*, timeout_seconds=5.):
+    """Observe freshness as well as exact ACK, without relaxing either gate.
+
+    The idle owner throttles heartbeats. A read on its boundary may be stale
+    by milliseconds; wait for a real new heartbeat, never enlarge its TTL or
+    treat the old commit time as the current liveness clock.
+    """
+    deadline = time.perf_counter() + timeout_seconds
+    last_error = "native owner pair is not coherently acknowledged"
+    while True:
+        sync, bot, ack = read_service_ack_pair(SYNC_PATH, BOT_STATUS,
+            timeout_seconds=min(timeout_seconds, max(.05, deadline - time.perf_counter())))
+        if ack.get("matched") is not True:
+            # The canonical observer already exhausted its ACK budget.
+            return sync, bot, ack
+        if ack.get("matched") is True:
+            try:
+                fresh_native_pair(bot, sync, datetime.now(TAIPEI))
+            except ValueError as exc:
+                last_error = str(exc)
+            else:
+                return sync, bot, ack
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            raise ValueError(last_error)
+        time.sleep(min(.05, remaining))
+
+
 def code_drift_warmup(bot, enabled):
     """Only a complete same-run code-admission rejection is recoverable here."""
     warm = bot.get("startup_inference_warmup") or {}
@@ -84,6 +113,42 @@ def code_drift_warmup(bot, enabled):
                 and row.get("retryable") is True
                 and isinstance(row.get("market"), str) for row in rows)
         and {row.get("market") for row in rows} == set(enabled))
+
+
+def terminal_entry_price_rejection(order, mode, *, now):
+    """A proven entry cancellation is terminal, not an active paper order."""
+    if not isinstance(order, dict) or order.get("status") != "cancelled_entry_price_guard":
+        return False
+    from stockagent.live.tw_day_trade_simulation import (
+        ENTRY_PRICE_GUARD_CONTRACT, ENTRY_PRICE_GUARD_REASONS, entry_price_guard_reason,
+    )
+    if (order.get("sizing_pending") is not False
+            or type(order.get("remaining_shares")) is not int
+            or order["remaining_shares"] < 0
+            or order.get("entry_price_guard_contract") != ENTRY_PRICE_GUARD_CONTRACT):
+        return False
+    template = order.get("position")
+    if (not isinstance(template, dict) or not template.get("signal_id")
+            or template["signal_id"] != mode.get("signal_id")
+            or not template.get("session_date")
+            or template["session_date"] != mode.get("session_date")):
+        return False
+    reason = entry_price_guard_reason(
+        side=template.get("side"), price=order.get("rejected_entry_price"),
+        take_profit_price=template.get("take_profit_price"),
+        stop_trigger_price=template.get("stop_trigger_price"),
+    )
+    if reason not in ENTRY_PRICE_GUARD_REASONS or reason != order.get("last_wait_reason"):
+        return False
+    try:
+        cancelled = datetime.fromisoformat(str(order.get("cancelled_at")))
+        quote_at = datetime.fromisoformat(str(order.get("last_quote_at")))
+        return (cancelled.tzinfo is not None and quote_at.tzinfo is not None
+                and quote_at <= cancelled <= now
+                and cancelled.astimezone(TAIPEI).date().isoformat() == template["session_date"]
+                and quote_at.astimezone(TAIPEI).date().isoformat() == template["session_date"])
+    except (TypeError, ValueError):
+        return False
 
 
 def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
@@ -145,12 +210,14 @@ def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
             for order in orders.values():
                 # The canonical engine retains filled entries for recovery.
                 # Do not delete them or confuse container length with work.
-                # Only explicit, fully sized zero-residual fills are exempt;
-                # malformed, cancelled/unknown, unsized or nonzero rows block.
+                # Explicit completed fills and proven TP/SL rejections are
+                # terminal. Unknown cancellations/unsized orders still block.
                 if (isinstance(order, dict) and order.get("status") == "filled"
                         and type(order.get("remaining_shares")) is int
                         and order["remaining_shares"] == 0
                         and order.get("sizing_pending") is False):
+                    terminal += 1
+                elif field == "pending_entry_orders" and terminal_entry_price_rejection(order, mode, now=now):
                     terminal += 1
                 else:
                     pending += 1
@@ -247,6 +314,8 @@ def main() -> int:
                         help="Discord code-only admission: pin this verified read-only source namespace")
     parser.add_argument("--output", type=Path, default=RECEIPT_PATH)
     parser.add_argument("--timeout-seconds", type=float, default=240)
+    parser.add_argument("--control-wait-seconds", type=float, default=0,
+                        help="Bounded wait for the existing maintenance OS lease; never force unlock")
     args = parser.parse_args()
     if args.code_admission_only and not args.discord_only:
         parser.error("--code-admission-only requires --discord-only")
@@ -254,11 +323,15 @@ def main() -> int:
         parser.error("--source-release requires --discord-only --code-admission-only")
     if not 1 <= args.timeout_seconds <= 600:
         parser.error("timeout-seconds must be between 1 and 600")
+    if not 0 <= args.control_wait_seconds <= 120:
+        parser.error("control-wait-seconds must be between 0 and 120")
     receipt = {"observed_at": datetime.now(TAIPEI).isoformat(), "status": "blocked",
                "broker_orders": 0, "operator_ledger_writes": 0, "restart_requested": False}
+    control_started = time.perf_counter()
     try:
-        with control_lease(owner="qualified-paper-service-reload", timeout_seconds=0):
-            sync, bot, ack = read_service_ack_pair(SYNC_PATH, BOT_STATUS, timeout_seconds=5.)
+        with control_lease(owner="qualified-paper-service-reload", timeout_seconds=args.control_wait_seconds):
+            receipt["control_wait_ms"] = (time.perf_counter() - control_started) * 1000
+            sync, bot, ack = read_fresh_ack_pair()
             if ack.get("matched") is not True:
                 raise ValueError("native owner pair is not coherently acknowledged")
             plan = reload_plan(read_object(STATE_PATH), bot, sync,
@@ -287,10 +360,6 @@ def main() -> int:
                 from stockagent.live.tw_public_source_guard import live_tw_public_source_read_guard
                 from stockagent.live.market_config import load_market_config
                 from stockagent.config import load_config
-                inputs = {name: {"size_bytes": (STATE_PATH.parent / name).stat().st_size}
-                          for name in ("events.jsonl", "orders.jsonl", "fills.jsonl")}
-                for name, value in inputs.items():
-                    value["sha256"] = prefix_sha256(STATE_PATH.parent / name, value["size_bytes"])
                 if release_path is not None:
                     namespace = namespace_identity(release_path, REPO_ROOT)
                     code, entrypoint = namespace["code"], namespace["entrypoint"]
@@ -307,14 +376,27 @@ def main() -> int:
                     "scripts/run_tw_day_trade_simulation.py", "stockagent/live/quote_provider.py",
                     "stockagent/live/tw_day_trade_simulation.py")]
                 expected_code = identity_digest({"code": code})
-                cfg = load_market_config(REPO_ROOT / "services/discord_bot/markets"
-                                         / (next(iter(plan["signal_ids"])) + ".yaml"))
-                config = load_config(cfg.config_path)
+                source_admission_required = not (
+                    args.discord_only and args.code_admission_only and release_path is not None)
+                source_guard = nullcontext()
+                if source_admission_required:
+                    cfg = load_market_config(REPO_ROOT / "services/discord_bot/markets"
+                                             / (next(iter(plan["signal_ids"])) + ".yaml"))
+                    config = load_config(cfg.config_path)
+                    source_guard = live_tw_public_source_read_guard(config.data.parquet_root)
+                receipt["source_read_admission_required"] = source_admission_required
+                receipt["data_or_gpu_readiness_claim"] = not args.code_admission_only
                 # A producer mid-commit is retryable, not a reason to kill it
                 # or to warm from an unaccepted mixed reference generation.
-                with live_tw_public_source_read_guard(config.data.parquet_root):
-                    current_sync, current_bot, ack = read_service_ack_pair(
-                        SYNC_PATH, BOT_STATUS, timeout_seconds=5.)
+                with source_guard:
+                    # Reject an active source writer before reading large
+                    # ledger prefixes. Keep the canonical control -> source
+                    # lock order and all independent post-reload readbacks.
+                    inputs = {name: {"size_bytes": (STATE_PATH.parent / name).stat().st_size}
+                              for name in ("events.jsonl", "orders.jsonl", "fills.jsonl")}
+                    for name, value in inputs.items():
+                        value["sha256"] = prefix_sha256(STATE_PATH.parent / name, value["size_bytes"])
+                    current_sync, current_bot, ack = read_fresh_ack_pair()
                     if ack.get("matched") is not True:
                         raise ValueError("native owner pair changed before reload")
                     plan = reload_plan(read_object(STATE_PATH), current_bot, current_sync,
@@ -419,6 +501,7 @@ def main() -> int:
                                inventory_restored_exactly=not args.discord_only,
                                engine_restarted=not args.discord_only)
     except Exception as exc:
+        receipt.setdefault("control_wait_ms", (time.perf_counter() - control_started) * 1000)
         receipt.update(status="failed_after_restart" if receipt["restart_requested"] else "blocked",
                        error_type=type(exc).__name__, error=str(exc))
     receipt["finished_at"] = datetime.now(TAIPEI).isoformat()

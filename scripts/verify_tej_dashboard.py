@@ -59,7 +59,7 @@ def verify_progress_binding(browser, url: str, baseline: dict, output: Path) -> 
     fixture['scheduler'].update(alive=True, state='executing', paused_reason=None)
     fixture['activity']['current_task'] = dict(task_id='a'*24, table_id=source['table_id'],
         table_name=source['table_name'], phase='P1', kind='download', query_work_rows=4,
-        stage='awaiting_preview', elapsed_seconds=1, readback_ratio=None,
+        stage='initializing_runtime', elapsed_seconds=1, readback_ratio=None,
         readback_scanned_row_slots=None, readback_total_row_slots=None)
     current = {'payload':fixture, 'http_status':200}
     calls = {'status':0,'features':0}
@@ -82,10 +82,23 @@ def verify_progress_binding(browser, url: str, baseline: dict, output: Path) -> 
     try:
         page.goto(url,wait_until='domcontentloaded',timeout=30000)
         open_acquisition_sections(page,'progress','catalog')
-        expect(page.locator('#active-stage')).to_have_text('等待來源回覆')
+        expect(page.locator('#active-stage')).to_have_text('開始啟動桌面橋接／驗證執行環境')
         expect(page.locator('#active-readback-card')).to_be_hidden()
         initial = baseline['workload']['exported_rows']
         expect(page.locator('#exported-rows')).to_have_text(format(initial,','))
+        fixture['activity']['current_task'].update(stage='preparing_scope',scope_phase='company_universe_and_lookup')
+        expect(page.locator('#active-stage')).to_have_text('核對並準備查詢範圍 · 讀取公司名單與精確搜尋',timeout=12000)
+        expect(page.locator('#active-readback-card')).to_be_hidden()
+        page.locator('#activity').scroll_into_view_if_needed()
+        page.screenshot(path=str(output/'scope-phase-desktop.png'))
+        page.set_viewport_size({'width':390,'height':900})
+        scroll_section_into_view(page,'#active-stage')
+        expect(page.locator('#active-stage')).to_be_in_viewport()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth+1'), 'Scope progress overflows mobile'
+        page.screenshot(path=str(output/'scope-phase-mobile.png'))
+        page.set_viewport_size({'width':1280,'height':900})
+        fixture['activity']['current_task']['stage'] = 'awaiting_preview'
+        expect(page.locator('#active-stage')).to_have_text('等待來源回覆',timeout=12000)
         page.locator('#table-search').fill('Price')
         reading = fixture['activity']['current_task']
         reading.update(stage='reading_preview',readback_ratio=.5,readback_scanned_row_slots=2,readback_total_row_slots=4)
@@ -128,7 +141,8 @@ def verify_progress_binding(browser, url: str, baseline: dict, output: Path) -> 
         assert not errors
         return {'basis':'isolated_browser_response_fixture_not_a_TEJ_download',
                 'production_queue_modified':False,'provider_queries_sent':0,
-                'automatic_poll_transitions':['awaiting_preview','reading_preview','committed','http_error','waiting_recovery','replaying_authorized'],
+                'automatic_poll_transitions':['initializing_runtime','preparing_scope','awaiting_preview','reading_preview','committed','http_error','waiting_recovery','replaying_authorized'],
+                'safe_scope_phase_rendered_desktop_and_mobile':True,
                 'preserved_filter_and_focus':True,'readback_not_counted_as_committed':True,
                 'requests':calls,'errors':errors,'accepted':True}
     finally:
@@ -148,6 +162,9 @@ def verify(url: str, output: Path) -> dict:
             for name, width in (('desktop',1440),('mobile',390)):
                 page = browser.new_page(viewport={'width':width,'height':1000},device_scale_factor=1)
                 errors, provider_requests = [], []
+                feature_requests = []
+                page.on('request',lambda req: feature_requests.append(urlsplit(req.url).query)
+                        if urlsplit(req.url).path=='/tej/api/features' else None)
                 status_responses = []
                 def record_status_response(reply):
                     if urlsplit(reply.url).path=='/tej/api/status' and reply.status==200:
@@ -267,8 +284,11 @@ def verify(url: str, output: Path) -> dict:
                 expect(page.locator('#feature-count')).to_have_text(re.compile('811'),timeout=15000)
                 page.locator('#feature-phase').select_option('all')
                 page.locator('#feature-search').fill('Volume')
-                expect(page.locator('#feature-rows tr')).not_to_have_count(0)
-                expect(page.locator('#feature-rows tr').first).to_contain_text('Volume',timeout=10000)
+                # Input intentionally clears the previous scope while its
+                # bounded local API request completes. Await the actual new
+                # content, not an unrelated shorter default row-count timer.
+                expect(page.locator('#feature-rows tr').first).to_contain_text('Volume',timeout=15000)
+                expect(page.locator('#feature-page')).to_have_text(re.compile(r'^1–50'),timeout=15000)
                 facts = page.evaluate("""() => ({viewport:innerWidth,document_width:document.documentElement.scrollWidth,
                     types:document.querySelector('#catalog-types').textContent,
                     fields:document.querySelector('#catalog-fields').textContent,
@@ -318,6 +338,23 @@ def verify(url: str, output: Path) -> dict:
                 page.remove_listener('response',record_status_response)
                 page.close()
             polling = verify_progress_binding(browser,url,status,output)
+        except Exception:
+            if 'page' in locals() and not page.is_closed():
+                # Preserve failed acceptance instead of silently retrying it.
+                # Only public local metadata/state, never raw licensed values.
+                diagnostic = page.evaluate("""() => ({
+                    offset:state.featureOffset,scope:featureScope(),
+                    request:state.featureRequest?.key||null,revision:state.featureRevision,
+                    visible:Dashboard.isElementVisible('features'),
+                    page:document.querySelector('#feature-page').textContent,
+                    count:document.querySelector('#feature-count').textContent,
+                    section:document.querySelector('#features').getBoundingClientRect().toJSON(),
+                    viewport:innerHeight,scroll:scrollY})""")
+                atomic_write_json(output/'failed_rendered_state.json',{
+                    'accepted':False,'profile':name,'state':diagnostic,
+                    'feature_requests':feature_requests,'page_errors':errors})
+                page.screenshot(path=str(output/'failed-render.png'),timeout=10000)
+            raise
         finally:
             browser.close()
     receipt = {'observed_at_utc':datetime.now(UTC).isoformat(),'url':url,

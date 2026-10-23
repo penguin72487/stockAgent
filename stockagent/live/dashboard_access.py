@@ -87,8 +87,11 @@ class _PublicHTML(HTMLParser):
         self.parts.append(f"<!{decl}>")
 
 
-def project_html(body: bytes, *, owner: bool = False, audience: str | None = None) -> bytes:
+def project_html(body: bytes, *, owner: bool = False, audience: str | None = None,
+                 core_version: str | None = None) -> bytes:
     resolved = _audience(owner=owner, audience=audience)
+    if core_version is not None and not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", core_version):
+        raise ValueError("invalid dashboard core asset version")
     text = body.decode("utf-8")
     if "</head>" not in text:
         return body
@@ -100,8 +103,11 @@ def project_html(body: bytes, *, owner: bool = False, audience: str | None = Non
         text = text.replace('id="page-title">資料與抓取總覽', 'id="page-title">台股策略總覽')
         text = text.replace("查看所有來源的抓取狀態、進度與配額；策略模擬另列於下方。公開唯讀，不呼叫供應商 API。",
                             "查看台股當沖與隔日沖的策略狀態、訊號及模擬交易。公開唯讀，報價依現有公開設定顯示。")
-    # Invalidate old immutable navigation JS URLs on every page, including
-    # unchanged page shells. A browser must not retain the old all-pages menu.
-    text = re.sub(r'(dashboard-core\.js\?v=)[A-Za-z0-9_.-]+', r'\g<1>access-v2', text)
+    # The gateway supplies the actual shared asset content identity, including
+    # unchanged page shells. A fixed override would pin every future release
+    # to an old immutable browser/CDN entry despite a page's new version.
+    if core_version is not None:
+        text = re.sub(r'(dashboard-core\.js\?v=)[A-Za-z0-9_.-]+',
+                      lambda match: match[1] + core_version, text)
     text = text.replace("</head>", f'<meta name="stockagent-audience" content="{resolved}">\n</head>', 1)
     return text.encode("utf-8")

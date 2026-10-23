@@ -319,6 +319,9 @@ def test_opening_fan_in_fetches_official_symbols_not_in_model(setup, monkeypatch
         assert result.open_prices.tolist() == [100.]
         assert result.requested_count == 1
         assert result.transport_timing["official_trading_universe"]["official_trading_count"] == 3
+        # The broker can satisfy quorum while the already-dispatched MIS job
+        # is still queued. Verify the full source lifecycle before its calls.
+        assert owner.wait_idle(timeout_seconds=1)
         assert calls == [["0050", "2330", "6488"]]
     finally:
         owner.close()

@@ -26,6 +26,41 @@ def evidence(root):
     return paths,[json.loads(p.read_bytes()) for p in paths]
 
 
+@pytest.mark.parametrize('version', [1, 2])
+def test_upmedia_received_failure_keeps_bounded_native_facts_without_second_parse_or_request(tmp_path, monkeypatch, version):
+    from bs4 import BeautifulSoup
+    from downloader.news_fulltext_upmedia import upmedia_public_modern_article
+    from test_news_upmedia_native import URL as UP_URL, TEXT, entry, v2_entry, page, single_byline_page, settings
+    import downloader.news_fulltext_upmedia as native
+    policy = PolicyRegistry(settings(entry() if version == 1 else v2_entry()), base=tmp_path)
+    soup = page() if version == 1 else single_byline_page()
+    soup.select_one('.news-box-text').append(soup.new_tag('hr'))
+    raw = Response(UP_URL, 200, {'content-type': 'text/html'}, str(soup).encode())
+    with pytest.raises(NewsError) as caught:
+        upmedia_public_modern_article(BeautifulSoup(raw.body, 'lxml'), page_url=UP_URL, adapter_contract_version=version)
+    monkeypatch.setattr(native, 'upmedia_public_modern_article', lambda *_a, **_k: pytest.fail('Do not parse/accept twice'))
+    with closing(NewsQueue(tmp_path / 'store', policy)) as queue:
+        with queue.db: queue.add_articles([{'url': UP_URL}])
+        row = queue.claim_url(UP_URL, 300, refresh=True)
+        source = policy.sources['upmedia']
+        error = caught.value
+        error.failure_response = diagnostics.FailureResponse(raw, source.provider, source.data_fingerprint,
+            UP_URL, '2026-10-23T00:00:00+00:00')
+        queue.failed(row, error, 6)
+        paths, rows = evidence(queue.root)
+        assert len(rows) == 1
+        facts = rows[0]['facts']['upmedia_native_boundary']
+        assert facts['contract_version'] == version and facts['unsupported_editor_tags'] == ['hr']
+        assert facts['byline_links'] == (2 if version == 1 else 1)
+        assert ('publication_header' in facts) == (version == 2)
+        assert rows[0]['facts']['failure_location']['sites'][-1]['function'] == '_whole_editor'
+        assert not facts['raw_response_retained'] and not facts['article_prose_retained']
+        assert TEXT not in paths[0].read_text() and '合成署名' not in paths[0].read_text()
+        assert rows[0]['budget_limit'] == 2 and rows[0]['budget_attempt'] == 1
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert not reports(queue.root)[0]
+
+
 @pytest.mark.parametrize('code', ['article_identity_not_verified', 'invalid_bulk_publication_clock'])
 def test_max_received_clock_metadata_observes_missing_tag_and_hidden_template_without_refetch(max_settings, tmp_path, code):
     policy = PolicyRegistry(max_settings, base=tmp_path)

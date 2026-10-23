@@ -261,7 +261,8 @@ def frozen_generation(receipt: Path) -> tuple:
                  for path in paths for info in [path.lstat()])
 
 
-def run_in_namespace(receipt: Path, root: Path, arguments: list[str], *, timeout: float = 60):
+def run_in_namespace(receipt: Path, root: Path, arguments: list[str], *, timeout: float = 60,
+                     measurement_role: str = "probe"):
     """Verify through the same systemd mount implementation as the native owner.
 
     Transient probes never run bot/model/quote services. Their bounded lifetime
@@ -271,14 +272,25 @@ def run_in_namespace(receipt: Path, root: Path, arguments: list[str], *, timeout
     # absolute receipt. Use that same verified identity for systemd bindings;
     # do not validate one spelling and then pass relative mount sources.
     # Keep receipt symlink rejection in the verifier (no premature resolve()).
+    if measurement_role not in {"probe", "lakehouse"}:
+        raise ValueError("unknown temporary namespace measurement role")
     proof = verify_frozen_source(receipt, root)
     receipt, root = Path(proof["receipt"]), root.resolve()
+    # The native resource comparator admits only its dedicated engineering
+    # cgroup. Preserve that gate inside an immutable-code measurement too.
+    prefix = ("stockagent-agent-lakehouse-source-wave-probe-" if measurement_role == "lakehouse"
+              else "stockagent-code-probe-")
     command = ["systemd-run", "--wait", "--collect", "--pipe", "--quiet",
-               "--unit=stockagent-code-probe-" + uuid.uuid4().hex,
+               "--unit=" + prefix + uuid.uuid4().hex,
                "--property=PrivateMounts=yes", "--property=WorkingDirectory=" + str(root),
                "--property=RuntimeMaxSec=" + str(timeout),
                "--property=Environment=PYTHONDONTWRITEBYTECODE=1",
                "--property=Environment=" + ENVIRONMENT + "=" + str(receipt)]
+    # systemd's default PATH omits caller runtime tools such as WSL's NVIDIA
+    # driver/Windows adapters. Pass one structured --setenv argument, including
+    # paths with spaces, without copying credentials or the whole environment.
+    if "PATH" in os.environ:
+        command.append("--setenv=PATH=" + os.environ["PATH"])
     bindings = mount_bindings(receipt, root)
     for readonly in (False, True):
         pairs = " ".join(f"{source}:{target}" for source, target, ro in bindings if ro == readonly)

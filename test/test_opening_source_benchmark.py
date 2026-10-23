@@ -19,6 +19,49 @@ from scripts import benchmark_tw_opening_sources as benchmark
 from stockagent.live import quote_provider as quotes
 
 
+def test_member_signature_benchmark_keeps_full_inventory_and_balanced_order(monkeypatch, tmp_path):
+    from scripts import benchmark_opening_preparation as preparation
+    member = tmp_path / "member"
+    member.write_bytes(b"immutable source")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"common": {"path": "member"}, "blocks": []}))
+    monkeypatch.setattr(preparation.bot, "_effective_market_config", lambda cfg: cfg)
+    monkeypatch.setattr(preparation, "load_config", lambda _p: SimpleNamespace(
+        data=SimpleNamespace(factorized_feature_manifest=str(manifest))))
+    cfgs = [SimpleNamespace(market=market, config_path="fixture") for market in ("a", "b")]
+    result = preparation.member_signature_probe(cfgs, repeats=2)
+    assert result["network_requests"] == result["model_forwards"] == 0
+    assert not result["ledger_modified"]
+    row, = result["comparisons"]
+    assert row["markets"] == ["a", "b"] and row["member_count"] == 2
+    assert row["exact_full_signature_parity"]
+    assert [sample["variant"] for sample in row["samples"]] == [
+        "per_member_resolve", "per_scan_parent_resolve",
+        "per_scan_parent_resolve", "per_member_resolve"]
+
+
+def test_member_signature_benchmark_rejects_mixed_generations(monkeypatch, tmp_path):
+    from scripts import benchmark_opening_preparation as preparation
+    from stockagent.live import signal_engine
+    member = tmp_path / "member"
+    member.write_bytes(b"original")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"common": {"path": "member"}, "blocks": []}))
+    monkeypatch.setattr(preparation.bot, "_effective_market_config", lambda cfg: cfg)
+    monkeypatch.setattr(preparation, "load_config", lambda _p: SimpleNamespace(
+        data=SimpleNamespace(factorized_feature_manifest=str(manifest))))
+    original = signal_engine._factorized_member_signatures
+
+    def changed(path):
+        signatures = original(path)
+        member.write_bytes(b"different")
+        return signatures
+
+    monkeypatch.setattr(signal_engine, "_factorized_member_signatures", changed)
+    with pytest.raises(RuntimeError, match="source changed"):
+        preparation.member_signature_probe([SimpleNamespace(market="a", config_path="fixture")], repeats=1)
+
+
 def test_configured_fugle_routes_match_regular_stock_etf_scope(monkeypatch):
     monkeypatch.delenv("FINMIND_TOKEN", raising=False)
     monkeypatch.setenv("FUGLE_API_KEY", "test-not-a-live-credential")
@@ -182,13 +225,16 @@ def test_input_preparation_probe_keeps_all_modes_and_warm_boundary(monkeypatch):
 
     def prefetch(**kwargs):
         called.append(kwargs["market"])
+        assert kwargs["panel_date"] == "2026-10-21"
         kwargs["progress_callback"]({"message": "quote_transport"})
         return SimpleNamespace(snapshot=quotes.PriceSnapshot(prices=np.array([100.]), source="receipt_fixture",
             open_prices=np.array([99.]), available_mask=np.array([True]),
             exchange_timestamps_ms=np.array([1])), request_key="canonical-input")
 
     monkeypatch.setattr(signal_engine, "prefetch_live_signal_prices", prefetch)
-    result = preparation.input_preparation_probe([Config("a"), Config("b")], repeats=2)
+    result = preparation.input_preparation_probe([Config("a"), Config("b")], repeats=2,
+                                               panel_date="2026-10-21")
+    assert result["requested_panel_date"] == "2026-10-21"
     assert sorted(called) == ["a", "a", "b", "b"]
     assert result["mode_count"] == 2 and not result["opening_slo_claim"]
     assert not result["signal_published"] and not result["ledger_modified"]
@@ -216,24 +262,50 @@ def test_independent_poll_comparison_preserves_complete_values_and_never_logs_in
     assert result["samples"][0]["financial_and_exchange_clock_sha256"] == result["samples"][1]["financial_and_exchange_clock_sha256"]
 
 
-def test_callback_pipeline_comparison_is_exact_and_never_logs_in(monkeypatch, tmp_path):
+@pytest.mark.parametrize("cached_rows", [0, 7])
+def test_callback_pipeline_comparison_is_exact_and_never_logs_in(monkeypatch, tmp_path, cached_rows):
     monkeypatch.setattr(quotes, "_SHIOAJI_STOCK_API", None)
     monkeypatch.setattr(quotes, "_shioaji_stock_api", lambda: pytest.fail("offline comparison must not log in"))
     captured = tmp_path / "before.py"
     shutil.copyfile(quotes.__file__, captured)
-    result = benchmark.compare_callback_pipeline([str(1000 + i) for i in range(25)], captured, rounds=2)
+    result = benchmark.compare_callback_pipeline([str(1000 + i) for i in range(25)], captured, rounds=2,
+        cached_rows=cached_rows, accounting_delay_ms=1 if cached_rows else 0, response_delay_ms=1 if cached_rows else 0)
     assert result["snapshot_parity"] and result["progress_parity"] and result["durable_rows_parity"]
     assert result["network_requests"] == 0
     assert not result["opening_slo_claim"]
     assert not result["production_ledger_modified"]
     assert result["baseline_code_sha256"] == result["candidate_code_sha256"]
     assert [row["variant"] for row in result["samples"]] == ["before", "after", "after", "before"]
-    assert all(row["snapshot_decode_count"] == 25 for row in result["samples"])
+    assert all(row["snapshot_decode_count"] == 25 - cached_rows for row in result["samples"])
+    assert all(row["pipeline_to_source_readback_ms"] >= row["initial_receipt_publish_ms"] for row in result["samples"])
     assert all(row["initial_receipt_writes"] == 1 and row["unchanged_receipt_writes"] == 0 for row in result["samples"])
     assert all(row["initial_storage_barriers"] == {"file": 1, "directory": 1} for row in result["samples"])
 
 
-def test_retained_finmind_comparison_keeps_full_financial_clock_and_scope_parity(monkeypatch, tmp_path):
+def test_negotiated_ipc_benchmark_keeps_exact_axis_and_bitwise_readback(tmp_path, monkeypatch):
+    from scripts import benchmark_tw_opening_ownership as ownership
+    pytest.importorskip("msgspec")
+    monkeypatch.setattr(quotes, "_shioaji_stock_api", lambda: pytest.fail("no benchmark login"))
+    receipt = tmp_path / "scope.json"
+    receipt.write_text(json.dumps({"requested_symbols": ["2330", "0050", "2317", "A"],
+        "requested_count": 4, "session_date": "2026-10-22"}))
+    output = tmp_path / "report.json"
+    result = ownership.run_ipc_serialization(receipt, output, repeats=2)
+    assert result["all_outputs_equal"] and result["symbol_count"] == 4
+    assert result["api_requests"] == result["broker_orders"] == result["ledger_writes"] == 0
+    assert result["injected_stall_ms"] == 0
+    assert json.loads(output.read_bytes())["official_receipt_sha256"] == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    for pair in result["pairs"]:
+        for codec, sample in pair.items():
+            assert sample["response_formats"] == [codec]
+            assert sample["response_write_count"] == 1 and sample["response_write_bytes"] > 0
+            assert sample["request_to_verified_readback_ms"] >= sample["client_total_ms"]
+            assert sample["response_encode_publish_ms"] >= 0 and sample["client_response_decode_ms"] >= 0
+        assert pair["json_v1"]["fixture_output_sha256"] == pair["msgpack_v1"]["fixture_output_sha256"]
+
+
+@pytest.mark.parametrize("include_failures", [False, True])
+def test_retained_finmind_comparison_keeps_full_financial_clock_and_scope_parity(monkeypatch, tmp_path, include_failures):
     now = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=9, minute=0, second=0, microsecond=0)
     baseline, quote_baseline, payload = tmp_path / "before.py", tmp_path / "quotes.py", tmp_path / "body.json"
     shutil.copyfile(benchmark.acquisition.__file__, baseline)
@@ -242,12 +314,50 @@ def test_retained_finmind_comparison_keeps_full_financial_clock_and_scope_parity
         "date": now.isoformat(), "total_volume": 1} for i, symbol in enumerate("AB")]}))
     monkeypatch.setattr(quotes, "_SHIOAJI_STOCK_API", None)
     result = benchmark.compare_finmind_decoder(list("AB"), tmp_path, baseline, payload,
-        rounds=1, baseline_quotes_path=quote_baseline)
+        rounds=1, baseline_quotes_path=quote_baseline, include_source_failures=include_failures)
     assert result["financial_and_clock_parity"]
+    assert result["durable_rows_parity"]
+    assert result["observation_journal_parity"]
+    assert result["controlled_parallel_failures"] == include_failures
     assert result["network_requests"] == 0 and not result["opening_slo_claim"]
     assert all(row["valid_open_count"] == row["durable_requested_count"] == 2 for row in result["samples"])
     assert all(row["quorum_reached"] for row in result["samples"])
     assert result["baseline_quote_owner_sha256"] == result["candidate_quote_owner_sha256"]
+    assert not result["provider_thread_profiling_enabled"]
+    for row in result["samples"]:
+        assert row["total_with_readback_ms"] >= row["total_local_workflow_ms"] >= row["quorum_return_ms"]
+        assert row["local_stage_policy"] == "all_threads_nested_wall_spans_not_additive_v1"
+        assert row["local_stage_spans"]["seed_tw_opening_snapshot_cache"]["calls"] >= 2
+        assert row["local_stage_spans"]["_record_source_events"]["calls"] > 0
+        assert row["provider_thread_profile"] == []
+    if include_failures:
+        assert all(all(write["row_count"] for write in row["input_receipt_writes"]) for row in result["samples"])
+
+
+def test_observation_coverage_rechecks_absence_age_not_model_or_fill_readiness():
+    observed = datetime.fromisoformat("2026-10-22T09:01:00+08:00")
+    stamp = int(observed.timestamp() * 1000)
+    value = quotes.PriceSnapshot(prices=np.ones(4), source="opening:shared_opening_snapshot",
+        open_prices=np.array([100., np.nan, np.nan, np.nan]), available_mask=np.ones(4, dtype=bool),
+        timestamps_ms=np.full(4, stamp), exchange_timestamps_ms=np.full(4, stamp),
+        no_open_print_timestamps_ms=np.array([0, stamp - 15000, stamp - 15001, stamp + 1]))
+    result = benchmark.observation_coverage(value, session_date="2026-10-22", observed_at=observed)
+    assert result["positive_open_count"] == result["observed_no_print_count"] == 1
+    assert result["resolved_count"] == result["unknown_count"] == result["stale_no_print_proof_count"] == 2
+    assert result["model_input_readiness"].startswith("unmeasured")
+    with pytest.raises(ValueError, match="aware"):
+        benchmark.observation_coverage(value, session_date="2026-10-22", observed_at=observed.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize("option,value", [("--profile-finmind-local", None), ("--retain-mis-responses", None),
+                                         ("--source-drain-timeout", "91")])
+def test_scheduled_probe_rejects_manual_profile_and_retention(monkeypatch, option, value):
+    argv = ["probe", "--scheduled", option] + ([] if value is None else [value])
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(benchmark, "scheduled_probe_context", lambda **_kwargs: pytest.fail("reject before scope read"))
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main()
+    assert exc.value.code == 2
 
 
 def test_finmind_only_probe_never_queries_mis_or_broker(monkeypatch, tmp_path):
@@ -355,6 +465,60 @@ def test_mis_probe_does_not_burst_after_failed_single_symbol_prewarm(monkeypatch
     assert result["mis_connection_prewarm"]["performed"]
     assert result["workflow_timing"]["total_before_final_report_write_ms"] >= result["mis_connection_prewarm"]["elapsed_ms"]
     assert "secret" not in str(result)
+
+
+def test_mis_retention_keeps_original_body_scope_and_clock_without_request_secrets(monkeypatch, tmp_path):
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    source, output = tmp_path / "scope.json", tmp_path / "result.json"
+    source.write_text(json.dumps({"session_date": now.date().isoformat(), "requested_symbols": ["2330"],
+        "rows": {}, "parquet_root": str(tmp_path)}))
+    monkeypatch.setattr(sys, "argv", ["probe", "--receipt", str(source), "--output", str(output),
+        "--rounds", "1", "--mis-only", "--retain-mis-responses"])
+    monkeypatch.setattr(quotes, "warm_tw_mis_quote_client", lambda: {"ready": True})
+    body = json.dumps({"msgArray": [{"c": "2330", "o": "100.00", "v": "1", "tlong": str(
+        int(now.timestamp() * 1000))}]}, separators=(", ", ": ")).encode()
+
+    def provider(names, fallback, **kwargs):
+        # Only ex_ch is retained; URL, credentials/cookies and unrelated query
+        # arguments must not enter the manifest. No extra HTTP/body read occurs.
+        response = SimpleNamespace(status_code=200, request=SimpleNamespace(
+            url="https://example.invalid/quote?ex_ch=tse_2330.tw&token=private-test-secret"),
+            headers={"Cookie": "private-test-cookie"})
+        assert quotes._decode_quote_response(response, body)["msgArray"][0]["o"] == "100.00"
+        value = quotes.PriceSnapshot(prices=np.array([100.]), open_prices=np.array([100.]),
+            source="official_mis:retained_test_not_market_data", available_mask=np.array([True]),
+            available_count=1, requested_count=1, timestamps_ms=np.array([int(now.timestamp() * 1000)]),
+            exchange_timestamps_ms=np.array([int(now.timestamp() * 1000)]))
+        kwargs["on_progress"](names, value)
+        return value
+
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", provider)
+    assert benchmark.main() == 0
+    report = json.loads(output.read_bytes())
+    retained = Path(report["retained_response_manifest"])
+    manifest = json.loads(retained.read_bytes())
+    assert manifest["requested_symbols"] == ["2330"]
+    assert len(manifest["responses"]) == 1
+    row = manifest["responses"][0]
+    assert row["channels"] == "tse_2330.tw" and row["http_status"] == 200
+    assert base64.b64decode(row["body_base64"]) == body
+    assert row["body_sha256"] == hashlib.sha256(body).hexdigest()
+    assert datetime.fromisoformat(row["decoded_at_taipei"]).tzinfo is not None
+    assert "private-test" not in retained.read_text() + output.read_text()
+    assert report["rounds"][0]["background_drained"]
+    assert report["rounds"][0]["readback_coverage"]["positive_open_count"] == 1
+
+
+@pytest.mark.parametrize("budget", ["4", "181", "nan", "inf"])
+def test_source_completion_diagnostic_budget_rejects_unbounded_values(monkeypatch, tmp_path, budget):
+    source = tmp_path / "scope.json"
+    source.write_text(json.dumps({"requested_symbols": ["2330"], "parquet_root": str(tmp_path)}))
+    monkeypatch.setattr(sys, "argv", ["probe", "--receipt", str(source), "--output", str(tmp_path / "unused.json"),
+        "--source-drain-timeout", budget])
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main()
+    assert exc.value.code == 2
+    assert not (tmp_path / "unused.json").exists()
 
 
 def test_all_source_probe_skips_refused_mis_but_runs_healthy_sources(monkeypatch, tmp_path):

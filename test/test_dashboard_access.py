@@ -58,7 +58,60 @@ def test_html_projection_removes_private_cards_before_delivery_and_does_not_muta
         assert b'href="' + slug + b'"' in owner
     assert public.count(b'class="dashboard-card ') == 2
     assert owner.count(b'class="dashboard-card ') == 11
-    assert b'dashboard-core.js?v=access-v2' in public
+    assert b'dashboard-core.js?v=15' in public
+    assert b'access-v2' not in public
+
+
+@pytest.mark.parametrize("audience", ["public", "member", "owner"])
+def test_html_core_version_uses_supplied_content_identity_not_a_permanent_override(audience):
+    body = b'<html><head><script src="/dashboard-core.js?v=16" defer></script></head></html>'
+    version = "core-" + "a" * 64
+    projected = project_html(body, audience=audience, core_version=version)
+    assert ('dashboard-core.js?v=' + version + '"').encode() in projected
+    assert b'access-v2' not in projected
+    assert b'dashboard-core.js?v=16' in body
+
+
+@pytest.mark.parametrize("version", ["", "x\" onload=\"bad", "../bad", "x" * 81])
+def test_html_core_version_rejects_untrusted_markup(version):
+    with pytest.raises(ValueError, match="invalid dashboard core asset version"):
+        project_html(b'<head></head>', core_version=version)
+
+
+@pytest.mark.parametrize("audience", ["public", "member", "owner"])
+def test_shared_core_update_invalidates_unchanged_projected_page_cache(tmp_path, audience):
+    import hashlib
+    import os
+
+    static = tmp_path / "static"
+    static.mkdir()
+    core = static / "dashboard-core.js"
+    page = static / "index.html"
+    core.write_bytes(b"old-shared-core")
+    page.write_bytes(b'<html><head><script src="/dashboard-core.js?v=16"></script></head></html>')
+    page_before = page.stat()
+    with listener(audience) as (server, _):
+        server.public_static_root = static
+        def read():
+            return server.cached_static(page, content_type="text/html; charset=utf-8", cache_control="no-store")
+        first = read()
+        assert read() is first
+        old_version = hashlib.sha256(core.read_bytes()).hexdigest().encode()
+        assert b"dashboard-core.js?v=core-" + old_version in first.body
+        before = core.stat()
+        replacement = static / "core-next.js"
+        replacement.write_bytes(b"new-shared-core")
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        replacement.replace(core)
+        second = read()
+        new_version = hashlib.sha256(core.read_bytes()).hexdigest().encode()
+        assert new_version != old_version
+        assert b"dashboard-core.js?v=core-" + new_version in second.body
+        assert first.etag != second.etag
+        assert read() is second
+        page_after = page.stat()
+        assert (page_after.st_ino, page_after.st_size, page_after.st_mtime_ns) == (
+            page_before.st_ino, page_before.st_size, page_before.st_mtime_ns)
 
 
 def test_member_sees_all_page_shells_without_claiming_owner_prices():

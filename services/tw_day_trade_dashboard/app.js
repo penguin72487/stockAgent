@@ -28,6 +28,11 @@ const HIDDEN_EQUITY_SERIES_STORAGE_KEY = IS_OVERNIGHT
 const HISTORY_CLIENT_CACHE_MAX_ENTRIES = 3;
 const DATE_FILTER_DEBOUNCE_MS = 180;
 let snapshot = null;
+let appliedStatusRevision = null;
+let appliedStatusPhase = "initial";
+const revisionPaintObserver = Dashboard.createRevisionPaintObserver?.({
+  getCurrentRevision: () => appliedStatusRevision,
+});
 let chartHistory = null;
 let chartHistoryKey = "";
 let hiddenEquitySeries = new Set();
@@ -191,7 +196,7 @@ function installProductCopy() {
   }
   if (signalPanel) {
     signalPanel.querySelector(".panel-head h2").textContent = "13:20 所有即時模型訊號";
-    signalPanel.querySelector(".panel-head p").textContent = "保留所有模型目標；當沖 checkpoint 目前只作暫時權重轉接，不代表已針對隔夜風險訓練。";
+    signalPanel.querySelector(".panel-head p").textContent = "隱藏目標為 0 的訊號，非零目標但 0 股未成交的股票仍保留；當沖 checkpoint 目前只作暫時權重轉接，不代表已針對隔夜風險訓練。";
     const headers = signalPanel.querySelectorAll("thead th");
     ["時間／模式", "股票／方向／結果", "分數／持倉 %", "決策計價／收盤委託", "收盤成交／目前估值", "損益／模式總權益"].forEach((label, index) => {
       if (headers[index]) headers[index].textContent = label;
@@ -1034,7 +1039,7 @@ function renderModes(data) {
       .slice(0, 4)
       .map(([reason, count]) => `${signalReasonLabel(reason)} ${number(count)}`)
       .join("、") || "無";
-    return `<article class="panel mode-card">
+    return `<article class="panel mode-card" data-public-signal-key="${esc(mode.public_signal_key || "")}">
       <header><h3>${esc(strategyLabel(mode))}</h3>${badge(engineStatusShortLabel(status), kind)}</header>
       <div class="equity ${pnlClass(returnPct)}">${returnPct == null ? "尚無估值" : `${returnPct >= 0 ? "+" : ""}${displayPct(returnPct)}`}</div>
       <div class="metric-context">所選期間報酬 · 起始${IS_OVERNIGHT ? "集合競價事件" : "有效分鐘"} = 0%</div>
@@ -1801,6 +1806,31 @@ function renderPriceSources(data = snapshot) {
   priceSourceInputs = inputs;
 }
 
+function measureRevisionPaint(action, rows, rootId, stillCurrent = () => true) {
+  if (!revisionPaintObserver || !appliedStatusRevision) return;
+  const root = $(rootId);
+  if (!root || !Dashboard.isElementVisible(root)) return;
+  const seen = new Set();
+  for (const row of rows) {
+    const key = row.public_signal_key;
+    if (!/^[a-f0-9]{32}$/.test(key || "") || seen.has(key)) continue;
+    // Detail responses do not yet carry a committed ledger revision. Match
+    // only the current logical signal and disclose that narrower proof; do
+    // not label a historical/paginated row as this status commit's fills.
+    const currentMode = (snapshot?.modes || []).find((mode) => mode.market === row.market);
+    if (rootId !== "mode-cards" && currentMode?.public_signal_key !== key) continue;
+    seen.add(key);
+    const visibleNode = [...root.querySelectorAll(`[data-public-signal-key="${key}"]`)]
+      .find((node) => Dashboard.isElementVisible(node));
+    if (!visibleNode) continue;
+    revisionPaintObserver.applied({revision: appliedStatusRevision, action, market: row.market,
+      sessionDate: row.session_date || snapshot.session_date, signalKey: key,
+      updatePhase: appliedStatusPhase,
+      viewEvidence: rootId === "mode-cards" ? "status_mode_snapshot" : "detail_signal_identity_only",
+      stillCurrent: () => stillCurrent() && visibleNode.isConnected && Dashboard.isElementVisible(visibleNode)});
+  }
+}
+
 function renderPositions() {
   const acceptedSelection = positionSelectionKey === detailSelectionKey("positions");
   detailComponents.pagedTable({
@@ -1812,6 +1842,11 @@ function renderPositions() {
     emptyText: acceptedSelection && positionDataRevision === detailDataRevision("positions")
       ? "目前沒有符合篩選的持倉" : "正在讀取符合篩選的持倉…",
   });
+  if (!positionLoading && acceptedSelection && positionDataRevision === detailDataRevision("positions")) {
+    const revision = positionDataRevision, selection = positionSelectionKey;
+    measureRevisionPaint("positions_revision_paint", positionRows, "position-body",
+      () => positionDataRevision === revision && positionSelectionKey === selection);
+  }
   renderPriceSources();
 }
 
@@ -1857,6 +1892,11 @@ function renderSignals() {
       selectedKey: featurePanelSignalKey,
     }),
   });
+  if (!signalLoading && acceptedSelection && signalDataRevision === detailDataRevision("signals")) {
+    const revision = signalDataRevision, selection = signalSelectionKey;
+    measureRevisionPaint("signals_revision_paint", signalRows, "signal-body",
+      () => signalDataRevision === revision && signalSelectionKey === selection);
+  }
   renderPriceSources();
 }
 
@@ -2006,6 +2046,7 @@ function render({heavy = true} = {}) {
   renderEvents();
   renderAudit(snapshot);
   renderSignalFeaturePanel();
+  measureRevisionPaint("status_revision_paint", snapshot.modes, "mode-cards");
 }
 
 async function loadSignals({append = false, force = false} = {}) {
@@ -2030,6 +2071,7 @@ async function loadSignals({append = false, force = false} = {}) {
     mode: selectedMode(),
     symbol: $("symbol-filter").value.trim(),
     status: $("status-filter").value,
+    hide_zero_targets: "1",
     offset: String(requestOffset),
     limit: String(SIGNAL_PAGE_SIZE),
   });
@@ -2217,6 +2259,9 @@ async function refresh({force = false} = {}) {
     if (date !== selectedDate()) { refreshQueued = true; return; }
     const previousRange = detailRangeKey();
     snapshot = nextSnapshot;
+    if (appliedStatusRevision && ["revision_token", "engine_generation", "state_revision"]
+      .some(key => appliedStatusRevision[key] !== nextSnapshot.service_sync?.[key])) appliedStatusPhase = "revision_change";
+    appliedStatusRevision = {...nextSnapshot.service_sync};
     lastServiceRevision = String(snapshot.service_sync?.revision_token || lastServiceRevision || "");
     lastFetchMs = performance.now() - started;
     const sourceUpdatedAt = String(snapshot.source_updated_at || "");
@@ -2318,7 +2363,8 @@ function installEventViewActivation() {
   defer(activateEventView);
 }
 
-function acceptServiceRevision(serviceSync) {
+function acceptServiceRevision(serviceSync, {transport = "poll"} = {}) {
+  revisionPaintObserver?.notice(serviceSync, transport);
   scheduleSessionRollover(serviceSync);
   const revision = String(serviceSync.revision_token || "");
   // Compare against the last *applied status*, not the last notification.
@@ -2471,3 +2517,12 @@ Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, refreshServic
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
 installTwPublicMonitorActivation();
 installEventViewActivation();
+for (const id of ["mode-cards", "signal-body", "position-body"]) {
+  const target = $(id);
+  if (target) Dashboard.observeVisibility(target, (visible) => {
+    if (!visible || !snapshot) return;
+    if (id === "mode-cards") measureRevisionPaint("status_revision_paint", snapshot.modes, id);
+    else if (id === "signal-body") renderSignals();
+    else renderPositions();
+  });
+}

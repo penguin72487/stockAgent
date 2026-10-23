@@ -139,6 +139,11 @@ REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
     "full_target_no_liquidity_claim_v1"
 )
 EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
+ENTRY_PRICE_GUARD_CONTRACT: Final[str] = "strict_inside_original_take_profit_stop_loss_v1"
+ENTRY_PRICE_GUARD_REASONS: Final[frozenset[str]] = frozenset({
+    "entry_bracket_unavailable", "entry_bracket_invalid",
+    "entry_price_at_or_beyond_stop_loss", "entry_price_at_or_beyond_take_profit",
+})
 TERMINAL_CLOSE_UNLIMITED_CONTRACT: Final[str] = (
     "source_close_full_deliverable_residual_no_capacity_paper_only_v1"
 )
@@ -578,6 +583,54 @@ def realized_account_nav(
     )
 
 
+def entry_bracket_prices(
+    *, side: str, upper_limit: object, lower_limit: object,
+    offset_ticks: int, trading_date: date, security_type: str,
+) -> tuple[float | None, float | None]:
+    """Resolve the original TP/SL once, using the same legal ticks as exits."""
+
+    if side not in {"long", "short"}:
+        return None, None
+    upper, lower = _finite(upper_limit), _finite(lower_limit)
+    if offset_ticks:
+        if upper is not None:
+            upper = float(move_price_ticks_numpy(
+                np.asarray([upper]), -offset_ticks, np.asarray([trading_date]),
+                security_types=security_type,
+            )[0])
+        if lower is not None:
+            lower = float(move_price_ticks_numpy(
+                np.asarray([lower]), offset_ticks, np.asarray([trading_date]),
+                security_types=security_type,
+            )[0])
+    return (upper, lower) if side == "long" else (lower, upper)
+
+
+def entry_price_guard_reason(
+    *, side: str, price: object, take_profit_price: object, stop_trigger_price: object,
+) -> str | None:
+    """Admit additions strictly inside the frozen bracket, never at a boundary.
+
+    This is an entry-only condition, not an exit trigger or a price proxy.  A
+    caller must first validate the quote's causal clock and executable side.
+    Do not round or use an epsilon that admits a boundary/outside price.
+    """
+
+    tp, sl = _finite(take_profit_price), _finite(stop_trigger_price)
+    if tp is None or sl is None:
+        return "entry_bracket_unavailable"
+    if side not in {"long", "short"} or not (sl < tp if side == "long" else tp < sl):
+        return "entry_bracket_invalid"
+    value = _finite(price)
+    if value is None:
+        return "no_executable_best_quote"
+    if (value <= sl if side == "long" else value >= sl):
+        return "entry_price_at_or_beyond_stop_loss"
+    if (value >= tp if side == "long" else value <= tp):
+        return "entry_price_at_or_beyond_take_profit"
+    return None
+
+
 def _prepare_entry_plan(
     raw_row: Mapping[str, Any],
     *,
@@ -654,6 +707,12 @@ def _prepare_entry_plan(
     quote_at = _parse_timestamp(quote_values.get("quote_at"))
     upper = _finite(quote_values.get("upper_limit"))
     lower = _finite(quote_values.get("lower_limit"))
+    security_type = evidence.security_type if evidence else None
+    security_type = (
+        security_type if security_type in {"stock", "etf"}
+        else classify_tw_stock_or_etf(symbol) or "stock"
+    )
+    take_profit = stop_trigger = None
     if synthetic_entry_fill:
         entry_price = _synthetic_open_tick_entry_price(
             sizing_price,
@@ -707,6 +766,12 @@ def _prepare_entry_plan(
                 raise ValueError("override must be nonnegative whole-lot shares")
         if requested_shares <= 0:
             status, reason = "skipped", "below_one_board_lot"
+    if not reduce_only and status in {"ready", "waiting_source"}:
+        take_profit, stop_trigger = entry_bracket_prices(
+            side=side, upper_limit=upper, lower_limit=lower,
+            offset_ticks=int(spec.price_limit_offset_ticks),
+            trading_date=observation_at.date(), security_type=security_type,
+        )
     if status == "ready":
         quote_is_causal = bool(
             entry_price is not None
@@ -756,6 +821,17 @@ def _prepare_entry_plan(
             status, reason = "blocked", "price_limit_unavailable"
         elif spec.uses_realistic_execution and not (lower - 1e-8 <= entry_price <= upper + 1e-8):
             status, reason = "blocked", "execution_price_outside_daily_limits"
+        elif not (synthetic_entry_fill or minute_price_at_0901 or official_open_at_0901) and not quote_is_causal:
+            status, reason = (
+                ("blocked", "quote_after_local_observation")
+                if quote_at is not None and quote_at > observation_at
+                else ("blocked", "quote_not_after_signal")
+            )
+        elif not reduce_only and (guard_reason := entry_price_guard_reason(
+            side=side, price=entry_price,
+            take_profit_price=take_profit, stop_trigger_price=stop_trigger,
+        )):
+            status, reason = "skipped", guard_reason
         elif minute_price_at_0901:
             # Missed-opening recovery separates the two causal roles that the
             # legacy replay conflated. The official session open sizes the
@@ -870,6 +946,9 @@ def _prepare_entry_plan(
         "sizing_price": sizing_price,
         "upper": upper,
         "lower": lower,
+        "take_profit_price": take_profit,
+        "stop_trigger_price": stop_trigger,
+        "entry_price_guard_contract": None if reduce_only else ENTRY_PRICE_GUARD_CONTRACT,
         "requested_shares": requested_shares,
         "filled_shares": filled_shares,
         "top_book_capacity_shares": top_book_capacity_shares,
@@ -2133,6 +2212,7 @@ class TwDayTradeSimulationEngine:
                 "checkpoint_fingerprint": mode.get("checkpoint_fingerprint"),
                 "config_fingerprint": mode.get("config_fingerprint"),
                 "execution_realism_contract": mode.get("execution_realism_contract"),
+                "entry_price_guard_contract": mode.get("entry_price_guard_contract"),
                 "margin_carry_contract": mode.get("margin_carry_contract"),
                 "cumulative_carry_cost_twd": mode.get("cumulative_carry_cost_twd", 0),
                 "cumulative_corporate_action_net_twd": mode.get("cumulative_corporate_action_net_twd", 0),
@@ -3299,6 +3379,7 @@ class TwDayTradeSimulationEngine:
         # it to rewrite a completed counterfactual replay makes state and the
         # append-only fill ledger disagree immediately after a service restart.
         mode["configured_entry_fill_policy"] = spec.entry_fill_policy
+        mode["configured_entry_price_guard_contract"] = ENTRY_PRICE_GUARD_CONTRACT
         mode["configured_intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
         mode["configured_terminal_close_contract"] = (
             TERMINAL_CLOSE_UNLIMITED_CONTRACT
@@ -4298,6 +4379,10 @@ class TwDayTradeSimulationEngine:
             else "09:00_fresh_level_one_depth_then_minimum_with_50pct_completed_minute_volume"
         )
         mode["entry_fill_policy"] = spec.entry_fill_policy
+        # Session semantics are frozen at registration, not relabelled by a
+        # later config read/restart. Individual later fills also carry this ABI.
+        mode["entry_price_guard_contract"] = ENTRY_PRICE_GUARD_CONTRACT
+        mode["entry_price_guard_rejection_counts"] = {}
         mode["execution_realism_contract"] = EXECUTION_REALISM_CONTRACT if spec.uses_realistic_execution else None
         mode["entry_sweep_funding_policy"] = spec.entry_sweep_funding_policy
         # Freeze this assumption with the new session. A config reload must
@@ -4477,6 +4562,9 @@ class TwDayTradeSimulationEngine:
                 "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "sizing_open_price": sizing_price,
                 "execution_price": entry_price,
+                "take_profit_price": plan["take_profit_price"],
+                "stop_trigger_price": plan["stop_trigger_price"],
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
                 "filled_shares": filled_shares,
                 "filled_weight": filled_weight,
                 "top_book_capacity_shares": top_book_capacity_shares,
@@ -4578,23 +4666,6 @@ class TwDayTradeSimulationEngine:
             # enters positions/fills until an actual causal quote is consumed.
             entry_price = None if unsized_source_wait else entry_price if entry_price is not None else sizing_price
 
-            upper_bracket = None if upper is None else float(
-                move_price_ticks_numpy(
-                    np.asarray([upper], dtype=np.float64),
-                    -offset_ticks,
-                    np.asarray([observed.date()]),
-                    security_types=security_types_by_symbol[symbol],
-                )[0]
-            )
-            lower_bracket = None if lower is None else float(
-                move_price_ticks_numpy(
-                    np.asarray([lower], dtype=np.float64),
-                    offset_ticks,
-                    np.asarray([observed.date()]),
-                    security_types=security_types_by_symbol[symbol],
-                )[0]
-            )
-
             signed_shares = filled_shares if side == "long" else -filled_shares
             buy_rate, sell_rate, rebate_rate, cash_buy_rate, cash_sell_rate = fee_rates[
                 symbol
@@ -4647,10 +4718,9 @@ class TwDayTradeSimulationEngine:
                 "security_type": security_types_by_symbol[symbol],
                 "upper_limit": upper,
                 "lower_limit": lower,
-                "take_profit_price": upper_bracket if side == "long" else lower_bracket,
-                "stop_trigger_price": lower_bracket
-                if side == "long"
-                else upper_bracket,
+                "take_profit_price": plan["take_profit_price"],
+                "stop_trigger_price": plan["stop_trigger_price"],
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
                 "price_limit_offset_ticks": offset_ticks,
                 "bracket_price_policy": (
                     "inside_daily_limits_by_ticks"
@@ -4713,6 +4783,9 @@ class TwDayTradeSimulationEngine:
                 "market": spec.market,
                 "signal_market": spec.signal_market or spec.market,
                 "entry_fill_policy": plan["entry_fill_policy"],
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+                "take_profit_price": plan["take_profit_price"],
+                "stop_trigger_price": plan["stop_trigger_price"],
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "price_limit_offset_ticks": offset_ticks,
                 "bracket_price_offset_ticks": offset_ticks,
@@ -4898,6 +4971,14 @@ class TwDayTradeSimulationEngine:
             else "no_fill"
         )
         mode["signal_reason_counts"] = reason_counts
+        mode["entry_price_guard_rejection_counts"] = {
+            reason: count for reason, count in reason_counts.items()
+            if reason in ENTRY_PRICE_GUARD_REASONS
+        }
+        mode["entry_price_guard_skipped_shares"] = sum(
+            int(plan["requested_shares"]) for plan in plans
+            if plan["reason"] in ENTRY_PRICE_GUARD_REASONS
+        )
         mode["entry_fill_count"] = entry_fill_count
         mode["entry_requested_shares"] = entry_requested_shares
         mode["entry_filled_shares"] = entry_filled_shares
@@ -4986,6 +5067,10 @@ class TwDayTradeSimulationEngine:
             )
             else "waiting_opening_source"
             if mode.get("pending_entry_source_count")
+            else "flat_entry_price_guard"
+            if entry_requested_shares > 0 and entry_fill_count == 0
+            and all(p["reason"] in ENTRY_PRICE_GUARD_REASONS
+                    for p in plans if int(p["requested_shares"]) > 0)
             else "entry_price_missing_no_fill"
             if entry_requested_shares > 0 and entry_fill_count == 0
             else "flat_no_executable_signal"
@@ -5094,6 +5179,49 @@ class TwDayTradeSimulationEngine:
                 ledger_session_date=now.date().isoformat(),
                 ledger_order_id=f"{p['position_id']}:mandatory_exit:{now.isoformat()}")
 
+    def _cancel_entry_price_guard(
+        self, mode, order, quote, price, now, rejection_records,
+    ) -> bool:
+        """Cancel only unfilled additions; retain original fills and exit rules.
+
+        The caller has validated the observation's clock and source. Rejections
+        are appended once per quote batch, not fsynced separately per symbol.
+        Restored templates are checked too, without relabelling old fills.
+        """
+
+        template = order["position"]
+        reason = entry_price_guard_reason(
+            side=str(template["side"]), price=price,
+            take_profit_price=template.get("take_profit_price"),
+            stop_trigger_price=template.get("stop_trigger_price"),
+        )
+        if reason is None:
+            return False
+        order.update(
+            status="cancelled_entry_price_guard", last_wait_reason=reason,
+            cancelled_at=now.isoformat(), last_quote_at=quote.get("quote_at"),
+            rejected_entry_price=price, entry_price_guard_contract=ENTRY_PRICE_GUARD_CONTRACT,
+        )
+        counts = mode.setdefault("entry_price_guard_rejection_counts", {})
+        counts[reason] = int(counts.get(reason) or 0) + 1
+        mode["entry_price_guard_skipped_shares"] = int(
+            mode.get("entry_price_guard_skipped_shares") or 0
+        ) + int(order.get("remaining_shares") or 0)
+        rejection_records.append({
+            "event": "entry_price_guard_rejected", "recorded_at": now.isoformat(),
+            "session_date": now.date().isoformat(), "market": mode["market"],
+            "signal_id": mode.get("signal_id"), "symbol": template["symbol"],
+            "position_id": template["position_id"], "reason": reason,
+            "remaining_shares": int(order.get("remaining_shares") or 0),
+            "side": template["side"], "price": price,
+            "quote_at": quote.get("quote_at"), "quote_source": quote.get("source"),
+            "take_profit_price": template.get("take_profit_price"),
+            "stop_trigger_price": template.get("stop_trigger_price"),
+            "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+            "simulation_only": True,
+        })
+        return True
+
     def _retry_historical_minute_entry_orders(
         self,
         mode: dict[str, Any],
@@ -5134,6 +5262,7 @@ class TwDayTradeSimulationEngine:
             if int(position.get("signed_shares") or 0) != 0
         )
         allocated = None
+        rejection_records: list[dict[str, Any]] = []
         if mode.get("entry_sweep_funding_policy") == "proportional_net_reservation_v1":
             # Plan the entire minute before recording any fill. This is the
             # same linear-fee scalar allocator as the differentiable FIFO
@@ -5151,7 +5280,12 @@ class TwDayTradeSimulationEngine:
                         or _parse_timestamp(quote.get("quote_at")) != now
                         or quote.get("historical_minute_valuation") is not True
                         or price is None
-                        or not float(template["lower_limit"]) <= price <= float(template["upper_limit"])):
+                        or not float(template["lower_limit"]) <= price <= float(template["upper_limit"])
+                        or entry_price_guard_reason(
+                            side=template["side"], price=price,
+                            take_profit_price=template.get("take_profit_price"),
+                            stop_trigger_price=template.get("stop_trigger_price"),
+                        ) is not None):
                     continue
                 lot = int(template["lot_size"])
                 key = str(quote.get("capacity_bucket") or f"{now.date()}:{now.strftime('%H:%M')}:{symbol}")
@@ -5200,6 +5334,8 @@ class TwDayTradeSimulationEngine:
                 <= price
                 <= float(template["upper_limit"])
             ):
+                continue
+            if self._cancel_entry_price_guard(mode, order, quote, price, now, rejection_records):
                 continue
             lot = int(template["lot_size"])
             capacity = _minute_kbar_capacity_shares(quote, lot_size=lot)
@@ -5261,6 +5397,7 @@ class TwDayTradeSimulationEngine:
                     entry_gross_fee_and_tax_twd=0.0,
                     entry_commission_rebate_accrued_twd=0.0,
                     counterfactual_minute_sweep_fill=True,
+                    entry_price_guard_contract=ENTRY_PRICE_GUARD_CONTRACT,
                 )
                 mode["positions"][position["position_id"]] = position
             previous_filled = int(position.get("filled_shares") or 0)
@@ -5294,6 +5431,9 @@ class TwDayTradeSimulationEngine:
                 "quantity": quantity,
                 "simulation_only": True,
                 "entry_fill_policy": ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+                "take_profit_price": template.get("take_profit_price"),
+                "stop_trigger_price": template.get("stop_trigger_price"),
             }
             self._order(
                 common
@@ -5351,6 +5491,7 @@ class TwDayTradeSimulationEngine:
             if not order["remaining_shares"]:
                 order["status"] = "filled"
 
+        _append_jsonl_many(self.events_path, rejection_records)
         mode["pending_entry_shares"] = sum(
             int(order.get("remaining_shares") or 0)
             for order in orders.values()
@@ -5538,14 +5679,21 @@ class TwDayTradeSimulationEngine:
             if not bool(price_on_tick_grid_numpy(np.array([opening]), np.array([now.date()]), security_types=security)[0]):
                 order["last_wait_reason"] = "opening_price_off_tick_grid"
                 continue
-            offset = int(template["price_limit_offset_ticks"])
-            top = float(move_price_ticks_numpy(np.array([upper]), -offset, np.array([now.date()]), security_types=security)[0])
-            bottom = float(move_price_ticks_numpy(np.array([lower]), offset, np.array([now.date()]), security_types=security)[0])
+            take_profit, stop_trigger = entry_bracket_prices(
+                side=side, upper_limit=upper, lower_limit=lower,
+                offset_ticks=int(template["price_limit_offset_ticks"]),
+                trading_date=now.date(), security_type=security,
+            )
+            # A later opening print resolves sizing, not permission to move an
+            # already published bracket to make an outside market price fit.
+            if template.get("take_profit_price") is not None:
+                take_profit = template["take_profit_price"]
+            if template.get("stop_trigger_price") is not None:
+                stop_trigger = template["stop_trigger_price"]
             template.update(
                 requested_shares=quantity, target_unsubmitted_shares=quantity,
                 sizing_open_price=opening, upper_limit=upper, lower_limit=lower,
-                take_profit_price=top if side == "long" else bottom,
-                stop_trigger_price=bottom if side == "long" else top,
+                take_profit_price=take_profit, stop_trigger_price=stop_trigger,
                 entry_price=opening, last_mark_price=opening,
             )
             order.update(status="working", sizing_pending=False, remaining_shares=quantity,
@@ -5578,6 +5726,7 @@ class TwDayTradeSimulationEngine:
             ENTRY_FILL_POLICY_CAUSAL_BOOK,
         }:
             return
+        rejection_records: list[dict[str, Any]] = []
         for symbol, order in orders.items():
             if order.get("status") != "working":
                 continue
@@ -5599,6 +5748,8 @@ class TwDayTradeSimulationEngine:
                 continue
             if not bool(price_on_tick_grid_numpy(np.array([price]), np.array([now.date()]),
                     security_types=template.get("security_type") or "stock")[0]):
+                continue
+            if self._cancel_entry_price_guard(mode, order, quote, price, now, rejection_records):
                 continue
             lot = int(template["lot_size"])
             cumulative = quote.get("cumulative_volume_lots")
@@ -5643,6 +5794,7 @@ class TwDayTradeSimulationEngine:
             if p is None:
                 p = dict(template)
                 p.update(entry_at=now.isoformat(), entry_quote_at=quote.get("quote_at"), entry_price=price,
+                         entry_price_guard_contract=ENTRY_PRICE_GUARD_CONTRACT,
                          filled_shares=0, signed_shares=0, entry_fee_twd=0., remaining_entry_fee_twd=0.,
                          entry_gross_fee_and_tax_twd=0., entry_commission_rebate_accrued_twd=0.)
                 mode["positions"][p["position_id"]] = p
@@ -5662,6 +5814,9 @@ class TwDayTradeSimulationEngine:
                       "purpose": "entry" if old == 0 else "entry_completion",
                       "quantity": quantity, "simulation_only": True,
                       "entry_fill_policy": entry_fill_policy}
+            common.update(entry_price_guard_contract=ENTRY_PRICE_GUARD_CONTRACT,
+                          take_profit_price=template.get("take_profit_price"),
+                          stop_trigger_price=template.get("stop_trigger_price"))
             self._order(common | {"order_type": "MKT", "price": None, "status": "filled",
                                   "side": "buy" if side == "long" else "sell_short"})
             self._fill(common | {"fill_at": now.isoformat(), "quote_at": quote.get("quote_at"),
@@ -5691,6 +5846,7 @@ class TwDayTradeSimulationEngine:
                 order["status"] = "filled"
             mode.pop("entry_retry_pending_commit", None)
             self._persist(now)
+        _append_jsonl_many(self.events_path, rejection_records)
         mode["pending_entry_shares"] = sum(int(o["remaining_shares"]) for o in orders.values() if o["status"] == "working")
 
     def _retry_full_target_entry_orders(self, mode, quotes, now) -> None:
@@ -5711,6 +5867,7 @@ class TwDayTradeSimulationEngine:
             return
 
         candidates: list[tuple[str, dict[str, Any], dict[str, Any], float]] = []
+        rejection_records: list[dict[str, Any]] = []
         for symbol, order in orders.items():
             if (
                 order.get("status") != "working"
@@ -5752,10 +5909,13 @@ class TwDayTradeSimulationEngine:
                 ):
                 order["last_wait_reason"] = "execution_price_off_tick_grid"
                 continue
+            if self._cancel_entry_price_guard(mode, order, quote, price, now, rejection_records):
+                continue
             order.pop("last_wait_reason", None)
             order["last_quote_at"] = quote.get("quote_at")
             candidates.append((symbol, order, quote, price))
 
+        _append_jsonl_many(self.events_path, rejection_records)
         if not candidates:
             mode["pending_entry_shares"] = sum(
                 int(order.get("remaining_shares") or 0)
@@ -5821,6 +5981,7 @@ class TwDayTradeSimulationEngine:
                     entry_at=now.isoformat(),
                     entry_quote_at=quote.get("quote_at"),
                     entry_price=price,
+                    entry_price_guard_contract=ENTRY_PRICE_GUARD_CONTRACT,
                     filled_shares=0,
                     signed_shares=0,
                     entry_fee_twd=0.0,
@@ -5862,6 +6023,9 @@ class TwDayTradeSimulationEngine:
                 "quantity": quantity,
                 "simulation_only": True,
                 "entry_fill_policy": ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+                "take_profit_price": template.get("take_profit_price"),
+                "stop_trigger_price": template.get("stop_trigger_price"),
             }
             order_records.append(
                 common
@@ -7114,7 +7278,11 @@ class TwDayTradeSimulationEngine:
             capacity = max(0, capacity - reduction_filled)
             plan["filled_shares"] = min(addition, capacity)
             if not plan["filled_shares"]:
-                if reduction_remaining and addition:
+                if addition and plan["reason"] in ENTRY_PRICE_GUARD_REASONS:
+                    # An inventory reduction must not erase a rejected new
+                    # entry or turn it into a retryable capacity shortage.
+                    plan["status"] = "skipped"
+                elif reduction_remaining and addition:
                     plan["status"] = "blocked"
                     plan["reason"] = "observed_09_01_minute_capacity_exhausted"
                 else:
@@ -7594,7 +7762,12 @@ class TwDayTradeSimulationEngine:
                 int(mode.get("entry_requested_shares") or 0) > 0
                 and int(mode.get("entry_fill_count") or 0) == 0
             ):
-                flat_status = "entry_price_missing_no_fill"
+                flat_status = (
+                    "flat_entry_price_guard"
+                    if int(mode.get("entry_price_guard_skipped_shares") or 0)
+                    >= int(mode["entry_requested_shares"])
+                    else "entry_price_missing_no_fill"
+                )
             else:
                 flat_status = "flat_no_executable_signal"
         mode.update(
@@ -7858,6 +8031,7 @@ class TwDayTradeSimulationEngine:
             {
                 "schema_version": SIMULATION_SCHEMA_VERSION,
                 "order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
+                "configured_entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
                 "state_revision": revision,
                 "content_revision": content_revision,
                 "engine_run_id": self._engine_run_id,
@@ -7890,6 +8064,7 @@ class TwDayTradeSimulationEngine:
                         if paper_market_at_best
                         else "size_at_official_open_then_execute_at_a_causally_later_best_ask_bid"
                     ),
+                    "entry_price_guard": "long: SL < Ask < TP; short: TP < Bid < SL; equal/outside cancels additions only",
                     "liquidity": (
                         "counterfactual_unbounded_paper_fill_no_exchange_claim"
                         if synthetic_open_tick
@@ -7933,6 +8108,10 @@ class TwDayTradeSimulationEngine:
                             "exchange_fill_guaranteed",
                             "entry_fill_policy",
                             "configured_entry_fill_policy",
+                            "entry_price_guard_contract",
+                            "configured_entry_price_guard_contract",
+                            "entry_price_guard_rejection_counts",
+                            "entry_price_guard_skipped_shares",
                             "entry_price_offset_ticks",
                             "entry_fill_is_synthetic",
                             "entry_fill_has_synthetic_fallback",

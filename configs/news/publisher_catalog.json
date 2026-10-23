@@ -11,6 +11,117 @@
   },
   "providers": [
     {
+      "id": "taiwannews",
+      "name": "Taiwan News 台灣英文新聞",
+      "domains": ["www.taiwannews.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "authorization": {
+        "kind": "personal_research",
+        "evidence_url": "https://www.taiwannews.com.tw/page/about-us",
+        "additional_evidence_urls": ["https://www.taiwannews.com.tw/"],
+        "reviewed_on": "2026-10-22",
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Known public Taiwan News literal article URLs supplied by existing local metadata, for requested private personal noncommercial reading only. Current native whole written body requires exact final URL/ID, source title/clock and bound completed public segments with the native editor/reporter/opinion-desk credit role. Preserve original source rights and raw declarations; explicit third-party wire/reprint text, media, scripts, paid/member pages and unknown active shapes are not in scope. No site discovery, API, guessed aliases, profile fetch, public reuse or training/export. Not an open license, verified ownership, legal fair-use finding or historical PIT grant.",
+        "rights_restrictions": "Official About Us and footer reserve copyright and list third-party media partners; absence of an identified automation prohibition is not an open license, unlimited historical-download grant or a legal fair-use finding. Respect actual REP and source refusals using the unchanged honest client. No official numeric quota is established."
+      },
+      "article_path_pattern": "^/(?:ch|zh)/news/[1-9][0-9]*$",
+      "article_selectors": [":scope > .taiwannews-native-body"],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [],
+      "note": "Reviewed native completed public segments only. Same shared NewsHTTP/REP/refusal owner; known-URL metadata growth only, no discovery. Retain minute clocks verbatim without invented seconds/offset. Editor and opinion-desk names are not inferred reporters; native role/profile declarations do not verify human identity or ownership. Bare-host OG corroborates ID only, never a transport alias. Separate hero image/caption, ads, support and related stories remain raw, not article prose. Unknown shapes remain unresolved. Two-second single-slot initial pacing is engineering policy, not an official/measured ceiling.",
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "embedded_article_layout": "taiwannews_completed_public_original_v3",
+      "exclude_selectors": [],
+      "capacity_max_parallelism": 1,
+      "adapter_verification": "literal_ID_chronological_completed_segments_explicit_inline_editor_minute_and_faithful_written_text_v3_offline_verified_20261022",
+      "review_url": "https://www.taiwannews.com.tw/page/about-us"
+    },
+    {
+      "id": "stockfeel",
+      "name": "StockFeel 股感",
+      "domains": [
+        "www.stockfeel.com.tw"
+      ],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "authorization": {
+        "kind": "personal_research",
+        "evidence_url": "https://www.stockfeel.com.tw/member/?view=copyright",
+        "additional_evidence_urls": [
+          "https://www.stockfeel.com.tw/member/?view=servicepolicy"
+        ],
+        "reviewed_on": "2026-10-22",
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "User-requested private personal noncommercial reading of the locally known public StockFeel original URLs and already retained literal original-link metadata. Each actual page must independently verify its canonical/head identity, matching native author/header/avatar declarations with exact StockFeel article-source67/stockfeel, plus the unchanged427/news pair; declaration is not ownership, free visible written body, publisher clocks and copyright. Hidden header credits stay explicit source declarations. No site discovery, internal API, guessed aliases, paid/member or third-party archive, public reuse, automatic training/export or claim of original historical versions; not a license or fair-use verdict.",
+        "rights_restrictions": "Copyright clauses2/3 retain all rights and distinguish personal/nonpersonal uses; personal purpose is not a legal fair-use finding. Respect actual REP and source refusals, never switch user agent or origin after denial. No official numeric source quota identified."
+      },
+      "article_path_pattern": "^/(?:[A-Za-z0-9_-]|%[0-9A-Fa-f]{2})+/$",
+      "article_selectors": [
+        ":scope > article.sin-content-body > .sin-content > .sin-content-original"
+      ],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [],
+      "note": "Private known-URL originals only, including already recorded literal original-link metadata and later locally observed URLs; no site discovery or separate refresh service. Linked native writer name, numeric ID, literal same-origin profile and avatar remain independently checked beside exact source67/stockfeel. v7 also retains a bounded plain-text native writer with explicitly empty numeric ID and no profile, only when head publisher group, publisher avatar and exact article-source67/stockfeel independently agree. Missing writer ID/profile remain missing; no guessed link, verified person or ownership. A distinct native writer and exact head publisher group stay separate roles, not equivalent names. The v5 coauthor/group, empty wbr and closed unrequested TradingView rules and v6 literal title comparison remain unchanged. Source427/news remains the old427 author only. External credits, reprints and unproved identities remain excluded. Initial hidden credits stay source declarations, not verified rendering or human identity. Preserve complete raw originals, prose/tables, clocks, copyright, refusals and pacing. No paid/member or third-party archive, public reuse or automatic training/export. The original89-head snapshot remains immutable evidence, not an artificial limit on requested incremental work. Two-second single-slot starting bound is not an official or measured maximum.",
+      "embedded_article_layout": "stockfeel_visible_original_v7",
+      "html_parser": "lxml",
+      "exclude_selectors": [],
+      "capacity_max_parallelism": 1,
+      "adapter_verification": "native_UTF8_named_unlinked_writer_and_distinct_head_publisher_roles_v7_scoped_20261022",
+      "review_url": "https://www.stockfeel.com.tw/member/?view=copyright",
+      "private_known_url_scope": "personal_noncommercial_originals_v1"
+    },
+    {
+      "id": "bastillepost",
+      "name": "巴士的報／私人已知網址正文",
+      "domains": [
+        "www.bastillepost.com"
+      ],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "capacity_max_parallelism": 1,
+      "html_parser": "lxml",
+      "embedded_article_layout": "bastillepost_visible_article_v7",
+      "article_path_pattern": "^/hongkong/article/[1-9][0-9]*(?:-[^/?#]+)?/?$",
+      "article_selectors": [
+        ":scope > .bastillepost-native-body"
+      ],
+      "title_selector": ".news-large__title-main > h2.h2.bpcategory-special-color",
+      "exclude_selectors": [],
+      "author_selectors": [],
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "feeds": [],
+      "sitemaps": [],
+      "wordpress_apis": [],
+      "fulltext_feeds": [],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-21",
+        "evidence_url": "https://www.bastillepost.com/hongkong/terms",
+        "additional_evidence_urls": [
+          "https://www.bastillepost.com/hongkong/specialpage/copyright"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Locally known literal public Hong Kong article text only for the user's confirmed personal noncommercial nonpublic local reading. Official terms1b state publisher ownership unless otherwise noted;3a preserve publisher/provider rights;3b and the copyright notice explicitly distinguish personal noncommercial downloading. This is not open-license, unlimited archive, redistribution, training/export or a legal fair-use verdict. Require the observed single native visible article-body, exact native/schema/OG headline and canonical/OG/mainEntity numeric-ID agreement, matching publisher, the current schema's exact corporate Person/name declaration, head/schema release and visible release/revision clock checks. Retain this brand-as-Person declaration as a corporate label, never a verified human author or independent original ownership proof; keep opaque prose credits and source values unchanged. Known explicit third-party/reprint declarations, unknown credits, hidden/conflicting content, active media/scripts or paywalls/challenges fail pending separate review. Actual same-ID same-host redirect witnesses may upgrade a literal HTTP URL; never guess a replacement URL or global alias. No unobserved IDs, search/Output/Category/WordPress endpoints, feeds/API/sitemap discovery, images/media, scripts executed, login, public prose or remote training/export. Honest native REP at every hop, persistent source/origin refusals, Retry-After and existing shared capacity controls remain binding. Two-second single-slot start is an engineering setting, not an official or proven maximum. Current source declarations are not observed historical PIT."
+      },
+      "review_url": "https://www.bastillepost.com/hongkong/terms",
+      "adapter_verification": "retained_native_body_dual_parser_and_independent_ordered_text_readback_20261021",
+      "note": "Reuse canonical collector/queue/raw receipts/dashboard; no second producer. Initial110 literal URL heads and60 metadata associations are distinct, not170 articles or all publisher history. Native written text only; captions preserved, images not fetched. Preserve Anue priority and CNA deferral."
+    },
+    {
       "id": "videoland",
       "name": "緯來新聞網／已核對私人研究原稿",
       "domains": [
@@ -315,26 +426,46 @@
       "note": "Only the frozen single known main-host article; all transport, ownership, queue, recovery and immutable receipts use the canonical collector. Native current CMS identifiers and page-title/heading are checked because this actual page declares no canonical/og URL or article schema. Preserve 校訊記者林亭/秘書處 and the unexpanded date-only release. Exclude separate SSU media/captions and every other editor/navigation block. No feeds, sitemaps, guessed IDs, full-site history, numerical official maximum, public body or training export enabled."
     },
     {
-      "id":"cmoneylearning", "name":"實習大人／已核對原文",
-      "domains":["cmoneylearning.com.tw"], "enabled":true, "acquisition_mode":"finite",
-      "interval_seconds":10, "parallelism":1, "capacity_max_parallelism":1,
-      "html_parser":"lxml", "embedded_article_layout":"cmoneylearning_visible_article_v1",
-      "article_path_pattern":"^(?:/%e6%9c%88%e9%85%8d%e6%81%afetf%e7%bc%ba%e9%bb%9e%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f%e9%99%a4%e6%81%af%e6%89%a3%e6%b7%a8%e5%80%bc%e3%80%81%e4%ba%8c%e4%bb%a3%e5%81%a5%e4%bf%9d%e9%96%80%e6%aa%bb/|/%e6%88%bf%e8%b2%b8%e8%bd%89%e8%b2%b8%e6%88%90%e6%9c%ac%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f5%e5%a4%a7%e9%9a%b1%e5%bd%a2%e8%b2%bb%e7%94%a8%e8%88%87%e9%81%95%e7%b4%84%e9%87%91%e8%a9%a6%e7%ae%97%ef%bc%9a/)$",
-      "article_selectors":[":scope > .articleContent__body > .articleContent__content--main > .articleContent__textContent"],
-      "exclude_selectors":[], "title_selector":"h1.articleContent__title",
-      "require_configured_container":true, "require_author_attribution":true,
-      "feeds":[], "sitemaps":[], "wordpress_apis":[],
-      "authorization":{
-        "kind":"personal_research", "reviewed_on":"2026-10-20",
-        "evidence_url":"https://www.cmoney.tw/member/tos.aspx",
-        "additional_evidence_urls":["https://cmoneylearning.com.tw/", "https://www.cmoney.tw/member/cr.aspx"],
-        "automated_access_review":"no_explicit_prohibition_identified",
-        "scope":"Bounded private diagnosis of exactly two public source-declared originals. No paid/member, third-party rights override, publication, training export or whole-site scope. Not a reuse license or fair-use verdict; preserve credits, REP and actual refusals."
+      "enabled": true,
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "require_configured_container": true,
+      "article_selectors": [
+        ":scope > .articleContent__body > .articleContent__content--main > .articleContent__textContent"
+      ],
+      "adapter_verification": "native_canonical_BlogPosting_editor_clock_v4_declared_00958B_20261023",
+      "note": "Reuse the nineteen completed originals, frozen cohort and supplements. Only the new literal CMNews-declared 00958B original may enter a separately verified supplement. No recursive discovery, guessed slugs, AI polling, public body, automatic training export, CMNews alias equivalence or historical-release guarantee. Ten-second local spacing is not a measured source maximum.",
+      "id": "cmoneylearning",
+      "name": "實習大人／已核對原文",
+      "domains": [
+        "cmoneylearning.com.tw"
+      ],
+      "acquisition_mode": "finite",
+      "capacity_max_parallelism": 1,
+      "allow_reviewed_supplements": true,
+      "embedded_article_layout": "cmoneylearning_visible_article_v4",
+      "article_path_pattern": "^(?:/%e6%9c%88%e9%85%8d%e6%81%afetf%e7%bc%ba%e9%bb%9e%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f%e9%99%a4%e6%81%af%e6%89%a3%e6%b7%a8%e5%80%bc%e3%80%81%e4%ba%8c%e4%bb%a3%e5%81%a5%e4%bf%9d%e9%96%80%e6%aa%bb/|/%e6%88%bf%e8%b2%b8%e8%bd%89%e8%b2%b8%e6%88%90%e6%9c%ac%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f5%e5%a4%a7%e9%9a%b1%e5%bd%a2%e8%b2%bb%e7%94%a8%e8%88%87%e9%81%95%e7%b4%84%e9%87%91%e8%a9%a6%e7%ae%97%ef%bc%9a/|/00907%e9%85%8d%e6%81%af0\\-24%e5%85%83%ef%bc%8c8%e6%9c%8825%e6%97%a5%e9%99%a4%e6%81%af%e5%89%8d%e8%a9%b2%e8%b2%b7%e5%97%8e%ef%bc%9f/|/00888%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e9%a0%98%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e6%9c%80%e5%be%8c%e8%b2%b7%e9%80%b2%e6%97%a5%e6%80%8e%e9%ba%bc%e7%9c%8b/|/%e6%b3%95%e5%9c%8b%e6%9a%b4%e5%8b%95%e5%8e%9f%e5%9b%a0%e6%98%af%e4%bb%80%e9%ba%bc%ef%bc%9f%e7%94%9f%e6%b4%bb%e6%88%90%e6%9c%ac%e3%80%81%e6%95%99%e8%82%b2%e4%b8%8d%e5%b9%b3%e7%ad%89%e8%88%87%e8%b3%87/|/%e4%bf%a1%e7%94%a8%e5%8d%a1%e9%a1%8d%e5%ba%a6%e8%aa%bf%e6%95%b4%e8%a6%81%e6%ba%96%e5%82%99%e4%bb%80%e9%ba%bc%e8%b3%87%e6%96%99%ef%bc%9f%e8%b2%a1%e5%8a%9b%e8%ad%89%e6%98%8e%e3%80%81%e7%94%b3%e8%ab%8b/|/0056%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e9%99%a4%e6%81%af%e5%be%8c%e7%82%ba%e4%bd%95%e4%b8%8d%e7%ad%89%e6%96%bc/|/%e5%be%85%e6%a5%ad%e6%9c%9f%e9%96%93%e6%8e%9b%e5%b7%a5%e6%9c%83%e6%8a%95%e4%bf%9d%e5%a5%bd%e5%97%8e%ef%bc%9f%e6%af%8f%e6%9c%88%e4%bf%9d%e8%b2%bb%e6%94%af%e5%87%ba%e3%80%81%e5%8b%9e%e4%bf%9d%e9%80%80/|/00990b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e9%a0%90%e4%bc%b080%e5%85%83%ef%bc%8c%e6%9c%88%e9%85%8d%e6%81%af%e8%83%bd%e7%95%b6%e5%9b%ba%e5%ae%9a%e6%94%b6%e5%85%a5/|/00726b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e9%a0%98%ef%bc%9f%e4%b8%80%e5%bc%b5%e9%a0%90%e4%bc%b0460%e5%85%83%ef%bc%8c%e6%8a%95%e7%ad%89%e5%82%b5%e6%9c%89%e5%93%aa%e4%ba%9b%e9%a2%a8%e9%9a%aa/|/%e8%87%aa%e5%be%8b%e7%a5%9e%e7%b6%93%e5%a4%b1%e8%aa%bf%e6%9c%83%e5%a5%bd%e5%97%8e%ef%bc%9f%e6%aa%a2%e6%9f%a5%e5%85%a8%e6%ad%a3%e5%b8%b8%e5%8d%bb%e5%a4%a9%e5%a4%a9%e5%bf%83%e6%82%b8%e9%a0%ad%e6%9a%88/|/%e9%95%b7%e8%80%85%e9%98%b2%e8%b7%8c%e8%82%8c%e5%8a%9b%e9%81%8b%e5%8b%95%e6%95%99%e5%ad%b8%ef%bc%9a%e5%a4%a7%e8%85%bf%e7%84%a1%e5%8a%9b%e8%b5%b0%e8%b7%af%e7%a2%8e%e6%ad%a5%e5%bf%83%e6%85%8c%ef%bc%9f/|/%e8%81%b7%e5%a0%b4%e5%86%b7%e6%9a%b4%e5%8a%9b%e9%80%bc%e9%80%80%e4%b8%bb%e7%ae%a1%e6%95%85%e6%84%8f%e4%b8%8d%e6%8c%87%e6%b4%be%e5%b7%a5%e4%bd%9c%ef%bc%9f%e5%bf%83%e7%90%86%e5%b8%ab%e6%8f%ad%e6%9a%97/|/%e5%ad%a9%e5%ad%90%e6%b5%81%e6%84%9f%e8%a6%81%e8%ab%8b%e5%81%87%e5%97%8e%ef%bc%9f%e5%85%88%e7%9c%8b3%e5%80%8b%e8%bf%94%e6%a0%a1%e6%a2%9d%e4%bb%b6%ef%bc%8c%e6%8e%9b%e6%80%a5%e8%a8%ba%e5%be%8c%e9%9a%94/|/meta%e6%99%ba%e6%85%a7%e7%9c%bc%e9%8f%a1%e5%af%a6%e6%b8%ac%ef%bc%9a%e9%9a%b1%e8%97%8f%e8%9e%a2%e5%b9%95%e6%8a%ac%e9%a0%ad%e9%a1%af%e7%a4%ba%ef%bc%8c%e5%85%89%e5%ad%b8%e5%be%ae%e6%8a%95%e5%bd%b1/|/2026%e4%b9%9d%e5%90%88%e4%b8%80%e9%81%b8%e8%88%89%e6%8a%95%e7%a5%a811\\-28%e5%85%ad%e5%b8%b6%e4%bb%80%e9%ba%bc%ef%bc%9f%e5%bf%85%e5%82%993%e6%a8%a3%e7%89%a9%e5%93%81%e8%88%87%e6%8a%95%e7%a5%a8/|/2027%e5%b9%b4%e8%8f%9c%e9%a0%90%e8%b3%bc%e5%93%aa%e8%a3%a1%e8%b2%b7%ef%bc%9f4%e5%a4%a7%e9%80%9a%e8%b7%af%e6%94%b6%e5%96%ae%e6%99%82%e7%a8%8b%e3%80%81%e4%bd%9b%e8%b7%b3%e7%89%86%e3%80%81%e7%b1%b3/|/%e7%b5%90%e5%a9%9a%e5%85%8d%e8%81%98%e9%87%91%e5%8f%aa%e8%a6%81%e7%a7%9f%e6%88%bf%e7%8d%a8%e7%ab%8b%ef%bc%9f%e5%a9%86%e5%ae%b6%e6%80%92%e6%96%a5%e6%8a%8a%e4%ba%ba%e6%95%b4%e7%a2%97%e7%ab%af%e8%b5%b0/|/%e5%9b%9b%e9%80%b1%e5%bd%88%e6%80%a7%e5%b7%a5%e6%99%82%e8%aa%bf%e7%a7%bb%e9%9b%87%e4%b8%bb%e8%83%bd%e7%89%87%e9%9d%a2%e6%8c%87%e5%ae%9a%e5%97%8e%ef%bc%9f%e6%8e%92%e7%8f%ad%e8%a6%8f%e5%89%87%e3%80%81/|/00958b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e6%9c%88%e9%85%8d%e9%8a%80%e8%a1%8c%e5%82%b5%e6%9c%89%e5%93%aa%e4%ba%9b/)$",
+      "exclude_selectors": [],
+      "title_selector": "h1.articleContent__title",
+      "require_author_attribution": true,
+      "feeds": [],
+      "sitemaps": [],
+      "wordpress_apis": [],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-23",
+        "evidence_url": "https://www.cmoney.tw/member/tos.aspx",
+        "additional_evidence_urls": [
+          "https://cmoneylearning.com.tw/",
+          "https://www.cmoney.tw/member/cr.aspx"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Bounded private personal research of the nineteen completed originals and exactly one additional literal canonical original declared by the completed CMNews 00958B relation witness. The new original requires explicit same-response source/body/credit/clock verification and a shared immutable supplemental receipt. No paid/member, third-party rights override, publication, training export, alias equivalence or whole-site scope. Not a reuse license or fair-use verdict; preserve credits, REP and actual refusals."
       },
-      "review_url":"https://www.cmoney.tw/member/tos.aspx",
-      "adapter_verification":"two_actual_literal_originals_native_blogposting_editor_offset_seconds_and_complete_SSR_replayed_20261020",
-      "note":"Finite two-URL personal-reading scope only. CMNews external canonical is discovery, not alias equivalence. No site discovery, guessed slugs, AI polling, public body, automatic training export or historical-release guarantee. Initial10-second local spacing, not an official or measured rate maximum. Reuses canonical transport, queue, immutable receipts and read-only progress."
+      "review_url": "https://www.cmoney.tw/member/tos.aspx"
     },
+
     {"id":"cmnews","name":"CMoney 投資網誌","domains":["cmnews.com.tw"],"enabled":true,
       "authorization":{"kind":"personal_research","evidence_url":"https://www.cmoney.tw/member/tos.aspx","additional_evidence_urls":["https://cmnews.com.tw/"],"scope":"User-requested private personal research capture of public CMoney investment blog articles only; preserve creator credits; paid/member articles and third-party rights overrides excluded; no redistribution or automatic training injection","reviewed_on":"2026-10-09","automated_access_review":"no_explicit_prohibition_identified","rights_restrictions":"CMoney-operated public investment blog, not a blanket reuse license; capture purpose is not a fair-use verdict. Separate hostname access policy; never reuse a blocked CMoney forum endpoint."},
       "article_path_pattern":"^/article/[A-Za-z0-9_-]+$",
@@ -506,7 +637,35 @@
       "note":"2026-10-14: remove only the local one-time cohort gate for known private original-newsroom URLs. Preserve the verified regular/subsite identity, visible newsroom/reporter grammar, exact source clock, body, third-party exclusion and original-response chain. Keep original cohorts/supplements and their receipts immutable. No new feed/index/API/sitemap endpoints, guessed IDs, source searches, capacity increase or refusal reset. Each original remains independently validated by the canonical concurrent scheduler; this is not all publisher history or permission to redistribute."},
     {"id":"uanalyze","name":"優分析","domains":["uanalyze.com.tw"],"review_url":"https://uanalyze.com.tw/terms-of-service","note":"2026-10-09 reviewed source terms section 9 requires prior written authorization for automated bulk extraction/download. Preserve known metadata and original-source alternatives; no aggressive retry or member-token workaround."},
     {"id":"vocus","name":"方格子","domains":["vocus.cc"],"review_url":"https://vocus.cc/"},
-    {"id":"setn","name":"三立新聞／三立財經","domains":["setn.com"],"article_selectors":["#Content1",".page-text","[itemprop=articleBody]"],"review_url":"https://www.setn.com/"},
+    {
+      "id": "setn",
+      "name": "三立新聞網（兩篇已審核公開原件）",
+      "domains": ["www.setn.com"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "finite_article_urls": ["https://www.setn.com/news/1911453", "https://www.setn.com/news/431945"],
+      "html_parser": "lxml",
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "article_path_pattern": "^/news/[1-9][0-9]*$",
+      "article_selectors": [":scope > .article_content_wrap > #article_content > #newsContent > p, :scope > .article_content_wrap > #article_content > #newsContent > figure > figcaption"],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [".article_time_wrap .author_wrap > a, #newsContent > p:first-child"],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-22",
+        "evidence_url": "https://www.setn.com/",
+        "additional_evidence_urls": ["https://blogs.iset.com.tw/setn/archives/9"],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Exactly the two literal already-retained unauthenticated public-news originals in finite_article_urls, revalidated offline for the user-confirmed private personal noncommercial nonpublic reading/research purpose. Preserve original diagnostic authorization and actual observation clocks. Both native visible person signatures match the current schema; the corporate meta-author is not inferred to be a person or ownership proof. No applicable explicit private-reading automation prohibition was identified in reviewed primary material, but privacy/editorial statements and a missing search result are not a sitewide license or individual legal fair-use verdict. Preserve the raw schema UTC offset and the separate visible second-precision clocks; same wall minute does not prove the same instant, so publication offset and historical first release remain unverified. No new source HTTP, discovery, legacy alias/body copying, guessed URLs, other subsites, API, member/account/media/script requests, access bypass, publication/republication, automatic training injection or remote export. The retained first301 and unattempted952211 remain separate evidence and unfinished history work.",
+        "original_author_scope_evidence_urls": ["https://www.setn.com/news/1911453", "https://www.setn.com/news/431945"]
+      },
+      "embedded_article_layout": "setn_public_native_article_v1",
+      "adapter_verification": "two_literal_retained_originals_finite_native_v3_20261022",
+      "note": "Only two retained original bodies, not3689 metadata URL heads or a sitewide license. Legacy301 identity remains separate; its LOCAL finite-scope failure was not publisher refusal. Preserve the source UTC label and visible clocks separately; no exact historical PIT claim. No discovery, source HTTP, account/member service, automatic training/export or publication. Ten seconds is engineering pacing, not an official or measured maximum."
+    },
     {"id":"storm","name":"風傳媒","domains":["storm.mg"],"article_selectors":[".article-content","[itemprop=articleBody]"],"review_url":"https://www.storm.mg/"},
     {
       "id": "tvbs",
@@ -583,7 +742,26 @@
     {"id":"wealth","name":"財訊","domains":["wealth.com.tw"],"review_url":"https://www.wealth.com.tw/footers/service-policy","note":"2026-10-09 reviewed terms require publisher permission for copying/transferring site data; keep public metadata and disabled adapter, do not treat paid membership or reachability as an archive grant."},
     {"id":"ctwant","name":"CTWANT","domains":["ctwant.com"],"article_selectors":[".article-body","[itemprop=articleBody]"],"review_url":"https://www.ctwant.com/"},
     {"id":"newtalk","name":"Newtalk 新頭殼","domains":["newtalk.tw"],"article_selectors":[".news-content","[itemprop=articleBody]"],"review_url":"https://newtalk.tw/"},
-    {"id":"knews","name":"知新聞","domains":["knews.com.tw"],"review_url":"https://www.knews.com.tw/"},
+    {"id":"knews","name":"知新聞（兩篇已審核公開原件）","domains":["www.knews.com.tw"],"enabled":true,
+      "acquisition_mode":"finite","finite_article_urls":[
+        "https://www.knews.com.tw/news/04CE23AF3987F7A667AECC0810CDBF4D",
+        "https://www.knews.com.tw/news/F84F5BD478EA9B742886C5819E33B9D7"],
+      "html_parser":"lxml","interval_seconds":10,"parallelism":1,
+      "article_path_pattern":"^/news/[0-9A-F]{32}$","embedded_article_layout":"knews_public_native_article_v1",
+      "article_selectors":[":scope > figure > figcaption, :scope > p.post-intro, :scope > .article-body-wrapper > .article-content-inner"],
+      "title_selector":"h1","require_configured_container":true,"require_author_attribution":true,
+      "author_selectors":[":scope > .article-meta-panel .abc-byline > a"],
+      "exclude_selectors":[".in-article-ad-wrapper",".related-news-card",".extend-reading",".app-promo-wrapper"],
+      "permitted_author_names":["芮內","克里夫"],
+      "authorization":{"kind":"personal_research","reviewed_on":"2026-10-22",
+        "evidence_url":"https://www.knews.com.tw/","additional_evidence_urls":["https://www.knews.com.tw/terms"],
+        "automated_access_review":"no_explicit_prohibition_identified",
+        "scope":"Exactly the two literal already-retained unauthenticated public-news originals in finite_article_urls, revalidated offline for the user-confirmed private personal noncommercial nonpublic research/reading purpose. Preserve original diagnostic authorization and actual observation clocks. Header/schema profile names and printed reporter signatures remain distinct source-declared roles, not verified aliases or ownership. The previously reviewed shopping/refund and campaign membership contracts are not silently transferred to ordinary nonmember news; this is not a sourcewide license or a legal fair-use verdict. No new source HTTP, discovery, guessed URLs, whole-site/history grant, subsites, API, account/member service, form, shopping, media/script request, access bypass, publication/republication, automatic training injection or remote export. Do not infer exact historical first publication from current markup.",
+        "original_author_scope_evidence_urls":[
+          "https://www.knews.com.tw/news/04CE23AF3987F7A667AECC0810CDBF4D",
+          "https://www.knews.com.tw/news/F84F5BD478EA9B742886C5819E33B9D7"]},
+      "adapter_verification":"two_literal_retained_originals_finite_native_v3_20261022",
+      "note":"Only two already-retained public originals, not all704 known heads or a license. No discovery, account/member access, automatic training/export or publication. Ten seconds is engineering pacing, not an official or measured maximum."},
     {"id":"nownews","name":"NOWnews 今日新聞","domains":["www.nownews.com"],"enabled":true,"acquisition_mode":"continuous","private_known_url_scope":"personal_noncommercial_originals_v1",
       "authorization":{"kind":"personal_research","evidence_url":"https://www.nownews.com/copyright","additional_evidence_urls":["https://www.nownews.com/terms","https://www.nownews.com/news/6881792","https://www.nownews.com/amp/news/6881938"],"scope":"User-requested private personal-reading capture of locally known public original articles and later locally observed URLs, regular and actual AMP URLs. Official copyright section3 limits downloads to reasonable individual noncommercial use; preserve current visible reporter/profile attribution, source clock and copyright. Exclude third-party work, media, paid/member text, republication and automatic training export. No guessed article IDs or site-wide discovery. Original frozen cohort membership and receipts remain immutable historical evidence, not a limit on the latest user-requested known-URL scope.","reviewed_on":"2026-10-14","automated_access_review":"no_explicit_prohibition_identified","rights_restrictions":"Membership terms prohibit improper BOT operation and server/network interference; no numeric rate or whole-site/reuse/training permission inferred. Personal purpose is not a fair-use verdict. Robots, source refusals and third-party exclusions stay binding; AMP is not a fallback after refusal."},
       "article_path_pattern":"^/(?:amp/)?news/[1-9][0-9]*/?$","embedded_article_layout":"nownews_visible_article_v1",
@@ -594,6 +772,38 @@
       "note":"2026-10-14: remove the local one-time cohort gate for known URLs under copyright section3 and the confirmed personal/noncommercial/nonpublic purpose. Preserve exact original ID/canonical/schema, visible regular/AMP body, reporter identity, publication and revision clocks, financial values and risk notice. Third-party credits remain exclusions; actual AMP is not a fallback after refusal. No new feed/index/API/sitemap endpoint, numeric source maximum or full history inferred. Normal bounded independent scheduler owns every request; other branded hosts remain unreviewed."},
     {"id":"housefun","name":"好房網新聞","domains":["housefun.com.tw"],"review_url":"https://news.housefun.com.tw/"},
     {"id":"businessweekly","name":"商業周刊／商周財富網","domains":["businessweekly.com.tw"],"review_url":"https://www.businessweekly.com.tw/"},
+    {
+      "id": "businessweekly_wealth",
+      "name": "商周財富網（1篇已驗原件）",
+      "domains": ["wealth.businessweekly.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "finite_article_urls": ["https://wealth.businessweekly.com.tw/GArticle.aspx?id=ARTL003020265"],
+      "finite_identity_query_keys": ["id"],
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "article_path_pattern": "^/GArticle[.]aspx$",
+      "article_selectors": [":scope > .article_main"],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [":scope > .articlefont.smart > .article_date > a.write > span"],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-22",
+        "evidence_url": "https://www.businessweekly.com.tw/CopyRight",
+        "additional_evidence_urls": ["https://www.businessweekly.com.tw/terms.html", "https://campaign.businessweekly.com.tw/bw/756"],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Exactly one literal already-retained public wealth.businessweekly.com.tw single-page written article, revalidated offline for confirmed private personal noncommercial nonpublic local reading. Visible writer matches current hidden declaration, not independently verified copyright ownership. Preserve original diagnostic authorization, whole written summary/body/values and actual day-only publication/HTTP observation clocks. This is not a legal fair-use verdict, open license, sitewide history, Smart/main/health subsite, paid/member, API, discovery, media/script, publication, model training or remote export grant. No new publisher HTTP; original origin controls remain authoritative.",
+        "original_author_scope_evidence_urls": ["https://wealth.businessweekly.com.tw/GArticle.aspx?id=ARTL003020265"]
+      },
+      "embedded_article_layout": "businessweekly_wealth_public_written_v1",
+      "permitted_author_names": ["湯名潔"],
+      "exclude_selectors": ["adcover", "ins", ".article_kv"],
+      "adapter_verification": "one_literal_retained_single_page_visible_writer_finite_v3_20261022",
+      "note": "One retained ARTL003020265 original only. Wealth is an independent child-host source, not permission for main/Smart/health or all492 wealth heads. Day-only source clock stays day-only. No new HTTP, discovery, ads/media/scripts, paid/member, publication, training or remote export. Ten seconds is engineering pacing, not an official maximum."
+    },
     {"id":"taisounds","name":"太報","domains":["taisounds.com"],"review_url":"https://www.taisounds.com/"},
     {"id":"bnext","name":"數位時代","domains":["bnext.com.tw"],"review_url":"https://www.bnext.com.tw/"},
     {"id":"cmmedia","name":"信傳媒","domains":["www.cmmedia.com.tw"],"enabled":true,"acquisition_mode":"continuous","private_known_url_scope":"personal_noncommercial_originals_v1",
@@ -615,7 +825,38 @@
       "note":"Preserve the reviewed article.page-single current heading, author-profile attribution, configured .desc prose and actual publisher clock. Local known-URL growth only; no guessed IDs, feed/index/sitemap/API polling or completed-body rescans. Copyright is retained, not a blanket bulk-reuse or training grant. Original frozen cohort and refusal deadlines remain unchanged."},
     {"id":"mirrordaily","name":"鏡報","domains":["mirrordaily.news"],"review_url":"https://www.mirrordaily.news/"},
     {"id":"ctinews","name":"中天新聞","domains":["ctinews.com"],"review_url":"https://ctinews.com/"},
-    {"id":"gvm","name":"遠見","domains":["gvm.com.tw"],"review_url":"https://www.gvm.com.tw/"},
+    {
+      "id": "gvm",
+      "name": "遠見（兩篇已審核原件）",
+      "domains": ["www.gvm.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "article_path_pattern": "^/article/[1-9][0-9]*$",
+      "article_selectors": [":scope > .article-content.article-content_level-0"],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [":scope > .article-head .article-head_author"],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-22",
+        "evidence_url": "https://www.gvm.com.tw/copyright",
+        "additional_evidence_urls": ["https://www.gvm.com.tw/authorization", "https://www.gvm.com.tw/privacy_policy"],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Exactly the two literal public main-host originals in finite_article_urls, privately retained and revalidated for user-requested personal noncommercial reading. The reviewed copyright notice distinguishes private noncommercial use and lawful downloading from public reproduction. Preserve source-declared reporter versus advertorial roles, original diagnostic authorization and observation clocks. No whole-site/history grant, discovery, enumeration, subsites, API, paid/member access, media/scripts, access bypass, publication, republication, automatic training injection or remote training/export. Not an open license, per-article rights verification, historical PIT proof or legal fair-use verdict.",
+        "rights_restrictions": "The authorization page limits noncommercial online forwarding of open-reading articles to500 Chinese characters with attribution/link; that is a republication rule, not an HTTP quota, permission to truncate body, or universal fulltext archive grant. Numeric official rate/volume quota and whole-history entitlement unverified.",
+        "original_author_scope_evidence_urls": ["https://www.gvm.com.tw/article/132737", "https://www.gvm.com.tw/article/76333"]
+      },
+      "note": "Exactly two reviewed retained originals, not all207 known heads. No discovery, paid/member access, publication or automatic training/export. Ten seconds is engineering pacing, not an official or measured maximum.",
+      "embedded_article_layout": "gvm_public_native_article_v1",
+      "exclude_selectors": [".newsletter", ".article-head_marketing", "#article_float_article", "#ad_article_video", "[id^=\"div-gpt-ad-\"]"],
+      "permitted_author_names": ["盧佳柔", "遠見雜誌整合傳播部企劃製作"],
+      "adapter_verification": "two_literal_retained_originals_finite_native_v3_20261022",
+      "finite_article_urls": ["https://www.gvm.com.tw/article/132737", "https://www.gvm.com.tw/article/76333"]
+    },
     {"id":"peopo","name":"PeoPo 公民新聞","domains":["peopo.org"],"enabled":true,"acquisition_mode":"continuous","private_known_url_scope":"per_article_licensed_text_v1",
       "authorization":{"kind":"open_license","license":"per-article-declared-CC-only","evidence_url":"https://www.peopo.org/about/regulation/P1-1.htm","scope":"Privately retain unchanged text of locally known articles and later locally observed URLs only after this actual article CC license link and credited author pass validation; rights-reserved or missing article-specific license excluded. Source-body container is mandatory, not a summary or related story. No audiovisual download, site-wide discovery, guessed IDs, redistribution or training injection. Original frozen membership and receipts remain immutable historical evidence.","verified_on":"2026-10-09","reviewed_on":"2026-10-14"},
       "article_path_pattern":"^/news/[0-9]+$",
@@ -626,7 +867,85 @@
       "license_selectors":["#block-peopo-content article.node--view-mode-full > .node-pre-content .view-node-field .license-logo a[href]"],
       "review_url":"https://www.peopo.org/",
       "note":"Author chooses each article license, not whole-site CC. Reviewed local metadata growth uses the same article-scoped license/body/byline/clock CSS; footer or related-article license never qualifies. Original frozen cohort remains immutable. No feed/index/sitemap polling, guessed IDs, media download or automatic training export."},
-    {"id":"upmedia","name":"上報","domains":["upmedia.mg"],"review_url":"https://www.upmedia.mg/"},
+    {
+      "id": "setn_inews_scope",
+      "name": "三立 iNEWS",
+      "enabled": true,
+      "domains": [
+        "inews.setn.com"
+      ],
+      "acquisition_mode": "continuous",
+      "article_path_pattern": "^/news/[1-9][0-9]*$",
+      "interval_seconds": 1,
+      "parallelism": 1,
+      "html_parser": "lxml",
+      "require_configured_container": true,
+      "article_selectors": [
+        ":scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > [itemprop=articleBody] > p, :scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > [itemprop=articleBody] > figure > figcaption, :scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > [itemprop=articleBody] > ul > li > p, :scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > [itemprop=articleBody] > ol > li > p"
+      ],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-23",
+        "evidence_url": "https://inews.setn.com/",
+        "additional_evidence_urls": [
+          "https://blogs.iset.com.tw/setn/archives/9"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "User-confirmed private personal noncommercial nonpublic reading/research of literal locally known unauthenticated iNEWS native public written articles, and future independently locally observed URLs only. The first native original was retained once under its diagnostic scope; preserve that authorization, raw bytes, observation clock and immutable evidence. The group editorial convention is not a capture licence or legal fair-use verdict. Require exact same-host canonical/OG and native NewsArticle headline, whole static editor, visible named reporter signature with the source-declared profile, or the reviewed first-written-paragraph 財經中心／<named reporter>報導 or 記者<named reporter>／<source-declared location>報導 signature when the native header credit is empty (keep an absent profile absent), and the raw native minute header clock. This signature is publisher attribution, not independently verified person, historical employment or ownership. Preserve written risk notices, photo captions/credits and original numbers; do not accept unreviewed desk/third-party/ambiguous credits or unknown layouts. The source header states neither timezone nor release-versus-revision role: preserve the label without adding an offset, seconds, revision or historical first-release/exact-PIT proof. REP/access/public-address/cooldown and refusal checks remain binding. No feeds/index/sitemap/API/discovery, guessed ID or alternate host, main-host or legacy alias, account/cookie/proxy, paid/member/challenge content, script/media/AI execution or fetching, body publication/republication, automatic training injection or remote export. Unknown representations remain separate gaps with same-response finite diagnostics, not fake complete bodies."
+      },
+      "title_selector": ":scope > .newsTitle.printdiv[itemprop=headline]",
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "embedded_article_layout": "setn_inews_native_article_v8",
+      "require_author_attribution": true,
+      "author_selectors": [
+        ":scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > .article_remark_wrap > .author_wrap > a[itemprop=author], :scope > .flexbox > #ckuse.pageText.printdiv > article > .newsCon > [itemprop=articleBody] > p"
+      ],
+      "capacity_max_parallelism": 4,
+      "adapter_verification": "native_microdata_whole_editor_inline_outline_and_written_prose_lists_v8_20261023",
+      "note": "Local known-URL original written articles only, including future locally observed URLs; not whole-site discovery or permission for third-party/member/media content. Reuse the original host REP/control evidence and useful canonical backfill work for bounded adaptive capacity measurement. One rps is an initial engineering cadence, not an official or measured upper limit; no endpoint enumeration, source refusal reset, profile request, guessed legacy alias, publication or automatic training/export."
+    },
+    {
+      "id": "upmedia",
+      "name": "上報",
+      "domains": [
+        "www.upmedia.mg"
+      ],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "article_path_pattern": "^/tw/(?:focus|commentary|lifestyle)/[a-z-]+/[1-9][0-9]*$",
+      "article_selectors": [
+        ":scope > .news-box-text"
+      ],
+      "require_configured_container": true,
+      "title_selector": "h1",
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-22",
+        "evidence_url": "https://www.upmedia.mg/",
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "User-confirmed unchanged private personal noncommercial nonpublic reading/research of literal locally known unauthenticated modern UpMedia public original written articles, and later independently locally observed modern URLs only. Official homepage/about/privacy were reviewed; no applicable explicit private-reading automation prohibition was identified in those materials. Privacy is not a news-content license or individual legal fair-use verdict. Require exact current canonical/OG/NewsArticle/publisher/title, matching visible byline with native author profile, whole visible editor and schema/visible release clock. Reviewed branded desk/named editor, current about-page editorial staff, and native single named bylines whose literal author profile, schema and visible written name agree are publisher attributions, not independently verified person, historical employment or ownership proofs. The source-observed single byline anchor contains its written author span; a current staff list is not a historical completeness test. Exclude unreviewed/third-party credits and explicit reprints, paid/member/challenge content and media. Keep source photo credits and complete written numbers/tables/captions. Preserve literal +08:00 source declaration, absent revision and actual observation time; no historical first release or exact PIT claim. No REP-disallowed news_info.php request or old-to-modern alias, enumeration, discovery/feed/index/sitemap/API, subsite, script/media/AI-tool request or execution, credentials, refusal bypass, public body/republication, automatic training injection or remote export. Existing REP, honest identity, pacing, cooldowns and refusals remain binding. This limited private collection is not a sitewide/archive or reuse license.",
+        "additional_evidence_urls": [
+          "https://www.upmedia.mg/about",
+          "https://www.upmedia.mg/privacy"
+        ]
+      },
+      "require_author_attribution": true,
+      "author_selectors": [
+        ":scope > .publish > .publish-text > .author > a, :scope > .publish > .publish-text > a:has(> span.author)"
+      ],
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "html_parser": "lxml",
+      "embedded_article_layout": "upmedia_public_modern_article_v4",
+      "exclude_selectors": [
+        ".ad-detail",
+        ".rss_close",
+        ".news-foot"
+      ],
+      "adapter_verification": "observed_related_label_parenthesis_geometry_and_nonidentity_house_desk_navigation_v4_20261023",
+      "note": "Only literal locally known modern /tw/ public originals. Preserve42 stored bodies and259 closed questions; repair only3 missing modern heads. v4 compares mixed-width related-navigation parentheses and the observed label-before-parenthesized-link spelling without discarding extra unlinked prose/numbers. A single visible house-desk byline still must agree with schema/head; its disagreeing relative author navigation is retained and explicitly unverified, not corrected/requested or used as human identity. Named-person profile, canonical URL, whole editor, credit/reprint and raw clock checks stay strict. Original-byte bounded root-description LF syntax repair is unchanged; no extra control/field acceptance. Authorization, REP/refusal/rate identity and original payloads are unchanged. No legacy-URL guessing, discovery, public body or training/export.10sec/one slot is baseline pacing, not a proven source maximum."
+    },
     {"id":"pts","name":"公視新聞網","domains":["news.pts.org.tw"],"article_selectors":[".post-article","[itemprop=articleBody]"],"review_url":"https://news.pts.org.tw/service/2025-07-29",
       "note":"Reviewed terms section 4 requires consent even for noncommercial reasonable use; awaiting publisher authorization, not a retryable downloader error."},
     {"id":"cnews","name":"CNEWS 匯流新聞網","domains":["cnews.com.tw"],"enabled":true,"acquisition_mode":"continuous","private_known_url_scope":"personal_noncommercial_originals_v1",
@@ -834,8 +1153,8 @@
       "domains": ["www.pocket.tw"], "enabled": true,
       "acquisition_mode": "continuous", "private_known_url_scope": "personal_noncommercial_originals_v1",
       "interval_seconds": 2, "parallelism": 1, "capacity_max_parallelism": 2,
-      "html_parser": "lxml", "embedded_article_layout": "pocket_visible_article_v6",
-      "article_path_pattern": "^/school/(?:report/[A-Za-z]+|articles)/[1-9][0-9]*/$",
+      "html_parser": "lxml", "embedded_article_layout": "pocket_visible_article_v12",
+      "article_path_pattern": "^/(?:(?:school/(?:report/[A-Za-z]+|articles)|invest_news/article)/[1-9][0-9]*/{0,2}|school/articles/article-[a-z0-9]{8}/)$",
       "article_selectors": [":scope > .pocket-native-body"], "exclude_selectors": [],
       "title_selector": "h1", "require_configured_container": true, "require_author_attribution": true,
       "feeds": [], "sitemaps": [], "wordpress_apis": [], "fulltext_feeds": [],
@@ -889,6 +1208,37 @@
       "review_url": "https://www.peoplemedia.tw/copyright",
       "adapter_verification": "nine_retained_public_2014_to_2017_native_articles_dual_engine_and_independent_ordered_text_replay_20261021",
       "note": "Known-URL native text only, exact observed credits with editorial labels retained as labels. Current page declarations are not original historical versions/PIT. No site-wide discovery or official numeric maximum inferred."
+    },
+    {
+      "id": "cw",
+      "name": "天下雜誌（1篇已驗原件）",
+      "domains": ["www.cw.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "finite_article_urls": ["https://www.cw.com.tw/article/5140783"],
+      "html_parser": "lxml",
+      "interval_seconds": 10,
+      "parallelism": 1,
+      "article_path_pattern": "^/article/[1-9][0-9]*$",
+      "article_selectors": [":scope > .article__body > .article__content"],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "author_selectors": [":scope > .article__body > .article__detail > .article__author .author--item > a"],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-22",
+        "evidence_url": "https://www.cw.com.tw/copyright",
+        "additional_evidence_urls": ["https://english.cw.com.tw/copyright", "https://sites.google.com/cw.com.tw/cwmagazine-authorization/main"],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Exactly one literal retained public www.cw.com.tw editor compilation, revalidated offline for confirmed private personal noncommercial reading. Preserve both static preview/full written containers, tables, FAQ, original diagnostic authorization and observation clocks; no third-party credited or preview-only body. This is not a legal fair-use verdict, open license, sitewide/history, paid/member, subsite, API, media/script, publication or training grant. No new HTTP, discovery, enumeration, automatic training injection or remote export.",
+        "original_author_scope_evidence_urls": ["https://www.cw.com.tw/article/5140783"]
+      },
+      "embedded_article_layout": "cw_public_editor_compilation_v1",
+      "permitted_author_names": ["天下編輯部"],
+      "exclude_selectors": [".cw__advertising"],
+      "adapter_verification": "one_literal_retained_public_editor_compilation_finite_v3_20261022",
+      "note": "Only the already-retained5140783 original, not all79 heads. Both public static written containers, tables/FAQ and editor credit required. No discovery, API, subsite, paid/member, media, publication or training/export. Ten seconds is engineering pacing, not a source maximum."
     }
   ]
 }

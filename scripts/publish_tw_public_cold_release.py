@@ -157,13 +157,13 @@ def _publish_while_source_stable(
     command: list[str], timeout: float, *,
     result_receipt: Path | None = None, defer_scan: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Exclude the canonical source monitor while packing one immutable release."""
+    """Exclude source writers, not model readers, while packing a release."""
 
     lock_path = _live_root().parent / ".locks" / "tw-public-refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         try:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise SourceRefreshBusy("canonical TW public refresh is active; retry publication") from exc
         _check_training_receipts(_live_root())

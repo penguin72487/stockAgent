@@ -308,6 +308,26 @@ def catalog(paths: list[Path]) -> tuple[list[dict], dict]:
                       "catalog_scan_complete": bool(types) and set(types) == covered}
 
 
+def finmind_local_metadata(con: sqlite3.Connection) -> tuple[dict, list[tuple]]:
+    """Same complete-task bounds and latest non-null receipt, without a global window sort.
+
+    The caller owns a read snapshot. Existing dataset indexes let SQLite retain
+    only the top receipt for each dataset, instead of sorting/materializing all
+    receipt paths. No new index, source request, writer or stale cache is used.
+    Bounds still include complete tasks whose receipt is absent; selecting a
+    representative receipt does not certify full field/key coverage.
+    """
+    rows = con.execute("""WITH datasets AS (
+        SELECT dataset,MIN(first_data_date) AS first,MAX(last_data_date) AS last
+        FROM tasks WHERE state='complete' GROUP BY dataset
+    ) SELECT d.dataset,d.first,d.last,(
+        SELECT receipt_path FROM tasks t WHERE t.dataset=d.dataset AND t.state='complete'
+        AND t.receipt_path IS NOT NULL ORDER BY t.last_data_date DESC,t.last_attempt_at_utc DESC LIMIT 1
+    ) FROM datasets d ORDER BY d.dataset""").fetchall()
+    return ({ds: (first, last) for ds, first, last, _ in rows},
+            [(ds, receipt) for ds, _, _, receipt in rows if receipt is not None])
+
+
 def local_features(root: Path) -> tuple[list[dict], list[dict]]:
     """Read current receipts/schemas, not all source arrays or model masks."""
     import pyarrow.parquet as pq
@@ -361,11 +381,7 @@ def local_features(root: Path) -> tuple[list[dict], list[dict]]:
             # A read transaction sees a consistent task snapshot, without locks
             # that block the downloader's WAL writes.
             con.execute("BEGIN")
-            coverage = {ds: (first, last) for ds, first, last in con.execute(
-                "SELECT dataset,MIN(first_data_date),MAX(last_data_date) FROM tasks WHERE state='complete' GROUP BY dataset")}
-            samples = con.execute("""SELECT dataset,receipt_path FROM (
-                SELECT dataset,receipt_path,ROW_NUMBER() OVER(PARTITION BY dataset ORDER BY last_data_date DESC,last_attempt_at_utc DESC) AS rank
-                FROM tasks WHERE state='complete' AND receipt_path IS NOT NULL) WHERE rank=1""").fetchall()
+            coverage, samples = finmind_local_metadata(con)
         for dataset, relative in samples:
             path = (base / relative).resolve()
             if not path.is_relative_to(base.resolve()) or not path.is_file():

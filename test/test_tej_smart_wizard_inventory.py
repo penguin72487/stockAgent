@@ -1,5 +1,6 @@
 import csv
 import json
+import sqlite3
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -7,8 +8,45 @@ import pytest
 
 from scripts.build_tej_smart_wizard_inventory import (
     cadence, catalog, category, dump_csv, field_role, local_cadence,
-    local_features, main, safe_date, unit, worklist,
+    finmind_local_metadata, local_features, main, safe_date, unit, worklist,
 )
+
+
+@pytest.mark.parametrize('indexed', [False, True])
+def test_finmind_top_receipt_matches_window_bounds_nulls_and_ties(indexed):
+    con = sqlite3.connect(':memory:')
+    try:
+        con.execute('CREATE TABLE tasks(dataset TEXT,state TEXT,first_data_date TEXT,last_data_date TEXT,last_attempt_at_utc TEXT,receipt_path TEXT)')
+        if indexed:
+            con.execute('CREATE INDEX idx_finmind_dataset_state ON tasks(dataset,state)')
+            con.execute('CREATE INDEX idx_finmind_status_covering ON tasks(dataset,state,first_data_date,last_data_date,last_attempt_at_utc)')
+        assert finmind_local_metadata(con) == ({}, [])
+        con.executemany('INSERT INTO tasks VALUES(?,?,?,?,?,?)', [
+            ('A','complete','2000','2020','2','old'),
+            ('A','complete','2001','2021','1','latest-date'),
+            ('A','complete','1999','2021','3','latest-attempt'),
+            ('A','complete','2002','2021','3','tied-attempt'),
+            ('A','complete','1990','2030','4',None),
+            ('A','pending','1900','2099','5','not-complete'),
+            ('B','complete',None,None,None,'null-clocks'),
+            ('B','complete','2000','2022','1',''),
+            ('C','complete','1995','1996','1',None),
+            ('D','observed_empty','1970','2099','1','empty-not-complete'),
+        ])
+        before = con.total_changes
+        coverage = dict((ds, (first, last)) for ds, first, last in con.execute(
+            "SELECT dataset,MIN(first_data_date),MAX(last_data_date) FROM tasks WHERE state='complete' GROUP BY dataset"))
+        samples = con.execute("""SELECT dataset,receipt_path FROM (
+            SELECT dataset,receipt_path,ROW_NUMBER() OVER(PARTITION BY dataset
+            ORDER BY last_data_date DESC,last_attempt_at_utc DESC) AS rank
+            FROM tasks WHERE state='complete' AND receipt_path IS NOT NULL) WHERE rank=1""").fetchall()
+        con.execute('PRAGMA query_only=ON')
+        assert finmind_local_metadata(con) == (coverage, samples)
+        assert coverage == {'A': ('1990','2030'), 'B': ('2000','2022'), 'C': ('1995','1996')}
+        assert len(samples) == 2 and samples[1] == ('B', '')
+        assert con.total_changes == before
+    finally:
+        con.close()
 
 
 def binding(fields=None, type_name="LISTED & DELISTED", table="TSE/OTC Unadjusted_Price(Daily)"):

@@ -11,7 +11,7 @@ from downloader.artifact_io import atomic_write_json
 from downloader.tej_desktop_attempts import begin_attempt
 from downloader.tej_history import (PREVIEW_SUBMISSION_CONTRACT, SOURCE_SCOPE_CONTRACT, compact_request, stable_id, configure_preview_planning,
     configure_runtime_policy, connect, recover_desktop_response, run_one, task_request)
-from downloader.tej_key_layout import KEY3_CONTRACT
+from downloader.tej_key_layout import KEY3_CONTRACT, key_count
 from downloader.tej_planning import CAPACITY_CONTRACT, build_plan, next_request, refill_ready_plans
 from downloader.tej_preview_capacity import OUTCOME, REVIEW_STATE, SUPERSEDED, replan_capacity
 from test_tej_history import scope_proof
@@ -31,14 +31,14 @@ def overflow(root,task,*,upper=100):
            'preview_submission_contract':PREVIEW_SUBMISSION_CONTRACT,'before_preview_signatures':['a'*64]}
     atomic_write_json(root/'raw'/(attempt+'.json.stage.json'),stage)
     payload={**{k:req[k] for k in ('contract_version','type','smart_id','table','fields',
-                 'company_labels','date_labels','source_key_mode','key_layout_contract')},
+                 'company_labels','date_labels','source_key_mode','key_layout_contract') if k in req},
              'provider':'tej_smart_wizard','action':'download','task_id':task['task_id'],
              'source_outcome':OUTCOME,'capacity_contract':CAPACITY_CONTRACT,
              'source_scope_proof':scope_proof(),'query_attempt_id':attempt,
              'preview_submission_contract':PREVIEW_SUBMISSION_CONTRACT,
              'fresh_preview_transition_verified':True,'preview_signature':'b'*64,
              'native_rows_lower_bound':req['max_rows']+3,'native_rows_upper_bound':upper,
-             'native_columns':len(req['fields'])+3,
+             'native_columns':len(req['fields'])+key_count(req),
              'requested_capacity':{k:req[k] for k in ('max_rows','max_cells')},
              'universe_scope':'exact_type_smart_id_all_sectors','calendar_date_mode':False,
              'checkbox_verification_method':'msaa_role44_state_flags',
@@ -157,6 +157,45 @@ def test_known_overflow_preserves_completed_scope_and_replans_only_missing_cells
     for _ in range(plan['total_queries']):
         assert run_one(root,bridge)=='completed_task'
     assert run_one(root,bridge)=='idle'
+
+
+def test_expanded_key2_overflow_shrinks_scope_not_capture_and_finishes_all_values(registry,monkeypatch):
+    from test_tej_query_tiling import setup_migration,capacity_config
+    from downloader.tej_planning import (SCOPE_BUDGET_CONTRACT,apply_scope_budget,
+                                          upgrade_query_tiling)
+    root,config,bridge=setup_migration(registry,monkeypatch)
+    assert run_one(root,bridge)=='completed_task'
+    config={**capacity_config(config),'max_rows_per_export':10,'max_scope_rows_per_export':50000,
+            'query_scope_contract':SCOPE_BUDGET_CONTRACT,'auto_preview_capacity_replanning':True}
+    configure_runtime_policy(root,config)
+    assert upgrade_query_tiling(root,config,capacity_upgrade=True)['queries_saved']>0
+    assert run_one(root,bridge)=='completed_task'  # The first small coverage hole.
+    task=unresolved(root)
+    request=task_request(root,task)
+    pairs=len(request['company_labels'])*len(request['date_labels'])
+    assert pairs>request['max_rows']==10 and request['max_scope_rows']==50000
+    payload,output=overflow(root,task,upper=pairs+4)
+    original=output.read_bytes()
+    with closing(connect(root)) as con:
+        completed=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete'")]
+        files={root/r['output_path']:(root/r['output_path']).read_bytes() for r in completed}
+    result=replan_capacity(root,task['task_id'],payload,output)
+    assert result['state']=='source_capacity_replanned' and result['provider_queries_sent']==0
+    assert result['source_rows_adopted'] is False and output.read_bytes()==original
+    with closing(connect(root)) as con:
+        assert [dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete'")]==completed
+        plan=json.loads(con.execute('SELECT plan_json FROM download_plans').fetchone()[0])
+    assert plan['request']['max_scope_rows']==plan['request']['max_rows']==10
+    assert apply_scope_budget(plan['request'],config)==plan['request']
+    assert all(path.read_bytes()==raw for path,raw in files.items())
+    assert replan_capacity(root,task['task_id'],payload,output)['already_reconciled']
+    for _ in range(plan['total_queries']):
+        assert run_one(root,bridge)=='completed_task'
+    assert run_one(root,bridge)=='idle'
+    seen=Counter((f,c,d) for req in bridge.requests if req['action']=='download'
+                 for f in req['fields'] for c in req['company_labels'] for d in req['date_labels'])
+    assert len(seen)==59*8*3 and set(seen.values())=={1}
+    assert upgrade_query_tiling(root,config,capacity_upgrade=True)['already_installed']
 
 
 def test_deferred_former_plan_keeps_immutable_capacity_after_global_upgrade(ready):

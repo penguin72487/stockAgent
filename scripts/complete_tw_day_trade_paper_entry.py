@@ -23,7 +23,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.promote_tw_day_trade_replay import _acquire_engine_lock, _atomic_json
-from stockagent.live.tw_day_trade_simulation import TAIPEI, TwDayTradeSimulationEngine
+from stockagent.live.tw_day_trade_simulation import (
+    ENTRY_PRICE_GUARD_CONTRACT, TAIPEI, TwDayTradeSimulationEngine,
+    entry_price_guard_reason,
+)
 
 
 CONTRACT = "user_authorized_same_recorded_price_full_target_paper_completion_v1"
@@ -87,11 +90,20 @@ def make_plan(
     side = str(position.get("side") or "")
     if side not in {"long", "short"} or (signed > 0) != (side == "long"):
         raise ValueError("position side and signed quantity disagree")
+    guard_reason = entry_price_guard_reason(
+        side=side, price=price, take_profit_price=position.get("take_profit_price"),
+        stop_trigger_price=position.get("stop_trigger_price"),
+    )
+    if guard_reason is not None:
+        raise ValueError(f"paper completion rejected: {guard_reason}")
     operation_key = hashlib.sha256(
         f"{market}|{session_date}|{symbol}|{filled}|{requested}|{price}".encode()
     ).hexdigest()[:16]
     return {
         "contract": CONTRACT,
+        "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+        "take_profit_price": position["take_profit_price"],
+        "stop_trigger_price": position["stop_trigger_price"],
         "operation_id": f"{session_date}:{market}:{symbol}:{operation_key}",
         "root": str(root.resolve()),
         "market": market,
@@ -182,6 +194,9 @@ def apply_plan(root: Path, plan: dict[str, Any], *, recorded_at: datetime) -> di
             order_id = f"{plan['position_id']}:manual_entry_completion:{plan['operation_id'].split(':')[-1]}"
             disclosure = {
                 "contract": CONTRACT,
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+                "take_profit_price": plan["take_profit_price"],
+                "stop_trigger_price": plan["stop_trigger_price"],
                 "recorded_at": recorded_at.isoformat(timespec="seconds"),
                 "effective_at": effective_at,
                 "original_quote_at": plan["recorded_quote_at"],
@@ -248,6 +263,9 @@ def apply_plan(root: Path, plan: dict[str, Any], *, recorded_at: datetime) -> di
                 "simulation_only": True,
                 "production_order_possible": False,
                 "counterfactual_paper_completion": disclosure,
+                "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+                "take_profit_price": plan["take_profit_price"],
+                "stop_trigger_price": plan["stop_trigger_price"],
             }
             engine._order(
                 common

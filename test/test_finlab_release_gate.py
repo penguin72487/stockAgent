@@ -140,6 +140,9 @@ def test_stage_refreshes_only_expired_full_hash_completion(tmp_path):
         catalog_completion_fields({**readiness, "hashes_verified": False})
     with pytest.raises(RuntimeError, match="elapsed"):
         catalog_completion_fields({**readiness, "valid_until_utc": now.isoformat()})
+    with pytest.raises(RuntimeError, match="elapsed"):
+        refresh_unchanged_completion(receipt, updated, {**readiness, "valid_until_utc": now.isoformat()})
+    assert receipt.stat().st_mtime_ns == stamp
 
 
 def test_finlab_stage_coexists_with_formal_reader_but_excludes_real_writers(tmp_path):
@@ -282,11 +285,83 @@ def test_finlab_stage_busy_dependency_does_not_hash_or_seal(tmp_path, monkeypatc
     assert json.loads(capsys.readouterr().out)["event"] == "finlab_research_stage_deferred"
 
 
-@pytest.mark.parametrize("build_exit,stage_exit,expected_exit,minute_runs", [
-    (75, 0, 0, True), (0, 75, 0, True), (1, 0, 1, False), (0, 1, 1, False),
+@pytest.mark.parametrize("missing,stale,catalog_fresh", [(1, 25, True), (0, 0, False)])
+def test_finlab_stage_due_catalog_defers_without_staging_or_changing_source_evidence(
+    tmp_path, monkeypatch, capsys, missing, stale, catalog_fresh,
+):
+    from contextlib import nullcontext
+    from scripts import stage_tw_public_finlab_research_release as stage
+    readiness = {"ready": False, "missing": missing, "stale": stale, "invalid": 0,
+                 "catalog_fresh": catalog_fresh}
+    monkeypatch.setattr(stage, "stage_source_guards", lambda *_a: nullcontext())
+    monkeypatch.setattr(stage, "catalog_readiness", lambda *_a, **_kw: readiness)
+    monkeypatch.setattr(stage, "validated_source", lambda *_a, **_kw: pytest.fail("due source consumed"))
+    destination = tmp_path / "staged"
+    assert stage.main(["--staged-root", str(destination)]) == 75
+    assert json.loads(capsys.readouterr().out) == {
+        "event": "finlab_research_stage_deferred", "reason": "finlab_catalog_not_current",
+        "retryable": True, "missing": missing, "stale": stale, "invalid": 0,
+        "catalog_fresh": catalog_fresh,
+    }
+    assert not destination.exists()
+    assert readiness["ready"] is False
+
+
+def test_finlab_stage_invalid_evidence_is_not_a_retryable_catalog_deferral(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from scripts import stage_tw_public_finlab_research_release as stage
+    monkeypatch.setattr(stage, "stage_source_guards", lambda *_a: nullcontext())
+    monkeypatch.setattr(stage, "catalog_readiness", lambda *_a, **_kw: {
+        "ready": False, "missing": 1, "stale": 25, "invalid": 1, "catalog_fresh": True,
+    })
+    with pytest.raises(RuntimeError, match="invalid=1"):
+        stage.main(["--staged-root", str(tmp_path / "staged")])
+
+
+def test_finlab_stage_expiry_during_work_retains_old_seal_and_exact_staged_bytes(
+    tmp_path, monkeypatch, capsys,
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from scripts import stage_tw_public_finlab_research_release as stage
+    source = tmp_path / "features.parquet"
+    source.write_bytes(b"original values: -7, NULL, shares=1000")
+    source_receipt = source.with_suffix(".finlab_research.json")
+    source_receipt.write_bytes(b'{"research_only":true}')
+    live = tmp_path / "live"
+    _write(live / "tw_corporate_action_entitlements.summary.json", {})
+    destination = tmp_path / "staged"
+    seal = destination / "release_receipt.json"
+    _write(seal, {"status": "old-not-complete"})
+    previous = seal.read_bytes()
+    readiness = {"contract": CONTRACT, "ready": True, "hashes_verified": True,
+                 "valid_until_utc": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                 "missing": 0, "stale": 0, "invalid": 0, "catalog_fresh": True}
+    monkeypatch.setattr(stage, "stage_source_guards", lambda *_a: nullcontext())
+    monkeypatch.setattr(stage, "catalog_readiness", lambda *_a, **_kw: readiness)
+    monkeypatch.setattr(stage, "ParquetLineage", lambda *_a: SimpleNamespace(identity={"kind": "file"}, verify=lambda: None))
+    monkeypatch.setattr(stage, "validated_source", lambda *_a, **_kw: (
+        {"inputs": {"sources": {}, "base_sha256": "a" * 64}}, {"inputs": {"official": {}}},
+        hashlib.sha256(source.read_bytes()).hexdigest(), 204, 104, 1, "2026-10-22",
+    ))
+    monkeypatch.setattr(stage, "assert_receipt", lambda *_a: None)
+    monkeypatch.setattr(stage, "receipt_fields", lambda *_a, **_kw: {})
+    monkeypatch.setattr(stage, "_required_formal_members", lambda *_a, **_kw: [])
+    monkeypatch.setattr(stage, "_action_members", lambda *_a: [])
+    assert stage.main(["--source", str(source), "--live-root", str(live),
+                       "--staged-root", str(destination)]) == 75
+    assert json.loads(capsys.readouterr().out)["reason"] == "finlab_catalog_expired_before_seal"
+    assert seal.read_bytes() == previous
+    assert (destination / "features/features.parquet").read_bytes() == source.read_bytes()
+    assert source.read_bytes() == b"original values: -7, NULL, shares=1000"
+
+
+@pytest.mark.parametrize("build_exit,stage_exit,publish_exit,expected_exit,minute_runs", [
+    (75, 0, 1, 0, True), (0, 75, 1, 0, True), (1, 0, 1, 1, False), (0, 1, 1, 1, False),
+    (0, 0, 75, 0, True), (0, 0, 2, 2, False),
 ])
 def test_real_finlab_wrapper_keeps_independent_minutes_after_expected_deferral(
-    tmp_path, build_exit, stage_exit, expected_exit, minute_runs,
+    tmp_path, build_exit, stage_exit, publish_exit, expected_exit, minute_runs,
 ):
     """Exercise actual set -e/function/command-substitution behavior, no API."""
     import subprocess
@@ -313,7 +388,7 @@ run_fintech_python() {{
     *) '{sys.executable}' "$@";;
   esac
 }}
-stockagent-data() {{ printf 'unexpected_publication\\n' >> unexpected.log; return 1; }}
+stockagent-data() {{ printf 'publication\\n' >> publication-called; return {publish_exit}; }}
 ''')
     (scripts / "download_finlab_history.py").write_text("# Fixture sweep: pass_complete already sealed locally.\n")
     (scripts / "download_finlab_market_intraday.py").write_text('''
@@ -330,4 +405,4 @@ state.write_text(json.dumps({"state":"waiting_older_publication", "active_kind":
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == expected_exit, result.stdout + result.stderr
     assert (tmp_path / "minute-called").exists() is minute_runs
-    assert not (tmp_path / "unexpected.log").exists()
+    assert (tmp_path / "publication-called").exists() is (build_exit == stage_exit == 0)

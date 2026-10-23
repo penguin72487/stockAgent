@@ -3274,6 +3274,124 @@ def _globalvoices_verified_image_context(node, *, page_url):
         return False
 
 
+def _globalvoices_photo_credit_only(entry):
+    """Closed native photo/credit shapes; neither prose nor media permission.
+
+    Read static markup only. Keep the original bytes/credit, never follow the
+    photo/profile URLs or sanitize an arbitrary broken document into a match.
+    """
+    from bs4 import Comment
+    from downloader.news_fulltext_public_originals import _visible
+
+    def children(node):
+        return [child for child in node.children if getattr(child, 'name', None)]
+
+    def reference(value):
+        if not isinstance(value, str) or not 0 < len(value) <= 2048:
+            return False
+        parts = urlsplit(value)
+        return bool(parts.scheme in {'http', 'https'} and parts.hostname and not parts.username and not parts.password)
+
+    def photo(node):
+        if (node.name not in {'p', 'div'} or set(node.attrs) - ({'align'} if node.name == 'div' else set())
+                or node.get('align', 'center') not in {'center', 'left'} or node.get_text(strip=True)):
+            return None
+        images, links = node.find_all('img'), node.find_all('a')
+        if len(images) != 1 or len(links) > 1 or len(node.find_all()) != 1 + len(links):
+            return None
+        image = images[0]
+        if (set(image.attrs) - {'src', 'alt', 'width', 'height', 'border', 'decoding', 'style'}
+                or not reference(image.get('src'))):
+            return None
+        if links:
+            link = links[0]
+            if (set(link.attrs) - {'href', 'title'} or not reference(link.get('href'))
+                    or children(link) != images or children(node) != links):
+                return None
+            return link['href']
+        return '' if children(node) == images else None
+
+    def credit(node, image_reference, *, malformed_inline=False):
+        if malformed_inline:
+            if node.name != 'span' or node.attrs != {'style': 'font-size: 0.9em; margin-top: 0px;'}:
+                return False
+        elif node.name != 'p' or node.attrs:
+            return False
+        links = node.find_all('a')
+        if not 1 <= len(links) <= 2 or any(child.name not in {'a', 'i', 'em', 'cite'} for child in node.find_all()):
+            return False
+        for tag in node.find_all(['i', 'em', 'cite']):
+            if tag.attrs or len(node.find_all(['i', 'em', 'cite'])) != 1 or tag.parent is not node:
+                return False
+        author = links[-1]
+        name = author.get_text(' ', strip=True)
+        if (author.attrs.keys() != {'href'} or author.find() or not reference(author.get('href'))
+                or not 0 < len(name) <= 128):
+            return False
+        text = re.sub(r'\s+', ' ', node.get_text(' ', strip=True)).replace('“ ', '“').replace(' ”', '”')
+        if not malformed_inline and len(links) == 1 and text in {'Photo by ' + name, 'Photograph by ' + name}:
+            return True
+        match = re.fullmatch(r'“([^“”\n]{1,256})” by ' + re.escape(name), text)
+        if match is None:
+            return False
+        # A quotation beside an arbitrary image can be real prose. These
+        # quoted-photo shapes must declare the same Flickr account in the
+        # photo link and photographer profile; no external URL is requested.
+        profile, photograph = urlsplit(author['href']), urlsplit(image_reference)
+        actor = re.fullmatch(r'/(?:photos|people)/([^/]{1,128})/?', profile.path)
+        picture = re.fullmatch(r'/photos/([^/]{1,128})/[0-9]+/?', photograph.path)
+        if (profile.hostname not in {'flickr.com', 'www.flickr.com'}
+                or photograph.hostname not in {'flickr.com', 'www.flickr.com'}
+                or actor is None or picture is None or actor[1] != picture[1]
+                or profile.query or profile.fragment or photograph.query or photograph.fragment):
+            return False
+        if malformed_inline:
+            # One independently observed legacy anchor spelling, not a
+            # general HTML repair: two BRs, then a quoted label and a profile.
+            return (len(links) == 2 and children(node) == links and links[0].attrs == {'<p': ''}
+                and not links[0].find() and reference(image_reference)
+                and image_reference.startswith(author['href'])
+                and links[0].get_text(' ', strip=True) == '“' + match[1] + '” by')
+        if len(links) == 2:
+            return (links[0].attrs.keys() == {'href'} and not links[0].find()
+                and reference(links[0].get('href')) and links[0]['href'] == image_reference
+                and links[0].get_text(' ', strip=True) == match[1])
+        return True
+
+    try:
+        nodes = entry.find_all()
+        if len(nodes) > 12 or any(isinstance(node, Comment) for node in entry.descendants):
+            return False
+        for node in (entry, *nodes):
+            _visible(node)
+        if any(str(child).strip() for child in entry.children if not getattr(child, 'name', None)):
+            return False
+        parts = children(entry)
+        if len(parts) == 2:
+            image_reference = photo(parts[0])
+            return image_reference is not None and credit(parts[1], image_reference)
+        if len(parts) == 1 and parts[0].name == 'p' and not parts[0].attrs:
+            inline = children(parts[0])
+            if (len(inline) != 4 or [node.name for node in inline] != ['a', 'br', 'br', 'span']
+                    or any(node.attrs or node.contents for node in inline[1:3])):
+                return False
+            # Validate the inline image without editing the source tree.
+            link, span = inline[0], inline[3]
+            images = link.find_all('img')
+            if (len(images) != 1 or children(link) != images or link.get_text(strip=True)
+                    or set(link.attrs) - {'href', 'title'} or not reference(link.get('href'))
+                    or set(images[0].attrs) - {'src', 'alt', 'width', 'height', 'border', 'decoding', 'style'}
+                    or not reference(images[0].get('src'))):
+                return False
+            # No text before/between/after the declared image/credit fields.
+            if any(str(child).strip() for child in parts[0].children if not getattr(child, 'name', None)):
+                return False
+            return credit(span, link['href'], malformed_inline=True)
+    except (NewsError, TypeError, ValueError, AttributeError):
+        return False
+    return False
+
+
 def globalvoices_verified_nontext_body(soup, source, *, page_url):
     """Classify reviewed native nontext pages, not missing text as success.
 
@@ -3297,6 +3415,8 @@ def globalvoices_verified_nontext_body(soup, source, *, page_url):
     if remaining:
         if not images or media or scripts:
             return None
+        if len(images) == 1 and _globalvoices_photo_credit_only(entry):
+            return 'source_body_image_only'
         # Only the absence-classification path copies the bounded entry. Do
         # not mutate the shared soup, source bytes or normal article hot path.
         reviewed = deepcopy(entry)
@@ -3783,6 +3903,124 @@ def _cmnews_short_table_announcement(scope, body, metadata, *, profile, visible_
     except NewsError:
         return False
     return True
+
+
+CMNEWS_CANONICAL_RELATION_QUESTION = 'cmnews_literal_canonical_relation_v1'
+
+
+def cmnews_canonical_relation_metadata(soup, *, page_url):
+    """Literal public locators for a NEW question, not an alias/body verdict.
+
+    Preserve the completed counts-only observation. Only current native
+    scope and matching-headline NewsArticle declarations supply locators;
+    never recommendations, hydration, inferred authors or guessed URLs.
+    """
+    from downloader.news_fulltext_policy import _objects, normalize_url
+
+    expected = normalize_url(page_url)
+    uuid_pattern = r'[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}'
+    route = re.compile(r'/article/([A-Za-z0-9_-]{1,100})-(' + uuid_pattern + r')', re.I)
+
+    def locator(value):
+        if not isinstance(value, str) or not 1 <= len(value) <= 2048:
+            return {'literal_locator_retained': False}
+        try:
+            absolute = urljoin(expected, value)
+            parts = urlsplit(absolute)
+            match = route.fullmatch(parts.path)
+            if (parts.scheme not in {'http', 'https'} or parts.username or parts.password
+                    or not parts.hostname or not re.fullmatch(r'[a-z0-9.-]{1,180}', parts.hostname)
+                    or parts.netloc.lower() != parts.hostname
+                    or parts.query or parts.fragment or not re.fullmatch(r'[/A-Za-z0-9_.%~-]{0,1800}', parts.path)
+                    or value != value.strip() or any(ord(char) <= 32 for char in value)):
+                return {'literal_locator_retained': False}
+            return {'literal_locator_retained': True, 'literal': value, 'absolute': absolute,
+                'article_UUID': match[2] if match else None,
+                'article_author_route': match[1] if match else None,
+                'same_publisher_host': parts.hostname == 'cmnews.com.tw',
+                'same_as_requested_url': absolute == expected}
+        except (TypeError, ValueError):
+            return {'literal_locator_retained': False}
+
+    canonical = soup.find_all('link', rel='canonical')
+    scopes = [node for node in soup.select('.articleContent[data-article-path]')
+        if locator(node.get('data-article-path')).get('absolute') == expected]
+    result = {'contract_version': 1, 'requested': locator(expected),
+        'canonical_count': len(canonical), 'canonical_locators': [locator(node.get('href')) for node in canonical[:8]],
+        'canonical_list_truncated': len(canonical) > 8, 'matching_native_scope_count': len(scopes),
+        'article_or_alias_accepted': False, 'raw_or_names_or_body_retained': False,
+        'literal_source_locators_retained': True}
+    if len(scopes) != 1:
+        return result
+    scope = scopes[0]
+    headings = scope.select('h1.articleContent__title')
+    headline = headings[0].get_text(' ', strip=True) if len(headings) == 1 else None
+    result.update(native_article_path=locator(scope.get('data-article-path')),
+        native_slug_matches_requested=scope.get('data-author-id-article-id') == urlsplit(expected).path.rsplit('/', 1)[-1],
+        native_UUID_matches_requested=scope.get('id') == 'ArticleContainer-' + str(result['requested'].get('article_UUID')),
+        byline_profile_locators=[locator(node.get('href')) for node in scope.select(
+            '.articleContent__content--main > div:first-child > .flex.items-center > a[href]')[:8]],
+        matching_headline_schema=[])
+    for script in soup.find_all('script', type='application/ld+json')[:16]:
+        try:
+            for declaration in _objects(json.loads(script.get_text())):
+                types = declaration.get('@type', [])
+                if isinstance(types, str):
+                    types = [types]
+                if not isinstance(types, list) or 'NewsArticle' not in types or not headline or declaration.get('headline') != headline:
+                    continue
+                if len(result['matching_headline_schema']) >= 8:
+                    result['matching_headline_schema_truncated'] = True
+                    break
+                identity = declaration.get('mainEntityOfPage') or declaration.get('url') or declaration.get('@id')
+                if isinstance(identity, dict):
+                    identity = identity.get('@id') or identity.get('url')
+                authors = declaration.get('author')
+                authors = authors if isinstance(authors, list) else [authors] if isinstance(authors, dict) else []
+                result['matching_headline_schema'].append({'identity_locator': locator(identity),
+                    'author_profile_locators': [locator(author.get('url')) for author in authors[:8] if isinstance(author, dict)],
+                    'explicitly_paid': declaration.get('isAccessibleForFree') in {False, 'False', 'false'}})
+        except (ValueError, TypeError):
+            continue
+    return result
+
+
+def cmnews_identity_metadata(soup, *, page_url):
+    """Counts and equality flags only; neither article bytes nor new aliases.
+
+    The existing native validator remains the authority. This description
+    localizes its unanswered identity failure without exporting a headline,
+    author, body, hydration payload, URL found in the page or inferred clock.
+    """
+    from downloader.news_fulltext_policy import normalize_url
+
+    expected = normalize_url(page_url)
+    parts = urlsplit(expected)
+    canonical = soup.find_all('link', rel='canonical')
+    def same_url(value):
+        try:
+            return isinstance(value, str) and normalize_url(urljoin(expected, value)) == expected
+        except (NewsError, TypeError, ValueError):
+            return False
+    scopes = soup.select('.articleContent[data-article-path]')
+    matched = [node for node in scopes if same_url(node.get('data-article-path'))]
+    result = {'contract_version': 1, 'canonical_count': len(canonical),
+        'matching_canonical_count': sum(same_url(node.get('href')) for node in canonical),
+        'native_scope_count': len(scopes), 'matching_native_scope_count': len(matched),
+        'ambiguous_native_scope': len(matched) != 1,
+        'source_values_or_body_exported': False, 'article_identity_accepted': False}
+    if len(matched) == 1:
+        scope = matched[0]
+        slug = parts.path.rsplit('/', 1)[-1]
+        match = re.fullmatch(r'.+-([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})', slug, re.I)
+        heads = scope.select('h1.articleContent__title')
+        result.update(native_slug_matches=scope.get('data-author-id-article-id') == slug,
+            native_UUID_container_matches=bool(match and scope.get('id') == 'ArticleContainer-' + match[1]),
+            native_title_count=len(heads), nonempty_native_title_count=sum(bool(n.get_text(strip=True)) for n in heads),
+            native_body_container_count=len(scope.select('.articleContent__textContent')),
+            native_byline_link_count=len(scope.select('.articleContent__content--main > div:first-child > .flex.items-center > a[href]')),
+            native_clock_node_count=len(scope.select('.articleContent__time')))
+    return result
 
 
 def cmnews_visible_article(soup, *, page_url):

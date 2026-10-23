@@ -25,6 +25,8 @@ from downloader.news_fulltext_policy import NewsError, cnyes_bulk_fingerprint
 
 
 CONTRACT_VERSION = 1
+CONSISTENCY_RECHECK_CONTRACT_VERSION = 2
+CONSISTENCY_RECHECK_MAX_FACTOR = 16
 COMPLETE_STATES = ('list_complete', 'list_complete_by_page_ID_equivalence', 'partition_list_complete')
 REPAIR_STATES = ('waiting_page_evidence', 'inconsistent_source_snapshot')
 REPAIR_CURSOR = 'cnyes_history_incomplete_scope_cursor_v1'
@@ -298,13 +300,114 @@ def schedule_original_page_check(queue, url, *, reason, evidence_sha):
     return True
 
 
+def schedule_consistency_recheck(queue, url, source, *, scope, evidence_sha, confirmed_at):
+    """Retry an unresolved list contradiction, never a completed diagnostic.
+
+    Keep the original one-shot witness immutable. A successful but still
+    contradictory response is not list completion: the next check uses the
+    source's discovery cadence with capped exponential spacing. The actual
+    successful response clock fences each attempt across owner restarts; a
+    loop, new proof SHA or process restart cannot create a fresh allowance.
+    Refused/failed/split jobs retain their own stronger controls.
+    """
+    if (not source.allowed or source.acquisition_mode == 'finite' or source.known_url_only
+            or wordpress_base(url) not in source.cnyes_apis or cnyes_scope(url) != scope):
+        return False
+    job = queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()
+    if (not job or job['kind'] != 'cnyes_news' or job['provider'] != source.provider
+            or job['error_code'] is not None or job['attempts'] != 0
+            or job['superseded_by_windows_json'] is not None or job['due'] <= time.time()):
+        return False
+    current = queue.db.execute('SELECT state,source_bulk_fingerprint,authorization_fingerprint,evidence_contract_version '
+        'FROM cnyes_history_scope_heads WHERE scope_url=?', (scope,)).fetchone()
+    if (not current or current['state'] not in REPAIR_STATES
+            or tuple(current)[1:] != (cnyes_bulk_fingerprint(source), source.authorization_fingerprint, CONTRACT_VERSION)):
+        return False
+    marker = 'cnyes_history_direct_page_recheck_v1:' + digest((url, evidence_sha))
+    # A different representation/proof must not erase this URL's retry history.
+    stable = 'cnyes_history_consistency_recheck_v2:' + digest((
+        url, cnyes_bulk_fingerprint(source), source.authorization_fingerprint))
+    saved = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (stable,)).fetchone()
+    try:
+        previous = json.loads(saved[0]) if saved else None
+        if saved:
+            if (type(previous) is not dict
+                    or previous['contract_version'] != CONSISTENCY_RECHECK_CONTRACT_VERSION
+                    or previous['url'] != url or previous['scope_url'] != scope):
+                return False
+            marker = previous['prior_v1_marker']
+        page = int(parse_qs(url.split('?', 1)[1]).get('page', ['1'])[0])
+        observed = queue.db.execute('SELECT h.last_confirmed_at_utc,o.response_sha256,o.observation_json '
+            'FROM cnyes_history_page_heads h JOIN cnyes_history_page_observations o '
+            'ON o.observation_sha256=h.observation_sha256 WHERE h.scope_url=? AND h.page=? '
+            'AND o.evidence_contract_version=? AND o.source_bulk_fingerprint=? AND o.authorization_fingerprint=?',
+            (scope, page, CONTRACT_VERSION, cnyes_bulk_fingerprint(source), source.authorization_fingerprint)).fetchone()
+        if (not observed or observed['last_confirmed_at_utc'] != confirmed_at
+                or observed['response_sha256'] != job['response_sha256']):
+            return False
+        coverage = queue.db.execute('SELECT total_articles,total_pages FROM bulk_api_coverage WHERE base_url=?', (scope,)).fetchone()
+        pagination = json.loads(observed['observation_json'])['pagination']
+        if not coverage or (pagination['total'], pagination['pages']) == tuple(coverage):
+            return False  # Waiting for other pages is not permission to revisit a healthy page.
+        prior = queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (marker,)).fetchone()
+        if not prior:
+            if saved:
+                return False
+            return schedule_original_page_check(queue, url,
+                reason='contradictory_list_page_evidence', evidence_sha=evidence_sha)
+        original = json.loads(prior[0])
+        original_job = original['prior_job']
+        if (type(original_job) is not dict or original_job['url'] != url
+                or original_job['kind'] != 'cnyes_news' or original_job['provider'] != source.provider
+                or original_job['attempts'] != 0 or original_job['error_code'] is not None
+                or original_job['superseded_by_windows_json'] is not None):
+            return False
+        checked = datetime.fromisoformat(job['last_checked_at_utc'])
+        confirmed = datetime.fromisoformat(confirmed_at)
+        initial = datetime.fromisoformat(original['changed_at_utc'])
+        original_checked = datetime.fromisoformat(original_job['last_checked_at_utc'])
+        if (any(clock.tzinfo is None for clock in (checked, confirmed, initial, original_checked))
+                or not original_checked <= initial < confirmed <= checked
+                or original['reason'] != 'contradictory_list_page_evidence'):
+            return False
+        count = previous['attempts'] if saved else 0
+        if type(count) is not int or count < (1 if saved else 0):
+            return False
+        if saved:
+            if (previous['prior_v1_marker_sha256'] != hashlib.sha256(prior[0].encode()).hexdigest()
+                    or checked <= datetime.fromisoformat(previous['successful_response_checked_at_utc'])
+                    or confirmed <= datetime.fromisoformat(previous['page_confirmed_at_utc'])):
+                return False
+        delay = source.discovery_interval_seconds * min(2 ** min(count, 4), CONSISTENCY_RECHECK_MAX_FACTOR)
+        due = max(time.time(), checked.timestamp() + delay)
+    except (IndexError, KeyError, ValueError, TypeError, OverflowError):
+        # A malformed/missing old witness is not permission to reset a budget.
+        return False
+    if due >= job['due']:
+        return False
+    proof = {'contract_version': CONSISTENCY_RECHECK_CONTRACT_VERSION,
+        'url': url, 'scope_url': scope, 'attempts': count + 1,
+        'successful_response_checked_at_utc': job['last_checked_at_utc'],
+        'page_confirmed_at_utc': confirmed_at, 'scheduled_at_utc': now(),
+        'current_evidence_sha256': evidence_sha,
+        'next_due_epoch': due, 'spacing_seconds': delay,
+        'prior_v1_marker': marker, 'prior_v1_marker_sha256': hashlib.sha256(prior[0].encode()).hexdigest(),
+        'prior_discovery_job': dict(job), 'source_failures_or_deadlines_reset': False,
+        'article_heads_or_completed_questions_requeued': False}
+    queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (stable, encoded(proof)))
+    queue.db.execute('UPDATE discovery SET due=?,etag=NULL,last_modified=NULL WHERE url=?', (due, url))
+    queue.metrics.count(source.provider, 'history_consistency_rechecks_scheduled')
+    return True
+
+
 def repair_scope_pages(queue, scope, source):
     """Repair missing/currently contradictory evidence, not completed history.
 
     An old successful job's annual revisit is not a list-completeness proof.
     Prefer the existing retained-envelope worker; otherwise wake only that
     original successful page. Refusals, active/due jobs and split parents keep
-    their own schedules. Per-page evidence markers bound unchanged conflicts.
+    their own schedules. Conflicting successful observations use durable,
+    cadence-spaced recovery rather than a permanent one-shot dead end.
     """
     result = {'retained_pages_queued': 0, 'page_checks_scheduled': 0}
     key = scope_key(scope)
@@ -315,8 +418,8 @@ def repair_scope_pages(queue, scope, source):
     if (not coverage or not 1 <= coverage['total_pages'] <= 30
             or queue.db.execute('SELECT 1 FROM bulk_window_splits WHERE scope_url=?', (scope,)).fetchone()):
         return result
-    observations = {row['page']: (row['observation_sha256'], json.loads(row['observation_json']))
-        for row in queue.db.execute('SELECT h.page,o.observation_sha256,o.observation_json '
+    observations = {row['page']: (row['observation_sha256'], json.loads(row['observation_json']), row['last_confirmed_at_utc'])
+        for row in queue.db.execute('SELECT h.page,h.last_confirmed_at_utc,o.observation_sha256,o.observation_json '
             'FROM cnyes_history_page_heads h JOIN cnyes_history_page_observations o '
             'ON o.observation_sha256=h.observation_sha256 WHERE h.scope_url=? AND h.page<=?',
             (scope, coverage['total_pages']))}
@@ -354,9 +457,18 @@ def repair_scope_pages(queue, scope, source):
         evidence = digest((scope, page, coverage['total_articles'], coverage['total_pages'],
             CONTRACT_VERSION, cnyes_bulk_fingerprint(source), source.authorization_fingerprint,
             prior[0] if prior else ('missing_page', job['last_checked_at_utc'], job['response_sha256'])))
-        result['page_checks_scheduled'] += schedule_original_page_check(queue, url,
-            reason='missing_current_list_page_evidence' if not prior else 'contradictory_list_page_evidence',
-            evidence_sha=evidence)
+        prior_current = prior and prior[1]['scope_url'] == scope and (
+            prior[1]['contract_version'], prior[1]['source_bulk_fingerprint'],
+            prior[1]['authorization_fingerprint'], prior[1]['source_day_offset_seconds']) == (
+                CONTRACT_VERSION, cnyes_bulk_fingerprint(source), source.authorization_fingerprint,
+                CNYES_QUERY_DAY_OFFSET_SECONDS)
+        if prior_current:
+            result['page_checks_scheduled'] += schedule_consistency_recheck(queue, url, source,
+                scope=scope, evidence_sha=evidence, confirmed_at=prior[2])
+        else:
+            result['page_checks_scheduled'] += schedule_original_page_check(queue, url,
+                reason='missing_current_list_page_evidence' if not prior else 'contradictory_list_page_evidence',
+                evidence_sha=evidence)
     return result
 
 

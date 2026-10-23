@@ -156,7 +156,7 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；保留所有模型訊號與 0 股未成交股票。期貨標記依最新期交所名單（日期列於各股票下方），不是訊號當日資格或目前可成交保證。</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號</h2><p>依 |持倉目標 %| 由大到小；隱藏目標為 0 的訊號，非零目標但 0 股未成交的股票仍保留。期貨標記依最新期交所名單（日期列於各股票下方），不是訊號當日資格或目前可成交保證。</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
 	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
@@ -207,11 +207,11 @@
       </div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=15" defer></script>
+  <script src="../dashboard-core.js?v=16" defer></script>
   <script src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32" defer></script>
   <script src="presentation.js?v=4" defer></script>
-  <script src="detail-components.js?v=20" defer></script>
+  <script src="detail-components.js?v=21" defer></script>
   <script src="chart-renderer.js?v=6" defer></script>
-  <script src="app.js?v=9b8483d4f942" defer></script>
+  <script src="app.js?v=dd453b8cd3be" defer></script>
 </body>
 </html>

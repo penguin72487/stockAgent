@@ -206,6 +206,38 @@ test("live readback is separate from cumulative committed work and clears during
   assert.match(d.byId("last-success-detail").textContent,/Last table.*375/);
 });
 
+test("runtime initialization reports waiting without inventing downloaded rows", () => {
+  const d=dashboard();d.context.data={scheduler:{alive:true,state:"executing"},activity:{contract:"tej_download_activity_v1",
+    completed_download_tasks:103,current_task:{table_name:"Source table",phase:"P1",kind:"download",stage:"initializing_runtime",elapsed_seconds:5}}};
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.match(d.byId("active-stage").textContent,/開始啟動桌面橋接.*驗證執行環境/);
+  assert.equal(d.byId("active-readback-card").hidden,true);
+  assert.equal(d.byId("completed-downloads").textContent,"103");
+});
+
+test("scope phases distinguish local preparation without exposing unreviewed labels or old phases", () => {
+  const d=dashboard();d.context.data={scheduler:{alive:true,state:"executing"},activity:{contract:"tej_download_activity_v1",
+    completed_download_tasks:103,current_task:{table_name:"Source table",phase:"P1",kind:"download",
+      stage:"preparing_scope",scope_phase:"company_universe_and_lookup",elapsed_seconds:5}}};
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.match(d.byId("active-stage").textContent,/準備查詢範圍.*公司名單與精確搜尋/);
+  assert.equal(d.byId("active-readback-card").hidden,true);
+  assert.equal(d.byId("completed-downloads").textContent,"103");
+  for(const phase of ["SECRET", "__proto__", "toString", null]) {
+    d.context.data.activity.current_task.scope_phase=phase;
+    vm.runInContext("renderActivity(data)",d.context);
+    assert.equal(d.byId("active-stage").textContent,"核對並準備查詢範圍");
+  }
+  d.context.data.activity.current_task.scope_phase="company_universe_and_lookup";
+  d.context.data.activity.current_task.stage="awaiting_preview";
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.equal(d.byId("active-stage").textContent,"等待來源回覆");
+  d.context.data.activity.current_task=null;
+  d.context.data.scheduler.state="refreshing_priorities";
+  vm.runInContext("renderActivity(data)",d.context);
+  assert.equal(d.byId("active-stage").textContent,"更新本機資料價值排序 · 未送來源查詢");
+});
+
 test("byte and result-row bars use committed actuals plus remaining estimates, not task counts", () => {
   const d=dashboard();d.context.eta={forecast:forecastFixture()};
   d.context.work={exported_rows:100,recorded_bytes:10000,resolved_grid_rows:10000};

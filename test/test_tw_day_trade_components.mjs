@@ -73,6 +73,33 @@ function components(options = {}) {
   return {view, presentation, modes, byId};
 }
 
+test("entry bracket rejections are explicit and never called a fill", () => {
+  const {presentation} = components();
+  for (const [reason, boundary] of [
+    ["entry_price_at_or_beyond_take_profit", "TP"],
+    ["entry_price_at_or_beyond_stop_loss", "SL"],
+  ]) {
+    const label = presentation.signalReasonLabel(reason);
+    assert.match(label, new RegExp(boundary));
+    assert.match(label, /不進場/);
+    assert.doesNotMatch(label, /已成交|已補齊/);
+  }
+});
+
+test("shared day-trade and overnight signal requests hide zero targets on the server before pagination", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const signalLoader = app.slice(app.indexOf("async function loadSignals("), app.indexOf("async function loadPositions("));
+  const positionLoader = app.slice(app.indexOf("async function loadPositions("), app.indexOf("async function loadEvents("));
+  assert.match(signalLoader, /hide_zero_targets: "1"/);
+  assert.doesNotMatch(positionLoader, /hide_zero_targets/);
+  assert.match(app, /product: IS_OVERNIGHT \? "tw_overnight" : "tw_day_trade"/);
+  const html = readFileSync(new URL("../services/tw_day_trade_dashboard/index.html", import.meta.url), "utf8");
+  assert.match(html, /隱藏目標為 0 的訊號/);
+  assert.match(html, /非零目標但 0 股未成交的股票仍保留/);
+  assert.match(app, /隱藏目標為 0 的訊號，非零目標但 0 股未成交的股票仍保留/);
+  assert.doesNotMatch(app, /保留所有模型目標/);
+});
+
 test("owner prices are labelled private observations without claiming public-feed permission", () => {
   const {view} = components();
   const data = {price_display_policy: {private_view: true, message: "本人私人檢視"}};

@@ -1808,21 +1808,37 @@ class PublicDashboardServer(ThreadingHTTPServer):
     ) -> PreparedResponse:
         """Reuse immutable bytes until metadata changes, including atomic swaps."""
 
-        signature = metadata_signature(target.stat())
+        is_html = content_type.startswith("text/html")
+        core_target = self.public_static_root / "dashboard-core.js"
+
+        def signature_now() -> tuple[int, ...]:
+            signature = metadata_signature(target.stat())
+            if is_html:
+                # The projected page embeds this dependency's URL. Updating
+                # only the shared JS must invalidate every cached page shell.
+                signature += metadata_signature(core_target.stat())
+            return signature
+
+        signature = signature_now()
         with self._static_cache_lock:
             cached = self._static_cache.get(target)
             if cached is not None and cached.signature == signature:
                 self._cache_observation("static_hit")
                 return cached.response
         body = target.read_bytes()
-        if content_type.startswith("text/html"):
-            body = project_html(body, audience=self.audience)
+        if is_html:
+            core = self.cached_static(
+                core_target, content_type="text/javascript; charset=utf-8",
+                cache_control="public, max-age=31536000, immutable",
+            )
+            core_version = "core-" + core.etag.removeprefix('"sha256-').removesuffix('"')
+            body = project_html(body, audience=self.audience, core_version=core_version)
         response = _prepared(
             body,
             content_type=content_type,
             cache_control=cache_control,
         )
-        if metadata_signature(target.stat()) == signature:
+        if signature_now() == signature:
             with self._static_cache_lock:
                 self._static_cache[target] = StaticCacheEntry(
                     signature=signature, response=response
@@ -3511,13 +3527,13 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise InvalidPublicRequest("invalid feature page query") from error
 
     @staticmethod
-    def _signal_query(raw_query: str) -> str:
+    def _signal_query(raw_query: str, *, allow_hide_zero_targets: bool = False) -> str:
         try:
             query = parse_qs(
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=8,
+                max_num_fields=8 + int(allow_hide_zero_targets),
             )
             allowed = {
                 "date",
@@ -3529,6 +3545,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 "offset",
                 "limit",
             }
+            if allow_hide_zero_targets:
+                allowed.add("hide_zero_targets")
             if set(query) - allowed or any(
                 len(values) != 1 for values in query.values()
             ):
@@ -3568,6 +3586,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "limit": limit,
                 }
             )
+            if "hide_zero_targets" in query:
+                hide_zero_targets = query["hide_zero_targets"][0]
+                if hide_zero_targets not in {"0", "1"}:
+                    raise InvalidPublicRequest("hide_zero_targets must be 0 or 1")
+                normalized["hide_zero_targets"] = hide_zero_targets
             return urlencode(normalized)
         except InvalidPublicRequest:
             raise
@@ -3808,7 +3831,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ),
             )
         if path == "/tw-day-trade/api/signals":
-            normalized = self._signal_query(raw_query)
+            normalized = self._signal_query(raw_query, allow_hide_zero_targets=True)
             query = parse_qs(normalized, keep_blank_values=True)
             return self.server.cached_local_json(
                 cache_key=f"tw-signals:{normalized}:{self.server.content_token()}",
@@ -3825,6 +3848,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         mode=str(query.get("mode", [""])[0]),
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
+                        hide_zero_targets=query.get("hide_zero_targets", ["0"])[0] == "1",
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
                     ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
@@ -3915,7 +3939,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 ),
             )
         if path == "/tw-overnight/api/signals":
-            normalized = self._signal_query(raw_query)
+            normalized = self._signal_query(raw_query, allow_hide_zero_targets=True)
             query = parse_qs(normalized, keep_blank_values=True)
             return self.server.cached_local_json(
                 cache_key=f"overnight-signals:{normalized}:{self.server.content_token('overnight')}",
@@ -3932,6 +3956,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         mode=str(query.get("mode", [""])[0]),
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
+                        hide_zero_targets=query.get("hide_zero_targets", ["0"])[0] == "1",
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
                     ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,

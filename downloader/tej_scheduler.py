@@ -703,7 +703,8 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         try:
                             defer_unsent_prequery(root,row['task_id'],bridge,
                                 base_seconds=config.get('prequery_retry_base_seconds',60),
-                                max_seconds=config.get('prequery_retry_max_seconds',900))
+                                max_seconds=config.get('prequery_retry_max_seconds',900),
+                                acknowledge_known_notices=config.get('acknowledge_known_metadata_runtime_notices',False))
                         except (ValueError,OSError,RuntimeError,subprocess.SubprocessError):
                             pass  # Unfinished/unknown/foreign evidence never licenses a new query.
                         barrier=local_barrier()
@@ -718,7 +719,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                     else:
                         paused_reason = None
                         from downloader.tej_value_priority import refresh_if_due
-                        refresh_if_due(root)
+                        refresh_if_due(root, on_refresh=lambda: publish('refreshing_priorities'))
                         if session_path is not None:
                             # Reload only explicitly pinned private identity,
                             # after reconciliation. Never discover or select a

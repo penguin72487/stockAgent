@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import re
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from downloader.news_fulltext_policy import NewsError, _objects, _plain_text_node
 from downloader.news_fulltext_public_originals import _one, _visible
@@ -20,6 +20,55 @@ from downloader.news_fulltext_public_originals import _one, _visible
 POCKET_ORIGIN = 'https://www.pocket.tw'
 POCKET_BODY_SELECTOR = ':scope > .pocket-native-body'
 POCKET_PATH_PATTERN = '^/school/(?:report/[A-Za-z]+|articles)/[1-9][0-9]*/$'
+POCKET_V10_PATH_PATTERN = r'^/(?:school/(?:report/[A-Za-z]+|articles)|invest_news/article)/[1-9][0-9]*/{0,2}$'
+POCKET_V11_PATH_PATTERN = r'^/(?:(?:school/(?:report/[A-Za-z]+|articles)|invest_news/article)/[1-9][0-9]*/{0,2}|school/articles/article-[a-z0-9]{8}/)$'
+# Full contracts derived from the installed ABI9 and reviewed ABI10 catalog,
+# not permission aliases. Any other policy edit gets no inherited HTTP state.
+POCKET_V10_SCOPE_REPAIR_IDENTITY = (
+    '8b54651a1148431359a495eb07daa6a807158b6cfa64a06e46815baad2771a29',
+    '687294216eb1ba1a4ebfc002d100bdc3310acaf14147a439b19bd94631ad4d6e',
+)
+POCKET_V10_PRIOR_HTTP_MEASUREMENT_IDENTITY = (
+    '6238b0d0bd9823279a7be95572d601f4679f02002b730abcbdff844551c7ff33',
+    '9b9585c074555ecdb4c45cdf601216d92b4c6687c7f49ef60c42dde5ed8e9057',
+)
+# This extension recognizes a literal opaque School ID, not a numeric alias.
+# Only the reviewed full contract pair may retain the prior HTTP measurements.
+POCKET_V11_SCOPE_REPAIR_IDENTITY = (
+    POCKET_V10_SCOPE_REPAIR_IDENTITY[1],
+    '8c7650e6afe495c51acb9b9256cffb1d848a4d9fe2275c323c3625c5b35b393a',
+)
+POCKET_V11_NEW_ARTICLE_REQUESTS = tuple(
+    POCKET_ORIGIN + '/school/articles/article-' + suffix + '/'
+    for suffix in ('mvaoags6', 'mvep8lsc', 'mvex3yk2', 'mvexg3rz', 'mvgbav11', 'mvgcdbyd')
+)
+# Three exact newly retained originals, not a retry of every missing article.
+POCKET_V12_NEW_BODY_REQUESTS = (
+    'https://www.pocket.tw/school/articles/article-mvexg3rz/',
+    'https://www.pocket.tw/school/articles/article-mvgcdbyd/',
+    'https://www.pocket.tw/school/report/newflash/8013',
+)
+POCKET_V12_SCOPE_REPAIR_IDENTITY = (
+    POCKET_V11_SCOPE_REPAIR_IDENTITY[1],
+    '70c7e9e7e90d1e09ca70311793ac85f0abf712b8c15fc38358c5d7123e22890e',
+)
+# Actual literal responses (2026-10-21) established same-ID native School
+# redirects and valid complete bodies. These twelve IDs have no local body;
+# ten other observed routes already have local originals and are not replayed.
+POCKET_V10_NEW_ARTICLE_REQUESTS = (
+    'https://www.pocket.tw/invest_news/article/1264528',
+    'https://www.pocket.tw/invest_news/article/1268889',
+    'https://www.pocket.tw/invest_news/article/1278880',
+    'https://www.pocket.tw/invest_news/article/1281244',
+    'https://www.pocket.tw/invest_news/article/7931',
+    'https://www.pocket.tw/invest_news/article/7933',
+    'https://www.pocket.tw/invest_news/article/7971',
+    'https://www.pocket.tw/invest_news/article/8025',
+    'https://www.pocket.tw/school/report/BeforeMarket/1277930',
+    'https://www.pocket.tw/school/report/BeforeMarket/1279232',
+    'https://www.pocket.tw/school/report/BeforeMarket/1279997',
+    'https://www.pocket.tw/school/report/SCHOOL/7973',
+)
 POCKET_AUTHOR = '口袋學堂編輯團隊'
 _CLOCK = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:[.][0-9]{1,6})?Z')
 _BODY_TAGS = frozenset({'p', 'h2', 'h3', 'h4', 'div', 'span', 'strong', 'b', 'em', 'i', 'u',
@@ -51,6 +100,8 @@ def _inner_calendar_notice(label, visible_day, version):
         ('data_as_of_date', '資料截至 '+numeric),
         ('data_as_of_date', '口袋觀點｜資料截至 '+spaced),
     )
+    if version >= 12:
+        forms += (('data_as_of_date', '口袋學堂｜資料截至 '+spaced),)
     for role, pattern in forms:
         match = re.fullmatch(pattern, label)
         if match is None:
@@ -93,7 +144,7 @@ def _native_visible(node, *, accessible_table_captions=False):
             raise NewsError('article_identity_not_verified')
 
 
-def pocket_article_id(url, *, requested=False):
+def pocket_article_id(url, *, requested=False, adapter_contract_version=1):
     """Recognize literal routes only; never synthesize a redirect or alias."""
     if not isinstance(url, str):
         return None
@@ -104,10 +155,69 @@ def pocket_article_id(url, *, requested=False):
     if (parts.scheme != 'https' or parts.netloc != 'www.pocket.tw'
             or parts.query or parts.fragment):
         return None
-    route = (r'/school/(?:report/[A-Za-z]+|articles)/([1-9][0-9]*)/' if requested
-             else r'/school/articles/([1-9][0-9]*)/')
+    if requested and adapter_contract_version >= 10:
+        route = r'/(?:school/(?:report/[A-Za-z]+|articles)|invest_news/article)/([1-9][0-9]*)/{0,2}'
+    else:
+        route = (r'/school/(?:report/[A-Za-z]+|articles)/([1-9][0-9]*)/' if requested
+                 else r'/school/articles/([1-9][0-9]*)/')
+    if adapter_contract_version in {11, 12}:
+        route = '(?:' + route + r'|/school/articles/(article-[a-z0-9]{8})/)'
     match = re.fullmatch(route, parts.path)
+    if match and adapter_contract_version in {11, 12}:
+        return next(value for value in match.groups() if value is not None)
     return match[1] if match else None
+
+
+def pocket_numeric_transport_verified(response, requested_url):
+    """Verify the received numeric-ID chain, never request a guessed alias.
+
+    Native final identity stays strict. The reviewed extra spellings are
+    request routes only; every actual intermediate hop must remain same-ID
+    and same-origin, with its literal Location, time and response witness.
+    """
+    from downloader.news_fulltext_http import RedirectHop
+    identity = pocket_article_id(requested_url, requested=True, adapter_contract_version=10)
+    if identity is None or pocket_article_id(response.url) != identity:
+        return False
+    hops = response.redirects
+    if not isinstance(hops, tuple) or any(not isinstance(hop, RedirectHop) for hop in hops):
+        return False
+    if response.url == requested_url:
+        return not hops
+    if not 1 <= len(hops) <= 8:
+        return False
+    previous = requested_url
+    for hop in hops:
+        if (hop.from_url != previous or hop.status not in {301, 302, 303, 307, 308}
+                or pocket_article_id(hop.to_url, requested=True, adapter_contract_version=10) != identity
+                or not isinstance(hop.location, str)
+                or not isinstance(hop.response_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', hop.response_sha256)
+                or type(hop.response_bytes) is not int or not 0 <= hop.response_bytes <= 8 << 20):
+            return False
+        try:
+            if (urljoin(hop.from_url, hop.location) != hop.to_url
+                    or datetime.fromisoformat(hop.observed_at_utc).utcoffset() is None):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        previous = hop.to_url
+    return previous == response.url
+
+
+def pocket_article_transport_verified(response, requested_url, *, adapter_contract_version):
+    """Keep witnessed numeric redirects and literal opaque identities distinct.
+
+    Opaque School requests have only been witnessed as self-canonical pages.
+    They cannot acquire a numeric ID, another slug, or an alias via a redirect.
+    Native canonical/schema/byline/body verification still follows separately.
+    """
+    if pocket_numeric_transport_verified(response, requested_url):
+        return True
+    identity = pocket_article_id(requested_url, requested=True,
+        adapter_contract_version=adapter_contract_version)
+    return (adapter_contract_version in {11, 12} and isinstance(identity, str)
+        and identity.startswith('article-') and response.url == requested_url
+        and isinstance(response.redirects, tuple) and not response.redirects)
 
 
 def _own_openaccount_link(url):
@@ -280,32 +390,63 @@ def _separate_brokerage_cta(native, notices, version):
     if not ctas:
         return
     tail = list(ctas[0].find_next_siblings())
+    ad_index = 0
+    if version >= 8:
+        # CMS whitespace paragraphs are not an ad or intervening prose. Leave
+        # them in the native body; ignore only visible text-only spacers when
+        # finding the adjacent identified ad. Images/links/hidden nodes cannot
+        # supply this boundary, and actual intervening prose is not skipped.
+        while ad_index < len(tail):
+            node = tail[ad_index]
+            if (node.name != 'p' or node.get_text(' ', strip=True)
+                    or any(child.name not in {'br', 'span', 'b', 'strong', 'em', 'i', 'u', 's'}
+                           for child in node.find_all(True))):
+                break
+            for child in (node, *node.find_all(True)):
+                _native_visible(child)
+            ad_index += 1
+    ad = tail[ad_index] if ad_index < len(tail) else None
     # The adjacent ad's identity, not its being last, defines its boundary.
     # v7 retains later native prose (including risk statements) for the usual
     # visibility/tag checks below; never erase everything following the CTA.
-    boundary_ok = bool(tail and (version >= 7 or len(tail) == 1))
+    boundary_ok = bool(ad is not None and (version >= 7 or len(tail) == 1))
     own_openaccount = bool(version >= 2 and boundary_ok
-        and any(_own_openaccount_link(a.get('href', '')) for a in tail[0].select('a[href]')))
-    branded = bool(boundary_ok and '口袋證券' in tail[0].get_text(' ', strip=True))
+        and any(_own_openaccount_link(a.get('href', '')) for a in ad.select('a[href]')))
+    branded = bool(boundary_ok and '口袋證券' in ad.get_text(' ', strip=True))
     own_action = []
     if version >= 6 and not branded and boundary_ok:
-        own_action = [a for a in tail[0].select('a[href]')
+        action_labels = {'線上申請證券戶'}
+        if version >= 8:
+            action_labels.update({'線上 5 分鐘快速申請', '👉 線上 5 分鐘快速申請'})
+        if version >= 9:
+            action_labels.add('線上5分鐘快速申請')
+        own_action = [a for a in ad.select('a[href]')
             if _own_openaccount_link(a.get('href', ''))
-            and a.get_text(' ', strip=True) == '線上申請證券戶']
+            and a.get_text(' ', strip=True) in action_labels]
         if len(own_action) == 1:
-            for node in (tail[0], own_action[0], *own_action[0].find_all(True)):
+            for node in (ad, own_action[0], *own_action[0].find_all(True)):
                 _native_visible(node)
-    if (len(ctas) != 1 or not boundary_ok or tail[0].name != 'div'
+    heading_ok = ctas[0].get_text(' ', strip=True).startswith('怎麼買' if version >= 2 else '怎麼買 ')
+    if version >= 9:
+        heading_ok = heading_ok or ctas[0].get_text(' ', strip=True) == '掌握富時指數調整，在口袋證券自行追蹤台股'
+    if (len(ctas) != 1 or not boundary_ok or ad.name != 'div'
             or ctas[0].name not in ({'h2', 'p'} if version >= 2 else {'h2'})
-            or not ctas[0].get_text(' ', strip=True).startswith('怎麼買' if version >= 2 else '怎麼買 ')
-            or not (tail[0].select_one('a[href="https://pse.im/78wp56"]') is not None or own_openaccount)
+            or not heading_ok
+            or not (ad.select_one('a[href="https://pse.im/78wp56"]') is not None or own_openaccount)
             or not (branded or version >= 6 and len(own_action) == 1)):
         raise NewsError('article_identity_not_verified')
-    if len(tail) > 1:
-        for node in (ctas[0], *ctas[0].find_all(True), tail[0], *tail[0].find_all(True)):
+    following_count = len(tail) - ad_index - 1
+    if following_count > 0 or ad_index:
+        if len(native.select('#section-cta')) != 1:
+            raise NewsError('article_identity_not_verified')
+        for node in (ctas[0], *ctas[0].find_all(True), ad, *ad.find_all(True)):
             _native_visible(node)
+    if ad_index:
+        notices.append({'kind': 'native_whitespace_paragraphs_between_cta_and_ad_preserved',
+            'paragraph_count': ad_index, 'whitespace_not_deleted_or_interpreted_as_prose': True})
+    if following_count > 0:
         notices.append({'kind': 'native_brokerage_cta_has_following_prose_preserved',
-            'following_native_sibling_count': len(tail) - 1,
+            'following_native_sibling_count': following_count,
             'following_prose_not_removed': True})
     if not branded:
         notices.append({'kind': 'native_own_account_action_identifies_brokerage_cta',
@@ -313,9 +454,112 @@ def _separate_brokerage_cta(native, notices, version):
             'source_url_raw': own_action[0]['href'], 'broker_name_text_invented': False,
             'account_form_or_media_requested': False})
     notices.append({'kind': 'separate_publisher_brokerage_cta_not_report_body',
-        'text': ctas[0].get_text(' ', strip=True) + '\n' + _plain_text_node(tail[0])})
+        'text': ctas[0].get_text(' ', strip=True) + '\n' + _plain_text_node(ad)})
     ctas[0].decompose()
-    tail[0].decompose()
+    ad.decompose()
+
+
+def _separate_zero_layout_summary_label(native, notices):
+    """One witnessed nonvisible label, never hidden article text or a gate."""
+    marker = native.find(recursive=False)
+    style = 'font-size:0px; line-height:0; height:0; margin:0; padding:0; overflow:hidden; visibility:hidden;'
+    if (marker is None or marker.name != 'p' or marker.attrs != {'style': style}
+            or marker.find(True) is not None or marker.get_text(' ', strip=True) != '重點速覽'):
+        return
+    following = marker.find_next_sibling()
+    if following is None or following.name != 'ol':
+        raise NewsError('article_identity_not_verified')
+    items = following.find_all('li', recursive=False)
+    if (not 1 <= len(items) <= 64
+            or any(len(item.find_all('h3', recursive=False)) != 1
+                   or not item.find_all('p', recursive=False) for item in items)):
+        raise NewsError('article_identity_not_verified')
+    _native_visible(native)
+    _native_visible(following)
+    notices.append({'kind': 'native_nonvisible_zero_layout_summary_label_not_body',
+        'text_raw': marker.get_text(), 'style_raw': marker['style'],
+        'visible_prose': False, 'body_text_inferred': False})
+    marker.decompose()
+
+
+def _separate_inline_update_label(native, notices):
+    """One native update label with an ARIA-decorative separator, not prose.
+
+    Do not make hidden characters generally visible. All three literal spans,
+    the known date/organisation grammar and the exact decorative glyph must
+    agree; every surrounding span/ancestor retains the normal visibility gate.
+    """
+    style = 'color: rgb(122, 128, 135); font-size: 14px;'
+    for paragraph in native.find_all('p', recursive=False):
+        spans = paragraph.find_all(recursive=False)
+        if (paragraph.attrs or len(spans) != 3 or any(n.name != 'span' for n in spans)
+                or spans[1].attrs != {'aria-hidden': 'true', 'style': style}
+                or spans[1].find(True) is not None or spans[1].get_text() != '｜'
+                or any(n.attrs != {'style': style} or n.find(True) is not None
+                       for n in (spans[0], spans[2]))
+                or any(str(n).strip() for n in paragraph.contents if n not in spans)):
+            continue
+        label = paragraph.get_text(' ', strip=True)
+        try:
+            clock = _inner_calendar_notice(label, datetime(2000, 1, 1).date(), 9)
+        except NewsError:
+            continue
+        if clock.get('clock_role') != 'update_date':
+            continue
+        for node in (paragraph, spans[0], spans[2]):
+            _native_visible(node)
+        notices.append({'kind': 'native_inline_update_label_with_decorative_separator_not_body',
+            'text_raw': label, 'calendar_date': clock['calendar_date'],
+            'decorative_separator_aria_hidden': True, 'hidden_prose_made_visible': False,
+            'label_not_promoted_to_release_or_revision_clock': True})
+        paragraph.decompose()
+
+
+def _reviewed_native_containers(native, version=9):
+    """Keep witnessed summaries and written figure captions, without media IO."""
+    accepted = set()
+    for node in native.find_all(['aside', 'figure', 'figcaption']):
+        if node.name == 'aside':
+            children = node.find_all(recursive=False)
+            if (node.parent is not native
+                    or node.attrs != {'aria-label': '重點速覽', 'class': ['key-takeaways']}
+                    or [child.name for child in children] != ['strong', 'ul']):
+                raise NewsError('article_identity_not_verified')
+            items = children[1].find_all('li', recursive=False)
+            if not 1 <= len(items) <= 64 or children[0].get_text(' ', strip=True) != f'{len(items)}個重點速覽':
+                raise NewsError('article_identity_not_verified')
+            accepted.add(id(node))
+        elif node.name == 'figure':
+            children = node.find_all(recursive=False)
+            linked = False
+            if version >= 12 and [child.name for child in children] == ['a', 'figcaption']:
+                anchor = children[0]
+                images = anchor.find_all(recursive=False)
+                try:
+                    target = urlsplit(anchor.get('href', ''))
+                except (TypeError, ValueError):
+                    raise NewsError('article_identity_not_verified') from None
+                linked = (set(anchor.attrs) <= {'href', 'target', 'rel', 'aria-label'}
+                    and anchor.get('target') == '_blank' and anchor.get('rel') == ['noopener', 'noreferrer']
+                    and not (target.scheme or target.netloc or target.query or target.fragment)
+                    and bool(target.path) and '/' not in target.path and target.path.endswith('.png')
+                    and [child.name for child in images] == ['img']
+                    and not any(str(n).strip() for n in anchor.contents if n not in images)
+                    and ('aria-label' not in anchor.attrs or isinstance(anchor['aria-label'], str)
+                         and 0 < len(anchor['aria-label']) <= 256))
+            allowed_attrs = {'style', 'id'} if version >= 12 else {'style'}
+            identifier = node.get('id')
+            if (node.parent is not native or set(node.attrs) - allowed_attrs
+                    or (identifier is not None and (not isinstance(identifier, str)
+                        or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,127}', identifier)
+                        or len(native.find_all(id=identifier)) != 1))
+                    or ([child.name for child in children] != ['img', 'figcaption'] and not linked)
+                    or any(str(n).strip() for n in node.contents if n not in children)):
+                raise NewsError('article_identity_not_verified')
+            accepted.update((id(node), id(children[1])))
+        elif id(node) not in accepted:
+            raise NewsError('article_identity_not_verified')
+    return accepted
 
 
 def _separate_native_nonprose(native, notices):
@@ -383,9 +627,9 @@ def _separate_native_nonprose(native, notices):
 
 def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
     """Verify the actual final page and native author before projecting text."""
-    if pocket_article_id(page_url) is None:
+    if pocket_article_id(page_url, adapter_contract_version=adapter_contract_version) is None:
         raise NewsError('article_identity_not_verified')
-    if adapter_contract_version not in {1, 2, 3, 4, 5, 6, 7}:
+    if adapter_contract_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}:
         raise NewsError('article_identity_not_verified')
     if adapter_contract_version == 1:
         heading = _one(soup, 'main h1')
@@ -474,7 +718,24 @@ def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
         native = nested[0]
         _native_visible(native)
         metas = native.select(':scope > .article-meta')
-        if metas or adapter_contract_version == 1:
+        prose_metas = False
+        if adapter_contract_version >= 9 and metas:
+            # A CMS class is not a clock. Preserve visible context/disclaimer
+            # paragraphs in their exact native position; do not force them
+            # into one update date or discard their written values. A single
+            # previously accepted calendar label keeps its existing output.
+            try:
+                if len(metas) != 1:
+                    raise NewsError('invalid_bulk_publication_clock')
+                _inner_calendar_notice(metas[0].get_text(' ', strip=True), visible_day, adapter_contract_version)
+            except NewsError:
+                prose_metas = (1 <= len(metas) <= 8 and all(n.name == 'p'
+                    and n.attrs == {'class': ['article-meta']} and n.get_text(' ', strip=True) for n in metas))
+                if prose_metas:
+                    notices.append({'kind': 'native_article_meta_paragraphs_preserved_as_body',
+                        'paragraph_count': len(metas), 'calendar_or_credit_inferred_from_class': False,
+                        'not_promoted_to_release_or_revision_clock': True})
+        if (metas and not prose_metas) or adapter_contract_version == 1:
             meta = _one(native, ':scope > .article-meta')
             meta_label = meta.get_text(' ', strip=True)
             if (adapter_contract_version >= 3
@@ -511,7 +772,8 @@ def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
             for toc in native.select('nav'):
                 _native_visible(toc)
                 links = toc.select('a')
-                if (toc.parent is not native or toc.get('class') != ['toc']
+                allowed_toc = (['toc'], ['toc-box']) if adapter_contract_version >= 9 else (['toc'],)
+                if (toc.parent is not native or toc.get('class') not in allowed_toc
                         or toc.get('aria-label') != '文章目錄' or not links
                         or any(node.name not in {'strong', 'ol', 'ul', 'li', 'a'}
                                for node in toc.find_all(True))):
@@ -535,6 +797,12 @@ def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
     if not nested and adapter_contract_version >= 4:
         _separate_native_nonprose(native, notices)
         _separate_brokerage_cta(native, notices, adapter_contract_version)
+    if adapter_contract_version >= 8:
+        _separate_zero_layout_summary_label(native, notices)
+    reviewed_containers = set()
+    if adapter_contract_version >= 9:
+        _separate_inline_update_label(native, notices)
+        reviewed_containers = _reviewed_native_containers(native, adapter_contract_version)
     for node in native.find_all(True):
         nonvisible_caption = (adapter_contract_version >= 4 and node.name == 'caption'
             and node.attrs == {'style': 'display:none;'} and node.parent.name == 'table'
@@ -552,6 +820,7 @@ def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
             _native_visible(node, accessible_table_captions=True)
         if (node.name not in _BODY_TAGS
                 and not (adapter_contract_version >= 4 and node.name == 'article')
+                and id(node) not in reviewed_containers
                 and node is not retained_inner_heading):
             raise NewsError('article_identity_not_verified')
         if node.name == 'img':
@@ -564,6 +833,16 @@ def pocket_visible_article(soup, *, page_url, adapter_contract_version=1):
     first = native.find(['p', 'h2', 'h3'])
     if first and re.match(r'^(?:轉載|轉自|本文來源|新聞來源|來源[：:])', first.get_text(' ', strip=True)):
         raise NewsError('article_rights_or_scope_excluded')
+    for node in native.find_all(['aside', 'figure']) if reviewed_containers else ():
+        # The common text walker correctly excludes unrelated page asides and
+        # figures. Only these already-verified *body* containers are projected
+        # as neutral blocks, or their native summary/caption would disappear.
+        # Do not relax the shared exclusion or fetch/infer image text.
+        assert id(node) in reviewed_containers
+        notices.append({'kind': 'native_verified_body_container_prose_preserved',
+            'source_tag': node.name, 'projected_tag': 'div', 'source_layout_retained_in_original': True,
+            'media_requested': False, 'media_text_inferred': False})
+        node.name = 'div'
     # Move, do not reparse or concatenate nested matches. Ordered text/table
     # cells retain their exact native values; immutable raw retains layout.
     normalized = soup.new_tag('div', attrs={'class': 'pocket-native-body'})

@@ -127,7 +127,7 @@ def test_CSS_and_FAQ_hashes_have_named_HTML_newline_basis_not_raw_response_hash(
             assert 'text_sha256'not in n and not n['executed']
 
 
-@pytest.mark.parametrize('version',[4,5])
+@pytest.mark.parametrize('version',[4,5,8])
 @pytest.mark.parametrize('old,new',[
     ('rel="canonical"','rel="alternate"'),
     ('<h1>','<h1 hidden>'),
@@ -209,7 +209,7 @@ def test_flat_cta_does_not_truncate_a_later_prose_sibling(settings):
         parse(versioned(settings,4),str(soup))
 
 
-@pytest.mark.parametrize('prior,current',[(3,4),(4,5),(5,6)])
+@pytest.mark.parametrize('prior,current',[(3,4),(4,5),(5,6),(6,7),(7,8),(8,9)])
 def test_exact_predecessor_and_original_HTTP_identity(settings,prior,current):
     original=PolicyRegistry(settings,base=Path.cwd()).sources['pocket']
     old=PolicyRegistry(versioned(settings,prior),base=Path.cwd()).sources['pocket']
@@ -221,7 +221,7 @@ def test_exact_predecessor_and_original_HTTP_identity(settings,prior,current):
     assert not pocket_native_parser_repair(new,original.data_fingerprint)
 
 
-@pytest.mark.parametrize('prior,current',[(3,4),(4,5),(5,6)])
+@pytest.mark.parametrize('prior,current',[(3,4),(4,5),(5,6),(6,7),(7,8),(8,9)])
 @pytest.mark.parametrize('obstruction',[None,'stored','lease','missing_observation','wrong_predecessor'])
 def test_once_only_unstored_observed_identity_failures_not_clocks_paths_rights_or_refusals(settings,tmp_path,obstruction,prior,current):
     old=PolicyRegistry(versioned(settings,prior),base=tmp_path);new=PolicyRegistry(versioned(settings,current),base=tmp_path)
@@ -250,3 +250,55 @@ def test_once_only_unstored_observed_identity_failures_not_clocks_paths_rights_o
         queue.db.execute("UPDATE articles SET state='article_identity_not_verified'WHERE state='retry'");queue.db.commit()
     with closing(NewsQueue(tmp_path,new))as queue:
         assert queue.db.execute("SELECT count(*)FROM articles WHERE state='retry'").fetchone()[0]==0
+
+
+ZERO_SUMMARY_STYLE='font-size:0px; line-height:0; height:0; margin:0; padding:0; overflow:hidden; visibility:hidden;'
+
+
+def zero_summary_label(*,nested=True):
+    soup=BeautifulSoup(page(nested=nested),'lxml')
+    root=soup.select_one('article.pocket-article')if nested else soup.select_one('.cms-article-scope')
+    marker=soup.new_tag('p',attrs={'style':ZERO_SUMMARY_STYLE});marker.string='重點速覽'
+    listing=BeautifulSoup('<ol><li><h3>可見的項目標題</h3><p>保留原生數值 -12.50、0、2.8。</p></li></ol>','lxml').ol
+    root.insert(0,listing);root.insert(0,marker)
+    return soup
+
+
+@pytest.mark.parametrize('engine',['lxml','html.parser'])
+@pytest.mark.parametrize('nested',[True,False])
+def test_v8_excludes_only_witnessed_nonvisible_zero_layout_label_not_visible_list(settings,engine,nested):
+    raw=str(zero_summary_label(nested=nested));config=versioned(settings,8);config['providers'][0]['html_parser']=engine
+    with pytest.raises(NewsError,match='article_identity_not_verified'):
+        parse(versioned(settings,7),raw)
+    result=parse(config,raw)
+    assert '重點速覽'not in result['body']
+    assert result['body'].count('可見的項目標題')==1 and result['body'].count('保留原生數值 -12.50、0、2.8。')==1
+    assert result['body'].index('可見的項目標題')<result['body'].index('第0段')
+    notice=next(n for n in json.loads(result['verified_article_notices_json'])
+        if n['kind']=='native_nonvisible_zero_layout_summary_label_not_body')
+    assert notice['text_raw']=='重點速覽'and notice['style_raw']==ZERO_SUMMARY_STYLE
+    assert not notice['visible_prose']and not notice['body_text_inferred']
+    assert not result['historical_point_in_time']and not result['per_article_license_verified']
+
+
+@pytest.mark.parametrize('mutation',[
+    'text','style','child','attributes','not_first','nested_marker','duplicate','not_list',
+    'no_items','no_item_heading','no_item_prose','hidden_list','hidden_real_prose',
+])
+def test_v8_label_exception_does_not_admit_hidden_prose_or_unknown_structure(settings,mutation):
+    soup=zero_summary_label();marker=soup.select_one('p[style]');listing=marker.find_next_sibling()
+    if mutation=='text':marker.string='原本不可見的秘密數值'
+    elif mutation=='style':marker['style']=ZERO_SUMMARY_STYLE+'color:red;'
+    elif mutation=='child':marker.append(soup.new_tag('br'))
+    elif mutation=='attributes':marker['hidden']=''
+    elif mutation=='not_first':marker.insert_before(BeautifulSoup('<p>不可越過的前段</p>','lxml').p)
+    elif mutation=='nested_marker':marker.wrap(soup.new_tag('div'))
+    elif mutation=='duplicate':listing.insert_after(BeautifulSoup(str(marker),'lxml').p)
+    elif mutation=='not_list':listing.name='div'
+    elif mutation=='no_items':listing.clear()
+    elif mutation=='no_item_heading':listing.h3.decompose()
+    elif mutation=='no_item_prose':listing.p.decompose()
+    elif mutation=='hidden_list':listing['hidden']=''
+    else:listing.p['hidden']=''
+    with pytest.raises(NewsError,match='article_identity_not_verified'):
+        parse(versioned(settings,8),str(soup))

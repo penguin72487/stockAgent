@@ -41,6 +41,7 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
     )
     from stockagent.data.tw_stock_futures_repair import apply_block_evidence
     from stockagent.data.tw_stock_futures_history import _read_verified_tick_partition, normalize_continuous_ticks
+    from stockagent.data.tw_price_rules import TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION
     selected = source.filter(pl.col('executable'))
     block_sha = sha256_file(block_manifest)
     facts, block_proof = apply_block_evidence(selected, Path(block_manifest))
@@ -97,6 +98,7 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
         raise ValueError('official block inventory changed during preparation')
     verified = coverage.filter(pl.col('verified')).select('date','physical_contract')
     proof = dict(source=BULK_SOURCE, price_policy=BULK_PRICE_POLICY,
+        product_history_contract_version=TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION,
         quantity='native_even_double_sided_divided_by_two_no_dedup',
         session='dated_product_rules_inclusive_exact_close_no_night_or_spread',
         admission='exact_continuous_book_quantity_and_official_hlc_or_independent_official_zero_book',
@@ -383,7 +385,7 @@ def main():
     p.add_argument("--tick-root", type=Path, action="append", default=[])
     p.add_argument("--exact-kbar-root", type=Path, action="append", default=[])
     p.add_argument('--finmind-bulk-root', type=Path,
-                   help='Use the canonical existing global tick collector, all delivery months')
+                   help='Whole-market tick collector root or pinned portable raw inventory JSON')
     p.add_argument('--block-manifest', type=Path, help='Independent official continuous-book quantity evidence')
     p.add_argument('--source-workers', type=int, choices=range(1,9), default=4)
     p.add_argument("--with-opening-reference", action="store_true",

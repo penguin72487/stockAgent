@@ -2,6 +2,7 @@
 from dataclasses import replace
 import hashlib
 import json
+from unittest.mock import patch
 
 import pyarrow.parquet as pq
 import pytest
@@ -46,8 +47,30 @@ def submit(queue, config):
 
 def claim(queue, config, client):
     submitted = submit(queue, config)
-    diagnostic.pump_candidates(queue)
+    # These tests exercise retention, not the resident's wall-time budget.
+    # Schema/fsync scheduling can legitimately exhaust the first 50 ms tick.
+    with patch.object(diagnostic.time, 'monotonic', return_value=0.0):
+        diagnostic.pump_candidates(queue)
     return submitted, diagnostic.claim_candidate(queue, client, config, 'pocket')
+
+
+def test_budget_exhaustion_defers_same_request_until_next_tick(config, queue):
+    before, client = head(queue), http(queue, body=page().encode())
+    submitted = submit(queue, config)
+    with patch.object(diagnostic.time, 'monotonic', side_effect=[0.0, 0.1]):
+        diagnostic.pump_candidates(queue)
+    assert diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.claim_candidate(queue, client, config, 'pocket') is None
+    assert head(queue) == before and client.calls == []
+    with patch.object(diagnostic.time, 'monotonic', return_value=0.0):
+        diagnostic.pump_candidates(queue)
+    job = diagnostic.claim_candidate(queue, client, config, 'pocket')
+    assert job['request_id'] == submitted['request_id']
+    result = diagnostic.fetch_candidate(client, job)
+    diagnostic.finish_candidate(queue, job, result=result)
+    assert not diagnostic.candidate_status(queue.root, submitted['request_id'])['raw_or_names_or_body_retained']
+    assert head(queue) == before and client.calls == [URL]
+    assert not submit(queue, config)['submitted']
 
 
 def test_owner_retains_exact_private_original_and_receipt_without_accepting_body(config, queue):

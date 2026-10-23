@@ -66,17 +66,28 @@ def main(argv=None):
     parser.add_argument("--url-file", type=Path, help="UTF-8 file with one article URL per line; # comments allowed")
     parser.add_argument("--refresh", action="store_true", help="Recheck selected saved articles with conditional HTTP")
     parser.add_argument("--reason", help="Bounded review reason for a missing-body repair request; repair only, no HTTP or owner restart")
+    parser.add_argument('--reviewed-empty-responses', type=Path,
+                        help='Repair only: private JSON mapping selected saved URLs to exact canonical zero-byte receipt references; no HTTP/body/freshness acceptance')
     parser.add_argument("--reviewed-supplement", type=Path, help="Retained public-source diagnostic report for an explicit finite supplement; requires source opt-in, at most16 direct --url arguments; original cohort unchanged")
     parser.add_argument('--reviewed-native-diagnostics', type=Path,
                         help='Explicit approved native diagnostic manifest; fetch only, 1-16 direct URLs, no HTTP or scope/retry reset')
     parser.add_argument("--materialize-reviewed-response", action="store_true",
                         help="Revalidate and durably accept the immutable reviewed response without a second HTTP request; fetch plus --reviewed-supplement only")
     parser.add_argument("--reviewed-source-outcomes", type=Path, help="Explicit non-body finite metadata correction through retained canonical probes; enqueue only, no HTTP or scope extension")
+    parser.add_argument('--reviewed-url-references', type=Path,
+                        help='Explicit pinned completed alias audit; enqueue only, 1-16 direct URLs; metadata links, no body copies or HTTP')
     parser.add_argument("--continuous", action="store_true", help="Keep one owner and warm bounded workers; sleep only when no source is ready")
     parser.add_argument("--duration-seconds", type=float, help="Bounded continuous diagnostic; normal service has no duration limit")
     args = parser.parse_args(argv)
     if (args.command == 'repair') != (args.reason is not None):
         parser.error('repair requires --reason; --reason belongs to repair')
+    if args.reviewed_empty_responses and args.command != 'repair':
+        parser.error('reviewed empty responses belong to repair only')
+    if args.reviewed_url_references and (args.command != 'enqueue' or args.url_file is not None
+            or not 1 <= len(args.url) <= 16 or args.refresh or args.reviewed_supplement
+            or args.reviewed_native_diagnostics or args.reviewed_source_outcomes
+            or args.materialize_reviewed_response or args.skip_local_ingest or args.continuous):
+        parser.error('reviewed URL references require enqueue and 1-16 direct URLs, without other mutations')
     if args.command == 'repair' and (args.refresh or args.reviewed_supplement or args.materialize_reviewed_response
             or args.reviewed_native_diagnostics or args.reviewed_source_outcomes or args.skip_local_ingest):
         parser.error('repair submits known missing parser failures under the reviewed source contract only; no refresh, supplement or ingest flags')
@@ -109,9 +120,17 @@ def main(argv=None):
     if args.command == 'repair':
         # Must stay before lifecycle/queue/HTTP construction. A live owner is
         # expected; this command only reads its heads and seals a local inbox.
-        from downloader.news_fulltext_repairs import submit_repairs
+        from downloader.news_fulltext_repairs import MAX_REQUEST_BYTES, _unique, submit_repairs
         from downloader.artifact_io import atomic_write_bytes
-        result = submit_repairs(root, registry, selected_urls(args), reason=args.reason)
+        witnesses = None
+        if args.reviewed_empty_responses:
+            with args.reviewed_empty_responses.open('rb') as stream:
+                raw = stream.read(MAX_REQUEST_BYTES + 1)
+            if len(raw) > MAX_REQUEST_BYTES:
+                raise ValueError('empty_response_manifest_too_large')
+            witnesses = json.loads(raw, object_pairs_hook=_unique)
+        result = submit_repairs(root, registry, selected_urls(args), reason=args.reason,
+                                empty_response_witnesses=witnesses)
         if args.output:
             atomic_write_bytes(args.output, json.dumps(result, ensure_ascii=False, indent=2).encode(), durable=True, mode=0o600)
         print_status(result)
@@ -183,6 +202,15 @@ def main(argv=None):
         from downloader.news_fulltext_failure_focus import configure_focus
         configure_focus(queue, config.get('failure_diagnostic_focus'),
                         metadata_identity_upgrade=config.get('failure_diagnostic_metadata_identity_upgrade', False))
+        if args.reviewed_url_references:
+            from downloader.news_fulltext_references import install_reviewed_references
+            references = install_reviewed_references(queue, args.url, args.reviewed_url_references)
+            result = queue.status(activity='reviewed_publisher_references_installed')
+            result['reviewed_publisher_references'] = references
+            if args.output:
+                atomic_write_json(args.output, result)
+            print_status(result)
+            return 0
         if args.reviewed_source_outcomes:
             from downloader.news_fulltext_cohorts import record_reviewed_source_outcomes
             result = record_reviewed_source_outcomes(queue, args.url, args.reviewed_source_outcomes)

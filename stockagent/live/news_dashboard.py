@@ -157,6 +157,31 @@ def _body_state_coverage(value: Any, counts: Mapping[str, int], stored: int | No
         'retained_bodies_are_not_missing': True, 'all_history_complete': False}
 
 
+def _publisher_reference_coverage(value: Any, known: int | None, stored: int | None,
+                                  coverage: dict | None) -> dict[str, Any] | None:
+    """Metadata links are a disjoint URL resolution, never stored body heads."""
+    raw = _object(value)
+    if (known is None or stored is None or coverage is None
+            or type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or type(raw.get('new_article_bodies')) is not int or raw['new_article_bodies'] != 0
+            or raw.get('raw_alias_response_retained') is not False or raw.get('all_history_complete') is not False):
+        return None
+    fields = ('registered_urls', 'verified_reference_urls', 'inactive_reference_urls')
+    counts = {key: _count(raw.get(key)) for key in fields}
+    if (any(number is None for number in counts.values())
+            or counts['registered_urls'] > known
+            or counts['verified_reference_urls'] + counts['inactive_reference_urls'] != counts['registered_urls']
+            or counts['verified_reference_urls'] > coverage['missing_body_states'].get('unsupported_article_path', 0)):
+        return None
+    resolved = stored + counts['verified_reference_urls']
+    if resolved > known:
+        return None
+    return {'contract_version': 1, **counts, 'stored_body_urls': stored,
+        'resolved_url_heads': resolved, 'unresolved_url_heads': known - resolved,
+        'resolved_url_progress_ratio': resolved / known if known else None,
+        'new_article_bodies': 0, 'raw_alias_response_retained': False, 'all_history_complete': False}
+
+
 def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
     """Safe optional owner projection; legacy/unreconciled snapshots are unknown."""
     raw = _object(value)
@@ -911,6 +936,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "stored_body_urls": stored_urls, "stored_body_progress_ratio": stored_ratio,
             "stored_body_counter_available": stored_counter_supported,
             "body_coverage": body_coverage,
+            "publisher_reference_coverage": _publisher_reference_coverage(
+                raw.get('publisher_body_references'), known, stored_urls, body_coverage) if valid else None,
             "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": _body_work_progress(raw.get('body_work_progress'), ready) if identifier == 'cnyes' else None,

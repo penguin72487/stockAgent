@@ -36,6 +36,14 @@ SOURCE_TOPICS = {
     "unregistered:buzzorange.com": "technology_business", "unregistered:www.wantgoo.com": "financial_markets",
     "unregistered:news.wearn.com": "financial_markets", "unregistered:www.investor.com.tw": "financial_markets",
     "unregistered:www.businessinsider.tw": "technology_business",
+    "unregistered:hk.investing.com": "financial_markets",
+    "unregistered:cn.investing.com": "financial_markets",
+    "unregistered:m.hk.investing.com": "financial_markets",
+    "unregistered:finance.eastmoney.com": "financial_markets",
+    "unregistered:www.cw.com.tw": "technology_business",
+    "cw": "technology_business",
+    "unregistered:crossing.cw.com.tw": "technology_business",
+    "unregistered:csr.cw.com.tw": "environment_energy",
 }
 
 ERROR_REPAIRS = {
@@ -58,6 +66,59 @@ ERROR_REPAIRS = {
     "unsupported_article_path": "verify legitimate article namespace, requeue only scoped path failures after changed capture contract",
     "article_identity_not_verified": "validate source article ID and canonical/embedded URL; never merge infinite-scroll articles",
 }
+
+
+def review_resume_plan(item, review):
+    """Reuse completed review steps, without declaring missing bodies done.
+
+    These are engineering handoff annotations only. A review is neither a
+    runtime permission source nor a reason to reset a source refusal deadline.
+    An incomplete review resumes its unresolved question; permission-waiting
+    sources stay inventoried but do not become fresh adapter/review work.
+    """
+    decision = review.get("capture_decision")
+    if decision == "permission_required":
+        state, completed, action = ("completed_waiting_permission", True,
+            "obtain_source_permission_without_repeating_unchanged_review")
+    elif decision == "authorized_api_configuration_required":
+        state, completed, action = ("completed_waiting_api_configuration", True,
+            "configure_verified_authorized_api_without_repeating_review")
+    elif decision == "review_incomplete":
+        state, completed, action = ("partially_completed", False,
+            "continue_unresolved_source_scope_not_completed_review_steps")
+    elif decision in {"private_public_candidate", "reviewed_existing_scope"}:
+        state, completed, action = ("completed_for_recorded_scope", True,
+            "verify_remaining_adapter_and_body_work_within_recorded_scope")
+    elif item.get("enabled"):
+        state, completed, action = ("existing_runtime_policy_not_new_review", False,
+            "retain_existing_collector_and_verify_remaining_body_work")
+    else:
+        state, completed, action = ("not_started", False,
+            "review_source_before_adapter_admission")
+    # Source-level status alone cannot distinguish an answered subquestion
+    # from a genuinely unresolved one. Project only the recorded scope; an
+    # empty legacy list is unknown, never proof there is no remaining work.
+    scope = review.get('current_scope_review', {})
+    if not isinstance(scope, dict):
+        raise ValueError('invalid recorded source review questions')
+    completed_questions = scope.get('completed_questions', [])
+    remaining_questions = scope.get('remaining_questions', [])
+    for questions in (completed_questions, remaining_questions):
+        if (not isinstance(questions, list) or len(questions) > 64
+                or any(not isinstance(q, str) or not q.strip() or len(q) > 800
+                       or not q.isprintable() for q in questions)
+                or len(set(questions)) != len(questions)):
+            raise ValueError('invalid recorded source review questions')
+    if set(completed_questions) & set(remaining_questions):
+        raise ValueError('invalid recorded source review questions')
+    return {"source_review_work_state": state, "recorded_review_stage_complete": completed,
+            "review_resume_action": action,
+            "review_revisit_trigger": "new_scope_policy_authorization_or_scheduled_policy_revalidation",
+            "review_annotation_grants_capture_access": False,
+            "review_question_inventory_available": bool(completed_questions or remaining_questions),
+            "completed_review_questions_json": json.dumps(completed_questions, ensure_ascii=False),
+            "remaining_review_questions_json": json.dumps(remaining_questions, ensure_ascii=False),
+            "review_questions_are_exhaustive_body_work": False}
 
 
 def implementation_plan(item, provider, entry, review):
@@ -90,6 +151,8 @@ def implementation_plan(item, provider, entry, review):
         action, family = "configure_and_verify_authorized_api_contract", "authorized_provider_api"
     elif review.get("capture_decision") == "permission_required":
         action = "permission_required_before_automatic_body_capture"
+    elif review.get("capture_decision") in {"private_public_candidate", "reviewed_existing_scope"}:
+        action = "verify_remaining_shared_adapter_within_recorded_scope"
     else:
         action = "review_then_extend_shared_source_adapter"
     errors = sorted({error["error_code"] for error in item.get("errors", []) if error.get("error_code")})
@@ -112,6 +175,7 @@ def implementation_plan(item, provider, entry, review):
         "review_evidence_urls_json": json.dumps(review.get("evidence_urls", []), ensure_ascii=False),
         "source_policy_observation": review.get("observation", "No new access permission inferred"),
         "reviewed_at_utc": review.get("reviewed_at_utc"),
+        **review_resume_plan(item, review),
         "observed_error_codes_json": json.dumps(errors),
         "remediation_actions_json": json.dumps(list(dict.fromkeys(repairs)), ensure_ascii=False),
         "cpu_strategy": "one body parse; indexed URL dedup and dispatch; receipt-bounded batch writes; no completed finite rescan",
@@ -178,6 +242,9 @@ def apply_work_order(rows, policy):
                                  else 1 if row['known_urls'] or row['literal_metadata_links'] else 2)
         row['implementation_state'] = (
             'deferred_by_user' if provider in deferred else
+            'waiting_source_permission' if (not row['enabled']
+                and (row['missing_body_urls'] or row['unqueued_literal_link_work'])
+                and row['implementation_action'] == 'permission_required_before_automatic_body_capture') else
             'repair_or_backfill_known_urls' if row['missing_body_urls'] else
             'review_literal_original_links' if row['unqueued_literal_link_work'] else
             'maintenance_only' if row['known_urls'] else 'review_discovery_after_known_urls')
@@ -202,6 +269,8 @@ def apply_work_order(rows, policy):
     return {
         'work_order_contract_version': version, 'selected_work_order': policy, **parallel,
         'implementation_order': [row['provider'] for row in work],
+        'actionable_implementation_order': [row['provider'] for row in work
+            if row['implementation_state'] != 'waiting_source_permission'],
         'body_downloader_implementation_order': [row['provider'] for row in work if row['body_downloader_candidate']],
         'deferred_source_keys': sorted(row['provider'] for row in rows if row['provider'] in deferred),
         'running_collectors_stopped': False, 'publisher_requests': 0, 'queue_writes': False,
@@ -253,6 +322,12 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         elif reviews.get(provider, {}).get("capture_decision") == "authorized_api_configuration_required":
             strategy, stage = "authorized_api_configuration_and_capability_check", 1
             gate = "existing user authorization accepted; actual licensed API product/key, tool schema, history and quota need verification"
+        elif reviews.get(provider, {}).get("capture_decision") == "permission_required":
+            strategy, stage = "retain_completed_review_wait_for_source_permission", 5
+            gate = "existing review retained; actual source permission or changed policy/scope evidence required, not a new identical review"
+        elif reviews.get(provider, {}).get("capture_decision") in {"private_public_candidate", "reviewed_existing_scope"}:
+            strategy, stage = "verify_remaining_adapter_within_recorded_scope", 1 if small or small_metadata else 2
+            gate = "reuse recorded review; verify unresolved native body, identity, byline and clocks before canonical admission; review annotation grants no capture access"
         elif known == 0 and literal_links:
             # A literal URL recovered from local metadata is reviewable work,
             # not an empty source. These are alias associations, however, not
@@ -313,6 +388,19 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         "unqueued_literal_link_source_keys": sum(row["unqueued_literal_link_work"] for row in rows),
         "plan_is_acquisition_acceptance": False, "all_history_complete": False,
         "source_policy_review_counts": dict(Counter(row["source_policy_review"] for row in rows)),
+        "review_resume_contract_version": 2,
+        "source_review_work_state_counts": dict(Counter(row["source_review_work_state"] for row in rows)),
+        "completed_review_source_keys": [row['provider'] for row in rows
+            if row['recorded_review_stage_complete']],
+        "remaining_source_review_order": [row['provider'] for row in rows
+            if row['source_review_work_state'] in {'not_started', 'partially_completed'}
+            and row['source_role'] not in {'redirector', 'aggregator', 'social_or_video'}
+            and (row['missing_body_urls'] or row['unqueued_literal_link_work'])
+            and row.get('implementation_state') != 'deferred_by_user'],
+        "waiting_source_permission_keys": [row['provider'] for row in rows
+            if not row['enabled'] and row['source_policy_review'] == 'permission_required'
+            and (row['missing_body_urls'] or row['unqueued_literal_link_work'])],
+        "completed_review_is_not_completed_body_history": True,
         "implementation_action_counts": dict(Counter(row["implementation_action"] for row in rows)),
         "all_source_keys_planned": len(rows) == len(inventory["providers"]),
         "all_sites_live_reviewed": all(row["source_policy_review"] != "not_reviewed" for row in rows),
@@ -329,16 +417,21 @@ def main(argv=None):
     parser.add_argument("--work-order", type=Path, help="Selected engineering focus and optional parallel background order; no HTTP or queue mutation")
     args = parser.parse_args(argv)
     before = sha256_file(args.inventory)
-    entries, reviews, inputs = {}, {}, {}
+    producer = Path(__file__).resolve()
+    entries, reviews, inputs = {}, {}, {str(producer): sha256_file(producer)}
     if args.config:
         from stockagent.data.news_source_catalog import load_news_configuration, configuration_paths
         config = load_news_configuration(args.config)
         entries = {entry["id"]: entry for entry in config["providers"]}
         inputs.update({str(path): sha256_file(path) for path in configuration_paths(args.config)})
-    if args.reviews:
+    reviews_path = args.reviews
+    if reviews_path is None and args.config:
+        from stockagent.data.news_source_catalog import planning_review_path
+        reviews_path = planning_review_path(args.config)
+    if reviews_path is not None:
         from stockagent.data.news_source_catalog import load_source_review_ledger
-        inputs[str(args.reviews)] = sha256_file(args.reviews)
-        reviews = load_source_review_ledger(args.reviews)
+        inputs[str(reviews_path)] = sha256_file(reviews_path)
+        reviews = load_source_review_ledger(reviews_path)
     work_order = None
     if args.work_order:
         inputs[str(args.work_order)] = sha256_file(args.work_order)
@@ -351,6 +444,8 @@ def main(argv=None):
         raise ValueError("source recipes or review ledger changed during planning")
     result["input_sha256"] = before
     result["planning_inputs_sha256"] = inputs
+    result["review_ledger_selection"] = ("explicit" if args.reviews else
+                                        "configured_catalog" if reviews_path is not None else "none")
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(args.output, result)
     buffer = io.StringIO(newline="")

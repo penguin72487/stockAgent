@@ -23,7 +23,7 @@ from downloader.tej_history import (
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("register", "prioritize", "recover-unlaunched", "run", "watch", "recover", "recover-desktop", "retry-unknown", "restart-unknown", "repair-key-layout", "repair-period-grid", "reopen-query", "restart-addin", "verify-interface", "compact-queue", "revalidate-scopes", "settle-metadata-error", "isolate-metadata", "isolate-source-response", "recover-local-input", "settle-preview-limit", "upgrade-preview-planning", "upgrade-query-tiling", "upgrade-query-capacity", "verify-input"))
+    p.add_argument("action", choices=("register", "prioritize", "recover-unlaunched", "run", "watch", "recover", "recover-desktop", "retry-metadata", "retry-unknown", "restart-unknown", "repair-key-layout", "repair-period-grid", "reopen-query", "restart-addin", "verify-interface", "compact-queue", "revalidate-scopes", "settle-metadata-error", "isolate-metadata", "isolate-source-response", "recover-local-input", "settle-preview-limit", "upgrade-preview-planning", "upgrade-query-tiling", "upgrade-query-capacity", "verify-input"))
     p.add_argument("--root", type=Path, default=Path("data_tej"))
     p.add_argument("--inventory", type=Path)
     p.add_argument("--priority-plan", type=Path, help="Finite verified source scopes; metadata only, existing service executes")
@@ -108,8 +108,8 @@ def main(argv=None):
         finally:
             for sig, handler in previous_handlers.items():
                 signal.signal(sig, handler)
-    if a.acknowledge_unknown_usage and a.action not in {'retry-unknown','restart-unknown'}:
-        p.error('--acknowledge-unknown-usage is only valid for explicit retry-unknown/restart-unknown')
+    if a.acknowledge_unknown_usage and a.action not in {'retry-metadata','retry-unknown','restart-unknown'}:
+        p.error('--acknowledge-unknown-usage is only valid for explicit retry-metadata/retry-unknown/restart-unknown')
     if a.allow_discard_query_settings and a.action not in {'reopen-query','restart-addin','restart-unknown'}:
         p.error('--allow-discard-query-settings is only valid for explicit query lifecycle recovery')
     if a.allow_restart_addin and a.action not in {'restart-addin','restart-unknown'}:
@@ -136,6 +136,16 @@ def main(argv=None):
                 p.error('verify-input requires --task-id; re-enter the same dates only, no Search/Preview or recovery')
             bridge=DesktopBridge(Path(__file__).resolve().parents[1],json.loads(a.session.read_text()))
             print(json.dumps(verify_desktop_input(root,a.task_id,bridge)))
+        elif a.action == 'retry-metadata':
+            if (a.task_id is None or a.evidence is None or not a.acknowledge_unknown_usage
+                    or a.response is not None or a.error_window is not None or a.max_tasks != 1):
+                p.error('retry-metadata requires one exact --task-id/--evidence and --acknowledge-unknown-usage')
+            from downloader.tej_metadata_recovery import requeue_legacy_metadata
+            bridge=DesktopBridge(Path(__file__).resolve().parents[1],json.loads(a.session.read_text()))
+            result=requeue_legacy_metadata(root,a.task_id,bridge,a.evidence,
+                acknowledge_unknown_usage=True,
+                acknowledge_known_notices=config.get('acknowledge_known_metadata_runtime_notices') is True)
+            print(json.dumps(result))
         elif a.action == 'retry-unknown':
             if a.task_id is None or a.evidence is None or not a.acknowledge_unknown_usage:
                 p.error('retry-unknown requires exact --task-id, original --evidence and --acknowledge-unknown-usage')

@@ -166,6 +166,7 @@
       "source": "/srv/stockagent-live/data_tw_public",
       "source_coordination_lock": ".locks/tw-public-refresh.lock",
       "source_coordination_lock_scope": "source_parent",
+      "source_coordination_lock_mode": "shared_read",
       "role": "training-and-audit",
       "publish": true,
       "pack_buckets": 64,

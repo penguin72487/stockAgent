@@ -589,6 +589,10 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
             },
             "live_latency": {
                 "quote_fetch_ms": 250.0,
+                "checkpoint_contract_build_ms": 8.0,
+                "checkpoint_contract_validate_ms": 0.05,
+                "quote_preparation_queue_ms": 12.0,
+                "compute_before_publish_ms": 300.0,
                 "model_inference_ms": 40.0,
                 "artifact_publish_ms": 25.0,
                 "quote_transport": {
@@ -628,6 +632,10 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
     assert payload["source_ready_from_open_ms"] == 300.0
     assert payload["source_ready_to_signal_ms"] == 500.0
     assert payload["stages"]["model_inference_ms"] == 40.0
+    assert payload["stages"]["checkpoint_contract_build_ms"] == 8.0
+    assert payload["stages"]["checkpoint_contract_validate_ms"] == 0.05
+    assert payload["stages"]["quote_preparation_queue_ms"] == 12.0
+    assert payload["stages"]["signal_other_compute_ms"] == 10.0
     assert payload["stages"]["quote_request_body_ms"] == 150.0
     assert payload["stages"]["quote_usage_before_ms"] == 0.0
     assert payload["stages"]["quote_traffic_record_ms"] == 3.0

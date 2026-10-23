@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 import uuid
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -15,6 +17,44 @@ if str(ROOT) not in sys.path:sys.path.insert(0,str(ROOT))
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import DesktopBridge
 from downloader import tej_windows_transport as transport
+
+
+def probe(root: Path, output: Path, interactive_root: Path) -> dict:
+    """Probe the caller's ACTUAL namespace/relay; never invokes the bridge.
+
+    Run this same command in the collector's service sandbox and outside it.
+    An interactive shell success does not establish service launch readiness.
+    """
+    from downloader.tej_startup import interactive_transport
+    root, output = root.resolve(), output.resolve()
+    if root.exists() or output.exists():
+        raise FileExistsError('New isolated transport probe root/output required')
+    root.mkdir(mode=0o700, parents=True)
+    relay = interactive_transport(interactive_root.resolve())
+    request = root/'requests'/('f'*24+'-'+uuid.uuid4().hex+'.json')
+    atomic_write_json(request, {'action': 'read_only_windows_session_probe', 'provider_queries_sent': 0})
+    started = time.monotonic()
+    accepted = False
+    outcome = 'unknown'
+    try:
+        result = transport.run_guarded_windows('[Console]::Write([Diagnostics.Process]::GetCurrentProcess().SessionId)',
+            request=request, windows_path=DesktopBridge.windows_path, timeout=30,
+            windows_session_id=relay['windows_session_id'], interop_socket=relay['interop_socket'])
+        accepted = result.returncode == 0 and result.stdout.decode('utf-8-sig').strip() == str(relay['windows_session_id'])
+        outcome = 'exact_interactive_session' if accepted else 'admitted_probe_failed'
+    except transport.UnpermittedWindowsLaunch as exc:
+        transport.validate_unpermitted(root, request, exc.evidence)
+        outcome = 'proven_unpermitted'
+    except subprocess.TimeoutExpired:
+        # A durable permit may exist. Keep the failure distinct from the
+        # proven-unpermitted case and never retry it within this diagnostic.
+        outcome = 'admitted_timeout'
+    report = {'contract': 'same_caller_namespace_interactive_windows_probe_v1', 'accepted': accepted,
+        'outcome': outcome, 'seconds': time.monotonic()-started,
+        'linux_mount_namespace': os.readlink('/proc/self/ns/mnt'),
+        'provider_queries_sent': 0, 'desktop_actions_sent': 0, 'tej_or_excel_connected': False}
+    atomic_write_json(output, report)
+    return report
 
 
 def run(root: Path, output: Path) -> dict:
@@ -28,7 +68,7 @@ def run(root: Path, output: Path) -> dict:
         marker=root/(mode+'.executed')
         command="[IO.File]::WriteAllText("+DesktopBridge.quote(DesktopBridge.windows_path(marker))+",'fixture executed once')"
         if mode=='admitted_error':command='exit 88'
-        if mode=='admitted_timeout':command='Start-Sleep -Seconds 4;exit 0'
+        if mode=='admitted_timeout':command='Start-Sleep -Seconds 30;exit 0'
         original=transport.subprocess.Popen;launches=[];outcome=None
         def launch(argv, **kwargs):
             if argv[0]==transport.POWERSHELL:
@@ -43,8 +83,13 @@ def run(root: Path, output: Path) -> dict:
         try:
             try:
                 result=transport.run_guarded_windows(command,request=request,windows_path=DesktopBridge.windows_path,
-                    readiness_seconds=1 if mode=='admitted_timeout' else 5,
-                    timeout=2 if mode=='admitted_timeout' else 30)
+                    # Starting Windows PowerShell itself can take several
+                    # seconds. A one-second admission gate injected the wrong
+                    # fault (not admitted) instead of the intended post-permit
+                    # timeout. Keep startup bounded and make only the fixture
+                    # command exceed the overall deadline.
+                    readiness_seconds=5,
+                    timeout=10 if mode=='admitted_timeout' else 30)
                 outcome='completed' if result.returncode==0 else 'admitted_unknown'
             except transport.UnpermittedWindowsLaunch as exc:
                 transport.validate_unpermitted(root,request,exc.evidence);outcome='proven_unpermitted'
@@ -71,8 +116,14 @@ def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--interactive-probe-root', type=Path,
+                        help='Read the live relay only; probe exact caller namespace, no source/GUI access')
     args=parser.parse_args(argv)
+    if args.interactive_probe_root:
+        report = probe(args.root, args.output, args.interactive_probe_root)
+        print(json.dumps(report))
+        return 0 if report['accepted'] else 1
     print(json.dumps(run(args.root,args.output)))
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':raise SystemExit(main())

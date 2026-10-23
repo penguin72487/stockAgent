@@ -11,6 +11,7 @@ import argparse
 import ast
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import copy
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -410,7 +411,8 @@ def raw_trial(path, *, enabled, readers=3):
             "columns": tables[0].num_columns, "stats": cache.stats()}
 
 
-def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
+def ipc_trial(state_dir, symbols, *, autonomous, stall_ms, response_format=None,
+              mixed_missing_values=False):
     start = time.perf_counter()
     base = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=9, minute=0, second=0, microsecond=0)
 
@@ -431,7 +433,22 @@ def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
     for index, field in enumerate(quotes._PRICE_SNAPSHOT_ARRAY_FIELDS):
         if getattr(fixture, field) is None:
             setattr(fixture, field, prices + index + .125)
+    if mixed_missing_values:
+        # Non-finite placeholders must survive transport, not become JSON null
+        # or zero-volume observations. These remain synthetic transport values.
+        for field in ("prices", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS):
+            values = getattr(fixture, field)
+            values[::17] = np.nan
+            if len(values) > 3:
+                values[1:4] = [-0.0, np.nextafter(100., 101.), np.inf]
+        fixture.available_mask = np.isfinite(fixture.prices) & (fixture.prices > 0)
+        fixture.available_count = int(fixture.available_mask.sum())
+        fixture.timestamps_ms[-1] = 2 ** 53 + 1
+        fixture.simtrade_flags[::17] = -1
     published, write_json = threading.Event(), quotes._atomic_write_json
+    write_bytes, decode = quotes._atomic_write_quote_bytes, quotes._decode_quote_ipc
+    response_sizes, response_formats, decode_spans, publish_spans = [], [], [], []
+    write_response = quotes._atomic_write_quote_response
 
     def publish(path, payload):
         write_json(path, payload)
@@ -443,13 +460,52 @@ def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
             raise AssertionError("IPC fixture changed the requested axis")
         return fixture
 
-    with patch.object(quotes, "datetime", OpeningClock), \
-            patch.object(quotes, "_atomic_write_json", publish), \
-            patch.object(quotes, "fetch_shioaji_stock_snapshots", provider):
+    def observe_write(path, body):
+        if path.parent.name == "responses":
+            response_sizes.append(len(body))
+            response_formats.append("msgpack_v1" if body.startswith(quotes._QUOTE_IPC_MSGPACK_MAGIC) else "json_v1")
+        return write_bytes(path, body)
+
+    def observe_response(*args):
+        started = time.perf_counter()
+        try:
+            return write_response(*args)
+        finally:
+            publish_spans.append((time.perf_counter() - started) * 1000)
+
+    def observe_decode(body):
+        started = time.perf_counter()
+        try:
+            return decode(body)
+        finally:
+            decode_spans.append((time.perf_counter() - started) * 1000)
+
+    def verify(result):
+        digest = hashlib.sha256()
+        for field in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
+                      "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms", "simtrade_flags"):
+            left, right = getattr(result, field), getattr(fixture, field)
+            if left.dtype != right.dtype or left.shape != right.shape or left.tobytes() != right.tobytes():
+                raise AssertionError(f"full IPC snapshot/clock/coverage parity failed: {field}")
+            digest.update(field.encode())
+            digest.update(right.dtype.str.encode())
+            digest.update(right.tobytes())
+        if result.available_count != fixture.available_count or result.requested_count != len(symbols):
+            raise AssertionError("full IPC requested/available count changed")
+        return digest.hexdigest()
+
+    with ExitStack() as patches:
+        for name, replacement in (("datetime", OpeningClock), ("_atomic_write_json", publish),
+                ("_atomic_write_quote_bytes", observe_write), ("_decode_quote_ipc", observe_decode),
+                ("_atomic_write_quote_response", observe_response), ("fetch_shioaji_stock_snapshots", provider)):
+            patches.enter_context(patch.object(quotes, name, replacement))
+        if response_format is not None:
+            patches.enter_context(patch.object(quotes, "_quote_ipc_response_format", lambda: response_format))
         broker = quotes.SharedDayTradeQuoteBroker(state_dir, autonomous=autonomous)
         broker.authorize(base.date().isoformat())
         try:
             with ThreadPoolExecutor(max_workers=1) as pool:
+                workflow_started = time.perf_counter()
                 client = pool.submit(quotes.fetch_shared_day_trade_stock_snapshots,
                     symbols, np.full(len(symbols), np.nan), state_dir=state_dir,
                     purpose="opening_signal", timeout_seconds=5, on_progress=lambda *_: None)
@@ -461,23 +517,55 @@ def ipc_trial(state_dir, symbols, *, autonomous, stall_ms):
                     broker.poll(allowed_purposes={"opening_signal"})
                     time.sleep(0.001)
                 result = client.result(timeout=1)
+                output_sha256 = verify(result)
+                verified_ms = (time.perf_counter() - workflow_started) * 1000
         finally:
             broker.close()
-    digest = hashlib.sha256()
-    for field in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
-                  "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms", "simtrade_flags"):
-        left, right = getattr(result, field), getattr(fixture, field)
-        if left.dtype != right.dtype or left.shape != right.shape or left.tobytes() != right.tobytes():
-            raise AssertionError(f"full IPC snapshot/clock/coverage parity failed: {field}")
-        digest.update(field.encode())
-        digest.update(right.dtype.str.encode())
-        digest.update(right.tobytes())
-    if result.available_count != len(symbols) or result.requested_count != len(symbols):
-        raise AssertionError("full IPC requested/available count changed")
     return {"client_total_ms": result.transport_timing["client_total_ms"],
+            "request_to_verified_readback_ms": verified_ms,
             "server_request_queue_ms": result.transport_timing["server_request_queue_ms"],
             "server_receiver_thread": result.transport_timing["server_receiver_thread"],
-            "fixture_output_sha256": digest.hexdigest()}
+            "response_write_bytes": sum(response_sizes), "response_write_count": len(response_sizes),
+            "response_formats": response_formats, "response_encode_publish_ms": sum(publish_spans),
+            "client_response_decode_ms": sum(decode_spans), "fixture_output_sha256": output_sha256}
+
+
+def run_ipc_serialization(receipt_path, output, *, repeats=7):
+    """Balanced full-axis codec comparison with the identical autonomous owner."""
+    if not quotes.private_json.native_available():
+        raise RuntimeError("MessagePack comparison requires the optional installed msgspec decoder")
+    raw = receipt_path.read_bytes()
+    receipt = json.loads(raw)
+    symbols = receipt["requested_symbols"]
+    if not symbols or len(symbols) != len(set(symbols)) or len(symbols) != receipt["requested_count"]:
+        raise ValueError("complete unique recorded universe required")
+    samples = []
+    with tempfile.TemporaryDirectory(prefix="opening-ipc-codec-") as temp:
+        for index in range(repeats):
+            pair = {}
+            for codec in (["json_v1", "msgpack_v1"] if index % 2 == 0 else ["msgpack_v1", "json_v1"]):
+                pair[codec] = ipc_trial(Path(temp) / f"{index}-{codec}", symbols,
+                    autonomous=True, stall_ms=0, response_format=codec, mixed_missing_values=True)
+                if pair[codec]["response_formats"] != [codec]:
+                    raise AssertionError("codec comparison silently used a fallback")
+                if pair[codec]["server_receiver_thread"] != "tw-shared-quote-owner":
+                    raise AssertionError("codec comparison changed quote ownership")
+            if len({row["fixture_output_sha256"] for row in pair.values()}) != 1:
+                raise AssertionError("full IPC numeric/NaN/signed-zero/int64/flag parity failed")
+            samples.append(pair)
+    result = {"contract": "opening_ipc_serialization_paired_offline_v1",
+        "scope": "full_axis_request_to_verified_readback_not_provider_model_or_live_opening_slo",
+        "observed_at": datetime.now().astimezone().isoformat(), "symbol_count": len(symbols),
+        "session_date": receipt["session_date"], "official_receipt_sha256": hashlib.sha256(raw).hexdigest(),
+        "candidate_quote_owner_sha256": sha256_file(Path(quotes.__file__)),
+        "injected_stall_ms": 0, "fixture_has_non_finite_signed_zero_and_int64_over_2pow53": True,
+        "api_requests": 0, "broker_orders": 0, "ledger_writes": 0, "all_outputs_equal": True,
+        "pairs": samples, "median": {codec: {field: statistics.median(row[codec][field] for row in samples)
+            for field in ("request_to_verified_readback_ms", "client_total_ms", "server_request_queue_ms",
+                          "response_write_bytes", "response_encode_publish_ms", "client_response_decode_ms")}
+            for codec in ("json_v1", "msgpack_v1")}}
+    atomic_write_json(output, result)
+    return result
 
 
 def run_ipc(receipt_path, output, *, repeats=7, stall_ms=200):
@@ -572,6 +660,8 @@ if __name__ == "__main__":
                         help="With --receipt, compare full-axis cache read/merge during durable flush")
     parser.add_argument("--ipc-only", action="store_true",
                         help="With --receipt, isolate full-axis IPC from feature-source rebuilding")
+    parser.add_argument("--ipc-serialization", action="store_true",
+                        help="With --receipt, compare negotiated codecs with the same owner and no injected stall")
     parser.add_argument("--factorized-market-config", type=Path,
                         help="Instead measure complete verified attachment/alignment, no model or quotes")
     parser.add_argument("--output", type=Path, required=True)
@@ -586,7 +676,10 @@ if __name__ == "__main__":
         parser.error("--cache-flush requires --receipt")
     if args.ipc_only and (not args.receipt or args.cache_flush):
         parser.error("--ipc-only requires --receipt and cannot combine with --cache-flush")
-    measured = (run_ipc(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
+    if args.ipc_serialization and (not args.receipt or args.ipc_only or args.cache_flush):
+        parser.error("--ipc-serialization requires --receipt and cannot combine with other modes")
+    measured = (run_ipc_serialization(args.receipt, args.output, repeats=args.repeats)
+                if args.ipc_serialization else run_ipc(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
                 if args.ipc_only else run_cache_flush(args.receipt, args.output, repeats=args.repeats, stall_ms=args.stall_ms)
                 if args.cache_flush else run_factorized_stages(args.factorized_market_config, args.output, repeats=args.repeats)
                 if args.factorized_market_config else

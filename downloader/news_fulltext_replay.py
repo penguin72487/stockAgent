@@ -29,6 +29,129 @@ from downloader.news_fulltext_queue import source_path, utc_now
 
 REPLAY_CHECKPOINT_CONTRACT_VERSION = 2
 RETAINED_FAILURE_REPLAY_VERSION = 1
+RETAINED_NONTEXT_OUTCOME_KIND = 'reviewed_retained_nontext_outcome'
+_ORIGINAL_REFERENCE_FIELDS = frozenset({'kind','path','sha256','receipt_path','receipt_sha256','response_sha256'})
+
+
+def validate_nontext_original_reference(reference):
+    """Only canonical immutable originals; no arbitrary local-file reader."""
+    if not isinstance(reference,dict) or set(reference)!=_ORIGINAL_REFERENCE_FIELDS:
+        raise ValueError('invalid_retained_outcome_reference')
+    if any(not isinstance(reference[key],str) or re.fullmatch(r'[0-9a-f]{64}',reference[key]) is None
+           for key in ('sha256','receipt_sha256','response_sha256')):
+        raise ValueError('invalid_retained_outcome_reference')
+    if reference['kind']=='native_candidate_original':
+        pattern=r'reviewed_repairs/candidate_diagnostics/originals/[0-9a-f]{64}\.parquet'
+    elif reference['kind']=='failure_diagnostic_original':
+        pattern=r'diagnostics/[0-9]{8}/globalvoices/[0-9]{8}T[0-9]{12}Z-[0-9a-f]{8}\.parquet'
+    else:
+        raise ValueError('invalid_retained_outcome_reference')
+    if (not isinstance(reference['path'],str) or re.fullmatch(pattern,reference['path']) is None
+            or reference['receipt_path']!=reference['path'][:-8]+'.receipt.json'):
+        raise ValueError('invalid_retained_outcome_reference')
+
+
+def classify_retained_nontext_outcome(queue, source, target, reference):
+    """Existing single writer projects one verified original, without HTTP.
+
+    This is a missing-only source outcome, not body acceptance, a new check or
+    an invented publication clock. The existing repair transaction/receipt
+    owns crash recovery; invalid/stale evidence never turns into a retry.
+    """
+    from dataclasses import replace
+    from downloader.news_fulltext_candidate_originals import private_globalvoices_original_permit
+    from downloader.news_fulltext_policy import GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION
+    from downloader.news_fulltext_publishers import globalvoices_verified_nontext_body
+    from downloader.news_fulltext_repairs import _clock,_head,_read_private_request
+
+    validate_nontext_original_reference(reference)
+    if (source.provider!='globalvoices' or GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION!=1
+            or target['state']!='body_not_found' or target['provider']!='globalvoices'
+            or not re.fullmatch(r'[0-9a-f]{64}',source.parser_repair_prior_capture_fingerprint)
+            or source.data_fingerprint==source.parser_repair_prior_capture_fingerprint):
+        raise ValueError('unsupported_retained_outcome_contract')
+    paths=[source_path(queue.root,reference[key]) for key in ('path','receipt_path')]
+    original,receipt_path=paths
+    if (any((queue.root/reference[key]).is_symlink() for key in ('path','receipt_path'))
+            or original.stat().st_size>4<<20 or receipt_path.stat().st_size>65536
+            or sha256_file(original)!=reference['sha256'] or sha256_file(receipt_path)!=reference['receipt_sha256']):
+        raise ValueError('invalid_retained_outcome_evidence')
+    receipt=json.loads(receipt_path.read_bytes());parquet=pq.ParquetFile(original)
+    if (parquet.metadata.num_rows!=1 or parquet.metadata.num_row_groups!=1
+            or parquet.metadata.row_group(0).total_byte_size>4<<20):
+        raise ValueError('unbounded_retained_outcome_evidence')
+    record,=parquet.read().to_pylist();raw=record['raw_response_body']
+    old_capture=source.parser_repair_prior_capture_fingerprint
+    if (not isinstance(raw,bytes) or not 0<len(raw)<=2<<20
+            or hashlib.sha256(raw).hexdigest()!=reference['response_sha256']
+            or record['response_sha256']!=reference['response_sha256']
+            or record['request_url']!=target['url'] or record['final_url']!=target['url']
+            or record['provider']!='globalvoices' or record['data_fingerprint']!=old_capture
+            or record.get('diagnostic_only') is not True or record.get('accepted_as_article') is not False
+            or record.get('publish') is not False):
+        raise ValueError('invalid_retained_outcome_evidence')
+    if reference['kind']=='native_candidate_original':
+        request_id=original.stem
+        processed=queue.root/'reviewed_repairs/candidate_diagnostics/processed'
+        request=_read_private_request(processed/(request_id+'.json'))
+        outcome_path=processed/(request_id+'.outcome.json')
+        if outcome_path.is_symlink() or outcome_path.stat().st_size>65536:
+            raise ValueError('invalid_retained_outcome_actor')
+        outcome=json.loads(outcome_path.read_bytes())
+        job=queue.db.execute('SELECT * FROM native_candidate_jobs WHERE request_id=?',(request_id,)).fetchone()
+        expected={'path':reference['path'],'sha256':reference['sha256'],'receipt_path':reference['receipt_path'],
+            'response_sha256':reference['response_sha256'],'response_bytes':len(raw)}
+        if (request.get('evidence_contract_version')!=13 or request.get('target')!=target
+                or request.get('source')!={'contract_version':1,'data_fingerprint':old_capture,
+                    'parser_fingerprint':source.parser_repair_fingerprint,'authorization_fingerprint':source.authorization_fingerprint}
+                or job is None or job['state']!='observed' or job['owner_id']!=outcome.get('owner_id')
+                or json.loads(job['request_json'])!=request or outcome.get('state')!='observed'
+                or outcome.get('raw_retention_state')!='retained_verified'
+                or outcome.get('article_heads_mutated') is not False
+                or json.loads(job['result_json'])!=outcome.get('result')
+                or outcome['result'].get('private_original')!=expected or receipt.get('original')!=expected
+                or record.get('request_id')!=request_id or record.get('source_document_url')!=target['url']
+                or json.loads(record['transport_redirects_json'])!=[]
+                or record.get('authorization_fingerprint')!=source.authorization_fingerprint
+                or not _clock(target['last_checked_at_utc'])<=_clock(record['observed_at_utc'])<=time.time()):
+            raise ValueError('stale_or_invalid_retained_outcome_actor')
+    else:
+        # These old failure sidecars predate a stored target witness. Only
+        # the original first failure, committed within one second of response
+        # observation, is eligible; a later check/attempt is never overwritten.
+        observed=_clock(receipt['captured_at_utc']);checked=_clock(target['last_checked_at_utc'])
+        if (target['attempts']!=1 or not 0<=checked-observed<=1 or observed>time.time()
+                or receipt.get('provider')!='globalvoices' or receipt.get('error_code')!='body_not_found'
+                or receipt.get('raw_response_retained') is not True or receipt.get('diagnostic_only') is not True
+                or receipt.get('accepted_as_article') is not False or receipt.get('publish') is not False
+                or receipt.get('data_fingerprint')!=old_capture or receipt.get('path')!=reference['path']
+                or receipt.get('sha256')!=reference['sha256'] or receipt.get('response_sha256')!=reference['response_sha256']
+                or receipt.get('request_url')!=target['url'] or receipt.get('final_url')!=target['url']
+                or receipt.get('status')!=200 or record.get('status')!=200
+                or receipt.get('response_bytes')!=len(raw) or record.get('captured_at_utc')!=receipt['captured_at_utc']
+                or json.loads(record['authorization_json'])!=source.authorization
+                or json.loads(receipt['authorization_json'])!=source.authorization):
+            raise ValueError('stale_or_invalid_retained_failure_outcome')
+    # One DOM parse supplies the old permit and the new nontext decision.
+    # No lower body threshold, response re-download, original rewrite or body
+    # writer is involved. Every native CC/author/clock/access gate still runs.
+    headers=json.loads(record['headers_json'])
+    if not isinstance(headers,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in headers.items()):
+        raise ValueError('invalid_retained_outcome_headers')
+    response=Response(target['url'],200,headers,raw)
+    old_source=replace(source,data_fingerprint=old_capture)
+    permit,document=private_globalvoices_original_permit(response,old_source,target['url'],include_document=True)
+    if reference['kind']=='native_candidate_original' and receipt.get('permit')!=permit:
+        raise ValueError('invalid_retained_outcome_permit')
+    if globalvoices_verified_nontext_body(document,source,page_url=target['url'])!='source_body_image_only':
+        return 'retained_nontext_outcome_unresolved'
+    current=queue.db.execute('SELECT * FROM articles WHERE id=?',(bytes.fromhex(target['id']),)).fetchone()
+    from downloader.news_fulltext_repairs import _head_problem
+    if _head_problem(current,time.time(),registry=queue.registry) or _head(current)!=target:
+        return 'head_changed_during_retained_validation'
+    queue.db.execute("UPDATE articles SET state='source_body_image_only',error_code='source_body_image_only' WHERE id=?",
+        (current['id'],))
+    return 'classified_source_body_image_only'
 
 
 def replay_retained_cnyes_failures(queue, *, maximum_responses=4, maximum_wall_seconds=0.5,

@@ -11,9 +11,10 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import uuid
 
-from downloader.artifact_io import atomic_write_json
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json
 from downloader.tej_operation_clock import source_operation_clock
 
 ATTEMPT_CONTRACT = 'attempt_scoped_preview_v1'
@@ -304,7 +305,8 @@ def proved_unsent_prequery(root: Path, con, task: dict, *, finished: bool = Fals
             or any(task.get(k) is not None for k in ('actual_rows','receipt_path','completed_at_utc'))):
         raise ValueError('Ambiguous/adopted prequery outcome; no automatic recovery')
     body=outcome.read_bytes();proof=json.loads(body.decode('utf-8-sig'))
-    original=_read_private(prepared,root/'requests',task_id);request=task_request(root,task)
+    original=_read_private(prepared,root/'requests',task_id)
+    request=task_request(root,task,connection=con)
     if not isinstance(proof, dict) or not isinstance(original, dict):
         raise ValueError('Exact prequery proof and prepared request objects required')
     if (request.get('action')!='download' or request.get('contract_version')!=CONTRACT_VERSION
@@ -504,7 +506,8 @@ def reconcile_unsent_attempt_annotation(root: Path, task_id: str) -> bool:
 
 
 def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int = 60,
-                         max_seconds: int = 900, allow_company_partition: bool = False) -> dict:
+                         max_seconds: int = 900, allow_company_partition: bool = False,
+                         acknowledge_known_notices: bool = False) -> dict:
     """Retry one proved-unsent fragment after a durable per-table backoff.
 
     Caller holds .download.lock. Only a finished exact negative proof and a
@@ -517,6 +520,8 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     from downloader.tej_history import CONTRACT_VERSION
     if type(base_seconds) is not int or type(max_seconds) is not int or not 5 <= base_seconds <= max_seconds <= 3600:
         raise ValueError('Invalid bounded proved-unsent backoff')
+    if type(acknowledge_known_notices) is not bool:
+        raise ValueError('Explicit boolean notice acknowledgement policy required')
     reconcile_unsent_attempt_annotation(root, task_id)
 
     def verified_task(con):
@@ -548,7 +553,35 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
     request={**verified['request'],'action':('repair_source_binding'
         if task['last_error_code']=='source_binding_prequery_needs_review' else 'confirm_metadata_error_cleared')}
     check_started=datetime.now(UTC)
-    payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
+    interface_evidence = []
+    restored_codes = []
+    try:
+        # Keep the one-call fast path. Only a failed interface check needs
+        # inspection; source preparation/Preview is never retried here.
+        try:
+            payload,readback,_=bridge.execute(root,{**task,'request_json':json.dumps(request)})
+        except (RuntimeError,OSError,subprocess.SubprocessError):
+            if not acknowledge_known_notices:
+                raise
+            from downloader.tej_history import restore_owned_metadata_interface
+            payload,readback,interface_evidence,restored_codes=restore_owned_metadata_interface(
+                root,task,verified['request'],bridge,acknowledge_known_notices=True,
+                check_action=request['action'])
+    except (ValueError,RuntimeError,OSError,subprocess.SubprocessError,KeyError,TypeError) as exc:
+        # Callers used to silently swallow this cause on every poll. Keep it
+        # private without changing original evidence or granting any retry.
+        note={'contract':PREQUERY_RETRY_CONTRACT,'state':'waiting_prequery_interface',
+              'task_id':task_id,'attempt_id':verified['attempt_id'],
+              'observed_at_utc':datetime.now(UTC).isoformat(),
+              'prepared_request_sha256':verified['prepared_request_sha256'],
+              'prequery_outcome_sha256':verified['prequery_outcome_sha256'],
+              'exception_type':type(exc).__name__,'private_diagnostic':str(exc)[:4096],
+              'provider_queries_sent':0,'source_rows_adopted':False,'retry_budget_changed':False}
+        diagnostic=root/'local_prequery_recovery'/(verified['attempt_id']+'-interface-'+uuid.uuid4().hex+'.json')
+        atomic_write_bytes(diagnostic,json.dumps(note,ensure_ascii=False).encode(),durable=True,mode=0o600)
+        atomic_write_json(root/'prequery_recovery_status.json',{
+            k:v for k,v in note.items() if k!='private_diagnostic'})
+        raise
     try:
         source_operation_clock(payload['observed_at_utc'],check_started,datetime.now(UTC))
     except (KeyError,TypeError,AttributeError) as exc:
@@ -593,6 +626,9 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
                'prequery_outcome_sha256':verified['prequery_outcome_sha256'],
                'interface_readback_path':str(readback.relative_to(root)),
                'interface_readback_sha256':hashlib.sha256(readback.read_bytes()).hexdigest(),
+               'restored_source_error_codes':restored_codes,
+               'interface_recovery_evidence_sha256':[
+                   hashlib.sha256(p.read_bytes()).hexdigest() for p in interface_evidence],
                'original_evidence_preserved':True,'unknown_outcome_auto_retry':False,'result':result}
         atomic_write_json(audit_path,audit,durable=True)
         con.execute('INSERT OR REPLACE INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
@@ -606,6 +642,14 @@ def defer_unsent_prequery(root: Path, task_id: str, bridge, *, base_seconds: int
         atomic_write_json(audit_path,audit,durable=True)
     except OSError:
         result={**result,'audit_commit_marker_pending':True}
+    try:
+        atomic_write_json(root/'prequery_recovery_status.json',{
+            'contract':PREQUERY_RETRY_CONTRACT,'state':result['state'],'task_id':task_id,
+            'attempt_id':verified['attempt_id'],'observed_at_utc':datetime.now(UTC).isoformat(),
+            'restored_source_error_codes':restored_codes,'provider_queries_sent':0,
+            'source_rows_adopted':False,'next_attempt_at_utc':due})
+    except OSError:
+        pass  # Display failure cannot repeat a committed state transition.
     return result
 
 

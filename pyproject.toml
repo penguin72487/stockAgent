@@ -43,6 +43,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 scripts = ["*.cu"]
+stockagent = ["workflow_metric_tree.cpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

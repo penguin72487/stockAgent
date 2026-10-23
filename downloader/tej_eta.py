@@ -41,13 +41,15 @@ def query_geometry(companies: int, dates: int, fields: int, keys: int,
         return 0, 0
     width = 30 - keys
     full, tail = divmod(fields, width)
-    from downloader.tej_planning import TILING_CONTRACT, company_batch_size, rectangle_queries
+    from downloader.tej_planning import (TILING_CONTRACT, apply_scope_budget, company_batch_size,
+                                         rectangle_queries, scope_row_budget)
+    scoped=apply_scope_budget({'max_rows':config['max_rows_per_export']},config)
 
     queries = 0
     for batch_width, batches in ((width, full), (tail, bool(tail))):
         if not batches:
             continue
-        rows = min(config["max_rows_per_export"], config["max_cells_per_export"] // (batch_width + keys) - 1)
+        rows = min(scope_row_budget(scoped,keys), config["max_cells_per_export"] // (batch_width + keys) - 1)
         size = company_batch_size(companies, dates, rows, config["max_companies_per_export"], keys,
                                   optimize=config.get('query_tiling_contract') == TILING_CONTRACT)
         queries += int(batches) * rectangle_queries(companies, dates, rows, size, keys)
@@ -288,6 +290,9 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                               "max_companies_per_export", "minimum_export_interval_seconds")}}
     provenance['bounds']['query_tiling_contract'] = config.get('query_tiling_contract')
     provenance['bounds']['query_interval_contract'] = interval_contract
+    for key in ('max_scope_rows_per_export','query_scope_contract'):
+        if key in config:
+            provenance['bounds'][key]=config[key]
     fingerprint = hashlib.sha256(json.dumps(provenance, ensure_ascii=False, sort_keys=True, allow_nan=False).encode()).hexdigest()
     return {"contract": CONTRACT, "as_of_utc": observed.isoformat(), "history_cutoff": cutoff,
             "input_sha256": fingerprint, "execution_state": "finite_batch_running" if alive else "not_running",
@@ -313,4 +318,6 @@ def build_staged_eta(tables: list[dict], samples: list[dict], config: dict,
                 "含完整查詢、驗證、保存、收據與工作間隔；不把恢復舊結果當下載速度",
                 "假設來源故障已修復；官方配額、桌面空檔與外部修復等待未知，未計入",
                 "筆數與容量是稀疏樣本外推，本機含原始匯出＋Parquet，不是網路流量",
+                *(["公司×日期查詢範圍與原始讀回列數分開；來源若超量會縮回小分批，尚未發生的回退成本未計入"]
+                  if config.get('query_scope_contract') else []),
                 "只估固定 cutoff 的既有範圍；原生歷史完整、精度、訓練可用與多源校驗另需驗證"]}

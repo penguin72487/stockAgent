@@ -30,7 +30,7 @@ from downloader.news_fulltext_bulk import (cnyes_history_priority, cnyes_paginat
                                           wordpress_base, wordpress_page, wordpress_records, wordpress_url)
 from downloader.news_fulltext_policy import (CONTRACT_VERSION, NewsError, PolicyRegistry, capture_usage,
                                              cnyes_bulk_fingerprint, extract_article, normalize_url,
-                                             ETTODAY_LAYOUT_VERSIONS)
+                                             ETTODAY_LAYOUT_VERSIONS, POCKET_LAYOUT_VERSIONS, BASTILLE_LAYOUT_VERSIONS)
 from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK, feed_page, feed_records, feed_url
 from downloader.news_fulltext_queue import NewsQueue, utc_now
 
@@ -115,10 +115,13 @@ def _require_article_response(response, source):
     pdf = mime == "application/pdf" and source.pdf_path_pattern
     if mime not in {"text/html", "application/xhtml+xml"} and not pdf:
         raise NewsError("unsupported_content_type")
-    if source.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2'} and response.body == b'':
+    if (response.body == b'' and (source.provider == 'cnyes'
+            or source.embedded_article_layout in {'pinview_visible_article_v1', 'pinview_visible_article_v2'})):
         # Observed real HTTP200/zero-byte envelopes contain no article or
         # identity evidence. Treat this as a bounded recoverable response,
-        # not a permanent parser/rights verdict. Other sources are unchanged.
+        # not a permanent parser/rights verdict. This also applies to a
+        # revalidation with a stored body; it must retain that body and retry.
+        # Only the two independently observed source scopes change (ABI2).
         raise NewsError('empty_http_response', retry=True, delay=30)
     return pdf
 
@@ -212,9 +215,10 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
                 allow_finance_redirect_query=ettoday_version >= 16,
                 allow_house=ettoday_version >= 24 and 'house.ettoday.net' in source.reviewed_article_subsites) is None:
             raise NewsError('unsupported_article_path')
-    elif source.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
+    elif source.embedded_article_layout in POCKET_LAYOUT_VERSIONS:
         from downloader.news_fulltext_pocket import pocket_article_id
-        if pocket_article_id(request_url, requested=True) is None:
+        if pocket_article_id(request_url, requested=True,
+                adapter_contract_version=POCKET_LAYOUT_VERSIONS[source.embedded_article_layout]) is None:
             raise NewsError('unsupported_article_path')
     elif source.embedded_article_layout in {'watchmedia_visible_article_v1', 'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}:
         from downloader.news_fulltext_watchmedia import watchmedia_article_id
@@ -227,6 +231,11 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     elif source.embedded_article_layout in {'peoplemedia_visible_article_v1', 'peoplemedia_visible_article_v2', 'peoplemedia_visible_article_v3'}:
         from downloader.news_fulltext_peoplemedia import peoplemedia_article_id
         if peoplemedia_article_id(request_url) is None:
+            raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout in BASTILLE_LAYOUT_VERSIONS:
+        from downloader.news_fulltext_bastillepost import bastillepost_article_id
+        if bastillepost_article_id(request_url, requested=True,
+                adapter_contract_version=BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout]) is None:
             raise NewsError('unsupported_article_path')
     elif source.embedded_article_layout in {'mitrade_visible_article_v1', 'mitrade_visible_article_v2', 'mitrade_visible_article_v3', 'mitrade_visible_article_v4', 'mitrade_visible_article_v5', 'mitrade_visible_article_v6'}:
         from downloader.news_fulltext_mitrade import mitrade_article_id
@@ -290,12 +299,16 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     if source.provider in {'idn', 'videoland'} and (
             response.url != request_url or getattr(response, 'redirects', ())):
         raise NewsError('article_identity_not_verified')
-    if source.embedded_article_layout in {'pocket_visible_article_v1', 'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7'}:
-        from downloader.news_fulltext_pocket import pocket_article_id
+    if source.embedded_article_layout in POCKET_LAYOUT_VERSIONS:
+        from downloader.news_fulltext_pocket import pocket_article_id, pocket_article_transport_verified
         hops = getattr(response, 'redirects', ())
-        if (pocket_article_id(response.url) != pocket_article_id(request_url, requested=True)
+        pocket_version = POCKET_LAYOUT_VERSIONS[source.embedded_article_layout]
+        if (pocket_article_id(response.url, adapter_contract_version=pocket_version)
+                != pocket_article_id(request_url, requested=True, adapter_contract_version=pocket_version)
                 or response.url != request_url and (not hops or hops[0].from_url != request_url
-                    or hops[-1].to_url != response.url)):
+                    or hops[-1].to_url != response.url)
+                or pocket_version >= 10 and not pocket_article_transport_verified(
+                    response, request_url, adapter_contract_version=pocket_version)):
             from downloader.news_fulltext_diagnostics import FailureResponse
             error = NewsError('article_identity_not_verified')
             error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
@@ -309,6 +322,16 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         # No host/ID alias for these layouts has a verified transport witness. A title,
         # declared OG or a different story's HTTP 200 cannot create one.
         raise NewsError('article_identity_not_verified')
+    if source.embedded_article_layout in BASTILLE_LAYOUT_VERSIONS:
+        from downloader.news_fulltext_bastillepost import bastillepost_transport_verified
+        version = BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout]
+        if not bastillepost_transport_verified(response, request_url, adapter_contract_version=version):
+            from downloader.news_fulltext_diagnostics import FailureResponse
+            error = NewsError('article_identity_not_verified')
+            error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
+            raise error
+        if response.url != request_url:
+            resolution_basis = 'verified_bastillepost_literal_same_id_source_redirect_v1; original_frontier_url_retained'
     if response.status == 304:
         # A 304 has no article body to parse. It proves freshness only for the
         # exact saved representation whose validators were actually requested,
@@ -1286,7 +1309,9 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
     # same loaded source deadlines/capacity as every later progress heartbeat.
     queue.http_capacity_snapshot = http.capacity_snapshot
     queue.provider_cooldown_snapshot = http.cooldown_snapshot
-    with ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") as executor:
+    from downloader.news_fulltext_wake import OwnerMailboxWake
+    with ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") as executor, \
+            OwnerMailboxWake(queue, http.stop) as mailbox:
         while not http.stop.is_set():
             remaining = duration_seconds - (time.monotonic() - started) if duration_seconds is not None else None
             if remaining is not None and remaining <= 0:
@@ -1319,13 +1344,14 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
                 idle_until = time.monotonic() + delay
                 with queue.metrics.measure("idle_wait"):
                     while not http.stop.is_set() and idle_until > time.monotonic():
-                        from downloader.news_fulltext_candidate_diagnostics import has_unadmitted_candidates
-                        if result['activity'] != 'waiting_disk' and has_unadmitted_candidates(queue):
+                        if result['activity'] != 'waiting_disk' and mailbox.has_pending():
                             break
                         queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                                      activity="waiting_disk" if result["activity"] == "waiting_disk" else "waiting_next_due",
                                      provider_cooldowns=http.provider_not_before)
-                        http.stop.wait(min(15, max(0, idle_until - time.monotonic())))
+                        if mailbox.wait(min(15, max(0, idle_until - time.monotonic())),
+                                enabled=result['activity'] != 'waiting_disk'):
+                            break
     return queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                         activity="stopped" if http.stop.is_set() else "service_duration_complete",
                         provider_cooldowns=http.provider_not_before)

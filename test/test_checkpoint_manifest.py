@@ -17,7 +17,10 @@ from stockagent.data.panel import PanelData
 from stockagent.data.tw_listing_admission import VERIFIED_EMERGING_TO_TPEX_LISTINGS
 from stockagent.data.walkforward import WalkForwardFold
 from stockagent.explainability import load_model_from_checkpoint
-from stockagent.training.checkpoint_contract import checkpoint_manifest_symbols
+from stockagent.training.checkpoint_contract import (
+    build_inference_checkpoint_manifest,
+    checkpoint_manifest_symbols,
+)
 from stockagent.training.trainer import (
     _align_panel_to_state_dict_universe,
     _checkpoint_manifest,
@@ -1498,6 +1501,110 @@ def test_inference_manifest_skips_expensive_content_hash_but_preserves_model_sch
     assert inference["contracts"]["data"]["panel_arrays"] == {"omitted_for_inference": True}
     assert inference["fingerprints"]["data_schema"] == full["fingerprints"]["data_schema"]
     assert inference["fingerprints"]["model"] == full["fingerprints"]["model"]
+
+
+@pytest.mark.parametrize("model_name", ["transformer_base_portfolio", "financial_transformer"])
+@pytest.mark.parametrize("external", [False, True])
+def test_model_scope_manifest_preserves_all_current_and_compatible_fingerprints(model_name, external):
+    panel, config = _panel(), _config()
+    config.training.model_name = model_name
+    config.data.use_external_features = external
+    full = _checkpoint_manifest(panel, config, include_data_content=False)
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint={"experiment_manifest": full})
+
+    assert expected["validation_scope"] == "model"
+    assert expected["contracts"] == {key: full["contracts"][key] for key in ("data", "model")}
+    assert expected["fingerprints"] == {key: full["fingerprints"][key] for key in ("data_schema", "model")}
+    for key, fingerprints in expected["compatibility_fingerprints"].items():
+        assert fingerprints == {name: value for name, value in full["compatibility_fingerprints"][key].items()
+                                if name in {"data_schema", "model"}}
+    for scope in ("model", "inference"):
+        _validate_checkpoint_manifest({"experiment_manifest": full}, expected,
+                                      checkpoint_path=Path("current.pt"), scope=scope)
+        for key, fingerprints in full["compatibility_fingerprints"].items():
+            if not key.startswith("schema_4_") or not isinstance(fingerprints, dict):
+                continue
+            historical = copy.deepcopy(full)
+            historical["fingerprints"].update({key: value for key, value in fingerprints.items()
+                                                if key in {"data_schema", "model"}})
+            for oracle in (full, expected):
+                _validate_checkpoint_manifest({"experiment_manifest": historical}, oracle,
+                                              checkpoint_path=Path("compatible.pt"), scope=scope)
+
+
+def test_model_scope_manifest_does_not_construct_unused_training_contracts(monkeypatch):
+    import stockagent.training.checkpoint_contract as contract
+    panel, config = _panel(), _config()
+    full = _checkpoint_manifest(panel, config, include_data_content=False)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("inference must not build unused training/resume contracts")
+
+    for name in ("_training_checkpoint_contract", "_evaluation_checkpoint_contract",
+                 "_trading_checkpoint_contract", "_configuration_fingerprint_snapshot"):
+        monkeypatch.setattr(contract, name, unexpected)
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint={"experiment_manifest": full})
+    _validate_checkpoint_manifest({"experiment_manifest": full}, expected,
+                                  checkpoint_path=Path("current.pt"), scope="model")
+
+
+@pytest.mark.parametrize("schema", [None, 1, 2, 3, 5, "invalid"])
+def test_model_scope_manifest_legacy_or_unknown_schemas_keep_complete_builder(schema):
+    panel, config = _panel(), _config()
+    checkpoint = {} if schema is None else {"experiment_manifest": {"schema_version": schema}}
+    assert build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint) == (
+        _checkpoint_manifest(panel, config, include_data_content=False)
+    )
+
+
+@pytest.mark.parametrize("scope", ["resume", "artifact"])
+def test_model_scope_manifest_cannot_validate_training_resume_or_artifacts(scope):
+    panel, config = _panel(), _config()
+    full = _checkpoint_manifest(panel, config, include_data_content=False)
+    checkpoint = {"experiment_manifest": full}
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint)
+    with pytest.raises(ValueError, match="cannot validate resume or artifacts"):
+        _validate_checkpoint_manifest(checkpoint, expected, checkpoint_path=Path("current.pt"), scope=scope)
+
+
+@pytest.mark.parametrize("mutation", ["feature", "symbol", "lookback", "model", "external", "runtime"])
+def test_model_scope_manifest_rebuilds_active_semantics_and_rejects_same_mismatches(mutation, monkeypatch):
+    panel, config = _panel(), _config()
+    config.training.model_name = "financial_transformer"
+    if mutation == "runtime":
+        config.training.financial_transformer.factorized_sparse_projection = True
+    full = _checkpoint_manifest(panel, config, include_data_content=False)
+    checkpoint = {"experiment_manifest": full}
+    if mutation == "feature":
+        panel.feature_names[0] = "changed"
+    elif mutation == "symbol":
+        panel.symbols.reverse()
+    elif mutation == "lookback":
+        config.training.lookback += 1
+    elif mutation == "model":
+        config.training.financial_transformer.projection_l1_scale_by_active_count = True
+    elif mutation == "external":
+        config.data.use_external_features = not config.data.use_external_features
+    else:
+        import stockagent.models.factorized_sparse_projection as sparse
+        monkeypatch.setattr(sparse, "sparse_adjoint_contract", lambda: {"backend": "changed_runtime"})
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint)
+    oracle = _checkpoint_manifest(panel, config, include_data_content=False)
+    errors = []
+    for manifest in (oracle, expected):
+        with pytest.raises(RuntimeError, match="semantic fingerprint mismatch") as exc:
+            _validate_checkpoint_manifest(checkpoint, manifest, checkpoint_path=Path("current.pt"), scope="model")
+        errors.append(str(exc.value))
+    assert errors[0] == errors[1]
+
+
+@pytest.mark.parametrize("schema", [None, 1, 2, 3])
+def test_partial_model_scope_expected_manifest_cannot_be_reused_for_legacy_checkpoint(schema):
+    panel, config = _panel(), _config()
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint={"experiment_manifest": {"schema_version": 4}})
+    checkpoint = {} if schema is None else {"experiment_manifest": {"schema_version": schema}}
+    with pytest.raises(RuntimeError, match="requires a schema-4 checkpoint"):
+        _validate_checkpoint_manifest(checkpoint, expected, checkpoint_path=Path("legacy.pt"), scope="model")
 
 
 def test_inference_physical_source_localization_preserves_trained_schema_but_is_recorded(tmp_path):

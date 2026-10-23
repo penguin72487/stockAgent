@@ -83,7 +83,8 @@ class NewsHTTP:
         self.session_factory, self.address_check = session_factory, address_check
         self.local = threading.local()
         self.lock = threading.RLock()
-        self.stop = threading.Event()
+        from downloader.news_fulltext_wake import OwnerStopEvent
+        self.stop = OwnerStopEvent()
         self.limiters = {p.provider: limiter_factory(p.interval_seconds, name="news-fulltext:" + p.provider)
                          for p in registry.sources.values() if p.request_enabled}
         self.send_locks = {provider: threading.Lock() for provider in self.limiters}
@@ -275,7 +276,13 @@ class NewsHTTP:
 
     def _require(self, url, metadata_feed=None):
         if metadata_feed is None:
-            return self.registry.require(url)
+            source = self.registry.require(url)
+            if source.finite_article_urls and url not in source.finite_article_urls:
+                parts = urlsplit(url)
+                if (parts.scheme != 'https' or parts.hostname not in source.domains
+                        or parts.path != '/robots.txt' or parts.query or parts.fragment):
+                    raise NewsError('article_rights_or_scope_excluded')
+            return source
         from downloader.news_fulltext_metadata_feeds import require_request
         return require_request(self.registry, url, metadata_feed)
 
@@ -492,7 +499,10 @@ class NewsHTTP:
     def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None, metadata_feed=None) -> Response:
         source = self._require(url, metadata_feed)
         if robots_origin is not None and (policy_origin(robots_origin + '/') != robots_origin
-                or self._require(robots_origin + ('/robots.txt' if metadata_feed is not None else '/'), metadata_feed).provider != source.provider):
+                # Validate the initial REP authority with its policy URL, not
+                # an unrelated home page outside an exact finite article scope.
+                # This does not fetch the home page or widen redirect access.
+                or self._require(robots_origin + '/robots.txt', metadata_feed).provider != source.provider):
             raise NewsError('robots_origin_context_invalid')
         if self.stop.is_set():
             raise NewsError("stopping", retry=True, delay=1, request_deferred=True)

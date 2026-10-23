@@ -1,13 +1,12 @@
 market: tw_day_trade_unit_mgda
 label: 台股・參數空間 Unit MGDA 當沖研究模擬（初始 1,000 萬）
-# Only the canonical additive promotion may enable this independent account.
-enabled: false
+enabled: true
 market_type: tw
 timezone: Asia/Taipei
-open_time: '09:00'
+open_time: 09:00
 close_time: '13:30'
-schedule_time: '09:00'
-preopen_prepare_time: '08:15'
+schedule_time: 09:00
+preopen_prepare_time: 08:15
 summary_time: '14:00'
 data_ready_time: '13:40'
 freshness_max_lag_days: 3
@@ -20,18 +19,17 @@ day_trade_strict_intraday: true
 day_trade_terminal_liquidation_unlimited_capacity: true
 day_trade_quote_interval_seconds: 60
 pre_signal_command:
-  - scripts/update_tw_day_trade_factorized_live.py
-  - --phase
-  - preopen
+- scripts/update_tw_day_trade_factorized_live.py
+- --phase
+- preopen
 pre_signal_timeout_seconds: 1200
 completed_session_command:
-  - scripts/update_tw_day_trade_factorized_live.py
-  - --phase
-  - completed
+- scripts/update_tw_day_trade_factorized_live.py
+- --phase
+- completed
 completed_session_timeout_seconds: 1800
 formal_history_timeout_seconds: 1800
 previous_signal_backfill_limit: 512
-# The selector owns config/fold/checkpoint identity; do not duplicate it here.
 model_selection_path: ../models/tw_day_trade_unit_mgda.yaml
 live_output_dir: artifacts/live_signals/tw_day_trade_unit_mgda
 panel_date: latest

@@ -105,6 +105,60 @@ def test_cached_graph_detects_later_namespace_package_without_initializer(tmp_pa
     assert str(branch / "child.py") in {row["path"] for row in after}
 
 
+def test_missing_imports_use_existing_ancestor_proof_even_with_restored_mtime(tmp_path):
+    entry = tmp_path / "entry.py"
+    entry.write_text("try:\n    from later.branch import child\nexcept ImportError:\n    pass\n")
+    roots = (entry,)
+    before = cache._implementation_identity_from_roots(tmp_path, roots)
+    watch = cache._DEPENDENCY_GRAPHS[(tmp_path, roots)][1]
+    assert tmp_path in watch
+    assert all(path.exists() for path in watch)
+    original = tmp_path.stat()
+    branch = tmp_path / "later/branch"
+    branch.mkdir(parents=True)
+    (branch / "child.py").write_text("VALUE = 1\n")
+    os.utime(tmp_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    after = cache._implementation_identity_from_roots(tmp_path, roots)
+    assert before != after
+    assert str(branch / "child.py") in {row["path"] for row in after}
+    (branch / "child.py").unlink()
+    assert cache._implementation_identity_from_roots(tmp_path, roots) == before
+
+
+@pytest.mark.parametrize("link_level", ["top_level", "nested"])
+def test_absent_symlink_target_becoming_importable_invalidates_cached_graph(tmp_path, link_level):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    entry = repo / "entry.py"
+    entry.write_text("try:\n    from optional.branch import child\nexcept ImportError:\n    pass\n")
+    external = tmp_path / "external"
+    if link_level == "top_level":
+        link = repo / "optional"
+        child = external / "branch/child.py"
+    else:
+        (repo / "optional").mkdir()
+        link = repo / "optional/branch"
+        child = external / "child.py"
+    link.symlink_to(external, target_is_directory=True)
+    roots = (entry,)
+    if link_level == "top_level":
+        # An unresolved top-level entry already fails the original membership
+        # fence. Preserve that rejection instead of admitting a different ABI.
+        with pytest.raises(cache.LoadedImplementationChanged):
+            cache._implementation_identity_from_roots(repo, roots)
+        before = None
+    else:
+        before = cache._implementation_identity_from_roots(repo, roots)
+        assert cache._DEPENDENCY_GRAPHS[(repo, roots)][1][link] is None
+    directory_generation = cache.file_generation(repo)
+    child.parent.mkdir(parents=True)
+    child.write_text("VALUE = 7\n")
+    assert cache.file_generation(repo) == directory_generation
+    after = cache._implementation_identity_from_roots(repo, roots)
+    assert before != after
+    assert str(child) in {row["path"] for row in after}
+
+
 def test_cached_identity_rows_are_not_mutable_by_consumers(tmp_path):
     _package, identity = _dependency_fixture(tmp_path)
     before = identity()
@@ -716,6 +770,26 @@ def test_live_forward_bypasses_persistent_cache(tmp_path, monkeypatch):
         assert receipt is None
         assert output[1]["aux"].dtype == torch.bfloat16  # Ordinary/live model ABI is unchanged.
     assert len(calls) == 2 and not (tmp_path / "cache").exists()
+
+
+def test_live_masked_and_raw_forwards_keep_the_original_diagnostic_policy(tmp_path, monkeypatch):
+    kwargs, _ = _toy_forward(tmp_path, monkeypatch)
+    choices = []
+
+    def forward(model, x, mask, *, return_aux, materialize_candle_aux):
+        choices.append((mask.tolist(), return_aux, materialize_candle_aux))
+        weights = mask.to(torch.float32) / 10
+        return weights, weights.clone(), {"score_logits": weights.clone(),
+            "candle_embedding": None, "stock_market_gate": weights.clone()}
+
+    monkeypatch.setattr(signal_engine, "call_model", forward)
+    output, raw, _, receipt = signal_engine._live_forward_outputs(
+        **{**kwargs, "completed_cache": False, "include_unconstrained": True})
+    assert choices == [([[True, False]], True, None), ([[True, True]], True, None)]
+    assert output[2].keys() == raw[2].keys()
+    assert output[2]["candle_embedding"] is None
+    assert raw[2]["score_logits"].tolist() == [[pytest.approx(.1), pytest.approx(.1)]]
+    assert receipt is None and not (tmp_path / "cache").exists()
 
 
 def test_model_cache_key_includes_resolved_inherited_configuration(tmp_path, monkeypatch):

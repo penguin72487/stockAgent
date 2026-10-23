@@ -23,7 +23,6 @@ from stockagent.data_sync.packed_snapshots import (  # noqa: E402
     DEFAULT_COMPRESSION_LEVEL,
     DEFAULT_LOOSE_FILE_THRESHOLD_BYTES,
     DEFAULT_PACK_BUCKETS,
-    _load_inventory,
     audit_packed_store,
     fetch_packed_snapshot,
     fetch_packed_subtree,
@@ -312,10 +311,7 @@ def main(argv: list[str] | None = None) -> int:
                     and args.result_receipt.resolve() == args.progress_receipt.resolve()):
                 raise SnapshotError("verification result and progress paths must differ")
             resolved = _resolved(args)
-            reconstruct_paths = None
-            if args.reconstruct_all_files:
-                reconstruct_paths = [row["path"] for row in _load_inventory(root.resolve(), resolved.manifest)
-                                     if row["kind"] == "file"]
+            source_files = int(resolved.manifest["source"]["files"]) if args.reconstruct_all_files else 0
             last_progress_at, last_stage = 0.0, None
 
             def progress(payload: dict[str, Any]) -> None:
@@ -337,15 +333,15 @@ def main(argv: list[str] | None = None) -> int:
                 root,
                 resolved,
                 materialized_path=args.materialized,
-                **({"reconstruct_paths": reconstruct_paths} if args.reconstruct_all_files else {}),
+                **({"reconstruct_all": True} if args.reconstruct_all_files else {}),
                 **({"progress": progress} if args.progress_receipt is not None else {}),
             )
             if args.reconstruct_all_files:
                 verification["full_original_file_reconstruction_verified"] = True
-                verification["source_files"] = len(reconstruct_paths)
+                verification["source_files"] = source_files
             if args.progress_receipt is not None:
-                progress({"stage": "finished", "completed_items": len(reconstruct_paths or ()),
-                          "total_items": len(reconstruct_paths or ())})
+                progress({"stage": "finished", "completed_items": source_files,
+                          "total_items": source_files})
             if args.profile:
                 io_after = _process_read_counters()
                 verification["profile"] = {

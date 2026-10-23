@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import fcntl
 import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +74,100 @@ def test_parallel_readers_hold_one_coherent_generation_and_release_on_error(tmp_
                     raise ValueError("real source defect")
         fcntl.flock(producer, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(producer, fcntl.LOCK_UN)
+
+
+def test_overlapping_os_leases_single_flight_scans_and_discard_epoch(tmp_path):
+    from stockagent.live import tw_public_source_guard as guard
+    _root, stocks, lock = _tree(tmp_path)
+    entered = threading.Barrier(6)
+    finished = threading.Barrier(6)
+    calls, epochs = [], []
+
+    def read(_):
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as epoch:
+            epochs.append(epoch)
+            entered.wait(timeout=5)
+            result = epoch.get("member-scan", lambda: calls.append(True) or ("exact",))
+            finished.wait(timeout=5)
+            return result
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        assert list(pool.map(read, range(6))) == [("exact",)] * 6
+    assert calls == [True] and len({id(epoch) for epoch in epochs}) == 1
+    assert not guard._READ_GENERATIONS
+    with pytest.raises(RuntimeError, match="OS leases ended"):
+        epochs[0].get("member-scan", lambda: None)
+    with lock.open("a+") as producer:
+        fcntl.flock(producer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with live_tw_public_source_read_guard(stocks, share_generation=True) as epoch:
+        assert epoch is not epochs[0]
+        assert epoch.get("member-scan", lambda: "new-source") == "new-source"
+
+
+def test_outer_read_only_operator_lease_does_not_extend_scan_memoization(tmp_path):
+    _root, stocks, _lock = _tree(tmp_path)
+    with live_tw_public_source_read_guard(stocks) as outer:
+        assert outer is None
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as first:
+            assert first.get("key", lambda: "first") == "first"
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as second:
+            assert second is not first
+            assert second.get("key", lambda: "second") == "second"
+
+
+def test_generation_failure_reaches_all_readers_and_leases_release(tmp_path):
+    from stockagent.live import tw_public_source_guard as guard
+    _root, stocks, lock = _tree(tmp_path)
+    calls = []
+
+    def corrupt():
+        calls.append(True)
+        raise ValueError("corrupt member")
+
+    with live_tw_public_source_read_guard(stocks, share_generation=True) as first:
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as second:
+            assert first is second
+            for epoch in (first, second):
+                with pytest.raises(ValueError, match="corrupt member"):
+                    epoch.get("key", corrupt)
+    assert calls == [True] and not guard._READ_GENERATIONS
+    with lock.open("a+") as producer:
+        fcntl.flock(producer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_panel_key_shared_scan_preserves_full_key_and_checks_external_sentinels(tmp_path, monkeypatch):
+    from stockagent.live import completed_inference_cache as cache
+    _root, stocks, _lock = _tree(tmp_path)
+    (stocks / "2330_features.parquet").write_bytes(b"exact-stock")
+    (stocks / "symbols.csv").write_text("2330")
+    external = tmp_path / "outside" / "extra.parquet"
+    external.parent.mkdir()
+    external.write_bytes(b"v1")
+    config = SimpleNamespace(data=SimpleNamespace(parquet_root=stocks))
+    kwargs = dict(live_tail_rows=48, panel_kwargs={"external_feature_path": str(external)})
+    canonical = cache._parquet_source_generations
+    scans = []
+
+    def counted(paths, *, feature_roots=()):
+        scans.append(bool(feature_roots))
+        return canonical(paths, feature_roots=feature_roots)
+
+    expected = signal_engine._live_panel_cache_key(config, **kwargs)
+    monkeypatch.setattr(cache, "_parquet_source_generations", counted)
+    with live_tw_public_source_read_guard(stocks, share_generation=True) as epoch:
+        first = signal_engine._live_panel_cache_key(config, **kwargs, source_read_generation=epoch)
+        second = signal_engine._live_panel_cache_key(config, **kwargs, source_read_generation=epoch)
+        assert first == second == expected
+        assert scans.count(True) == 1 and scans.count(False) == 2
+        external.write_bytes(b"v2-different-external-generation")
+        changed = signal_engine._live_panel_cache_key(config, **kwargs, source_read_generation=epoch)
+        assert changed != first
+        assert changed == signal_engine._live_panel_cache_key(config, **kwargs)
+    (stocks / "2330_features.parquet").write_bytes(b"repaired-stock")
+    with live_tw_public_source_read_guard(stocks, share_generation=True) as epoch:
+        after = signal_engine._live_panel_cache_key(config, **kwargs, source_read_generation=epoch)
+        assert after != changed
+        assert after == signal_engine._live_panel_cache_key(config, **kwargs)
 
 
 def test_producer_crash_releases_wait_and_does_not_mask_remaining_corruption(monkeypatch, tmp_path):

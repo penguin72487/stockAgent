@@ -14,6 +14,42 @@ from scripts.download_tw_futures_intraday_gaps import candidate_plan, valid_save
 DAY = date(2020, 3, 23)
 
 
+@pytest.mark.parametrize('corruption', [None, 'receipt', 'duplicate', 'escape', 'missing'])
+def test_portable_bulk_inventory_preserves_original_receipt_and_rejects_drift(tmp_path, corruption):
+    from stockagent.data.tw_futures_finmind_ticks import BULK_INVENTORY, pin_bulk_tick_inventory
+    member = tmp_path / 'ticks.parquet'
+    receipt_path = tmp_path / 'receipt.json'
+    atomic_write_parquet(member, pl.DataFrame({'price': [10.]}))
+    receipt = dict(dataset='TaiwanFuturesTick', data_id='', partition=str(DAY), status='complete',
+        parquet_path=member.name, sha256=sha256_file(member), rows=1,
+        parquet_size_bytes=member.stat().st_size, fetched_at_utc='2026-10-21T00:00:00Z',
+        historical_point_in_time=False, request={'source_order': 'native_response'})
+    atomic_write_json(receipt_path, receipt)
+    item = dict(date=str(DAY), path=member.name, receipt_path=receipt_path.name,
+        sha256=receipt['sha256'], receipt_sha256=sha256_file(receipt_path), rows=1,
+        bytes=member.stat().st_size, fetched_at_utc=receipt['fetched_at_utc'],
+        historical_point_in_time=False, source_order='native_response')
+    objects = [item]
+    if corruption == 'receipt':
+        atomic_write_json(receipt_path, dict(receipt, rows=2))
+    elif corruption == 'duplicate':
+        objects.append(dict(item))
+    elif corruption == 'escape':
+        item['receipt_path'] = '../receipt.json'
+    elif corruption == 'missing':
+        objects = []
+    manifest = tmp_path / 'inventory.json'
+    atomic_write_json(manifest, dict(contract=BULK_INVENTORY, dataset='TaiwanFuturesTick', objects=objects))
+    if corruption is not None:
+        with pytest.raises(ValueError):
+            pin_bulk_tick_inventory(manifest, [DAY])
+    else:
+        pinned = pin_bulk_tick_inventory(manifest, [DAY])
+        assert pinned[0]['path'] == str(member)
+        assert pinned[0]['sha256'] == receipt['sha256']
+        assert pinned[0]['inventory_sha256'] == sha256_file(manifest)
+
+
 def bulk_fixture():
     expected = pl.DataFrame(dict(date=[DAY]*3, product=['DDF']*3,
         contract=['202004','202005','202006'], physical_contract=['DDF:202004@life1','DDF:202005@life1','DDF:202006@life1'],

@@ -990,37 +990,61 @@ def runtime_status(
     )
 
 
+class _UncacheableReturnSummary(ValueError):
+    """Failed or changing reads must not become reusable performance facts."""
+
+
+@lru_cache(maxsize=128)
+def _cumulative_recent_returns_cached(
+    target_text: str, window_days: int, identity: tuple[int, ...],
+) -> dict[str, Any]:
+    from stockagent.live.performance_contract import compound_simple_returns, simple_return_frame
+    import polars as pl
+
+    target = Path(target_text)
+    if _file_identity(target) != identity:
+        raise _UncacheableReturnSummary("return artifact changed before read")
+    frame = pl.read_parquet(target) if target.suffix == ".parquet" else pl.read_csv(target)
+    if _file_identity(target) != identity:
+        raise _UncacheableReturnSummary("return artifact changed during read")
+    if frame.height == 0:
+        raise _UncacheableReturnSummary("empty return artifact")
+    frame = frame.sort("date").tail(max(1, int(window_days)))
+    dates = frame.get_column("date").to_list()
+    date_only = not any(":" in str(item) for item in dates)
+    frame = simple_return_frame(frame)
+    strat_ret = compound_simple_returns(frame["portfolio_return"].to_list())
+    bench_ret = compound_simple_returns(frame["benchmark_return"].to_list())
+    if strat_ret is None or bench_ret is None:
+        raise _UncacheableReturnSummary("return summary unavailable")
+    return {
+        "window_days": int(frame.height),
+        "start_date": _date_to_text(dates[0], date_only=date_only),
+        "end_date": _date_to_text(dates[-1], date_only=date_only),
+        "strategy_return": float(strat_ret),
+        "benchmark_return": float(bench_ret),
+        "excess_return": float(strat_ret - bench_ret),
+        "source_path": str(target),
+        "return_type": "simple",
+        "source": "model_backtest_returns",
+    }
+
+
 def cumulative_recent_returns(path: Path | None, *, window_days: int, prefer_integer: bool = True) -> dict[str, Any] | None:
     if path is None or not path.exists():
         return None
-    from stockagent.live.performance_contract import compound_simple_returns, resolve_return_artifact, simple_return_frame
+    from stockagent.live.performance_contract import resolve_return_artifact
     target = resolve_return_artifact(path.parent if path.name == "checkpoint_best.pt" else path, prefer_integer=prefer_integer)
     if target is None:
         return None
     try:
-        import polars as pl
-
-        frame = pl.read_parquet(target) if target.suffix == ".parquet" else pl.read_csv(target)
-        if frame.height == 0:
+        # Resolve preferred membership each time: a newly published integer
+        # artifact supersedes the old research table without waiting for a TTL.
+        identity = _file_identity(target)
+        result = _cumulative_recent_returns_cached(str(target), int(window_days), identity)
+        if _file_identity(target) != identity:
             return None
-        frame = frame.sort("date").tail(max(1, int(window_days)))
-        dates = frame.get_column("date").to_list()
-        date_only = not any(":" in str(item) for item in dates)
-        frame = simple_return_frame(frame)
-        strat_ret = compound_simple_returns(frame["portfolio_return"].to_list())
-        bench_ret = compound_simple_returns(frame["benchmark_return"].to_list())
-        if strat_ret is None or bench_ret is None:
-            return None
-        return {
-            "window_days": int(frame.height),
-            "start_date": _date_to_text(dates[0], date_only=date_only),
-            "end_date": _date_to_text(dates[-1], date_only=date_only),
-            "strategy_return": float(strat_ret),
-            "benchmark_return": float(bench_ret),
-            "excess_return": float(strat_ret - bench_ret),
-            "source_path": str(target),
-            "return_type": "simple",
-            "source": "model_backtest_returns",
-        }
+        # Callers annotate their summary; never expose the cached dictionary.
+        return dict(result)
     except Exception:
         return None

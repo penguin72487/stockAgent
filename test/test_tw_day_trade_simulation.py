@@ -5364,6 +5364,89 @@ def test_lossless_history_projection_survives_process_memory_cache_loss(
     assert restored == first
 
 
+@pytest.mark.parametrize("initial", [None, "not-a-number"])
+@pytest.mark.parametrize("fallback", [None, 0.0, "fraction_overflow"])
+def test_dashboard_history_preserves_invalid_capital_short_circuit(tmp_path, monkeypatch, initial, fallback):
+    root = tmp_path / "state"
+    root.mkdir()
+    row = {"market": "tw_day_trade", "minute": "2026-08-14T09:30+08:00",
+           "initial_capital_twd": initial, "total_equity_twd": 10**400}
+    if fallback == "fraction_overflow":
+        row["return_fraction"] = 10**400
+    elif fallback is not None:
+        row["return_pct"] = fallback
+    (root / "marks.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    monkeypatch.setattr(dashboard_module, "_native_ledger_frame", lambda *args, **kwargs: None)
+    kwargs = dict(state_dir=root, range_key="all", use_memory_cache=False,
+                  use_persistent_cache=False, use_session_projection=False)
+    if fallback is None:
+        # The canonical initial-capital failure returns before touching a
+        # non-representable equity when no fallback return exists.
+        assert build_dashboard_history_snapshot(**kwargs)["raw_points_in_range"] == 0
+    else:
+        # A supplied return still follows the original fallback/field parse
+        # order and fails rather than silently coercing this invalid row.
+        with pytest.raises(OverflowError):
+            build_dashboard_history_snapshot(**kwargs)
+
+
+@pytest.mark.parametrize("product", ["tw_day_trade", "tw_overnight"])
+@pytest.mark.parametrize("resolution,encoding", [
+    ("sampled", "minute_columns_v1"),
+    ("1m", "minute_columns_v1"),
+    ("1m", "minute_columns_v2"),
+])
+def test_optional_native_history_storage_preserves_complete_projection(
+    tmp_path, monkeypatch, product, resolution, encoding,
+):
+    import builtins
+    import sys
+    import types
+
+    fallback = types.ModuleType("_dashboard_history_storage_fallback")
+    fallback.__file__ = dashboard_module.__file__
+    original_import = builtins.__import__
+
+    def without_native_record(name, *args, **kwargs):
+        if name == "msgspec":
+            raise ImportError("exercise optional record fallback")
+        return original_import(name, *args, **kwargs)
+
+    fallback.__dict__["__builtins__"] = {**vars(builtins), "__import__": without_native_record}
+    monkeypatch.setitem(sys.modules, fallback.__name__, fallback)
+    source = Path(dashboard_module.__file__).read_bytes()
+    exec(compile(source, fallback.__file__, "exec"), fallback.__dict__)
+    assert fallback._NATIVE_HISTORY_POINTS is False
+    root = tmp_path / "state"
+    root.mkdir()
+    (root / "state.json").write_text(json.dumps({"product": product}))
+    marks = [
+        {"market": "strategy", "minute": f"2026-08-14T{minute}+08:00",
+         "initial_capital_twd": "100.0", "total_equity_twd": equity,
+         "historical_minute_replay": True, "valuation_stale": index % 2,
+         "missing_price_position_count": index % 2,
+         "fresh_trade_notional_coverage_ratio": 0.75}
+        for index, (minute, equity) in enumerate([
+            ("08:59", 100), ("09:00", 101.25), ("09:01", -2),
+            ("09:01", 102.5), ("13:30", 105), ("13:31", 110),
+        ])
+    ]
+    (root / "marks.jsonl").write_text("".join(json.dumps(row) + "\n" for row in marks))
+    kwargs = dict(state_dir=root, range_key="all", resolution=resolution,
+                  history_encoding=encoding, use_memory_cache=False,
+                  use_persistent_cache=False, use_session_projection=False)
+    captures = []
+    outputs = []
+    for module in (dashboard_module, fallback):
+        monkeypatch.setattr(module, "_native_ledger_frame", lambda *args, **kwargs: None)
+        capture = {"2026-08-14": {"source_fingerprint": "fixture"}}
+        outputs.append(module.build_dashboard_history_snapshot(**kwargs, _session_projection_capture=capture))
+        captures.append(capture)
+    assert outputs[0] == outputs[1]
+    assert outputs[0]["returned_points"] > 0
+    assert captures[0] == captures[1]
+
+
 def test_dashboard_history_keeps_leveraged_reference_below_zero(
     tmp_path: Path,
 ) -> None:
@@ -7200,6 +7283,59 @@ def test_historical_signal_range_skips_current_session_calendar(
 
     build_dashboard_signal_page(state_dir=state_dir, session_date=current_day)
     assert calendar_calls
+
+
+@pytest.mark.parametrize("columnar", [False, True])
+@pytest.mark.parametrize("product", ["tw_day_trade", "tw_overnight"])
+def test_signal_page_hides_zero_targets_without_changing_audit_or_ledger(
+    tmp_path: Path, monkeypatch, columnar: bool, product: str,
+) -> None:
+    state_dir = tmp_path / product
+    state_dir.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(
+        dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1 if columnar else 10**9,
+    )
+    state = {"product": product, "modes": {
+        "mode_a": {"session_date": "2026-08-14", "initial_capital_twd": 10_000_000},
+    }}
+    (state_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    rows = [
+        {"session_date": "2026-08-13", "market": "mode_a", "signal_id": "signal",
+         "symbol": symbol, "name": symbol, "target_weight": weight,
+         "status": "hold" if weight == 0 else "below_one_board_lot",
+         "requested_shares": 0, "filled_shares": 0}
+        for symbol, weight in (
+            ("ZERO", 0.0), ("ZERO_NEGATIVE", -0.0), ("ZERO_STRING", "0"),
+            ("LONG", 0.2), ("TINY_SHORT", -1e-12), ("UNKNOWN", None),
+        )
+    ]
+    signal_path = state_dir / "signals.jsonl"
+    original = "".join(json.dumps(row) + "\n" for row in rows).encode()
+    signal_path.write_bytes(original)
+    request = dict(state_dir=state_dir, session_date="2026-08-13", limit=1)
+
+    full = build_dashboard_signal_page(**request)
+    first = build_dashboard_signal_page(**request, hide_zero_targets=True)
+    second = build_dashboard_signal_page(**request, hide_zero_targets=True, offset=1)
+    third = build_dashboard_signal_page(**request, hide_zero_targets=True, offset=2)
+    assert full["total"] == full["opening_execution_audit"]["mode_a"]["model_signal_row_count"] == 6
+    assert first["total"] == second["total"] == third["total"] == 3
+    assert [page["rows"][0]["symbol"] for page in (first, second, third)] == [
+        "LONG", "TINY_SHORT", "UNKNOWN",
+    ]
+    assert first["has_more"] and second["has_more"] and not third["has_more"]
+    for page in (first, second, third):
+        assert page["direction_summary"] == full["direction_summary"]
+        assert page["opening_execution_audit"] == full["opening_execution_audit"]
+        assert page["record_count"] == full["record_count"] == 6
+        assert page["source_rows_scanned"] == full["source_rows_scanned"]
+    assert build_dashboard_signal_page(**request) == full  # separate page-cache keys
+    empty = build_dashboard_signal_page(**request, hide_zero_targets=True, symbol="ZERO")
+    assert empty["total"] == empty["returned"] == 0
+    assert empty["rows"] == [] and empty["has_more"] is False
+    assert signal_path.read_bytes() == original
+    assert json.loads((state_dir / "state.json").read_bytes()) == state
 
 
 def test_columnar_signal_range_matches_strict_json_path(

@@ -30,7 +30,60 @@ from stockagent.config import load_config
 from stockagent.live import market_status
 
 
-def input_preparation_probe(cfgs, *, repeats):
+def _legacy_factorized_member_signatures(manifest_path):
+    """Frozen comparator: original per-member resolve, not a runtime fallback."""
+    from stockagent.data.factorized_panel import factorized_member_proofs
+    manifest = json.loads(manifest_path.read_text())
+    members = [manifest_path, *[manifest_path.parent / p["path"]
+                               for p in factorized_member_proofs(manifest)]]
+    return tuple((str(path.resolve()), s.st_dev, s.st_ino, s.st_size,
+                  s.st_mtime_ns, s.st_ctime_ns)
+                 for path in members for s in [path.stat()])
+
+
+def member_signature_probe(cfgs, *, repeats):
+    """Balanced full-inventory comparison; every generation must remain equal."""
+    from stockagent.live.signal_engine import _factorized_member_signatures
+    manifests = {}
+    for original in cfgs:
+        cfg = bot._effective_market_config(original)
+        path = load_config(cfg.config_path).data.factorized_feature_manifest
+        if path:
+            manifests.setdefault(Path(path).resolve(strict=True), []).append(cfg.market)
+    records = []
+    for manifest, markets in manifests.items():
+        raw = manifest.read_bytes()
+        expected = _legacy_factorized_member_signatures(manifest)
+        expected_sha = hashlib.sha256(json.dumps(expected).encode()).hexdigest()
+        samples = []
+        implementations = {"per_member_resolve": _legacy_factorized_member_signatures,
+                           "per_scan_parent_resolve": _factorized_member_signatures}
+        for repeat in range(repeats):
+            order = tuple(implementations)
+            for variant in order if repeat % 2 == 0 else order[::-1]:
+                started = time.perf_counter()
+                actual = implementations[variant](manifest)
+                elapsed = (time.perf_counter() - started) * 1000
+                if actual != expected:
+                    raise RuntimeError("member generation changed; reject timing comparison")
+                samples.append({"repeat": repeat, "variant": variant, "elapsed_ms": elapsed})
+        if manifest.read_bytes() != raw or _legacy_factorized_member_signatures(manifest) != expected:
+            raise RuntimeError("source changed during benchmark; reject comparison")
+        records.append({"manifest": str(manifest), "markets": markets,
+            "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+            "member_count": len(expected), "member_signature_sha256": expected_sha,
+            "exact_full_signature_parity": True, "samples": samples,
+            "variant_median_ms": {variant: statistics.median(
+                row["elapsed_ms"] for row in samples if row["variant"] == variant)
+                for variant in implementations}})
+    if not records:
+        raise RuntimeError("no deployed factorized manifests")
+    return {"scope": "local_full_member_generation_scan_not_full_inference_or_opening_slo",
+        "network_requests": 0, "ledger_modified": False, "model_forwards": 0,
+        "comparisons": records}
+
+
+def input_preparation_probe(cfgs, *, repeats, panel_date=None):
     """Full current mode inputs, cold then warm; no forward/network/publication."""
     from stockagent.live import signal_engine
     import torch
@@ -54,7 +107,7 @@ def input_preparation_probe(cfgs, *, repeats):
             phase, clock = str(event["message"]), now
 
         result = signal_engine.prefetch_live_signal_prices(**cfg.signal_kwargs(
-            price_source="tw", progress_callback=progress))
+            price_source="tw", progress_callback=progress, panel_date=panel_date))
         progress({"message": "finished"})
         digest = hashlib.sha256()
         for field in ("prices", "open_prices", "available_mask", "exchange_timestamps_ms"):
@@ -75,6 +128,7 @@ def input_preparation_probe(cfgs, *, repeats):
         raise RuntimeError("input preparation unexpectedly initialized CUDA")
     return {"contract": "five_mode_input_preparation_probe_v1",
         "scope": "current_session_receipt_only_no_forward_not_real_opening_slo", "mode_count": len(cfgs),
+        "requested_panel_date": panel_date,
         "signal_published": False, "ledger_modified": False,
         "derived_cache_writes_possible": True, "network_requests": 0, "model_forwards": 0,
         "cuda_initialized": False, "opening_slo_claim": False, "samples": samples}
@@ -85,16 +139,31 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=8)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--inputs-only", action="store_true", help="Probe all five current complete input paths without quotes, CUDA, model forward or publication")
+    parser.add_argument("--panel-date", help="Explicit completed input session; latest inputs still require full source coverage")
+    parser.add_argument("--compare-member-signatures", action="store_true",
+                        help="Balanced original/current full factorized member generation scans; no input/model work")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("repeats must be positive")
+    if args.panel_date and not args.inputs_only:
+        parser.error("panel-date is only valid with inputs-only")
+    if args.compare_member_signatures and args.inputs_only:
+        parser.error("member scan comparison is separate from inputs-only")
     cfgs = [bot._resolve_market(market) for market in bot._scheduled_markets()
             if bot._resolve_market(market).day_trade_simulation_enabled]
     if not cfgs:
         parser.error("no deployed day-trade modes")
+    if args.compare_member_signatures:
+        from downloader.artifact_io import atomic_write_json
+        result = member_signature_probe(cfgs, repeats=args.repeats)
+        atomic_write_json(args.output, result, durable=True)
+        print(json.dumps({"scope": result["scope"], "comparisons": [
+            {key: value for key, value in row.items() if key != "samples"}
+            for row in result["comparisons"]]}))
+        return
     if args.inputs_only:
         from downloader.artifact_io import atomic_write_json
-        result = input_preparation_probe(cfgs, repeats=args.repeats)
+        result = input_preparation_probe(cfgs, repeats=args.repeats, panel_date=args.panel_date)
         atomic_write_json(args.output, result, durable=True)
         print(json.dumps({**{key: value for key, value in result.items() if key != "samples"},
             "all_mode_input_samples_ms": [row["all_mode_inputs_ms"] for row in result["samples"]]}))

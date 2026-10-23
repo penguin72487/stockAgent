@@ -8,17 +8,20 @@ desktop query, imputation or source-state reset is performed by this module.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from contextlib import closing
+from collections.abc import Callable
+from contextlib import closing, contextmanager
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
 from pathlib import Path
 import re
 import sqlite3
+import time
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 
 CONTRACT = "tej_local_gap_value_priority_v1"
+PRIORITY_WRITE_CONTRACT = "sqlite_enforced_priority_only_transaction_v1"
 API_CATEGORIES = {
     "AIND": "company_lifecycle", "TAMT": "corporate_actions", "TASALE": "monthly_revenue",
     "TAGIN": "stock_margin", "TAPRCD": "stock_daily", "TAQFII": "stock_flow",
@@ -253,39 +256,98 @@ def installed_priority(con, table_id: str, default: int, *, kind: str = "downloa
     return row[0] + (kind == "discover") if row else default
 
 
+@contextmanager
+def _priority_writes_only(con, *, installer_metadata=False):
+    """Enforce the write set, including trigger/FK programs, before execution.
+
+    This connection belongs to the ranking installer. Do not use it concurrently
+    or install another authorizer on it. Reads are allowed; *only* priority
+    columns and the ranking table may be written. The final, fixed literal-key
+    metadata statement has a separate capability; general source-control meta
+    writes are not enabled for the ranking statements. No source
+    payload, state, cursor, receipt or plan body can be changed, even by a
+    previously prepared statement or a trigger. The caller owns the transaction.
+    """
+    columns = {
+        "tasks": {"priority"}, "download_plans": {"priority"},
+        "acquisition_value_priorities": {
+            "priority", "rank", "value_score", "missing_fields", "crosscheck_fields", "reason"},
+    }
+    if installer_metadata:
+        columns['meta'] = {'value'}
+    def authorize(action, table, column, database, trigger):
+        if action in {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ}:
+            return sqlite3.SQLITE_OK
+        if database == "main" and trigger is None:
+            if action == sqlite3.SQLITE_INSERT and (table == 'acquisition_value_priorities'
+                    or installer_metadata and table == 'meta'):
+                return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_UPDATE and column in columns.get(table, ()):
+                return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    con.set_authorizer(authorize)
+    try:
+        yield
+    finally:
+        con.set_authorizer(None)
+
+
 def install_priorities(con, snapshot: dict, channel: str) -> dict:
-    """One metadata transaction. Completed/running/blocked source states stay intact."""
+    """Atomically reorder work without reading/rehashing historical payloads.
+
+    The old before/after full-scope hash is replaced by an enforced SQL write
+    capability, NOT a cached source fingerprint. There is deliberately no new
+    claim to have hashed every task. A rejected write rolls back this install
+    alone, retaining the caller's earlier transaction and last approved order.
+    """
     if snapshot.get("contract") != CONTRACT or channel not in {"smart_wizard", "api"}:
         raise ValueError("Invalid value ranking snapshot")
-    scope_columns = ('task_id,table_id,kind,state,request_json,scope_contract' if channel == 'smart_wizard'
-                     else 'id,table_id,state,params_json,cursor,query_rows,actual_rows,page_size')
-    def scope_identity():
-        digest, count = hashlib.sha256(), 0
-        order_key = 'task_id' if channel == 'smart_wizard' else 'id'
-        for row in con.execute('SELECT ' + scope_columns + " FROM tasks WHERE state IN ('pending','retry','running','complete','blocked') ORDER BY " + order_key):
-            digest.update(json.dumps(tuple(row), ensure_ascii=False, separators=(',', ':')).encode())
-            digest.update(b'\n')
-            count += 1
-        return digest.hexdigest(), count
-    before_scope = scope_identity()
-    con.execute("CREATE TABLE IF NOT EXISTS acquisition_value_priorities (table_id TEXT PRIMARY KEY,priority INTEGER NOT NULL,rank INTEGER NOT NULL,value_score INTEGER NOT NULL,missing_fields INTEGER NOT NULL,crosscheck_fields INTEGER NOT NULL,reason TEXT NOT NULL)")
     own = [r for r in snapshot["tables"] if r["channel"] == channel]
-    con.executemany("INSERT OR REPLACE INTO acquisition_value_priorities VALUES(?,?,?,?,?,?,?)",
-        [(r["table_id"], r["priority"], r["rank"], r["value_score"], r["missing_or_gap_fields"],
-          r["crosscheck_candidate_fields"], r["value_basis"]) for r in own])
-    if channel == "smart_wizard":
-        changed = con.execute("UPDATE tasks SET priority=(SELECT priority FROM acquisition_value_priorities p WHERE p.table_id=tasks.table_id)+(kind='discover') WHERE state='pending' AND priority>=0 AND table_id IN (SELECT table_id FROM acquisition_value_priorities)").rowcount
-        con.execute("UPDATE download_plans SET priority=(SELECT priority FROM acquisition_value_priorities p WHERE p.table_id=download_plans.table_id) WHERE table_id IN (SELECT table_id FROM acquisition_value_priorities)")
-    else:
-        changed = con.execute("UPDATE tasks SET priority=(SELECT priority FROM acquisition_value_priorities p WHERE p.table_id=tasks.table_id) WHERE state IN ('pending','retry') AND priority>=0 AND table_id IN (SELECT table_id FROM acquisition_value_priorities)").rowcount
     meta = {"contract": CONTRACT, "fingerprint": snapshot["fingerprint"],
             "generated_at_utc": snapshot["generated_at_utc"], "next_refresh_at_utc": snapshot["next_refresh_at_utc"],
-            "channel": channel, "tables": len(own), "states_or_scope_changed": False}
-    if scope_identity() != before_scope:
-        raise ValueError('Ordering changed source scope, saved cursor or lifecycle; rollback required')
-    con.execute("INSERT OR REPLACE INTO meta VALUES('acquisition_value_priority',?)", (json.dumps(meta),))
-    return {**meta, "pending_priorities_updated": changed, "audited_source_tasks": before_scope[1],
-            "preserved_source_identity_sha256": before_scope[0], "source_identity_verified_unchanged": True}
+            "channel": channel, "tables": len(own), "states_or_scope_changed": False,
+            "source_identity_verification": PRIORITY_WRITE_CONTRACT}
+    if not con.in_transaction:
+        con.execute("BEGIN IMMEDIATE")
+    con.execute("SAVEPOINT tej_value_priority_install")
+    try:
+        # This fixed DDL only initializes our metadata table. All DML below,
+        # including any pre-existing trigger, is inside the authorizer fence.
+        con.execute("CREATE TABLE IF NOT EXISTS acquisition_value_priorities (table_id TEXT PRIMARY KEY,priority INTEGER NOT NULL,rank INTEGER NOT NULL,value_score INTEGER NOT NULL,missing_fields INTEGER NOT NULL,crosscheck_fields INTEGER NOT NULL,reason TEXT NOT NULL)")
+        with _priority_writes_only(con):
+            con.executemany("INSERT INTO acquisition_value_priorities VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(table_id) DO UPDATE SET priority=excluded.priority,rank=excluded.rank,"
+                "value_score=excluded.value_score,missing_fields=excluded.missing_fields,"
+                "crosscheck_fields=excluded.crosscheck_fields,reason=excluded.reason",
+                [(r["table_id"], r["priority"], r["rank"], r["value_score"], r["missing_or_gap_fields"],
+                  r["crosscheck_candidate_fields"], r["value_basis"]) for r in own])
+            target = "(SELECT priority FROM acquisition_value_priorities p WHERE p.table_id=tasks.table_id)"
+            if channel == "smart_wizard":
+                target += "+(kind='discover')"
+                states = "state='pending'"
+            else:
+                states = "state IN ('pending','retry')"
+            changed = con.execute(f"UPDATE tasks SET priority={target} WHERE {states} AND priority>=0 "
+                f"AND table_id IN (SELECT table_id FROM acquisition_value_priorities) AND priority IS NOT ({target})").rowcount
+            if channel == "smart_wizard":
+                target = "(SELECT priority FROM acquisition_value_priorities p WHERE p.table_id=download_plans.table_id)"
+                con.execute(f"UPDATE download_plans SET priority={target} "
+                    f"WHERE table_id IN (SELECT table_id FROM acquisition_value_priorities) AND priority IS NOT ({target})")
+        # This literal key is not taken from a snapshot or caller. Keep even
+        # its triggers inside the authorizer, without granting general meta
+        # writes to the statements that change task/plan priorities above.
+        with _priority_writes_only(con, installer_metadata=True):
+            con.execute("INSERT INTO meta VALUES('acquisition_value_priority',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(meta),))
+        con.execute("RELEASE tej_value_priority_install")
+    except BaseException:
+        con.execute("ROLLBACK TO tej_value_priority_install")
+        con.execute("RELEASE tej_value_priority_install")
+        raise
+    return {**meta, "pending_priorities_updated": changed, "audited_source_tasks": None,
+            "preserved_source_identity_sha256": None, "source_payloads_decoded": 0,
+            "source_identity_verified_unchanged": True}
 
 
 def apply_snapshot(root: Path, snapshot: dict) -> list[dict]:
@@ -294,15 +356,18 @@ def apply_snapshot(root: Path, snapshot: dict) -> list[dict]:
     for channel, db in (("smart_wizard", root / "queue.sqlite3"), ("api", root / "api_trial_v1/queue.sqlite3")):
         if not db.is_file():
             continue
+        started = time.monotonic()
         with closing(sqlite3.connect(db, timeout=5)) as con:
             con.execute("BEGIN IMMEDIATE")
             results.append(install_priorities(con, snapshot, channel))
             con.commit()
+        results[-1]['local_install_seconds'] = time.monotonic()-started
     atomic_write_json(root / "value_priority.json", snapshot, durable=True)
     return results
 
 
-def refresh_if_due(root: Path, *, now: datetime | None = None) -> dict | None:
+def refresh_if_due(root: Path, *, now: datetime | None = None,
+                   on_refresh: Callable[[], None] | None = None) -> dict | None:
     """Opt-in, local metadata refresh at task boundaries; no per-call full scan."""
     path = root / "value_priority.json"
     if not path.is_file():
@@ -323,9 +388,14 @@ def refresh_if_due(root: Path, *, now: datetime | None = None) -> dict | None:
             raise ValueError("Incompatible acquisition value snapshot")
         if now < datetime.fromisoformat(snapshot["next_refresh_at_utc"]):
             return None
+        started = time.monotonic()
+        if on_refresh is not None:
+            on_refresh()  # Only an actually due refresh changes the UI state.
         fresh, _, _ = build_ranking(root.parent, root, snapshot["policy"])
+        built = time.monotonic()
         result = {"state": "local_value_priorities_refreshed", "channels": apply_snapshot(root, fresh),
-                  "provider_requests_sent": 0}
+                  "provider_requests_sent": 0, "observed_at_utc": datetime.now(UTC).isoformat(),
+                  "local_inventory_seconds": built-started, "total_refresh_seconds": time.monotonic()-started}
     except (OSError, ValueError, KeyError, TypeError, AttributeError, sqlite3.Error):
         # A ranking metadata failure must not stop the healthy downloader or
         # turn into a per-query catalog scan. Retain the last approved order.

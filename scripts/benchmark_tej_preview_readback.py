@@ -82,8 +82,9 @@ def run(root: Path, baseline: Path, output: Path, *, fixture: bool = False,
     candidate=(candidate or ROOT/'scripts/tej_smart_wizard_bridge.ps1').resolve()
     if not candidate.is_file() or candidate.stat().st_size>1024**2:
         raise ValueError('Bounded reviewed candidate bridge required')
-    if (type(fixture_rows) is not int or not 1<=fixture_rows<=3000
-            or type(fixture_columns) is not int or not 3<=fixture_columns<=30):
+    if (type(fixture_rows) is not int or not 1<=fixture_rows<=50000
+            or type(fixture_columns) is not int or not 3<=fixture_columns<=30
+            or (fixture_rows+1)*fixture_columns>400000):
         raise ValueError('Reviewed fixture dimensions required')
     lock = nullcontext() if fixture else exclusive_dataset_lock(
         root/'.download.lock', provider='tej_no_query_readback_benchmark', timeout_seconds=0)

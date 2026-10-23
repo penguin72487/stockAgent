@@ -1266,6 +1266,54 @@ def test_real_readback_does_not_count_as_committed_data_or_renew_deadline(regist
     assert json.loads((root/'worker_status.json').read_text()) == worker
 
 
+def test_runtime_initialization_is_display_only_not_readback_or_an_adoption(registry):
+    repo, root, now, _, worker, progress, path = _live_readback(registry)
+    atomic_write_json(path, {**progress, 'stage':'initializing_runtime'})
+    status = build_tej_public_status(repo, now=now)
+    current = status['activity']['current_task']
+    assert current['stage'] == 'initializing_runtime'
+    assert current['readback_ratio'] is None and current['readback_scanned_row_slots'] is None
+    assert current['adopted'] is False and status['workload']['exported_rows'] == 0
+    assert status['activity']['completed_download_tasks'] == 0
+    assert json.loads((root/'worker_status.json').read_text()) == worker
+    assert 'SECRET' not in json.dumps(status)
+
+
+@pytest.mark.parametrize('phase', [
+    'context_and_source_binding', 'field_selection', 'company_universe_and_lookup',
+    'date_model_and_lookup', 'company_selection_and_verification',
+    'date_selection_and_verification', 'final_source_and_preview_guards',
+])
+def test_scope_preparation_phase_is_safe_display_only(registry, phase):
+    repo, root, now, _, worker, progress, path = _live_readback(registry)
+    atomic_write_json(path, {**progress, 'stage': 'preparing_scope', 'scope_phase': phase})
+    status = build_tej_public_status(repo, now=now)
+    current = status['activity']['current_task']
+    assert current['scope_phase'] == phase and current['stage'] == 'preparing_scope'
+    assert current['readback_ratio'] is None and current['adopted'] is False
+    assert status['activity']['completed_download_tasks'] == 0
+    assert json.loads((root/'worker_status.json').read_text()) == worker
+    assert 'SECRET' not in json.dumps(status)
+
+
+@pytest.mark.parametrize('phase', ['SECRET', '__proto__', [], {}, 17, None])
+def test_unreviewed_scope_phase_never_reaches_public_status(registry, phase):
+    repo, root, now, _, _, progress, path = _live_readback(registry)
+    atomic_write_json(path, {**progress, 'stage': 'preparing_scope', 'scope_phase': phase})
+    status = build_tej_public_status(repo, now=now)
+    assert status['activity']['current_task']['scope_phase'] is None
+    assert 'SECRET' not in json.dumps(status)
+
+
+def test_old_scope_phase_cannot_mislabel_source_wait_or_renew_owner(registry):
+    repo, root, now, _, worker, progress, path = _live_readback(registry)
+    atomic_write_json(path, {**progress, 'stage': 'awaiting_preview', 'scope_phase': 'field_selection'})
+    status = build_tej_public_status(repo, now=now)
+    assert status['activity']['current_task']['stage'] == 'awaiting_preview'
+    assert status['activity']['current_task']['scope_phase'] is None
+    assert json.loads((root/'worker_status.json').read_text()) == worker
+
+
 @pytest.mark.parametrize('mutation', ['expired_owner', 'pid_reused', 'wrong_attempt', 'old_attempt',
     'wrong_task', 'invalid_stage', 'future_clock', 'oversized', 'symlink', 'invalid_slots', 'bool_slots'])
 def test_readback_requires_exact_attempt_bounded_time_and_safe_metadata(registry, mutation):

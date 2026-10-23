@@ -968,15 +968,20 @@ def _wait_discord_ready(
             if isinstance(row, Mapping)
         }
         target_warm = warm_markets.get(target_market) or {}
+        current_run = str(status.get("run_id") or "")
         if (
-            str(status.get("run_id") or "")
-            and str(status.get("run_id") or "") != previous_run_id
+            current_run
+            and current_run != previous_run_id
             and bool(status.get("discord_connected"))
             and str(status.get("core_health") or "") == "ready"
             and set(status.get("scheduled_day_trade_markets") or ()) == expected_markets
             and str(status.get("engine_run_id") or "") == expected_engine_run_id
             and str(warmup.get("status") or "") == "ready"
             and int(warmup.get("ready_count") or 0) == len(expected_markets)
+            and str(warmup.get("run_id") or "") == current_run
+            and set(warm_markets) == expected_markets
+            and len(warmup.get("markets") or ()) == len(expected_markets)
+            and all(row.get("status") == "ready" for row in warm_markets.values())
             and str(target_warm.get("checkpoint_fingerprint") or "")
             == checkpoint_fingerprint
         ):
@@ -1652,34 +1657,93 @@ def _recover_promoted_consumers(args, plan, previous_operation):
         raise ValueError("consumer recovery requires the exact already-promoted failed operation")
     live = _resolved(args.live_dir)
     run = Path(previous_operation["run_dir"])
-    with control_lease(owner=f"deployed-consumer-recovery:{market}", timeout_seconds=90):
-        _flat_live_state(live, expected)
-        sync = _wait_engine_sync(live, expected)
-        schedule = _ensure_discord_deployment_schedule(market, run_dir=run)
-        previous_run = _object(_resolved(DISCORD_STATUS_PATH)).get("run_id", "")
-        restart = _restart_and_wait_active(DISCORD_SERVICE)
-        discord = _wait_discord_ready(expected_engine_run_id=sync["engine_run_id"],
-            expected_markets=expected, target_market=market,
-            checkpoint_fingerprint=target["checkpoint_fingerprint"], previous_run_id=str(previous_run))
-        public = _restart_and_wait_active(PUBLIC_SERVICE)
-        dashboard = _verify_dashboard(market=market, start_date=history["start_date"],
-                                     end_date=history["end_date"], expected_markets=expected)
-        promotion = _object(live / "promotion_receipt.json")
-        if promotion["acceptance"]["minute_curve_validation"]["validated_rows"] != history["expected_strategy_minute_rows"]:
-            raise RuntimeError("consumer recovery minute scope differs")
-        result = {**previous_operation,
-            "status": "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete",
-            "previous_consumer_failure": previous_operation.get("error"), "error": None,
-            "consumer_recovered_at": datetime.now(TAIPEI).isoformat(), "promotion_completed": True,
-            "completed_at": datetime.now(TAIPEI).isoformat(), "schedule_update": schedule,
-            "promotion_receipt": str(live / "promotion_receipt.json"),
-            "rollback_directory": promotion["rollback_directory"], "engine_sync": sync,
-            "discord": {"run_id": discord.get("run_id"), "restart": restart,
-                        "warmup": discord.get("startup_inference_warmup")},
-            "public_restart": public, "dashboard_acceptance": dashboard,
-            "second_ledger_promotion_performed": False}
-        _atomic_json(_resolved(args.operations_root) / market / "status.json", result)
-        return result
+    status_path = _resolved(args.operations_root) / market / "status.json"
+    started = datetime.now(TAIPEI)
+    attempt_path = run / f"consumer_recovery_{started.strftime('%Y%m%dT%H%M%S%f%z')}.json"
+    progress: dict[str, Any] = {"started_at": started.isoformat(), "stage": "control_lease",
+                                "second_ledger_promotion_performed": False}
+    lease_acquired = False
+    with ExitStack() as recovery_context:
+        try:
+            recovery_context.enter_context(control_lease(owner=f"deployed-consumer-recovery:{market}", timeout_seconds=90))
+            lease_acquired = True
+            progress["stage"] = "flat_and_engine_sync"
+            _flat_live_state(live, expected)
+            sync = _wait_engine_sync(live, expected)
+            progress["engine_sync"] = sync
+            progress["stage"] = "promoted_minute_scope"
+            promotion = _object(live / "promotion_receipt.json")
+            if promotion["acceptance"]["minute_curve_validation"]["validated_rows"] != history["expected_strategy_minute_rows"]:
+                raise RuntimeError("consumer recovery minute scope differs")
+            progress["stage"] = "schedule_update"
+            schedule = _ensure_discord_deployment_schedule(market, run_dir=run)
+            progress["schedule_update"] = schedule
+            previous_run = _object(_resolved(DISCORD_STATUS_PATH)).get("run_id", "")
+            progress["stage"] = "discord_warmup"
+            try:
+                # The native owner can finish its retry after the prior CLI
+                # deadline. Re-admit its current same-run proof before doing
+                # another cold restart; this is not a cached failed snapshot.
+                discord = _wait_discord_ready(expected_engine_run_id=sync["engine_run_id"],
+                    expected_markets=expected, target_market=market,
+                    checkpoint_fingerprint=target["checkpoint_fingerprint"], previous_run_id="",
+                    timeout_seconds=1.0)
+            except RuntimeError:
+                restart = _restart_and_wait_active(DISCORD_SERVICE)
+                progress["discord_restart"] = restart
+                discord = _wait_discord_ready(expected_engine_run_id=sync["engine_run_id"],
+                    expected_markets=expected, target_market=market,
+                    checkpoint_fingerprint=target["checkpoint_fingerprint"], previous_run_id=str(previous_run))
+            else:
+                restart = {"service": DISCORD_SERVICE, "active": True, "restarted": False,
+                           "reason": "current_same_run_warmup_and_engine_ack_verified"}
+                progress["discord_restart"] = restart
+            progress["discord_run_id"] = discord.get("run_id")
+            progress["stage"] = "dashboard_acceptance"
+            try:
+                _wait_active(PUBLIC_SERVICE, timeout_seconds=1.0)
+                dashboard = _verify_dashboard(market=market, start_date=history["start_date"],
+                                             end_date=history["end_date"], expected_markets=expected)
+            except Exception as exc:
+                progress["public_initial_acceptance_error"] = str(exc)
+                progress["stage"] = "public_restart"
+                public = _restart_and_wait_active(PUBLIC_SERVICE)
+                progress["public_restart"] = public
+                progress["stage"] = "dashboard_acceptance"
+                dashboard = _verify_dashboard(market=market, start_date=history["start_date"],
+                                             end_date=history["end_date"], expected_markets=expected)
+            else:
+                public = {"service": PUBLIC_SERVICE, "active": True, "restarted": False,
+                          "reason": "current_history_mode_union_and_ledger_sync_verified"}
+                progress["public_restart"] = public
+        except Exception as exc:
+            progress.update(status="failed_retryable", error=str(exc), finished_at=datetime.now(TAIPEI).isoformat())
+            _atomic_json(attempt_path, progress)
+            failed = {**previous_operation, "status": "failed_retryable", "error": str(exc),
+                      "previous_consumer_failure": previous_operation.get("error"),
+                      "consumer_recovery": progress, "consumer_recovery_receipt": str(attempt_path),
+                      "promotion_completed": True, "second_ledger_promotion_performed": False}
+            if lease_acquired:
+                _atomic_json(status_path, failed)
+            raise
+        else:
+            completed_status = "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete"
+            progress.update(status=completed_status, stage="complete", finished_at=datetime.now(TAIPEI).isoformat())
+            _atomic_json(attempt_path, progress)
+            result = {**previous_operation,
+                "status": completed_status,
+                "previous_consumer_failure": previous_operation.get("error"), "error": None,
+                "consumer_recovered_at": datetime.now(TAIPEI).isoformat(), "promotion_completed": True,
+                "completed_at": datetime.now(TAIPEI).isoformat(), "schedule_update": schedule,
+                "promotion_receipt": str(live / "promotion_receipt.json"),
+                "rollback_directory": promotion["rollback_directory"], "engine_sync": sync,
+                "discord": {"run_id": discord.get("run_id"), "restart": restart,
+                            "warmup": discord.get("startup_inference_warmup")},
+                "public_restart": public, "dashboard_acceptance": dashboard,
+                "consumer_recovery": progress, "consumer_recovery_receipt": str(attempt_path),
+                "second_ledger_promotion_performed": False}
+            _atomic_json(status_path, result)
+            return result
 
 
 def main() -> None:

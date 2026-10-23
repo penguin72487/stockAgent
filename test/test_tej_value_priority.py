@@ -10,7 +10,8 @@ import pytest
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import connect, _ready_task
 from downloader.tej_value_priority import (
-    CONTRACT, coverage_hint, feature_value, installed_priority, install_priorities,
+    CONTRACT, PRIORITY_WRITE_CONTRACT, _priority_writes_only,
+    coverage_hint, feature_value, installed_priority, install_priorities,
     rank_feature, refresh_if_due, summarize_table, validate_policy,
 )
 
@@ -47,6 +48,21 @@ def test_gap_precedes_even_high_value_complete_concept(policy):
     missing = rank_feature(feature(table="Fund's NAV", category="funds_bonds", field="NAV"), {}, policy)
     assert missing["priority"] < seen["priority"]
     assert seen["coverage_is_complete"] is False and seen["exclusion_enabled_by_ranking"] is False
+
+
+def test_isolated_installer_benchmark_verifies_all_source_columns_and_order(tmp_path):
+    from scripts.benchmark_tej_value_priority import benchmark
+    report = benchmark(tmp_path/'abba.json', tasks=20, payload_bytes=32)
+    assert report['accepted'] and report['source_and_priority_parity']
+    assert report['fixture_is_synthetic'] and report['production_database_read'] is False
+    assert report['provider_queries_sent'] == 0 and len(report['samples']) == 8
+    for channel in ('smart_wizard', 'api'):
+        samples = [r for r in report['samples'] if r['channel'] == channel]
+        assert [r['variant'] for r in samples] == ['baseline', 'candidate', 'candidate', 'baseline']
+        assert len({r['source_columns_sha256'] for r in samples}) == 1
+        assert len({r['priority_columns_sha256'] for r in samples}) == 1
+    with pytest.raises(FileExistsError):
+        benchmark(tmp_path/'abba.json')
 
 
 def test_high_value_gap_before_cheap_auxiliary_gap(policy):
@@ -183,17 +199,36 @@ def test_refresh_is_local_periodic_and_failures_do_not_stop_download(tmp_path, m
     now = datetime.now(UTC)
     doc = {**snapshot(), "policy": policy}
     atomic_write_json(tmp_path / "value_priority.json", doc)
-    calls = []
+    calls, display = [], []
     def fail(*args):
         calls.append(1)
         raise OSError("private-path-or-source-error-not-published")
     monkeypatch.setattr('downloader.tej_value_priority.build_ranking', fail)
-    assert refresh_if_due(tmp_path, now=now) is None and calls == []
+    assert refresh_if_due(tmp_path, now=now, on_refresh=lambda: display.append(1)) is None and calls == []
+    assert display == []
     due = datetime.fromisoformat(doc['next_refresh_at_utc'])
-    result = refresh_if_due(tmp_path, now=due)
+    result = refresh_if_due(tmp_path, now=due, on_refresh=lambda: display.append(1))
     assert result['existing_order_retained'] and result['provider_requests_sent'] == 0
     assert 'private-path' not in json.dumps(result)
-    assert refresh_if_due(tmp_path, now=due + timedelta(seconds=1)) is None and calls == [1]
+    assert refresh_if_due(tmp_path, now=due + timedelta(seconds=1), on_refresh=lambda: display.append(1)) is None and calls == [1]
+    assert display == [1]  # No transient "refreshing" on every healthy query.
+
+
+def test_due_refresh_reports_real_inventory_and_install_time_without_source_calls(tmp_path, monkeypatch, policy):
+    doc = {**snapshot(), 'policy': policy}
+    atomic_write_json(tmp_path/'value_priority.json', doc)
+    events = []
+    def build(*args):
+        events.append('inventory')
+        return doc, [], []
+    monkeypatch.setattr('downloader.tej_value_priority.build_ranking', build)
+    result = refresh_if_due(tmp_path, now=datetime.fromisoformat(doc['next_refresh_at_utc']),
+                            on_refresh=lambda: events.append('display'))
+    assert events == ['display', 'inventory']
+    assert result['state'] == 'local_value_priorities_refreshed'
+    assert result['total_refresh_seconds'] >= result['local_inventory_seconds'] >= 0
+    assert datetime.fromisoformat(result['observed_at_utc']).tzinfo is not None
+    assert result['provider_requests_sent'] == 0
 
 
 @pytest.mark.parametrize('payload', ['{broken', 'null', '{}', '{"contract":"wrong"}'])
@@ -202,3 +237,135 @@ def test_invalid_ranking_cache_cannot_stop_healthy_source_or_clear_existing_orde
     result = refresh_if_due(tmp_path)
     assert result['existing_order_retained'] and result['provider_requests_sent'] == 0
     assert refresh_if_due(tmp_path) is None
+
+
+def test_priority_install_does_not_decode_history_and_noop_updates_no_tasks(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,state) "
+                    "VALUES('history','risk','download','P1',100,?,'complete')", ('private history' * 10000,))
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json) "
+                    "VALUES('new','fund','download','P1',100,'original')")
+        sql = []
+        con.set_trace_callback(sql.append)
+        first = install_priorities(con, snapshot(), 'smart_wizard')
+        second = install_priorities(con, snapshot(), 'smart_wizard')
+        assert first['pending_priorities_updated'] == 1
+        assert second['pending_priorities_updated'] == 0
+        assert first['source_identity_verification'] == PRIORITY_WRITE_CONTRACT
+        assert first['source_identity_verified_unchanged'] and first['source_payloads_decoded'] == 0
+        assert first['preserved_source_identity_sha256'] is None and first['audited_source_tasks'] is None
+        assert not any('request_json' in statement or 'ORDER BY task_id' in statement for statement in sql)
+        assert con.execute("SELECT request_json FROM tasks WHERE task_id='history'").fetchone()[0] == 'private history' * 10000
+
+
+@pytest.mark.parametrize('statement', [
+    "UPDATE tasks SET request_json='changed'", "UPDATE tasks SET state='complete'",
+    "UPDATE tasks SET active_attempt_id='changed'", "DELETE FROM tasks",
+    "INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json) VALUES('x','x','download','P1',0,'{}')",
+    "UPDATE download_plans SET next_query=999", "UPDATE download_plans SET plan_json='changed'",
+    "DELETE FROM download_plans", "UPDATE tables SET state='complete'",
+    "UPDATE meta SET value='changed'", "INSERT INTO meta VALUES('source_contract','changed')",
+    "PRAGMA user_version=999", "CREATE TABLE bypass(value)",
+])
+def test_priority_capability_rejects_all_non_priority_writes(tmp_path, statement):
+    with closing(connect(tmp_path)) as con:
+        with _priority_writes_only(con), pytest.raises(sqlite3.DatabaseError):
+            con.execute(statement)
+
+
+def test_prepared_statement_is_reauthorized_and_policy_is_removed_after_error(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        sql = "UPDATE tasks SET state='pending' WHERE task_id='missing'"
+        con.execute(sql)  # Populate sqlite3's statement cache before the fence.
+        with pytest.raises(sqlite3.DatabaseError), _priority_writes_only(con):
+            con.execute(sql)
+        # The installer owns this connection's policy; unrelated later owner
+        # work must not retain the installer's priority-only restrictions.
+        con.execute(sql)
+
+
+@pytest.mark.parametrize('origin', ['tasks', 'download_plans', 'acquisition_value_priorities', 'meta'])
+def test_trigger_cannot_change_source_and_failed_install_rolls_back_only_itself(tmp_path, origin):
+    with closing(connect(tmp_path)) as con:
+        install_priorities(con, snapshot(), 'smart_wizard')
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json) "
+                    "VALUES('pending','fund','download','P1',100,'original')")
+        con.execute("INSERT INTO download_plans VALUES('fund','original','original',0,1,'P1',100)")
+        con.execute(f"CREATE TRIGGER source_mutation AFTER UPDATE ON {origin} "
+                    "BEGIN UPDATE tasks SET request_json='changed'; END")
+        con.commit()
+        # Caller has earlier uncommitted work. Failed ranking must not commit
+        # it or roll it back, nor leave a half-installed order behind.
+        con.execute("INSERT INTO meta VALUES('caller','preserve')")
+        before = [tuple(r) for r in con.execute('SELECT * FROM tasks ORDER BY task_id')]
+        with pytest.raises(sqlite3.DatabaseError):
+            install_priorities(con, snapshot(), 'smart_wizard')
+        assert before == [tuple(r) for r in con.execute('SELECT * FROM tasks ORDER BY task_id')]
+        assert con.execute("SELECT value FROM meta WHERE key='caller'").fetchone()[0] == 'preserve'
+        assert con.in_transaction
+        con.rollback()
+        assert con.execute("SELECT 1 FROM meta WHERE key='caller'").fetchone() is None
+
+
+def test_api_scope_cursor_and_receipt_writes_are_denied_even_from_a_trigger(tmp_path):
+    from downloader.tej_api import connect as api_connect
+    with closing(api_connect(tmp_path)) as con, con:
+        con.execute("INSERT INTO tasks(id,table_id,params_json,priority,state,cursor,query_rows,actual_rows,page_size) "
+                    "VALUES('paid','TRAIL/TANAV','{}',0,'pending','paid-token',20000,20000,10000)")
+        con.execute("CREATE TRIGGER mutate_paid_cursor AFTER UPDATE OF priority ON tasks "
+                    "BEGIN UPDATE tasks SET cursor=NULL,query_rows=0,actual_rows=0; END")
+        before = tuple(con.execute("SELECT * FROM tasks WHERE id='paid'").fetchone())
+        with pytest.raises(sqlite3.DatabaseError):
+            install_priorities(con, snapshot(), 'api')
+        assert before == tuple(con.execute("SELECT * FROM tasks WHERE id='paid'").fetchone())
+
+
+def test_foreign_key_cascade_outside_priority_columns_is_denied_and_rolled_back():
+    with closing(sqlite3.connect(':memory:')) as con:
+        con.execute('PRAGMA foreign_keys=ON')
+        con.executescript("CREATE TABLE tasks(id TEXT PRIMARY KEY,table_id TEXT,state TEXT,priority INTEGER UNIQUE);"
+                         "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);"
+                         "CREATE TABLE child(value INTEGER REFERENCES tasks(priority) ON UPDATE CASCADE);"
+                         "INSERT INTO tasks VALUES('x','TRAIL/TANAV','pending',100);"
+                         "INSERT INTO child VALUES(100);")
+        with pytest.raises(sqlite3.DatabaseError):
+            install_priorities(con, snapshot(), 'api')
+        assert con.execute('SELECT priority FROM tasks').fetchone()[0] == 100
+        assert con.execute('SELECT value FROM child').fetchone()[0] == 100
+
+
+@pytest.mark.parametrize('mismatch', [False, True])
+def test_inventory_abba_keeps_read_snapshot_and_retains_failed_oracle(tmp_path, monkeypatch, mismatch):
+    from scripts import benchmark_tej_value_priority as tool
+    from scripts import build_tej_smart_wizard_inventory as inventory
+    baseline = b'''def local_features(root):
+        coverage_sql = "SELECT dataset,MIN(first_data_date),MAX(last_data_date) FROM tasks WHERE state='complete' GROUP BY dataset"
+        samples_sql = "SELECT dataset,receipt_path FROM (SELECT dataset,receipt_path,ROW_NUMBER() OVER(PARTITION BY dataset ORDER BY last_data_date DESC,last_attempt_at_utc DESC) AS rank FROM tasks WHERE state='complete' AND receipt_path IS NOT NULL) WHERE rank=1"
+'''
+    monkeypatch.setattr(tool.subprocess, 'check_output', lambda args, **kwargs:
+                        'a'*40 if args[1]=='rev-parse' else baseline)
+    root = tmp_path/'repo'
+    queue = root/'data_finmind'/'complement'/'queue.sqlite3'
+    queue.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(queue)) as con, con:
+        con.execute('CREATE TABLE tasks(dataset,state,first_data_date,last_data_date,last_attempt_at_utc,receipt_path)')
+        con.execute("INSERT INTO tasks VALUES('fixture','complete','2000','2025','now','private-receipt')")
+    before = queue.read_bytes()
+    if mismatch:
+        original = inventory.finmind_local_metadata
+        monkeypatch.setattr(inventory, 'finmind_local_metadata', lambda con:(original(con)[0], []))
+    output = tmp_path/'oracle.json'
+    if mismatch:
+        with pytest.raises(ValueError, match='failed ABBA receipt retained'):
+            tool.benchmark_inventory(root, output)
+    else:
+        tool.benchmark_inventory(root, output)
+    report = json.loads(output.read_text())
+    assert report['accepted'] is (not mismatch)
+    assert len(report['samples']) == 4
+    assert report['provider_queries_sent'] == 0 and report['queue_modified'] is False
+    assert report['source_values_read'] is False
+    assert 'private-receipt' not in output.read_text()
+    assert queue.read_bytes() == before
+    with pytest.raises(FileExistsError):
+        tool.benchmark_inventory(root, output)

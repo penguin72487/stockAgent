@@ -54,18 +54,23 @@ public static class TejReadbackBenchmark {
         thread=new Thread(()=> {
             try {
                 form=new PassiveForm {Text="StockAgent owned readback benchmark",Width=540,Height=350};
-                grid=new DataGridView {Dock=DockStyle.Fill,AllowUserToAddRows=true};
+                grid=new DataGridView {Dock=DockStyle.Fill,AllowUserToAddRows=true,
+                    AutoSizeColumnsMode=DataGridViewAutoSizeColumnsMode.None,
+                    AutoSizeRowsMode=DataGridViewAutoSizeRowsMode.None};
+                grid.SuspendLayout();
                 for(int c=0;c<columns;c++)grid.Columns.Add("c"+c,"Raw_"+c);
+                var batch=new DataGridViewRow[rows];
+                string[] values={"0","-0.0001",null,"台灣 café 😀","1,234.50","\"literal\"","1234567890123456789.001"};
                 for(int r=0;r<rows;r++) {
                     var cells=new object[columns];
                     for(int c=0;c<columns;c++) {
                         // Keep zero, signs, null, unicode, quoted strings and
                         // more-than-double precision distinct, without math.
-                        string[] values={"0","-0.0001",null,"台灣 café 😀","1,234.50","\"literal\"","1234567890123456789.001"};
                         cells[c]=c==0?"ID"+r:values[(r+c)%values.Length];
                     }
-                    grid.Rows.Add(cells);
+                    var row=new DataGridViewRow();row.CreateCells(grid,cells);batch[r]=row;
                 }
+                grid.Rows.AddRange(batch);grid.ResumeLayout(false);
                 form.Controls.Add(grid);form.Shown+=(s,e)=>{handle=grid.Handle.ToInt64();ready.Set();};
                 Application.Run(form);
             }catch(Exception e){error=e;ready.Set();}
@@ -128,7 +133,7 @@ $beforeForeground=[TejBridgeNative]::GetForegroundWindow().ToInt64()
 $mutex=[Threading.Mutex]::new($false,'Local\StockAgentTEJSmartWizardOwner');$owns=$false
 try {
     if($Fixture) {
-        if($Session -or $Prepared -or $FixtureRows -lt 1 -or $FixtureRows -gt 3000 -or $FixtureColumns -lt 3 -or $FixtureColumns -gt 30){throw 'Unreviewed fixture scope'}
+        if($Session -or $Prepared -or $FixtureRows -lt 1 -or $FixtureRows -gt 50000 -or $FixtureColumns -lt 3 -or $FixtureColumns -gt 30 -or ($FixtureRows+1)*$FixtureColumns -gt 400000){throw 'Unreviewed fixture scope'}
         $grid=[TejReadbackBenchmark]::Open($FixtureRows,$FixtureColumns);$opened=$true
         $maxRows=$FixtureRows+1;$columns=$FixtureColumns;$basis='owned_software_fixture_not_TEJ_source'
     } else {

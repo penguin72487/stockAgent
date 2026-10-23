@@ -316,6 +316,10 @@ def _opening_signal_latency_record(
         ),
         "model_lock_queue_ms": timing.get("model_lock_queue_ms"),
         "signal_pre_quote_prepare_ms": live_latency.get("pre_quote_prepare_ms"),
+        # Nested preparation spans, never added again to signal_total_ms.
+        "checkpoint_contract_build_ms": live_latency.get("checkpoint_contract_build_ms"),
+        "checkpoint_contract_validate_ms": live_latency.get("checkpoint_contract_validate_ms"),
+        "quote_preparation_queue_ms": live_latency.get("quote_preparation_queue_ms"),
         "signal_quote_fetch_ms": live_latency.get("quote_fetch_ms"),
         "signal_pre_inference_prepare_ms": live_latency.get(
             "pre_inference_prepare_ms"

@@ -44,6 +44,14 @@ coordinated code, config, test, and documentation change.
   immutable payloads, not another full physical copy per version. The common
   policy/roots live in `configs/columnar_storage.json:source_versioning`; the
   existing publication catalog still owns scope, locks and transport rights.
+  The enrolled `tw-public` read-only publisher uses a `shared_read` source
+  coordination lease: it excludes source writers but admits model readers.
+  Its wrapper and canonical child must agree; an inherited FD must prove its
+  own held flock without converting or unlocking the parent's description.
+  Other datasets and actual source mutations retain exclusive ownership.
+  Cold target serialization, source stat/hash/freshness fences and complete
+  publication/recovery acceptance remain mandatory; never downgrade an
+  already-running publisher or delete its lock to adopt this policy.
   Packed v2 adds bounded SHA-256 byte chunks; updated readers retain v1 release support;
   deploy v2 consumers before explicitly opting a source in. Once enabled,
   scheduled releases inherit its chunk policy. Registration is not native
@@ -63,6 +71,18 @@ coordinated code, config, test, and documentation change.
   and path/type/symlink guard without retaining a second file inventory.
   Preserve the original census scope/order and all source/cold SHA gates;
   report storage-assignment and final-stability phases separately from hashing.
+  During the final private-cohort fence, resolve a selected path only when
+  its file/directory/symlink check uses it; sealed atomic-JSON observations
+  still require their original complete hash and storage binding. Construct a
+  logical path once, without splitting/reparsing its components. This is not
+  path admission, a skipped stat fence, or permission to accept an unsealed row.
+  Named atomic-JSON observations and bounded private control captures read
+  only the held regular file's observed size plus one growth-detection byte,
+  after enforcing the original 64 MiB limit. Do not request that whole limit
+  for every tiny receipt. Keep no-follow/nonblocking open, before/after FD
+  size/mtime, complete JSON validation and bounded retries; close an owned FD
+  if stream construction fails. A substituted FIFO must fail, not block the
+  owner. This does not expand control scope or weaken raw-payload stability.
   A bounded metadata-memory benchmark is not full migration or RSS acceptance.
   A failed disposable metadata index may be retired only through
   `packed_snapshot metadata-scratch-plan` / `metadata-scratch-apply`: explicitly
@@ -466,7 +486,18 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   results advance immediately to other eligible work instead of imposing a
   blanket 30-second timer; when all remaining sources wait, sleep only to the
   earliest bounded retry. Old recorded results retain their original timer
-  during deterministic Temporal replay. These sources remain
+  during deterministic Temporal replay. If an unfinished catalog changes only
+  `source_coordination_lock_mode`, finish its SHA-bound saved catalog first and
+  record the pending catalog identity; do not discard already accepted source
+  bindings or relabel them with the new mode. Require identical paths, rights,
+  validation/freshness gates and version policy, and reject a damaged/redirected
+  saved plan. A completed plan also preserves its existing daily deadline for
+  this lock-mode-only change; do not immediately repeat the full source/recovery
+  cycle or restart its completed progress. Adopt the new exact catalog at that
+  deadline, without restamping old manifests. Actual source, rights, freshness,
+  lock-path or version-policy changes retain immediate new-plan admission. This
+  narrow scheduling deferral does not permit reusing old permissions after a
+  source/rights/policy change. These sources remain
   under the ignored host-private history boundary; their database states use
   native SQLite backup and their append-only observation cohorts remain
   explicitly non-atomic. For live WAL sources, pin a native read transaction
@@ -561,6 +592,79 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   uncommitted rotation/epoch siblings and reviewed catalog projection siblings;
   final logs, arbitrary temporary names and unknown changing observations stay
   selected and strict. No public-export or globally atomic workspace claim changes.
+  Control scope v14 (engineering rollout v15) adds only FinLab's reviewed
+  `intraday/{minute_cursor,market_cursor,source_backoff,batch_metrics,batch_metrics_seed}.json`.
+  The original market collector/calibration atomically replaces these bounded
+  queue/backoff/summary controls. Retain their first complete stable-FD/JSON/SHA
+  observation, native DB bindings and prior captures across named-only upgrades;
+  never reinterpret dated `batch_receipts`, arbitrary intraday/raw JSON or foreign
+  lookalikes as mutable. They have individual observation clocks, not one atomic
+  market snapshot. No source value, lock inode or API quota changes.
+  Control scope v15 (engineering rollout v18) adds only FinMind's reviewed
+  `announcements/{head,repair_plan}.json`; dated announcements, checks and raw
+  observations remain strict. Upgrade v14 preparations by probing named control
+  locations only, preserving their native DB bindings and original captures.
+  The `finlab_atomic_sibling_v1` rule applies only to the private `data_finlab`
+  observation cohort and exact reviewed producer directories/token patterns.
+  It omits uncommitted atomic siblings, not final Parquet/Feather/JSON, arbitrary
+  temporary names or source payloads; it never deletes those staging files.
+  Control scope v16 (engineering rollout v19) additionally captures only the
+  original FinLab overlay's `normalized/<24 lowercase hex>.parquet` and
+  `normalized/builds/<24 lowercase hex>/part-<four-digit year>.parquet` outputs.
+  The builder atomically replaces even an existing deterministic-token path;
+  that name is not immutable-inode evidence. Preserve each first stable-FD
+  copy and its full SHA across retries, using the existing private capture and
+  scratch-reserve owner; do not repeat raw census or native SQLite backups on
+  a prepared-scope upgrade. Unknown payloads and redirected build directories
+  remain strict. `finlab_research_atomic_sibling_v1` skips only those exact
+  producers' uncommitted `.parquet.tmp` siblings, never their final files.
+  Captures stay local/private and are retired only after full cold recovery.
+  Control scope v17 (engineering rollout v21) additionally captures only the
+  two reviewed `empty_evidence/<safe_stem>-<64 lowercase hex>.json` observations
+  for `dividend_otc:權息` and `management_change_events:變更交易開始日`.
+  Their producer rewrites the check clock under the raw-content digest; the
+  digest names the Feather payload, not immutable JSON bytes. Keep the original
+  raw Feather, other keys/JSON, redirected paths and unknown mutations strict.
+  Upgrade v16 through these named probes only, preserving the first fixed
+  captures and native database bindings instead of repeating raw preparation.
+  Durable migration retries prioritize fixed committed recovery, untouched work,
+  then the oldest attempted source. Lifetime error counts are not waiting time;
+  do not starve a short branch behind a recurring multi-million-file retry.
+  FinLab market frontier resets must preserve completed one-time raw/derived
+  index bootstrap flags. Universe/range changes invalidate the frontier, not
+  the same index's completed historical replay; first-time replay still runs,
+  and newly downloaded ticks continue recording their derived minutes normally.
+  The [v18 scoped evidence](../dataset_incremental_storage.md#2026-10-22-57-of-60)
+  proves fewer failure-driven census passes and original-byte recovery, but its
+  complete ABBA wall/CPU were higher. Do not describe it as a whole-chain speedup.
+  Complete inventories buffer canonical rows before the original gzip compressor
+  and hash the sequential compressed writes (including header/trailer), instead
+  of rereading the freshly written inventory. Preserve exact compressed bytes,
+  row order, encoding/level, short-write rejection, fsync and independent cold
+  SHA/reconstruction. Bounded row progress and the separate observation-cohort
+  stability stage must not imply dataset acceptance or omit any selected stat fence.
+  For spilled inventories, ZIP membership names use the existing covering
+  `(object_sha,path)` index directly, preserving UTF-8/surrogate ordering and
+  tracked cursor closure; do not decode full JSON rows twice just for names.
+  Full original recovery still reads the complete rows and verifies every
+  original SHA/length and all stored ZIP member CRCs. Bounded intra-pack progress
+  distinguishes reconstructed files/bytes from fully verified objects; advance
+  object counters only after the native read context and requested proofs pass.
+  The 2026-10-21 v16 complete ABBA preserves both inventories and old-version
+  recovery but does not demonstrate a whole-workflow speedup. Component lookup
+  savings are not a production-throughput or hardware-bound acceptance claim.
+  After durable pack installation, storage-only metadata updates must preserve
+  their previously selected bucket without naming `bucket` in SQLite's SET
+  list; even assigning its unchanged value rewrites the large routing index.
+  Use the existing bounded group's streaming `executemany` in the original
+  transaction, retaining kind/size/object/full-row updates, census-membership
+  rejection and required object-index maintenance. No extra inventory, commit,
+  source omission or durability authority is introduced. The 2026-10-22 v17
+  large-index ABBA reduced this component's CPU/time by about 32%, with exact
+  complete metadata/object/routing readback. Its separate complete crash/retry
+  workload had higher wall time; it does not prove a production speedup or the
+  absence of remaining software overhead. See the
+  [dated scoped evidence](../dataset_incremental_storage.md#2026-10-22-56-of-60).
   Ordinary packed-source reads may fuse the first pathname stat with a
   no-follow, nonblocking open and descriptor stat. Check regular-file type and
   all five original signature fields before reading, close descriptors on all
@@ -606,7 +710,12 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   A bounded seekable pack-write buffer may coalesce ZIP header backpatches,
   preserving exactly the legacy archive bytes. Drain failures must leave the
   old accepted head intact; retain full source stat/SHA fences and the original
-  fsync-before-install barriers. Measure initial publication and the complete
+  fsync-before-install barriers. The producer pack SHA may be fused into writes
+  only for finalized sequential windows, including exact short-write handling.
+  A ZIP backpatch outside the buffered window, a hole or nonzero start requires
+  the original full-file SHA pass; never digest superseded/partial bytes.
+  This does not replace independent cold SHA/CRC/original-file reconstruction.
+  Measure initial publication and the complete
   publish/incremental/recovery/old-version-readback workflow separately, not
   small-write counts alone. Attempt-bound work samples and transition-journal
   timestamps are different clocks; stale samples alone cannot authorize a
@@ -642,6 +751,24 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   Seal full source hashes and a future `catalog_valid_until_utc`; recheck this
   versioned scope and expiry before publication commit. Rebuild a stale union
   through the original builder rather than editing its lineage receipt.
+  A due/missing catalog or expiry during research staging defers that branch
+  with structured exit 75. The original account queue must refresh sources;
+  neither extend their expiry nor interrupt independent minute work. Invalid
+  hashes/schema/permissions remain hard failures. Leave an old seal unchanged
+  if the new attempt expires, including after staging exact payload bytes.
+  The publisher preserves the same distinction before its final head commit:
+  only a valid FinLab contract reaching its timestamp is retryable exit 75;
+  invalid/missing scope or expiry evidence still fails. The original wrapper
+  checks that exit explicitly and continues its independent minute queue,
+  without assuming a missing result receipt proves no head committed.
+  Canonical new publications bind the entire enrolled catalog entry under
+  `catalog_entry_publication_v1`. Migration may recover that exact already
+  admitted v2 historical release when the matching live workspace is busy or
+  stale; this is not a new publication or a current-history-completeness claim.
+  Match scope, role, selection, reader/chunk ABI and catalog identity, then
+  require the original full object/original-file recovery before acceptance.
+  A legacy manifest without this admission identity still uses the original
+  live publisher; never retrofit a marker or extend an expired source receipt.
   An uncommitted first private baseline may checkpoint only fully installed,
   directory-synced packs in bounded, content-hashed fragments under that exact
   operation's owned `sealed-pack-checkpoints/<dataset>` directory. Bind cold
@@ -672,12 +799,36 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   verified-extent callback is allowed. A failed batch cannot seal a recovery or
   materialization. Only an empty recognized interop startup failure may retry.
   Migration enables this separately through `d_primary_native_chunk_reads`,
-  only on the canonical public D root and for originals at least 64 MiB; small
-  files and private roots keep their previous reader. Do not infer native blob
+  on the canonical public D root or the exact enrolled private-history root
+  and for originals at least 64 MiB; small files retain their previous reader.
+  Private chunk reads require the original owner/0700/marker/ignore and
+  export-false checks without initialization, just like private pack reads.
+  Do not infer native blob
   activation from the independent pack-read option. Complete new verification
   owns its one presence/size pass: resolvers may omit duplicate presence only
   immediately before it, while cached recovery receipts still require current
   presence. Manifest identity/schema and full byte checks are never omitted.
+  Existing-chunk reuse may explicitly coalesce metadata across original-file
+  boundaries and overlap one D reader with C source hashing. Bound each batch
+  to 16 members, with at most one batch in flight plus 16 queued descriptors;
+  retain no source-byte queue or parallel HDD readers. The background reader
+  returns complete hashes only; the original parent alone checks exact members,
+  SHA and fresh path signatures before admitting the whole batch. Preserve the
+  64 MiB native-startup threshold, per-extent/whole-original source SHA, original
+  SQLite transactions and atomic publication. Drain all verification before
+  commit and join the reader even when a source fails. Full independent cold
+  recovery remains separate. Compare complete crash/retry, correction/deletion
+  and both-version restoration under matched owner limits before activation;
+  generated-D results are not all-source, NAS or hardware-limit evidence.
+  Canonical D publication of the enrolled v2 FinLab research source may enable
+  that same bounded existing-chunk pipeline; custom roots, v1 sources and other
+  catalog entries retain their original policy. This grants no new source or
+  export authority and does not extend the original source-expiry clock.
+  The `packed_snapshot verify --reconstruct-all-files` CLI must call the
+  original `reconstruct_all=True` verifier directly. Do not expand a second
+  all-path list and select the slower partial-path reader: that bypasses the
+  already verified chunk-object/whole-original SHA fusion. Preserve every
+  object/CRC/file/byte gate, result/progress fields and fixed-release scope.
   A code-only worker rollout waits for the existing dataset/source/catalog
   owner locks (with a declared bounded deadline), rejects candidate code drift
   during the wait, then verifies the actually loaded code and persistent chain
@@ -706,6 +857,16 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   passes without initialization. Large packs keep full native SHA, guarded
   staging and all-member CRC/original-file SHA. This does not enable private
   blob shortcuts, NAS export, source retirement or generic alternate roots.
+  Chunk publication may batch reuse checks for at most 16 distinct existing
+  members; source extents and the whole original are still hashed in order.
+  Launch the original native full-SHA batch only when it totals at least
+  64 MiB; small tails retain the complete Linux hash. Require exact returned
+  membership, every expected SHA and unchanged before/after member identity
+  before admitting any member of that batch. Preserve source-stability,
+  CAS durability and independent full-original recovery. This option does
+  not create another object pool or export owner. The v20 complete ABBA
+  shows a scoped modest wall-time reduction, not a production hardware limit;
+  see the [dated evidence](../dataset_incremental_storage.md#2026-10-22-v20).
 - lab203's fixed `lab203-lake-relay` rclone-copies closed deliveries to a
   separate immutable NAS archive. Accept only exact paired ACKs after full
   file/set/byte checks, independent NAS readback, mount/runtime/owner guards

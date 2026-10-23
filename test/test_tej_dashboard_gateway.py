@@ -103,3 +103,52 @@ def test_estimate_execution_state_distinguishes_waiting_from_running(state):
     expected=('automatic_running' if state in {'executing','between_tasks'} else
               'automatic_waiting_recovery' if state=='waiting_recovery' else 'automatic_waiting')
     assert _automatic_execution_state(state)==expected
+
+
+def test_monitor_query_budget_releases_reader_lock(tmp_path, monkeypatch):
+    import sqlite3
+    import stockagent.live.tej_dashboard as dashboard
+
+    root = tmp_path / 'data_tej'
+    root.mkdir()
+    with sqlite3.connect(root / 'queue.sqlite3') as writer:
+        writer.execute('CREATE TABLE source(id INTEGER)')
+        writer.execute('INSERT INTO source VALUES(1)')
+    monkeypatch.setattr(dashboard, 'METADATA_READ_BUDGET_SECONDS', .02)
+    reader = dashboard._read(root)
+    try:
+        reader.execute('BEGIN')
+        reader.execute('SELECT * FROM source').fetchall()
+        with pytest.raises(sqlite3.OperationalError, match='interrupted'):
+            reader.execute('WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL '
+                           'SELECT x+1 FROM n WHERE x<100000000) SELECT SUM(x) FROM n').fetchone()
+    finally:
+        reader.close()
+    with sqlite3.connect(root / 'queue.sqlite3', timeout=.05) as writer:
+        writer.execute('BEGIN EXCLUSIVE')
+        assert writer.execute('SELECT COUNT(*) FROM source').fetchone()[0] == 1
+        writer.rollback()
+
+
+def test_latest_receipt_index_covers_all_timing_bases(tmp_path):
+    from contextlib import closing
+    from downloader.tej_history import connect
+
+    with closing(connect(tmp_path / 'data_tej')) as con:
+        statement = ("SELECT task_id,table_id,actual_rows,actual_bytes,completed_at_utc FROM tasks "
+                     "WHERE state='complete' AND kind='download' AND scope_contract=? "
+                     "ORDER BY completed_at_utc DESC LIMIT 1")
+        detail = ' '.join(row['detail'] for row in con.execute(
+            'EXPLAIN QUERY PLAN ' + statement, ('editable_source_scope_v1',)))
+        assert 'USING COVERING INDEX tasks_scope_latest' in detail
+        assert 'TEMP B-TREE' not in detail
+        # A newer legacy receipt must not disappear merely because ETA uses
+        # the separate fresh_end_to_end sample index.
+        con.executemany(
+            'INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,state,'
+            'scope_contract,timing_basis,completed_at_utc) VALUES(?,?,?,?,?,?,?,?,?,?)',
+            [(name, 'table', 'download', 'P1', 0, '{}', 'complete',
+              'editable_source_scope_v1', basis, clock) for name, basis, clock in (
+                ('fresh', 'fresh_end_to_end', '2026-10-22T01:00:00+00:00'),
+                ('legacy', 'legacy_bridge_only', '2026-10-22T01:01:00+00:00'))])
+        assert con.execute(statement, ('editable_source_scope_v1',)).fetchone()['task_id'] == 'legacy'

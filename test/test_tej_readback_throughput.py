@@ -101,6 +101,124 @@ def test_optional_full_windows_timing_is_bounded_exact_attempt_metadata_only(que
     assert 'PRIVATE_' not in json.dumps(report)
 
 
+def test_native_cache_timings_distinguish_fingerprinting_from_compilation_without_exposing_paths(queue,tmp_path):
+    attempt = 'a'*24+'-'+'b'*32
+    value = {'contract':'tej_monotonic_windows_full_flow_v1','task_id':'a'*24,
+        'query_attempt_id':attempt,'action':'download','phases':{},
+        'native_helper_cache':{'contract':'exact_native_code_compilation_cache_v1','state':'hit',
+            'private_path':'PRIVATE_VALUE','timings':{'fingerprint_seconds':185.1,
+                'prepare_or_compile_seconds':.2,'load_and_verify_seconds':.1,
+                'PRIVATE_FIELD':1,'other':float('inf')}}}
+    (queue/'raw'/(attempt+'.json.flow.json')).write_text(json.dumps(value))
+    report = profile(queue,tmp_path/'native-cache-flow.json')
+    assert report['samples'][0]['windows_flow']['native_helper_cache'] == {
+        'state':'hit','timings':{'fingerprint_seconds':185.1,
+            'prepare_or_compile_seconds':.2,'load_and_verify_seconds':.1}}
+    assert 'PRIVATE_' not in json.dumps(report)
+
+
+@pytest.mark.parametrize('fault', [None, 'foreign_task', 'foreign_attempt', 'foreign_digest', 'malformed'])
+def test_transport_timing_is_exact_request_bound_and_allowlisted(queue, tmp_path, fault):
+    attempt = 'a'*24+'-'+'b'*32
+    prepared = queue/'requests'/(attempt+'.json')
+    path = queue/'progress'/(attempt+'.json.transport.json')
+    path.parent.mkdir()
+    value = {'contract':'tej_monotonic_guarded_transport_timing_v1', 'task_id':'a'*24,
+        'attempt_id':attempt, 'request_sha256':hashlib.sha256(prepared.read_bytes()).hexdigest(),
+        'local_prelaunch_seconds':.1, 'admission_seconds':2, 'permit_write_seconds':.001,
+        'admitted_execution_seconds':3, 'total_transport_seconds':5.001,
+        'PRIVATE_VALUE':'secret', 'launches':2}
+    if fault == 'foreign_task': value['task_id'] = 'f'*24
+    if fault == 'foreign_attempt': value['attempt_id'] = 'f'*24+'-'+'e'*32
+    if fault == 'foreign_digest': value['request_sha256'] = '0'*64
+    if fault == 'malformed': path.write_text('{')
+    else: path.write_text(json.dumps(value))
+    report = profile(queue, tmp_path/'transport.json')
+    assert report['all']['tasks'] == 1
+    assert ('transport_timing' in report['samples'][0]) is (fault is None)
+    if fault is None:
+        assert set(report['samples'][0]['transport_timing']) == {
+            'local_prelaunch_seconds', 'admission_seconds', 'permit_write_seconds',
+            'admitted_execution_seconds', 'total_transport_seconds'}
+    assert 'PRIVATE_' not in json.dumps(report)
+
+
+def test_prebridge_optional_metadata_keeps_only_finite_approved_phases(queue, tmp_path):
+    attempt = 'a'*24+'-'+'b'*32
+    value = {'contract':'tej_monotonic_windows_full_flow_v1','task_id':'a'*24,
+        'query_attempt_id':attempt,'action':'download','phases':{},
+        'prebridge_timing':{'contract':'tej_monotonic_prebridge_timing_v1',
+            'script_staging_seconds':.1,'hash_and_parse_seconds':False,'PRIVATE_VALUE':6}}
+    (queue/'raw'/(attempt+'.json.flow.json')).write_text(json.dumps(value))
+    report = profile(queue, tmp_path/'prebridge.json')
+    assert report['samples'][0]['windows_flow']['prebridge_timing'] == {'script_staging_seconds':.1}
+    assert 'PRIVATE_' not in json.dumps(report)
+
+
+@pytest.mark.parametrize('fixture', [True, False])
+@pytest.mark.parametrize('fault', [None, 'accepted', 'provider_queries_sent', 'desktop_actions_sent',
+    'queue_modified', 'source_values_exposed', 'source_selection_unchanged', 'exact_handle_parity',
+    'candidate_sha256', 'process_failure'])
+def test_control_benchmark_launcher_requires_exact_source_parity_and_canonical_owner(tmp_path, monkeypatch,
+                                                                                  fixture, fault):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from scripts import benchmark_tej_control_lookup as control
+
+    root = tmp_path/'data_tej'
+    root.mkdir()
+    (root/'desktop_session.json').write_text('{}')
+    baseline, candidate = tmp_path/'baseline.ps1', tmp_path/'candidate.ps1'
+    baseline.write_text('# retained baseline')
+    candidate.write_text('# exact candidate')
+    output = tmp_path/'comparison.json'
+    locks, launches = [], []
+
+    @contextmanager
+    def owner(path, **kwargs):
+        locks.append((path, kwargs))
+        yield
+
+    def launch(command, **kwargs):
+        launches.append((command, kwargs))
+        value = {'contract':'tej_exact_control_lookup_abba_v1', 'accepted':True,
+            'provider_queries_sent':0, 'desktop_actions_sent':0, 'queue_modified':False,
+            'source_values_exposed':False, 'source_selection_unchanged':True, 'exact_handle_parity':True,
+            'baseline_sha256':hashlib.sha256(baseline.read_bytes()).hexdigest(),
+            'candidate_sha256':hashlib.sha256(candidate.read_bytes()).hexdigest()}
+        if fault == 'process_failure':
+            return SimpleNamespace(returncode=1, stderr=b'isolated private failure')
+        if fault:
+            value[fault] = 'different' if fault.endswith('sha256') else not value[fault]
+        output.write_text(json.dumps(value))
+        return SimpleNamespace(returncode=0, stderr=b'')
+
+    monkeypatch.setattr(control, 'exclusive_dataset_lock', owner)
+    monkeypatch.setattr(control, 'valid_session', lambda _pins: True)
+    monkeypatch.setattr(control, 'interactive_transport', lambda _root:
+        {'windows_session_id':7, 'interop_socket':'owned fixture relay'})
+    monkeypatch.setattr(control.DesktopBridge, 'windows_path', staticmethod(str))
+    monkeypatch.setattr(control, 'run_guarded_windows', launch)
+    if fault:
+        with pytest.raises(RuntimeError if fault == 'process_failure' else ValueError):
+            control.run(root, baseline, output, fixture=fixture, candidate=candidate)
+    else:
+        assert control.run(root, baseline, output, fixture=fixture, candidate=candidate)['accepted'] is True
+        with pytest.raises(FileExistsError):
+            control.run(root, baseline, output, fixture=fixture, candidate=candidate)
+    assert len(launches) == 1
+    assert len(locks) == int(not fixture)
+    if locks:
+        assert locks[0][0] == root/'.download.lock'
+        assert locks[0][1]['timeout_seconds'] == 10
+    assert launches[0][1]['windows_session_id'] == 7
+    assert launches[0][1]['timeout'] == 180
+    if fault == 'process_failure':
+        diagnostic = output.with_suffix('.stderr.txt')
+        assert diagnostic.read_bytes() == b'isolated private failure'
+        assert diagnostic.stat().st_mode & 0o777 == 0o600
+
+
 @pytest.mark.parametrize('error',['attempt','task','contract','action','invalid_json'])
 def test_optional_timing_failure_or_other_attempt_never_affects_data_profile(queue,tmp_path,error):
     attempt='a'*24+'-'+'b'*32
@@ -302,7 +420,7 @@ def test_complete_capture_fault_checks_can_only_mutate_the_owned_fixture():
     assert block.index('[TejReadbackBenchmark]::Close()') < block.index('destroyed_window_full_capture_rejected=$true')
 
 
-@pytest.mark.parametrize('rows,columns',[(0,30),(3001,30),(True,30),(12,2),(12,31),(12,False)])
+@pytest.mark.parametrize('rows,columns',[(0,30),(50001,3),(20000,30),(True,30),(12,2),(12,31),(12,False)])
 def test_fixture_dimensions_rejected_before_windows_admission(queue,tmp_path,rows,columns):
     baseline=tmp_path/'baseline.ps1';baseline.write_text('owned baseline')
     with pytest.raises(ValueError,match='fixture dimensions'):

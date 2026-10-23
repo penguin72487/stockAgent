@@ -37,7 +37,7 @@ def record(field="last_mark_price", *, public_value=112.5):
 @pytest.mark.parametrize("field", [
     "price", "entry_price", "last_mark_price", "exit_price", "execution_price",
     "bid", "ask", "upper_limit", "lower_limit", "sizing_open_price",
-    "call_entry_ask", "put_entry_bid", "open", "Open", "last_prices",
+    "call_entry_ask", "put_entry_bid", "open", "Open", "last_prices", "model_input_price",
 ])
 def test_unlicensed_prices_are_withheld_but_private_facts_are_preserved(field):
     source = record(field)
@@ -158,7 +158,8 @@ def test_malformed_policy_fails_closed(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("field", ["strike_price", "entry_fee_twd", "net_pnl_twd", "return_pct",
-                                    "opening_price_covered_count", "entry_price_source", "price_offset_ticks"])
+    "opening_price_covered_count", "entry_price_source", "price_offset_ticks",
+    "model_input_price_basis", "model_input_price_is_carry", "model_input_price_source_date"])
 def test_non_quote_accounting_metadata_is_not_removed(field):
     assert not quotes.is_quote_price_field(field)
 
@@ -342,7 +343,7 @@ def test_owner_strategy_report_rejects_invalid_context_value_or_clock(change):
 
 
 @pytest.mark.parametrize("field", ["entry_price", "execution_price", "sizing_open_price", "last_mark_price",
-    "bid", "ask", "open", "close", "upper_limit", "lower_limit", "next_upper_limit", "price"])
+    "bid", "ask", "open", "close", "upper_limit", "lower_limit", "next_upper_limit", "price", "model_input_price"])
 def test_owner_strategy_report_does_not_authorize_inputs_quotes_exchange_limits_or_fills(field):
     row = paper_position(**{field: 123.0, "public_display_authorized": True})
     policy = quotes.PublicQuoteDisplayPolicy(paper_strategy_reports=True)

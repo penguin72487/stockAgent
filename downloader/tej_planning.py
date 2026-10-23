@@ -15,6 +15,9 @@ import math
 
 CONTRACT = 'preview_30_columns_lazy_fields_v1'
 MAX_PREVIEW_COLUMNS = 30
+MAX_PREVIEW_ROWS = 10000
+MAX_SCOPE_ROWS = 50000
+SCOPE_BUDGET_CONTRACT = 'bounded_scope_geometry_independent_native_readback_v1'
 TILING_CONTRACT = 'minimum_uniform_company_date_rectangles_v1'
 CAPACITY_CONTRACT = 'native_row_capacity_replanning_v1'
 OPERATOR_GEOMETRY_CONTRACT = 'operator_unknown_record_geometry_prior_v1'
@@ -24,6 +27,42 @@ MAX_SELECTOR_LABELS = 2000  # ExactListIndices / SelectListBatch / TrySelectList
 COMPANY_MEMBERSHIP_CONTRACT = 'exact_current_company_membership_v1'
 COMPANY_MEMBERSHIP_DEFERRED = 'source_company_labels_absent_fragment'
 COMPANY_HINT_CONTRACT = 'prior_negative_company_membership_scheduling_only_v1'
+
+
+def scope_row_budget(request: dict, keys: int) -> int:
+    """Potential company/date pairs are not observed native records.
+
+    Only reviewed key2 scopes may expand. Actual capture/ingestion still uses
+    max_rows, and a proved over-bound Preview replans through the existing owner.
+    Native multi-record key3 and snapshots retain their former geometry.
+    """
+    value=request.get('max_scope_rows')
+    if value is None and request.get('query_scope_contract') is None:
+        return request['max_rows']
+    if (request.get('query_scope_contract') != SCOPE_BUDGET_CONTRACT
+            or type(value) is not int or not 1 <= value <= MAX_SCOPE_ROWS):
+        raise ValueError('Unreviewed independent source scope budget')
+    return value if keys==2 else request['max_rows']
+
+
+def apply_scope_budget(request: dict, config: dict) -> dict:
+    from downloader.tej_key_layout import key_count
+    value=config.get('max_scope_rows_per_export')
+    contract=config.get('query_scope_contract')
+    if value is None and contract is None:
+        return request
+    # Validate even before a key3/snapshot discovery; a typo is not permission.
+    scope_row_budget({'max_rows':request['max_rows'],'max_scope_rows':value,
+                      'query_scope_contract':contract},2)
+    if request.get('scope_capacity_backoff_contract')==CAPACITY_CONTRACT:
+        # A source-proved dense table must not be expanded again by a later
+        # maintenance upgrade using the same global policy.
+        if scope_row_budget(request,2)>request['max_rows']:
+            raise ValueError('Unreviewed source scope capacity backoff')
+        return request
+    if key_count(request)!=2:
+        return request
+    return {**request,'max_scope_rows':value,'query_scope_contract':contract}
 
 
 def rectangle_queries(companies: int, dates: int, rows: int, size: int, keys: int,
@@ -76,6 +115,7 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
         raise ValueError('Preview cap is exactly the reviewed 30 total columns')
     from downloader.tej_key_layout import key_count
     keys=key_count(request)
+    scope_rows=scope_row_budget(request,keys)
     density=request.get('native_record_density_hint',1)
     if (type(density) is not int or not 1 <= density <= 1000000
             or request.get('record_capacity_contract') not in (None,CAPACITY_CONTRACT,OPERATOR_GEOMETRY_CONTRACT)
@@ -108,7 +148,9 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
         if selector:
             core['query_selector_contract'] = selector
         return {**core,'fingerprint':hashlib.sha256(json.dumps(core,sort_keys=True,ensure_ascii=False).encode()).hexdigest()}
-    coverage=[]
+    # Index the immutable scope witnesses once, not once per company in every
+    # field batch. The names/period sets stay shared; no Cartesian date rows.
+    coverage=defaultdict(list)
     for done in completed:
         if (key_count(done) != keys
                 or any(done.get(k) != request.get(k) for k in ('type','smart_id','table'))
@@ -116,12 +158,14 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
                 or not set(done['company_labels']) <= company_index.keys()
                 or not set(done['date_labels']) <= date_index.keys()):
             raise ValueError('Completed query proof is outside the verified plan')
-        coverage.append((set(done['fields']),set(done['company_labels']),{date_index[x] for x in done['date_labels']}))
+        proof=(set(done['fields']),{date_index[x] for x in done['date_labels']})
+        for company in done['company_labels']:
+            coverage[company].append(proof)
     segments=[]; query_count=0; remaining_rows=0
     missing_cache={}
     for begin in range(0,len(fields),width):
         stop=min(len(fields),begin+width); selected=set(fields[begin:stop]); columns=stop-begin+keys
-        rows=min(request['max_rows'],request['max_cells']//columns-1)
+        rows=min(scope_rows,request['max_cells']//columns-1)
         # Key=3 means several native records may share a company/period.
         # The hint bounds query geometry, not actual observation counts.
         rows //= density
@@ -136,8 +180,8 @@ def build_plan(request: dict, companies: list[str], dates: list[str], config: di
             grouped=defaultdict(list)
             for index in range(c,min(len(companies),c+company_size)):
                 covered=set()
-                for names,labels,periods in coverage:
-                    if selected <= names and companies[index] in labels:
+                for names,periods in coverage[companies[index]]:
+                    if selected <= names:
                         covered.update(periods)
                 # Compact ranges keep century-sized date axes stored ONCE.
                 grouped[frozenset(covered)].append(index)
@@ -250,6 +294,7 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
         # Discovery captures menus, not market observations. The next data
         # request may use the explicitly upgraded output memory budget.
         request={**request,'max_rows':config['max_rows_per_export'],'max_cells':config['max_cells_per_export']}
+    request=apply_scope_budget(request,config)
     plan=build_plan(request,payload['company_labels'],payload['date_labels'],config,completed)
     weights=[]
     for done,task in zip(completed,completed_tasks):
@@ -341,7 +386,11 @@ def repartition_selector_pending(con, root, row) -> bool:
                    for identifier,_,_ in children)):
         raise ValueError('Exact new disjoint selector work and unchanged denominator required')
     retry=con.execute('SELECT * FROM desktop_retry_windows WHERE table_id=?',(row['table_id'],)).fetchone()
-    if retry is not None and retry['task_id'] != row['task_id']:
+    # Missing company labels defer only their own fragment. Preserve another
+    # fragment's retry owner verbatim while splitting this independent scope;
+    # genuine table-wide failures still prevent work from bypassing cooldown.
+    if (retry is not None and retry['task_id'] != row['task_id']
+            and retry['error_code'] != COMPANY_MEMBERSHIP_DEFERRED):
         raise ValueError('Another original fragment owns the table retry window')
     audit_path=root/'selector_replanning'/(row['task_id']+'-'+uuid.uuid4().hex+'.json')
     audit={'contract':SELECTOR_CONTRACT,'state':'prepared','observed_at_utc':datetime.now(UTC).isoformat(),
@@ -358,7 +407,7 @@ def repartition_selector_pending(con, root, row) -> bool:
             (identifier,row['table_id'],'download',row['phase'],row['priority'],
              json.dumps(compact_request(part,definition),ensure_ascii=False,separators=(',',':')),
              expected,SOURCE_SCOPE_CONTRACT,expected,row['safe_prequery_retries'],row['next_attempt_at_utc']))
-    if retry is not None:
+    if retry is not None and retry['task_id']==row['task_id']:
         con.execute('UPDATE desktop_retry_windows SET task_id=? WHERE table_id=?',(children[0][0],row['table_id']))
     return True  # Caller commits the queue; durable intent is not a download receipt.
 
@@ -620,16 +669,19 @@ def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) 
     if capacity_upgrade and (config.get('query_capacity_contract') != LOCAL_CAPACITY_CONTRACT
             or type(config.get('max_cells_per_export')) is not int or not 100 <= config['max_cells_per_export'] <= 400000
             or type(config.get('max_companies_per_export')) is not int or not 1 <= config['max_companies_per_export'] <= 1024
-            or type(config.get('max_rows_per_export')) is not int or not 1 <= config['max_rows_per_export'] <= 10000):
+            or type(config.get('max_rows_per_export')) is not int or not 1 <= config['max_rows_per_export'] <= MAX_PREVIEW_ROWS):
         raise ValueError('Explicit reviewed local Preview capacity required')
+    if capacity_upgrade:
+        apply_scope_budget({'max_rows':config['max_rows_per_export']},config)
     with closing(connect(root)) as con, con:
         saved = dict(con.execute('SELECT key,value FROM meta'))
         deferred_ids = set(json.loads(saved.get('query_tiling_deferred_tables','[]')))
         original_config = json.loads(saved['config'])
         if (saved.get('query_tiling_contract') == TILING_CONTRACT and not deferred_ids
                 and (not capacity_upgrade or saved.get('query_capacity_contract') == LOCAL_CAPACITY_CONTRACT
-                     and all(config[k]==original_config[k] for k in
-                             ('max_rows_per_export','max_cells_per_export','max_companies_per_export')))):
+                     and all(config.get(k)==original_config.get(k) for k in
+                             ('max_rows_per_export','max_cells_per_export','max_companies_per_export',
+                              'max_scope_rows_per_export','query_scope_contract')))):
             return {'contract':contract,'already_installed':True,'provider_queries_sent':0}
         if saved.get('preview_planning_contract') != CONTRACT:
             raise ValueError('Upgrade the canonical Preview planner first')
@@ -650,11 +702,17 @@ def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) 
         if capacity_upgrade:
             new_config.update({k:config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export',
                                                    'query_capacity_contract')})
+            for key in ('max_scope_rows_per_export','query_scope_contract'):
+                if key in config:
+                    new_config[key]=config[key]
             new_config['query_interval_contract'] = config.get('query_interval_contract','minimum_completion_gap_v1')
         migration = root/'planning_migrations'/uuid.uuid4().hex
         audit = {'contract':contract,'state':'prepared','provider_queries_sent':0,
                  'observed_at_utc':datetime.now(UTC).isoformat(),'tables':[], 'deferred_tables':[],
                  'source_files_deleted':False,'completed_scopes_preserved':True,
+                 'former_scope_row_budget':original_config.get('max_scope_rows_per_export'),
+                 'new_scope_row_budget':new_config.get('max_scope_rows_per_export'),
+                 'native_readback_bound_unchanged':new_config['max_rows_per_export']==original_config['max_rows_per_export'],
                  'former_bounds':{k:original_config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export')},
                  'new_bounds':{k:new_config[k] for k in ('max_rows_per_export','max_cells_per_export','max_companies_per_export')}}
         prepared = []
@@ -679,6 +737,8 @@ def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) 
             completed = [expand_request(json.loads(t['request_json']),definition,row['table_id']) for t in finished]
             base = {**previous['request'],'max_rows':new_config['max_rows_per_export'],
                     'max_cells':new_config['max_cells_per_export']} if capacity_upgrade else previous['request']
+            if capacity_upgrade:
+                base=apply_scope_budget(base,new_config)
             try:
                 plan = build_plan(base,previous['companies'],previous['dates'],new_config,completed)
             except ValueError:
@@ -688,6 +748,17 @@ def upgrade_query_tiling(root, config: dict, *, capacity_upgrade: bool = False) 
                 continue
             resolved = sum(t['work_expected_rows'] if t['work_expected_rows'] is not None else t['expected_rows'] for t in finished)
             if (plan['total_work_rows'] != previous['total_work_rows'] or plan['completed_work_rows'] != resolved):
+                if capacity_upgrade:
+                    # Existing scope inconsistencies require their own source
+                    # reconciliation. Preserve this exact table unchanged;
+                    # they must not abort valid, independent table upgrades.
+                    audit['deferred_tables'].append({'table_id':row['table_id'],
+                        'reason':'completed_coverage_reconciliation_required',
+                        'former_total_work_rows':previous['total_work_rows'],
+                        'candidate_total_work_rows':plan['total_work_rows'],
+                        'candidate_completed_work_rows':plan['completed_work_rows'],
+                        'receipt_work_rows':resolved})
+                    continue
                 raise ValueError('Completed scope coverage changed or overlapped; reject migration')
             pending = [dict(r) for r in con.execute("SELECT task_id,request_json FROM tasks WHERE table_id=? AND kind='download' AND state='pending' AND scope_contract=?",(row['table_id'],SOURCE_SCOPE_CONTRACT))]
             native_scopes = []

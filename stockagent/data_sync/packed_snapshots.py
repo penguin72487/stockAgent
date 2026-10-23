@@ -70,7 +70,8 @@ MIN_NATIVE_CHUNK_STREAM_BYTES = 64 * 1024 * 1024
 INVENTORY_FORMAT = "jsonl-gzip-v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_STAGING_RULES = frozenset({"artifact_io_atomic_sibling_v1", "finmind_parquet_promote_v1",
-                                    "openbb_l1_atomic_sibling_v1", "openbb_operational_atomic_sibling_v1"})
+                                    "openbb_l1_atomic_sibling_v1", "openbb_operational_atomic_sibling_v1",
+                                    "finlab_atomic_sibling_v1", "finlab_research_atomic_sibling_v1"})
 
 
 class PackedPublicationBusy(SnapshotError):
@@ -366,6 +367,45 @@ def _is_private_writer_staging(relative: str, rules: tuple[str, ...]) -> bool:
     if ("artifact_io_atomic_sibling_v1" in rules
             and re.fullmatch(r"\..+\.[0-9]+\.[0-9]+\.tmp", parts[-1])):
         return True
+    if 'finlab_atomic_sibling_v1' in rules:
+        # Original history/intraday writers close and validate these temporary
+        # siblings before promoting content-addressed objects or JSON receipts.
+        # Match the producer directory AND tempfile's eight-character token;
+        # neither final files nor arbitrary .tmp/raw observations are omitted.
+        parent, name = parts[:-1], parts[-1]
+        if (parent == ('datasets',)
+                and re.fullmatch(r'\.finlab-[a-z0-9_]{8}\.parquet\.tmp', name)):
+            return True
+        if (parent == ('intraday', 'objects') and re.fullmatch(
+                r'\.finlab-(?:intraday|unit|derived)-[a-z0-9_]{8}\.parquet\.tmp', name)):
+            return True
+        json_parent = (parent in {(), ('attempts',), ('catalog',), ('receipts',), ('runs',),
+                                 ('intraday',), ('intraday', 'batch_receipts')}
+            or (len(parent) == 2 and parent[0] == 'versions')
+            or (len(parent) == 3 and parent[:2] in {('intraday', 'receipts'), ('intraday', 'attempts')})
+            or (len(parent) == 4 and parent[:2] == ('intraday', 'versions'))
+            or (len(parent) == 4 and parent[:3] == ('intraday', 'derived_minute', 'receipts'))
+            or (len(parent) == 5 and parent[:3] == ('intraday', 'derived_minute', 'versions')))
+        if json_parent and re.fullmatch(r'\.finlab-[a-z0-9_]{8}\.json\.tmp', name):
+            return True
+        # finlab_arrow_history preserves signed/downloaded Feather originals
+        # and null evidence only after validating their closed temporary copy.
+        if parent == ('raw',) and re.fullmatch(r'tmp[a-z0-9_]{8}\.feather\.tmp', name):
+            return True
+        if parent == ('empty_evidence',) and re.fullmatch(r'tmp[a-z0-9_]{8}\.tmp', name):
+            return True
+        if (parent in {('raw_receipts',), ('empty_evidence',)}
+                and re.fullmatch(r'\.raw-[a-z0-9_]{8}', name)):
+            return True
+    if 'finlab_research_atomic_sibling_v1' in rules:
+        parent, name = parts[:-1], parts[-1]
+        if (parent == ('normalized',)
+                and re.fullmatch(r'[0-9a-f]{24}\.parquet\.tmp', name)):
+            return True
+        if (len(parent) == 3 and parent[:2] == ('normalized', 'builds')
+                and re.fullmatch(r'[0-9a-f]{24}', parent[2])
+                and re.fullmatch(r'part-[0-9]{4}\.parquet\.tmp', name)):
+            return True
     if "openbb_l1_atomic_sibling_v1" in rules:
         # compact_openbb_l1 closes/validates these private siblings before
         # replace. Do not generalize to .tmp observations or other providers.
@@ -597,7 +637,10 @@ def _collect_entries(
 
 
 def _entry_read_path(source: Path, entry: _SourceEntry) -> Path:
-    return entry.read_path or source.joinpath(*PurePosixPath(entry.path).parts)
+    # Logical names are already validated POSIX paths by the census/manifest
+    # reader. Path.joinpath parses the whole name once; splitting into another
+    # PurePosixPath and reparsing every component adds no containment check.
+    return entry.read_path or source.joinpath(entry.path)
 
 
 def _is_atomic_json_control(source: Path, logical: str) -> bool:
@@ -629,12 +672,21 @@ def _read_atomic_json_control(source: Path, entry: _SourceEntry) -> bytes:
     for attempt in range(3):
         if path.parent.resolve() != path.parent:
             raise SnapshotError('atomic JSON control parent is redirected')
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        with os.fdopen(descriptor, 'rb') as stream:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        try:
+            stream = os.fdopen(descriptor, 'rb')
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with stream:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_size > 64 * 1024**2:
                 raise SnapshotError('atomic JSON control exceeds its bounded regular-file scope')
-            raw = stream.read(64 * 1024**2 + 1)
+            # BufferedReader allocates for its requested size, even for a tiny
+            # receipt. Millions of bounded controls do not each need a 64 MiB
+            # allocation. One extra byte detects growth; the unchanged FD/size
+            # fences below still reject an append, truncation or in-place edit.
+            raw = stream.read(before.st_size + 1)
             after = os.fstat(stream.fileno())
         if _source_stat(before)[:4] == _source_stat(after)[:4] and len(raw) == before.st_size:
             try:
@@ -652,7 +704,7 @@ def _read_atomic_json_control(source: Path, entry: _SourceEntry) -> bytes:
     raise AssertionError('bounded JSON observation did not finish')
 
 
-def _guard_observation_cohort(source: Path, entries: Iterable[_SourceEntry], root_identity) -> None:
+def _guard_observation_cohort(source: Path, entries: Iterable[_SourceEntry], root_identity, *, progress=None) -> None:
     """Additions are the next version; changes to selected bytes still fail.
 
     This is not an atomic workspace/database snapshot and grants no shared
@@ -663,8 +715,8 @@ def _guard_observation_cohort(source: Path, entries: Iterable[_SourceEntry], roo
     """
     if _source_stat(source.lstat())[:2] != root_identity:
         raise SnapshotError("observation cohort root was replaced")
-    for entry in entries:
-        path = _entry_read_path(source, entry)
+    completed = 0
+    for completed, entry in enumerate(entries, 1):
         if entry.kind == "file":
             if entry.atomic_json_control:
                 # These exact bytes were observed and completely hashed during
@@ -672,13 +724,20 @@ def _guard_observation_cohort(source: Path, entries: Iterable[_SourceEntry], roo
                 if not entry.sha256 or not entry.storage:
                     raise SnapshotError('atomic JSON observation has no sealed storage')
             else:
-                _ensure_source_stat(path, entry)
+                _ensure_source_stat(_entry_read_path(source, entry), entry)
         elif entry.kind == "directory":
+            path = _entry_read_path(source, entry)
             info = path.lstat()
             if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != entry.mode:
                 raise SnapshotError(f"selected cohort directory changed: {path}")
-        elif not path.is_symlink() or os.readlink(path) != entry.target:
-            raise SnapshotError(f"selected cohort symlink changed: {path}")
+        else:
+            path = _entry_read_path(source, entry)
+            if not path.is_symlink() or os.readlink(path) != entry.target:
+                raise SnapshotError(f"selected cohort symlink changed: {path}")
+        if progress is not None and completed % 4096 == 0:
+            progress(completed)
+    if progress is not None:
+        progress(completed)
 
 
 def _copy_and_hash(source: Path, destination: Path) -> str:
@@ -793,13 +852,21 @@ class _SeekablePackBuffer:
     archive encoding, a source cache, or a relaxed durability boundary.
     """
 
-    def __init__(self, stream, *, capacity: int = PACK_WRITE_BUFFER_BYTES):
+    def __init__(self, stream, *, capacity: int = PACK_WRITE_BUFFER_BYTES,
+                 digest_writes: bool = True):
         if type(capacity) is not int or capacity < 1:
             raise ValueError("pack write buffer must be positive")
         self._stream = stream
         self._capacity = capacity
         self._position = self._start = stream.tell()
         self._buffer = bytearray()
+        # Hash only finalized sequential windows. ZIP may backpatch a member
+        # header after its window was drained (e.g. a large stored member).
+        # In that case the caller must retain the original complete-file read;
+        # never return a digest of superseded bytes or a partial prefix.
+        self._digest = hashlib.sha256()
+        self._hashed_bytes = 0
+        self._hash_valid = digest_writes and self._start == 0
 
     def tell(self):
         return self._position
@@ -839,18 +906,29 @@ class _SeekablePackBuffer:
     def flush(self):
         if self._buffer:
             self._stream.seek(self._start)
+            if self._start != self._hashed_bytes:
+                self._hash_valid = False
             view = memoryview(self._buffer)
             try:
                 while view:
                     written = self._stream.write(view)
-                    if not isinstance(written, int) or not 0 < written <= len(view):
+                    if type(written) is not int or not 0 < written <= len(view):
                         raise OSError("short pack write; retain uncommitted staging")
+                    if self._hash_valid:
+                        self._digest.update(view[:written])
+                        self._hashed_bytes += written
                     view = view[written:]
             finally:
                 view.release()
             self._buffer.clear()
         self._start = self._position
         self._stream.flush()
+
+    def complete_sha256(self) -> str | None:
+        """A producer digest, not fsync, immutable-install or cold-recovery proof."""
+        if self._hash_valid and not self._buffer and self._position == self._hashed_bytes:
+            return self._digest.hexdigest()
+        return None
 
 
 def _write_pack(
@@ -860,39 +938,42 @@ def _write_pack(
     *,
     compression_level: int,
     on_entry: Callable[[_SourceEntry], None] | None = None,
-) -> None:
-    with temporary.open("xb", buffering=0) as stream, zipfile.ZipFile(
-        _SeekablePackBuffer(stream),
-        mode="x",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=compression_level,
-        allowZip64=True,
-    ) as archive:
-        for entry in entries:
-            source_path = _entry_read_path(source, entry)
-            if entry.atomic_json_control:
-                raw = _read_atomic_json_control(source, entry)
-                with archive.open(_zip_info(entry), mode='w', force_zip64=True) as output_stream:
-                    output_stream.write(raw)
-                entry.sha256 = hashlib.sha256(raw).hexdigest()
+) -> str | None:
+    with temporary.open("xb", buffering=0) as stream:
+        buffered = _SeekablePackBuffer(stream)
+        with zipfile.ZipFile(
+            buffered,
+            mode="x",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=compression_level,
+            allowZip64=True,
+        ) as archive:
+            for entry in entries:
+                source_path = _entry_read_path(source, entry)
+                if entry.atomic_json_control:
+                    raw = _read_atomic_json_control(source, entry)
+                    with archive.open(_zip_info(entry), mode='w', force_zip64=True) as output_stream:
+                        output_stream.write(raw)
+                    entry.sha256 = hashlib.sha256(raw).hexdigest()
+                    if on_entry is not None:
+                        on_entry(entry)
+                    continue
+                digest = hashlib.sha256()
+                with (
+                    _open_source_entry(source, entry) as input_stream,
+                    archive.open(
+                        _zip_info(entry), mode="w", force_zip64=True
+                    ) as output_stream,
+                ):
+                    while block := input_stream.read(8 * 1024 * 1024):
+                        digest.update(block)
+                        output_stream.write(block)
+                if entry.sha256 is not None and entry.sha256 != digest.hexdigest():
+                    raise SnapshotError(f"source file changed while packing: {source_path}")
+                entry.sha256 = digest.hexdigest()
                 if on_entry is not None:
                     on_entry(entry)
-                continue
-            digest = hashlib.sha256()
-            with (
-                _open_source_entry(source, entry) as input_stream,
-                archive.open(
-                    _zip_info(entry), mode="w", force_zip64=True
-                ) as output_stream,
-            ):
-                while block := input_stream.read(8 * 1024 * 1024):
-                    digest.update(block)
-                    output_stream.write(block)
-            if entry.sha256 is not None and entry.sha256 != digest.hexdigest():
-                raise SnapshotError(f"source file changed while packing: {source_path}")
-            entry.sha256 = digest.hexdigest()
-            if on_entry is not None:
-                on_entry(entry)
+        return buffered.complete_sha256()
 
 
 def _hash_source_entry(source: Path, entry: _SourceEntry, *, native_d_io: bool = False) -> str:
@@ -918,24 +999,56 @@ def _is_ordered_subset(selected: list[str], available: list[str]) -> bool:
     return all(any(candidate == expected for candidate in iterator) for expected in selected)
 
 
-def _write_inventory(temporary: Path, entries: Iterable[_SourceEntry]) -> str:
-    digest = hashlib.sha256()
+class _InventoryDigestWriter:
+    """Hash the sequential compressed bytes, including the gzip header/trailer.
+
+    This avoids rereading the newly written inventory on the cold drive. A
+    failed/zero-length write must not yield a usable digest or installed object.
+    Durability and subsequent independent object verification stay with callers.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.digest = hashlib.sha256()
+
+    def write(self, block):
+        view = memoryview(block)
+        length = len(view)
+        while view:
+            written = self.stream.write(view)
+            if type(written) is not int or not 0 < written <= len(view):
+                raise OSError("short inventory write; retain uncommitted staging")
+            self.digest.update(view[:written])
+            view = view[written:]
+        return length
+
+    def flush(self):
+        self.stream.flush()
+
+
+def _write_inventory(temporary: Path, entries: Iterable[_SourceEntry], *, progress=None) -> str:
     with temporary.open("xb") as raw_stream:
-        with gzip.GzipFile(
+        observed = _InventoryDigestWriter(raw_stream)
+        # Coalesce small canonical rows before entering the Python gzip writer.
+        # Keep its original compression level, header, row order and exact bytes.
+        # The buffer is bounded; a large row can pass directly to the compressor.
+        with io.BufferedWriter(gzip.GzipFile(
             filename="",
             mode="wb",
             compresslevel=6,
-            fileobj=raw_stream,
+            fileobj=observed,
             mtime=0,
-        ) as stream:
-            for entry in entries:
+        ), buffer_size=1024 * 1024) as stream:
+            completed = 0
+            for completed, entry in enumerate(entries, 1):
                 stream.write(_canonical_json_bytes(entry.inventory_row()))
+                if progress is not None and completed % 4096 == 0:
+                    progress(completed)
         raw_stream.flush()
         os.fsync(raw_stream.fileno())
-    with temporary.open("rb") as stream:
-        while block := stream.read(8 * 1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
+    if progress is not None:
+        progress(completed)
+    return observed.digest.hexdigest()
 
 
 def _object_relpath(kind: str, digest: str, suffix: str) -> PurePosixPath:
@@ -1354,6 +1467,76 @@ def _archive_d_primary_head(sync_root: Path, head_path: Path) -> str | None:
     return relative.as_posix()
 
 
+MIN_NATIVE_CHUNK_REUSE_BYTES = 64 * 1024**2
+
+
+class _PipelinedChunkReuse:
+    """One D reader overlaps C source hashing; only the publisher admits proofs.
+
+    At most 16 metadata-only members are in flight and 16 are queued across
+    source-file boundaries. Never fan out HDD readers or retain source blocks.
+    """
+
+    def __init__(self, created_objects):
+        self.created_objects = created_objects
+        self.pending = {}
+        self.inflight = None
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='packed-chunk-proof')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        try:
+            if kind is None:
+                self.finish()
+        finally:
+            # The fixed native adapter bounds its own process lifetime. Drain
+            # even on a source failure; no detached verifier can outlive owner.
+            self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def contains(self, digest):
+        return digest in self.pending or (self.inflight is not None and digest in self.inflight[0])
+
+    @staticmethod
+    def _read(batch):
+        from stockagent.data_sync.windows_cold_io import hash_many
+        paths = [item[0] for item in batch.values()]
+        return (hash_many(paths)
+                if sum(item[1].st_size for item in batch.values()) >= MIN_NATIVE_CHUNK_REUSE_BYTES
+                else {path: sha256_file(path) for path in paths})
+
+    def _collect(self):
+        if self.inflight is None:
+            return
+        batch, future = self.inflight
+        proofs = future.result()
+        if set(proofs) != {item[0] for item in batch.values()}:
+            raise SnapshotError('native chunk reuse omitted or added an exact member')
+        for digest, (path, before, descriptor) in batch.items():
+            if proofs[path] != digest or _source_stat(path.lstat()) != _source_stat(before):
+                raise SnapshotError(f'content-addressed chunk is corrupt: {path}')
+        # A worker returns hashes, never updates shared object/SQLite state or
+        # progress. Admit the whole batch only after fresh parent-side fences.
+        self.created_objects.update((digest, item[2]) for digest, item in batch.items())
+        self.inflight = None
+
+    def _submit(self):
+        self._collect()
+        if self.pending:
+            batch, self.pending = self.pending, {}
+            self.inflight = (batch, self.executor.submit(self._read, batch))
+
+    def add(self, digest, path, before, descriptor):
+        self.pending[digest] = (path, before, descriptor)
+        if len(self.pending) == 16:
+            self._submit()
+
+    def finish(self):
+        self._submit()
+        self._collect()
+
+
 def _store_chunked_source(
     sync_root: Path,
     source: Path,
@@ -1364,6 +1547,8 @@ def _store_chunked_source(
     newly_installed_hashes: set[str],
     install_options: Mapping[str, Any],
     chunking: str = "fixed-v1",
+    native_existing_chunks: bool = False,
+    existing_chunk_verifier: _PipelinedChunkReuse | None = None,
 ) -> None:
     """Store exact bounded extents in the existing blob CAS, not another pool."""
     path = _entry_read_path(source, entry)
@@ -1372,6 +1557,30 @@ def _store_chunked_source(
     chunks = []
     complete_hash = hashlib.sha256()
     total = 0
+    pending_existing: dict[str, tuple[Path, os.stat_result, dict]] = {}
+
+    def verify_existing() -> None:
+        if not pending_existing:
+            return
+        from stockagent.data_sync.windows_cold_io import hash_many
+        paths = [item[0] for item in pending_existing.values()]
+        # Native startup has a fixed cost. Small tails keep their original
+        # complete Linux hash instead of launching a process for a few bytes.
+        proofs = (hash_many(paths)
+                  if sum(item[1].st_size for item in pending_existing.values()) >= MIN_NATIVE_CHUNK_REUSE_BYTES
+                  else {destination: sha256_file(destination) for destination in paths})
+        if set(proofs) != {item[0] for item in pending_existing.values()}:
+            raise SnapshotError("native chunk reuse omitted or added an exact member")
+        for digest, (destination, before, descriptor) in pending_existing.items():
+            if (proofs[destination] != digest
+                    or _source_stat(destination.lstat()) != _source_stat(before)):
+                raise SnapshotError(f"content-addressed chunk is corrupt: {destination}")
+        # No unverified member enters the admitted object set, even when a
+        # preceding batch succeeded and a later member fails. The original
+        # publisher still owns commit and independent complete cold recovery.
+        created_objects.update((digest, item[2]) for digest, item in pending_existing.items())
+        pending_existing.clear()
+
     with path.open("rb") as stream:
         for block in _source_blocks(stream, chunk_bytes, chunking):
             total += len(block)
@@ -1380,10 +1589,15 @@ def _store_chunked_source(
             complete_hash.update(block)
             digest = hashlib.sha256(block).hexdigest()
             chunks.append({"object_sha256": digest, "bytes": len(block)})
-            if digest in created_objects:
+            if (digest in created_objects or digest in pending_existing
+                    or (existing_chunk_verifier is not None and existing_chunk_verifier.contains(digest))):
                 continue
             relpath = _object_relpath("blobs", digest, ".blob")
             destination = sync_root.joinpath(*relpath.parts)
+            descriptor = {
+                "bytes": len(block), "file_count": 1, "kind": "blob",
+                "logical_bytes": len(block), "relpath": relpath.as_posix(), "sha256": digest,
+            }
             _ensure_shared_packed_directory(sync_root, destination.parent)
             if destination.is_symlink():
                 raise SnapshotError(f"content-addressed object is redirected: {destination}")
@@ -1391,6 +1605,14 @@ def _store_chunked_source(
                 before = destination.lstat()
                 if not stat.S_ISREG(before.st_mode) or before.st_size != len(block):
                     raise SnapshotError(f"content-addressed chunk is corrupt: {destination}")
+                if native_existing_chunks:
+                    if existing_chunk_verifier is not None:
+                        existing_chunk_verifier.add(digest, destination, before, descriptor)
+                        continue
+                    pending_existing[digest] = (destination, before, descriptor)
+                    if len(pending_existing) == 16:
+                        verify_existing()
+                    continue
                 if (sha256_file(destination) != digest
                         or _source_stat(destination.lstat()) != _source_stat(before)):
                     raise SnapshotError(f"content-addressed chunk is corrupt: {destination}")
@@ -1405,10 +1627,8 @@ def _store_chunked_source(
                 )
                 if not present:
                     newly_installed_hashes.add(digest)
-            created_objects[digest] = {
-                "bytes": len(block), "file_count": 1, "kind": "blob",
-                "logical_bytes": len(block), "relpath": relpath.as_posix(), "sha256": digest,
-            }
+            created_objects[digest] = descriptor
+    verify_existing()
     _ensure_source_stat(path, entry)
     actual_hash = complete_hash.hexdigest()
     if total != entry.size or (entry.sha256 is not None and actual_hash != entry.sha256):
@@ -1477,6 +1697,8 @@ def publish_packed_snapshot(
     batch_directory_fsync: bool = False,
     d_primary_native_blob_reads: bool = False,
     d_primary_native_blob_writes: bool = False,
+    d_primary_native_chunk_reuse: bool = False,
+    d_primary_native_chunk_reuse_pipeline: bool = False,
     file_chunk_bytes: int | None = None,
     publication_lock_nonblocking: bool = False,
     file_chunking: str | None = None,
@@ -1502,6 +1724,14 @@ def publish_packed_snapshot(
         raise SnapshotError("d_primary_native_blob_reads must be an explicit boolean")
     if d_primary_native_blob_reads and sync_root != Path("/srv/stockagent-packed"):
         raise SnapshotError("native D blob reads require the canonical enrolled D store")
+    if type(d_primary_native_chunk_reuse) is not bool:
+        raise SnapshotError("d_primary_native_chunk_reuse must be an explicit boolean")
+    if type(d_primary_native_chunk_reuse_pipeline) is not bool:
+        raise SnapshotError('d_primary_native_chunk_reuse_pipeline must be an explicit boolean')
+    if d_primary_native_chunk_reuse_pipeline and not d_primary_native_chunk_reuse:
+        raise SnapshotError('native chunk pipeline requires explicit native chunk reuse')
+    if d_primary_native_chunk_reuse:
+        _check_native_pack_read_authority(sync_root)
     if type(d_primary_native_blob_writes) is not bool:
         raise SnapshotError("d_primary_native_blob_writes must be an explicit boolean")
     if d_primary_native_blob_writes:
@@ -1685,6 +1915,8 @@ def publish_packed_snapshot(
         # cold-byte recovery verification remains a separate required gate.
         created_objects: dict[str, dict[str, Any]] = dict(previous_objects)
         newly_installed_hashes: set[str] = set()
+        chunk_verifier = (publication_locks.enter_context(_PipelinedChunkReuse(created_objects))
+                          if d_primary_native_chunk_reuse_pipeline else None)
         completed_files = completed_bytes = routed_files = 0
         last_progress = 0.0
         def report(stage, *, force=False, phase_completed=None, phase_total=None):
@@ -1729,7 +1961,9 @@ def publish_packed_snapshot(
             elif one_pass:
                 _store_chunked_source(sync_root, source, entry, chunk_bytes=file_chunk_bytes,
                     created_objects=created_objects, newly_installed_hashes=newly_installed_hashes,
-                    install_options=install_options, chunking=file_chunking)
+                    install_options=install_options, chunking=file_chunking,
+                    native_existing_chunks=d_primary_native_chunk_reuse,
+                    existing_chunk_verifier=chunk_verifier)
             else:
                 entry.sha256 = _hash_source_entry(source, entry, native_d_io=d_primary_native_blob_reads)
             if entry.atomic_json_control:
@@ -1768,7 +2002,9 @@ def publish_packed_snapshot(
             if file_chunk_bytes is not None and entry.size > file_chunk_bytes:
                 _store_chunked_source(sync_root, source, entry, chunk_bytes=file_chunk_bytes,
                     created_objects=created_objects, newly_installed_hashes=newly_installed_hashes,
-                    install_options=install_options, chunking=file_chunking)
+                    install_options=install_options, chunking=file_chunking,
+                    native_existing_chunks=d_primary_native_chunk_reuse,
+                    existing_chunk_verifier=chunk_verifier)
                 entries.update(entry)
                 continue
             source_path = _entry_read_path(source, entry)
@@ -1841,6 +2077,11 @@ def publish_packed_snapshot(
                 }
             entries.update(entry)
 
+        # No queued or in-flight cold proof may escape into packing/commit.
+        # Source SHA, original inventory, independent full recovery and CAS
+        # installation remain with the existing synchronous publisher owner.
+        if chunk_verifier is not None:
+            chunk_verifier.finish()
         buckets = [(bucket, count, size) for bucket, count, size in entries.changed_groups() if bucket >= 0]
         report("packing_changed_small_files", force=True, phase_completed=0, phase_total=len(buckets))
         for bucket_index, (bucket, _, _) in enumerate(buckets, start=1):
@@ -1861,9 +2102,10 @@ def publish_packed_snapshot(
                     report("packing_changed_small_files", phase_completed=bucket_index - 1,
                            phase_total=len(buckets))
                 temporary = staging_root / f"pack-{bucket:04d}-{uuid.uuid4().hex}.partial"
-                _write_pack(source, bucket_entries, temporary, compression_level=compression_level,
-                            on_entry=packed_entry)
-                digest = sha256_file(temporary)
+                digest = _write_pack(source, bucket_entries, temporary, compression_level=compression_level,
+                                     on_entry=packed_entry)
+                if digest is None:
+                    digest = sha256_file(temporary)
                 relpath = _object_relpath("packs", digest, ".zip")
                 destination = sync_root.joinpath(*relpath.parts)
                 size = temporary.stat().st_size
@@ -1874,7 +2116,7 @@ def publish_packed_snapshot(
                 logical_bytes = sum(entry.size for entry in bucket_entries)
                 for entry in bucket_entries:
                     entry.storage = {"kind": "pack", "member": entry.path, "object_sha256": digest}
-                    entries.update(entry)
+                entries.update_many(bucket_entries)
                 created_objects[digest] = {
                     "bucket": bucket,
                     "bytes": size,
@@ -1929,9 +2171,13 @@ def publish_packed_snapshot(
                                 + b'\0' + extra.encode('utf-8', errors='surrogateescape') + b'\n')
             before['portable_fingerprint_sha256'] = portable.hexdigest()
 
-        report("committing_complete_inventory", force=True)
+        report("committing_complete_inventory", force=True,
+               phase_completed=0, phase_total=len(entries))
         inventory_temp = staging_root / f"inventory-{uuid.uuid4().hex}.partial"
-        inventory_sha = _write_inventory(inventory_temp, entries)
+        def inventory_progress(completed):
+            report("committing_complete_inventory", phase_completed=completed, phase_total=len(entries))
+        inventory_sha = _write_inventory(inventory_temp, entries,
+            **({'progress': inventory_progress} if progress is not None else {}))
         inventory_relpath = _object_relpath("inventories", inventory_sha, ".jsonl.gz")
         inventory_path = sync_root.joinpath(*inventory_relpath.parts)
         inventory_bytes = inventory_temp.stat().st_size
@@ -1940,7 +2186,12 @@ def publish_packed_snapshot(
         )
 
         if private_observation_cohort:
-            _guard_observation_cohort(source, entries, selected_root)
+            report("verifying_observation_cohort_stability", force=True,
+                   phase_completed=0, phase_total=len(entries))
+            def cohort_progress(completed):
+                report("verifying_observation_cohort_stability", phase_completed=completed, phase_total=len(entries))
+            _guard_observation_cohort(source, entries, selected_root,
+                **({'progress': cohort_progress} if progress is not None else {}))
             after = before
         else:
             report("verifying_source_stability", force=True,
@@ -1999,6 +2250,8 @@ def publish_packed_snapshot(
             and (included is None or previous.manifest.get("metadata", {}) == dict(metadata or {}))
             and previous.manifest.get("metadata", {}).get("version_dependencies_sha256")
             == (metadata or {}).get("version_dependencies_sha256")
+            and all(previous.manifest.get("metadata", {}).get(key) == (metadata or {}).get(key)
+                    for key in ("catalog_publication_contract", "catalog_entry_sha256"))
             and previous.manifest["archive"].get("file_chunking", "fixed-v1") == file_chunking
             and str(previous.manifest["archive"]["inventory"]["sha256"])
             == inventory_sha
@@ -2372,7 +2625,7 @@ def _validate_inventory(
             raise SnapshotError(f"blob object has no inventory references: {digest}")
     if retain_object_members and isinstance(entries, MetadataRows):
         def paths_for_object(digest):
-            return (row["path"] for row in entries.object_rows(digest))
+            return entries.object_paths(digest)
         object_members = {digest: paths_for_object(digest) for digest, item in object_by_hash.items()
                           if item["kind"] == "pack"}
     return {"counts": counts, "object_members": object_members,
@@ -2503,7 +2756,7 @@ def _verified_packed_inventory(sync_root, resolved, *, materialized_path=None,
     if (type(d_primary_native_blob_reads) is not bool or type(d_primary_native_pack_reads) is not bool
             or type(d_primary_native_chunk_reads) is not bool):
         raise SnapshotError('native D verification requires an explicit boolean')
-    if (d_primary_native_blob_reads or d_primary_native_chunk_reads) and sync_root != Path('/srv/stockagent-packed'):
+    if d_primary_native_blob_reads and sync_root != Path('/srv/stockagent-packed'):
         raise SnapshotError('native D verification is restricted to canonical D authority')
     if d_primary_native_pack_reads or d_primary_native_chunk_reads:
         _check_native_pack_read_authority(sync_root)
@@ -2526,7 +2779,8 @@ def _verified_packed_inventory(sync_root, resolved, *, materialized_path=None,
 def _check_native_pack_read_authority(sync_root: Path) -> None:
     """The same D authority, including its already enrolled local-only history.
 
-    This enables only verified pack reads into anonymous bounded SSD scratch;
+    This enables only verified pack reads into anonymous bounded SSD scratch
+    and bounded full-SHA chunk streams from the same enrolled authority;
     private publication, export, NAS and source-retirement rights do not change.
     Reuse the migration owner's exact marker/permission/ignore checks rather
     than treating every directory below .local-state as an authorized history.
@@ -2635,8 +2889,6 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
             raise SnapshotError(
                 f"packed object checksum mismatch: expected {item['sha256']}, got {actual}"
             )
-        verified_bytes += int(item["bytes"])
-        verified_objects += 1
         if item["kind"] == "pack":
             expected_names = list(inventory_result["object_members"][str(item["sha256"])])
             try:
@@ -2656,7 +2908,7 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
                         # original. Do not run testzip() then decode again.
                         current = iter(entries.object_rows(str(item["sha256"])))
                         row = next(current, None)
-                        for name in names:
+                        for member_number, name in enumerate(names, 1):
                             selected = row is not None and row["path"] == name
                             digest, decoded_size = hashlib.sha256(), 0
                             with archive.open(name, mode="r") as stream:
@@ -2670,6 +2922,15 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
                                 reconstructed_files += 1
                                 reconstructed_bytes += decoded_size
                                 row = next(current, None)
+                            if progress is not None and member_number % 4096 == 0:
+                                progress({'stage': 'reconstruct-original-pack-files',
+                                    'completed_items': reconstructed_files,
+                                    'total_items': int(manifest['source']['files']),
+                                    'completed_bytes': reconstructed_bytes,
+                                    'total_bytes': int(manifest['source']['logical_bytes']),
+                                    'pack_members_completed': member_number, 'pack_members_total': len(names),
+                                    'verified_objects': verified_objects, 'total_objects': object_count,
+                                    'verified_object_bytes': verified_bytes, 'total_object_bytes': object_bytes})
                         if row is not None:
                             raise SnapshotError("not every original pack member was reconstructed")
                         bad_member = None  # CRC already checked by ZipExtFile
@@ -2709,6 +2970,10 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
                     )
                 reconstructed_files += 1
                 reconstructed_bytes += int(row["size"])
+        # An object is complete only after the native read context's fences,
+        # all ZIP CRCs and requested original-file hashes passed, not on entry.
+        verified_bytes += int(item["bytes"])
+        verified_objects += 1
         if progress is not None:
             progress({'stage': 'verify-cold-objects', 'completed_items': verified_objects,
                       'total_items': object_count, 'completed_bytes': verified_bytes,

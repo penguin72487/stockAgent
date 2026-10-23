@@ -87,6 +87,28 @@ def test_relative_namespace_receipt_still_rejects_symlinks_before_building_mount
         release.run_in_namespace(alias.relative_to(workspace.parent), Path(workspace.name), ["-c", "pass"])
 
 
+def test_temporary_lakehouse_measurement_retains_runtime_path_and_native_resource_gate(workspace, monkeypatch):
+    receipt = prepare(workspace)
+    runtime_path = "/usr/lib/wsl/lib:/runtime tools/bin:/usr/bin"
+    monkeypatch.setenv("PATH", runtime_path)
+    monkeypatch.setenv("BENCHMARK_SECRET", "do-not-copy-to-probe")
+    calls = []
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+    monkeypatch.setattr(release.subprocess, "run", run)
+    release.run_in_namespace(receipt, workspace, ["-c", "pass"], measurement_role="lakehouse")
+    assert len(calls) == 1
+    command = calls[0]
+    assert "--setenv=PATH=" + runtime_path in command
+    assert any(arg.startswith("--unit=stockagent-agent-lakehouse-source-wave-probe-") for arg in command)
+    assert not any("BENCHMARK_SECRET" in arg or "do-not-copy-to-probe" in arg for arg in command)
+    assert "--property=PrivateMounts=yes" in command
+    with pytest.raises(ValueError, match="measurement role"):
+        release.run_in_namespace(receipt, workspace, ["-c", "pass"], measurement_role="production")
+    assert len(calls) == 1
+
+
 @pytest.mark.parametrize("change", ["contents", "added", "deleted", "writable", "symlink", "hardlink", "bundle"])
 def test_actual_pinned_source_drift_still_fails_closed(workspace, change):
     receipt = prepare(workspace)

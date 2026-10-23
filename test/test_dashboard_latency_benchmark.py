@@ -3,6 +3,38 @@ import pytest
 from scripts.benchmark_dashboard_latency import capture_measurement, http_sample, measure_http, summarize, timing_summary, warm_samples
 
 
+@pytest.mark.parametrize("suffix", ["", ".updates.jsonl", ".launch.json"])
+def test_owned_browser_probe_never_overwrites_existing_evidence(tmp_path, suffix):
+    from scripts.benchmark_dashboard_browser import validate_probe
+    output = tmp_path / "browser.json"
+    existing = tmp_path / ("browser.json" + suffix)
+    existing.write_bytes(b"retained")
+    with pytest.raises(FileExistsError):
+        validate_probe("https://dashboard.example/tw-day-trade/", output, watch_ms=1000, port=9238)
+    assert existing.read_bytes() == b"retained"
+
+
+@pytest.mark.parametrize("change", [
+    {"url": "https://token:password@dashboard.example/"}, {"url": "file:///private"},
+    {"url": "https://dashboard.example/?token=private"}, {"url": "https://dashboard.example/#private"},
+    {"watch_ms": -1}, {"watch_ms": 900001}, {"port": 0}, {"port": 65536},
+])
+def test_owned_browser_probe_rejects_credentials_and_unbounded_runs(tmp_path, change):
+    from scripts.benchmark_dashboard_browser import validate_probe
+    args = {"url": "http://127.0.0.1:8770/tw-day-trade/", "output": tmp_path / "new.json",
+            "watch_ms": 0, "port": 9238, **change}
+    with pytest.raises(ValueError):
+        validate_probe(**args)
+
+
+def test_owned_browser_watch_can_arm_without_creating_a_fake_receipt(tmp_path):
+    from scripts.benchmark_dashboard_browser import validate_probe
+    output = tmp_path / "new.json"
+    assert validate_probe("http://127.0.0.1:8770/tw-day-trade/", output,
+                          watch_ms=600000, port=9238) == output.resolve()
+    assert not output.exists()
+
+
 def test_service_counters_are_allowlisted_and_unavailable_values_are_not_sizes(monkeypatch):
     import subprocess
     from scripts import benchmark_dashboard_latency as benchmark
@@ -152,6 +184,29 @@ def test_inventory_replay_fails_explicitly_without_current_inputs(tmp_path):
     from scripts.benchmark_dashboard_latency import profile_inventory
     with pytest.raises(ValueError, match="current footer inventory required"):
         profile_inventory(tmp_path, 1)
+
+
+def test_frozen_inventory_paths_support_source_identity_encoding(tmp_path, monkeypatch):
+    import os
+    from scripts.benchmark_dashboard_latency import profile_inventory
+    from stockagent.live import data_monitor_inventory as inventory
+    source = tmp_path / "source.parquet"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(inventory, "_read_json", lambda path: {"version": inventory.INVENTORY_VERSION})
+    monkeypatch.setattr(inventory, "_selected_files", lambda root: {"dataset": [source]})
+
+    def build(root):
+        observed = inventory._selected_files(root)["dataset"][0]
+        assert os.fsencode(observed) == os.fsencode(source)
+        assert observed.name == source.name
+        assert observed.stat().st_size == len(b"source")
+        assert len(inventory._source_file_identity(observed, observed.stat())) == 5
+        return {"rows": [{"dataset_id": "dataset", "field": "price"}]}
+
+    monkeypatch.setattr(inventory, "build_feature_inventory", build)
+    receipt = profile_inventory(tmp_path, 2)
+    assert receipt["outputs_identical"]
+    assert receipt["implementations"]["current"]["fields"] == 1
 
 
 def test_shioaji_profile_preserves_one_observation_clock_and_compares_real_outputs(tmp_path, monkeypatch):
@@ -327,3 +382,17 @@ def test_local_profile_retains_separate_full_source_baseline(tmp_path, monkeypat
     assert report["session_projection_enabled"] is False
     assert "session projection bypassed" in report["boundary"]
     assert observed[0]["use_session_projection"] is False
+
+
+def test_local_history_profile_detects_changed_enabled_market_inputs(tmp_path, monkeypatch):
+    from scripts.benchmark_dashboard_latency import profile_history
+    from stockagent.live import tw_day_trade_dashboard
+    state = tmp_path / "state.json"
+    state.write_text('{"product":"tw_day_trade","enabled_markets":["a"]}')
+
+    def build(**kwargs):
+        state.write_text('{"product":"tw_day_trade","enabled_markets":["b"]}')
+        return {"returned_points": 0, "minute_series": []}
+
+    monkeypatch.setattr(tw_day_trade_dashboard, "build_dashboard_history_snapshot", build)
+    assert profile_history(tmp_path, 1)["source_stable"] is False

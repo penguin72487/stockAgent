@@ -180,6 +180,10 @@ def test_gateway_tw_status_omits_only_order_fill_display_reads(
     # Call the real route without constructing a listening server or live cache.
     server = SimpleNamespace(
         repo_root=tmp_path,
+        # Match the real gateway's quote-privacy boundary without constructing
+        # a source or issuing any quote/network request in this route test.
+        public_quote_source=None,
+        is_owner=False,
         tw_revision=lambda: SimpleNamespace(body=b'{"revision_token":"fixed"}'),
         cached_local_json=build_response,
         _revision_stale_or_build=build_response,

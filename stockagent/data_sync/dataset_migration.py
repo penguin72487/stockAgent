@@ -14,6 +14,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import stat
@@ -35,7 +36,7 @@ from stockagent.data_sync.packed_metadata import MetadataRows
 
 CONTRACT = "all_catalog_incremental_migration_v1"
 PRIVATE_RELATIVE = ".local-state/private-history"
-CONTROL_SCOPE = "recursive_mutable_controls_v13"
+CONTROL_SCOPE = "recursive_mutable_controls_v17"
 FROZEN_CONTROLS_INLINE_LIMIT = 4096
 
 
@@ -372,6 +373,31 @@ def _mutable_published_locations(source: Path) -> dict[str, tuple[str, ...] | No
         # The existing rule-only catalog is a separate source from its whole
         # root complement. Both refer to the same original atomic publisher.
         return {'normalized': None}
+    if source.name == 'data_finlab':
+        # finlab_research_overlay closes and atomically replaces these exact
+        # deterministic-token outputs, including existing build partitions.
+        # A token is not immutable-inode evidence: later overlays can rewrite
+        # it during a multi-hour baseline. Never probe raw descendants here.
+        locations = {}
+        normalized = source / 'normalized'
+        if normalized.exists() or normalized.is_symlink():
+            if normalized.resolve() != normalized or not normalized.is_dir():
+                raise SnapshotError('FinLab normalized writer directory is redirected')
+            locations['normalized'] = tuple(sorted(member.name for member in normalized.iterdir()
+                if re.fullmatch(r'[0-9a-f]{24}\.parquet', member.name)))
+        builds = normalized / 'builds'
+        if builds.exists() or builds.is_symlink():
+            if builds.resolve() != builds or not builds.is_dir():
+                raise SnapshotError('FinLab normalized build directory is redirected')
+            for directory in sorted(builds.iterdir()):
+                if not re.fullmatch(r'[0-9a-f]{24}', directory.name):
+                    continue
+                if directory.resolve() != directory or not directory.is_dir():
+                    raise SnapshotError('FinLab normalized build identity is redirected')
+                locations['normalized/builds/' + directory.name] = tuple(sorted(
+                    member.name for member in directory.iterdir()
+                    if re.fullmatch(r'part-[0-9]{4}\.parquet', member.name)))
+        return locations
     if source.name == 'data_openBB':
         # Reviewed catalog/monitor writers publish closed outputs. Arbitrary
         # raw/provider Parquet files do not inherit their mutable semantics.
@@ -431,11 +457,36 @@ def _mutable_control_file_locations(source: Path) -> dict[str, tuple[str, ...]]:
         # Dated/raw response records must not inherit its mutable semantics.
         locations['runs'] = ('latest.json',)
         locations['catalog'] = ('discovery.json',)
+        # The market collector atomically replaces its two queue frontiers,
+        # shared provider backoff and bounded batch index. Calibration rewrites
+        # the seed from original service/quota evidence. Dated batch_receipts
+        # remain immutable payloads; none of these names imply a global clock.
+        locations['intraday'] = ('minute_cursor.json', 'market_cursor.json',
+                                 'source_backoff.json', 'batch_metrics.json',
+                                 'batch_metrics_seed.json')
+        # capture_empty_evidence rewrites the observation clock under the same
+        # raw-content digest. Only these two reviewed producers are controls;
+        # their immutable Feather evidence and arbitrary JSON remain strict.
+        evidence = source / 'empty_evidence'
+        if evidence.exists() or evidence.is_symlink():
+            if evidence.resolve() != evidence or not evidence.is_dir():
+                raise SnapshotError('FinLab empty evidence directory is redirected')
+            from stockagent.data.finlab_acquisition_contract import safe_stem
+            stems = tuple(safe_stem(key) + '-' for key in (
+                'dividend_otc:權息', 'management_change_events:變更交易開始日'))
+            locations['empty_evidence'] = tuple(sorted(member.name for member in evidence.iterdir()
+                if any(member.name.startswith(stem)
+                       and re.fullmatch(r'[0-9a-f]{64}\.json', member.name[len(stem):])
+                       for stem in stems)))
     if source.name == 'data_finmind':
         # finmind_json_pipeline.run_cycle atomically replaces this bounded
         # summary after a batch. It is not one of the raw response records.
         locations.update({root: ('json_pipeline_last.json',)
                           for root in ('.', 'complement', 'sponsor')})
+        # The announcement watcher replaces these two heads, while snapshots/
+        # and checks/ retain the original dated evidence. They are not raw
+        # financial observations or permission to freeze arbitrary plan files.
+        locations['announcements'] = ('head.json', 'repair_plan.json')
     if source.name == 'data_openBB':
         # The priority queue and L1 compactor own these atomic control heads.
         # Probe exact names on retry instead of rescanning millions of shards.
@@ -574,7 +625,9 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                  "recursive_mutable_controls_v6", "recursive_mutable_controls_v7",
                  "recursive_mutable_controls_v8", "recursive_mutable_controls_v9",
                  "recursive_mutable_controls_v10", "recursive_mutable_controls_v11",
-                 "recursive_mutable_controls_v12")):
+                 "recursive_mutable_controls_v12", "recursive_mutable_controls_v13",
+                 "recursive_mutable_controls_v14", "recursive_mutable_controls_v15",
+                 "recursive_mutable_controls_v16")):
             raise SnapshotError("control freeze intent changed")
         if previous_intent != intent:
             # Expand the named control scope without replacing retained
@@ -612,7 +665,9 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                         'recursive_mutable_controls_v5', 'recursive_mutable_controls_v6',
                         'recursive_mutable_controls_v7', 'recursive_mutable_controls_v8',
                         'recursive_mutable_controls_v9', 'recursive_mutable_controls_v10',
-                        'recursive_mutable_controls_v11', 'recursive_mutable_controls_v12', CONTROL_SCOPE}:
+                        'recursive_mutable_controls_v11', 'recursive_mutable_controls_v12',
+                        'recursive_mutable_controls_v13', 'recursive_mutable_controls_v14',
+                        'recursive_mutable_controls_v15', 'recursive_mutable_controls_v16', CONTROL_SCOPE}:
         # Completed recursive censuses only need named delta probes. v4 added
         # reports/atomic outputs; v5 added rule-only TAIFEX, v6 news controls.
         # v7 adds native CEX reports/lock epochs and the official feature table;
@@ -622,6 +677,11 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
         # v11 adds direct public query journals and OpenBB compactor heads.
         # v12 adds the FinLab run head and exact public feature companions.
         # v13 completes reviewed FinLab discovery/OpenBB operational producers.
+        # v14 adds the FinLab intraday frontiers/backoff/batch summary, not the
+        # immutable dated batch receipts or another SQLite snapshot.
+        # v15 adds only the FinMind announcement watcher's two mutable heads.
+        # v16 adds the FinLab overlay's exact token/year closed outputs.
+        # v17 adds only the two reviewed mutable null-audit JSON reports.
         # Large receipt
         # trees are observed directly into cold packs, never millions of copies.
         # Never rewalk millions of raw files or replace retained observations.
@@ -709,11 +769,16 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
             else:
                 for attempt in range(3):
                     descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
-                    with os.fdopen(descriptor, "rb") as src:
+                    try:
+                        src = os.fdopen(descriptor, "rb")
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
+                    with src:
                         first = os.fstat(src.fileno())
                         if not stat.S_ISREG(first.st_mode) or first.st_size > 64 * 1024**2:
                             raise SnapshotError("control source exceeded its bounded regular-file scope")
-                        raw = src.read(64 * 1024**2 + 1)
+                        raw = src.read(first.st_size + 1)
                         last = os.fstat(src.fileno())
                     # Atomic source replacement is harmless to the held FD.
                     # In-place writes still fail the size/mtime/content fences.
@@ -856,6 +921,9 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
         staging_rules = ["artifact_io_atomic_sibling_v1"]
         if entry["dataset"] == "finmind-free" and source == (repo / "data_finmind").resolve():
             staging_rules.append("finmind_parquet_promote_v1")
+        if source == (repo / 'data_finlab').resolve():
+            staging_rules.append('finlab_atomic_sibling_v1')
+            staging_rules.append('finlab_research_atomic_sibling_v1')
         if source == (repo / 'data_openBB').resolve():
             staging_rules.append('openbb_l1_atomic_sibling_v1')
             staging_rules.append('openbb_operational_atomic_sibling_v1')
@@ -873,6 +941,8 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             pack_buckets=int(entry["pack_buckets"]) or 64,
             file_chunk_bytes=policy["file_chunk_bytes"], excluded_subtrees=excluded,
             batch_directory_fsync=True, publication_lock_nonblocking=True,
+            d_primary_native_chunk_reuse=(cold == Path('/srv/stockagent-packed/.local-state/private-history')),
+            d_primary_native_chunk_reuse_pipeline=(cold == Path('/srv/stockagent-packed/.local-state/private-history')),
             bootstrap_file_storage=inherited_files, bootstrap_objects=inherited_objects,
             private_observation_cohort=True,
             private_atomic_json_controls=source.name in {
@@ -930,7 +1000,8 @@ def _recover(cold: Path, dataset: str, snapshot: str, receipt: Path, progress_pa
     native_pack_reads = cold in (primary, primary / '.local-state/private-history')
     proof = verify_packed_snapshot(cold, selected, reconstruct_all=True, progress=progress,
                                   d_primary_native_pack_reads=native_pack_reads,
-                                  d_primary_native_chunk_reads=(cold == primary))
+                                  d_primary_native_chunk_reads=(cold in {
+                                      primary, primary / '.local-state/private-history'}))
     proof.update(contract=CONTRACT, dataset=dataset, snapshot_id=snapshot,
                  manifest_sha256=selected.manifest_sha256,
                  full_original_file_reconstruction_verified=True, source_files=int(selected.manifest["source"]["files"]),
@@ -1046,6 +1117,52 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict, *, p
     return result
 
 
+def _committed_catalog_release(entry: dict, args, cold: Path):
+    """Pin an already admitted v2 release; never republish stale/live source bytes.
+
+    Migration proves recovery of a fixed historical version, not perpetual
+    freshness of its source workspace. The canonical publisher's exact entry
+    identity binds scope, rights and admission gates at commit. Legacy/unbound
+    manifests still go through the original live publisher. In either case all
+    objects and original files must pass _recover before migration acceptance.
+    """
+    from scripts.publish_data_releases import (
+        CATALOG_PUBLICATION_CONTRACT, _source_path, _version_options,
+        catalog_publication_identity,
+    )
+    if not entry.get('publish') or 'publication_family' in entry or 'completed_forward_key' in entry:
+        return None
+    # Missing heads are normal before first publication. Do not hide a corrupt
+    # or redirected existing head behind a fallback to an older/live source.
+    heads = cold / 'heads' / entry['dataset']
+    if not heads.exists() and not heads.is_symlink():
+        return None
+    saved = resolve_latest_packed(cold, entry['dataset'], require_objects=False)
+    manifest, expected = saved.manifest, catalog_publication_identity(entry)
+    metadata = manifest.get('metadata', {})
+    if (manifest['schema_version'] != 2
+            or metadata.get('catalog_publication_contract') != CATALOG_PUBLICATION_CONTRACT
+            or metadata.get('catalog_entry_sha256') != expected):
+        return None
+    source, archive = manifest['source'], manifest['archive']
+    options = _version_options(entry, args)
+    from stockagent.data_sync.packed_snapshots import (
+        _normalize_excluded_subtrees, _normalize_included_root_files,
+    )
+    excluded = list(_normalize_excluded_subtrees(entry.get('excluded_subtrees', [])))
+    included = (list(_normalize_included_root_files(entry['included_root_files']))
+                if 'included_root_files' in entry else None)
+    if (metadata.get('role') != str(entry['role']) or metadata.get('catalog_schema') != '1'
+            or source['snapshot_root_name'] != _source_path(entry).name
+            or source.get('excluded_subtrees', []) != excluded
+            or source.get('selection', {}).get('included_root_files') != included
+            or source.get('selection', {}).get('private_observation_cohort', False)
+            or source.get('omitted_files_above_maximum', 0) != 0
+            or archive.get('file_chunk_bytes') != options.get('file_chunk_bytes')):
+        raise SnapshotError('committed catalog publication disagrees with its enrolled contract')
+    return saved
+
+
 def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     """One resumable operation; all concrete catalog sources, not just repo links."""
     from scripts.publish_data_releases import _publish_entry, _source_path
@@ -1116,10 +1233,12 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
         for pass_number in range(args.maximum_passes):
             # Resume committed releases first, then untouched work. A repeatedly
             # changing multi-million-file source must not starve every pending
-            # branch on each durable activity. Busy peers still get retries.
+            # branch on each durable activity. Among retries, oldest attempt
+            # goes first: historical failure counts are not waiting time.
             ordered = sorted(entries, key=lambda entry: (
                 0 if "snapshot_id" in result["datasets"][entry["dataset"]] else
                 1 if result["datasets"][entry["dataset"]]["state"] == "pending" else 2,
+                result["datasets"][entry["dataset"]].get("started_at_utc", ""),
                 result["datasets"][entry["dataset"]].get("attempts", 0)))
             for entry in ordered:
                 row = result["datasets"][entry["dataset"]]
@@ -1156,8 +1275,16 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                                                           require_objects=False)
                         extra = row.get("publication", {})
                     elif entry["publish"]:
-                        status, saved = _publish_entry(entry, run_args, parent)
-                        extra = {"source_status": status}
+                        saved = _committed_catalog_release(entry, run_args, parent)
+                        if saved is None:
+                            status, saved = _publish_entry(entry, run_args, parent)
+                            extra = {"source_status": status}
+                        else:
+                            extra = {"state": "fixed_committed_catalog_release",
+                                "catalog_entry_sha256": saved.manifest['metadata']['catalog_entry_sha256'],
+                                "published_at": saved.manifest['published_at'],
+                                "current_source_freshness_checked": False,
+                                "all_current_source_history_complete_claim": False}
                     else:
                         saved, extra = _private_publish(repo, entry, run_args, parent, policy, catalog)
                     if saved is None:
@@ -1234,6 +1361,42 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
         return result
 
 
+def _inflight_lock_only_catalog(repo: Path, root: Path, current: dict, catalog: list[dict],
+                                policy: dict) -> list[dict] | None:
+    """Retain a fixed plan until a lock-mode-only change's normal next cycle.
+
+    Do not relabel accepted manifests or apply the new mode to old receipts.
+    Source paths, publication rights, validation/freshness gates and the entire
+    version policy must still match. Other catalog changes keep their existing
+    new-plan behavior. A corrupted/redirected saved plan is never a fallback.
+    """
+    operation = Path(current['operation_directory'])
+    plan_path = operation / 'plan.json'
+    if (operation.resolve() != operation or not operation.is_relative_to(root / 'operations')
+            or plan_path.is_symlink() or plan_path.stat().st_size > 32 * 1024**2):
+        raise SnapshotError('in-flight migration plan is redirected or oversized')
+    saved = json.loads(plan_path.read_bytes())
+    if (saved.get('contract') != CONTRACT or saved.get('plan_sha256') != current['plan_sha256']
+            or _identity({'catalog': saved['catalog'], 'policy': saved['policy']}) != current['plan_sha256']):
+        raise SnapshotError('in-flight migration plan identity differs')
+    entries = migration_entries(repo, catalog, policy)
+    def without_modes(rows):
+        normalized = []
+        for row in rows:
+            if row.get('source_coordination_lock_mode', 'exclusive') not in ('exclusive', 'shared_read'):
+                raise SnapshotError('invalid in-flight source coordination mode')
+            normalized.append({key: value for key, value in row.items()
+                               if key != 'source_coordination_lock_mode'})
+        return normalized
+    if saved['policy'] != policy or without_modes(saved['catalog']) != without_modes(entries):
+        return None
+    by_name = {entry['dataset']: entry for entry in saved['catalog']}
+    frozen = [by_name[entry['dataset']] for entry in catalog]
+    if migration_entries(repo, frozen, policy) != saved['catalog']:
+        raise SnapshotError('in-flight catalog cannot reconstruct its original exact plan')
+    return frozen
+
+
 def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | None = None) -> dict:
     """One bounded source step for the existing Temporal storage worker.
 
@@ -1264,6 +1427,20 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
     with _operation_owner(root):
         current_path = root / "current.json"
         current = json.loads(current_path.read_text()) if current_path.exists() else None
+        # Coordination policy changes neither the accepted bytes nor their
+        # source scope. Complete an in-flight original plan, and preserve a
+        # completed cycle's deadline instead of immediately rereading every
+        # source just because a reader's lock mode changed. At the deadline a
+        # new exact plan adopts the revised catalog normally.
+        if (current and current.get('plan_sha256') != plan
+                and (current.get('state') != 'verified'
+                     or observed < current['next_cycle_unix'])):
+            frozen = _inflight_lock_only_catalog(repo, root, current, catalog, policy)
+            if frozen is not None:
+                if current.get('deferred_catalog_plan_sha256') != plan:
+                    current['deferred_catalog_plan_sha256'] = plan
+                    atomic_write_json(current_path, current)
+                catalog, plan = frozen, current['plan_sha256']
         if (current is None or current.get("plan_sha256") != plan
                 or (current.get("state") == "verified" and observed >= current["next_cycle_unix"])):
             current = {"contract": CONTRACT, "plan_sha256": plan, "state": "processing",
@@ -1272,7 +1449,9 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
             atomic_write_json(current_path, current)
         elif current.get("state") == "verified":
             return {"state": "waiting_next_daily_cycle", "verified_datasets": current["verified_datasets"],
-                    "source_count": current["source_count"], "next_cycle_unix": current["next_cycle_unix"]}
+                    "source_count": current["source_count"], "next_cycle_unix": current["next_cycle_unix"],
+                    **({'deferred_catalog_plan_sha256': current['deferred_catalog_plan_sha256']}
+                       if 'deferred_catalog_plan_sha256' in current else {})}
         args = SimpleNamespace(sync_root=cold, migration_state=Path(current["operation_directory"]),
             node_id=None, retry_seconds=retry, maximum_passes=1, watch=False,
             maximum_completed_sources=1, retire_staging=True,

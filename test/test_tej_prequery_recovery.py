@@ -324,6 +324,109 @@ def test_watch_restart_recovers_only_proved_unsent_window_and_keeps_other_work_r
     assert bridge.calls==1
 
 
+class PrequeryNoticeBridge(HealthyReadback):
+    """Fail the ordinary check once, then emulate exact owned notice recovery."""
+    session={'ExpectedWindow':1234}
+
+    def __init__(self, notices=(), *, inspection=None):
+        super().__init__()
+        self.notices=list(notices)
+        self.inspection=inspection or {}
+        self.actions=[]
+
+    def execute(self,root,task):
+        request=json.loads(task['request_json']);action=request['action']
+        self.actions.append(action)
+        if len(self.actions)==1:
+            assert action=='confirm_metadata_error_cleared'
+            raise RuntimeError('retained private vendor error')
+        if action=='confirm_metadata_error_cleared':
+            return super().execute(root,task)
+        base={**{k:request[k] for k in ('contract_version','action','type','smart_id','table')},
+              'provider':'tej_smart_wizard','task_id':task['task_id'],
+              'observed_at_utc':datetime.now(UTC).isoformat(),'credentials_read':False,
+              'data_query_repeated':False}
+        if action=='inspect_notices':
+            payload={**base,'notices':self.notices[:1],'notice_acknowledged':False,
+                     'root_enabled':not self.notices,'root_automation_enabled':not self.notices,
+                     **self.inspection}
+        elif action=='ack_source_memory_error':
+            assert request['error_window']==99
+            self.notices.pop(0)
+            payload={**base,'error_code':request['error_code']}
+        else:
+            raise AssertionError('No plan, Preview, source axes or restart allowed')
+        output=root/'raw'/(task['task_id']+'-'+uuid.uuid4().hex+'.json')
+        atomic_write_json(output,payload)
+        return payload,output,0.01
+
+
+@pytest.mark.parametrize('messages',[['MySql:malloc'],['Cannot find table 0.'],
+                                    ['MySql:malloc','Cannot find table 0.']])
+def test_proved_unsent_download_repairs_only_known_owned_runtime_notices(ready,messages):
+    from downloader.tej_desktop_attempts import defer_unsent_prequery
+    from test_tej_history import runtime_notice
+    root,_,_=ready;task,proof,prepared=exhausted(root)
+    retained={p:p.read_bytes() for p in (proof,prepared)}
+    bridge=PrequeryNoticeBridge([runtime_notice(message) for message in messages])
+    result=defer_unsent_prequery(root,task['task_id'],bridge,acknowledge_known_notices=True)
+    assert result['state']=='prequery_failure_deferred'
+    assert bridge.actions==['confirm_metadata_error_cleared',
+        *[action for _ in messages for action in ('inspect_notices','ack_source_memory_error')],
+        'inspect_notices','confirm_metadata_error_cleared']
+    assert all(p.read_bytes()==body for p,body in retained.items())
+    with closing(connect(root)) as con:
+        updated=con.execute('SELECT state,safe_prequery_retries,actual_rows,receipt_path FROM tasks WHERE task_id=?',
+                            (task['task_id'],)).fetchone()
+        assert tuple(updated)==('pending',2,None,None)
+    audit=json.loads((root/result['audit']).read_text())
+    assert len(audit['interface_recovery_evidence_sha256'])==2*len(messages)+2
+    assert len(audit['restored_source_error_codes'])==len(messages)
+    assert result['provider_queries_sent']==0 and result['data_query_repeated'] is False
+
+
+@pytest.mark.parametrize('fault',['permission','quota','auth','foreign','unknown','disabled','provider','clock','policy'])
+def test_unsent_notice_repair_preserves_barrier_for_unknown_or_unproved_interface(ready,fault):
+    from downloader.tej_desktop_attempts import defer_unsent_prequery
+    from test_tej_history import runtime_notice
+    root,_,_=ready;task,proof,prepared=exhausted(root)
+    notice=runtime_notice({'permission':'Permission denied','quota':'Quota exhausted',
+        'auth':'Please login','unknown':'Other runtime failure'}.get(fault,'MySql:malloc'))
+    if fault=='foreign':notice['owner']=999
+    inspection=({'root_enabled':False,'root_automation_enabled':False} if fault=='disabled' else
+                {'provider':'foreign'} if fault=='provider' else
+                {'observed_at_utc':(datetime.now(UTC)-timedelta(hours=1)).isoformat()} if fault=='clock' else {})
+    bridge=PrequeryNoticeBridge([] if fault=='disabled' else [notice],inspection=inspection)
+    retained={p:p.read_bytes() for p in (proof,prepared)}
+    with pytest.raises((RuntimeError,ValueError)):
+        defer_unsent_prequery(root,task['task_id'],bridge,acknowledge_known_notices=fault!='policy')
+    assert 'ack_source_memory_error' not in bridge.actions
+    assert bridge.actions==(['confirm_metadata_error_cleared'] if fault=='policy' else
+                           ['confirm_metadata_error_cleared','inspect_notices'])
+    assert all(p.read_bytes()==body for p,body in retained.items())
+    with closing(connect(root)) as con:
+        row=dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone())
+        assert row==task and con.execute('SELECT count(*) FROM desktop_retry_windows').fetchone()[0]==0
+    status=json.loads((root/'prequery_recovery_status.json').read_text())
+    assert status['state']=='waiting_prequery_interface' and status['retry_budget_changed'] is False
+    assert 'private_diagnostic' not in status and status['provider_queries_sent']==0
+    diagnostic=next((root/'local_prequery_recovery').glob('*-interface-*.json'))
+    assert diagnostic.stat().st_mode & 0o777==0o600
+
+
+def test_prequery_repair_standing_policy_is_forwarded_by_persistent_supervisor(ready):
+    from downloader.tej_scheduler import watch_queue
+    from test_tej_history import runtime_notice
+    from test_tej_scheduler import InstantWait
+    root,config,_=ready;task,_,_=exhausted(root)
+    config={**config,'automation':{'enabled':True},'prequery_failure_isolation':True,
+            'acknowledge_known_metadata_runtime_notices':True}
+    bridge=PrequeryNoticeBridge([runtime_notice()]);calls=[]
+    watch_queue(root,bridge,config,stop=InstantWait(),max_cycles=1,emit=lambda *_,**__:None,
+                runner=lambda *_:calls.append('healthy-work') or 'completed_task')
+    assert calls==['healthy-work'] and 'ack_source_memory_error' in bridge.actions
+
+
 @pytest.mark.parametrize('field,value',[
     ('prequery_failure_isolation',1),('prequery_recovery_contract','unreviewed'),
     ('prequery_retry_base_seconds',True),('prequery_retry_base_seconds',0),

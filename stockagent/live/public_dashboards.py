@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from functools import lru_cache
+import hashlib
+import json
 import math
 import re
 import threading
@@ -146,10 +148,23 @@ def _public_replay_signal_origin(row: Mapping[str, Any]) -> str | None:
 
 def _public_projected_row(row: Mapping[str, Any], allowed_fields: set[str]) -> dict[str, Any]:
     output = {str(field): value for field, value in row.items() if str(field) in allowed_fields}
+    trace = public_paper_signal_key(row)
+    if trace is not None:
+        output["public_signal_key"] = trace
     origin = _public_replay_signal_origin(row)
     if origin is not None:
         output["replay_signal_origin"] = origin
     return output
+
+
+def public_paper_signal_key(row: Mapping[str, Any]) -> str | None:
+    """Opaque correlation only; never publish the private signal identifier."""
+    market, session, signal = (row.get(key) for key in ("market", "session_date", "signal_id"))
+    if (not all(isinstance(value, str) and value for value in (market, session, signal))
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", session)):
+        return None
+    return hashlib.sha256(json.dumps(["public_paper_signal_v1", market, session, signal],
+        ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()[:32]
 
 
 def _scrub_public_value(
@@ -166,6 +181,9 @@ def _scrub_public_value(
         if quote_source is not None:
             value = quote_source.enrich(value, session_date=session_date)
         output: dict[str, Any] = {}
+        trace = public_paper_signal_key(value)
+        if trace is not None:
+            output["public_signal_key"] = trace
         origin = _public_replay_signal_origin(value)
         if origin is not None:
             output["replay_signal_origin"] = origin
@@ -175,6 +193,8 @@ def _scrub_public_value(
         quote_policy = public_quote_display_policy()
         for raw_key, item in value.items():
             key = str(raw_key)
+            if key == "public_signal_key" and trace is not None:
+                continue  # Derive from identity, never trust an upstream override.
             disposition = _public_key_disposition(key)
             if disposition == "drop":
                 continue

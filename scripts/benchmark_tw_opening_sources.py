@@ -31,6 +31,7 @@ import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -41,6 +42,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stockagent.live import opening_price_acquisition as acquisition, quote_provider as quotes
+from stockagent.live.opening_price_journal import observation_values
 from stockagent.data import tw_current_trading_universe as universe
 from stockagent.live.tw_day_trade_simulation import _atomic_json
 
@@ -182,7 +184,7 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
                     # Lightweight wall spans cover EVERY calling thread, unlike
                     # the optional provider-thread-only cProfile. Nested and
                     # concurrent spans are diagnostic, never additive costs.
-                    for attribute in ("seed_tw_opening_snapshot_cache", "fetch_tw_mis_opening_snapshot",
+                    for attribute in ("load_symbol_yahoo_map", "seed_tw_opening_snapshot_cache", "fetch_tw_mis_opening_snapshot",
                                       "tw_opening_observation_diagnostics", "persist_tw_opening_snapshot_cache",
                                       "_persist_tw_mis_opening_receipt"):
                         measure_stage(module, attribute, attribute)
@@ -298,7 +300,8 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
             sys.modules.pop(name, None)
 
 
-def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, rounds, baseline_quotes_path=None):
+def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, rounds, baseline_quotes_path=None,
+                            include_source_failures=False, profile_local=False):
     """Same retained full response, original prices/clocks, real fsyncs.
 
     Zero network latency is explicit. This measures the complete fan-in local
@@ -357,37 +360,110 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
                         from contextlib import nullcontext
                         owner_patch = nullcontext()
                     with owner_patch:
+                        input_writes = []
+                        stage_spans, stage_lock = {}, threading.Lock()
+                        profile = cProfile.Profile()
+                        original_write = variant_quotes._persist_tw_mis_opening_receipt
+
+                        def input_write(**kwargs):
+                            timing = kwargs.get("timings")
+                            input_writes.append({"row_count": len(kwargs["rows"]),
+                                                 "thread": threading.current_thread().name,
+                                                 "stages": timing})
+                            return original_write(**kwargs)
+
+                        def measure_stage(target, attribute):
+                            original = getattr(target, attribute)
+
+                            def measured(*args, **kwargs):
+                                stage_started = time.perf_counter()
+                                try:
+                                    return original(*args, **kwargs)
+                                finally:
+                                    elapsed = (time.perf_counter() - stage_started) * 1000
+                                    with stage_lock:
+                                        span = stage_spans.setdefault(attribute, {"calls": 0, "sum_ms": 0., "max_ms": 0.})
+                                        span["calls"] += 1
+                                        span["sum_ms"] += elapsed
+                                        span["max_ms"] = max(span["max_ms"], elapsed)
+
+                            return patch.object(target, attribute, measured)
+
+                        def denied(*_args):
+                            raise quotes.requests.HTTPError(response=SimpleNamespace(status_code=403))
+
+                        def disconnected(*_args):
+                            raise quotes.requests.ConnectionError("controlled retained-source failure fixture")
+
+                        providers = ({"fixture_permission_denied": denied, "fixture_connection_failure": disconnected}
+                                     if include_source_failures else {})
+                        def provider(names, values, progress):
+                            if profile_local:
+                                profile.enable()
+                            try:
+                                return module.fetch_finmind_opening_prices(names, values, progress)
+                            finally:
+                                if profile_local:
+                                    profile.disable()
+
+                        providers["finmind_snapshot"] = provider
                         fallback = np.full(len(symbols), np.nan)
                         owner = module.OpeningPriceFanIn()
-                        started = time.perf_counter()
-                        try:
-                            result = owner.fetch(symbols, fallback, parquet_root=root,
-                                providers={"finmind_snapshot": module.fetch_finmind_opening_prices},
-                                minimum_coverage=.9, timeout_seconds=4.5,
-                                cache_reader=lambda: variant_quotes.fetch_tw_mis_opening_snapshot(
-                                    symbols, fallback, parquet_root=root, allow_network=False))
-                            quorum_ms = (time.perf_counter() - started) * 1000
-                            drained = owner.wait_idle(timeout_seconds=5)
-                        finally:
-                            owner.close()
+                        started, cpu_started = time.perf_counter(), time.process_time()
+                        with ExitStack() as measurements:
+                            measurements.enter_context(patch.object(variant_quotes, "_persist_tw_mis_opening_receipt", input_write))
+                            for attribute in ("seed_tw_opening_snapshot_cache", "fetch_tw_mis_opening_snapshot",
+                                              "tw_opening_observation_diagnostics", "persist_tw_opening_snapshot_cache"):
+                                measurements.enter_context(measure_stage(variant_quotes, attribute))
+                            measurements.enter_context(measure_stage(module, "_record_source_events"))
+                            try:
+                                result = owner.fetch(symbols, fallback, parquet_root=root,
+                                    providers=providers, minimum_coverage=.9, timeout_seconds=4.5,
+                                    cache_reader=lambda: variant_quotes.fetch_tw_mis_opening_snapshot(
+                                        symbols, fallback, parquet_root=root, allow_network=False))
+                                quorum_ms = (time.perf_counter() - started) * 1000
+                                drained = owner.wait_idle(timeout_seconds=5)
+                            finally:
+                                owner.close()
                         total_ms = (time.perf_counter() - started) * 1000
                         final = variant_quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
                         digest = hashlib.sha256()
-                        for field in ("prices", "open_prices", "available_mask", "timestamps_ms",
-                                      "exchange_timestamps_ms", "simtrade_flags", "no_open_print_timestamps_ms"):
+                        for field in ("prices", "available_mask", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS,
+                                      "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms"):
                             value = getattr(final, field)
                             digest.update(field.encode())
                             digest.update(b"None" if value is None else np.asarray(value).tobytes())
                         receipt = json.loads(variant_quotes._tw_mis_opening_receipt_path(fixture_at.date().isoformat()).read_bytes())
+                        journal = variant_quotes._tw_mis_opening_receipt_path(fixture_at.date().isoformat()).with_suffix(".acquisition.jsonl").read_bytes()
+                        observations = [[row["provider"], list(observation_values(row))]
+                            for line in journal.splitlines() if (row := json.loads(line))["event"] == "observations_delta"]
+                        top = sorted(profile.getstats(), key=lambda row: row.totaltime, reverse=True)[:25]
                         samples.append({"round": round_id + 1, "variant": label,
                             "quorum_return_ms": round(quorum_ms, 3), "total_local_workflow_ms": round(total_ms, 3),
+                            "total_with_readback_ms": round((time.perf_counter() - started) * 1000, 3),
+                            "process_cpu_ms": round((time.process_time() - cpu_started) * 1000, 3),
+                            "local_stage_spans": {name: {key: round(value, 3) if key.endswith("_ms") else value
+                                for key, value in span.items()} for name, span in stage_spans.items()},
+                            "local_stage_policy": "all_threads_nested_wall_spans_not_additive_v1",
+                            "provider_thread_profile": [{"function": str(row.code) if isinstance(row.code, str) else
+                                f"{Path(row.code.co_filename).name}:{row.code.co_firstlineno}:{row.code.co_name}",
+                                "calls": row.callcount, "cumulative_ms": round(row.totaltime * 1000, 3),
+                                "own_ms": round(row.inlinetime * 1000, 3)} for row in top],
                             "background_drained": drained, "requested_count": len(symbols),
                             "durable_requested_count": receipt["requested_count"],
                             "valid_open_count": int(quotes.tw_session_open_observed_mask(final).sum()),
+                            "input_receipt_writes": input_writes,
+                            "source_journal_bytes": len(journal),
+                            "observation_rows_sha256": hashlib.sha256(json.dumps(observations, allow_nan=False).encode()).hexdigest(),
+                            "durable_rows_sha256": hashlib.sha256(json.dumps(receipt["rows"], sort_keys=True, allow_nan=False).encode()).hexdigest(),
                             "financial_and_clock_sha256": digest.hexdigest(),
                             "quorum_reached": result.transport_timing["opening_quorum_ready"]})
         if len({row["financial_and_clock_sha256"] for row in samples}) != 1:
             raise AssertionError("FinMind decoding changed original financial fields or receipt clocks")
+        if len({row["durable_rows_sha256"] for row in samples}) != 1:
+            raise AssertionError("FinMind comparison changed durable financial/source evidence")
+        if len({row["observation_rows_sha256"] for row in samples}) != 1:
+            raise AssertionError("FinMind comparison changed original observation journal values")
         return {"schema_version": 1, "scope": "retained_full_response_complete_local_ingestion_not_network_or_opening_slo",
             "baseline_sha256": hashlib.sha256(code).hexdigest(),
             "candidate_sha256": hashlib.sha256(Path(acquisition.__file__).read_bytes()).hexdigest(),
@@ -395,9 +471,15 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
             "candidate_quote_owner_sha256": hashlib.sha256(Path(quotes.__file__).read_bytes()).hexdigest(),
             "payload_sha256": hashlib.sha256(body).hexdigest(), "payload_bytes": len(body),
             "requested_count": len(symbols), "financial_and_clock_parity": True,
+            "durable_rows_parity": True, "observation_journal_parity": True,
+            "controlled_parallel_failures": include_source_failures,
+            "provider_thread_profiling_enabled": profile_local,
+            "readback_boundary": "complete_fan_in_drain_then_snapshot_receipt_and_observation_journal_readback",
             "network_requests": 0, "signal_published": False, "broker_order_submitted": False,
             "production_ledger_modified": False, "opening_slo_claim": False,
             "median_total_local_workflow_ms": {name: statistics.median(row["total_local_workflow_ms"]
+                for row in samples if row["variant"] == name) for name in ("before", "after")},
+            "median_total_with_readback_ms": {name: statistics.median(row["total_with_readback_ms"]
                 for row in samples if row["variant"] == name) for name in ("before", "after")},
             "samples": samples}
     finally:
@@ -736,7 +818,9 @@ def compare_mis_recovery(symbols, root, baseline_file: Path, *, rounds: int) -> 
             for row in samples if row["variant"] == label) for label in ("before", "after")}}
 
 
-def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> dict:
+def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int,
+                              cached_rows: int = 0, accounting_delay_ms: float = 0.,
+                              response_delay_ms: float = 0.) -> dict:
     """Lossless full-axis local pipeline comparison; no live-feed/SLO claim.
 
     Load the explicitly captured pre-change quote module, not a pretend slow
@@ -746,6 +830,9 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
     """
     if quotes._SHIOAJI_STOCK_API is not None or not symbols or len(set(symbols)) != len(symbols):
         raise ValueError("comparison requires an isolated logged-out process and unique symbols")
+    if (not 0 <= cached_rows < len(symbols) or any(not math.isfinite(value) or not 0 <= value <= 500
+            for value in (accounting_delay_ms, response_delay_ms))):
+        raise ValueError("callback controls require fewer cached rows than scope and finite 0..500ms delays")
     spec = importlib.util.spec_from_file_location("_opening_quote_baseline", baseline_file)
     if spec is None or spec.loader is None:
         raise ValueError("invalid captured baseline module")
@@ -785,20 +872,33 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
         for round_id in range(rounds):
             variants = [("before", before), ("after", quotes)]
             for label, module in (variants if round_id % 2 == 0 else reversed(variants)):
-                with tempfile.TemporaryDirectory(prefix="opening-pipeline-benchmark-") as temporary, patch.dict(
-                    quotes.os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary,
-                        "STOCKAGENT_SHIOAJI_TRAFFIC_LEDGER_ROOT": str(Path(temporary) / "traffic")}
-                ), patch("requests.sessions.Session.request", forbid_network), patch.object(module, "datetime", Clock), patch.object(
-                    module, "time", local_time
-                ), patch.object(module, "_SHIOAJI_STOCK_CACHE", {}), patch.object(module, "_SHIOAJI_STOCK_CONTRACTS", {}), patch.object(
-                    module, "_SHIOAJI_HISTORY_REQUEST_TIMES", deque()
-                ), patch.object(module, "_TW_MIS_OPENING_CACHE_KEY", None), patch.object(module, "_TW_MIS_OPENING_CACHE", {}), patch.object(
-                    module, "_TW_MIS_OPENING_REQUESTED", set()
-                ), patch.object(module, "_TW_MIS_OPENING_DIRTY", False), patch.object(module, "_load_prepared_tw_price_limits", lambda *_: ({}, None)):
+                with tempfile.TemporaryDirectory(prefix="opening-pipeline-benchmark-") as temporary, ExitStack() as isolation:
+                    isolation.enter_context(patch.dict(quotes.os.environ, {
+                        "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary,
+                        "STOCKAGENT_SHIOAJI_TRAFFIC_LEDGER_ROOT": str(Path(temporary) / "traffic")}))
+                    isolation.enter_context(patch("requests.sessions.Session.request", forbid_network))
+                    for attribute, value in {"datetime": Clock, "time": local_time,
+                            "_SHIOAJI_STOCK_CACHE": {}, "_SHIOAJI_STOCK_CONTRACTS": contracts.copy() if cached_rows else {},
+                            "_SHIOAJI_HISTORY_REQUEST_TIMES": deque(), "_TW_MIS_OPENING_CACHE_KEY": None,
+                            "_TW_MIS_OPENING_CACHE": {}, "_TW_MIS_OPENING_REQUESTED": set(),
+                            "_TW_MIS_OPENING_DIRTY": False, "_load_prepared_tw_price_limits": lambda *_: ({}, None)}.items():
+                        isolation.enter_context(patch.object(module, attribute, value))
                     callbacks, progress_digests, decoded, writes, syncs = [], [], [], [], []
                     submitted, progressed = threading.Event(), threading.Event()
                     original_decode, original_write = module._shioaji_snapshot_values, module._persist_tw_mis_opening_receipt
+                    original_accounting = module.record_avoided_query
                     original_sync, observing_storage = os.fsync, False
+                    for code in symbols[:cached_rows]:
+                        row = SimpleNamespace(code=code, ts=market_ns, open=100., close=101.,
+                            high=102., low=99., total_volume=2., buy_price=100., sell_price=101.,
+                            buy_volume=2., sell_volume=3., simtrade=False)
+                        module._SHIOAJI_STOCK_CACHE[code] = (time.monotonic(), original_decode(
+                            row, contracts[code], received_ms=int(fixed.timestamp()*1000)))
+
+                    def accounting(**kwargs):
+                        if accounting_delay_ms:
+                            time.sleep(accounting_delay_ms / 1000.)
+                        return original_accounting(**kwargs)
 
                     def decode(row, contract, *, received_ms):
                         decoded.append(row.code)
@@ -823,7 +923,7 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
                                 high=102., low=99., total_volume=2., buy_price=100., sell_price=101.,
                                 buy_volume=2., sell_volume=3., simtrade=False) for c in requested]
                             callbacks.append((cb, rows))
-                            if len(callbacks) == int(np.ceil(len(symbols) / 500)):
+                            if len(callbacks) == int(np.ceil((len(symbols) - cached_rows) / 500)):
                                 submitted.set()
                             return []
 
@@ -833,11 +933,13 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
                         progressed.set()
 
                     started = time.perf_counter()
-                    with patch.object(module, "_shioaji_snapshot_values", decode), patch.object(module, "_persist_tw_mis_opening_receipt", durable), patch.object(os, "fsync", synced), ThreadPoolExecutor(max_workers=1) as pool:
+                    with patch.object(module, "_shioaji_snapshot_values", decode), patch.object(module, "_persist_tw_mis_opening_receipt", durable), patch.object(module, "record_avoided_query", accounting), patch.object(os, "fsync", synced), ThreadPoolExecutor(max_workers=1) as pool:
                         future = pool.submit(module._fetch_shioaji_stock_snapshots_once,
-                            symbols, fallback, api=API(), cache_ttl_seconds=0., on_progress=progress)
+                            symbols, fallback, api=API(), cache_ttl_seconds=100. if cached_rows else 0., on_progress=progress)
                         if not submitted.wait(timeout=5):
                             raise AssertionError("nonblocking native batches were not all submitted")
+                        if response_delay_ms:
+                            time.sleep(response_delay_ms / 1000.)
                         for cb, rows in callbacks:
                             progressed.clear()
                             cb(rows)
@@ -851,6 +953,10 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
                         module.seed_tw_opening_snapshot_cache(symbols, snapshot, parquet_root=root)
                         initial_publish_ms = (time.perf_counter() - publish_started) * 1000
                         pipeline_to_source_receipt_ms = (time.perf_counter() - started) * 1000
+                        initial_receipt = module._tw_mis_opening_receipt_path(fixed.date().isoformat()).read_bytes()
+                        initial_rows = json.loads(initial_receipt)["rows"]
+                        initial_rows_sha = hashlib.sha256(json.dumps(initial_rows, sort_keys=True, allow_nan=False).encode()).hexdigest()
+                        source_readback_ms = (time.perf_counter() - started) * 1000
                         initial_writes = len(writes)
                         initial_barriers = {kind: syncs.count(kind) for kind in ("file", "directory")}
                         syncs.clear()
@@ -861,16 +967,20 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
                                 prices=fallback, source="opening_request_scope", available_mask=np.zeros(len(symbols), dtype=bool)), parquet_root=root)
                         noop_ms = (time.perf_counter() - noop_started) * 1000
                         receipt = json.loads(module._tw_mis_opening_receipt_path(fixed.date().isoformat()).read_text())
+                        if initial_rows != receipt["rows"]:
+                            raise AssertionError("unchanged source reseed altered durable rows")
                     samples.append({"round": round_id + 1, "variant": label,
                         "pipeline_ms": round(pipeline_ms, 3), "snapshot_decode_count": len(decoded),
                         "initial_receipt_publish_ms": round(initial_publish_ms, 3),
                         "pipeline_to_source_receipt_ms": round(pipeline_to_source_receipt_ms, 3),
+                        "pipeline_to_source_readback_ms": round(source_readback_ms, 3),
+                        "snapshot_timing": snapshot.transport_timing,
                         "native_batch_count": len(callbacks), "snapshot_sha256": digest(snapshot),
                         "progress_sha256": progress_digests, "initial_receipt_writes": initial_writes,
                         "initial_storage_barriers": initial_barriers,
                         "unchanged_progress_ms": round(noop_ms, 3), "unchanged_receipt_writes": len(writes) - initial_writes,
                         "unchanged_storage_barriers": {kind: syncs.count(kind) for kind in ("file", "directory")},
-                        "receipt_rows_sha256": hashlib.sha256(json.dumps(receipt["rows"], sort_keys=True, allow_nan=False).encode()).hexdigest()})
+                        "receipt_rows_sha256": initial_rows_sha})
     finally:
         before._TW_MIS_HTTP_POOL.shutdown(wait=True, cancel_futures=True)
         sys.modules.pop(spec.name, None)
@@ -886,10 +996,13 @@ def compare_callback_pipeline(symbols, baseline_file: Path, *, rounds: int) -> d
         "network_requests": 0, "extra_shioaji_login": False, "production_ledger_modified": False,
         "signal_published": False, "broker_order_submitted": False, "opening_slo_claim": False,
         "source_receipt_storage_barriers_measured": True,
+        "input_cache_fixture_rows": cached_rows,
+        "controlled_delays_ms": {"avoided_accounting": accounting_delay_ms, "response_after_submission": response_delay_ms,
+            "boundary": "explicit_synthetic_waits_not_measured_provider_latency"},
         "snapshot_parity": True, "progress_parity": True, "durable_rows_parity": True,
         "samples": samples,
         "median_ms": {label: {metric: statistics.median(row[metric] for row in samples if row["variant"] == label)
-            for metric in ("pipeline_ms", "initial_receipt_publish_ms", "pipeline_to_source_receipt_ms", "unchanged_progress_ms")} for label in ("before", "after")}}
+            for metric in ("pipeline_ms", "initial_receipt_publish_ms", "pipeline_to_source_receipt_ms", "pipeline_to_source_readback_ms", "unchanged_progress_ms")} for label in ("before", "after")}}
 
 
 def compare_stream_priority(symbols, root, *, rounds: int, snapshot_delay_seconds: float = 0.1,
@@ -1172,6 +1285,24 @@ def scheduled_probe_context(*, observed_at=None, receipt_path=None, output_root=
     return path, output, context
 
 
+def observation_coverage(snapshot, *, session_date, observed_at):
+    """Current observation proof, not model last-trade readiness or a fill."""
+    if observed_at.utcoffset() is None:
+        raise ValueError("coverage readback requires an aware as-of clock")
+    opens = quotes.tw_session_open_observed_mask(snapshot, session_date=session_date)
+    retained = quotes.tw_session_no_open_print_mask(snapshot, session_date=session_date)
+    fresh = quotes.tw_session_no_open_print_mask(snapshot, session_date=session_date,
+        asof_timestamp_ms=int(observed_at.timestamp() * 1000))
+    return {"asof_taipei": observed_at.isoformat(timespec="microseconds"),
+        "positive_open_count": int(opens.sum()), "observed_no_print_count": int(fresh.sum()),
+        "stale_no_print_proof_count": max(int((retained & ~fresh).sum()),
+            int((snapshot.transport_timing or {}).get("opening_stale_no_print_proof_count", 0))),
+        "resolved_count": int((opens | fresh).sum()), "unknown_count": int((~(opens | fresh)).sum()),
+        "contract": "session_open_or_fresh_no_first_print_proof_v2",
+        "model_input_readiness": "unmeasured_requires_each_models_last_real_trade_reference",
+        "boundary": "source_observation_not_execution_or_model_readiness"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path, help="Read universe/root only; never reused as the timed opening cache")
@@ -1179,23 +1310,30 @@ def main() -> int:
     parser.add_argument("--scheduled", action="store_true", help="Native intraday/postclose non-broker probe; opening uses the existing passive audit")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--no-connection-prewarm", action="store_true", help="Also retain cold HTTP connection costs; a prewarm failure never cancels other sources")
+    parser.add_argument("--source-drain-timeout", type=float, default=90., help="Diagnostic-only complete provider-job wait, including input fsync/journal; never extends the model quorum wait")
     parser.add_argument("--compare-no-progress", action="store_true", help="OFFLINE: compare provider-local retry using synthetic stale replies over the receipt's complete universe")
     parser.add_argument("--compare-finmind-cadence", action="store_true", help="OFFLINE: pinned old owner versus bounded start-clock polling over the full recorded universe")
     parser.add_argument("--compare-independent-poll", type=Path, help="OFFLINE: captured previous acquisition owner versus source-owned retry while a competing source stalls")
     parser.add_argument("--compare-mis-recovery", type=Path, help="OFFLINE: full-axis transport outage recovery against a captured acquisition owner; real retry clocks, no live SLO claim")
     parser.add_argument("--compare-finmind-decoder", type=Path, help="OFFLINE: captured prior owner versus complete retained FinMind response ingestion, validation and persistence")
     parser.add_argument("--finmind-payload", type=Path, help="Private retained original response bytes, required only for --compare-finmind-decoder")
+    parser.add_argument("--retained-source-failures", action="store_true", help="OFFLINE retained FinMind comparison only: include parallel permission/connection failures, not live provider timing")
     parser.add_argument("--baseline-quote-owner", type=Path, help="Captured pre-change quote owner for the complete local FinMind ingestion comparison")
     parser.add_argument("--compare-mis-pipeline", type=Path, help="OFFLINE: explicit prior quote owner versus retained complete MIS response parsing, fan-in and durable receipts")
     parser.add_argument("--mis-responses", type=Path, help="Integrity-checked retained original MIS response manifest; required with --compare-mis-pipeline")
     parser.add_argument("--profile-mis-local", action="store_true", help="Add provider-thread cProfile; profiling overhead is included, so keep off for ordinary timings")
+    parser.add_argument("--profile-finmind-local", action="store_true", help="Add provider-thread cProfile to offline retained FinMind ingestion; not an ordinary latency sample")
     parser.add_argument("--mis-simulated-http-delay-ms", type=float, default=0., help="OFFLINE retained MIS comparison only: explicit synthetic per-request wait, 0..100ms")
     parser.add_argument("--mis-simulated-progress-delay-ms", type=float, default=0., help="OFFLINE retained MIS comparison only: explicit synthetic per-callback wait, 0..100ms")
     parser.add_argument("--baseline-acquisition-owner", type=Path, help="OFFLINE MIS comparison: also compare the captured pre-change fan-in owner")
     parser.add_argument("--retained-universe-owner", type=Path, help="OFFLINE MIS comparison: captured registry verifier matching the retained historical response contract; never bypasses its source hashes")
     parser.add_argument("--compare-stream-priority", action="store_true", help="OFFLINE: full-universe native-priority scheduling and opening price parity; not a live feed SLA")
     parser.add_argument("--compare-callback-pipeline", type=Path, help="OFFLINE: compare against the explicit pre-change quote_provider.py; preserve all financial/source arrays and durable writes")
+    parser.add_argument("--callback-cached-rows", type=int, default=0, help="OFFLINE callback comparison only: declared identical warm source rows in both arms")
+    parser.add_argument("--callback-accounting-delay-ms", type=float, default=0., help="OFFLINE callback comparison only: explicit synthetic avoided-query ledger wait, 0..500ms")
+    parser.add_argument("--callback-response-delay-ms", type=float, default=0., help="OFFLINE callback comparison only: explicit synthetic native response wait, 0..500ms")
     parser.add_argument("--mis-only", action="store_true", help="Actual-network MIS transport/coverage probe through the existing source owner; no broker requests")
+    parser.add_argument("--retain-mis-responses", action="store_true", help="MIS-only, one round: retain already-read response bodies for exact local parity replays, without extra HTTP")
     parser.add_argument("--finmind-only", action="store_true", help="Actual-network full FinMind responses with original HTTP/body/parse clocks; no MIS, broker, publication or orders")
     parser.add_argument("--mis-chunk-size", type=int, default=80)
     parser.add_argument("--mis-request-timeout", type=float, default=4.)
@@ -1205,10 +1343,10 @@ def main() -> int:
     args = parser.parse_args()
     schedule_context = None
     if args.scheduled:
-        if args.output or args.rounds != 2 or any(value for name, value in vars(args).items()
-                if name.startswith("compare_") or name in {"mis_only", "finmind_only", "profile_mis_local",
+        if args.output or args.rounds != 2 or args.source_drain_timeout != 90. or any(value for name, value in vars(args).items()
+                if name.startswith(("compare_", "callback_")) or name in {"mis_only", "finmind_only", "retain_mis_responses", "profile_mis_local", "profile_finmind_local",
                     "baseline_acquisition_owner", "retained_universe_owner", "baseline_quote_owner",
-                    "mis_responses", "finmind_payload", "mis_simulated_http_delay_ms", "mis_simulated_progress_delay_ms"}):
+                    "mis_responses", "finmind_payload", "retained_source_failures", "mis_simulated_http_delay_ms", "mis_simulated_progress_delay_ms"}):
             parser.error("scheduled probe owns its providers, one round and append-only output paths")
         args.receipt, args.output, schedule_context = scheduled_probe_context(receipt_path=args.receipt)
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1235,10 +1373,14 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
     probe_started = time.perf_counter()
     probe_entered_at = datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")
     source_bytes = args.receipt.read_bytes()
+    if args.output.resolve() == args.receipt.resolve():
+        parser.error("benchmark output must not overwrite its source receipt")
     source = json.loads(source_bytes)
     session_date = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
     if not 1 <= args.rounds <= 5:
         parser.error("probe requires 1..5 rounds")
+    if not math.isfinite(args.source_drain_timeout) or not 5 <= args.source_drain_timeout <= 180:
+        parser.error("source drain timeout requires finite 5..180 seconds")
     symbols = list(source.get("requested_symbols") or source["rows"])
     if not symbols or len(set(symbols)) != len(symbols):
         parser.error("universe must be nonempty and unique")
@@ -1247,6 +1389,8 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
         parser.error("retained MIS comparison requires both baseline quote owner and response manifest")
     if args.profile_mis_local and not args.compare_mis_pipeline:
         parser.error("MIS local profiling requires the retained-response comparison")
+    if args.profile_finmind_local and not args.compare_finmind_decoder:
+        parser.error("FinMind local profiling requires the retained-response comparison")
     if (args.mis_simulated_http_delay_ms or args.mis_simulated_progress_delay_ms) and not args.compare_mis_pipeline:
         parser.error("simulated stage delays require the offline retained MIS comparison")
     if (args.baseline_acquisition_owner or args.retained_universe_owner) and not args.compare_mis_pipeline:
@@ -1255,12 +1399,18 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
         parser.error("retained FinMind comparison requires both baseline owner and original payload")
     if args.baseline_quote_owner and not args.compare_finmind_decoder:
         parser.error("baseline quote owner is only valid for the retained FinMind comparison")
+    if args.retained_source_failures and not args.compare_finmind_decoder:
+        parser.error("retained source failures require the offline retained FinMind comparison")
     if comparisons > 1:
         parser.error("select one isolated comparison")
+    if (args.callback_cached_rows or args.callback_accounting_delay_ms or args.callback_response_delay_ms) and not args.compare_callback_pipeline:
+        parser.error("callback controls require the offline retained callback comparison")
     if args.mis_only and args.finmind_only:
         parser.error("select at most one isolated network provider")
     if (args.mis_only or args.finmind_only) and comparisons:
         parser.error("network probe cannot be combined with an offline comparison")
+    if args.retain_mis_responses and (not args.mis_only or args.rounds != 1 or comparisons):
+        parser.error("response retention requires one isolated MIS-only network round")
     if not (1 <= args.mis_chunk_size <= 80 and .25 <= args.mis_request_timeout <= 8
             and 1 <= args.mis_parallel_requests <= quotes._TW_MIS_HTTP_WORKERS):
         parser.error("MIS probe requires 1..80 channels, .25..8s timeout and 1..16 workers")
@@ -1272,11 +1422,14 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                     simulated_http_delay_ms=args.mis_simulated_http_delay_ms,
                     simulated_progress_delay_ms=args.mis_simulated_progress_delay_ms)
                   if args.compare_mis_pipeline else compare_finmind_decoder(symbols, source["parquet_root"], args.compare_finmind_decoder, args.finmind_payload,
-                    rounds=args.rounds, baseline_quotes_path=args.baseline_quote_owner)
+                    rounds=args.rounds, baseline_quotes_path=args.baseline_quote_owner,
+                    include_source_failures=args.retained_source_failures, profile_local=args.profile_finmind_local)
                   if args.compare_finmind_decoder else compare_independent_poll(symbols, source["parquet_root"], args.compare_independent_poll, rounds=args.rounds)
                   if args.compare_independent_poll else compare_mis_recovery(symbols, source["parquet_root"], args.compare_mis_recovery, rounds=args.rounds)
                   if args.compare_mis_recovery else compare_finmind_cadence(symbols, source["parquet_root"], rounds=args.rounds)
-                  if args.compare_finmind_cadence else compare_callback_pipeline(symbols, args.compare_callback_pipeline, rounds=args.rounds)
+                  if args.compare_finmind_cadence else compare_callback_pipeline(symbols, args.compare_callback_pipeline,
+                    rounds=args.rounds, cached_rows=args.callback_cached_rows,
+                    accounting_delay_ms=args.callback_accounting_delay_ms, response_delay_ms=args.callback_response_delay_ms)
                   if args.compare_callback_pipeline else compare_stream_priority(symbols, source["parquet_root"], rounds=args.rounds,
                     evidence_dir=args.output.parent / (args.output.stem + ".sources"))
                   if args.compare_stream_priority else compare_no_progress(symbols, source["parquet_root"], rounds=args.rounds))
@@ -1343,7 +1496,25 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             ensure_ascii=False), flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="opening-source-probe-") as temporary, patch.dict(quotes.os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary}):
+    with tempfile.TemporaryDirectory(prefix="opening-source-probe-") as temporary, patch.dict(quotes.os.environ, {"STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT": temporary}), ExitStack() as captures:
+        retained_bodies, retained_lock = [], threading.Lock()
+        if args.retain_mis_responses:
+            original_decode = quotes._decode_quote_response
+
+            def retain_decoded_response(response, body):
+                value = original_decode(response, body)
+                if isinstance(body, bytes) and isinstance(value, dict) and isinstance(value.get("msgArray"), list):
+                    query = parse_qs(urlparse(response.request.url).query)
+                    channels = query.get("ex_ch", [])
+                    if len(channels) != 1:
+                        raise ValueError("retained MIS response lacks an unambiguous channel scope")
+                    with retained_lock:
+                        retained_bodies.append((channels[0], response.status_code, body,
+                            datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")))
+                return value
+
+            captures.enter_context(patch.object(quotes, "_decode_quote_response", retain_decoded_response))
+            report["raw_body_retention"] = "existing_decoded_responses_only_no_additional_http"
         report["mis_connection_prewarm"] = {"performed": False}
         prewarm_error = []
 
@@ -1408,7 +1579,10 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             try:
                 snapshot = owner.fetch(symbols, fallback, parquet_root=root, providers=providers, minimum_coverage=0.90, cache_reader=lambda: quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False))
                 quorum_ms = (time.perf_counter() - started) * 1000
-                drained = owner.wait_idle(timeout_seconds=40 if schedule_context else 30 if args.mis_only else 8)
+                quorum_coverage = observation_coverage(snapshot, session_date=session_date,
+                    observed_at=datetime.now(ZoneInfo("Asia/Taipei")))
+                drained = owner.wait_idle(timeout_seconds=args.source_drain_timeout)
+                jobs_wait_ms = (time.perf_counter() - started) * 1000
             finally:
                 owner.close()
             volatile_final = quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
@@ -1423,8 +1597,21 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             quotes._TW_MIS_OPENING_REQUESTED = set()
             quotes._TW_MIS_OPENING_DIRTY = False
             final = quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=root, allow_network=False)
+            final_coverage = observation_coverage(final, session_date=session_date,
+                observed_at=datetime.now(ZoneInfo("Asia/Taipei")))
             provider_states = {name: dict(metric) for state in owner._sessions.values() for name, metric in state.metrics.items()}
-            record = {"round": round_id, "initial_cached_open_count": 0, "quorum_return_ms": round(quorum_ms, 3), "all_sources_complete_ms": round((time.perf_counter() - started) * 1000, 3), "background_drained": drained, "positive_opens_at_quorum": int(quotes.tw_session_open_observed_mask(snapshot).sum()), "resolved_at_quorum": int((quotes.tw_session_open_observed_mask(snapshot) | quotes.tw_session_no_open_print_mask(snapshot)).sum()), "final_positive_opens": int(quotes.tw_session_open_observed_mask(final).sum()), "final_observed_no_prints": int(quotes.tw_session_no_open_print_mask(final).sum()), "quorum_timing": snapshot.transport_timing, "providers": provider_states, "final_conflicts": final.transport_timing.get("opening_conflict_count", 0)}
+            record = {"round": round_id, "initial_cached_open_count": 0, "quorum_return_ms": round(quorum_ms, 3),
+                "all_sources_complete_ms": round(jobs_wait_ms, 3) if drained else None,
+                "source_jobs_wait_ms": round(jobs_wait_ms, 3),
+                "source_drain_timeout_seconds": args.source_drain_timeout,
+                "background_drained": drained, "source_deadline_exceeded": not drained,
+                "positive_opens_at_quorum": quorum_coverage["positive_open_count"],
+                "resolved_at_quorum": quorum_coverage["resolved_count"],
+                "quorum_coverage": quorum_coverage, "readback_coverage": final_coverage,
+                "final_positive_opens": final_coverage["positive_open_count"],
+                "final_observed_no_prints": final_coverage["observed_no_print_count"],
+                "quorum_timing": snapshot.transport_timing, "providers": provider_states,
+                "final_conflicts": final.transport_timing.get("opening_conflict_count", 0)}
             report["rounds"].append(record)
             if receipt.exists():
                 shutil.copyfile(receipt, args.output.with_name(f"{args.output.stem}.round{round_id}.receipt.json"))
@@ -1440,7 +1627,7 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                 quorum_reached=record["resolved_at_quorum"] >= int(np.ceil(len(symbols) * .90)),
                 data_complete=record["durable_receipt_retained"] and record["final_positive_opens"] == len(symbols),
                 resolved_complete=record["durable_receipt_retained"] and record["final_positive_opens"] + record["final_observed_no_prints"] == len(symbols),
-                all_sources_complete_boundary="source_jobs_stopped_not_full_quote_coverage",
+                all_sources_complete_boundary="all_jobs_input_fsync_and_journal_finished_not_full_quote_coverage",
                 entry_to_round_readback_ms=round((time.perf_counter() - probe_started) * 1000, 3))
             if record["durable_receipt_retained"]:
                 record["data_state"] = ("complete" if record["data_complete"] else
@@ -1455,6 +1642,16 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
             audit = opening_coverage_milestones(telemetry, session_date, symbols)
             report["provider_latency"] = audit["provider_latency"]
             report["provider_phase_latency"] = audit["provider_phase_latency"]
+        if args.retain_mis_responses:
+            target = args.output.with_suffix(".mis-responses.json")
+            _atomic_json(target, {"observed_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
+                "session_date": session_date, "requested_symbols": symbols,
+                "universe_receipt_sha256": hashlib.sha256(source_bytes).hexdigest(),
+                "source_provenance": "unmodified_successfully_decoded_http_bodies_original_clocks_retained",
+                "responses": [{"channels": channels, "http_status": status,
+                    "body_base64": base64.b64encode(body).decode(), "body_sha256": hashlib.sha256(body).hexdigest(),
+                    "decoded_at_taipei": observed} for channels, status, body, observed in retained_bodies]})
+            report["retained_response_manifest"] = str(target)
     report["data_complete"] = bool(report["rounds"]) and all(row["data_complete"] for row in report["rounds"])
     report["resolved_complete"] = bool(report["rounds"]) and all(row["resolved_complete"] for row in report["rounds"])
     report["status"] = ("complete" if report["data_complete"] else

@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from downloader.artifact_io import atomic_write_json
+from stockagent.live.opening_price_journal import (
+    NO_FIRST_PRINT_PROOF_TTL_SECONDS, journal_absence_proof_ms, observation_values,
+)
 
 
 def _atomic_json(path, payload):
@@ -40,6 +43,43 @@ def quote_session_phase(observed_at: datetime) -> str:
             else "intraday" if seconds < 13 * 3600 + 30 * 60 else "postclose")
 
 
+def _source_failure_reasons(job):
+    """Closed diagnostic labels, not a guess about a WAF/ISP/exchange outage."""
+    transport = job.get("stage_timing", {}).get("transport_timing", {})
+    failed_requests = transport.get("mis_failed_request_count")
+    if (job["state"] not in {"failed", "degraded"}
+            and not (type(failed_requests) is int and failed_requests > 0)):
+        return []
+    raw_statuses = transport.get("mis_http_error_statuses")
+    statuses = {value for value in raw_statuses if type(value) is int} if isinstance(raw_statuses, list) else set()
+    if type(job.get("http_status")) is int:
+        statuses.add(job["http_status"])
+    reasons = set()
+    if statuses & {401, 402, 403} or job.get("error_type") == "PermissionError":
+        reasons.add("permission_or_subscription")
+    if 429 in statuses:
+        reasons.add("provider_rate_limit")
+    if any(500 <= value <= 599 for value in statuses):
+        reasons.add("provider_http_5xx")
+    phases = transport.get("mis_failure_phase_counts")
+    phases = phases if isinstance(phases, dict) else {}
+    phase = transport.get("http_failure_phase")
+    prewarm = transport.get("mis_connection_prewarm")
+    prewarm = prewarm if isinstance(prewarm, dict) else {}
+    if (phase in {"connection_or_headers", "connect_tls_or_response_headers"}
+            or any(phases.get(label, 0) for label in {"connection_or_headers", "connect_tls_or_response_headers"})
+            or prewarm.get("ready") is False and prewarm.get("error_type") in {
+                "ConnectionError", "ReadTimeout", "ConnectTimeout", "Timeout"}):
+        reasons.add("connection_or_headers_no_http_response")
+    response_phases = {"body", "body_read", "json_decode", "row_decode", "validation",
+                       "schema_validation", "status_body_or_validation"}
+    if phase in response_phases or any(phases.get(label, 0) for label in response_phases):
+        reasons.add("response_body_or_validation")
+    if not reasons:
+        reasons.add("unclassified_failure_not_zero_latency")
+    return sorted(reasons)
+
+
 def provider_phase_latency(events, symbols, session_start):
     """Per-request full-axis proof; never time a shrinking delta as a full sweep.
 
@@ -48,6 +88,7 @@ def provider_phase_latency(events, symbols, session_start):
     Old owners are explicitly unmeasured, not zero-latency successes.
     """
     requested_count = len(symbols)
+    requested = set(symbols)
     scope_hash = hashlib.sha256("\n".join(sorted(symbols)).encode()).hexdigest()
     ordered_hash = hashlib.sha256("\n".join(symbols).encode()).hexdigest()
     jobs = {}
@@ -58,7 +99,9 @@ def provider_phase_latency(events, symbols, session_start):
         job = jobs.setdefault(key, {"provider": key[0], "owner_pid": key[1], "job_id": key[2],
             "started_after_open_ms": None, "phase": "unverified", "state": "running",
             "full_scope_verified": False, "requested_count": None,
-            "first_valid_open_ms": None, "positive_coverage_ms": {}, "resolved_coverage_ms": {},
+            "first_valid_open_ms": None, "first_observation_response_ms": None,
+            "observation_response_coverage_ms": {}, "positive_coverage_ms": {}, "resolved_coverage_ms": {},
+            "raw_payload_coverage": None,
             "source_total_ms": None, "source_and_persistence_ms": None,
             "coverage_evidence": "missing_per_job_coverage_not_zero"})
         if row["event"] == "started":
@@ -87,11 +130,35 @@ def provider_phase_latency(events, symbols, session_start):
                 response_count=responses, unknown_count=count - positive - no_print)
             if positive and job["first_valid_open_ms"] is None:
                 job["first_valid_open_ms"] = duration
+            if responses and job["first_observation_response_ms"] is None:
+                job["first_observation_response_ms"] = duration
             for fraction in (.5, .9, .95, .99, 1.):
+                if responses >= math.ceil(count * fraction):
+                    job["observation_response_coverage_ms"].setdefault(str(fraction), duration)
                 if positive >= math.ceil(count * fraction):
                     job["positive_coverage_ms"].setdefault(str(fraction), duration)
                 if positive + no_print >= math.ceil(count * fraction):
                     job["resolved_coverage_ms"].setdefault(str(fraction), duration)
+        elif row["event"] == "provider_snapshot":
+            coverage = row["coverage"]
+            # The full raw response can contain every requested row while
+            # most prices are still yesterday's. Keep original source receipt
+            # clocks separate from per-job monotonic admission clocks.
+            valid = requested.intersection(coverage["valid_open_symbols"])
+            rejected = {reason: requested.intersection(values) - valid
+                        for reason, values in coverage["rejected_symbols"].items()}
+            returned = valid.union(*(values for values in rejected.values()))
+            received = datetime.fromisoformat(coverage["received_at_taipei"])
+            validated = datetime.fromisoformat(coverage["validated_at_taipei"])
+            job["raw_payload_coverage"] = {
+                "contract": "full_market_payload_requested_axis_not_admitted_prices_v1",
+                "snapshot_id": coverage["snapshot_id"], "response_count": len(returned),
+                "valid_open_count": len(valid), "absent_count": len(requested - returned),
+                "rejected_counts": {reason: len(values) for reason, values in rejected.items()},
+                "full_response_observed": len(returned) == requested_count,
+                "received_after_open_ms": round((received - session_start).total_seconds() * 1000, 3),
+                "validated_after_open_ms": round((validated - session_start).total_seconds() * 1000, 3),
+                "clock": "original_provider_wall_clock_not_job_monotonic_or_fill"}
         elif row["event"] == "finished":
             job.update(state=row.get("state", "unverified"), source_total_ms=row.get("last_total_ms"),
                        source_and_persistence_ms=row.get("source_and_persistence_ms"),
@@ -117,7 +184,7 @@ def provider_phase_latency(events, symbols, session_start):
             job["stage_timing"] = {key: row[key] for key in (
                 "provider_call_offset_ms", "dispatch_telemetry_wait_ms", "dispatch_telemetry_recorded",
                 "last_diagnostics_ms", "last_cache_merge_ms", "last_validation_ms",
-                "input_flush", "transport_timing") if key in row and row[key] is not None
+                "input_flush", "input_flush_policy", "transport_timing") if key in row and row[key] is not None
                 and (key != "transport_timing" or row[key])}
             job["stage_timing_boundary"] = "nested_wall_spans_overlap_not_additive_v1"
             # Legacy counts are useful final observations, not first/full clocks.
@@ -127,12 +194,18 @@ def provider_phase_latency(events, symbols, session_start):
         group = groups.setdefault(job["phase"], {}).setdefault(job["provider"], {
             "job_count": 0, "failed_or_degraded_jobs": 0, "full_scope_jobs": 0,
             "full_positive_observed_jobs": 0, "full_resolved_observed_jobs": 0,
+            "full_raw_response_observed_jobs": 0, "failure_reason_counts": {},
             "source_duration_samples_ms": [], "jobs": []})
         group["job_count"] += 1
         group["failed_or_degraded_jobs"] += job["state"] in {"failed", "degraded"}
         group["full_scope_jobs"] += job["full_scope_verified"]
         group["full_positive_observed_jobs"] += job["full_scope_verified"] and "1.0" in job["positive_coverage_ms"]
         group["full_resolved_observed_jobs"] += job["full_scope_verified"] and "1.0" in job["resolved_coverage_ms"]
+        group["full_raw_response_observed_jobs"] += (job["full_scope_verified"]
+            and bool((job["raw_payload_coverage"] or {}).get("full_response_observed")))
+        job["failure_reasons"] = _source_failure_reasons(job)
+        for reason in job["failure_reasons"]:
+            group["failure_reason_counts"][reason] = group["failure_reason_counts"].get(reason, 0) + 1
         duration = job["source_total_ms"]
         if isinstance(duration, (int, float)) and math.isfinite(duration) and duration >= 0:
             group["source_duration_samples_ms"].append(duration)  # include failures/timeouts
@@ -143,9 +216,10 @@ def provider_phase_latency(events, symbols, session_start):
             group["source_duration_percentiles_ms"] = {str(p): durations[max(0, math.ceil(len(durations) * p) - 1)]
                 if durations else None for p in (.5, .95, .99)}
             group["duration_sample_count_including_failures"] = len(durations)
-    return {"contract": "quote_phase_full_scope_per_job_latency_v2", "requested_count": requested_count,
+    return {"contract": "quote_phase_full_scope_per_job_latency_v3", "requested_count": requested_count,
         "requested_scope_sha256": scope_hash, "phases": groups,
         "boundary": "validated_opening_fields_not_fresh_executable_book_or_broker_fill",
+        "response_boundary": "raw_payload_response_and_validated_observation_coverage_are_not_positive_price_coverage",
         "full_positive_requires_every_symbol_to_have_a_genuine_open": True}
 
 
@@ -260,6 +334,7 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
     receipt clocks, durable quorum, model publication and fills are separate.
     """
     start = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    gate_ms = int(start.timestamp() * 1000)
     requested = set(symbols)
     if not requested or len(requested) != len(symbols):
         raise ValueError("opening coverage audit requires a nonempty unique scope")
@@ -285,6 +360,8 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                 provider = row["provider"]
                 if not isinstance(provider, str) or not provider:
                     raise ValueError("invalid provider")
+                if provider == "merged" and row.get("event") in {"observations_delta", "provider_snapshot"}:
+                    raise ValueError("merged consumer is not source observation evidence")
                 if provider != "merged" and elapsed >= 0 and row.get("event") in {
                         "started", "finished", "observations_delta", "provider_snapshot", "coverage_progress"}:
                     compact = {key: row.get(key) for key in ("provider", "event", "job_id", "owner_pid",
@@ -294,10 +371,17 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                         "observed_no_print_count", "response_count", "source_and_persistence_ms", "error_type", "http_status")}
                     compact.update({key: row[key] for key in ("provider_call_offset_ms", "dispatch_telemetry_wait_ms",
                         "dispatch_telemetry_recorded", "last_diagnostics_ms", "last_cache_merge_ms",
-                        "last_validation_ms", "input_flush") if key in row})
+                        "last_validation_ms", "input_flush", "input_flush_policy") if key in row})
                     if row["event"] == "observations_delta":
-                        compact["observations"] = [{"symbol": obs["symbol"], "state": obs["state"]}
-                            for obs in row.get("observations", [])]
+                        optional = ("no_first_print_observed_timestamp_ms", "source", "available",
+                            "market_timestamp_ms", "received_timestamp_ms", "open_price", "simtrade")
+                        compact["observations"] = [{"symbol": symbol, "state": state,
+                            "no_first_print_observed_timestamp_ms": journal_absence_proof_ms(
+                                state=state, proof=proof, source=source, available=available,
+                                market=market, received=received, price=price, simtrade=simtrade,
+                                gate_ms=gate_ms, elapsed=elapsed)}
+                            for symbol, state, proof, source, available, market, received, price, simtrade in
+                            observation_values(row, ("symbol", "state"), optional_fields=optional)]
                     elif row["event"] == "provider_snapshot":
                         coverage = row["coverage"]
                         if (not isinstance(coverage, dict)
@@ -328,14 +412,26 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                             "mis_failure_phase_counts", "mis_dispatch_stopped", "mis_dispatch_stop_reason", "mis_dispatch_policy",
                             "mis_deferred_channel_count", "mis_request_count", "mis_http_workers",
                             "mis_http_error_statuses", "mis_error_chain_types", "mis_progress_batch_count",
-                            "mis_span_policy", "mis_local_overlap_policy"}}
+                            "mis_span_policy", "mis_local_overlap_policy", "mis_source_prepare_ms", "mis_timing_boundary"}}
+                    prewarm = transport.get("mis_connection_prewarm")
+                    if isinstance(prewarm, dict):
+                        compact["transport_timing"]["mis_connection_prewarm"] = {
+                            key: value for key, value in prewarm.items()
+                            if (key in {"performed", "ready"} and type(value) is bool)
+                            or (key == "elapsed_ms" and type(value) in {int, float}
+                                and math.isfinite(value) and value >= 0)
+                            or (key == "error_type" and isinstance(value, str) and value in {
+                                "ConnectionError", "ReadTimeout", "ConnectTimeout", "Timeout",
+                                "HTTPError", "RuntimeError", "ValueError"})}
                     # Named finite numeric spans and a closed connection-origin
                     # enum only; never URLs, headers, tokens or arbitrary text.
                     for field, allowed in {
                         "mis_requests": {"channel_count", "response_row_count", "elapsed_ms", "headers_ms",
                             "http_status", "worker_queue_ms", "session_prepare_ms", "http_headers_ms", "http_session_origin",
                             "body_read_ms", "body_bytes", "json_decode_ms", "row_decode_ms",
-                            "request_to_decoded_rows_ms"},
+                            "request_to_decoded_rows_ms", "request_index", "enqueued_offset_ms",
+                            "request_started_offset_ms", "headers_received_offset_ms", "body_received_offset_ms",
+                            "decoded_rows_ready_offset_ms", "failed_offset_ms"},
                         "mis_progress_spans": {"row_count", "cohort_count", "snapshot_assembly_ms",
                             "callback_ms", "elapsed_since_source_start_ms"},
                     }.items():
@@ -363,12 +459,13 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                     failures[provider] = failures.get(provider, 0) + 1
                 if row.get("event") not in {"observations_delta", "provider_snapshot"} or elapsed < 0:
                     continue
-                observations = (row.get("observations", []) if row["event"] == "observations_delta" else
+                observations = (compact["observations"] if row["event"] == "observations_delta" else
                     [{"symbol": symbol, "state": "valid_open"} for symbol in row["coverage"]["valid_open_symbols"]])
                 for cutoff in cutoffs:
                     if elapsed > cutoff:
                         continue
-                    source_states = states[cutoff].setdefault(provider, {"valid": set(), "no_print": set()})
+                    source_states = states[cutoff].setdefault(provider, {"valid": set(), "no_print": set(),
+                                                                       "latest_absence": {}})
                     for observation in observations:
                         symbol, state = observation["symbol"], observation["state"]
                         if symbol not in requested:
@@ -378,6 +475,11 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
                             source_states["no_print"].discard(symbol)
                         elif state == "observed_no_first_print" and symbol not in source_states["valid"]:
                             source_states["no_print"].add(symbol)
+                        previous = source_states["latest_absence"].get(symbol)
+                        if previous is None or elapsed >= previous[0]:
+                            source_states["latest_absence"][symbol] = (elapsed,
+                                observation.get("no_first_print_observed_timestamp_ms")
+                                if state == "observed_no_first_print" else None)
             except (KeyError, TypeError, ValueError):
                 malformed += 1
     milestones = []
@@ -386,8 +488,21 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
             providers.setdefault(provider, {"valid": set(), "no_print": set()})
         valid = set().union(*(source["valid"] for source in providers.values()))
         no_print = set().union(*(source["no_print"] for source in providers.values())) - valid
+        fresh_absence = set().union(*({symbol for symbol, (observed_ms, proof) in
+            source.get("latest_absence", {}).items() if type(proof) is int
+            and gate_ms <= proof <= gate_ms + observed_ms
+            and 0 <= gate_ms + cutoff - proof <= NO_FIRST_PRINT_PROOF_TTL_SECONDS * 1000}
+            for source in providers.values())) - valid
         milestones.append({"after_open_ms": cutoff, "valid_open_count": len(valid),
             "observed_no_print_count": len(no_print), "unknown_count": len(requested - valid - no_print),
+            "last_trade_reference_standard": {
+                "contract": "fresh_no_first_print_last_trade_candidates_v1",
+                "fresh_no_first_print_candidate_count": len(fresh_absence),
+                "resolved_reference_candidate_count": len(valid | fresh_absence),
+                "unresolved_reference_candidate_count": len(requested - valid - fresh_absence),
+                "previous_trade_prices_verified": False,
+                "no_first_print_max_age_seconds": NO_FIRST_PRINT_PROOF_TTL_SECONDS,
+                "boundary": "source_candidates_not_model_reference_inventory_or_execution"},
             "providers": {name: {"valid_open_count": len(source["valid"]),
                 "observed_no_print_count": len(source["no_print"])} for name, source in providers.items()}})
     if legacy_events:
@@ -395,9 +510,13 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
             row["retained_symbol_event_lower_bounds"] = {key: row[key] for key in ("valid_open_count", "observed_no_print_count")}
             row.update(valid_open_count=None, observed_no_print_count=None, unknown_count=None,
                        provider_counts_are_lower_bounds=True)
+            standard = row["last_trade_reference_standard"]
+            standard["counts_are_lower_bounds"] = True
+            standard["unresolved_reference_candidate_count"] = None
     return {"state": "degraded" if malformed else "insufficient_evidence" if legacy_events else "observed", "path": str(path), "session_date": session_date,
         "requested_count": len(symbols), "scope_basis": "canonical_receipt_posthoc_axis_not_backdated_registry",
         "measurement_boundary": "source_validation_event_clock_not_durable_quorum_or_broker_fill",
+        "legacy_observation_counts_boundary": "ever_retained_source_state_not_fresh_model_input_readiness",
         "malformed_lines": malformed, "legacy_aggregate_events": legacy_events,
         "per_symbol_schema_usable": not legacy_events and not malformed,
         "failed_or_degraded_jobs": failures, "milestones": milestones,
@@ -515,6 +634,43 @@ def deadline_assessment(report: dict, target_ms: int) -> dict:
         "publication": publication, "execution": execution, "source_at_deadline": source,
         "simulation_only": True, "broker_fill_claim": False,
         "measurement_boundary": "native_durable_publication_and_full_paper_targets_not_replay_or_hot_probe"}
+
+
+def postclose_symbol_forensics(*, receipt_bytes: bytes, journal: Path, output_root: Path,
+                              observed_at: datetime) -> dict:
+    """Retain the first postclose full-axis diagnosis once, off the hot path.
+
+    Later calls link this historical assessment, not a claim about a newer
+    source generation. The manual symbol audit can compare any later receipt.
+    """
+    from scripts.audit_tw_opening_symbol_status import classify_symbols, journal_symbol_timeline
+    from stockagent.data.tw_current_trading_universe import load_current_universe
+
+    receipt = json.loads(receipt_bytes)
+    session = receipt["session_date"]
+    gate = datetime.fromisoformat(session + "T13:35:00+08:00")
+    if (observed_at.tzinfo is None or observed_at < gate
+            or observed_at.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat() != session):
+        raise ValueError("full symbol forensics is postclose only")
+    path = output_root / "first_postclose_symbols.json"
+    if not path.exists():
+        universe = load_current_universe(session)
+        result = classify_symbols(receipt, universe)
+        result.update(observed_at=observed_at.isoformat(),
+            source_sha256=hashlib.sha256(receipt_bytes).hexdigest(),
+            journal_timeline=journal_symbol_timeline(journal, receipt, universe),
+            provider_requests_enabled=False, ledger_modified=False)
+        _atomic_json(path, result)
+    retained_bytes = path.read_bytes()
+    retained = json.loads(retained_bytes)
+    if (retained.get("session_date") != session
+            or retained.get("contract") != "opening_symbol_membership_and_source_evidence_v1"):
+        raise ValueError("invalid retained postclose symbol assessment")
+    return {"path": str(path), "sha256": hashlib.sha256(retained_bytes).hexdigest(),
+        "observed_at": retained["observed_at"], "source_captured_at": retained["source_captured_at"],
+        "state": retained["journal_timeline"]["state"],
+        "requested_count": retained["journal_timeline"]["requested_count"],
+        "boundary": "first_postclose_historical_diagnosis_not_latest_source_state_or_trading_gate"}
 
 
 def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output_root: Path,
@@ -645,6 +801,13 @@ def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output
             report["source_coverage_milestones"] = opening_coverage_milestones(
                 receipt_path.with_suffix(".acquisition.jsonl"), session_date, receipt["requested_symbols"])
             report["source_coverage_milestones"]["universe_receipt_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+            if now >= gate + timedelta(hours=4, minutes=35):
+                try:
+                    report["postclose_symbol_forensics"] = postclose_symbol_forensics(
+                        receipt_bytes=receipt_bytes, journal=receipt_path.with_suffix(".acquisition.jsonl"),
+                        output_root=root, observed_at=now)
+                except (OSError, KeyError, TypeError, ValueError) as exc:
+                    report["postclose_symbol_forensics"] = {"state": "unavailable", "error_type": type(exc).__name__}
         except (OSError, KeyError, TypeError, ValueError) as exc:
             report["source_coverage_milestones"] = {"state": "unavailable", "error_type": type(exc).__name__}
         report["mode_timings"] = {market: {"attempt_count": stats["attempt_count"],

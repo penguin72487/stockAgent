@@ -217,9 +217,9 @@ def test_dashboard_distinguishes_partial_company_retry_and_counts_every_pending_
     assert row['local_retry_window']['consecutive_failures'] is None
 
 
-def new_hint_tile(root,request,*,labels=None):
+def new_hint_tile(root,request,*,labels=None,day_offset=0):
     from downloader.tej_history import compact_request
-    new={**request,'date_labels':['1988/02/01','1988/02/02','1988/02/03']}
+    new={**request,'date_labels':[(date(1988,2,1)+timedelta(days=day_offset+i)).strftime('%Y/%m/%d') for i in range(3)]}
     if labels is not None:new['company_labels']=labels
     with closing(connect(root)) as con,con:
         definition=dict(con.execute('SELECT * FROM tables LIMIT 1').fetchone())
@@ -229,6 +229,26 @@ def new_hint_tile(root,request,*,labels=None):
             (identifier,definition['table_id'],'download','P1',100,
              json.dumps(compact_request(new,definition)),count,SOURCE_SCOPE_CONTRACT,count))
         return dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(identifier,)).fetchone()),new
+
+
+def test_company_hint_reuses_owned_write_transaction_instead_of_locking_itself(registry,monkeypatch):
+    from downloader.tej_desktop_attempts import defer_unsent_prequery
+    from downloader.tej_planning import defer_planned_company_hint
+    from test_tej_prequery_recovery import HealthyReadback
+    root,_=registry
+    prior,request,*_=membership_failure(root)
+    defer_unsent_prequery(root,prior['task_id'],HealthyReadback())
+    task,_=new_hint_tile(root,request)
+    with closing(connect(root)) as con,con:
+        # A real write transaction models lazy refill before validating the
+        # existing negative proof. A second schema-opening connection would
+        # wait on our own RESERVED lock and roll back all new queue work.
+        con.execute("INSERT OR REPLACE INTO meta VALUES('owned_refill_test','retained')")
+        monkeypatch.setattr('downloader.tej_history.connect',
+                            lambda *_:pytest.fail('Must reuse the original transaction'))
+        assert defer_planned_company_hint(con,root,task)
+        assert con.in_transaction
+        assert con.execute("SELECT value FROM meta WHERE key='owned_refill_test'").fetchone()[0]=='retained'
 
 
 @pytest.mark.parametrize('all_absent,different_fields',[(False,False),(True,False),(False,True)])
@@ -416,6 +436,116 @@ def test_canonical_runner_consumes_hint_without_launching_another_desktop_operat
         assert con.execute('SELECT state FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone()[0]==('pending' if api_owns else 'superseded_company_hint_v1')
 
 
+@pytest.mark.parametrize('batch,deadline_expired',[(1,False),(4,False),(8,False),(32,False),(8,True)])
+def test_local_batch_keeps_every_scope_and_retry_clock_without_claiming_source_work(registry,monkeypatch,batch,deadline_expired):
+    from types import SimpleNamespace
+    from downloader.tej_desktop_attempts import defer_unsent_prequery,PREQUERY_RETRY_CONTRACT
+    from downloader.tej_history import configure_runtime_policy
+    from test_tej_prequery_recovery import HealthyReadback
+    root,config=registry;prior,request,sidecar,outcome,prepared=membership_failure(root)
+    defer_unsent_prequery(root,prior['task_id'],HealthyReadback())
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE tasks SET priority=1000')
+    tasks=[new_hint_tile(root,request,labels=[request['company_labels'][1]],day_offset=i*3)[0] for i in range(8)]
+    configure_runtime_policy(root,{**config,'prequery_failure_isolation':True,
+        'prequery_recovery_contract':PREQUERY_RETRY_CONTRACT,'local_planning_batch_size':batch})
+    with closing(connect(root)) as con,con:
+        for task in tasks:con.execute('UPDATE tasks SET priority=0 WHERE task_id=?',(task['task_id'],))
+        window=dict(con.execute('SELECT * FROM desktop_retry_windows').fetchone())
+        attempts=[dict(r) for r in con.execute('SELECT * FROM desktop_attempts')]
+        traffic=[dict(r) for r in con.execute('SELECT * FROM traffic')]
+        scopes={t['task_id']:task_request(root,t) for t in tasks}
+    saved={p:p.read_bytes() for p in (sidecar,outcome,prepared)}
+    clock=iter([100,101.1]) if deadline_expired else None
+    monkeypatch.setattr('downloader.tej_history.time',SimpleNamespace(monotonic=lambda:next(clock) if clock else 100))
+    class NoDesktop:
+        def execute(self,*args):pytest.fail('A local batch cannot launch or claim a source query')
+    assert run_one(root,NoDesktop(),kind='download',table_id=prior['table_id'])=='selector_scope_repartitioned'
+    expected=1 if deadline_expired else min(8,batch)
+    with closing(connect(root)) as con:
+        after=[dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(t['task_id'],)).fetchone()) for t in tasks]
+        assert sum(t['last_error_code']=='source_company_labels_absent_fragment' for t in after)==expected
+        assert all(t['state']=='pending' and t['active_attempt_id'] is None and t['actual_rows'] is None for t in after)
+        assert all(task_request(root,t)==scopes[t['task_id']] for t in after)
+        assert all(t['next_attempt_at_utc']==window['next_attempt_at_utc'] for t in after if t['last_error_code'])
+        assert dict(con.execute('SELECT * FROM desktop_retry_windows').fetchone())==window
+        assert [dict(r) for r in con.execute('SELECT * FROM desktop_attempts')]==attempts
+        assert [dict(r) for r in con.execute('SELECT * FROM traffic')]==traffic
+    assert all(p.read_bytes()==body for p,body in saved.items())
+    assert len(list((root/'selector_replanning').glob('*-company-hint.json')))==expected
+
+
+@pytest.mark.parametrize('batch',[0,33,True,'8',2.5])
+def test_invalid_local_batch_is_rejected_before_any_source_action(registry,batch):
+    from downloader.tej_history import configure_runtime_policy
+    root,config=registry
+    with pytest.raises(ValueError):configure_runtime_policy(root,{**config,'local_planning_batch_size':batch})
+
+
+@pytest.mark.parametrize('barrier',['unknown','running','interface'])
+def test_local_batch_does_not_bypass_shared_source_reconciliation_barriers(registry,monkeypatch,barrier):
+    from downloader.tej_history import configure_runtime_policy
+    root,config=registry;task,_=pending_scope(root,days=3000)
+    configure_runtime_policy(root,{**config,'query_selector_contract':SELECTOR_CONTRACT,'local_planning_batch_size':8})
+    with closing(connect(root)) as con,con:
+        if barrier=='interface':con.execute("INSERT INTO meta VALUES ('desktop_interface_recovery_required','original')")
+        else:con.execute('UPDATE tasks SET state=?,last_error_code=? WHERE task_id=?',
+            ('running' if barrier=='running' else 'blocked',None if barrier=='running' else 'unknown_outcome_no_auto_retry',task['task_id']))
+        before=[dict(r) for r in con.execute('SELECT * FROM tasks')]
+    monkeypatch.setattr('downloader.tej_history._prepare_ready_task',lambda *args:pytest.fail('Barrier must precede all local batch work'))
+    class NoDesktop:
+        def execute(self,*args):pytest.fail('No source action with an unresolved barrier')
+    assert run_one(root,NoDesktop())==('desktop_interface_recovery_required' if barrier=='interface' else 'inflight_requires_recovery')
+    with closing(connect(root)) as con:
+        assert [dict(r) for r in con.execute('SELECT * FROM tasks')]==before
+        assert not con.execute('SELECT 1 FROM traffic').fetchone()
+
+
+def test_local_batch_balanced_complete_queue_transaction_comparison(registry,tmp_path):
+    """Time full finite local queue preparation, not a provider speed claim."""
+    import shutil
+    import time
+    from downloader.tej_desktop_attempts import defer_unsent_prequery,PREQUERY_RETRY_CONTRACT
+    from downloader.tej_history import configure_runtime_policy
+    from test_tej_prequery_recovery import HealthyReadback
+    root,config=registry;prior,request,*_=membership_failure(root)
+    defer_unsent_prequery(root,prior['task_id'],HealthyReadback())
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE tasks SET priority=1000')
+    tasks=[new_hint_tile(root,request,labels=[request['company_labels'][1]],day_offset=i*3)[0] for i in range(8)]
+    with closing(connect(root)) as con,con:
+        for task in tasks:con.execute('UPDATE tasks SET priority=0 WHERE task_id=?',(task['task_id'],))
+        original_traffic=con.execute('SELECT count(*) FROM traffic').fetchone()[0]
+    class NoDesktop:
+        def execute(self,*args):pytest.fail('Local benchmark must never send a provider query')
+    samples=[];signatures=[]
+    for pass_id,batch in enumerate((1,8,8,1)):
+        trial=tmp_path/('local-transaction-'+str(pass_id));shutil.copytree(root,trial)
+        configure_runtime_policy(trial,{**config,'prequery_failure_isolation':True,
+            'prequery_recovery_contract':PREQUERY_RETRY_CONTRACT,'local_planning_batch_size':batch})
+        calls=0;started=time.perf_counter()
+        while True:
+            assert calls<8
+            assert run_one(trial,NoDesktop(),kind='download',table_id=prior['table_id'])=='selector_scope_repartitioned'
+            calls+=1
+            with closing(connect(trial)) as con:
+                after=[dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(t['task_id'],)).fetchone()) for t in tasks]
+            if all(t['last_error_code']=='source_company_labels_absent_fragment' for t in after):break
+        seconds=time.perf_counter()-started
+        with closing(connect(trial)) as con:
+            signatures.append([{
+                key:t[key] for key in ('task_id','state','last_error_code','next_attempt_at_utc',
+                                      'work_expected_rows','active_attempt_id','actual_rows','safe_prequery_retries')
+            } for t in after])
+            assert con.execute('SELECT count(*) FROM traffic').fetchone()[0]==original_traffic
+        assert len(list((trial/'selector_replanning').glob('*-company-hint.json')))==8
+        samples.append({'batch_size':batch,'seconds':seconds,'canonical_calls':calls,'local_fragments':8})
+    assert all(signature==signatures[0] for signature in signatures)
+    print(json.dumps({'contract':'tej_finite_local_queue_abba_v1','accepted':True,
+        'provider_queries_sent':0,'same_scope_and_retry_clocks':True,'samples':samples,
+        'interpretation':'Eight original fixture scopes, complete local durable intents and queue commits; not provider throughput or full-history completion'}))
+
+
 @pytest.mark.parametrize('error',['hash','task','attempt','count','duplicates','out_of_range','bool_position',
     'partial_lookup','changed_source','changed_count','query_possible','clock','manifest','saved_raw'])
 def test_bad_membership_evidence_never_partitions_or_requeues(registry,error):
@@ -484,6 +614,30 @@ def test_unsent_table_retry_window_is_transferred_without_reset(registry):
         assert retry['attempt_id']=='retained-original-attempt' and retry['audit_path']=='original-audit.json'
         assert retry['task_id']!=parent['task_id']
         assert con.execute('SELECT state FROM tasks WHERE task_id=?',(retry['task_id'],)).fetchone()[0]=='pending'
+
+
+@pytest.mark.parametrize('fragment_only',[True,False])
+def test_selector_partition_preserves_another_company_fragments_retry_window(registry,fragment_only):
+    from downloader.tej_planning import COMPANY_MEMBERSHIP_DEFERRED
+    root,_=registry
+    parent,_=pending_scope(root)
+    other,_=pending_scope(root,companies=2,days=3)
+    due='2099-01-01T00:00:00+00:00'
+    code=COMPANY_MEMBERSHIP_DEFERRED if fragment_only else 'prequery_failure_deferred'
+    with closing(connect(root)) as con,con:
+        con.execute('INSERT INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+            (other['table_id'],other['task_id'],'retained-other-attempt',7,due,code,'other-audit.json'))
+        original=dict(con.execute('SELECT * FROM desktop_retry_windows').fetchone())
+        if not fragment_only:
+            with pytest.raises(ValueError,match='Another original fragment'):
+                repartition_selector_pending(con,root,parent)
+            return
+        assert repartition_selector_pending(con,root,parent)
+        assert dict(con.execute('SELECT * FROM desktop_retry_windows').fetchone())==original
+        assert dict(con.execute('SELECT * FROM tasks WHERE task_id=?',(other['task_id'],)).fetchone())==other
+        assert con.execute('SELECT COUNT(*) FROM traffic').fetchone()[0]==0
+        children=[dict(r) for r in con.execute("SELECT * FROM tasks WHERE kind='download' AND state='pending' AND task_id<>?",(other['task_id'],))]
+        assert len(children)==5 and sum(r['work_expected_rows'] for r in children)==parent['work_expected_rows']
 
 
 def test_native_ui_is_not_invoked_for_locally_impossible_scope(registry):

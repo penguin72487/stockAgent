@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT
 
-PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v3_full_windows_flow'
+PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v5_transport_and_prebridge'
 SCOPE_TIMING_PHASES = frozenset({
     'context_and_source_binding', 'field_selection',
     'company_universe_and_lookup', 'date_model_and_lookup',
@@ -31,6 +31,9 @@ SCOPE_TIMING_PHASES = frozenset({
 FLOW_TIMING_PHASES = frozenset({
     'initialization_compile_seconds', 'scope_preparation_seconds',
     'query_and_response_seconds', 'full_readback_seconds', 'serialize_and_save_seconds',
+})
+NATIVE_CACHE_TIMING_PHASES = frozenset({
+    'fingerprint_seconds', 'prepare_or_compile_seconds', 'load_and_verify_seconds',
 })
 
 
@@ -56,6 +59,18 @@ def _flow_metadata(path: Path, task_id: str, attempt: str) -> dict:
         for key in ('windows_bridge_seconds', 'windows_cpu_seconds'):
             if finite(value.get(key)):
                 result[key] = value[key]
+        cache = value.get('native_helper_cache')
+        if (isinstance(cache, dict) and cache.get('contract') == 'exact_native_code_compilation_cache_v1'
+                and cache.get('state') in {'built', 'rebuilt', 'hit'} and isinstance(cache.get('timings'), dict)):
+            result['native_helper_cache'] = {
+                'state': cache['state'],
+                'timings': {key: seconds for key, seconds in cache['timings'].items()
+                            if key in NATIVE_CACHE_TIMING_PHASES and finite(seconds)},
+            }
+        wrapper = value.get('prebridge_timing')
+        if isinstance(wrapper, dict) and wrapper.get('contract') == 'tej_monotonic_prebridge_timing_v1':
+            result['prebridge_timing'] = {key: wrapper[key] for key in
+                ('script_staging_seconds', 'hash_and_parse_seconds') if finite(wrapper.get(key))}
         return result
     except (OSError, ValueError, TypeError):
         return {}
@@ -75,6 +90,8 @@ def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
     started = time.monotonic()
     with closing(sqlite3.connect(f'file:{root / "queue.sqlite3"}?mode=ro', uri=True, timeout=2)) as con:
         con.row_factory = sqlite3.Row
+        deadline = time.monotonic()+2
+        con.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         con.execute('BEGIN')
         observed = datetime.now(UTC).isoformat()
         plan = [dict(r) for r in con.execute('EXPLAIN QUERY PLAN '+query, args)]
@@ -114,6 +131,20 @@ def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
             flow = _flow_metadata(root/'raw'/(attempt+'.json.flow.json'), row['task_id'], attempt)
             if flow:
                 sample['windows_flow'] = flow
+            transport = root/'progress'/(attempt+'.json.transport.json')
+            try:
+                if (not transport.is_symlink() and transport.is_file() and transport.stat().st_size <= 4096):
+                    value = json.loads(transport.read_text(encoding='utf-8-sig'))
+                    if (isinstance(value, dict)
+                            and value.get('contract') == 'tej_monotonic_guarded_transport_timing_v1'
+                            and value.get('task_id') == row['task_id'] and value.get('attempt_id') == attempt
+                            and value.get('request_sha256') == sample.get('prepared_sha256')):
+                        finite = lambda v: type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 86400
+                        sample['transport_timing'] = {key: value[key] for key in (
+                            'local_prelaunch_seconds', 'admission_seconds', 'permit_write_seconds',
+                            'admitted_execution_seconds', 'total_transport_seconds') if finite(value.get(key))}
+            except (OSError, ValueError, TypeError):
+                pass  # Optional profiling must not change acquisition acceptance.
         samples.append(sample)
 
     def summary(selected):

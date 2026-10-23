@@ -161,12 +161,10 @@
     return result;
   }
 
-  let navigationRevision = 0;
   // Also used by existing programmatic scroll controls, not just anchor clicks.
   function reveal(target) {
     const element = typeof target === "string" ? document.getElementById(target.replace(/^#/, "")) : target;
     if (!element) return null;
-    navigationRevision += 1;
     if (element.tagName === "DETAILS") element.open = true;
     for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
       if (ancestor.tagName === "DETAILS") ancestor.open = true;
@@ -374,24 +372,42 @@
       ...(source.tagName === "PROGRESS" ? {attributes: true, attributeFilter: ["value", "max"]} : {}),
     });
     sync();
+    const hashTarget = (hash) => {
+      try { return document.getElementById(decodeURIComponent(hash.slice(1))); }
+      catch { return null; }
+    };
+    const showTarget = (target) => {
+      if (target) reveal(target).scrollIntoView({block: "start", behavior: "instant"});
+    };
+    // A click is one navigation, not click + a later hash task + another frame.
+    // Otherwise that stale task can reopen a disclosure the user just closed,
+    // or move hit targets while the next pointer action is being dispatched.
+    let activatedURL = "";
     const activateHash = () => {
-      let id;
-      try { id = decodeURIComponent(window.location.hash.slice(1)); } catch { return; }
-      const target = reveal(id);
-      const revision = navigationRevision;
-      if (target) window.requestAnimationFrame(() => {
-        if (revision === navigationRevision) target.scrollIntoView({block: "start", behavior: "instant"});
-      });
+      if (activatedURL === window.location.href) return;
+      activatedURL = window.location.href;
+      showTarget(hashTarget(window.location.hash));
     };
     document.addEventListener("click", (event) => {
+      if (event.defaultPrevented || event.button !== 0
+          || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
       const anchor = event.target.closest("a[href^='#']");
-      if (!anchor) return;
-      const id = anchor.getAttribute("href").slice(1);
-      const target = reveal(id);
-      if (target?.tagName === "DETAILS" && target.classList.contains("acq-details")) target.open = true;
+      if (!anchor || anchor.hasAttribute("download") || (anchor.target && anchor.target !== "_self")) return;
+      if (anchor.origin !== window.location.origin || anchor.pathname !== window.location.pathname
+          || anchor.search !== window.location.search) return;
+      const target = hashTarget(anchor.hash);
+      // Leave ordinary skip links and unknown fragments to the browser.
+      if (!target?.closest("details.acq-details")) return;
+      try {
+        if (window.location.hash !== anchor.hash) window.history.pushState(window.history.state, "", anchor.hash);
+      } catch { return; } // Native navigation remains available if history is unavailable.
+      event.preventDefault();
+      activatedURL = window.location.href;
+      showTarget(target); // Same-hash clicks deliberately reopen, without adding history.
     });
+    window.addEventListener("popstate", activateHash);
     window.addEventListener("hashchange", activateHash);
-    if (window.location.hash) activateHash();
+    activateHash();
   }
 
   window.StockAgentAcquisition = Object.freeze({profiles, reveal});

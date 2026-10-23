@@ -922,7 +922,17 @@ def test_news_browser_filters_pages_recovers_and_never_calls_publishers(tmp_path
                     page.wait_for_function("() => document.querySelectorAll('#pipeline-grid .pipeline-card').length === 24")
                     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
                     page.locator('a[href="#acq-quota"]').click()
-                    page.locator("#traffic").scroll_into_view_if_needed()
+                    try:
+                        page.locator("#traffic").scroll_into_view_if_needed()
+                    except Exception:
+                        print(json.dumps({'viewport_width': width, 'quota_navigation': page.evaluate("""() => ({
+                            hash: location.hash, trafficHidden: document.querySelector('#traffic')?.hidden,
+                            groups: [...document.querySelectorAll('[data-acq-group]')].map(n => ({
+                                id: n.id, hidden: n.hidden, display: getComputedStyle(n).display
+                            }))
+                        })""")}), flush=True)
+                        page.screenshot(path=str(tmp_path / f'news-quota-navigation-{width}.png'))
+                        raise
                     page.wait_for_function("() => document.querySelectorAll('#traffic-rows tr').length === 11")
                     assert page.evaluate("""() => {
                         const caption = document.querySelector('#traffic caption').getBoundingClientRect();

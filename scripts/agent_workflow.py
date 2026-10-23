@@ -18,12 +18,14 @@ import json
 import os
 from pathlib import Path
 import re
+import resource
 import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import time
 import uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -865,6 +867,11 @@ class Workflow:
                     argv = list(record["argv"])
                     if argv[0] == "run_fintech_python":
                         argv[0] = record["python"]
+                    # Measure the waited command with a monotonic clock. Task
+                    # queue/launcher latency and receipt publication are outside
+                    # this interval. Failed commands keep their real duration.
+                    usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+                    command_started_ns = time.perf_counter_ns()
                     try:
                         child = subprocess.Popen(
                             argv,
@@ -883,6 +890,8 @@ class Workflow:
                     except OSError as exc:
                         output.write((f"{type(exc).__name__}: {exc}\n").encode())
                         code = 127
+                    elapsed_ns = time.perf_counter_ns() - command_started_ns
+                    usage_after = resource.getrusage(resource.RUSAGE_CHILDREN)
                     record.update(
                         state="cancelled"
                         if received
@@ -890,6 +899,16 @@ class Workflow:
                         exit_code=code,
                         received_signals=received,
                         finished_at_utc=now(),
+                        performance={
+                            "contract": "waited_command_monotonic_resources_v1",
+                            "elapsed_nanoseconds": elapsed_ns,
+                            "wall_seconds": elapsed_ns / 1e9,
+                            "child_cpu_user_seconds": usage_after.ru_utime - usage_before.ru_utime,
+                            "child_cpu_system_seconds": usage_after.ru_stime - usage_before.ru_stime,
+                            "block_input_operations": usage_after.ru_inblock - usage_before.ru_inblock,
+                            "block_output_operations": usage_after.ru_oublock - usage_before.ru_oublock,
+                            "scope": "child launch through wait; reaped-child resource deltas; excludes queue, final receipt and detached workers",
+                        },
                     )
                     with lock(path.with_suffix(".lock")):
                         save(path, record)

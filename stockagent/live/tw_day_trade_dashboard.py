@@ -35,6 +35,23 @@ from typing import Any, Final
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
+try:
+    from msgspec import Struct as _HistoryPointStorage
+except ImportError:
+    class _HistoryPointStorage:
+        __slots__ = ()
+
+    _HistoryPointMeta = type(Mapping)
+    _NATIVE_HISTORY_POINTS = False
+else:
+    # Keep the Mapping contract used by session projections while letting the
+    # optional native record allocate and initialize chart fields in one call.
+    class _HistoryPointMeta(type(_HistoryPointStorage), type(Mapping)):
+        pass
+
+    _NATIVE_HISTORY_POINTS = True
+
+from stockagent import private_json
 from stockagent.backtest.tw_day_trade_contract import MARGIN_CARRY_CONTRACT
 from stockagent.data.tw_stock_futures_catalog import load_stock_futures_catalog
 from stockagent.live.dashboard_updates import metadata_signature
@@ -159,6 +176,63 @@ _EVENT_PAGE_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
 _HISTORY_SNAPSHOT_CACHE_LOCK = threading.Lock()
 _HISTORY_SNAPSHOT_CACHE_MAX_ENTRIES: Final[int] = 4
+
+
+class _HistoryPoint(_HistoryPointStorage, Mapping[str, Any], metaclass=_HistoryPointMeta):
+    """Compact chart row; materialize the public dictionary only when needed.
+
+    The session-projection helpers retain their mapping interface. The full
+    minute transport reads attributes directly instead of allocating a large
+    dictionary and repeatedly hashing its field names for every observed point.
+    """
+
+    series_id: str
+    series_type: str
+    market: object
+    benchmark_id: object
+    minute: str
+    session_date: str
+    timestamp_seconds: float
+    return_fraction: float
+    return_pct: float
+    cumulative_return_fraction: float
+    cumulative_return_pct: float
+    _initial_capital_twd: float | None
+    _total_equity_twd: float | None
+    _wealth_index: float
+    valuation_stale: bool
+    historical_minute_replay: bool
+    minute_valuation_contract: object
+    valuation_source: object
+    valuation_executable: object
+    fresh_trade_position_count: object
+    last_trade_carried_position_count: object
+    missing_price_position_count: object
+    fresh_trade_notional_coverage_ratio: object
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in _HISTORY_POINT_KEYS:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __iter__(self):
+        return iter(_HISTORY_POINT_FIELDS)
+
+    def __len__(self) -> int:
+        return len(_HISTORY_POINT_FIELDS)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key) if key in _HISTORY_POINT_KEYS else default
+
+    def as_dict(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in _HISTORY_POINT_FIELDS}
+
+
+if not _NATIVE_HISTORY_POINTS:
+    _HistoryPoint = dataclass(slots=True)(_HistoryPoint)
+
+_HISTORY_POINT_FIELDS: Final[tuple[str, ...]] = tuple(_HistoryPoint.__annotations__)
+_HISTORY_POINT_KEYS: Final[frozenset[str]] = frozenset(_HISTORY_POINT_FIELDS)
 _HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 3
 _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
 _HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 4
@@ -667,6 +741,9 @@ def build_dashboard_revision(
         "session_clock": session_clock,
         "state_revision": engine_revision,
         "content_revision": content_revision,
+        "engine_generation": hashlib.sha256(
+            ("public_paper_engine_v1:" + engine["engine_run_id"]).encode()
+        ).hexdigest()[:32] if isinstance(engine.get("engine_run_id"), str) and engine["engine_run_id"] else None,
         "engine_published_at": engine.get("published_at"),
         "engine_heartbeat_at": engine_liveness_at,
         "engine_age_seconds": (
@@ -706,7 +783,7 @@ def _object(path: Path, *, use_cache: bool = True) -> dict[str, Any]:
         opened = metadata_signature(os.fstat(stream.fileno()))
         raw = stream.read()
         finished = metadata_signature(os.fstat(stream.fileno()))
-    payload = json.loads(raw)
+    payload = private_json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     if (
@@ -1037,6 +1114,28 @@ def _signal_position_overlays(
                 str(position.get("signal_id") or ""),
             )
             overlays[identity] = position
+        for order in (raw_mode.get("pending_entry_orders") or {}).values():
+            if not isinstance(order, Mapping) or order.get("status") != "cancelled_entry_price_guard":
+                continue
+            template = order.get("position") or {}
+            if not isinstance(template, Mapping):
+                continue
+            identity = (
+                str(template.get("session_date") or "")[:10],
+                str(template.get("market") or raw_mode.get("market") or ""),
+                str(template.get("symbol") or ""),
+                str(template.get("signal_id") or ""),
+            )
+            # A cancelled zero-fill order is NOT a position. Overlay only its
+            # non-price rejection metadata; keep private quote prices private.
+            overlay = dict(overlays[identity]) if identity in overlays else {"_entry_rejection_only": True}
+            overlay["entry_remainder_rejection"] = {
+                "reason": order.get("last_wait_reason"),
+                "cancelled_at": order.get("cancelled_at"),
+                "cancelled_shares": int(order.get("remaining_shares") or 0),
+                "entry_price_guard_contract": order.get("entry_price_guard_contract"),
+            }
+            overlays[identity] = overlay
     if not overlays:
         return overlays, ""
     material = []
@@ -1052,7 +1151,8 @@ def _signal_position_overlays(
             str(completion.get("contract")),
             str(completion.get("recorded_at")),
             str(completion.get("broker_fill")),
-            _signal_valuation_position(position),
+            None if position.get("_entry_rejection_only") else _signal_valuation_position(position),
+            position.get("entry_remainder_rejection"),
         ))
     encoded = json.dumps(material, separators=(",", ":")).encode("utf-8")
     return overlays, hashlib.sha256(encoded).hexdigest()
@@ -1072,7 +1172,7 @@ def _overlay_signal_page_rows(
             str(row.get("symbol") or ""),
             str(row.get("signal_id") or ""),
         ))
-        if isinstance(overlay, Mapping):
+        if isinstance(overlay, Mapping) and not overlay.get("_entry_rejection_only"):
             # A signal page must not rely on an independently paginated
             # position page to establish whether this exact signal was filled.
             row["position"] = _signal_valuation_position(overlay)
@@ -1100,6 +1200,12 @@ def _overlay_signal_page_rows(
                     row["entry_completion_broker_fill"] = bool(
                         completion.get("broker_fill")
                     )
+        rejection = overlay.get("entry_remainder_rejection") if isinstance(overlay, Mapping) else None
+        if isinstance(rejection, Mapping):
+            row["entry_remainder_rejection"] = dict(rejection)
+            row["initial_execution_reason"] = row.get("reason")
+            row["reason"] = rejection.get("reason")
+            row["status"] = "partial_depth" if int(row.get("filled_shares") or 0) else "skipped"
         row["stock_futures"] = futures_catalog.membership(
             str(row.get("symbol") or "")
         )
@@ -4790,6 +4896,22 @@ def _operational_issues(
             "漲跌停價格缺漏",
             "缺少該交易日合法價格界線，未建立持倉。",
         ),
+        "entry_bracket_unavailable": (
+            "error", "TP／SL 缺漏，已拒絕進場",
+            "無法確認原始止盈／止損區間，不建立或增加部位；既有出場機制不受影響。",
+        ),
+        "entry_bracket_invalid": (
+            "error", "TP／SL 區間無效，已拒絕進場",
+            "止盈／止損沒有形成正確方向的有效區間，不建立或增加部位。",
+        ),
+        "entry_price_at_or_beyond_take_profit": (
+            "info", "市價已觸及 TP，不進場",
+            "進場價必須嚴格位於原始 TP／SL 之間；碰到或超出 TP 即跳過，不移動界線配合成交。",
+        ),
+        "entry_price_at_or_beyond_stop_loss": (
+            "info", "市價已觸及 SL，不進場",
+            "進場價必須嚴格位於原始 TP／SL 之間；碰到或超出 SL 即跳過，不移動界線配合成交。",
+        ),
         "no_executable_best_quote": (
             "error",
             "最佳一檔報價不可用",
@@ -4939,6 +5061,8 @@ def _operational_issues(
             )
         reasons = mode.get("signal_reason_counts")
         reasons = dict(reasons) if isinstance(reasons, Mapping) else {}
+        for reason, count in (mode.get("entry_price_guard_rejection_counts") or {}).items():
+            reasons[reason] = max(int(reasons.get(reason) or 0), int(count or 0))
         # ``below_one_board_lot`` is an expected capital/lot conversion result,
         # not a service incident.  Its complete model row remains visible in
         # the signal table and execution audit instead of occupying the global
@@ -5180,7 +5304,7 @@ def _all_json_objects(path: Path):
         for line in handle:
             if not line.strip():
                 continue
-            payload = json.loads(line)
+            payload = private_json.loads(line)
             if isinstance(payload, dict):
                 yield payload
 
@@ -5389,7 +5513,7 @@ def build_dashboard_history_snapshot(
     else:
         benchmark_history = _benchmark_history_index(root)
     benchmark_origins = benchmark_history.origins
-    deduplicated: dict[tuple[str, str], dict[str, Any]] = {}
+    deduplicated: dict[tuple[str, str], _HistoryPoint] = {}
     canonical_benchmark_keys: set[tuple[str, str]] = set()
     marks_path = root / "marks.jsonl"
     live_benchmark_path = root / "benchmark_marks.jsonl"
@@ -5624,6 +5748,9 @@ def build_dashboard_history_snapshot(
 
     # Several accounts and all benchmarks share the same observed minute.
     # Convert its clock once; do not infer missing minutes or alter timezone rules.
+    strategy_start = datetime_time(9, 1)
+    strategy_end = datetime_time(13, 30)
+
     @lru_cache(maxsize=131_072)
     def observed_clock(raw_timestamp: str):
         # The same retained minute appears across every strategy and benchmark.
@@ -5632,9 +5759,16 @@ def build_dashboard_history_snapshot(
         utc = _timestamp(raw_timestamp)
         timestamp_seconds = utc.timestamp()
         local = utc.astimezone(TAIPEI)
+        local_clock = local.timetz().replace(tzinfo=None)
+        strategy_clock_valid = (
+            (local_clock.hour == 9 and local_clock.minute == 0)
+            or (local_clock.hour == 13 and local_clock.minute == 30)
+            if is_overnight
+            else strategy_start <= local_clock <= strategy_end
+        )
         return (
             timestamp_seconds,
-            local.timetz().replace(tzinfo=None),
+            strategy_clock_valid,
             utc.isoformat(timespec="minutes"),
             local.date().isoformat(),
         )
@@ -5642,27 +5776,21 @@ def build_dashboard_history_snapshot(
     def add_values(
         series_type: str,
         canonical: bool,
-        market: object,
-        benchmark_id: object,
-        raw_minute: object,
-        raw_recorded_at: object,
-        initial_capital_value: object,
-        total_equity_value: object,
-        return_pct_value: object,
-        return_fraction_value: object,
-        valuation_stale: object,
-        historical_minute_replay: object,
-        historical_counterfactual_replay: object,
-        minute_valuation_contract: object,
-        valuation_source: object,
-        valuation_executable: object,
-        fresh_trade_position_count: object,
-        last_trade_carried_position_count: object,
-        missing_price_position_count: object,
-        fresh_trade_notional_coverage_ratio: object,
+        values: tuple,
     ) -> None:
         """Project only chart fields, independent of the source row container."""
 
+        # Native decoding already supplies this tuple. Pass it through intact
+        # instead of allocating and expanding twenty call arguments per mark.
+        (
+            market, benchmark_id, raw_minute, raw_recorded_at,
+            initial_capital_value, total_equity_value,
+            return_pct_value, return_fraction_value, valuation_stale,
+            historical_minute_replay, historical_counterfactual_replay,
+            minute_valuation_contract, valuation_source, valuation_executable,
+            fresh_trade_position_count, last_trade_carried_position_count,
+            missing_price_position_count, fresh_trade_notional_coverage_ratio,
+        ) = values
         series_id = str(market if series_type == "strategy" else benchmark_id or "")
         if not series_id:
             return
@@ -5683,21 +5811,12 @@ def build_dashboard_history_snapshot(
                 continue
         if chart_clock is None:
             return
-        timestamp_seconds, local_clock, minute, session_date = chart_clock
+        timestamp_seconds, strategy_clock_valid, minute, session_date = chart_clock
         # Full-history requests deliberately skip the separate byte-span index;
         # the rows already being projected are the cheapest exact authority for
         # their available trading dates.
         available_session_dates.add(session_date)
-        if series_type == "strategy" and not (
-            (
-                local_clock.hour == 9
-                and local_clock.minute == 0
-                or local_clock.hour == 13
-                and local_clock.minute == 30
-            )
-            if is_overnight
-            else datetime_time(9, 1) <= local_clock <= datetime_time(13, 30)
-        ):
+        if series_type == "strategy" and not strategy_clock_valid:
             # Signal publication can happen during 09:00, but the canonical
             # right-labelled strategy curve is exactly 09:01..13:30.  Keeping
             # a 09:00 point for only the live session makes the latest day use
@@ -5731,33 +5850,31 @@ def build_dashboard_history_snapshot(
             return
         if canonical:
             canonical_benchmark_keys.add(point_key)
-        deduplicated[(series_id, minute)] = {
-            "series_id": series_id,
-            "series_type": series_type,
-            "market": market if series_type == "strategy" else None,
-            "benchmark_id": benchmark_id if series_type == "benchmark" else None,
-            "minute": minute,
-            "session_date": session_date,
-            "timestamp_seconds": timestamp_seconds,
-            "return_fraction": return_fraction,
-            "return_pct": return_pct,
-            "cumulative_return_fraction": return_fraction,
-            "cumulative_return_pct": return_pct,
-            "_initial_capital_twd": initial_capital,
-            "_total_equity_twd": total_equity,
-            "_wealth_index": wealth_index,
-            "valuation_stale": bool(valuation_stale),
-            "historical_minute_replay": bool(
-                historical_minute_replay or historical_counterfactual_replay
-            ),
-            "minute_valuation_contract": minute_valuation_contract,
-            "valuation_source": valuation_source,
-            "valuation_executable": valuation_executable,
-            "fresh_trade_position_count": fresh_trade_position_count,
-            "last_trade_carried_position_count": last_trade_carried_position_count,
-            "missing_price_position_count": missing_price_position_count,
-            "fresh_trade_notional_coverage_ratio": fresh_trade_notional_coverage_ratio,
-        }
+        deduplicated[point_key] = _HistoryPoint(
+            series_id,
+            series_type,
+            market if series_type == "strategy" else None,
+            benchmark_id if series_type == "benchmark" else None,
+            minute,
+            session_date,
+            timestamp_seconds,
+            return_fraction,
+            return_pct,
+            return_fraction,
+            return_pct,
+            initial_capital,
+            total_equity,
+            wealth_index,
+            bool(valuation_stale),
+            bool(historical_minute_replay or historical_counterfactual_replay),
+            minute_valuation_contract,
+            valuation_source,
+            valuation_executable,
+            fresh_trade_position_count,
+            last_trade_carried_position_count,
+            missing_price_position_count,
+            fresh_trade_notional_coverage_ratio,
+        )
 
     projected_ledger_fields = (
         "market",
@@ -5788,24 +5905,26 @@ def build_dashboard_history_snapshot(
         add_values(
             series_type,
             canonical,
-            source.get("market"),
-            source.get("benchmark_id"),
-            source.get("minute"),
-            source.get("recorded_at"),
-            source.get("initial_capital_twd"),
-            source.get("total_equity_twd"),
-            source.get("return_pct"),
-            source.get("return_fraction"),
-            source.get("valuation_stale", False),
-            source.get("historical_minute_replay", False),
-            source.get("historical_counterfactual_replay", False),
-            source.get("minute_valuation_contract"),
-            source.get("valuation_source"),
-            source.get("valuation_executable"),
-            source.get("fresh_trade_position_count"),
-            source.get("last_trade_carried_position_count"),
-            source.get("missing_price_position_count"),
-            source.get("fresh_trade_notional_coverage_ratio"),
+            (
+                source.get("market"),
+                source.get("benchmark_id"),
+                source.get("minute"),
+                source.get("recorded_at"),
+                source.get("initial_capital_twd"),
+                source.get("total_equity_twd"),
+                source.get("return_pct"),
+                source.get("return_fraction"),
+                source.get("valuation_stale", False),
+                source.get("historical_minute_replay", False),
+                source.get("historical_counterfactual_replay", False),
+                source.get("minute_valuation_contract"),
+                source.get("valuation_source"),
+                source.get("valuation_executable"),
+                source.get("fresh_trade_position_count"),
+                source.get("last_trade_carried_position_count"),
+                source.get("missing_price_position_count"),
+                source.get("fresh_trade_notional_coverage_ratio"),
+            ),
         )
 
     def add_complete_ledger(path: Path, *, series_type: str) -> None:
@@ -5813,8 +5932,16 @@ def build_dashboard_history_snapshot(
 
         native = _native_ledger_frame(path, projected_schema=_HISTORY_MARK_COLUMN_TYPES)
         if native is None:
-            for source in _all_json_objects(path) or ():
-                add(source, series_type=series_type)
+            if not path.is_file():
+                return
+            # Large ledgers retain bounded streaming instead of lifting the
+            # columnar memory cap. Decode the same complete chart projection
+            # natively, without allocating unused source fields or dict.get
+            # calls for every value. Legacy documents use the shared fallback.
+            with path.open("r", encoding="utf-8") as handle:
+                while lines := handle.readlines(4 * 1024 * 1024):
+                    for values in private_json.projected_object_rows(lines, projected_ledger_fields):
+                        add_values(series_type, False, values)
             return
         pl, frame = native
         expressions = [
@@ -5822,7 +5949,7 @@ def build_dashboard_history_snapshot(
             for field in projected_ledger_fields
         ]
         for values in frame.select(expressions).iter_rows(named=False):
-            add_values(series_type, False, *values)
+            add_values(series_type, False, values)
 
     if explicit_dates:
         selected_date_set = set(selected_sessions)
@@ -5871,7 +5998,7 @@ def build_dashboard_history_snapshot(
 
     rows = sorted(
         deduplicated.values(),
-        key=lambda row: (float(row["timestamp_seconds"]), str(row["series_id"])),
+        key=lambda row: (row.timestamp_seconds, row.series_id),
     )
     available_dates = [
         datetime_date.fromisoformat(session_date)
@@ -5884,7 +6011,7 @@ def build_dashboard_history_snapshot(
             if (
                 selected_start is None
                 or datetime.fromtimestamp(
-                    float(row["timestamp_seconds"]), tz=timezone.utc
+                    row.timestamp_seconds, tz=timezone.utc
                 )
                 .astimezone(TAIPEI)
                 .date()
@@ -5893,14 +6020,14 @@ def build_dashboard_history_snapshot(
             and (
                 selected_end is None
                 or datetime.fromtimestamp(
-                    float(row["timestamp_seconds"]), tz=timezone.utc
+                    row.timestamp_seconds, tz=timezone.utc
                 )
                 .astimezone(TAIPEI)
                 .date()
                 <= selected_end
             )
         ]
-    anchor = max((float(row["timestamp_seconds"]) for row in rows), default=None)
+    anchor = max((row.timestamp_seconds for row in rows), default=None)
     duration = CHART_RANGE_SECONDS[normalized_range]
     cutoff = (
         None
@@ -5911,31 +6038,31 @@ def build_dashboard_history_snapshot(
         else anchor - duration
     )
     if cutoff is not None:
-        rows = [row for row in rows if float(row["timestamp_seconds"]) >= cutoff]
+        rows = [row for row in rows if row.timestamp_seconds >= cutoff]
 
-    historical_rows = [row for row in rows if row["historical_minute_replay"]]
+    historical_rows = [row for row in rows if row.historical_minute_replay]
     fresh_coverage = [
         value
         for row in historical_rows
-        if (value := _finite_float(row.get("fresh_trade_notional_coverage_ratio")))
+        if (value := _finite_float(row.fresh_trade_notional_coverage_ratio))
         is not None
     ]
-    grouped: dict[str, list[dict[str, Any]]] = {}
+    grouped: dict[str, list[_HistoryPoint]] = {}
     for row in rows:
-        grouped.setdefault(str(row["series_id"]), []).append(row)
+        grouped.setdefault(row.series_id, []).append(row)
     range_summary: list[dict[str, Any]] = []
     for series_id, series_rows in sorted(grouped.items()):
         # Grouping preserves the already sorted global chronology.
         first = series_rows[0]
         last = series_rows[-1]
-        baseline_wealth = float(first["_wealth_index"])
-        initial_capital = _finite_float(first.get("_initial_capital_twd"))
-        baseline_equity = _finite_float(first.get("_total_equity_twd"))
-        end_equity = _finite_float(last.get("_total_equity_twd"))
+        baseline_wealth = first._wealth_index
+        initial_capital = first._initial_capital_twd
+        baseline_equity = first._total_equity_twd
+        end_equity = last._total_equity_twd
         if baseline_equity is None and initial_capital is not None:
             baseline_equity = initial_capital * baseline_wealth
         if end_equity is None and initial_capital is not None:
-            end_equity = initial_capital * float(last["_wealth_index"])
+            end_equity = initial_capital * last._wealth_index
         cumulative_net_pnl = (
             end_equity - initial_capital
             if end_equity is not None and initial_capital is not None
@@ -5947,28 +6074,28 @@ def build_dashboard_history_snapshot(
         # A reference that has crossed zero cannot use a return ratio, so keep
         # the existing finite wealth-index difference fallback in that case.
         for row in series_rows:
-            wealth = float(row["_wealth_index"])
+            wealth = row._wealth_index
             selected_return_fraction = (
                 wealth / baseline_wealth - 1.0
                 if baseline_wealth > 0.0
                 else wealth - baseline_wealth
             )
-            row["return_fraction"] = selected_return_fraction
-            row["return_pct"] = selected_return_fraction * 100.0
-        period_return_fraction = float(last["return_fraction"])
+            row.return_fraction = selected_return_fraction
+            row.return_pct = selected_return_fraction * 100.0
+        period_return_fraction = last.return_fraction
         period_return_pct = float(period_return_fraction) * 100.0
         session_point_counts: dict[str, int] = {}
         for row in series_rows:
-            session = str(row["session_date"])
+            session = row.session_date
             session_point_counts[session] = session_point_counts.get(session, 0) + 1
         # The strategy is 09:01..13:30 because there is deliberately no
         # fabricated 09:00 position. Cash benchmarks retain the 09:00 official
         # open, while the right-labelled TX day session covers 08:46..13:45.
         points_per_session = (
             2
-            if is_overnight and first["series_type"] == "strategy"
+            if is_overnight and first.series_type == "strategy"
             else 270
-            if first["series_type"] == "strategy"
+            if first.series_type == "strategy"
             else 300
             if series_id == "benchmark_tx_continuous"
             else 271
@@ -5977,25 +6104,25 @@ def build_dashboard_history_snapshot(
         range_summary.append(
             {
                 "series_id": series_id,
-                "series_type": first["series_type"],
+                "series_type": first.series_type,
                 "baseline_kind": "first_visible_mark",
-                "baseline_at_utc": first["minute"],
+                "baseline_at_utc": first.minute,
                 "baseline_equity_twd": baseline_equity,
                 "initial_capital_twd": initial_capital,
-                "start_at_utc": first["minute"],
-                "end_at_utc": last["minute"],
-                "start_equity_twd": _finite_float(first.get("_total_equity_twd")),
+                "start_at_utc": first.minute,
+                "end_at_utc": last.minute,
+                "start_equity_twd": first._total_equity_twd,
                 "end_equity_twd": end_equity,
                 "range_net_pnl_twd": (
                     end_equity - baseline_equity
                     if end_equity is not None and baseline_equity is not None
                     else None
                 ),
-                "return_fraction": last["return_fraction"],
-                "return_pct": last["return_pct"],
+                "return_fraction": last.return_fraction,
+                "return_pct": last.return_pct,
                 "cumulative_net_pnl_twd": cumulative_net_pnl,
-                "cumulative_return_fraction": last["cumulative_return_fraction"],
-                "cumulative_return_pct": last["cumulative_return_pct"],
+                "cumulative_return_fraction": last.cumulative_return_fraction,
+                "cumulative_return_pct": last.cumulative_return_pct,
                 "period_return_fraction": period_return_fraction,
                 "period_return_pct": period_return_pct,
                 "point_count": len(series_rows),
@@ -6022,8 +6149,9 @@ def build_dashboard_history_snapshot(
     )
     if resolution != "1m":
         sampled.sort(
-            key=lambda row: (float(row["timestamp_seconds"]), row["series_id"])
+            key=lambda row: (row.timestamp_seconds, row.series_id)
         )
+        sampled = [row.as_dict() for row in sampled]
         for row in sampled:
             for internal_key in (
                 "timestamp_seconds",
@@ -6076,11 +6204,11 @@ def build_dashboard_history_snapshot(
         "range_summary": range_summary,
         "historical_minute_replay_points": len(historical_rows),
         "historical_minute_carried_price_points": sum(
-            int(row.get("last_trade_carried_position_count") or 0) > 0
+            int(row.last_trade_carried_position_count or 0) > 0
             for row in historical_rows
         ),
         "historical_minute_missing_price_points": sum(
-            int(row.get("missing_price_position_count") or 0) > 0
+            int(row.missing_price_position_count or 0) > 0
             for row in historical_rows
         ),
         "historical_minute_min_fresh_trade_notional_coverage_ratio": (
@@ -6093,14 +6221,14 @@ def build_dashboard_history_snapshot(
             {
                 str(value)
                 for row in historical_rows
-                if (value := row.get("minute_valuation_contract"))
+                if (value := row.minute_valuation_contract)
             }
         ),
         "historical_minute_valuation_sources": sorted(
             {
                 str(value)
                 for row in historical_rows
-                if (value := row.get("valuation_source"))
+                if (value := row.valuation_source)
             }
         ),
         "history": sampled,
@@ -6113,16 +6241,16 @@ def build_dashboard_history_snapshot(
         payload["minute_series"] = [
             {
                 "series_id": series_id,
-                "series_type": values[0]["series_type"],
+                "series_type": values[0].series_type,
                 "points": [
                     [
-                        int(row["timestamp_seconds"] // 60),
-                        row["return_pct"],
-                        row["cumulative_return_pct"],
-                        int(row["valuation_stale"])
-                        | (int(row["historical_minute_replay"]) << 1)
+                        int(row.timestamp_seconds // 60),
+                        row.return_pct,
+                        row.cumulative_return_pct,
+                        int(row.valuation_stale)
+                        | (int(row.historical_minute_replay) << 1)
                         | (
-                            int(int(row.get("missing_price_position_count") or 0) > 0)
+                            int(int(row.missing_price_position_count or 0) > 0)
                             << 2
                         ),
                     ]
@@ -6137,7 +6265,7 @@ def build_dashboard_history_snapshot(
         # indexes and parallel numeric columns. It remains lossless while the
         # browser can feed the values directly to a Canvas renderer.
         minute_axis = sorted(
-            {int(row["timestamp_seconds"] // 60) for row in sampled}
+            {int(row.timestamp_seconds // 60) for row in sampled}
         )
         minute_index = {minute: index for index, minute in enumerate(minute_axis)}
         payload["history_encoding"] = "minute_columns_v2"
@@ -6145,21 +6273,21 @@ def build_dashboard_history_snapshot(
         payload["minute_series"] = [
             {
                 "series_id": series_id,
-                "series_type": values[0]["series_type"],
+                "series_type": values[0].series_type,
                 "minute_indexes": [
-                    minute_index[int(row["timestamp_seconds"] // 60)]
+                    minute_index[int(row.timestamp_seconds // 60)]
                     for row in values
                 ],
-                "return_pct": [row["return_pct"] for row in values],
+                "return_pct": [row.return_pct for row in values],
                 "cumulative_return_pct": [
-                    row["cumulative_return_pct"] for row in values
+                    row.cumulative_return_pct for row in values
                 ],
                 "quality_flags": [
-                    int(row["valuation_stale"])
-                    | (int(row["historical_minute_replay"]) << 1)
+                    int(row.valuation_stale)
+                    | (int(row.historical_minute_replay) << 1)
                     | (
                         int(
-                            int(row.get("missing_price_position_count") or 0) > 0
+                            int(row.missing_price_position_count or 0) > 0
                         )
                         << 2
                     )
@@ -7579,6 +7707,10 @@ def build_dashboard_snapshot(
                 "feature_cutoff_date": mode.get("feature_cutoff_date"),
                 "signal_counts": mode.get("signal_counts") or {},
                 "signal_reason_counts": mode.get("signal_reason_counts") or {},
+                "entry_price_guard_contract": mode.get("entry_price_guard_contract"),
+                "configured_entry_price_guard_contract": mode.get("configured_entry_price_guard_contract"),
+                "entry_price_guard_rejection_counts": mode.get("entry_price_guard_rejection_counts") or {},
+                "entry_price_guard_skipped_shares": int(mode.get("entry_price_guard_skipped_shares") or 0),
                 "entry_fill_count": int(
                     len(mode_positions)
                     if mode.get("entry_fill_count") is None
@@ -8098,6 +8230,8 @@ def build_dashboard_snapshot(
                     "entry_0901_vwap_fill_count", "entry_0901_close_fill_count",
                     "entry_0901_minute_price_fill_count", "signal_counts",
                     "signal_reason_counts",
+                    "entry_price_guard_contract", "configured_entry_price_guard_contract",
+                    "entry_price_guard_rejection_counts", "entry_price_guard_skipped_shares",
                 ):
                     if key in committed_mode:
                         mode[key] = committed_mode[key]
@@ -8572,6 +8706,7 @@ def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
         arguments.get(field, default) for field, default in (
             ("session_date", None), ("start_date", None), ("end_date", None),
             ("mode", ""), ("symbol", ""), ("status", "all"),
+            ("hide_zero_targets", False),
             ("offset", 0), ("limit", 250), ("maximum_scan_rows", 100_000),
         )
     ))
@@ -8610,6 +8745,7 @@ def build_dashboard_signal_page(
     mode: str = "",
     symbol: str = "",
     status: str = "all",
+    hide_zero_targets: bool = False,
     offset: int = 0,
     limit: int = 250,
     maximum_scan_rows: int = 100_000,
@@ -8742,6 +8878,7 @@ def build_dashboard_signal_page(
         normalized_mode,
         normalized_symbol,
         normalized_status,
+        hide_zero_targets,
         int(offset),
         int(limit),
         int(maximum_scan_rows),
@@ -9306,6 +9443,24 @@ def build_dashboard_signal_page(
         )
     mark_stage("summary")
 
+    # This is a display filter, not a change to the append-only signal ledger
+    # or its complete-model audit. Apply it before pagination/counting and
+    # after the audit; keep unknown weights and every nonzero target, including
+    # targets too small for a board lot. Do not compare rounded percentages.
+    if hide_zero_targets:
+        if filtered_frame is not None:
+            displayed_weight = pl.col("target_weight").cast(pl.Float64, strict=False)
+            filtered_frame = filtered_frame.filter(
+                (displayed_weight != 0.0).fill_null(True)
+            )
+            filtered_total = filtered_frame.height
+        else:
+            filtered = [
+                row for row in filtered
+                if _finite_float(row.get("target_weight")) != 0.0
+            ]
+            filtered_total = len(filtered)
+
     source_page = (
         filtered_frame.top_k(
             min(offset + limit, filtered_total),
@@ -9352,6 +9507,7 @@ def build_dashboard_signal_page(
                 mode=mode,
                 symbol=symbol,
                 status=status,
+                hide_zero_targets=hide_zero_targets,
                 offset=offset,
                 limit=limit,
                 maximum_scan_rows=maximum_scan_rows,

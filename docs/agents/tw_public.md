@@ -15,6 +15,12 @@ Use for Taiwan official downloaders, parsers, price precision, listing lifecycle
   `tick_rule`/`tick_bands()`
   for live FOP contract metadata when available and reconcile it with official
   notices; current metadata cannot rewrite historical quotes.
+- Historical futures grid contract v3 accepts stock-futures prints from
+  2011-01-03 using the launch-era official six-band grid and day-session
+  evidence. TX/MTX retain their reviewed 2011 scope; other index/ETF periods
+  remain separately bounded. Numeric validation does not establish a dated
+  product's listing, physical month, adjustment, margin or execution capacity.
+  See [2011 stock-futures preparation](../tw_stock_futures_history2011_2026-10-21.md).
 - Market labels from the broker are not a point-in-time listing-status proof:
   `tpex` minute KBars include emerging issues. The emerging-stock tick was
   fixed at TWD 0.01 before 2020-03-23 and follows six regular-stock bands

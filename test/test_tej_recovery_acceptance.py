@@ -44,6 +44,25 @@ def test_acceptance_uses_private_owner_status_not_the_public_gateway():
     assert OWNER_STATUS_URL == 'http://127.0.0.1:8771/tej/api/status'
 
 
+@pytest.mark.parametrize('fault', [None, 'schema', 'writable', 'raw', 'dead', 'paused', 'recovery', 'scheduler_absent'])
+def test_live_acceptance_tracks_current_dashboard_abi_without_relaxing_safety(fault):
+    from scripts.verify_tej_self_healing import validate_live_dashboard
+    from stockagent.live.tej_dashboard import SCHEMA_VERSION
+    status = {'schema_version': SCHEMA_VERSION, 'read_only': True, 'raw_values_exposed': False,
+              'scheduler': {'alive': True, 'paused_reason': None, 'metadata_recovery': {'enabled': True}}}
+    if fault == 'schema': status['schema_version'] -= 1
+    elif fault == 'writable': status['read_only'] = False
+    elif fault == 'raw': status['raw_values_exposed'] = True
+    elif fault == 'dead': status['scheduler']['alive'] = False
+    elif fault == 'paused': status['scheduler']['paused_reason'] = 'unknown_source'
+    elif fault == 'recovery': status['scheduler']['metadata_recovery']['enabled'] = False
+    elif fault == 'scheduler_absent': del status['scheduler']
+    if fault:
+        with pytest.raises(ValueError): validate_live_dashboard(status)
+    else:
+        validate_live_dashboard(status)
+
+
 def test_empty_progress_reference_preserves_actual_value_evidence(tmp_path):
     path=tmp_path/'reference.json'
     path.write_text(json.dumps({'accepted':True,'source_rows':125,'original_cells_checked':3618,'code_sha256':CODE}))

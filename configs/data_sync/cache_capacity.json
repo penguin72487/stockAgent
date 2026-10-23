@@ -6,5 +6,5 @@
   "materialized_capacity_bytes": 274877906944,
   "panel_family_capacity_bytes": 68719476736,
   "maximum_inventory_entries": 200000,
-  "maximum_inventory_seconds": 5
+  "maximum_inventory_seconds": 30
 }

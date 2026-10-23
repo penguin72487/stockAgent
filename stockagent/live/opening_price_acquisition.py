@@ -1,7 +1,7 @@
 """Session-fenced, single-flight fan-in for model opening inputs (not fills)."""
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, time as daytime
@@ -21,6 +21,7 @@ import requests
 
 from stockagent import private_json
 from stockagent.live import quote_provider as quotes
+from stockagent.live.opening_price_journal import pack_observation_details
 
 Progress = Callable[[list[str], quotes.PriceSnapshot], None]
 Provider = Callable[[list[str], np.ndarray, Progress], quotes.PriceSnapshot]
@@ -105,11 +106,14 @@ def _record_source_events(key, provider, events) -> bool:
     try:
         # Large per-symbol evidence must not serialize while holding the shared
         # append lock: a different provider's tiny quorum receipt can be ready.
-        payloads = [{"schema_version": 1, "session_date": key[1], "parquet_root": key[0],
-            "provider": provider, "event": event, "owner_pid": os.getpid(),
-            "observed_at_taipei": datetime.now(TAIPEI).isoformat(timespec="microseconds"),
-            "measurement_boundary": "opening_source_acquisition_not_broker_fill", **details}
-            for event, details in events]
+        payloads = []
+        for event, details in events:
+            packed = pack_observation_details(details) if event == "observations_delta" else details
+            payloads.append({"schema_version": 2 if packed is not details else 1,
+                "session_date": key[1], "parquet_root": key[0],
+                "provider": provider, "event": event, "owner_pid": os.getpid(),
+                "observed_at_taipei": datetime.now(TAIPEI).isoformat(timespec="microseconds"),
+                "measurement_boundary": "opening_source_acquisition_not_broker_fill", **packed})
         encoded = "".join(json.dumps(payload, ensure_ascii=False, allow_nan=False,
             separators=(",", ":")) + "\n" for payload in payloads)
         with _TELEMETRY_LOCK:
@@ -123,6 +127,30 @@ def _record_source_events(key, provider, events) -> bool:
         return False
 
 
+def _journal_provider_metrics(metrics, durable_jobs):
+    """Reference only source details already fsynced in this owner's journal.
+
+    Consumer DTOs retain the full metrics. A pending/failed journal append must
+    keep its details inline; a reference never substitutes for missing evidence.
+    """
+    result = {}
+    for name, metric in metrics.items():
+        summary = dict(metric)
+        job = summary.get("last_completed_job")
+        job_id = job.get("job_id") if isinstance(job, dict) else None
+        if job_id is not None and durable_jobs.get(name) == job_id:
+            reference = {"event": "finished", "job_id": job_id, "owner_pid": os.getpid()}
+            summary.pop("last_completed_job")
+            summary["completed_job_ref"] = reference
+            # A newer result may already have updated aggregate transport while
+            # the previous job's durable completion is still the latest one.
+            if summary.get("last_result_job_id") == job_id:
+                summary.pop("transport_timing", None)
+                summary["transport_timing_ref"] = reference
+        result[name] = summary
+    return result
+
+
 @dataclass
 class _Session:
     condition: threading.Condition = field(default_factory=threading.Condition)
@@ -132,6 +160,8 @@ class _Session:
     provider_symbols: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     observations: dict[str, dict[str, dict]] = field(default_factory=dict)
     provider_snapshot_ids: set[str] = field(default_factory=set)
+    durable_completed_jobs: dict[str, str] = field(default_factory=dict)
+    jobs: set[Future] = field(default_factory=set)
 
 
 class OpeningPriceFanIn:
@@ -161,18 +191,29 @@ class OpeningPriceFanIn:
         self._pool.shutdown(wait=True, cancel_futures=True)
 
     def wait_idle(self, *, timeout_seconds: float = 8) -> bool:
-        """Diagnostic/shutdown boundary only, never part of model quorum wait."""
+        """Drain complete jobs, including input fsync and final journal writes.
+
+        Network inflight is cleared before persistence so model retries need
+        not wait on telemetry. It cannot prove the worker's durable completion.
+        This diagnostic boundary is never part of the model quorum wait.
+        """
         deadline = time.monotonic() + timeout_seconds
         with self._lock:
             sessions = list(self._sessions.values())
         for session in sessions:
             with session.condition:
-                while any(session.inflight.values()):
+                while session.jobs or any(session.inflight.values()):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
                     session.condition.wait(timeout=remaining)
         return True
+
+    @staticmethod
+    def _job_finished(session: _Session, job: Future) -> None:
+        with session.condition:
+            session.jobs.discard(job)
+            session.condition.notify_all()
 
     def warm_transports(self, *, parquet_root, session_date, probes, force=False, timeout_seconds=2):
         """First proven transport wins; this cannot supply model prices.
@@ -187,6 +228,14 @@ class OpeningPriceFanIn:
                 raise RuntimeError("opening acquisition owner is closed")
             self._transport_sessions = {k: v for k, v in self._transport_sessions.items() if k[1] == session_date}
             session = self._transport_sessions.setdefault(key, _Session())
+        # Parse the local venue map before the opening gate, alongside existing
+        # preparation, not on the first full sweep. The quote owner rechecks its
+        # file generation on every use; this is NOT official scope or a price.
+        local_started = time.perf_counter()
+        venue_mapping_count = len(quotes.load_symbol_yahoo_map(key[0]))
+        local_preparation = {"venue_mapping_count": venue_mapping_count,
+            "venue_mapping_ms": round((time.perf_counter() - local_started) * 1000, 3),
+            "boundary": "venue_mapping_only_not_official_membership_or_quote"}
         with session.condition:
             ttl = 60 if force else 7200
             if not any(row.get("ready") and time.monotonic() - row.get("completed_monotonic", 0) < ttl for row in session.metrics.values()):
@@ -207,7 +256,7 @@ class OpeningPriceFanIn:
             if self._closed:
                 raise RuntimeError("opening acquisition owner is closed")
             metrics = {name: dict(row) for name, row in session.metrics.items()}
-        return {"ready": True, "source": "parallel_opening_sources", "proof": "responding_transport_not_opening_price_readiness", "session_date": session_date, "elapsed_ms": round((time.perf_counter() - started) * 1000, 3), "providers": metrics}
+        return {"ready": True, "source": "parallel_opening_sources", "proof": "responding_transport_not_opening_price_readiness", "session_date": session_date, "elapsed_ms": round((time.perf_counter() - started) * 1000, 3), "local_preparation": local_preparation, "providers": metrics}
 
     def _probe_transport(self, session, name, probe, key):
         started = time.perf_counter()
@@ -265,7 +314,8 @@ class OpeningPriceFanIn:
         observed = cache_reader()
         flush_timing = {}
         before = quotes.tw_session_open_observed_mask(observed, session_date=date_text)
-        resolved = before | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text) if resolve_no_prints else False)
+        resolved = before | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text,
+            asof_timestamp_ms=int(datetime.now(TAIPEI).timestamp() * 1000)) if resolve_no_prints else False)
         if not force_refresh and int(resolved.sum()) >= required:
             quotes.persist_tw_opening_snapshot_cache(parquet_root=key[0], session_date=date_text, timings=flush_timing)
             observed.transport_timing = {**(observed.transport_timing or {}), "opening_acquisition_policy": "parallel_incremental_fan_in_v1", "opening_cache_ready": True, "opening_durable_flush": flush_timing, "opening_quorum_wait_ms": round((time.perf_counter() - started) * 1000, 3)}
@@ -281,7 +331,8 @@ class OpeningPriceFanIn:
             # by callback merges/removal from inflight: otherwise a concurrent
             # model can resubmit an already-resolved delta (and spend API quota).
             opens = quotes.tw_session_open_observed_mask(observed, session_date=date_text)
-            resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text) if resolve_no_prints else False)
+            resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text,
+                asof_timestamp_ms=int(observed_at.timestamp() * 1000)) if resolve_no_prints else False)
             # Initial pass requests the complete universe from EVERY provider,
             # even if another provider wins immediately. Later passes retry gaps.
             jobs = []
@@ -326,7 +377,10 @@ class OpeningPriceFanIn:
             # Enqueue all sources under a short lock. Workers perform no I/O
             # until the lock is released; a fast winner cannot cancel a loser.
             for name, provider, requested, values, job_id, recovery_probe in jobs:
-                self._pool.submit(self._run, session, generation, key, name, provider, requested, values, started, job_id, time.perf_counter(), recovery_probe)
+                job = self._pool.submit(self._run, session, generation, key, name, provider,
+                    requested, values, started, job_id, time.perf_counter(), recovery_probe)
+                session.jobs.add(job)
+                job.add_done_callback(lambda completed, state=session: self._job_finished(state, completed))
         with session.condition:
             generation = session.generation
             dispatch(cache_reader(), now)
@@ -338,7 +392,8 @@ class OpeningPriceFanIn:
                     raise RuntimeError("opening acquisition session was superseded")
                 observed = cache_reader()
                 opens = quotes.tw_session_open_observed_mask(observed, session_date=date_text)
-                resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text) if resolve_no_prints else False)
+                resolved = opens | (quotes.tw_session_no_open_print_mask(observed, session_date=date_text,
+                    asof_timestamp_ms=int(datetime.now(TAIPEI).timestamp() * 1000)) if resolve_no_prints else False)
                 ready = int(resolved.sum()) >= required
                 clock = time.monotonic()
                 mis_metric = session.metrics.get("official_mis", {})
@@ -356,6 +411,7 @@ class OpeningPriceFanIn:
                 scheduled_poll = next_poll is not None and next_poll < min(deadline, polling_until)
                 if ready or (not pending and not scheduled_poll) or remaining <= 0:
                     metrics = {name: dict(metric) for name, metric in session.metrics.items()}
+                    journal_metrics = _journal_provider_metrics(metrics, session.durable_completed_jobs)
                     break
                 # Provider completion notifies immediately; an idle healthy
                 # snapshot also wakes at its OWN request-start retry clock.
@@ -379,7 +435,7 @@ class OpeningPriceFanIn:
             "opening_providers": metrics,
             "opening_source_errors": [f"{name}_{row['error_type']}" for name, row in metrics.items() if row.get("error_type")],
         }
-        observed.transport_timing["opening_telemetry_recorded"] = _record_source_event(key, "merged", "quorum" if ready else "waiting_source", {"requested_count": len(symbols), "valid_open_count": int(opens.sum()), "resolved_count": int(resolved.sum()), "required_count": required, "elapsed_ms": observed.transport_timing["opening_quorum_wait_ms"], "background_pending": pending, "input_flush": flush_timing, "providers": metrics})
+        observed.transport_timing["opening_telemetry_recorded"] = _record_source_event(key, "merged", "quorum" if ready else "waiting_source", {"requested_count": len(symbols), "valid_open_count": int(opens.sum()), "resolved_count": int(resolved.sum()), "required_count": required, "elapsed_ms": observed.transport_timing["opening_quorum_wait_ms"], "background_pending": pending, "input_flush": flush_timing, "providers": journal_metrics, "provider_metric_layout": "inline_until_durable_finished_reference_v1"})
         return observed
 
     def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id, enqueued_at=None, recovery_probe=False):
@@ -432,15 +488,23 @@ class OpeningPriceFanIn:
             validation_started = time.perf_counter()
             if not set(requested).issubset(requested_set) or len(requested) != len(snapshot.prices):
                 raise ValueError("provider progress does not match requested universe")
-            quality, observations = quotes.tw_opening_observation_diagnostics(requested, snapshot, session_date=key[1])
+            quality, observations = quotes.tw_opening_observation_diagnostics(requested, snapshot, session_date=key[1],
+                include_no_first_print_clock=True)
             diagnostics_ms = (time.perf_counter() - validation_started) * 1000
             changed = []
             with session.condition:
                 if session.generation != generation or datetime.now(TAIPEI).date().isoformat() != key[1] or self._closed:
                     return
                 merge_started = time.perf_counter()
-                quotes.seed_tw_opening_snapshot_cache(requested, snapshot, parquet_root=key[0], session_date=key[1], persist=False)
+                merged = quotes.seed_tw_opening_snapshot_cache(requested, snapshot, parquet_root=key[0], session_date=key[1], persist=False)
                 merge_ms = (time.perf_counter() - merge_started) * 1000
+                # A failed/absent source owns no input durability barrier. The
+                # consumer always persists the full requested scope, and a
+                # source that observed ANY rows still flushes even if it later
+                # fails. Do not let a 403/timeout force an empty receipt write
+                # ahead of the independently arriving useful observations.
+                if merged["accepted_count"]:
+                    metric["input_observation_received"] = True
                 scope = session.provider_symbols[name]
                 observed = session.observations.setdefault(name, {})
                 previous_counts = (len(job_valid), len(job_no_print), len(job_responded))
@@ -465,8 +529,12 @@ class OpeningPriceFanIn:
                     # wall-clock update; successful observations stay intact.
                     if state == "no_source_observation" and previous is not None:
                         continue
-                    identity = (state, row["open_price"], row["simtrade"])
-                    before = (previous["state"], previous["open_price"], previous["simtrade"]) if previous is not None else None
+                    # Absence is a time-bounded fact. Refresh its OWN proof,
+                    # never the latest delivery time of an unrelated row.
+                    identity = (state, row["open_price"], row["simtrade"],
+                        row.get("no_first_print_observed_timestamp_ms") if state == "observed_no_first_print" else None)
+                    before = (previous["state"], previous["open_price"], previous["simtrade"],
+                        previous.get("no_first_print_observed_timestamp_ms") if previous["state"] == "observed_no_first_print" else None) if previous is not None else None
                     observed[symbol] = row
                     if identity != before:
                         changed.append(row)
@@ -549,7 +617,7 @@ class OpeningPriceFanIn:
                 metric.update(state=state, valid_open_count=valid_opens,
                               response_count=responses, no_print_count=no_prints,
                               transport_timing=transport)
-                aggregate.update(transport_timing=transport, last_response_count=responses,
+                aggregate.update(transport_timing=transport, last_result_job_id=job_id, last_response_count=responses,
                                  last_valid_open_count=valid_opens,
                                  last_observation_quality=metric.get("observation_quality"))
                 if endpoint_unavailable or (responses == 0 and not transport.get("response_schema_valid")):
@@ -615,11 +683,13 @@ class OpeningPriceFanIn:
             # another provider or model. The canonical cache writer still owns
             # generation checking, serialization and durable publication.
             try:
-                if should_persist:
+                if should_persist and metric.get("input_observation_received"):
                     flush_timing = {}
                     quotes.persist_tw_opening_snapshot_cache(parquet_root=key[0], session_date=key[1], timings=flush_timing)
                     with session.condition:
                         metric["input_flush"] = flush_timing
+                elif should_persist:
+                    metric["input_flush_policy"] = "no_source_observations_consumer_retains_scope_barrier_v1"
             except Exception as exc:
                 with session.condition:
                     metric.update(state="failed", error_type=type(exc).__name__)
@@ -632,7 +702,9 @@ class OpeningPriceFanIn:
                     metric["source_and_persistence_ms"] = round((time.perf_counter() - started) * 1000, 3)
                     aggregate["last_completed_job"] = dict(metric)
                     session.condition.notify_all()
-            _record_source_event(key, name, "finished", dict(metric))
+            if _record_source_event(key, name, "finished", dict(metric)):
+                with session.condition:
+                    session.durable_completed_jobs[name] = job_id
 
 
 _HTTP_LOCAL = threading.local()

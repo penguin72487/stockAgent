@@ -1,6 +1,7 @@
 """Replan a proved oversized Preview, never retry an unknown source action.
 
-The native record key makes company/period pairs an inadequate row estimate.
+Native record keys and sparse key2 scopes make company/period pairs an
+inadequate observed-row estimate. Capture and query geometry stay independent.
 An overflow descriptor contains no adopted values. It must bind to the exact
 fresh attempt before the existing lazy plan can be replaced transactionally.
 Original attempts, requests, plans and traffic evidence remain private/intact.
@@ -29,7 +30,8 @@ def validate_capacity_response(root: Path, task: dict, request: dict,
                                payload: dict, output: Path) -> dict:
     from downloader.tej_desktop_attempts import query_stage, validate_active_attempt
     from downloader.tej_history import PREVIEW_SUBMISSION_CONTRACT, validate_source_scope
-    from downloader.tej_key_layout import KEY3_CONTRACT
+    from downloader.tej_key_layout import KEY3_CONTRACT, key_count
+    from downloader.tej_planning import SCOPE_BUDGET_CONTRACT, scope_row_budget
 
     output = output.resolve()
     if (output.parent != (root/'raw').resolve() or not output.name.startswith(task['task_id']+'-')
@@ -37,10 +39,13 @@ def validate_capacity_response(root: Path, task: dict, request: dict,
             or json.loads(output.read_text(encoding='utf-8-sig')) != payload):
         raise ValueError('Exact private capacity descriptor required')
     validate_source_scope(request,payload,'download')
+    keys=key_count(request)
+    expanded_key2=(keys==2 and request.get('query_scope_contract')==SCOPE_BUDGET_CONTRACT
+                   and scope_row_budget(request,keys)>request['max_rows'])
     if (task['kind'] != 'download' or not task.get('active_attempt_id')
             or payload.get('task_id') != task['task_id'] or payload.get('contract_version') != 4
             or payload.get('source_outcome') != OUTCOME or payload.get('capacity_contract') != CAPACITY_CONTRACT
-            or request.get('source_key_mode') != 3 or request.get('key_layout_contract') != KEY3_CONTRACT
+            or not (expanded_key2 or keys==3 and request.get('key_layout_contract')==KEY3_CONTRACT)
             or any(payload.get(k) != request.get(k) for k in
                    ('source_key_mode','key_layout_contract','company_labels','date_labels'))
             or any(payload.get(k) is not False for k in
@@ -61,7 +66,7 @@ def validate_capacity_response(root: Path, task: dict, request: dict,
                             ('native_rows_lower_bound','native_rows_upper_bound','native_columns'))
     max_rows,max_cells = request.get('max_rows'),request.get('max_cells')
     if (any(type(n) is not int or not 1 <= n <= 1000000 for n in (lower,upper,columns,max_rows,max_cells))
-            or lower > upper or columns != len(request['fields'])+3
+            or lower > upper or columns != len(request['fields'])+keys
             or payload.get('requested_capacity') != {'max_rows':max_rows,'max_cells':max_cells}
             # At most one header/new-row each. Cells include the header, not
             # the optional new-row affordance. Counts are never observations.
@@ -124,7 +129,8 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
         config = json.loads(con.execute("SELECT value FROM meta WHERE key='config'").fetchone()[0])
         runtime = con.execute("SELECT value FROM meta WHERE key='runtime_policy'").fetchone()
         enabled = runtime is not None and json.loads(runtime[0]).get('auto_preview_capacity_replanning') is True
-        if (former['request'].get('source_key_mode')!=3 or former['request'].get('key_layout_contract')!=KEY3_CONTRACT
+        keys=key_count(request)
+        if (key_count(former['request'])!=keys
                 or request.get('field_partition',{}).get('plan_fingerprint')!=former['fingerprint']
                 or stable_id([task['table_id'],request])!=task_id
                 or not set(request['company_labels']) <= set(former['companies'])
@@ -143,26 +149,35 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
         if task['actual_rows'] is not None or task['receipt_path'] is not None or task['completed_at_utc'] is not None:
             raise ValueError('Capacity response cannot supersede adopted source observations')
         pairs = len(request['company_labels'])*len(request['date_labels'])
-        hint = max(former['request'].get('native_record_density_hint',1)*2,
-                   math.ceil(2*payload['native_rows_upper_bound']/pairs))
-        review = not enabled or pairs == 1
+        hint = (max(former['request'].get('native_record_density_hint',1)*2,
+                    math.ceil(2*payload['native_rows_upper_bound']/pairs)) if keys==3 else None)
+        review = not enabled or pairs == 1 or keys==2 and pairs<=request['max_rows']
         plan = former
         inherited_empty_proofs = []
         if not review:
-            base = {**former['request'],'native_record_density_hint':hint,
-                    'record_capacity_contract':CAPACITY_CONTRACT}
-            # A hint cannot justify exceeding local bounds, even for one pair.
-            columns = min(30,len(base['fields'])+3)
-            hint_cap = min(base['max_rows'],base['max_cells']//columns-1)
-            hint = min(hint,hint_cap)
-            if hint <= former['request'].get('native_record_density_hint',1):
-                review = True
+            if keys==2:
+                # An expanded Cartesian scope returned more than the unchanged
+                # capture budget. Fall back to former safe geometry, not a
+                # larger readback, fabricated rows or another identical query.
+                base={**former['request'],'max_scope_rows':request['max_rows'],
+                      'scope_capacity_backoff_contract':CAPACITY_CONTRACT}
             else:
+                base = {**former['request'],'native_record_density_hint':hint,
+                        'record_capacity_contract':CAPACITY_CONTRACT}
+                # A hint cannot justify exceeding local bounds, even for one pair.
+                columns = min(30,len(base['fields'])+3)
+                hint_cap = min(base['max_rows'],base['max_cells']//columns-1)
+                hint = min(hint,hint_cap)
+                if hint <= former['request'].get('native_record_density_hint',1):
+                    review = True
                 base['native_record_density_hint'] = hint
+            if not review:
                 done = []
                 for row in completed:
                     completed_request = expand_request(json.loads(row['request_json']),definition,task['table_id'])
-                    if key_count(completed_request)!=3:
+                    if key_count(completed_request)!=keys:
+                        if keys!=3:
+                            raise ValueError('Completed key scope differs from expanded query')
                         completed_request,empty_proof = verified_empty_scope(root,dict(row))
                         inherited_empty_proofs.append(empty_proof)
                         completed_request = {**completed_request,'source_key_mode':3,'key_layout_contract':KEY3_CONTRACT}
@@ -177,6 +192,7 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
                   'provider_queries_sent':0,'data_query_repeated':False,
                   'source_rows_adopted':False,'original_attempt_retained':True,
                   'completed_scopes_preserved':True,'native_record_density_hint':hint,
+                  'scope_budget_backoff':keys==2 and not review,
                   'remaining_queries':plan['total_queries']-plan_row['next_query'] if review else plan['total_queries'],
                   'audit':str(audit_path.relative_to(root))}
         backup_path = audit_path.with_suffix('.original_plan.json')

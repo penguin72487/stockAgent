@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
+import io
 import json
 import os
 import stat
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -25,6 +29,25 @@ from stockagent.data_sync.packed_snapshots import (
 )
 
 
+def test_full_pack_recovery_reports_member_progress_before_counting_verified_object(tmp_path, monkeypatch):
+    monkeypatch.setattr(packed_snapshots, 'MAX_PACK_MEMBERS', 5000)
+    source, cold = tmp_path / 'source', tmp_path / 'cold'
+    source.mkdir()
+    for number in range(4100):
+        (source / f'{number:06}.json').touch()
+    initialize_packed_layout(cold, node_id='test')
+    selected = publish_packed_snapshot(cold, 'example', source, node_id='test', pack_buckets=1)
+    observed = []
+    proof = verify_packed_snapshot(cold, selected, reconstruct_all=True, progress=observed.append)
+    members = [row for row in observed if row['stage'] == 'reconstruct-original-pack-files']
+    assert len(members) == 1
+    assert members[0]['completed_items'] == members[0]['pack_members_completed'] == 4096
+    assert members[0]['total_items'] == members[0]['pack_members_total'] == 4100
+    assert members[0]['verified_objects'] == members[0]['verified_object_bytes'] == 0
+    assert proof['objects'] == 1 and proof['independently_reconstructed_files'] == 4100
+    assert proof['independently_reconstructed_bytes'] == 0
+
+
 def _source_tree(root: Path) -> Path:
     source = root / "source"
     (source / "empty").mkdir(parents=True)
@@ -36,6 +59,414 @@ def _source_tree(root: Path) -> Path:
     (source / "large-b.bin").write_bytes(large)
     (source / "current").symlink_to("text/first.json")
     return source
+
+
+def _atomic_control_fixture(tmp_path, raw=b'{"value":-7,"missing":null,"unit":"shares"}'):
+    source = tmp_path / 'data_finmind'
+    path = source / 'receipts/market/observation.json'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    entry = packed_snapshots._SourceEntry(path='receipts/market/observation.json',
+        kind='file', mode=0o600, atomic_json_control=True)
+    return source, path, entry
+
+
+@pytest.mark.parametrize('logical', [
+    'raw/record.json', '目錄/原始 值.json', 'a//b', './a/b', 'a/../b',
+    '../outside', '/absolute', '//server/path', 'ending/', '.', '',
+])
+def test_entry_read_path_matches_component_reference(tmp_path, logical):
+    entry = packed_snapshots._SourceEntry(path=logical, kind='file', mode=0o600)
+    # Path construction never supplied containment validation, even in the
+    # reference. Admission remains the census/manifest reader's responsibility.
+    assert packed_snapshots._entry_read_path(tmp_path, entry) == tmp_path.joinpath(*PurePosixPath(logical).parts)
+    entry.read_path = tmp_path / 'frozen original'
+    assert packed_snapshots._entry_read_path(tmp_path, entry) is entry.read_path
+
+
+def test_sealed_atomic_cohort_needs_no_unused_path_resolution(tmp_path, monkeypatch):
+    source, _, entry = _atomic_control_fixture(tmp_path)
+    entry.sha256, entry.storage = 'sealed', {'object': 'fixed'}
+    def unused(*_args):
+        pytest.fail('sealed JSON controls do not use a live path during the final guard')
+    monkeypatch.setattr(packed_snapshots, '_entry_read_path', unused)
+    progress = []
+    identity = packed_snapshots._source_stat(source.lstat())[:2]
+    packed_snapshots._guard_observation_cohort(source, [entry] * 4100, identity, progress=progress.append)
+    assert progress == [4096, 4100]
+    entry.storage = None
+    with pytest.raises(SnapshotError, match='no sealed storage'):
+        packed_snapshots._guard_observation_cohort(source, [entry], identity)
+
+
+@pytest.mark.parametrize('changed', ['payload', 'directory', 'symlink', 'override'])
+def test_cohort_lazy_paths_still_reject_selected_mutations(tmp_path, changed):
+    source = _source_tree(tmp_path)
+    options = {}
+    if changed == 'override':
+        frozen = tmp_path / 'frozen.bin'
+        frozen.write_bytes(b'frozen original')
+        options['file_overrides'] = {'large-a.bin': frozen}
+    entries, _ = packed_snapshots._collect_entries(source, **options)
+    identity = packed_snapshots._source_stat(source.lstat())[:2]
+    packed_snapshots._guard_observation_cohort(source, entries, identity)
+    if changed == 'payload':
+        (source / 'large-a.bin').write_bytes(b'changed')
+    elif changed == 'directory':
+        (source / 'empty').chmod(0o500)
+    elif changed == 'symlink':
+        (source / 'current').unlink()
+        (source / 'current').symlink_to('text/second.csv')
+    else:
+        frozen.write_bytes(b'changed frozen original')
+    with pytest.raises(SnapshotError, match='changed'):
+        packed_snapshots._guard_observation_cohort(source, entries, identity)
+
+
+def test_cohort_empty_progress_and_replaced_root_remain_checked(tmp_path):
+    identity = packed_snapshots._source_stat(tmp_path.lstat())[:2]
+    progress = []
+    packed_snapshots._guard_observation_cohort(tmp_path, [], identity, progress=progress.append)
+    assert progress == [0]
+    with pytest.raises(SnapshotError, match='root was replaced'):
+        packed_snapshots._guard_observation_cohort(tmp_path, [], (identity[0], identity[1] + 1))
+
+
+def _record_control_reads(monkeypatch, on_read=None):
+    native = packed_snapshots.os.fdopen
+    reads, streams = [], []
+    class ObservedStream:
+        def __init__(self, stream):
+            self.stream = stream
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return self.stream.__exit__(*args)
+        def fileno(self):
+            return self.stream.fileno()
+        def read(self, bound):
+            reads.append(bound)
+            raw = self.stream.read(bound)
+            if on_read is not None:
+                on_read(len(reads))
+            return raw
+    def observed(*args, **kwargs):
+        stream = native(*args, **kwargs)
+        streams.append(stream)
+        return ObservedStream(stream)
+    monkeypatch.setattr(packed_snapshots.os, 'fdopen', observed)
+    return reads, streams
+
+
+def test_atomic_control_requests_observed_size_not_64_mib(tmp_path, monkeypatch):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    expected = path.read_bytes()
+    reads, streams = _record_control_reads(monkeypatch)
+    assert packed_snapshots._read_atomic_json_control(source, entry) == expected
+    assert reads == [len(expected) + 1]
+    assert entry.size == len(expected) and json.loads(expected)['missing'] is None
+    assert all(stream.closed for stream in streams)
+
+
+def test_atomic_control_benchmark_reference_changes_only_read_bound(tmp_path, monkeypatch):
+    from scripts.benchmark_cold_blob_read import atomic_control_reference_reader
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    expected = path.read_bytes()
+    reference = atomic_control_reference_reader()
+    reads, streams = _record_control_reads(monkeypatch)
+    assert reference(source, entry) == expected
+    assert reads == [64 * 1024**2 + 1] and entry.size == len(expected)
+    assert all(stream.closed for stream in streams)
+
+
+@pytest.mark.parametrize('changed', [b'{"value":0}', b'{"value":-999,"new":"longer complete observation"}'])
+def test_atomic_control_size_change_retries_complete_observation(tmp_path, monkeypatch, changed):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    old_size = path.stat().st_size
+    reads, streams = _record_control_reads(monkeypatch,
+        lambda number: path.write_bytes(changed) if number == 1 else None)
+    assert packed_snapshots._read_atomic_json_control(source, entry) == changed
+    assert reads == [old_size + 1, len(changed) + 1]
+    assert entry.size == len(changed) and all(stream.closed for stream in streams)
+
+
+def test_atomic_control_continuous_mutation_rejects_after_three_closed_reads(tmp_path, monkeypatch):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    reads, streams = _record_control_reads(monkeypatch,
+        lambda number: path.write_bytes(json.dumps({'revision': number}).encode() + b' ' * number))
+    with pytest.raises(SnapshotError, match='changed during bounded observation'):
+        packed_snapshots._read_atomic_json_control(source, entry)
+    assert len(reads) == 3 and all(stream.closed for stream in streams)
+    assert entry.sha256 is None and entry.storage is None
+
+
+def test_atomic_control_atomic_replacement_preserves_held_observation(tmp_path, monkeypatch):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    expected = path.read_bytes()
+    replacement = path.with_suffix('.new')
+    replacement.write_bytes(b'{"next":true}')
+    reads, streams = _record_control_reads(monkeypatch, lambda _number: replacement.replace(path))
+    assert packed_snapshots._read_atomic_json_control(source, entry) == expected
+    assert reads == [len(expected) + 1] and path.read_bytes() == b'{"next":true}'
+    assert all(stream.closed for stream in streams)
+
+
+def test_atomic_control_fifo_is_nonblocking_and_rejected(tmp_path, monkeypatch):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    path.unlink()
+    os.mkfifo(path)
+    native, descriptors = os.open, []
+    def nonblocking_open(target, flags, *args, **kwargs):
+        assert flags & os.O_NONBLOCK  # Refuse a blocking reference before opening the FIFO.
+        descriptor = native(target, flags, *args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+    monkeypatch.setattr(packed_snapshots.os, 'open', nonblocking_open)
+    with pytest.raises(SnapshotError, match='bounded regular-file scope'):
+        packed_snapshots._read_atomic_json_control(source, entry)
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_atomic_control_fdopen_failure_closes_owned_descriptor(tmp_path, monkeypatch):
+    source, _path, entry = _atomic_control_fixture(tmp_path)
+    descriptors = []
+    def failed_fdopen(descriptor, *_args, **_kwargs):
+        descriptors.append(descriptor)
+        raise OSError('deliberate stream construction failure')
+    monkeypatch.setattr(packed_snapshots.os, 'fdopen', failed_fdopen)
+    with pytest.raises(OSError, match='deliberate stream construction failure'):
+        packed_snapshots._read_atomic_json_control(source, entry)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
+
+
+@pytest.mark.parametrize('kind', ['oversized', 'invalid-json', 'unknown-scope', 'symlink', 'redirected-parent'])
+def test_atomic_control_bounded_reader_does_not_relax_validation(tmp_path, kind):
+    source, path, entry = _atomic_control_fixture(tmp_path)
+    if kind == 'oversized':
+        with path.open('r+b') as stream:
+            stream.truncate(64 * 1024**2 + 1)
+    elif kind == 'invalid-json':
+        path.write_bytes(b'{"incomplete":')
+    elif kind == 'unknown-scope':
+        entry.path = 'raw/observation.json'
+    elif kind == 'symlink':
+        target = tmp_path / 'other.json'
+        target.write_bytes(path.read_bytes())
+        path.unlink()
+        path.symlink_to(target)
+    else:
+        target = tmp_path / 'other'
+        path.parent.rename(target)
+        path.parent.symlink_to(target, target_is_directory=True)
+    with pytest.raises((SnapshotError, OSError, ValueError)):
+        packed_snapshots._read_atomic_json_control(source, entry)
+    assert entry.sha256 is None and entry.storage is None
+
+
+def test_pack_window_digest_uses_final_patched_bytes_and_complete_short_writes():
+    class ShortWriter(io.BytesIO):
+        def write(self, block):
+            return super().write(block[:3])
+    target = ShortWriter()
+    buffered = packed_snapshots._SeekablePackBuffer(target, capacity=32)
+    buffered.write(b'header payload trailer')
+    buffered.seek(0)
+    buffered.write(b'HEADER')
+    assert buffered.complete_sha256() is None  # Not drained, not a full digest.
+    buffered.seek(22)
+    buffered.flush()
+    expected = b'HEADER payload trailer'
+    assert target.getvalue() == expected
+    assert buffered.complete_sha256() == hashlib.sha256(expected).hexdigest()
+
+
+@pytest.mark.parametrize('returned', [0, None, True, -1, 1000])
+def test_pack_window_digest_rejects_invalid_writes_without_success(returned):
+    from types import SimpleNamespace
+    target = SimpleNamespace(tell=lambda: 0, seek=lambda _n: None, write=lambda _raw: returned)
+    buffered = packed_snapshots._SeekablePackBuffer(target, capacity=8)
+    buffered.write(b'original')
+    with pytest.raises(OSError, match='short pack write'):
+        buffered.flush()
+    assert buffered.complete_sha256() is None
+
+
+@pytest.mark.parametrize('kind', ['backpatch', 'hole', 'nonzero_start', 'disabled'])
+def test_pack_window_digest_never_returns_superseded_partial_or_nonzero_prefix(kind):
+    target = io.BytesIO()
+    if kind == 'nonzero_start':
+        target.write(b'earlier bytes')
+    buffered = packed_snapshots._SeekablePackBuffer(target, capacity=8, digest_writes=kind != 'disabled')
+    buffered.write(b'original payload')
+    buffered.flush()
+    if kind == 'backpatch':
+        buffered.seek(0)
+        buffered.write(b'REVISED!')
+        buffered.seek(16)
+    elif kind == 'hole':
+        buffered.seek(32)
+        buffered.write(b'not a continuous prefix')
+    buffered.flush()
+    assert buffered.complete_sha256() is None
+
+
+@pytest.mark.parametrize('capacity,expected_fused', [(1024**2, True), (32, False)])
+def test_pack_producer_digest_preserves_exact_zip_bytes_and_large_backpatch_fallback(
+        tmp_path, monkeypatch, capacity, expected_fused):
+    source = tmp_path / 'source'
+    source.mkdir()
+    for name, payload in [('中文.json', b'{"raw":-123.75,"missing":null}'),
+                          ('stored.parquet', bytes(range(256)) * 8), ('empty.csv', b'')]:
+        (source / name).write_bytes(payload)
+    native = packed_snapshots._SeekablePackBuffer
+    monkeypatch.setattr(packed_snapshots, '_SeekablePackBuffer',
+                        lambda stream: native(stream, capacity=capacity))
+    entries, _ = packed_snapshots._collect_entries(source)
+    target = tmp_path / 'candidate.zip'
+    digest = packed_snapshots._write_pack(source, entries, target, compression_level=6)
+    reference = tmp_path / 'reference.zip'
+    with reference.open('xb', buffering=0) as stream, zipfile.ZipFile(
+            native(stream, capacity=capacity, digest_writes=False), 'x',
+            compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+        for entry in entries:
+            with archive.open(packed_snapshots._zip_info(entry), 'w', force_zip64=True) as member:
+                member.write((source / entry.path).read_bytes())
+    assert target.read_bytes() == reference.read_bytes()
+    assert (digest is not None) is expected_fused
+    if digest is not None:
+        assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+    with zipfile.ZipFile(target) as archive:
+        assert archive.testzip() is None
+        for name in archive.namelist():
+            assert archive.read(name) == (source / name).read_bytes()
+
+
+@pytest.mark.parametrize('capacity,rehashes', [(1024**2, 0), (32, 1)])
+def test_publisher_fuses_sequential_pack_hash_but_falls_back_after_out_of_window_patch(
+        tmp_path, monkeypatch, capacity, rehashes):
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'stored.parquet').write_bytes(bytes(range(256)) * 8)
+    native = packed_snapshots._SeekablePackBuffer
+    monkeypatch.setattr(packed_snapshots, '_SeekablePackBuffer',
+                        lambda stream: native(stream, capacity=capacity))
+    original = packed_snapshots.sha256_file
+    reads = []
+    def hashed(path):
+        if path.name.startswith('pack-') and path.suffix == '.partial':
+            reads.append(path)
+        return original(path)
+    monkeypatch.setattr(packed_snapshots, 'sha256_file', hashed)
+    cold = tmp_path / 'cold'
+    release = publish_packed_snapshot(cold, 'example', source, node_id='test', pack_buckets=1)
+    assert len(reads) == rehashes
+    proof = verify_packed_snapshot(cold, release, reconstruct_all=True)
+    assert proof['independently_reconstructed_files'] == 1
+    assert proof['independently_reconstructed_bytes'] == 2048
+    target = fetch_packed_snapshot(cold, tmp_path / 'restored', release)
+    assert (target / 'stored.parquet').read_bytes() == (source / 'stored.parquet').read_bytes()
+
+
+@pytest.mark.parametrize('count,padding', [(0, 0), (1, 0), (4096, 0), (1, 1024**2 + 17)])
+def test_inventory_buffer_preserves_every_compressed_byte_and_does_not_reread(tmp_path, monkeypatch, count, padding):
+    from types import SimpleNamespace
+    def rows():
+        for index in range(count):
+            yield SimpleNamespace(inventory_row=lambda index=index: {
+                'path': f'原始/{index:08}.json', 'value': -index, 'missing': None,
+                'padding': 'x' * padding})
+    reference, candidate = tmp_path / 'reference.gz', tmp_path / 'candidate.gz'
+    with reference.open('xb') as raw:
+        with gzip.GzipFile(filename='', mode='wb', compresslevel=6, fileobj=raw, mtime=0) as stream:
+            for entry in rows():
+                stream.write(packed_snapshots._canonical_json_bytes(entry.inventory_row()))
+        raw.flush()
+        os.fsync(raw.fileno())
+    original_open = Path.open
+    opened = []
+    def observed(path, mode='r', *args, **kwargs):
+        if path == candidate:
+            opened.append(mode)
+            assert mode == 'xb', 'inventory was reopened instead of hashing its one write'
+        return original_open(path, mode, *args, **kwargs)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path, 'open', observed)
+        digest = packed_snapshots._write_inventory(candidate, rows())
+    assert opened == ['xb']
+    assert candidate.read_bytes() == reference.read_bytes()
+    assert digest == hashlib.sha256(candidate.read_bytes()).hexdigest()
+    assert gzip.decompress(candidate.read_bytes()) == b''.join(
+        packed_snapshots._canonical_json_bytes(entry.inventory_row()) for entry in rows())
+
+
+def test_inventory_digest_writer_handles_partial_writes_and_empty_blocks():
+    class ShortWriter(io.BytesIO):
+        def write(self, block):
+            return super().write(block[:3])
+    target = ShortWriter()
+    observed = packed_snapshots._InventoryDigestWriter(target)
+    payload = b'full compressed header body and trailer'
+    assert observed.write(b'') == 0
+    assert observed.write(payload) == len(payload)
+    observed.flush()
+    assert observed.digest.hexdigest() == hashlib.sha256(target.getvalue()).hexdigest()
+    assert target.getvalue() == payload
+
+
+@pytest.mark.parametrize('returned', [0, None, True, -1, 1000])
+def test_inventory_digest_writer_rejects_incomplete_or_invalid_writes(returned):
+    from types import SimpleNamespace
+    observed = packed_snapshots._InventoryDigestWriter(SimpleNamespace(write=lambda _block: returned))
+    with pytest.raises(OSError, match='short inventory write'):
+        observed.write(b'original')
+
+
+def test_inventory_digest_is_not_returned_before_durable_fsync(tmp_path, monkeypatch):
+    target = tmp_path / 'unsealed.gz'
+    def no_space(_fd):
+        raise OSError('durability failed')
+    monkeypatch.setattr(os, 'fsync', no_space)
+    with pytest.raises(OSError, match='durability failed'):
+        packed_snapshots._write_inventory(target, iter(()))
+    assert target.exists(), 'a failed write remains uncommitted staging, not a successful inventory'
+
+
+def test_inventory_progress_is_bounded_and_completion_follows_fsync(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    rows = (SimpleNamespace(inventory_row=lambda: {'kind': 'directory', 'path': 'scope', 'mode': 0o700})
+            for _ in range(8200))
+    events = []
+    fsync = os.fsync
+    def durable(fd):
+        fsync(fd)
+        events.append('fsync')
+    monkeypatch.setattr(os, 'fsync', durable)
+    packed_snapshots._write_inventory(tmp_path / 'inventory.gz', rows, progress=events.append)
+    assert events == [4096, 8192, 'fsync', 8200]
+
+
+def test_private_observation_stability_reports_its_own_stage_without_early_acceptance(tmp_path):
+    from stockagent.data_sync.dataset_migration import private_history_root
+    source = _source_tree(tmp_path)
+    parent = tmp_path / 'cold'
+    initialize_packed_layout(parent, node_id='test')
+    cold = private_history_root(parent, {'private_history': {
+        'enabled': True, 'relative_root': '.local-state/private-history',
+        'shared_export': False, 'nas_export': False, 'source_retirement': False}})
+    events = []
+    selected = publish_packed_snapshot(cold, 'observation', source, node_id='test',
+        private_observation_cohort=True, progress=events.append)
+    stages = [event['stage'] for event in events]
+    assert stages.index('committing_complete_inventory') < stages.index('verifying_observation_cohort_stability')
+    assert stages.index('verifying_observation_cohort_stability') < stages.index('source_fences_verified')
+    cohort = next(event for event in events if event['stage'] == 'verifying_observation_cohort_stability')
+    assert cohort['phase_completed_items'] == 0 and cohort['phase_total_items'] > 0
+    assert all(event['acceptance'] is False for event in events)
+    assert verify_packed_snapshot(cold, selected, reconstruct_all=True)['independently_reconstructed_files'] == 4
 
 
 @pytest.mark.parametrize("selection", ["all", "excluded", "maximum", "selected", "override", "staging"])
@@ -1559,6 +1990,64 @@ def test_openbb_operational_staging_rule_is_explicit_and_keeps_final_logs(name, 
     assert not packed_snapshots._is_private_writer_staging(name, ())
 
 
+@pytest.mark.parametrize('name,expected', [
+    ('datasets/.finlab-2c3a7_3z.parquet.tmp', True),
+    ('intraday/objects/.finlab-intraday-abcdefgh.parquet.tmp', True),
+    ('intraday/objects/.finlab-unit-abcdefgh.parquet.tmp', True),
+    ('intraday/objects/.finlab-derived-abcdefgh.parquet.tmp', True),
+    ('.finlab-abcdefgh.json.tmp', True),
+    ('runs/.finlab-abcdefgh.json.tmp', True),
+    ('catalog/.finlab-abcdefgh.json.tmp', True),
+    ('attempts/.finlab-abcdefgh.json.tmp', True),
+    ('receipts/.finlab-abcdefgh.json.tmp', True),
+    ('versions/symbol/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/batch_receipts/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/receipts/symbol/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/attempts/symbol/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/versions/symbol/2026-10-22/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/derived_minute/receipts/symbol/.finlab-abcdefgh.json.tmp', True),
+    ('intraday/derived_minute/versions/symbol/2026-10-22/.finlab-abcdefgh.json.tmp', True),
+    ('raw/tmpabcdefgh.feather.tmp', True),
+    ('empty_evidence/tmpabcdefgh.tmp', True),
+    ('raw_receipts/.raw-abcdefgh', True),
+    ('empty_evidence/.raw-abcdefgh', True),
+    ('datasets/final.parquet', False),
+    ('intraday/objects/symbol-day-sha.parquet', False),
+    ('receipts/final.json', False),
+    ('raw/final.feather', False),
+    ('raw_receipts/final.json', False),
+    ('datasets/.finlab-too-short.parquet.tmp', False),
+    ('datasets/.finlab-ABCDEFGH.parquet.tmp', False),
+    ('raw/.finlab-abcdefgh.parquet.tmp', False),
+    ('datasets/.finlab-intraday-abcdefgh.parquet.tmp', False),
+    ('foreign/datasets/.finlab-abcdefgh.parquet.tmp', False),
+    ('raw/.finlab-abcdefgh.json.tmp', False),
+    ('intraday/raw/.finlab-abcdefgh.json.tmp', False),
+    ('raw/.raw-abcdefgh', False),
+    ('raw_receipts/tmpabcdefgh.feather.tmp', False),
+    ('raw/arbitrary.feather.tmp', False),
+    ('empty_evidence/arbitrary.tmp', False),
+])
+def test_finlab_staging_rule_matches_only_reviewed_directories_names_and_tempfile_tokens(name, expected):
+    assert packed_snapshots._is_private_writer_staging(name, ('finlab_atomic_sibling_v1',)) is expected
+
+
+@pytest.mark.parametrize('name,expected', [
+    ('normalized/' + 'a' * 24 + '.parquet.tmp', True),
+    ('normalized/builds/' + 'b' * 24 + '/part-2026.parquet.tmp', True),
+    ('normalized/' + 'a' * 24 + '.parquet', False),
+    ('normalized/builds/' + 'b' * 24 + '/part-2026.parquet', False),
+    ('normalized/unknown.parquet.tmp', False),
+    ('raw/' + 'a' * 24 + '.parquet.tmp', False),
+    ('normalized/builds/not-a-token/part-2026.parquet.tmp', False),
+    ('normalized/builds/' + 'b' * 24 + '/part-future.parquet.tmp', False),
+])
+def test_finlab_research_staging_matches_only_original_overlay_siblings(name, expected):
+    assert packed_snapshots._is_private_writer_staging(name, ('finlab_research_atomic_sibling_v1',)) is expected
+    assert not packed_snapshots._is_private_writer_staging(name, ())
+
+
 def test_frozen_observation_cannot_silently_disappear_before_census(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()
@@ -1764,6 +2253,11 @@ def test_verify_cli_reconstructs_every_original_without_materialization(tmp_path
     assert result == json.loads(receipt.read_text())
     assert result["full_original_file_reconstruction_verified"] is True
     assert result["independently_reconstructed_files"] == result["source_files"] == published.manifest["source"]["files"]
+    if chunked:
+        # Full CLI recovery must select the canonical all-original verifier,
+        # not load another path list and hash chunk-only objects twice.
+        assert result['chunk_object_hash_fusion']['objects'] > 0
+        assert result['chunk_object_hash_fusion']['redundant_cold_read_bytes_avoided'] > 0
     assert result["materialized_verified"] is False
     assert result["proof_scope"] == "selected_fixed_packed_release_not_NAS_or_full_history"
     telemetry = json.loads(progress.read_text())

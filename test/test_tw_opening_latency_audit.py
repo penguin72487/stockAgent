@@ -35,6 +35,46 @@ def test_daily_audit_keeps_mis_failure_phase_and_unsent_scope_not_private_reques
     assert "mis_requests" not in kept and "must not copy" not in str(result)
 
 
+def test_postclose_symbol_forensics_reuses_original_assessment_without_rescanning_or_relabelling(tmp_path, monkeypatch):
+    from scripts import audit_tw_opening_latency as audit
+    from scripts import audit_tw_opening_symbol_status as symbols
+    from stockagent.data import tw_current_trading_universe as registry
+    calls = []
+    monkeypatch.setattr(registry, "load_current_universe", lambda _: {})
+    monkeypatch.setattr(symbols, "classify_symbols", lambda receipt, _: {
+        "contract": "opening_symbol_membership_and_source_evidence_v1", "session_date": receipt["session_date"],
+        "source_captured_at": receipt["captured_at_taipei"]})
+    def timeline(*args):
+        calls.append(1)
+        return {"state": "observed", "requested_count": 2309}
+    monkeypatch.setattr(symbols, "journal_symbol_timeline", timeline)
+    raw = json.dumps({"session_date": "2026-10-22", "captured_at_taipei": "2026-10-22T13:29:59+08:00"}).encode()
+    first = audit.postclose_symbol_forensics(receipt_bytes=raw, journal=tmp_path / "journal.jsonl",
+        output_root=tmp_path, observed_at=datetime.fromisoformat("2026-10-22T13:35:00+08:00"))
+    path = tmp_path / "first_postclose_symbols.json"
+    original = path.read_bytes()
+    later = audit.postclose_symbol_forensics(receipt_bytes=raw.replace(b"13:29:59", b"13:30:00"),
+        journal=tmp_path / "journal.jsonl", output_root=tmp_path,
+        observed_at=datetime.fromisoformat("2026-10-22T14:30:00+08:00"))
+    assert first == later and len(calls) == 1 and path.read_bytes() == original
+    assert "not_latest_source_state" in later["boundary"]
+    with pytest.raises(ValueError, match="postclose only"):
+        audit.postclose_symbol_forensics(receipt_bytes=raw, journal=tmp_path / "journal.jsonl",
+            output_root=tmp_path, observed_at=datetime.fromisoformat("2026-10-22T09:00:30+08:00"))
+
+
+def test_corrupt_retained_symbol_assessment_stays_visible_and_is_never_overwritten(tmp_path):
+    from scripts import audit_tw_opening_latency as audit
+    path = tmp_path / "first_postclose_symbols.json"
+    path.write_text('{"session_date":"wrong","contract":"unknown"}')
+    original = path.read_bytes()
+    raw = b'{"session_date":"2026-10-22"}'
+    with pytest.raises(ValueError, match="invalid retained"):
+        audit.postclose_symbol_forensics(receipt_bytes=raw, journal=tmp_path / "journal.jsonl",
+            output_root=tmp_path, observed_at=datetime.fromisoformat("2026-10-22T14:30:00+08:00"))
+    assert path.read_bytes() == original
+
+
 def test_asof_counts_keep_scope_unknown_and_no_first_print_distinct(tmp_path):
     path = tmp_path / "events.jsonl"
     write(path, [event("mis", 0, event="started"), event("shioaji_shared", 0, event="started"),
@@ -62,6 +102,64 @@ def test_asof_counts_keep_scope_unknown_and_no_first_print_distinct(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_new_standard_daily_audit_expires_proof_without_refreshing_it_from_delivery(tmp_path):
+    path = tmp_path / "proof.jsonl"
+    gate = int(datetime.fromisoformat("2026-10-13T09:00:00+08:00").timestamp() * 1000)
+    absent = {"symbol": "A", "state": "observed_no_first_print",
+              "no_first_print_observed_timestamp_ms": gate + 1000}
+    write(path, [event("source", 1500, [absent]), event("source", 19000, [absent])])
+    result = opening_coverage_milestones(path, "2026-10-13", ["A", "UNKNOWN"])
+    rows = {row["after_open_ms"]: row for row in result["milestones"]}
+    assert rows[11000]["last_trade_reference_standard"]["resolved_reference_candidate_count"] == 1
+    assert rows[20000]["observed_no_print_count"] == 1  # Kept historical observation, not readiness.
+    latest = rows[20000]["last_trade_reference_standard"]
+    assert latest["fresh_no_first_print_candidate_count"] == 0
+    assert latest["unresolved_reference_candidate_count"] == 2
+    assert latest["previous_trade_prices_verified"] is False
+
+
+@pytest.mark.parametrize("kind", ["direct", "shared", "trial", "future", "unknown", "stale"])
+def test_new_standard_daily_audit_only_credits_current_original_absence_clock(tmp_path, kind):
+    path = tmp_path / "proof.jsonl"
+    gate = int(datetime.fromisoformat("2026-10-13T09:00:00+08:00").timestamp() * 1000)
+    observation = {"symbol": "A", "state": "observed_no_first_print", "available": True,
+        "source": "twse_tpex:mis", "open_price": None, "simtrade": False,
+        "market_timestamp_ms": gate + 1000, "received_timestamp_ms": gate + 1200}
+    if kind == "shared":
+        observation["source"] = "twse_tpex:shared_opening_snapshot"
+    elif kind == "trial":
+        observation["simtrade"] = 1
+    elif kind == "future":
+        observation["no_first_print_observed_timestamp_ms"] = gate + 2000
+    elif kind == "unknown":
+        observation["state"] = "no_source_observation"
+    elif kind == "stale":
+        observation["market_timestamp_ms"] = gate - 1
+    write(path, [event("official_mis", 1500, [observation])])
+    result = opening_coverage_milestones(path, "2026-10-13", ["A"])
+    rows = {row["after_open_ms"]: row for row in result["milestones"]}
+    standard = rows[2000]["last_trade_reference_standard"]
+    assert standard["fresh_no_first_print_candidate_count"] == int(kind == "direct")
+    assert rows[20000]["last_trade_reference_standard"]["resolved_reference_candidate_count"] == 0
+
+
+def test_new_standard_daily_audit_does_not_invent_readiness_for_legacy_missing_proof(tmp_path):
+    path = tmp_path / "legacy.jsonl"
+    write(path, [event("source", 75, [{"symbol": "A", "state": "observed_no_first_print"}])])
+    row = opening_coverage_milestones(path, "2026-10-13", ["A"])["milestones"][0]
+    assert row["observed_no_print_count"] == 1
+    assert row["last_trade_reference_standard"]["resolved_reference_candidate_count"] == 0
+
+
+def test_new_standard_daily_audit_retains_valid_open_when_later_absence_expires(tmp_path):
+    path = tmp_path / "events.jsonl"
+    write(path, [event("source", 75, [{"symbol": "A", "state": "valid_open"}]),
+                event("source", 1500, [{"symbol": "A", "state": "observed_no_first_print"}])])
+    row = opening_coverage_milestones(path, "2026-10-13", ["A"])["milestones"][-1]
+    assert row["last_trade_reference_standard"]["resolved_reference_candidate_count"] == 1
+    assert row["last_trade_reference_standard"]["fresh_no_first_print_candidate_count"] == 0
+
+
 @pytest.mark.parametrize("bad", [None, {}, "broken", {"session_date": "2026-10-13"}])
 def test_malformed_evidence_remains_visible_as_degraded(tmp_path, bad):
     path = tmp_path / "events.jsonl"
@@ -70,6 +168,18 @@ def test_malformed_evidence_remains_visible_as_degraded(tmp_path, bad):
     assert result["state"] == "degraded"
     assert result["malformed_lines"] == 1
     assert result["milestones"][0]["unknown_count"] == 1
+
+
+@pytest.mark.parametrize("preceding_source", [False, True])
+def test_merged_event_cannot_inherit_or_invent_source_observations(tmp_path, preceding_source):
+    path = tmp_path / "merged.jsonl"
+    rows = [event("source", 10, [{"symbol": "A", "state": "valid_open"}])] if preceding_source else []
+    rows.append(event("merged", 20, [{"symbol": "B", "state": "valid_open"}]))
+    write(path, rows)
+    result = opening_coverage_milestones(path, "2026-10-13", list("AB"))
+    assert result["state"] == "degraded" and result["malformed_lines"] == 1
+    assert result["milestones"][0]["valid_open_count"] == int(preceding_source)
+    assert "merged" not in result["milestones"][0]["providers"]
 
 
 def test_preopen_other_day_and_naive_time_cannot_count_as_today(tmp_path):
@@ -448,6 +558,19 @@ def test_daily_module_import_does_not_load_discord_torch_or_provider(tmp_path):
         check=True, timeout=20)
 
 
+def test_daily_new_standard_analysis_does_not_initialize_a_provider_or_gpu(tmp_path):
+    import subprocess
+    import sys
+    source = tmp_path / "empty.jsonl"
+    source.write_text("")
+    subprocess.run([sys.executable, "-c",
+        "import sys; from pathlib import Path; "
+        "from scripts.audit_tw_opening_latency import opening_coverage_milestones; "
+        f"opening_coverage_milestones(Path({str(source)!r}), '2026-10-13', ['A']); "
+        "assert not ({'torch', 'services.discord_bot.bot', 'stockagent.live.quote_provider'} & sys.modules.keys())"],
+        check=True, timeout=20)
+
+
 def test_daily_native_units_are_read_only_observers_with_scoped_install():
     from pathlib import Path
     service = Path("deploy/systemd/stockagent-tw-opening-audit.service.in").read_text()
@@ -485,7 +608,10 @@ def test_phase_latency_separates_full_scope_delta_no_print_and_failures(tmp_path
     progress = {**base, "event": "coverage_progress", "measurement_clock": "provider_job_perf_counter_v1",
         "valid_open_count": 1, "observed_no_print_count": 1, "response_count": 2, "elapsed_ms": 12.5}
     stage = {"mis_requests": [{"http_headers_ms": 8., "body_read_ms": 1., "json_decode_ms": .5,
-        "row_decode_ms": .25, "http_session_origin": "validated_prewarm_exclusive_handoff"}], "mis_progress_spans": [{"callback_ms": 2.}],
+        "row_decode_ms": .25, "http_session_origin": "validated_prewarm_exclusive_handoff",
+        "request_index": 0, "enqueued_offset_ms": .1, "request_started_offset_ms": .2,
+        "headers_received_offset_ms": 8.2, "body_received_offset_ms": 9.2,
+        "decoded_rows_ready_offset_ms": 9.95}], "mis_progress_spans": [{"callback_ms": 2.}],
         "mis_span_policy": "nested_local_wall_spans_overlap_http_not_additive_v1"}
     write(path, [event("mis", 1, event="started", requested_scope_sha256=sha256(b"A\nB").hexdigest(), **base),
         event("mis", 14, **progress), event("mis", 20, event="finished", state="complete", last_total_ms=18.,
@@ -497,10 +623,11 @@ def test_phase_latency_separates_full_scope_delta_no_print_and_failures(tmp_path
         event("mis", 18000000, event="started", job_id="close", owner_pid=1, requested_count=2),
         event("mis", 18000010, event="finished", job_id="close", owner_pid=1, state="failed", last_total_ms=4200.)])
     result = opening_coverage_milestones(path, "2026-10-13", symbols)["provider_phase_latency"]
-    assert result["contract"] == "quote_phase_full_scope_per_job_latency_v2"
+    assert result["contract"] == "quote_phase_full_scope_per_job_latency_v3"
     opening = result["phases"]["opening"]["mis"]
     assert opening["full_scope_jobs"] == 1
     job = opening["jobs"][0]
+    assert job["first_observation_response_ms"] == job["observation_response_coverage_ms"]["1.0"] == 12.5
     assert job["first_valid_open_ms"] == job["resolved_coverage_ms"]["1.0"] == 12.5
     assert "1.0" not in job["positive_coverage_ms"]
     assert job["unknown_count"] == 0 and job["source_and_persistence_ms"] == 19.
@@ -517,3 +644,85 @@ def test_phase_latency_separates_full_scope_delta_no_print_and_failures(tmp_path
     assert quote_session_phase(datetime.fromisoformat("2026-10-13T01:00:00+00:00")) == "opening"
     with pytest.raises(ValueError, match="aware"):
         quote_session_phase(datetime(2026, 10, 13, 9))
+
+
+def test_full_raw_payload_with_stale_rows_is_not_full_validated_prices(tmp_path):
+    from hashlib import sha256
+    path = tmp_path / "raw-scope.jsonl"
+    base = {"job_id": "one", "owner_pid": 1, "requested_count": 2}
+    snapshot = full_snapshot(1200, ["A"], {"other_session_rows": ["B"]},
+        received_at_taipei="2026-10-13T09:00:01+08:00",
+        validated_at_taipei="2026-10-13T09:00:01.100+08:00")
+    snapshot.update(base)
+    write(path, [event("finmind_snapshot", 1, event="started",
+        requested_scope_sha256=sha256(b"A\nB").hexdigest(), **base), snapshot,
+        event("finmind_snapshot", 1300, event="coverage_progress",
+            measurement_clock="provider_job_perf_counter_v1", elapsed_ms=1290.,
+            valid_open_count=1, observed_no_print_count=0, response_count=1, **base),
+        event("finmind_snapshot", 1400, event="finished", state="complete", last_total_ms=1390., **base)])
+    group = opening_coverage_milestones(path, "2026-10-13", list("AB"))["provider_phase_latency"]["phases"]["opening"]["finmind_snapshot"]
+    job = group["jobs"][0]
+    assert group["full_raw_response_observed_jobs"] == 1
+    assert group["full_positive_observed_jobs"] == group["full_resolved_observed_jobs"] == 0
+    assert "1.0" not in job["observation_response_coverage_ms"]
+    raw = job["raw_payload_coverage"]
+    assert raw["response_count"] == 2 and raw["valid_open_count"] == 1 and raw["absent_count"] == 0
+    assert raw["rejected_counts"] == {"other_session_rows": 1}
+    assert raw["received_after_open_ms"] == 1000. and raw["validated_after_open_ms"] == 1100.
+    assert job["first_valid_open_ms"] == 1290. and not job["failure_reasons"]
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_phase_audit_reads_packed_observations_and_rejects_broken_layout(tmp_path, corrupt):
+    from stockagent.live.opening_price_journal import pack_observation_details
+    symbols = [f"A{i}" for i in range(128)]
+    rows = [{"symbol": symbol, "state": "valid_open", "source": "fixture", "open_price": 100.,
+        "available": True, "market_timestamp_ms": 1, "received_timestamp_ms": 2, "simtrade": False}
+        for symbol in symbols]
+    observation = event("source", 50, **pack_observation_details({"observations": rows}))
+    if corrupt:
+        observation["observations"][-1].pop()
+    path = tmp_path / "packed.jsonl"
+    write(path, [observation])
+    result = opening_coverage_milestones(path, "2026-10-13", symbols)
+    assert result["malformed_lines"] == int(corrupt)
+    assert result["milestones"][0]["valid_open_count"] == (0 if corrupt else 128)
+    assert result["state"] == ("degraded" if corrupt else "observed")
+
+
+@pytest.mark.parametrize("status,transport,error,expected", [
+    (403, {"http_failure_phase": "http_status"}, "HTTPError", "permission_or_subscription"),
+    (429, {}, "HTTPError", "provider_rate_limit"),
+    (None, {"mis_failure_phase_counts": {"connect_tls_or_response_headers": 4}}, None, "connection_or_headers_no_http_response"),
+    (None, {"mis_failure_phase_counts": {"schema_validation": 1}}, None, "response_body_or_validation"),
+    (None, {"mis_connection_prewarm": {"ready": False, "performed": True,
+        "elapsed_ms": 700., "error_type": "ConnectionError", "url": "never-retain"}}, "RuntimeError", "connection_or_headers_no_http_response"),
+    (None, {"http_failure_phase": "json_decode"}, "ValueError", "response_body_or_validation"),
+    (None, {"mis_http_error_statuses": None, "mis_failure_phase_counts": []}, None, "unclassified_failure_not_zero_latency"),
+])
+def test_phase_failure_classification_preserves_samples_without_guessing_network_cause(
+        tmp_path, status, transport, error, expected):
+    path = tmp_path / "failure.jsonl"
+    write(path, [event("source", 1, event="started", job_id="one", requested_count=1),
+        event("source", 100, event="finished", job_id="one", state="failed", last_total_ms=99.,
+            http_status=status, error_type=error, transport_timing=transport,
+            input_flush_policy="no_source_observations_consumer_retains_scope_barrier_v1")])
+    group = opening_coverage_milestones(path, "2026-10-13", ["A"])["provider_phase_latency"]["phases"]["opening"]["source"]
+    assert group["failure_reason_counts"] == {expected: 1}
+    assert group["source_duration_percentiles_ms"]["0.99"] == 99.
+    job = group["jobs"][0]
+    assert job["raw_payload_coverage"] is None and job["first_observation_response_ms"] is None
+    assert job["stage_timing"]["input_flush_policy"].startswith("no_source_observations")
+    assert "never-retain" not in json.dumps(group)
+
+
+def test_completed_partial_source_still_exposes_failed_requests(tmp_path):
+    path = tmp_path / "partial.jsonl"
+    write(path, [event("official_mis", 1, event="started", job_id="partial", requested_count=2),
+        event("official_mis", 100, event="finished", job_id="partial", state="complete", last_total_ms=99.,
+            transport_timing={"mis_failed_request_count": 1,
+                "mis_failure_phase_counts": {"connect_tls_or_response_headers": 1}})])
+    group = opening_coverage_milestones(path, "2026-10-13", list("AB"))["provider_phase_latency"]["phases"]["opening"]["official_mis"]
+    assert group["failed_or_degraded_jobs"] == 0  # Job completion is not full request success.
+    assert group["failure_reason_counts"] == {"connection_or_headers_no_http_response": 1}
+    assert group["source_duration_percentiles_ms"]["0.99"] == 99.

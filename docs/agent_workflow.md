@@ -85,6 +85,13 @@ stdout／stderr 留在完整 log；實際 exit code、開始／結束時間、bo
 留在原子寫入的收據。PID 重用或原 runner 消失會顯示 `interrupted`，不能推定成功。
 同名 run 尚在執行或結果未知時拒絕再啟動；需要先核對程序與既有工作狀態。
 
+2026-10-21 起，完成的命令另保存 `performance`：以 monotonic clock 記錄
+child launch 至 wait 結束的耗時，以及已回收 child 的 CPU／block I/O 計數差。
+它包含命令內的匯入與完整工作，排隊、最後收據落盤及脫離監督的 worker 另計；
+失敗命令同樣保留耗時。舊 UTC 起迄只能作 wall-clock 估計，不能冒充這個計時契約。
+跨下載、訓練、服務與儲存的可重測索引見
+[工作流測速基準](workflow_speed_baselines_2026-10-21.md)。
+
 如果 runner 中斷或未留下開始收據，先依原工作契約核對進度／checkpoint／來源。
 保存核對結果後執行下列命令，再用同一 task 和 run 名稱啟動相容的恢復指令：
 

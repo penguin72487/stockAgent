@@ -1039,6 +1039,16 @@ public static class TejBridgeNative {
         }
     }
     public static void WriteProgress(string path,string task,string attempt,string stage,int scanned,int total) {
+        WriteProgressCore(path,task,attempt,stage,scanned,total,null);
+    }
+    public static void WriteScopeProgress(string path,string task,string attempt,string phase) {
+        if(phase!="context_and_source_binding"&&phase!="field_selection"&&
+           phase!="company_universe_and_lookup"&&phase!="date_model_and_lookup"&&
+           phase!="company_selection_and_verification"&&phase!="date_selection_and_verification"&&
+           phase!="final_source_and_preview_guards")return;
+        WriteProgressCore(path,task,attempt,"preparing_scope",-1,-1,phase);
+    }
+    private static void WriteProgressCore(string path,string task,string attempt,string stage,int scanned,int total,string phase) {
         // Display-only, bounded metadata. No values, HWND, account or private
         // exception strings; no UI calls and no query-deadline renewal.
         if(String.IsNullOrEmpty(path)||!path.EndsWith(".json.progress.json")||
@@ -1049,6 +1059,7 @@ public static class TejBridgeNative {
         if(scanned>=0&&scanned<=total&&total<=10001){lastScanned=scanned;lastTotal=total;lastProgressPath=path;}
         string slots=scanned>=0&&scanned<=total&&total<=10001?
             ",\"scanned_row_slots\":"+scanned+",\"total_row_slots\":"+total:"";
+        if(phase!=null)slots+=",\"scope_phase\":\""+phase+"\"";
         string json="{\"contract\":\"tej_native_readback_progress_v1\",\"task_id\":\""+task+
             "\",\"attempt_id\":\""+attempt+"\",\"stage\":\""+stage+
             "\",\"observed_at_utc\":\""+DateTime.UtcNow.ToString("o")+"\""+slots+"}";
@@ -1223,7 +1234,11 @@ function Initialize-TejNativeHelper([string]$BridgeFile,[string]$CacheDirectory)
     function Digest-File([string]$path) {
         $sha=[Security.Cryptography.SHA256]::Create();$stream=$null
         try {
-            $stream=[IO.File]::OpenRead($path)
+            # SHA256.ComputeHash reads small blocks. Keep the exact byte check,
+            # but coalesce the physical reads and let Windows prefetch this
+            # sequential pass; do not memoize mutable runtime file metadata.
+            $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,
+                [IO.FileShare]::Read,1048576,[IO.FileOptions]::SequentialScan)
             return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-','').ToLowerInvariant()
         } finally {if($null -ne $stream){$stream.Dispose()};$sha.Dispose()}
     }
@@ -1298,7 +1313,16 @@ if($ExpectedTitle -cne ($titlePrefix+$ExpectedWorkbook) -and
    (-not $ExpectedTitle.StartsWith($titlePrefix,[StringComparison]::Ordinal) -or
     -not $ExpectedTitle.EndsWith(('\'+$ExpectedWorkbook),[StringComparison]::Ordinal))){throw 'Unreviewed wizard version or workbook'}
 if($requestDoc.fields.Count -lt 1 -or $requestDoc.fields.Count -gt 2000){throw 'Unreviewed field bound'}
-if($requestDoc.max_cells -lt 100 -or $requestDoc.max_cells -gt 400000 -or $requestDoc.max_rows -gt 10000){throw 'Unreviewed output bound'}
+if($requestDoc.max_cells -lt 100 -or $requestDoc.max_cells -gt 400000 -or $requestDoc.max_rows -lt 1 -or $requestDoc.max_rows -gt 10000){throw 'Unreviewed output bound'}
+$scopeRowBudget=[int]$requestDoc.max_rows
+if($null -ne $requestDoc.max_scope_rows -or $null -ne $requestDoc.query_scope_contract) {
+    if($requestDoc.query_scope_contract -cne 'bounded_scope_geometry_independent_native_readback_v1' -or
+       ($requestDoc.max_scope_rows -isnot [int] -and $requestDoc.max_scope_rows -isnot [long]) -or
+       $requestDoc.max_scope_rows -lt 1 -or $requestDoc.max_scope_rows -gt 50000) {
+        throw 'Unreviewed independent source scope budget'
+    }
+    if($requestDoc.source_key_mode -notin @(1,3)){$scopeRowBudget=[int]$requestDoc.max_scope_rows}
+}
 $mutex=[Threading.Mutex]::new($false,'Local\StockAgentTEJSmartWizardOwner')
 $owns=$false
 $querySubmissionPossible=$false
@@ -1308,6 +1332,12 @@ $progressPath=Join-Path (Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetDi
 function Write-DownloadProgress([string]$stage) {
     [TejBridgeNative]::WriteProgress($progressPath,[string]$requestDoc.task_id,
         [IO.Path]::GetFileNameWithoutExtension($Output),$stage,-1,-1)
+}
+function Write-ScopeProgress([string]$phase) {
+    if($requestDoc.action -in @('download','plan')) {
+        [TejBridgeNative]::WriteScopeProgress($progressPath,[string]$requestDoc.task_id,
+            [IO.Path]::GetFileNameWithoutExtension($Output),$phase)
+    }
 }
 $scopeClock=[Diagnostics.Stopwatch]::StartNew();$scopeLast=0.0;$scopeTimings=@{}
 $companyMembershipProof=$null
@@ -1320,6 +1350,7 @@ function Write-FlowTiming {
             query_attempt_id=$requestDoc.query_attempt_id;action=$requestDoc.action;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');phases=$flowTimings;
             native_helper_cache=$nativeCache;
+            prebridge_timing=$tejBridgeWrapperTiming;
             windows_bridge_seconds=$bridgeClock.Elapsed.TotalSeconds;
             windows_cpu_seconds=[Diagnostics.Process]::GetCurrentProcess().TotalProcessorTime.TotalSeconds}
         [TejBridgeNative]::WriteArtifact(($Output+'.flow.json'),($flow|ConvertTo-Json -Depth 4 -Compress))
@@ -1329,10 +1360,25 @@ function Stamp-ScopeTiming([string]$name) {
     $now=$scopeClock.Elapsed.TotalSeconds
     $scopeTimings[$name]=$now-$script:scopeLast;$script:scopeLast=$now
 }
+function Get-TejPreparationFailureCode([string]$message,[bool]$noticesAbsent) {
+    # Pure classification. Never inspect/acknowledge a dialog, repeat input or
+    # infer whether Preview was submitted. The catch's exact boundary does that.
+    if($message -cmatch 'SOURCE_BINDING_BEFORE_QUERY:'){return 'local_source_binding_failed_before_preview'}
+    if($message -cmatch 'DESKTOP_CONTEXT_BEFORE_QUERY:'){return 'desktop_context_unavailable_before_preview'}
+    if($message -cmatch 'DATE_INPUT_BEFORE_QUERY:') {
+        if($message -cmatch 'Foreground unavailable; no input sent|DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:'){
+            return 'desktop_foreground_unavailable_before_preview'
+        }
+        return 'local_date_input_failed_before_preview'
+    }
+    if($noticesAbsent -and $message -cmatch 'LOCAL_SELECTION_BEFORE_QUERY:'){return 'local_list_selection_failed_before_preview'}
+    if($noticesAbsent -and $message -cmatch 'QUERY_ACTIVATION_BEFORE_QUERY:'){return 'local_query_activation_failed_before_preview'}
+    return 'local_query_preparation_failed_before_preview'
+}
 try {
     $owns=$mutex.WaitOne(0)
     if(-not $owns){throw 'Another StockAgent desktop query owns this session'}
-    if($requestDoc.action -in @('download','plan')){Write-DownloadProgress 'preparing_scope'}
+    Write-ScopeProgress 'context_and_source_binding'
     try {
         [TejBridgeNative]::AssertControlScope($ExpectedWindow,$ExpectedWindow,$TejProcessId,$ExpectedTitle)
         $root=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$ExpectedWindow)
@@ -1555,11 +1601,23 @@ try {
             $h=[TejBridgeNative]::ExactButton($ExpectedWindow,$group.Current.NativeWindowHandle,$name,[int]::MinValue)
             Assert-Scope $h;return $h
         }
-        $prefix=@{'*BUTTON*'='WindowsForms10.BUTTON.';'*COMBOBOX*'='WindowsForms10.COMBOBOX.'}[$class]
-        if(-not $prefix){throw 'Unreviewed native control class'}
-        $matches=@(Native-Controls $group $prefix|Where-Object {([string]$_.Current.Name).Trim() -ceq $name})
-        if($matches.Count -ne 1){throw ('Ambiguous control: '+$name)}
-        Assert-Scope $matches[0].Current.NativeWindowHandle;return [long]$matches[0].Current.NativeWindowHandle
+        if($class -ceq '*COMBOBOX*') {
+            # Fresh native enumeration + exact UIA Name. A CacheRequest candidate
+            # improved isolated lookup but did NOT pass complete-workflow speed
+            # acceptance; retain its immutable benchmark, not a production flag.
+            # MSAA accName is not interchangeable with this provider's UIA Name.
+            $parent=$group.Current.NativeWindowHandle;Assert-Scope $parent
+            $matches=@(Native-Controls $group 'WindowsForms10.COMBOBOX.'|Where-Object {
+                ([string]$_.Current.Name).Trim() -ceq $name
+            })
+            if($matches.Count -ne 1){throw ('Ambiguous control: '+$name)}
+            $found=[long]$matches[0].Current.NativeWindowHandle
+            Assert-Scope $found
+            if(-not [TejBridgeNative]::IsChild([IntPtr]$parent,[IntPtr]$found) -or
+               -not [TejBridgeNative]::IsWindowVisible([IntPtr]$found)){throw 'Native widget scope changed'}
+            return $found
+        }
+        throw 'Unreviewed native control class'
     }
     function Message([long]$h,[uint32]$m,[long]$w=0,[long]$l=0) {Assert-Scope $h;return [TejBridgeNative]::Message($h,$m,$w,$l)}
     function Items([long]$h,[bool]$combo=$false) {Assert-Scope $h;return ,[TejBridgeNative]::Items($h,$combo)}
@@ -2133,6 +2191,7 @@ try {
     } else {Prepare-SourceBinding}
     $sourceKeyMode=Read-SourceKeyMode
     Stamp-ScopeTiming 'context_and_source_binding'
+    Write-ScopeProgress 'field_selection'
     if($requestDoc.action -eq 'download') {
         $plannedKeyMode=$(if($requestDoc.source_key_mode){[int]$requestDoc.source_key_mode}else{2})
         if($sourceKeyMode -ne $plannedKeyMode -or ($sourceKeyMode -eq 1 -and
@@ -2177,6 +2236,7 @@ try {
     $selectedFieldOrderVerified=$true
     $fieldBulkSelectionUsed=[TejBridgeNative]::LastSelectionMethod -ceq 'owned_multi_list_one_select_complete_readback_v1'
     Stamp-ScopeTiming 'field_selection'
+    Write-ScopeProgress 'company_universe_and_lookup'
     $company=Find-QueryGroup 'Company Setting';$companyLists=Lists $company
     if($companyLists.Count -ne 4){throw 'Unreviewed company list layout'}
     $sectorCombo=Sector-Control $company
@@ -2284,6 +2344,7 @@ try {
         }
     } else {$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle}
     Stamp-ScopeTiming 'company_universe_and_lookup'
+    Write-ScopeProgress 'date_model_and_lookup'
     $availableDates=@();$selectedDates=@();$dateLists=@()
     if($sourceKeyMode -ne 1) {
     $dates=Find-QueryGroup 'Date Setting'
@@ -2350,9 +2411,10 @@ try {
             date_axis=$(if($sourceKeyMode -eq 1){'observed_source_snapshot_no_historical_date_claim'}else{'requested_smart_wizard_grid_not_native_observation_dates'});provider_http_requests=$null;credentials_read=$false}
         if($sourceKeyMode -eq 1){$payload.source_key_mode=1;$payload.key_layout_contract='native_company_observed_snapshot_key1_v1'}
     } else {
+        Write-ScopeProgress 'company_selection_and_verification'
         if($requestDoc.company_labels.Count -lt 1 -or ($sourceKeyMode -ne 1 -and $requestDoc.date_labels.Count -lt 1)){throw 'Empty query grid'}
         $expectedRows=$requestDoc.company_labels.Count*$(if($sourceKeyMode -eq 1){1}else{$requestDoc.date_labels.Count})
-        if($expectedRows -gt $requestDoc.max_rows -or ($expectedRows+1)*($requestDoc.fields.Count+$sourceKeyMode) -gt $requestDoc.max_cells){throw 'Query exceeds reviewed memory/cell bound'}
+        if($expectedRows -gt $scopeRowBudget -or ($expectedRows+1)*($requestDoc.fields.Count+$sourceKeyMode) -gt $requestDoc.max_cells){throw 'Query exceeds reviewed memory/cell bound'}
         if($sourceKeyMode -ne 1){[TejBridgeNative]::WaitSelectedList($ExpectedWindow,$dateLists[1].Current.NativeWindowHandle,0,$null)}
         # Fresh complete source-bound destination read, not cached permission.
         # Keep lookup and final full company/date/field verification unchanged.
@@ -2377,6 +2439,7 @@ try {
         $selectedCompanies=Items $companyLists[3].Current.NativeWindowHandle
         if(-not [TejBridgeNative]::SameItems([string[]]$selectedCompanies,[string[]]$requestDoc.company_labels)){throw 'LOCAL_SELECTION_BEFORE_QUERY: Company selection mismatch'}
         Stamp-ScopeTiming 'company_selection_and_verification'
+        Write-ScopeProgress 'date_selection_and_verification'
         if($sourceKeyMode -ne 1) {
         if($requestDoc.date_labels.Count -eq $availableDateCount) {
             Click-Button $dates 'Select All'
@@ -2392,6 +2455,7 @@ try {
         if(-not [TejBridgeNative]::SameItems([string[]]$selectedDates,[string[]]$requestDoc.date_labels)){throw 'LOCAL_SELECTION_BEFORE_QUERY: Date selection mismatch'}
         }
         Stamp-ScopeTiming 'date_selection_and_verification'
+        Write-ScopeProgress 'final_source_and_preview_guards'
         # Avoid the advanced settings/Excel-range modes. Source values only.
         $main=$root
         if($sourceKeyMode -ne 1){[void](Set-Checkbox $main 'Adv. Date Option' $false)}
@@ -2499,12 +2563,18 @@ try {
     if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
        -not (Test-Path -LiteralPath ($Output+'.stage.json')) -and
        -not (Test-Path -LiteralPath ($Output+'.outcome.json'))) {
+        $failureText=$_.Exception.ToString();$noticesAbsent=$false
+        if($failureText -cmatch 'LOCAL_SELECTION_BEFORE_QUERY:|QUERY_ACTIVATION_BEFORE_QUERY:') {
+            try{$noticesAbsent=[TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0}catch{}
+        }
         $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
             query_attempt_id=$requestDoc.query_attempt_id;type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='download';market_data_query_submission_possible=$false;
-            error_code=$(if($_.Exception.ToString().Contains('SOURCE_BINDING_BEFORE_QUERY:')){
-                'local_source_binding_failed_before_preview'}else{'local_query_preparation_failed_before_preview'});
+            error_code=(Get-TejPreparationFailureCode $failureText $noticesAbsent);
             observed_at_utc=[DateTime]::UtcNow.ToString('o')}
+        if($outcome.error_code -ceq 'local_list_selection_failed_before_preview' -and $null -ne $companyMembershipProof){
+            $outcome.company_membership_sha256=$companyMembershipProof
+        }
         # A failed UNC publication must not erase a pre-Preview negative
         # attestation. The admitted Python owner validates the exact attempt,
         # code hash, clock and scope before persisting it from Linux instead.
@@ -2528,41 +2598,6 @@ try {
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             action='plan';market_data_query_submission_possible=$false;
             error_code='metadata_preparation_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
-    }
-    if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
-       $_.Exception.ToString().Contains('DESKTOP_CONTEXT_BEFORE_QUERY:')) {
-        $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
-            type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
-            action='download';market_data_query_submission_possible=$false;
-            error_code='desktop_context_unavailable_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
-    }
-    if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
-       $_.Exception.ToString().Contains('DATE_INPUT_BEFORE_QUERY:')) {
-        $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
-            type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
-            action='download';market_data_query_submission_possible=$false;
-            error_code=$(if($_.Exception.ToString().Contains('Foreground unavailable; no input sent') -or
-                           $_.Exception.ToString().Contains('DATE_FOCUS_AVAILABILITY_BEFORE_INPUT:')){
-                'desktop_foreground_unavailable_before_preview'}else{'local_date_input_failed_before_preview'});observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
-    }
-    if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
-       $_.Exception.ToString().Contains('LOCAL_SELECTION_BEFORE_QUERY:') -and [TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0) {
-        $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
-            type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
-            action='download';market_data_query_submission_possible=$false;
-            error_code='local_list_selection_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
-        if($null -ne $companyMembershipProof){$outcome.company_membership_sha256=$companyMembershipProof}
-        [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
-    }
-    if($requestDoc.action -eq 'download' -and -not $querySubmissionPossible -and
-       $_.Exception.ToString().Contains('QUERY_ACTIVATION_BEFORE_QUERY:') -and [TejBridgeNative]::Dialogs($ExpectedWindow).Count -eq 0) {
-        $outcome=@{contract_version=4;provider='tej_smart_wizard';task_id=$requestDoc.task_id;
-            type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
-            action='download';market_data_query_submission_possible=$false;
-            error_code='local_query_activation_failed_before_preview';observed_at_utc=[DateTime]::UtcNow.ToString('o')}
         [TejBridgeNative]::WriteArtifact(($Output+'.outcome.json'),($outcome|ConvertTo-Json -Depth 3 -Compress))
     }
     throw

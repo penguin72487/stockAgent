@@ -236,6 +236,9 @@ def test_actual_exit_code_stdout_stderr_and_literal_arguments(workflow, monkeypa
     assert workflow.execute(record["run_id"]) == 7
     result = workflow.read(workflow.run_path(record["run_id"]))
     assert result["state"] == "failed" and result["exit_code"] == 7
+    assert result["performance"]["wall_seconds"] > 0
+    assert result["performance"]["elapsed_nanoseconds"] > 0
+    assert result["performance"]["child_cpu_user_seconds"] >= 0
     log = Path(result["log"]).read_text()
     assert payload in log and "stderr retained" in log
     assert not (workflow.root / "SHOULD_NOT_EXIST").exists()
@@ -253,6 +256,18 @@ def test_runtime_alias_uses_selected_python_and_duplicate_execution_is_rejected(
     assert sys.executable in Path(record["log"]).read_text()
     with pytest.raises(ValueError, match="already executed"):
         workflow.execute(record["run_id"])
+
+
+def test_command_duration_uses_monotonic_clock_when_wall_clock_moves_back(workflow, monkeypatch):
+    record = prepare_run(workflow, monkeypatch, [sys.executable, "-c", "pass"])
+    stamps = iter(["2026-10-21T10:00:00+00:00", "2026-10-21T09:00:00+00:00"])
+    monkeypatch.setattr(workflow_module, "now", lambda: next(stamps))
+    monotonic = iter([10_000_000_000, 10_250_000_000])
+    monkeypatch.setattr(workflow_module.time, "perf_counter_ns", lambda: next(monotonic))
+    assert workflow.execute(record["run_id"]) == 0
+    result = workflow.read(workflow.run_path(record["run_id"]))
+    assert result["finished_at_utc"] < result["started_at_utc"]
+    assert result["performance"]["wall_seconds"] == .25
 
 
 def test_failed_command_can_retry_without_erasing_failure(workflow, monkeypatch):

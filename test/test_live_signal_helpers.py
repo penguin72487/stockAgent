@@ -273,11 +273,14 @@ def test_historical_opening_panel_slices_before_factorized_coverage_gate(monkeyp
         close_prices=np.array([[100.], [101.], [102.]], dtype=np.float32))
     config = SimpleNamespace(data=SimpleNamespace(parquet_root="unused", factorized_feature_manifest="manifest"))
     monkeypatch.setattr(signal_engine, "require_live_feature_source", lambda *_: None)
-    monkeypatch.setattr(signal_engine, "live_tw_public_source_read_guard", lambda *_: nullcontext())
+    monkeypatch.setattr(signal_engine, "live_tw_public_source_read_guard", lambda *_, **kw: nullcontext())
     monkeypatch.setattr(signal_engine, "_build_panel_from_stable_source", lambda *a, **kw: (panel, True, "disk"))
     seen = []
 
-    def attach(value, *_):
+    def attach(value, *_, panel_end_date=None):
+        from stockagent.data.panel import slice_panel_end
+        if panel_end_date is not None:
+            value = slice_panel_end(value, panel_end_date)
         days = [str(day) for day in value.dates]
         if "2026-10-19" in days:
             raise ValueError("projection unavailable for the unneeded later session")
@@ -291,6 +294,118 @@ def test_historical_opening_panel_slices_before_factorized_coverage_gate(monkeyp
     assert len(panel.dates) == 3  # The shared base/cache remains unchanged.
     with pytest.raises(ValueError, match="unneeded later session"):
         signal_engine._build_panel(config, live_tail=True)
+
+
+def test_bounded_factorized_attachment_reuses_owner_and_rechecks_members(monkeypatch, tmp_path):
+    from collections import OrderedDict
+    from stockagent.data import factorized_panel
+
+    panel = PanelData(
+        dates=np.array(["2026-10-15", "2026-10-16", "2026-10-19"], dtype="datetime64[D]"),
+        symbols=["2330"], feature_names=["base"],
+        features=np.arange(3, dtype=np.float32).reshape(3, 1, 1),
+        returns_1d=np.zeros((3, 1), dtype=np.float32),
+        tradable_mask=np.ones((3, 1), dtype=bool), alive_mask=np.ones((3, 1), dtype=bool),
+        benchmark_returns=np.zeros(3, dtype=np.float32),
+        close_prices=np.full((3, 1), 100., dtype=np.float32))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("valid")
+    config = SimpleNamespace(data=SimpleNamespace(
+        factorized_feature_manifest=str(manifest), factorized_host_cache_bytes=4096))
+    monkeypatch.setattr(signal_engine, "_LIVE_FACTORIZED_PANEL_CACHE", OrderedDict())
+    monkeypatch.setattr(signal_engine, "_factorized_member_signatures", lambda p: (p.read_text(),))
+    calls = []
+
+    def attach(value, *_a, **_kw):
+        calls.append(tuple(value.dates))
+        if manifest.read_text() != "valid":
+            raise ValueError("member identity mismatch")
+        if str(value.dates[-1]) > "2026-10-16":
+            raise ValueError("projection unavailable")
+        return value
+
+    monkeypatch.setattr(factorized_panel, "attach_factorized_live_features", attach)
+    first = signal_engine._cached_factorized_live_panel(panel, config, panel_end_date="2026-10-16")
+    second = signal_engine._cached_factorized_live_panel(panel, config, panel_end_date="2026-10-16")
+    assert first is second and len(calls) == 1
+    older = signal_engine._cached_factorized_live_panel(panel, config, panel_end_date="2026-10-15")
+    assert len(older.dates) == 1 and len(calls) == 2
+    with pytest.raises(ValueError, match="projection unavailable"):
+        signal_engine._cached_factorized_live_panel(panel, config)
+    manifest.write_text("corrupt")
+    with pytest.raises(ValueError, match="member identity mismatch"):
+        signal_engine._cached_factorized_live_panel(panel, config, panel_end_date="2026-10-16")
+    assert len(panel.dates) == 3
+
+
+def test_factorized_member_scan_matches_full_resolve_and_rechecks_changes(tmp_path):
+    from stockagent.data.factorized_panel import factorized_member_proofs
+
+    data = tmp_path / "data"
+    data.mkdir()
+    first, second = data / "first", data / "second"
+    first.write_bytes(b"abc")
+    second.write_bytes(b"def")
+    (tmp_path / "parent").symlink_to(data, target_is_directory=True)
+    (tmp_path / "alias").symlink_to(first)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"common": {"path": "parent/first"}, "blocks": [
+        {"path": "data/second"}, {"path": "alias"}, {"path": "data/../data/first"}]}))
+
+    def oracle():
+        paths = [manifest, *[manifest.parent / p["path"]
+                            for p in factorized_member_proofs(json.loads(manifest.read_text()))]]
+        return tuple((str(p.resolve()), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                     for p in paths for s in [p.stat()])
+
+    before = signal_engine._factorized_member_signatures(manifest)
+    assert before == oracle() and len(before) == 5
+    # In-place, same-size corruption must invalidate an existing attachment.
+    first.write_bytes(b"xyz")
+    after = signal_engine._factorized_member_signatures(manifest)
+    assert after == oracle() and after != before
+    # A final-component symlink retarget must not reuse a cached target.
+    (tmp_path / "alias").unlink()
+    (tmp_path / "alias").symlink_to(second)
+    assert signal_engine._factorized_member_signatures(manifest) == oracle()
+    assert signal_engine._factorized_member_signatures(manifest) != after
+
+
+@pytest.mark.parametrize("dangling_symlink", [False, True])
+def test_factorized_member_scan_rejects_missing_members(tmp_path, dangling_symlink):
+    member = tmp_path / "missing"
+    if dangling_symlink:
+        member.symlink_to(tmp_path / "absent_target")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"common": {"path": member.name}, "blocks": []}))
+    with pytest.raises(FileNotFoundError):
+        signal_engine._factorized_member_signatures(manifest)
+
+
+def test_factorized_member_scan_fences_parent_retarget_during_scan(monkeypatch, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for parent in (first, second):
+        (parent / "member").write_bytes(b"same bytes different generation")
+    link = tmp_path / "current"
+    link.symlink_to(first, target_is_directory=True)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"common": {"path": "current/member"}, "blocks": []}))
+    original = os.lstat
+
+    def retarget(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if os.fspath(path) == str(first / "member"):
+            link.unlink()
+            link.symlink_to(second, target_is_directory=True)
+        return result
+
+    with monkeypatch.context() as scope:
+        scope.setattr(signal_engine.os, "lstat", retarget)
+        with pytest.raises(RuntimeError, match="parent changed"):
+            signal_engine._factorized_member_signatures(manifest)
+    assert signal_engine._factorized_member_signatures(manifest)[1][0] == str(second / "member")
 
 
 def test_day_trade_quote_coverage_does_not_require_every_symbol_to_trade() -> None:

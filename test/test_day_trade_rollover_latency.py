@@ -49,6 +49,21 @@ def test_unverified_calendar_does_not_invent_a_session(calendar, monkeypatch):
     assert not clock["calendar_verified"]
 
 
+def test_public_engine_generation_is_opaque_and_changes_across_restarts(calendar, tmp_path, monkeypatch):
+    receipt = {"engine_run_id": "private-engine-id", "state_revision": 12, "content_revision": 8}
+    monkeypatch.setattr(dashboard, "load_service_sync", lambda _: dict(receipt))
+    first = dashboard.build_dashboard_revision(state_dir=tmp_path, now=at("2026-10-22T09:00:00"))
+    assert len(first["engine_generation"]) == 32
+    assert "private-engine-id" not in json.dumps(first)
+    receipt["engine_run_id"] = "another-private-engine-id"
+    second = dashboard.build_dashboard_revision(state_dir=tmp_path, now=at("2026-10-22T09:00:00"))
+    assert first["engine_generation"] != second["engine_generation"]
+    assert first["state_revision"] == second["state_revision"]
+    for invalid in (None, 1, {}, ""):
+        receipt["engine_run_id"] = invalid
+        assert dashboard.build_dashboard_revision(state_dir=tmp_path, now=at("2026-10-22T09:00:00"))["engine_generation"] is None
+
+
 def test_rollover_invalidates_revision_and_date_cache_without_writes(calendar, tmp_path):
     state = {"modes": {"a": {"session_date": "2026-09-08"}}}
     before = at("2026-09-09T08:29:59")

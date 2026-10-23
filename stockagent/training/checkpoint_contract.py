@@ -2512,8 +2512,11 @@ def _checkpoint_manifest(
     config: ExperimentConfig,
     *,
     include_data_content: bool = True,
+    _model_scope_only: bool = False,
 ) -> dict[str, Any]:
     """Build a portable, content-addressed checkpoint compatibility manifest."""
+    if _model_scope_only and include_data_content:
+        raise ValueError("A model-scope manifest cannot include training data content")
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
     carry_resume_compatible_release_ids: tuple[str, ...] = ()
     effective_short_open = (
@@ -2536,7 +2539,7 @@ def _checkpoint_manifest(
         if panel.force_exit_mask is not None
         else np.zeros_like(panel.tradable_mask, dtype=bool)
     )
-    schema_2_force_exit_compatible = not bool(
+    schema_2_force_exit_compatible = _model_scope_only or not bool(
         np.asarray(effective_force_exit, dtype=bool).any()
     )
     if include_data_content:
@@ -3145,6 +3148,36 @@ def _checkpoint_manifest(
         schema_4_with_inactive_causal_feature_fields_fingerprints["model"] = (
             _stable_fingerprint(historical_model_contract)
         )
+    if _model_scope_only:
+        # Build the exact same current/compatible fingerprints, not a cached
+        # acceptance decision. Model-scope validation never consumes training,
+        # labels, evaluation or resume contracts. Legacy checkpoint schemas
+        # still use the full builder through build_inference_checkpoint_manifest.
+        return {
+            "schema_version": 4,
+            "validation_scope": "model",
+            "contracts": {"data": data_contract, "model": model_contract},
+            "fingerprints": {
+                "data_schema": _stable_fingerprint(data_schema_contract),
+                "model": _stable_fingerprint(model_contract),
+            },
+            "compatibility_fingerprints": {
+                "schema_4_pre_external_feature_source": {
+                    name: value
+                    for name, value in schema_4_pre_external_source_fingerprints.items()
+                    if name == "data_schema"
+                },
+                "schema_4_pre_projection_l1_active_count_scale": (
+                    schema_4_pre_projection_scale_fingerprints
+                ),
+                "schema_4_with_inactive_futures_fields": (
+                    schema_4_with_inactive_futures_fields_fingerprints
+                ),
+                "schema_4_with_inactive_causal_feature_fields": (
+                    schema_4_with_inactive_causal_feature_fields_fingerprints
+                ),
+            },
+        }
     schema_3_model_contract = {
         "model_name": active_model.get("contract_name", active_model["config_name"]),
         "model": _schema_3_checkpoint_model_values(active_model),
@@ -3482,6 +3515,9 @@ def _validate_checkpoint_manifest(
     }
     if normalized_scope not in scopes:
         raise ValueError(f"Unknown checkpoint validation scope: {scope!r}")
+    model_scope_only = expected.get("validation_scope") == "model"
+    if model_scope_only and normalized_scope not in {"inference", "model"}:
+        raise ValueError("A model-scope manifest cannot validate resume or artifacts")
 
     actual = checkpoint.get("experiment_manifest")
     continuation = expected.get("contracts", {}).get("training", {}).get("fold_continuation", {})
@@ -3490,6 +3526,8 @@ def _validate_checkpoint_manifest(
         "day_trade_annual_episode_sharding",
     ))
     if actual is None:
+        if model_scope_only:
+            raise RuntimeError("A model-scope manifest requires a schema-4 checkpoint")
         if normalized_scope in {"resume", "artifact"} and new_day_trade_training:
             raise RuntimeError(
                 "Legacy checkpoint cannot resume the new day-trade training contract; "
@@ -3545,6 +3583,8 @@ def _validate_checkpoint_manifest(
             f"{actual_schema}: {checkpoint_path}. This runtime supports schemas 1 through 4; "
             "use a runtime that understands the saved schema instead of guessing compatibility."
         )
+    if model_scope_only and actual_schema != 4:
+        raise RuntimeError("A model-scope manifest requires a schema-4 checkpoint")
     if actual_schema < 4 and normalized_scope in {"resume", "artifact"}:
         if new_day_trade_training:
             raise RuntimeError(
@@ -3675,7 +3715,7 @@ def _validate_checkpoint_manifest(
                 "schema_4_pre_lookback_context",
                 {},
             )
-            if actual_fingerprints.get("walk_forward") == pre_context.get(
+            if "walk_forward" in pre_context and actual_fingerprints.get("walk_forward") == pre_context.get(
                 "walk_forward"
             ):
                 expected_fingerprints = dict(expected_fingerprints)
@@ -3694,7 +3734,7 @@ def _validate_checkpoint_manifest(
                 ),
             ):
                 candidate = compatibility.get(compatibility_key, {})
-                if actual_fingerprints.get(layer) == candidate.get(layer):
+                if layer in candidate and actual_fingerprints.get(layer) == candidate.get(layer):
                     expected_fingerprints[layer] = candidate[layer]
             source_extensions = compatibility.get(
                 "schema_4_physical_source_domain_extensions", ()
@@ -3706,6 +3746,7 @@ def _validate_checkpoint_manifest(
             for candidate in source_extensions:
                 if (
                     isinstance(candidate, Mapping)
+                    and "data" in candidate
                     and actual_fingerprints.get("data") == candidate.get("data")
                 ):
                     # This candidate is emitted only by the current receipt-
@@ -4000,6 +4041,31 @@ def build_checkpoint_manifest(
     """Build the canonical semantic manifest persisted with checkpoints."""
     return _checkpoint_manifest(
         panel, config, include_data_content=include_data_content
+    )
+
+
+def build_inference_checkpoint_manifest(
+    panel: PanelData,
+    config: ExperimentConfig,
+    *,
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recompute current model-scope semantics; retain the full legacy oracle.
+
+    This is an expected-validation manifest, never a persisted checkpoint or a
+    training-resume manifest. Runtime/environment-dependent model fields are
+    rebuilt on every request, just as in the complete builder.
+    """
+    actual = checkpoint.get("experiment_manifest")
+    try:
+        schema = int(actual.get("schema_version", 1)) if isinstance(actual, Mapping) else None
+    except (TypeError, ValueError):
+        schema = None
+    return _checkpoint_manifest(
+        panel,
+        config,
+        include_data_content=False,
+        _model_scope_only=schema == 4,
     )
 
 

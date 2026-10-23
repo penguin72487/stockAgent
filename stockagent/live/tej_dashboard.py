@@ -10,17 +10,22 @@ import re
 import shutil
 import sqlite3
 from statistics import median
+import time
 from typing import Any
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 STATUS_CACHE_SECONDS = 4.0
 STATUS_REFRESH_SECONDS = 5
+METADATA_READ_BUDGET_SECONDS = 2.0
 PROGRESS_CONTRACT = 'tej_native_readback_progress_v1'
-PROGRESS_STAGES = frozenset({'preparing_scope', 'awaiting_preview', 'reading_preview',
+PROGRESS_STAGES = frozenset({'initializing_runtime', 'preparing_scope', 'awaiting_preview', 'reading_preview',
                             'response_saved', 'validating_and_saving'})
+SCOPE_PHASES = frozenset({'context_and_source_binding', 'field_selection', 'company_universe_and_lookup',
+                         'date_model_and_lookup', 'company_selection_and_verification',
+                         'date_selection_and_verification', 'final_source_and_preview_guards'})
 SCHEDULER_STATES = frozenset({'starting', 'executing', 'between_tasks', 'waiting_local_retry', 'waiting_desktop',
     'waiting_queue', 'waiting_storage', 'waiting_owner', 'waiting_metadata', 'waiting_recovery', 'recovering_response',
-    'replaying_authorized', 'recovering_metadata', 'stopped'})
+    'replaying_authorized', 'recovering_metadata', 'refreshing_priorities', 'stopped'})
 SCHEDULER_REASONS = frozenset({'desktop_interface_recovery_required', 'inflight_requires_recovery',
     'unknown_outcome_no_auto_retry', 'source_validation_failed', 'local_storage_failed',
     'source_key_layout_replan_required', 'date_input_prequery_needs_review',
@@ -45,6 +50,12 @@ def _read(root: Path) -> sqlite3.Connection:
     con = sqlite3.connect((root / "queue.sqlite3").resolve().as_uri() + "?mode=ro", uri=True, timeout=.25)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA query_only=ON")
+    # DELETE-journal readers can block the collector's commit.  Bound the
+    # entire snapshot, not just SQLite's lock wait, including cold/slow I/O.
+    # The caller closes this connection on interruption; partial counts are
+    # never presented as a valid snapshot or carried into a new transaction.
+    deadline = time.monotonic() + METADATA_READ_BUDGET_SECONDS
+    con.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
     return con
 
 
@@ -194,6 +205,7 @@ def _current_task_public(root: Path, task: dict | None, worker: dict, alive: boo
              'started_at_utc': started.isoformat() if started else None,
              'elapsed_seconds': max(0, (observed-started).total_seconds()) if started else None,
              'query_work_rows': task['work_rows'], 'stage': 'awaiting_progress',
+             'scope_phase': None,
              'progress_observed_at_utc': None, 'readback_scanned_row_slots': None,
              'readback_total_row_slots': None, 'readback_ratio': None,
              'adopted': False, 'progress_stale': False}
@@ -214,6 +226,9 @@ def _current_task_public(root: Path, task: dict | None, worker: dict, alive: boo
         return value
     value.update(stage=progress['stage'], progress_observed_at_utc=clock.isoformat(),
                  progress_stale=(observed-clock).total_seconds() > 30)
+    phase = progress.get('scope_phase')
+    if progress['stage'] == 'preparing_scope' and isinstance(phase, str) and phase in SCOPE_PHASES:
+        value['scope_phase'] = phase
     scanned, total = progress.get('scanned_row_slots'), progress.get('total_row_slots')
     if (type(scanned) is int and type(total) is int and 0 <= scanned <= total <= 10001
             and progress['stage'] in {'reading_preview', 'response_saved', 'validating_and_saving'}):

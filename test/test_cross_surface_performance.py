@@ -86,6 +86,56 @@ def test_producer_and_discord_select_the_same_execution_return_source(tmp_path, 
         assert result["strategy_return"] == pytest.approx(producer["strategy_return"])
 
 
+def test_recent_return_cache_revalidates_file_membership_and_does_not_share_mutable_results(tmp_path, monkeypatch):
+    from stockagent.live import market_status
+    target = tmp_path / "daily_portfolio_returns.parquet"
+    frame = pl.DataFrame({"date": ["2026-09-09"], "portfolio_return": [math.log1p(0.1)], "benchmark_return": [0.0]})
+    frame.write_parquet(target)
+    reads = []
+    original = pl.read_parquet
+
+    def read(path, *args, **kwargs):
+        reads.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(pl, "read_parquet", read)
+    market_status._cumulative_recent_returns_cached.cache_clear()
+    first = cumulative_recent_returns(tmp_path, window_days=32)
+    first["strategy_return"] = 99
+    assert cumulative_recent_returns(tmp_path, window_days=32)["strategy_return"] == pytest.approx(0.1)
+    assert len(reads) == 1
+    replacement = target.with_suffix(".new")
+    frame.with_columns(pl.lit(math.log1p(0.2)).alias("portfolio_return")).write_parquet(replacement)
+    replacement.replace(target)
+    assert cumulative_recent_returns(tmp_path, window_days=32)["strategy_return"] == pytest.approx(0.2)
+    frame.with_columns(pl.lit(-math.inf).alias("portfolio_return")).write_parquet(tmp_path / "integer_share_daily_portfolio_returns.parquet")
+    assert cumulative_recent_returns(tmp_path, window_days=32)["strategy_return"] == -1.0
+    assert cumulative_recent_returns(tmp_path, window_days=32, prefer_integer=False)["strategy_return"] == pytest.approx(0.2)
+    assert len(reads) == 3
+
+
+def test_recent_return_cache_rejects_concurrent_change_and_does_not_cache_failure(tmp_path, monkeypatch):
+    from stockagent.live import market_status
+    target = tmp_path / "daily_portfolio_returns.parquet"
+    frame = pl.DataFrame({"date": ["2026-09-09"], "portfolio_return": [0.0], "benchmark_return": [0.0]})
+    frame.write_parquet(target)
+    original = pl.read_parquet
+    market_status._cumulative_recent_returns_cached.cache_clear()
+    changed = False
+
+    def read(path, *args, **kwargs):
+        nonlocal changed
+        value = original(path, *args, **kwargs)
+        if not changed:
+            changed = True
+            frame.with_columns(pl.lit(math.log1p(0.3)).alias("portfolio_return")).write_parquet(target)
+        return value
+
+    monkeypatch.setattr(pl, "read_parquet", read)
+    assert cumulative_recent_returns(tmp_path, window_days=32) is None
+    assert cumulative_recent_returns(tmp_path, window_days=32)["strategy_return"] == pytest.approx(0.3)
+
+
 def test_risk_does_not_hide_total_loss():
     risk = bot._risk_adjusted_metrics_from_simple_returns([-1.0, 0.1])
     assert risk["max_drawdown"] == -1.0

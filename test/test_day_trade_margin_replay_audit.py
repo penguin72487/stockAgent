@@ -13,8 +13,14 @@ from scripts.audit_tw_day_trade_margin_replay import (
     _verify_calendar_coverage, _claim_matches_source, _verified_action_sources,
     _with_verified_share_volume,
     _selected_replay_source_bars,
+    _audit_source_bar_projection,
+    _full_0901_price_only_sources,
+    _is_verified_full_0901_price_only_entry,
 )
-from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
+from stockagent.live.tw_day_trade_simulation import (
+    MARGIN_CARRY_CONTRACT,
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+)
 
 
 def test_audit_uses_pinned_symbol_session_source_not_overlapping_chunk():
@@ -31,6 +37,98 @@ def test_audit_uses_pinned_symbol_session_source_not_overlapping_chunk():
     # Old receipts have no symbol pins: disagreements must remain visible.
     assert _selected_replay_source_bars(frame, None).height == 3
     assert _selected_replay_source_bars(frame, {}).height == 0
+
+
+def _price_only_opening_fixture():
+    day = "2026-09-01"
+    path = "/source/minute_chunks/009802/2026-08-07_2026-09-01.parquet"
+    source = f"local_minute_parquet_0901_minute_close:{path}"
+    witness = dict(symbol="009802", quote_at=f"{day}T09:01:00+08:00",
+                   source=source, execution_price_0901=19.35,
+                   tick_volume_units_0901=0.,
+                   source_window_start=f"{day}T09:00:00+08:00",
+                   source_window_end=f"{day}T09:00:59+08:00")
+    bar = dict(symbol="009802", minute_key=f"{day}T09:01", close=19.35,
+               low=19.3, high=19.4, volume_shares=0., _source_path=path)
+    fill = dict(symbol="009802", session_date=day, purpose="entry", price=19.35,
+                fill_at=f"{day}T09:01:00+08:00", recorded_at=f"{day}T09:01:00+08:00",
+                fill_contract=REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                simulation_only=True, simulation_replay=True,
+                counterfactual_0901_price_fill=True, synthetic_fill=False,
+                entry_price_method="minute_close", entry_price_source=source)
+    return witness, bar, fill
+
+
+def test_full_0901_price_only_audit_uses_exact_opening_owner_not_intraday_tape():
+    witness, bar, fill = _price_only_opening_fixture()
+    frame = pl.DataFrame([bar, bar | {"_source_path": "/intraday", "close": 19.4}])
+    pins = {(fill["session_date"], fill["symbol"]): frozenset({"/intraday"})}
+    assert _selected_replay_source_bars(frame, pins)["close"].to_list() == [19.4]
+    prices = _full_0901_price_only_sources(frame, [witness])
+    assert _is_verified_full_0901_price_only_entry(fill, prices, full_target=True)
+    assert not _is_verified_full_0901_price_only_entry(fill, prices, full_target=False)
+    assert not _full_0901_price_only_sources(frame.filter(pl.col("_source_path") == "/intraday"), [witness])
+
+
+@pytest.mark.parametrize("patch", [
+    {"purpose": "take_profit"}, {"fill_contract": "ordinary_replay"},
+    {"fill_at": "2026-09-01T09:08:00+08:00"},
+    {"recorded_at": "2026-09-01T09:08:00+08:00"},
+    {"simulation_only": False}, {"simulation_replay": False},
+    {"counterfactual_0901_price_fill": False}, {"synthetic_fill": True},
+    {"entry_price_method": "minute_vwap"}, {"price": 19.4},
+    {"entry_price_source": "local_minute_parquet_0901_minute_close:/other"},
+])
+def test_full_0901_price_only_audit_cannot_waive_other_fills(patch):
+    witness, bar, fill = _price_only_opening_fixture()
+    prices = _full_0901_price_only_sources(pl.DataFrame([bar]), [witness])
+    assert not _is_verified_full_0901_price_only_entry(fill | patch, prices, full_target=True)
+
+
+@pytest.mark.parametrize("patch", [
+    {"close": 19.36}, {"close": None}, {"low": 19.36}, {"high": 19.34},
+    {"close": float("nan")},
+])
+def test_full_0901_price_only_audit_rejects_unproven_source_close(patch):
+    witness, bar, _ = _price_only_opening_fixture()
+    with pytest.raises(ValueError, match="source-published Close"):
+        _full_0901_price_only_sources(pl.DataFrame([bar | patch]), [witness])
+
+
+def test_full_0901_price_only_audit_rejects_duplicate_witness_or_observation():
+    witness, bar, _ = _price_only_opening_fixture()
+    with pytest.raises(ValueError, match="duplicate price-only"):
+        _full_0901_price_only_sources(pl.DataFrame([bar]), [witness, witness])
+    with pytest.raises(ValueError, match="ambiguous price-only"):
+        _full_0901_price_only_sources(pl.DataFrame([bar, bar]), [witness])
+
+
+def test_full_0901_price_only_audit_leaves_positive_volume_on_normal_path():
+    witness, bar, _ = _price_only_opening_fixture()
+    assert not _full_0901_price_only_sources(
+        pl.DataFrame([bar | {"volume_shares": 1000.}]), [witness]
+    )
+
+
+@pytest.mark.parametrize("patch", [
+    {"tick_volume_units_0901": 1.},
+    {"source_window_start": "2026-09-01T09:01:00+08:00"},
+    {"source_window_end": "2026-09-01T09:08:00+08:00"},
+    {"quote_at": "2026-09-01T09:08:00+08:00"},
+])
+def test_full_0901_price_only_audit_does_not_move_future_or_trade_witness(patch):
+    witness, bar, _ = _price_only_opening_fixture()
+    assert not _full_0901_price_only_sources(pl.DataFrame([bar]), [witness | patch])
+
+
+def test_audit_source_projection_preserves_close_without_inventing_volume():
+    raw = pl.DataFrame(dict(symbol=["009802"], ts=[datetime(2026, 9, 1, 9, 1)],
+                            High=[19.4], Low=[19.3], Close=[19.35],
+                            Volume=[0.], Amount=[0.]))
+    actual = _audit_source_bar_projection(raw.lazy()).collect().row(0, named=True)
+    assert actual["close"] == 19.35
+    assert actual["volume_shares"] in (None, 0.)
+    assert _audit_source_bar_projection(raw.drop("Close").lazy()).collect()["close"][0] is None
 
 
 @pytest.mark.parametrize("raw_volume", [1.0, 1_000.0])
