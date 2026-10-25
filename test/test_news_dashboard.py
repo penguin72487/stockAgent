@@ -18,6 +18,55 @@ NOW = datetime(2026, 10, 8, 15, tzinfo=UTC)
 REPO = Path(__file__).resolve().parents[1]
 
 
+def disk_sample(*, free=19, required=25):
+    return {'contract_version': 1, 'checked_at_utc': NOW.isoformat(), 'free_bytes': free,
+        'required_free_bytes': required, 'shortfall_bytes': max(0,required-free),
+        'fetch_allowed': free >= required, 'automatic_recheck_seconds': 60,
+        'path': 'PRIVATE_STORAGE_PATH', 'token': 'PRIVATE_DISK_TOKEN'}
+
+
+def test_disk_constraint_outlives_inventory_phase_and_clears_on_real_sample(tmp_path):
+    status = _seed(tmp_path)
+    status.update(activity='inventorying', disk_admission=disk_sample())
+    path = tmp_path/'data_news_fulltext/status.json'
+    atomic_write_json(path,status)
+    result = build_news_public_status(tmp_path,now=NOW)
+    source = next(row for row in result['providers'] if row['id']=='cnyes')
+    assert result['health']=='waiting_disk' and result['worker']['source_activity']=='inventorying'
+    assert result['worker']['disk_admission']['shortfall_bytes']==6
+    assert source['state']=='waiting_disk' and source['conditional_eta_seconds'] is None
+    assert result['acquisition']['stored_body_articles']==2 and result['acquisition']['known_urls']==10
+    assert 'PRIVATE_STORAGE_PATH' not in json.dumps(result) and 'PRIVATE_DISK_TOKEN' not in json.dumps(result)
+    status['disk_admission']=disk_sample(free=25)
+    atomic_write_json(path,status)
+    result = build_news_public_status(tmp_path,now=NOW)
+    source = next(row for row in result['providers'] if row['id']=='cnyes')
+    assert result['health']=='inventorying' and source['state']=='backfilling'
+    assert result['worker']['disk_admission']['fetch_allowed'] and source['conditional_eta_seconds'] is not None
+
+
+@pytest.mark.parametrize('patch', [
+    {'free_bytes':True}, {'required_free_bytes':-1}, {'shortfall_bytes':0},
+    {'fetch_allowed':True}, {'contract_version':True}, {'automatic_recheck_seconds':0},
+    {'checked_at_utc':(NOW-timedelta(seconds=181)).isoformat()},
+    {'checked_at_utc':(NOW+timedelta(seconds=10)).isoformat()},
+])
+def test_invalid_or_stale_disk_sample_cannot_restore_a_live_forecast(tmp_path,patch):
+    status = _seed(tmp_path)
+    status.update(activity='inventorying',disk_admission={**disk_sample(),**patch})
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json',status)
+    result = build_news_public_status(tmp_path,now=NOW)
+    assert result['health']=='unavailable' and result['worker']['disk_admission'] is None
+    assert next(row for row in result['providers'] if row['id']=='cnyes')['conditional_eta_seconds'] is None
+
+
+def test_stopped_owner_is_not_reclassified_as_a_disk_wait(tmp_path):
+    status = _seed(tmp_path)
+    status.update(activity='stopped',disk_admission=disk_sample())
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json',status)
+    assert build_news_public_status(tmp_path,now=NOW)['health']=='stopped'
+
+
 def test_cna_authorization_setup_is_separate_from_disabled_html_and_secrets(tmp_path):
     status = _seed(tmp_path)
     status['providers']['cna'] = {'states': {'awaiting_authorization': 3},
@@ -628,6 +677,82 @@ def test_global_provider_deadline_remains_separate_and_suspends_eta(tmp_path):
     assert source['state'] == 'cooldown' and source['conditional_eta_seconds'] is None
     assert source['next_attempt_at_utc'] == (NOW + timedelta(seconds=300)).isoformat()
     assert source['robots_origin_policy_pause']['next_policy_probe_at_utc'] == (NOW + timedelta(seconds=30)).isoformat()
+
+
+def _request_scope_status(tmp_path, *, paused=4):
+    status = _origin_pause_status(tmp_path, {'https://amp-news.cnyes.com': NOW.timestamp() + 30})
+    status['providers']['cnyes']['body_work_progress'] = {
+        **_work_snapshot(), 'active_missing_body_urls': 4, 'existing_primary_body_candidates': 3,
+        'request_scope_progress': {'contract_version': 1, 'available': True,
+            'active_missing_body_urls': 4, 'source_paused_missing_body_urls': paused,
+            'other_missing_body_urls': 4 - paused, 'policy_paused_missing_body_urls': paused,
+            'gateway_paused_missing_body_urls': 0, 'source_recovery_verified': False,
+            'next_source_probe_at_utc': (NOW + timedelta(seconds=30)).isoformat() if paused else None,
+            'private_url': 'PRIVATE_URL', 'body': 'PRIVATE_BODY'}}
+    return status
+
+
+@pytest.mark.parametrize('paused', [1, 2, 4])
+def test_known_paused_missing_scopes_do_not_borrow_healthy_lane_speed(tmp_path, paused):
+    status = _request_scope_status(tmp_path, paused=paused)
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    scope = source['body_request_scope_progress']
+    assert scope['available'] and scope['source_paused_missing_body_urls'] == paused
+    assert scope['other_missing_body_urls'] == 4 - paused
+    assert source['state'] == 'backfilling' and source['owner_articles_per_second'] == 0.1
+    assert source['conditional_eta_seconds'] is source['conditional_finish_at_utc'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_paused'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+    assert source['remaining_urls'] == 4 and source['stored_body_urls'] is None
+    assert not scope['source_recovery_verified'] and not scope['source_probe_ready']
+    assert 'PRIVATE_' not in json.dumps(result) and 'amp-news.cnyes.com' not in json.dumps(result)
+
+
+def test_probe_deadline_elapsed_is_not_source_recovery_or_completed_missing_bodies(tmp_path):
+    _save(tmp_path, _request_scope_status(tmp_path))
+    data = build_news_public_status(tmp_path, now=NOW + timedelta(seconds=31))
+    source = next(row for row in data['providers'] if row['id'] == 'cnyes')
+    scope = source['body_request_scope_progress']
+    assert scope['source_probe_ready'] and not scope['source_recovery_verified']
+    assert scope['source_paused_missing_body_urls'] == 4
+    assert source['conditional_eta_seconds'] is None and source['complete_urls'] == 2
+
+
+def test_unaffected_missing_scopes_keep_rate_and_eta_despite_unrelated_origin_pause(tmp_path):
+    _save(tmp_path, _request_scope_status(tmp_path, paused=0))
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['conditional_eta_seconds'] == 40 and source['conditional_eta_unavailable_reason'] is None
+    assert source['body_request_scope_progress']['other_missing_body_urls'] == 4
+    assert source['robots_origin_policy_pause']['active_origin_count'] == 1
+
+
+@pytest.mark.parametrize('patch', [{'contract_version': True}, {'available': True, 'other_missing_body_urls': 1},
+    {'source_paused_missing_body_urls': True}, {'active_missing_body_urls': 5},
+    {'policy_paused_missing_body_urls': 0}, {'gateway_paused_missing_body_urls': 5},
+    {'next_source_probe_at_utc': None}, {'next_source_probe_at_utc': 'PRIVATE_TIME'},
+    {'next_source_probe_at_utc': (NOW + timedelta(days=2)).isoformat()},
+    {'source_recovery_verified': True}, {'available': False}])
+def test_invalid_request_scope_counts_are_unknown_and_cannot_reenable_eta(tmp_path, patch):
+    status = _request_scope_status(tmp_path)
+    status['providers']['cnyes']['body_work_progress']['request_scope_progress'].update(patch)
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['body_request_scope_progress'] is None
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+
+
+def test_explicit_unavailable_request_scope_is_unknown_not_zero_or_completion(tmp_path):
+    status = _request_scope_status(tmp_path)
+    status['providers']['cnyes']['body_work_progress']['request_scope_progress'] = {
+        'contract_version': 1, 'available': False, 'source_recovery_verified': False}
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    scope = source['body_request_scope_progress']
+    assert not scope['available'] and scope['source_paused_missing_body_urls'] is None
+    assert source['conditional_eta_seconds'] is None and source['remaining_urls'] == 4
 
 
 def test_endpoint_parser_circuits_are_finite_private_and_not_provider_refusals(tmp_path):

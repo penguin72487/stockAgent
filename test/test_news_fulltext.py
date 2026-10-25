@@ -676,11 +676,19 @@ def test_default_configuration_separates_personal_capture_from_licenses():
             CMONEY_LEARNING_V2_PATH_PATTERN,CMONEY_LEARNING_V2_AUTH_SCOPE,
             CMONEY_LEARNING_V3_PATH_PATTERN,CMONEY_LEARNING_V3_AUTH_SCOPE,
             CMONEY_LEARNING_V4_PATH_PATTERN,CMONEY_LEARNING_V4_AUTH_SCOPE,
+            CMONEY_LEARNING_V5_PATH_PATTERN,CMONEY_LEARNING_V5_AUTH_SCOPE,
+            CMONEY_LEARNING_V6_PATH_PATTERN,CMONEY_LEARNING_V6_AUTH_SCOPE,
         )
         assert learning.acquisition_mode == 'finite' and not learning.known_url_only
         assert learning.domains == ('cmoneylearning.com.tw',)
-        assert learning.embedded_article_layout in {'cmoneylearning_visible_article_v1','cmoneylearning_visible_article_v2','cmoneylearning_visible_article_v3','cmoneylearning_visible_article_v4'}
-        if learning.embedded_article_layout.endswith('_v4'):
+        assert learning.embedded_article_layout in {'cmoneylearning_visible_article_v1','cmoneylearning_visible_article_v2','cmoneylearning_visible_article_v3','cmoneylearning_visible_article_v4','cmoneylearning_visible_article_v5','cmoneylearning_visible_article_v6'}
+        if learning.embedded_article_layout.endswith('_v6'):
+            assert learning.article_path_pattern == CMONEY_LEARNING_V6_PATH_PATTERN
+            assert learning.authorization['scope'] == CMONEY_LEARNING_V6_AUTH_SCOPE and learning.allow_reviewed_supplements
+        elif learning.embedded_article_layout.endswith('_v5'):
+            assert learning.article_path_pattern == CMONEY_LEARNING_V5_PATH_PATTERN
+            assert learning.authorization['scope'] == CMONEY_LEARNING_V5_AUTH_SCOPE and learning.allow_reviewed_supplements
+        elif learning.embedded_article_layout.endswith('_v4'):
             assert learning.article_path_pattern == CMONEY_LEARNING_V4_PATH_PATTERN
             assert learning.authorization['scope'] == CMONEY_LEARNING_V4_AUTH_SCOPE and learning.allow_reviewed_supplements
         elif learning.embedded_article_layout.endswith('_v3'):
@@ -698,6 +706,24 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert learning.authorization['evidence_url'] == 'https://www.cmoney.tw/member/tos.aspx'
         assert not learning.feeds and not learning.sitemaps and not learning.wordpress_apis and not learning.fulltext_feeds
         expected.add('cmoneylearning')
+    contentplatform = registry.sources.get('contentplatform')
+    if contentplatform and contentplatform.allowed:
+        from downloader.news_fulltext_contentplatform import (
+            CONTENTPLATFORM_BODY, CONTENTPLATFORM_PATH, CONTENTPLATFORM_TITLE,
+        )
+        assert contentplatform.known_url_only and contentplatform.acquisition_mode == 'continuous'
+        assert contentplatform.domains == ('www.contentplatform.info',)
+        assert contentplatform.embedded_article_layout in {
+            'contentplatform_native_article_v1', 'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}
+        assert contentplatform.article_path_pattern == CONTENTPLATFORM_PATH
+        assert contentplatform.selectors == (CONTENTPLATFORM_BODY,)
+        assert contentplatform.title_selector == CONTENTPLATFORM_TITLE
+        assert contentplatform.require_configured_container and contentplatform.require_author_attribution
+        assert contentplatform.authorization['kind'] == 'personal_research'
+        assert contentplatform.authorization['evidence_url'] == 'https://www.contentplatform.info/copyright/'
+        assert not any((contentplatform.feeds, contentplatform.sitemaps, contentplatform.wordpress_apis,
+                        contentplatform.fulltext_feeds, contentplatform.index_pages, contentplatform.cnyes_apis))
+        expected.add('contentplatform')
     stockfeel = registry.sources.get('stockfeel')
     if stockfeel and stockfeel.allowed:
         from downloader.news_fulltext_stockfeel import STOCKFEEL_BODY_SELECTOR, STOCKFEEL_ORIGIN, STOCKFEEL_PATH_PATTERN, STOCKFEEL_LAYOUT_VERSIONS
@@ -770,22 +796,39 @@ def test_default_configuration_separates_personal_capture_from_licenses():
     gvm = registry.sources.get('gvm')
     if gvm is not None and gvm.allowed:
         from downloader.news_fulltext_gvm import (
-            GVM_LAYOUT, GVM_PATH_PATTERN, GVM_BODY_SELECTOR, GVM_AUTHOR_SELECTOR,
-            GVM_EXCLUSIONS, GVM_REVIEWED_AUTHORS, GVM_FINITE_HTTP_BINDING,
+            GVM_KNOWN_URL_LAYOUT, GVM_MEDIA_LAYOUT, GVM_TABLE_LAYOUT, GVM_INLINE_LAYOUT, GVM_MAGAZINE_LAYOUT, GVM_UNTITLED_MEDIA_LAYOUT, GVM_WRITTEN_FORMAT_LAYOUT, GVM_STATIC_EDITOR_LAYOUT, GVM_PRESENTATION_LAYOUT, GVM_ORDERED_CREDIT_LAYOUT,
+            GVM_PATH_PATTERN, GVM_BODY_SELECTOR, GVM_AUTHOR_SELECTOR,
+            GVM_EXCLUSIONS, GVM_FINITE_HTTP_BINDING,
+            GVM_V2_VERIFICATION, GVM_V3_VERIFICATION, GVM_V4_VERIFICATION, GVM_V5_VERIFICATION, GVM_V6_VERIFICATION, GVM_V7_VERIFICATION, GVM_V8_VERIFICATION, GVM_V9_VERIFICATION, GVM_V10_VERIFICATION, GVM_V11_VERIFICATION,
         )
-        assert gvm.acquisition_mode == 'finite' and not gvm.allow_reviewed_supplements
-        assert gvm.domains == ('www.gvm.com.tw',) and gvm.embedded_article_layout == GVM_LAYOUT
+        assert gvm.acquisition_mode == 'continuous' and gvm.known_url_only and not gvm.allow_reviewed_supplements
+        assert gvm.domains == ('www.gvm.com.tw',)
+        assert gvm.embedded_article_layout in {GVM_KNOWN_URL_LAYOUT, GVM_MEDIA_LAYOUT, GVM_TABLE_LAYOUT, GVM_INLINE_LAYOUT, GVM_MAGAZINE_LAYOUT, GVM_UNTITLED_MEDIA_LAYOUT, GVM_WRITTEN_FORMAT_LAYOUT, GVM_STATIC_EDITOR_LAYOUT, GVM_PRESENTATION_LAYOUT, GVM_ORDERED_CREDIT_LAYOUT}
         assert gvm.article_path_pattern == GVM_PATH_PATTERN and gvm.selectors == (GVM_BODY_SELECTOR,)
         assert gvm.author_selectors == (GVM_AUTHOR_SELECTOR,) and gvm.exclude_selectors == GVM_EXCLUSIONS
-        assert gvm.permitted_author_names == GVM_REVIEWED_AUTHORS
+        assert not gvm.permitted_author_names
         assert gvm.require_configured_container and gvm.require_author_attribution
         assert gvm.authorization['kind'] == 'personal_research'
         assert gvm.authorization['evidence_url'] == 'https://www.gvm.com.tw/copyright'
-        assert gvm.finite_article_urls == (
-            'https://www.gvm.com.tw/article/132737', 'https://www.gvm.com.tw/article/76333')
-        assert gvm.authorization['original_author_scope_evidence_urls'] == list(gvm.finite_article_urls)
-        assert (gvm.data_fingerprint, gvm.authorization_fingerprint,
-                gvm.http_capacity_source_fingerprint, gvm.http_capacity_authorization_fingerprint) == GVM_FINITE_HTTP_BINDING
+        assert not gvm.finite_article_urls
+        assert gvm.authorization['original_author_scope_evidence_urls'] == [
+            'https://www.gvm.com.tw/article/132737', 'https://www.gvm.com.tw/article/76333']
+        assert gvm.data_fingerprint != GVM_FINITE_HTTP_BINDING[0]
+        assert not gvm.http_capacity_authorization_fingerprint
+        if gvm.embedded_article_layout == GVM_KNOWN_URL_LAYOUT:
+            assert not gvm.http_capacity_source_fingerprint
+        else:
+            # Preserve the exact original HTTP grant, including its rights,
+            # URLs and pacing; changing a parser is not a new rate grant.
+            earlier = deepcopy(config)
+            earlier.pop('provider_catalog', None)
+            old_entry = next(p for p in earlier['providers'] if p['id'] == 'gvm')
+            old_entry['embedded_article_layout'] = GVM_KNOWN_URL_LAYOUT
+            if old_entry.get('adapter_verification') in {GVM_V3_VERIFICATION, GVM_V4_VERIFICATION, GVM_V5_VERIFICATION, GVM_V6_VERIFICATION, GVM_V7_VERIFICATION, GVM_V8_VERIFICATION, GVM_V9_VERIFICATION, GVM_V10_VERIFICATION, GVM_V11_VERIFICATION}:
+                old_entry['adapter_verification'] = GVM_V2_VERIFICATION
+            old = PolicyRegistry(earlier, base=repo).sources['gvm']
+            assert gvm.http_capacity_source_fingerprint == old.data_fingerprint
+            assert gvm.authorization_fingerprint == old.authorization_fingerprint
         assert not gvm.feeds and not gvm.sitemaps and not gvm.wordpress_apis and not gvm.fulltext_feeds
         expected.add('gvm')
     cw = registry.sources.get('cw')
@@ -832,19 +875,61 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         from downloader.news_fulltext_knews import (
             KNEWS_AUTHOR_SELECTOR, KNEWS_BODY_SELECTOR, KNEWS_EXCLUSIONS, KNEWS_FINITE_HTTP_BINDING,
             KNEWS_LAYOUT, KNEWS_PATH_PATTERN, KNEWS_REVIEWED_HEADER_AUTHORS, KNEWS_REVIEWED_URLS,
+            KNEWS_KNOWN_URL_LAYOUT, KNEWS_KNOWN_HTTP_BINDING, KNEWS_V2_VERIFICATION,
+            KNEWS_EDITOR_LAYOUT, KNEWS_V3_VERIFICATION,
+            KNEWS_DECLARATIONS_LAYOUT, KNEWS_V4_VERIFICATION, KNEWS_EDITOR_HTTP_BINDING,
+            KNEWS_CREDITS_LAYOUT, KNEWS_V5_VERIFICATION, KNEWS_DECLARATIONS_HTTP_BINDING,
+            KNEWS_WRITTEN_BLOCKS_LAYOUT, KNEWS_V6_VERIFICATION, KNEWS_CREDITS_HTTP_BINDING,
+            KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_V7_VERIFICATION, KNEWS_WRITTEN_BLOCKS_HTTP_BINDING,
         )
-        assert knews.acquisition_mode == 'finite' and not knews.allow_reviewed_supplements
-        assert knews.domains == ('www.knews.com.tw',) and knews.embedded_article_layout == KNEWS_LAYOUT
+        assert not knews.allow_reviewed_supplements
+        assert knews.domains == ('www.knews.com.tw',)
         assert knews.article_path_pattern == KNEWS_PATH_PATTERN and knews.selectors == (KNEWS_BODY_SELECTOR,)
         assert knews.author_selectors == (KNEWS_AUTHOR_SELECTOR,) and knews.exclude_selectors == KNEWS_EXCLUSIONS
-        assert knews.permitted_author_names == KNEWS_REVIEWED_HEADER_AUTHORS
         assert knews.require_configured_container and knews.require_author_attribution
         assert knews.authorization['kind'] == 'personal_research'
         assert knews.authorization['evidence_url'] == 'https://www.knews.com.tw/'
-        assert knews.finite_article_urls == KNEWS_REVIEWED_URLS
-        assert knews.authorization['original_author_scope_evidence_urls'] == list(KNEWS_REVIEWED_URLS)
+        if knews.embedded_article_layout == KNEWS_LAYOUT:
+            assert knews.acquisition_mode == 'finite' and not knews.known_url_only
+            assert knews.permitted_author_names == KNEWS_REVIEWED_HEADER_AUTHORS
+            assert knews.finite_article_urls == KNEWS_REVIEWED_URLS
+            assert knews.authorization['original_author_scope_evidence_urls'] == list(KNEWS_REVIEWED_URLS)
+            binding = KNEWS_FINITE_HTTP_BINDING
+        else:
+            assert knews.embedded_article_layout in {KNEWS_KNOWN_URL_LAYOUT, KNEWS_EDITOR_LAYOUT, KNEWS_DECLARATIONS_LAYOUT, KNEWS_CREDITS_LAYOUT, KNEWS_WRITTEN_BLOCKS_LAYOUT, KNEWS_SPARSE_NATIVE_LAYOUT}
+            assert knews.acquisition_mode == 'continuous' and knews.known_url_only
+            assert not knews.permitted_author_names and not knews.finite_article_urls
+            value = next(e for e in config['providers'] if e['id'] == 'knews')
+            if knews.embedded_article_layout == KNEWS_KNOWN_URL_LAYOUT:
+                assert value['adapter_verification'] == KNEWS_V2_VERIFICATION
+                binding = KNEWS_KNOWN_HTTP_BINDING
+            elif knews.embedded_article_layout == KNEWS_EDITOR_LAYOUT:
+                assert value['adapter_verification'] == KNEWS_V3_VERIFICATION
+                assert knews.parser_repair_prior_capture_fingerprint == KNEWS_KNOWN_HTTP_BINDING[0]
+                assert knews.data_fingerprint != KNEWS_KNOWN_HTTP_BINDING[0]
+                binding = (knews.data_fingerprint, *KNEWS_KNOWN_HTTP_BINDING[1:])
+            elif knews.embedded_article_layout == KNEWS_DECLARATIONS_LAYOUT:
+                assert value['adapter_verification'] == KNEWS_V4_VERIFICATION
+                assert knews.parser_repair_prior_capture_fingerprint == KNEWS_EDITOR_HTTP_BINDING[0]
+                assert knews.data_fingerprint != KNEWS_EDITOR_HTTP_BINDING[0]
+                binding = (knews.data_fingerprint, *KNEWS_EDITOR_HTTP_BINDING[1:])
+            elif knews.embedded_article_layout == KNEWS_CREDITS_LAYOUT:
+                assert value['adapter_verification'] == KNEWS_V5_VERIFICATION
+                assert knews.parser_repair_prior_capture_fingerprint == KNEWS_DECLARATIONS_HTTP_BINDING[0]
+                assert knews.data_fingerprint != KNEWS_DECLARATIONS_HTTP_BINDING[0]
+                binding = (knews.data_fingerprint, *KNEWS_DECLARATIONS_HTTP_BINDING[1:])
+            elif knews.embedded_article_layout == KNEWS_WRITTEN_BLOCKS_LAYOUT:
+                assert value['adapter_verification'] == KNEWS_V6_VERIFICATION
+                assert knews.parser_repair_prior_capture_fingerprint == KNEWS_CREDITS_HTTP_BINDING[0]
+                assert knews.data_fingerprint != KNEWS_CREDITS_HTTP_BINDING[0]
+                binding = (knews.data_fingerprint, *KNEWS_CREDITS_HTTP_BINDING[1:])
+            else:
+                assert value['adapter_verification'] == KNEWS_V7_VERIFICATION
+                assert knews.parser_repair_prior_capture_fingerprint == KNEWS_WRITTEN_BLOCKS_HTTP_BINDING[0]
+                assert knews.data_fingerprint != KNEWS_WRITTEN_BLOCKS_HTTP_BINDING[0]
+                binding = (knews.data_fingerprint, *KNEWS_WRITTEN_BLOCKS_HTTP_BINDING[1:])
         assert (knews.data_fingerprint, knews.authorization_fingerprint,
-                knews.http_capacity_source_fingerprint, knews.http_capacity_authorization_fingerprint) == KNEWS_FINITE_HTTP_BINDING
+                knews.http_capacity_source_fingerprint, knews.http_capacity_authorization_fingerprint) == binding
         assert not any((knews.feeds, knews.sitemaps, knews.wordpress_apis, knews.fulltext_feeds,
                         knews.metadata_feeds, knews.index_pages, knews.cnyes_apis))
         expected.add('knews')
@@ -876,7 +961,7 @@ def test_default_configuration_separates_personal_capture_from_licenses():
             INEWS_LAYOUT_VERSIONS, INEWS_PROVIDER, INEWS_TITLE_SELECTOR, SETN_PATH_PATTERN,
             INEWS_V2_HTTP_BINDING, INEWS_V3_HTTP_BINDING,
             INEWS_V4_AUTHOR_SELECTOR, INEWS_V4_HTTP_BINDING, INEWS_V5_HTTP_BINDING, INEWS_V6_HTTP_BINDING,
-            INEWS_V7_HTTP_BINDING, INEWS_V8_HTTP_BINDING,
+            INEWS_V7_HTTP_BINDING, INEWS_V8_HTTP_BINDING, INEWS_V9_HTTP_BINDING, INEWS_V10_HTTP_BINDING, INEWS_V11_HTTP_BINDING,
         )
         assert inews.known_url_only and inews.acquisition_mode == 'continuous'
         assert inews.domains == ('inews.setn.com',) and inews.embedded_article_layout in INEWS_LAYOUT_VERSIONS
@@ -894,11 +979,35 @@ def test_default_configuration_separates_personal_capture_from_licenses():
         assert not inews.finite_article_urls and not inews.allow_reviewed_supplements
         assert (inews.data_fingerprint, inews.authorization_fingerprint,
                 inews.http_capacity_source_fingerprint, inews.http_capacity_authorization_fingerprint) == (
-                    {1:INEWS_HTTP_BINDING,2:INEWS_V2_HTTP_BINDING,3:INEWS_V3_HTTP_BINDING,4:INEWS_V4_HTTP_BINDING,5:INEWS_V5_HTTP_BINDING,6:INEWS_V6_HTTP_BINDING,7:INEWS_V7_HTTP_BINDING,8:INEWS_V8_HTTP_BINDING}[
+                    {1:INEWS_HTTP_BINDING,2:INEWS_V2_HTTP_BINDING,3:INEWS_V3_HTTP_BINDING,4:INEWS_V4_HTTP_BINDING,5:INEWS_V5_HTTP_BINDING,6:INEWS_V6_HTTP_BINDING,7:INEWS_V7_HTTP_BINDING,8:INEWS_V8_HTTP_BINDING,9:INEWS_V9_HTTP_BINDING,10:INEWS_V10_HTTP_BINDING,11:INEWS_V11_HTTP_BINDING}[
                         INEWS_LAYOUT_VERSIONS[inews.embedded_article_layout]])
         assert not any((inews.feeds, inews.sitemaps, inews.wordpress_apis, inews.fulltext_feeds,
                         inews.metadata_feeds, inews.index_pages, inews.cnyes_apis))
         expected.add(INEWS_PROVIDER)
+    fuhouse = registry.sources.get('policy_setn_fuhouse')
+    if fuhouse is not None and fuhouse.allowed:
+        from downloader.news_fulltext_setn import (
+            FUHOUSE_BODY_SELECTOR, FUHOUSE_AUTHOR_SELECTOR, FUHOUSE_V2_BODY_SELECTOR, FUHOUSE_V3_BODY_SELECTOR, FUHOUSE_V4_BODY_SELECTOR,
+            FUHOUSE_V2_AUTHOR_SELECTOR, FUHOUSE_HTTP_BINDING, SETN_PATH_PATTERN,
+        )
+        assert fuhouse.domains == ('fuhouse.setn.com',) and fuhouse.known_url_only
+        assert fuhouse.acquisition_mode == 'continuous'
+        assert fuhouse.embedded_article_layout in {'setn_fuhouse_native_article_v1', 'setn_fuhouse_native_article_v2', 'setn_fuhouse_native_article_v3', 'setn_fuhouse_native_article_v4'}
+        version = int(fuhouse.embedded_article_layout.rsplit('_v',1)[1])
+        assert fuhouse.selectors == ({1:FUHOUSE_BODY_SELECTOR,2:FUHOUSE_V2_BODY_SELECTOR,3:FUHOUSE_V3_BODY_SELECTOR,4:FUHOUSE_V4_BODY_SELECTOR}[version],)
+        assert fuhouse.author_selectors == (FUHOUSE_V2_AUTHOR_SELECTOR if version>=2 else FUHOUSE_AUTHOR_SELECTOR,)
+        assert fuhouse.article_path_pattern == SETN_PATH_PATTERN
+        assert fuhouse.require_configured_container and fuhouse.require_author_attribution
+        assert fuhouse.authorization['kind'] == 'personal_research'
+        assert fuhouse.authorization['evidence_url'] == 'https://fuhouse.setn.com/'
+        assert fuhouse.authorization_fingerprint == FUHOUSE_HTTP_BINDING[1]
+        assert (fuhouse.http_capacity_source_fingerprint,
+            fuhouse.http_capacity_authorization_fingerprint) == FUHOUSE_HTTP_BINDING[2:]
+        assert fuhouse.interval_seconds == 10 and fuhouse.parallelism == 1
+        assert not fuhouse.exclude_selectors and not fuhouse.finite_article_urls
+        assert not any((fuhouse.feeds, fuhouse.sitemaps, fuhouse.wordpress_apis,
+            fuhouse.cnyes_apis, fuhouse.metadata_feeds, fuhouse.index_pages))
+        expected.add('policy_setn_fuhouse')
     upmedia = registry.sources.get('upmedia')
     if upmedia is not None and upmedia.allowed:
         from downloader.news_fulltext_upmedia import (

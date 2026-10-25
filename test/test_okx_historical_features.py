@@ -540,6 +540,11 @@ def test_full_enrichment_preserves_existing_prices_when_index_stage_fails(tmp_pa
     assert json.loads(result.stage_status_json)["index_price"] == "failed"
     assert written[0]["okx_index_close"].to_list() == [99.0]
     assert "ValueError" in json.loads(result.errors_json)["index_price"]
+    # Attempt counts survive a failed mark stage, including its bounded exact retry.
+    assert json.loads(result.mark_acquisition_json)["page_calls"] == {
+        features.MARK_PRICE_HISTORY_ENDPOINT: 1
+    }
+    assert result.report_contract == "okx_historical_feature_worker_report_v2"
 
 
 def test_complete_eight_stage_enrichment_writes_exact_same_features_and_masks_for_hybrid(tmp_path, monkeypatch):
@@ -578,19 +583,32 @@ def test_complete_eight_stage_enrichment_writes_exact_same_features_and_masks_fo
         "close": [100.0] * 1440,
         "Trading_Volume": [20.0] * 1440,
     })
-    frames, results = [], []
+    frames, results, calls = [], [], []
+    audit_mark = True
+    fetch_with_window = features._fetch_array_history
+
+    def audit_toggle_fetch(client, path, *args, **kwargs):
+        if path == features.MARK_PRICE_HISTORY_ENDPOINT and not audit_mark:
+            kwargs.pop("request_audit", None)
+        return fetch_with_window(client, path, *args, **kwargs)
+
+    monkeypatch.setattr(features, "_fetch_array_history", audit_toggle_fetch)
     record = SimpleNamespace(code="BTC", okx_symbol="BTC-USDT-SWAP", inst_family="BTC-USDT")
-    for variant in ("history_only", "hybrid"):
-        prefer_recent = variant == "hybrid"
+    for variant in ("history_only", "hybrid", "hybrid_without_mark_audit"):
+        prefer_recent = variant != "history_only"
+        audit_mark = variant != "hybrid_without_mark_audit"
         output = tmp_path / f"{variant}_features.parquet"
         features._write_parquet(base, output)
+        client = FullClient(now_ms=now_ms)
         result = features.enrich_symbol_historical_features(
-            FullClient(now_ms=now_ms), record, output,
+            client, record, output,
             start_ms=start_ms, end_ms=end_ms, include_funding_archive=False,
         )
         results.append(result)
+        calls.append(client.calls)
         frames.append(features._read_parquet(output))
     assert frames[0].equals(frames[1])
+    assert frames[1].equals(frames[2]) and calls[1] == calls[2]
     assert frames[1].height == 1440
     assert set(features.ALL_FEATURE_COLUMNS) <= set(frames[1].columns)
     assert all(result.status == "updated" for result in results)
@@ -602,3 +620,12 @@ def test_complete_eight_stage_enrichment_writes_exact_same_features_and_masks_fo
     assert frames[1]["okx_index_close"].null_count() == 0
     assert frames[1]["okx_funding_realized_rate"].null_count() == 0
     assert frames[1]["okx_open_interest_usd"].drop_nulls().len() == 288
+    for result in results[:2]:
+        mark_audit = json.loads(result.mark_acquisition_json)
+        assert mark_audit["page_calls"] == {features.MARK_PRICE_HISTORY_ENDPOINT: 15}
+        assert mark_audit["call_count_basis"] == "logical_pages_not_transport_retry_attempts"
+        assert mark_audit["acquisition_fingerprint_sha256"] == features.feature_acquisition_payload()["fingerprint_sha256"]
+    assert json.loads(results[2].mark_acquisition_json) == {}
+    assert features.feature_catalog_payload()["worker_report_contract"] == "okx_historical_feature_worker_report_v2"
+    assert all(row["report_contract"] == "okx_historical_feature_worker_report_v2"
+               for row in features.result_rows(results))

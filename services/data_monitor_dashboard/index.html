@@ -8,6 +8,7 @@
   <title>StockAgent 全資料監控</title>
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=21">
+  <link rel="stylesheet" href="ticks.css?v=1">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
   <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
@@ -60,6 +61,11 @@
         <span id="tw-calendar-next">下一個台股串流時窗：待確認</span>
       </div>
       <p id="tw-calendar-evidence" class="calendar-banner-evidence">歷史逐日收據與最新官方休市表分開驗證；日曆未知時不預測開市。</p>
+    </section>
+
+    <section id="tick-inventory" class="section-block tick-catalog" aria-labelledby="tick-inventory-title">
+      <div class="section-heading"><div><p class="eyebrow">TICK & ORDER BOOK INVENTORY</p><h2 id="tick-inventory-title">逐筆成交與五檔資料清冊</h2></div>
+        <p>台股在前，依市場、來源與商品分列筆數、實際天數及起訖；連續期貨可展開各合約。</p></div>
     </section>
 
     <section class="section-block finlab-monitor" aria-labelledby="finlab-title">
@@ -265,9 +271,10 @@
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
   <script src="../dashboard-core.js?v=15" defer></script>
-  <script src="../dashboard-acquisition.js?v=8" defer></script>
+  <script src="../dashboard-acquisition.js?v=9" defer></script>
   <script src="../feature-page-constraints.js?v=1" defer></script>
   <script src="../feature-page-contract.js?v=1" defer></script>
-  <script src="app.js?v=50" defer></script>
+  <script src="app.js?v=52" defer></script>
+  <script src="ticks.js?v=3" defer></script>
 </body>
 </html>

@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 from stockagent.data.taifex_sessions import next_taifex_capture_window
 from stockagent.live.market_status import tw_stock_day_decision
 from stockagent.live.data_monitor_inventory import PHYSICAL_FAMILIES, build_feature_inventory, build_record_inventory
+from stockagent.live.tick_inventory import tick_summary
 from stockagent.live.openbb_archive_dashboard import build_openbb_public_status
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status
 from stockagent.live.tw_public_acquisition_progress import (
@@ -65,6 +66,7 @@ DATA_MONITOR_SUMMARY_KEYS: Final[tuple[str, ...]] = (
     "provider_summaries",
     "market_categories",
     "record_inventory_progress",
+    "tick_inventory",
     "integrity_checks",
     "definitions",
     "tw_public_acquisition",
@@ -76,7 +78,10 @@ DATA_MONITOR_SUMMARY_KEYS: Final[tuple[str, ...]] = (
 def project_data_monitor_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Keep the first-paint projection identical across producer and gateway."""
 
-    return {key: payload[key] for key in DATA_MONITOR_SUMMARY_KEYS if key in payload}
+    result = {key: payload[key] for key in DATA_MONITOR_SUMMARY_KEYS if key in payload}
+    if isinstance(result.get("tick_inventory"), Mapping):
+        result["tick_inventory"] = tick_summary(result["tick_inventory"])
+    return result
 
 
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
@@ -7295,6 +7300,7 @@ def build_data_monitor_public_status(
     refresh_inventory: bool = False,
     inventory_max_refresh_files: int = 4_096,
     record_inventory: Mapping[str, Any] | None = None,
+    tick_inventory: Mapping[str, Any] | None = None,
     timing_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the complete public registry and current monitor projection."""
@@ -7309,6 +7315,7 @@ def build_data_monitor_public_status(
             stage_started = completed
 
     root = Path(repo_root)
+    tick_inventory = dict(tick_inventory or {})
     observed = (now or datetime.now(UTC)).astimezone(UTC)
     if record_inventory is not None and refresh_inventory:
         raise ValueError("cannot refresh an already observed record inventory")
@@ -7538,11 +7545,23 @@ def build_data_monitor_public_status(
     rows.sort(key=_row_sort_key)
     for index, row in enumerate(rows, start=1):
         row["sort_index"] = index
+    tick_sources = {item["source_id"]: item for item in tick_inventory.get("groups", [])
+                    if item.get("source_id")}
     for row in rows:
         category = _market_category(row)
         row["market_category"] = category
         row["market_category_label"] = _MARKET_CATEGORY_LABELS[category]
         row["record_stats"] = _record_stats_for_row(row, inventory_datasets)
+        tick = tick_sources.get(row.get("id"))
+        if tick is not None:
+            row["record_stats"].update({key: tick.get(key) for key in ("count", "first", "last", "days", "symbols", "date_basis", "basis")})
+            row["record_stats"]["state"] = (
+                "verified" if tick["statistics_state"] == "parquet_footers" else tick["statistics_state"]
+            )
+            row["market_category"] = tick["market_category"]
+            row["market_category_label"] = tick["market_category_label"]
+        row["record_stats"]["earliest_date"] = row["record_stats"].get("first")
+        row["record_stats"]["latest_date"] = row["record_stats"].get("last")
     groups = [row for row in rows if row.get("scope") == "storage_group"]
     logical = [row for row in rows if row.get("scope") != "storage_group"]
     status_counts: dict[str, int] = {}
@@ -7748,6 +7767,7 @@ def build_data_monitor_public_status(
             ),
         },
         "provider_summaries": _provider_summaries(rows),
+        "tick_inventory": tick_inventory,
         "market_categories": [
             {
                 "id": category,

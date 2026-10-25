@@ -1,5 +1,6 @@
 """Publisher-original body scope, not a blanket right inferred from a byline."""
 from dataclasses import replace
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -44,6 +45,44 @@ def test_verified_moneyweekly_exact_original_body_byline_and_date_only(source):
     assert not source.feeds and not source.sitemaps and not source.index_pages
 
 
+def reviewed_moneyweekly_config():
+    config, _, _ = load_config(Path('configs/news_fulltext.json'))
+    candidate = deepcopy(config)
+    entry = next(p for p in candidate['providers'] if p['id'] == 'moneyweekly')
+    entry['permitted_author_names'] = ['理周投研部', '洪崇晏', '林庭頡']
+    entry['authorization']['reviewed_on'] = '2026-10-24'
+    entry['authorization']['original_author_scope_evidence_urls'] = [
+        'https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394',
+        'https://www.moneyweekly.com.tw/ArticleData/Info/Article/254340',
+        'https://www.moneyweekly.com.tw/Home/ChangePage/Article/195112/',
+        'https://www.moneyweekly.com.tw/Magazine/List/%E7%90%86%E8%B2%A1%E5%91%A8%E5%88%8A/12109',
+        'https://www.moneyweekly.com.tw/ArticleData/Info/Article/147720']
+    return candidate
+
+
+def test_short_parser_and_reviewed_contributor_preserve_exact_old_http_refusal_identity():
+    config = reviewed_moneyweekly_config()
+    source = PolicyRegistry(config, base=Path.cwd()).sources['moneyweekly']
+    assert source.http_capacity_source_fingerprint == '66a7bdb4cd1750deeb470285f7c9d6df67f4b7d663a3e7ace0e6a0935fb56d3e'
+    assert source.http_capacity_authorization_fingerprint == '275aa8eb6ea29a31f0668b6348bc7213e89bbd54c5b702adc1a95566ca265f3c'
+    assert source.data_fingerprint != source.http_capacity_source_fingerprint
+    assert source.authorization_fingerprint != source.http_capacity_authorization_fingerprint
+
+
+@pytest.mark.parametrize('change', ['interval', 'parallel', 'domain', 'scope', 'author'])
+def test_short_parser_http_compatibility_cannot_hide_other_transport_or_authorization_changes(change):
+    config = reviewed_moneyweekly_config()
+    entry = next(p for p in config['providers'] if p['id'] == 'moneyweekly')
+    if change == 'interval': entry['interval_seconds'] = 9.25
+    elif change == 'parallel': entry['capacity_max_parallelism'] = 3
+    elif change == 'domain': entry['domains'] = ['www.moneyweekly.com.tw']
+    elif change == 'scope': entry['authorization']['scope'] += ' Additional unreviewed grant.'
+    else: entry['permitted_author_names'].append('未審查作者')
+    source = PolicyRegistry(config, base=Path.cwd()).sources['moneyweekly']
+    assert not source.http_capacity_source_fingerprint
+    assert not source.http_capacity_authorization_fingerprint
+
+
 @pytest.mark.parametrize('author', ['第三方新聞社', '', '理周投研部 第三方作者', '相關報導作者'])
 def test_unknown_or_third_party_current_byline_is_not_replaced_by_matching_schema_author(source, author):
     payload, _ = page(author, schema_author='理周投研部')
@@ -68,6 +107,110 @@ def test_unconfigured_author_filter_retains_existing_source_semantics(source):
     article = extract_article(payload, replace(source, permitted_author_names=()),
                               page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
     assert json.loads(article['authors_json']) == ['其他作者']
+
+
+def test_moneyweekly_structure_keeps_unknown_byline_as_metadata_without_exporting_prose(source):
+    from bs4 import BeautifulSoup
+    from scripts.probe_news_sources import moneyweekly_public_structure
+    payload, prose = page('尚未核對的作者')
+    soup = BeautifulSoup(payload, 'lxml')
+    before = str(soup)
+    result = moneyweekly_public_structure(soup, source,
+        page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    assert result['current_header_authors'] == [
+        {'label': '尚未核對的作者', 'reviewed_name': False, 'links': []}]
+    assert result['current_header_clocks'] == ['2026/10/8']
+    assert result['body_nodes'][0]['paragraphs'] == 1
+    assert result['body_nodes'][0]['normalized_characters'] > 100
+    assert prose not in json.dumps(result, ensure_ascii=False)
+    assert result['article_accepted'] is result['raw_retained'] is False
+    assert result['source_permission_changed'] is False
+    assert str(soup) == before
+
+
+def test_moneyweekly_structure_does_not_borrow_related_author_or_publication_date(source):
+    from bs4 import BeautifulSoup
+    from scripts.probe_news_sources import moneyweekly_public_structure
+    payload, _ = page('', current_clock=False)
+    result = moneyweekly_public_structure(BeautifulSoup(payload, 'lxml'), source,
+        page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    assert result['current_header_authors'][0]['label'] == ''
+    assert result['current_header_clocks'] == ['']
+    assert '第三方作者' not in json.dumps(result, ensure_ascii=False)
+    assert '2099/1/1' not in json.dumps(result, ensure_ascii=False)
+
+
+def test_moneyweekly_structure_preserves_native_access_mask_and_identity_failure(source):
+    from bs4 import BeautifulSoup
+    from scripts.probe_news_sources import moneyweekly_public_structure
+    payload, prose = page()
+    payload = payload.replace(('<p>' + prose + '</p>').encode(),
+        ' <div class="mt-5">》本文限會員登入瀏覽，請先登入</div>'.encode())
+    result = moneyweekly_public_structure(BeautifulSoup(payload, 'lxml'), source,
+        page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    assert result['article_identity_or_access_error'] == 'paywall_or_login'
+    result = moneyweekly_public_structure(BeautifulSoup(payload, 'lxml'), source,
+        page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/999')
+    assert result['article_identity_or_access_error'] == 'article_identity_not_verified'
+
+
+SHORT_PROSE = '公司(1234)公告6月營收 -12.50 億，月增2.23%、年增12.75%；累計營收2607.29億，年增34.54%。'
+
+
+def short_page(*, prose=SHORT_PROSE, author='理周投研部', current_clock=True):
+    payload, long_prose = page(author, current_clock=current_clock)
+    editor = (f'<p>{prose}</p><p><img src="/Photo/Article/example.png" alt="" title="" style="width: 60%;"></p>'
+        '<div class="cols-12 d-flex"><div class="col-11 py-3 div_Article_Info">圖片出處:理周圖庫</div></div>')
+    return payload.replace(('<p>' + long_prose + '</p>').encode(), editor.encode())
+
+
+def test_complete_native_moneyweekly_short_prose_preserves_raw_numbers_and_excludes_media_slots(source):
+    payload = short_page()
+    article = extract_article(payload, source,
+        page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    assert article['body'] == SHORT_PROSE
+    assert article['extraction_method'] == 'moneyweekly_visible_short_prose_v1'
+    assert article['published_at_raw'] == '2026/10/8'
+    assert json.loads(article['authors_json']) == ['理周投研部']
+    assert article['body_completeness'].startswith('verified_publisher_short_body;')
+    assert '圖片出處' not in article['body']
+    assert '推薦廣告' not in article['body']
+
+
+@pytest.mark.parametrize('prose', ['', '圖片出處 : 理周圖庫', '閱讀全文請先登入會員',
+    '圖／來源單位', '<a href="https://other.test/">' + SHORT_PROSE + '</a>'])
+def test_short_caption_access_notice_or_link_is_never_promoted_to_complete_prose(source, prose):
+    with pytest.raises(NewsError, match='body_not_found|paywall_or_login'):
+        extract_article(short_page(prose=prose), replace(source, allow_short_configured_body=True),
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+
+
+def test_short_prose_does_not_hide_extra_unclassified_financial_block(source):
+    payload = short_page().replace(b'</p><p><img', '</p><div>其他數值 -999</div><p><img'.encode(), 1)
+    with pytest.raises(NewsError, match='body_not_found'):
+        extract_article(payload, source,
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+
+
+def test_short_prose_rejects_hidden_paragraph_and_duplicate_native_editor(source):
+    payload = short_page().replace(('<p>' + SHORT_PROSE).encode(),
+        ('<p style="display:none">' + SHORT_PROSE).encode())
+    with pytest.raises(NewsError, match='article_identity_not_verified'):
+        extract_article(payload, source,
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    payload = short_page() + b'<div class="div_Article_Info" itemprop="articleBody"><p>duplicate</p></div>'
+    with pytest.raises(NewsError, match='article_identity_not_verified'):
+        extract_article(payload, source,
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+
+
+def test_short_prose_needs_reviewed_current_author_and_current_source_date(source):
+    with pytest.raises(NewsError, match='article_rights_or_scope_excluded'):
+        extract_article(short_page(author='未知作者'), source,
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
+    with pytest.raises(NewsError, match='body_not_found'):
+        extract_article(short_page(current_clock=False), source,
+            page_url='https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394')
 
 
 @pytest.mark.parametrize('value', [True, '作者', [''], [' 作者'], ['作者', '作者'], [['作者']]])

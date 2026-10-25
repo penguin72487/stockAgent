@@ -20,6 +20,7 @@ import time
 from urllib.parse import urlsplit
 
 from downloader.news_fulltext_candidates import native_candidate_source, candidate_response_metadata, candidate_evidence_allowed
+from downloader.news_fulltext_diagnostics import IDENTITY_METADATA_READ_VERSIONS
 from downloader.news_fulltext_candidate_originals import (
     PendingOriginal, QUESTION, LEGACY_QUESTION, legacy_route, private_original_permit,
     private_legacy_original_permit, retain_original, retention_flags, original_route_version,
@@ -28,12 +29,16 @@ from downloader.news_fulltext_candidate_originals import (
     GLOBALVOICES_ORIGINAL_LAYOUT, GLOBALVOICES_ORIGINAL_QUESTION,
     globalvoices_original_url, private_globalvoices_original_permit,
     STOCKFEEL_ORIGINAL_QUESTION, INEWS_ORIGINAL_QUESTION, INEWS_HEADER_ORIGINAL_QUESTION,
+    INEWS_BODY_ORIGINAL_QUESTION,
+    INEWS_SHORT_CREDIT_ORIGINAL_QUESTION,
     ETTODAY_CREDIT_ORIGINAL_QUESTION, ETTODAY_INLINE_ORIGINAL_QUESTION, ETTODAY_VISIBLE_ORIGINAL_QUESTION,
     ETTODAY_IMAGE_ORIGINAL_QUESTION, ETTODAY_NONEMPTY_ORIGINAL_QUESTION,
     ETTODAY_CANONICAL_ORIGINAL_QUESTION,
+    GVM_ORIGINAL_QUESTION,
 )
 from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, NewsError, normalize_url
 from downloader.news_fulltext_bastillepost import BASTILLE_RESIDENT_EVIDENCE_VERSIONS
+from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_QUESTIONS, CONTENTPLATFORM_EVIDENCE_VERSIONS
 from downloader.news_fulltext_setn import (
     INEWS_BOUNDARY_QUESTION, INEWS_LAYOUT_VERSIONS, INEWS_PROVIDER, inews_literal_article_url,
 )
@@ -52,12 +57,22 @@ _KIND = 'reviewed_native_candidate_metadata'
 _SAFE_HASH = re.compile(r'[0-9a-f]{64}')
 _TERMINAL = frozenset({'observed', 'observed_error', 'skipped', 'uncertain_outcome'})
 _CANDIDATE_FAILURES = REPAIRABLE - {'body_not_found'}
-_EVIDENCE_VERSIONS = frozenset(range(1, 34))
+_EVIDENCE_VERSIONS = frozenset(range(1, 46))
 
 
 def _failure_states(layout, evidence):
     # These are diagnoses, NOT normal article requeues. The same exact head,
     # current source, lease/deadline and once-only observation key still bind.
+    from downloader.news_fulltext_gvm import GVM_CANDIDATE_LAYOUTS
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_LAYOUTS
+    if evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS or layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS:
+        return {'article_identity_not_verified'} if evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS and layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS else set()
+    if evidence in GVM_CANDIDATE_LAYOUTS or layout in GVM_CANDIDATE_LAYOUTS.values():
+        if GVM_CANDIDATE_LAYOUTS.get(evidence)!=layout:return set()
+        return ({'article_identity_not_verified','article_rights_or_scope_excluded'}
+                if evidence==34 else {'article_identity_not_verified'})
+    if evidence in {38, 39}:
+        return {'body_not_found'} if layout == 'setn_inews_native_article_v8' else set()
     if evidence in {27, 28, 29, 30, 31, 32, 33}:
         return ({'article_identity_not_verified', 'article_attribution_not_verified'}
                 if layout == 'ettoday_visible_article_v39' else set())
@@ -136,6 +151,7 @@ def _inbox(root):
 
 
 def _key(target, candidate, *, evidence_contract_version=1):
+    from downloader.news_fulltext_gvm import GVM_CANDIDATE_LAYOUTS
     # User reasons/timestamps and changing failure counters cannot buy a second
     # observation of the same URL and candidate contract.
     if (type(evidence_contract_version) is not int or evidence_contract_version not in _EVIDENCE_VERSIONS
@@ -144,8 +160,10 @@ def _key(target, candidate, *, evidence_contract_version=1):
             or evidence_contract_version == 12 and target['provider'] != 'fed_board'
             or evidence_contract_version == 13 and target['provider'] != 'globalvoices'
             or evidence_contract_version == 19 and target['provider'] != 'cmnews'
+            or (target['provider'] == 'contentplatform') != (evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS)
+            or (target['provider'] == 'gvm') != (evidence_contract_version in GVM_CANDIDATE_LAYOUTS)
             or evidence_contract_version in {27, 28, 29, 30, 31, 32, 33} and target['provider'] != 'ettoday'
-            or (target['provider'] == INEWS_PROVIDER) != (evidence_contract_version in {24, 25, 26})
+            or (target['provider'] == INEWS_PROVIDER) != (evidence_contract_version in {24, 25, 26, 38, 39})
             or (target['provider'] == 'upmedia') != (evidence_contract_version in {20, 21, 22, 23})
             or (target['provider'] == 'stockfeel') != (evidence_contract_version in {14, 15})
             or (target['provider'] == 'taiwannews') != (evidence_contract_version in {16, 17, 18})
@@ -222,6 +240,10 @@ def _key(target, candidate, *, evidence_contract_version=1):
         basis = [25, target['provider'], target['id'], INEWS_ORIGINAL_QUESTION]
     elif evidence_contract_version == 26:
         basis = [26, target['provider'], target['id'], INEWS_HEADER_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 38:
+        basis = [38, target['provider'], target['id'], INEWS_BODY_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 39:
+        basis = [39, target['provider'], target['id'], INEWS_SHORT_CREDIT_ORIGINAL_QUESTION]
     elif evidence_contract_version == 27:
         basis = [27, target['provider'], target['id'], ETTODAY_BOUNDARY_QUESTION]
     elif evidence_contract_version == 28:
@@ -236,6 +258,31 @@ def _key(target, candidate, *, evidence_contract_version=1):
         basis = [32, target['provider'], target['id'], ETTODAY_NONEMPTY_ORIGINAL_QUESTION]
     elif evidence_contract_version == 33:
         basis = [33, target['provider'], target['id'], ETTODAY_CANONICAL_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 34:
+        from downloader.news_fulltext_gvm import GVM_BOUNDARY_QUESTION
+        basis = [34, target['provider'], target['id'], GVM_BOUNDARY_QUESTION]
+    elif evidence_contract_version == 35:
+        from downloader.news_fulltext_gvm import GVM_EDITOR_QUESTION
+        basis = [35, target['provider'], target['id'], GVM_EDITOR_QUESTION]
+    elif evidence_contract_version == 36:
+        from downloader.news_fulltext_gvm import GVM_REMAINING_QUESTION
+        basis = [36, target['provider'], target['id'], GVM_REMAINING_QUESTION]
+    elif evidence_contract_version == 37:
+        from downloader.news_fulltext_gvm import GVM_V4_FAILURE_QUESTION
+        basis = [37, target['provider'], target['id'], GVM_V4_FAILURE_QUESTION]
+    elif evidence_contract_version == 40:
+        # This original is reusable by future parsers. Neither parser hashes,
+        # changed failure counters nor another reason buys another source GET.
+        basis = [40, target['provider'], target['id'], GVM_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 41:
+        from downloader.news_fulltext_gvm import GVM_HEADER_QUESTION
+        basis = [41, target['provider'], target['id'], GVM_HEADER_QUESTION]
+    elif evidence_contract_version == 42:
+        from downloader.news_fulltext_gvm import GVM_MULTIPLE_CREDIT_QUESTION
+        basis = [42, target['provider'], target['id'], GVM_MULTIPLE_CREDIT_QUESTION]
+    elif evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS:
+        basis = [evidence_contract_version, target['provider'], target['id'],
+            CONTENTPLATFORM_EVIDENCE_QUESTIONS[evidence_contract_version]]
     return hashlib.sha256(_bytes(basis)).hexdigest()
 
 
@@ -248,6 +295,210 @@ def _prior_unfinished_observation(db, target, *, request_id='', created_at_utc='
         "ORDER BY CASE state WHEN 'uncertain_outcome' THEN 0 WHEN 'reserved' THEN 1 ELSE 2 END LIMIT 1",
         (target['provider'], request_id, target['id'], request_id, created_at_utc, request_id)).fetchone()
     return row[0] if row else None
+
+
+def _prior_contentplatform_root_refusal(db, source, url):
+    """The nested-root question follows one closed, unretained header failure.
+
+    Bind the exact original head, request, source and response outcome. A
+    successful retained original, transport failure or uncertain reservation
+    never authorizes another request. Recheck at reservation, not just submit.
+    """
+    from downloader.news_fulltext_contentplatform import (
+        CONTENTPLATFORM_ORIGINAL_LAYOUTS, CONTENTPLATFORM_ORIGINAL_QUESTION,
+        CONTENTPLATFORM_V2_ORIGINAL_BINDING, contentplatform_original_source)
+    from downloader.news_fulltext_repairs import _unique
+    error = 'completed_contentplatform_unretained_header_refusal_required'
+    try:
+        if not contentplatform_original_source(source):
+            raise ValueError(error)
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        key = _key(target, source.data_fingerprint, evidence_contract_version=43)
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='native_candidate_jobs'").fetchone():
+            raise ValueError(error)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?', (key,)).fetchone()
+        if (not prior or prior['state'] != 'observed' or any(
+                not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072
+                for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = (json.loads(prior[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        old_source = request['source']
+        location = result['private_original_scope_failure_location']
+        if (hashlib.sha256(_bytes(request)).hexdigest() != prior['request_id']
+                or request['target'] != target or request['observation_key'] != key
+                or request['candidate_layout'] not in CONTENTPLATFORM_ORIGINAL_LAYOUTS
+                or request['evidence_contract_version'] != 43 or result['evidence_contract_version'] != 43
+                or set(old_source) != SOURCE_FIELDS
+                or old_source['authorization_fingerprint'] != source.authorization_fingerprint
+                or (old_source['data_fingerprint'], old_source['authorization_fingerprint']) not in {
+                    CONTENTPLATFORM_V2_ORIGINAL_BINDING, (source.data_fingerprint, source.authorization_fingerprint)}
+                or request['candidate_fingerprint'] != old_source['data_fingerprint']
+                or result['question'] != CONTENTPLATFORM_ORIGINAL_QUESTION
+                or result['provider'] != source.provider or result['requested_url'] != url or result['final_url'] != url
+                or type(result['status']) is not int or result['status'] != 200
+                or result['private_original_scope_error'] != 'article_identity_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result[k] is not False for k in ('raw_or_names_or_body_retained', 'accepted_as_article',
+                    'body_completeness_verified', 'identity_or_alias_accepted'))
+                or not location['sites']
+                or location['sites'][-1].get('module') != 'news_fulltext_contentplatform.py'
+                or location['sites'][-1].get('function') != '_native_header'
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+        raise ValueError(error) from None
+
+
+def _prior_contentplatform_image_refusal(db, source, url):
+    """Only the closed div/image refusal authorizes this distinct relation."""
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ROOT_QUESTION
+    from downloader.news_fulltext_repairs import _unique
+    _prior_contentplatform_root_refusal(db, source, url)
+    error = 'completed_contentplatform_leading_image_refusal_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        key = _key(target, source.data_fingerprint, evidence_contract_version=44)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?', (key,)).fetchone()
+        if (not prior or prior['state'] != 'observed' or any(
+                not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072
+                for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = (json.loads(prior[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        shape = result['native_root_shape']
+        if (hashlib.sha256(_bytes(request)).hexdigest() != prior['request_id']
+                or request['target'] != target or request['observation_key'] != key
+                or request['source'] != _source_contract(db, source, url)[1]
+                or request['candidate_layout'] != source.embedded_article_layout
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or request['evidence_contract_version'] != 44 or result['evidence_contract_version'] != 44
+                or result['question'] != CONTENTPLATFORM_ROOT_QUESTION
+                or result['provider'] != source.provider or result['requested_url'] != url or result['final_url'] != url
+                or type(result['status']) is not int or result['status'] != 200
+                or result['private_original_scope_error'] != 'private_contentplatform_nested_credit_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result[k] is not False for k in ('raw_or_names_or_body_retained', 'accepted_as_article',
+                    'body_completeness_verified', 'identity_or_alias_accepted'))
+                or shape['contract_version'] != 1 or shape['native_identity_author_clock_verified'] is not True
+                or shape['direct_tag_counts'] != {'div': 1}
+                or shape['first_written_candidate_path'] != ['div', 'img']
+                or shape['first_candidate_is_nested_paragraph'] is not False
+                or shape['first_credit_matches_declared_author'] is not False
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+        raise ValueError(error) from None
+
+
+def _prior_gvm_header_refusal(db, source, url):
+    """A new header question requires a closed, same-head V8 refusal.
+
+    The original-retention question stays closed. Only its explicit missing
+    header evidence can authorize the distinct finite relation observation;
+    a changed parser, reason, failed transport or unknown outcome cannot.
+    Rechecked on both submission and reservation by the existing owner.
+    """
+    from downloader.news_fulltext_gvm import GVM_V8_ORIGINAL_BINDING, GVM_WRITTEN_FORMAT_LAYOUT, gvm_static_editor_source
+    from downloader.news_fulltext_repairs import _unique
+
+    error = 'completed_gvm_missing_header_original_refusal_required'
+    try:
+        if (not gvm_static_editor_source(source)
+                or (source.parser_repair_prior_capture_fingerprint, source.authorization_fingerprint)
+                    != GVM_V8_ORIGINAL_BINDING
+                or not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone()):
+            raise ValueError(error)
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        key = _key(target, GVM_V8_ORIGINAL_BINDING[0], evidence_contract_version=40)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?', (key,)).fetchone()
+        if (not prior or prior['state'] != 'observed' or any(
+                not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072
+                for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = (json.loads(prior[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        if not isinstance(request, dict) or not isinstance(result, dict):
+            raise ValueError(error)
+        old_source = request.get('source')
+        context, location = result.get('gvm_received_failure_context'), result.get('failure_location')
+        if (hashlib.sha256(_bytes(request)).hexdigest() != prior['request_id']
+                or request.get('target') != target or request.get('observation_key') != key
+                or not isinstance(old_source, dict) or set(old_source) != SOURCE_FIELDS
+                or old_source.get('data_fingerprint') != GVM_V8_ORIGINAL_BINDING[0]
+                or old_source.get('authorization_fingerprint') != GVM_V8_ORIGINAL_BINDING[1]
+                or request.get('candidate_layout') != GVM_WRITTEN_FORMAT_LAYOUT
+                or request.get('evidence_contract_version') != 40
+                or request.get('candidate_fingerprint') != GVM_V8_ORIGINAL_BINDING[0]
+                or result.get('evidence_contract_version') != 40 or result.get('question') != GVM_ORIGINAL_QUESTION
+                or result.get('provider') != 'gvm' or result.get('requested_url') != url
+                or result.get('final_url') != url or result.get('redirect_count') != 0 or result.get('status') != 200
+                or result.get('current_native_error') != 'article_identity_not_verified'
+                or result.get('private_original_scope_error') != 'private_gvm_original_scope_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result.get(k) is not False for k in ('raw_or_names_or_body_retained', 'accepted_as_article',
+                    'body_completeness_verified', 'identity_or_alias_accepted'))
+                or not isinstance(context, dict) or context.get('native_parser_version') != 8
+                or context.get('current_native_error') != 'article_identity_not_verified'
+                or context.get('prior_header_identity_access_credit_clocks_passed') is not False
+                or any(context.get(k) is not True for k in ('native_frame_observed', 'native_head_found',
+                    'native_body_found', 'native_unrestricted'))
+                or not isinstance(location, dict) or not isinstance(location.get('sites'), list)
+                or not any(isinstance(site, dict) and site.get('module') == 'news_fulltext_gvm.py'
+                    and site.get('function') in {'gvm_public_native_article', '_magazine_issue'}
+                    for site in location['sites'])
+                # The periodical template omits the online access attribute;
+                # reaching _magazine_issue proves the earlier public checks ran.
+                or context.get('native_accessible') is not True and not (
+                    context.get('native_accessible') is False and any(isinstance(site, dict)
+                        and site.get('module') == 'news_fulltext_gvm.py' and site.get('function') == '_magazine_issue'
+                        for site in location['sites']))
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+
+
+def _prior_gvm_multiple_credit_refusal(db,source,url):
+    """A closed two-credit V9 refusal, never a replay of its single-credit question."""
+    from downloader.news_fulltext_gvm import GVM_V9_ORIGINAL_BINDING, GVM_HEADER_QUESTION, GVM_STATIC_EDITOR_LAYOUT, gvm_presentation_source
+    from downloader.news_fulltext_repairs import _unique
+    error='completed_gvm_two_credit_header_refusal_required'
+    try:
+        if (not gvm_presentation_source(source)
+                or (source.parser_repair_prior_capture_fingerprint,source.authorization_fingerprint)!=GVM_V9_ORIGINAL_BINDING
+                or not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone()):
+            raise ValueError(error)
+        target=_head(db.execute('SELECT * FROM articles WHERE url=?',(url,)).fetchone())
+        key=_key(target,GVM_V9_ORIGINAL_BINDING[0],evidence_contract_version=41)
+        prior=db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',(key,)).fetchone()
+        if (not prior or prior['state']!='observed' or any(not isinstance(prior[k],str)
+                or not 0<len(prior[k])<=131072 for k in ('request_json','result_json'))):raise ValueError(error)
+        request,result=(json.loads(prior[k],object_pairs_hook=_unique) for k in ('request_json','result_json'))
+        old=request.get('source');relations=result.get('gvm_header_relations')
+        if (hashlib.sha256(_bytes(request)).hexdigest()!=prior['request_id'] or request.get('target')!=target
+                or request.get('observation_key')!=key or not isinstance(old,dict) or set(old)!=SOURCE_FIELDS
+                or (old.get('data_fingerprint'),old.get('authorization_fingerprint'))!=GVM_V9_ORIGINAL_BINDING
+                or request.get('candidate_layout')!=GVM_STATIC_EDITOR_LAYOUT or request.get('evidence_contract_version')!=41
+                or request.get('candidate_fingerprint')!=GVM_V9_ORIGINAL_BINDING[0]
+                or result.get('evidence_contract_version')!=41 or result.get('question')!=GVM_HEADER_QUESTION
+                or result.get('provider')!='gvm' or result.get('requested_url')!=url or result.get('final_url')!=url
+                or result.get('status')!=200 or result.get('redirect_count')!=0
+                or result.get('current_native_error')!='article_identity_not_verified'
+                or result.get('private_original_scope_error')!='private_gvm_header_original_scope_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result.get(k) is not False for k in ('raw_or_names_or_body_retained','accepted_as_article',
+                    'body_completeness_verified','identity_or_alias_accepted'))
+                or not isinstance(relations,dict) or relations.get('native_parser_version')!=9
+                or any(relations.get(k)!=2 for k in ('native_credit_anchor_count','prior_credit_selector_count','native_credit_node_count','schema_author_count'))
+                or any(relations.get(k) is not True for k in ('literal_native_identity_agrees','native_public_access',
+                    'schema_publisher_and_literal_URL_agree','schema_public_access','native_publication_clocks_agree'))
+                or relations.get('external_media_credit_marker') is not False or relations.get('explicit_reprint_marker') is not False
+                or relations.get('private_header_profile_schema_clocks_verified') is not False
+                or not (_clock(target['last_checked_at_utc'])<=_clock(prior['created_at_utc'])
+                    <=_clock(prior['reserved_at_utc'])<=_clock(prior['completed_at_utc'])<=time.time())):
+            raise ValueError(error)
+    except (AttributeError,KeyError,TypeError,ValueError,RecursionError):raise ValueError(error) from None
 
 
 def _prior_upmedia_missing_header(db, source, identity, url):
@@ -382,6 +633,14 @@ def _prior_upmedia_remaining_context(db, source, identity, url):
 def _question_source(db, registry, url, evidence):
     if evidence != 7:
         source, identity = _source(db, registry, url)
+        if evidence==41:
+            _prior_gvm_header_refusal(db,source,url)
+        if evidence==42:
+            _prior_gvm_multiple_credit_refusal(db,source,url)
+        if evidence == 44:
+            _prior_contentplatform_root_refusal(db, source, url)
+        if evidence == 45:
+            _prior_contentplatform_image_refusal(db, source, url)
         if evidence == 12:
             from downloader.news_fulltext_pdf import board_pdf_original_url
             if not board_pdf_original_url(url, source):
@@ -402,6 +661,8 @@ def _question_source(db, registry, url, evidence):
             _prior_upmedia_remaining_context(db, source, identity, url)
         if evidence in {25, 26}:
             _prior_inews_printed_credit(db, source, identity, url, header_credit=evidence == 26)
+        if evidence == 39:
+            _prior_inews_short_credit(db, source, identity, url)
         if evidence == 28:
             _prior_ettoday_leading_credit(db, source, identity, url)
         if evidence == 29:
@@ -611,6 +872,47 @@ def _prior_ettoday_leading_credit(db, source, identity, url):
         raise ValueError(error) from None
 
 
+def _prior_inews_short_credit(db, source, identity, url):
+    """Only the closed v38 short editor/printed-credit gap, not a new v38 GET."""
+    error = 'completed_inews_short_editor_or_printed_credit_proof_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        key = _key(target, source.data_fingerprint, evidence_contract_version=38)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?', (key,)).fetchone()
+        if not prior or prior['state'] != 'observed':
+            raise ValueError(error)
+        request, facts = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        boundary = facts['inews_native_boundary']
+        credits, editors = boundary['credits'], boundary['editors']
+        body = editors[0]['bodies'][0]
+        credit = credits[0]
+        printed = (credit['prefix_candidate']=='empty' and credit['element']['characters']==0
+            and not credit['links'])
+        named_editor = (credit['prefix_candidate']=='編輯' and len(credit['links'])==1
+            and credit['links'][0]['native_author'] is True and not credit['links'][0]['hidden']
+            and 2 <= credit['links'][0]['characters'] <= 20 and not credit['links'][0]['child_tags'])
+        paragraphs = [r for r in body['children'] if r['tag']=='p']
+        if (source.provider!=INEWS_PROVIDER or request['source']!=identity or request['target']!=target
+                or request['evidence_contract_version']!=38 or facts['evidence_contract_version']!=38
+                or facts['question']!=INEWS_BODY_ORIGINAL_QUESTION or facts['provider']!=INEWS_PROVIDER
+                or facts['requested_url']!=url or facts['final_url']!=url or facts['redirect_count']!=0
+                or facts['status']!=200 or facts['accepted_as_article'] is not False
+                or facts['raw_or_names_or_body_retained'] is not False
+                or facts['native_short_body_scope_verified'] is not False
+                or boundary['context_truncated'] or boundary['global_shape_limit_reached']
+                or len(editors)!=1 or len(credits)!=1 or editors[0]['body_count']!=1
+                or editors[0]['bodies_truncated'] or body['children_truncated']
+                or credit['element']['hidden'] or credit['links_truncated'] or not (printed or named_editor)
+                or not 0 < sum(p['characters'] for p in paragraphs) < 100
+                or any(r['tag'] not in {'p','figure'} for r in body['children'])
+                or hashlib.sha256(prior['request_json'].encode()).hexdigest()!=prior['request_id']
+                or not (_clock(prior['created_at_utc']) <= _clock(prior['reserved_at_utc'])
+                    <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (sqlite3.OperationalError, KeyError, IndexError, TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+
+
 def _prior_inews_printed_credit(db, source, identity, url, *, header_credit=False):
     """Completed same-head credit geometry, never a replay of v24 or v25."""
     error = ('completed_inews_named_header_editor_proof_required' if header_credit
@@ -731,7 +1033,9 @@ def recorded_cmnews_canonical(db, source, target):
                         continue
                     payload = stream.read(65537)
                 facts = json.loads(payload)
-                if (facts.get('contract_version') != 1 or facts.get('provider') != 'cmnews'
+                version = facts.get('contract_version')
+                if (type(version) is not int or version not in IDENTITY_METADATA_READ_VERSIONS
+                        or facts.get('provider') != 'cmnews'
                         or facts.get('data_fingerprint') != source.data_fingerprint
                         or facts.get('authorization_fingerprint') != source.authorization_fingerprint
                         or facts.get('request_url') != target['url'] or facts.get('final_url') != target['url']
@@ -847,7 +1151,7 @@ def submit_candidate(root, config, registry, url, layout, *, reason, evidence_co
     candidate = native_candidate_source(config, registry, registry.base, layout)
     if not candidate_evidence_allowed(registry.sources[candidate.provider], candidate, evidence_contract_version):
         raise ValueError('reviewed_candidate_evidence_contract_required')
-    if evidence_contract_version in {24, 25, 26} and not inews_literal_article_url(url):
+    if evidence_contract_version in {24, 25, 26, 38, 39} and not inews_literal_article_url(url):
         raise ValueError('literal_current_inews_route_required')
     if evidence_contract_version == 27 and not ettoday_literal_diagnostic_url(url,
             allow_house='house.ettoday.net' in candidate.reviewed_article_subsites):
@@ -903,7 +1207,7 @@ def submit_candidate(root, config, registry, url, layout, *, reason, evidence_co
                     'request_id': existing['request_id'], 'state': existing['state'],
                     'publisher_requests': 0, 'article_heads_mutated': False, 'accepted_as_article': False}
             if (candidate.provider == 'cmnews' or evidence_contract_version in {
-                    7, 12, 13, 14, 15, 18, 20, 21, 22, 23, 24, 25, 26, 27, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}) and _prior_unfinished_observation(db, target):
+                    7, 12, 13, 14, 15, 18, 20, 21, 22, 23, 24, 25, 26, 27, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}) and _prior_unfinished_observation(db, target):
                 raise ValueError('prior_observation_not_terminal')
     request = {'contract_version': CONTRACT_VERSION, 'kind': _KIND,
         'created_at_utc': utc_now(), 'reason': reason.strip(), 'target': target, 'source': identity,
@@ -930,6 +1234,8 @@ def submit_candidate(root, config, registry, url, layout, *, reason, evidence_co
 
 
 def _load(path):
+    from downloader.news_fulltext_gvm import GVM_CANDIDATE_LAYOUTS
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_LAYOUTS, contentplatform_article_id
     request = _read_private_request(path)
     fields = {'contract_version', 'kind', 'created_at_utc', 'reason', 'target', 'source',
               'candidate_layout', 'candidate_fingerprint', 'observation_key'}
@@ -950,6 +1256,8 @@ def _load(path):
                    for key in SOURCE_FIELDS - {'contract_version'})
             or not isinstance(request['candidate_layout'], str) or not (
                 request['candidate_layout'] == BOARD_PDF_ORIGINAL_LAYOUT
+                or request['candidate_layout'] in CONTENTPLATFORM_ORIGINAL_LAYOUTS
+                or request['candidate_layout'] in GVM_CANDIDATE_LAYOUTS.values()
                 or request['candidate_layout'] in INEWS_LAYOUT_VERSIONS
                 or request['candidate_layout'] in {'upmedia_public_modern_article_v1', 'upmedia_public_modern_article_v2', 'upmedia_public_modern_article_v3', 'upmedia_public_modern_article_v4'}
                 or request['candidate_layout'] in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'}
@@ -974,10 +1282,14 @@ def _load(path):
             or request['candidate_layout'] == 'cmnews_visible_article_v1' and (
                 target['provider'] != 'cmnews' or evidence not in {1, 19})
             or evidence == 19 and (target['provider'] != 'cmnews' or request['candidate_layout'] != 'cmnews_visible_article_v1')
+            or (request['candidate_layout'] in CONTENTPLATFORM_ORIGINAL_LAYOUTS) != (evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS)
+            or evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS and (target['provider'] != 'contentplatform' or contentplatform_article_id(target['url']) is None)
+            or (request['candidate_layout'] in GVM_CANDIDATE_LAYOUTS.values() or evidence in GVM_CANDIDATE_LAYOUTS)
+                and (target['provider']!='gvm' or GVM_CANDIDATE_LAYOUTS.get(evidence)!=request['candidate_layout'])
             or evidence in {27, 28, 29, 30, 31, 32, 33} and (target['provider'] != 'ettoday' or request['candidate_layout'] != 'ettoday_visible_article_v39')
             or request['candidate_layout'] == 'ettoday_visible_article_v39' and evidence not in {1, 27, 28, 29, 30, 31, 32, 33}
-            or (request['candidate_layout'] in INEWS_LAYOUT_VERSIONS) != (evidence in {24, 25, 26})
-            or evidence in {24, 25, 26} and (target['provider'] != INEWS_PROVIDER or not inews_literal_article_url(target['url']))
+            or (request['candidate_layout'] in INEWS_LAYOUT_VERSIONS) != (evidence in {24, 25, 26, 38, 39})
+            or evidence in {24, 25, 26, 38, 39} and (target['provider'] != INEWS_PROVIDER or not inews_literal_article_url(target['url']))
             or request['candidate_layout'] == 'watchmedia_visible_article_v3' and (
                 target['provider'] != 'watchmedia' or evidence not in {1, 6})
             or evidence == 6 and (target['provider'] != 'watchmedia'
@@ -1153,7 +1465,7 @@ def claim_candidate(queue, http, config, provider):
                 or parts.scheme+'://'+parts.netloc in http.blocked_robots_origins(provider)):
             continue
         try:
-            if evidence_version in {7, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}:
+            if evidence_version in {7, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}:
                 # Pending files can race before either enters SQLite. Serialize
                 # ready questions in a stable order; otherwise they would each
                 # see the other as "prior" and wait forever. Reservations and
@@ -1223,10 +1535,10 @@ def fetch_candidate(http, job):
         raise NewsError('candidate_literal_response_not_verified')
     facts = candidate_response_metadata(response, job['source'], job['candidate'],
         evidence_contract_version=evidence_version,
-        **({'requested_url':job['url']} if evidence_version in {5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS} else {}))
+        **({'requested_url':job['url']} if evidence_version in {5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS} else {}))
     parsed = time.perf_counter()
     permit = None
-    if evidence_version in {15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33}:
+    if evidence_version in {15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS}:
         permit = facts.pop('private_original_permit', None)
     current_errors = {'article_identity_not_verified'}
     if evidence_version == 5 and original_route_version(job['source'].embedded_article_layout) == 11:

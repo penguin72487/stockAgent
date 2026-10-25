@@ -24,6 +24,7 @@ from stockagent.data_sync.desync_snapshots import (
     atomic_write_json,
     sha256_file,
 )
+from stockagent.data_sync.dataset_migration import migration_process_identity
 from stockagent.data_sync.legacy_artifact_archive import (
     LegacyArchiveSpec,
     legacy_process_scope,
@@ -528,6 +529,17 @@ def _quarantine_resume_binding(spec: LegacyArchiveSpec, plan: Mapping[str, Any],
         raise SnapshotError("interrupted legacy retirement fixed cold release changed")
     binding = _full_verification_binding(spec, quarantine/"source", quarantine/"hot",
                                          archive, Path(options["sync_root"]))
+    # Most producer receipts live inside the bound source tree. These exact
+    # older producers use original external reports; include their
+    # complete bytes in every fresh binding, even when reusing the byte audit.
+    from stockagent.data_sync.benchmark_fixtures import (
+        external_benchmark_contract, completed_benchmark_evidence,
+    )
+    external_contract = external_benchmark_contract(source)
+    if external_contract is not None and spec.relative_root.startswith('benchmarks/'):
+        binding['external_benchmark_completion'] = completed_benchmark_evidence(
+            quarantine/'source', required_contract=external_contract,
+            original_source=source)
     binding.update(quarantine=str(quarantine), retirement_state=state)
     return quarantine, binding
 
@@ -552,8 +564,11 @@ def plan_legacy_quarantine_resume(spec: LegacyArchiveSpec, prior_plan: Mapping[s
     if _quarantine_resume_binding(spec, prior_plan, **options)[1] != binding:
         raise SnapshotError("interrupted legacy retirement changed during full audit")
     return {**prior_plan, **cold, "quarantine_resume":True, "peer_proof":peer,
-            "full_verification":{"contract":"owned-legacy-quarantine-resume-v1",
-                "binding":binding, "verified_at_epoch":time.time()}}
+            "full_verification":{"contract":"owned-legacy-quarantine-resume-v2",
+                "binding":binding, "verified_at_epoch":time.time(),
+                "owner_process":migration_process_identity(),
+                "original_files":proof["files"], "original_bytes":proof["original_bytes"],
+                "verified_archive_manifest_sha256":sha256_file(archive/"legacy_archive_manifest.json")}}
 
 
 def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: str,
@@ -567,18 +582,34 @@ def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: s
         original["full_verification"] = {"binding":{
             "dataset":spec.dataset, "hot":full.get("binding", {}).get("hot")}}
         if (plan.get("plan_fingerprint") != expected_fingerprint
-                or full.get("contract") != "owned-legacy-quarantine-resume-v1"
+                or full.get("contract") != "owned-legacy-quarantine-resume-v2"
+                or full.get("owner_process") != migration_process_identity()
                 or not 0 <= time.time()-float(full.get("verified_at_epoch", 0)) <= 1500):
             raise SnapshotError("interrupted legacy retirement full audit expired or differs")
         quarantine, binding = _quarantine_resume_binding(spec, original, **options)
         if binding != full["binding"]:
             raise SnapshotError("interrupted legacy retirement generation changed before unlink")
         archive = spec.stage_root/spec.dataset/"archive"
-        proof = verify_archive_directory(archive, quarantine/"source", spec=spec,
-            manual_capture=plan.get("manual_capture", False),
-            artifact_root=Path(options["artifact_root"]), repo_root=Path(options["repo_root"]))
+        # This transaction does not rename again. The same owned quarantine
+        # was fully decoded/hashed immediately before acquiring the mutation
+        # owner, and its complete inode/ctime binding still matches. Reuse
+        # that fresh proof; keep bulk decoding outside the shared owner. The
+        # initial rename and stage-prune rename retain their full byte audits.
+        raw_manifest = (archive/"legacy_archive_manifest.json").read_bytes()
+        if hashlib.sha256(raw_manifest).hexdigest() != full.get("verified_archive_manifest_sha256"):
+            raise SnapshotError("owned quarantine verified archive manifest differs")
+        manifest = json.loads(raw_manifest)
+        rows = manifest.get("files")
+        if (not isinstance(rows, list) or type(full.get("original_files")) is not int
+                or type(full.get("original_bytes")) is not int or full["original_bytes"] < 0
+                or len(rows) != full["original_files"] or not rows
+                or any(not isinstance(row, dict) or not isinstance(row.get("source"), dict)
+                       or type(row["source"].get("size")) is not int or row["source"]["size"] < 0
+                       for row in rows)
+                or sum(row["source"]["size"] for row in rows) != full["original_bytes"]):
+            raise SnapshotError("owned quarantine full original inventory differs")
         inventory = [{"kind":"file", "path":r["path"], "size":r["source"]["size"],
-                      "sha256":r["original_sha256"]} for r in proof["manifest"]["files"]]
+                      "sha256":r["original_sha256"]} for r in rows]
         _hot_mirror(quarantine/"source", quarantine/"hot", inventory)
         resolved = resolve_latest_packed(Path(options["sync_root"]), spec.dataset)
         verify_cold_resilience(Path(options["sync_root"]), resolved, Path(options["backup_config"]))
@@ -592,7 +623,8 @@ def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: s
         shutil.rmtree(quarantine/"source")
         quarantine.rmdir()
         result = {**plan, "action":"retired", "deleted":True, "resumed_quarantine":True,
-                  "reclaimed_allocated_file_bytes":reclaimed, "unlink_peer_proof":peer}
+                  "reclaimed_allocated_file_bytes":reclaimed, "unlink_peer_proof":peer,
+                  "reused_same_owned_quarantine_full_verification":True}
         state = _read_state(_state_path(state_root, spec.dataset))
         assert state is not None
         state.update(state="cold-only", retired_at=_utc_iso_from_ns(time.time_ns()),

@@ -1,0 +1,15 @@
+# Paired action-universe study: identical stock inputs, account, dates and model.
+# Expanded cases are source-admitted stock/ETF/index futures, not all-TWD proof.
+base_config: tw_stock_futures_carry_0845_history2013_20261023_v2.yaml
+experiment_name: tw-futures-equity-universe-2020-20261023-v2
+data:
+  panel_cache_root: data_tw_index_futures/training_cache/equity_universe_20261023_v2/base_panel
+trading:
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_equity_universe_20261023_v2/stock_only/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_equity_universe_20261023_v2/stock_only/clocks/0845/opening_reference.parquet
+walk_forward:
+  expected_first_year: 2020
+  split_start_year: 2020
+runner:
+  output_dir: artifacts/markets/tw_futures_equity_universe_20261023_v2/stock_only__0845
+  resume: false

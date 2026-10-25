@@ -266,3 +266,49 @@ def test_kbars_only_never_reads_or_schedules_ticks_and_preserves_full_summary(tm
     assert summary["tick_dates"] == 0 and not summary["tick_target_universe_finalized"]
     assert (tmp_path / "summary.json").read_text() == "existing complete tick summary"
     assert (tmp_path / "summary_kbars.json").is_file()
+
+
+def test_summary_actual_tick_days_are_a_union_not_contract_days(tmp_path, monkeypatch):
+    import downloader.download_shioaji_historical_market_data as collector
+
+    rows = [_row(collection="exact_futures", priority=2, code=code, security_type="FUT")
+            for code in ("A", "B")]
+    def valid(_receipt, _data, *, method, code):
+        if method == "kbars":
+            return {"status": "complete", "rows": 2, "size": 10,
+                    "observed_trading_dates": ["2026-08-27", "2026-08-28"]}
+        if "2026-08-27" in str(_receipt):
+            return {"status": "source_empty", "rows": 0, "size": 0}
+        return {"status": "complete", "rows": 5 if code == "A" else 4, "size": 20}
+    monkeypatch.setattr(collector, "_valid_receipt", valid)
+    result = collector._write_summary(tmp_path, rows, chunk_days=29, state="observed",
+        usage=None, progress_path=tmp_path / "progress.json", persist=False)
+    bucket = result["by_collection"]["exact_futures"]
+    assert bucket["tick_dates"] == 4 and bucket["tick_rows"] == 9
+    assert bucket["tick_data_days"] == 1 and bucket["tick_symbols_with_data"] == 2
+    assert result["tick_data_days"] == 1
+    assert bucket["tick_first_data_date"] == bucket["tick_last_data_date"] == "2026-08-28"
+
+
+def test_summary_only_uses_original_writer_lock_and_never_logs_in(tmp_path, monkeypatch):
+    import builtins
+    import fcntl
+    import sys
+    import pytest
+    import downloader.download_shioaji_historical_market_data as collector
+
+    monkeypatch.setattr(sys, "argv", ["collector", "--summary-only", "--output-dir", str(tmp_path)])
+    monkeypatch.setattr(collector, "load_inventory", lambda root: [
+        _row(collection="exact_futures", priority=2, code="A", security_type="FUT")])
+    real_import = builtins.__import__
+    def no_login(name, *args, **kwargs):
+        if name == "shioaji":
+            raise AssertionError("metadata rebuild must not import or log in to the SDK")
+        return real_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", no_login)
+    with (tmp_path / "download.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(BlockingIOError):
+            collector.main()
+    assert collector.main() == 0
+    assert (tmp_path / "summary.json").is_file()

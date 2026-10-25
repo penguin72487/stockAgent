@@ -368,6 +368,16 @@ def metadata_update_trial(files, enabled):
         'sealed_pack_recovery_enabled_in_both_variants': True}
 
 
+def _wait_for_recorded_retry(retry_at, *, timeout_seconds=10):
+    """Honor the persisted wall deadline despite host-clock corrections."""
+    deadline = time.monotonic() + timeout_seconds
+    while (remaining := retry_at - time.time()) > 0:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise TimeoutError('recorded retry deadline did not arrive within the bounded wait')
+        time.sleep(min(remaining, budget, 0.25))
+
+
 def mutable_trial(files, enabled, *, operational_controls=False, announcement_controls=False):
     """Full v3 upgrade -> publish/retry -> cold readback -> owned cleanup.
 
@@ -479,7 +489,7 @@ def mutable_trial(files, enabled, *, operational_controls=False, announcement_co
             if not enabled:
                 if result['datasets']['example']['state'] != 'waiting_retry':
                     raise ValueError('reference failed to exercise the mutable-payload rejection')
-                time.sleep(1.05)  # Real retry deadline; no journal edit or fake clock.
+                _wait_for_recorded_retry(result['datasets']['example']['retry_at_unix'])
                 result = migration.migrate_catalog(base, args, [entry])
         if result['state'] != 'verified' or not replaced:
             raise ValueError('complete mutable-cohort publication did not verify')

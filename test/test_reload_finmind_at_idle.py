@@ -29,6 +29,117 @@ def test_preparation_stack_is_not_an_idle_flag_or_live_batch():
     assert not reload.preparation_stack(foreign)
 
 
+def test_store_fence_adoption_requires_full_exact_store_trials_and_unchanged_final_files():
+    proof = {'measurement_contract': reload.STORE_MEASUREMENT,
+             'state': 'accepted_bounded_store_replay',
+             'scope': 'canonical_store_first_publish_and_same_value_refresh_with_full_footer_and_sha_readback',
+             'exact_output_parity': True, 'source_parquet_preserved': True, 'code_stable': True,
+             'provider_calls': 0, 'production_queue_mutations': 0, 'production_source_writes': 0,
+             'records': {'tasks': 48, 'stores_per_trial': 96, 'rows_per_payload': 389},
+             'trials': [{'variant': name, 'elapsed_seconds': cost, 'cpu_seconds': cost,
+                         'stores': 96, 'exact_existing_final_inode_preserved': True,
+                         'output_sha256': 'a' * 64}
+                        for name, cost in [('baseline', 2), ('candidate', 1),
+                                           ('candidate', 1), ('baseline', 2)] * 2],
+             'medians': {name: {'elapsed_seconds': cost, 'cpu_seconds': cost}
+                         for name, cost in [('baseline', 2), ('candidate', 1)]}}
+    assert reload.accepted_local_measurement(proof)
+    for key in ('source_parquet_preserved', 'code_stable', 'exact_output_parity'):
+        assert not reload.accepted_local_measurement({**proof, key: False})
+    assert not reload.accepted_local_measurement({**proof, 'production_source_writes': 1})
+    assert not reload.accepted_local_measurement({**proof, 'trials': proof['trials'][:4]})
+    assert not reload.accepted_local_measurement({**proof, 'medians': {}})
+    for field, bad in [('output_sha256', 'b' * 64), ('elapsed_seconds', float('nan')),
+                       ('stores', 48), ('exact_existing_final_inode_preserved', False)]:
+        trials = [{**row} for row in proof['trials']]
+        trials[1][field] = bad
+        assert not reload.accepted_local_measurement({**proof, 'trials': trials})
+
+
+def test_parallel_publication_adoption_requires_full_pipeline_parity_and_original_bounds():
+    import copy
+    expected = {'calls': 48, 'accepted_requests': 48, 'nonempty_requests': 48, 'failed_tasks': 0}
+    proof = {'measurement_contract': reload.PUBLICATION_MEASUREMENT,
+             'state': 'eight_full_pipeline_trials_verified', 'configuration_sha256': 'a'*64,
+             'exact_output_parity': True, 'outputs_identical': True, 'source_preserved': True, 'code_stable': True,
+             'provider_calls': 0, 'production_queue_mutations': 0, 'source_writes': 0,
+             'tasks_per_pass': 48, 'passes_per_trial': 2, 'status_writes_per_trial': 5, 'source_rows': 240,
+             'benchmark_device': 7, 'target_queue_device': 7, 'boot_id': 'test-boot',
+             'medians': {'baseline': 2, 'candidate': 1},
+             'trials': [{'variant': label, 'wall_seconds': 1 if label=='candidate' else 2, 'cpu_seconds': 1,
+                         'output_sha256': 'b'*64, 'passes': [expected.copy(), expected.copy()],
+                         'existing_parquet_inodes_preserved': True, 'full_source_readback': True,
+                         'queue_writer_thread_verified': True, 'max_response_slots': 16,
+                         'same_filesystem_as_target_queue': True,
+                         'max_claimed_responses': 16, 'max_publication_workers': 2 if label=='candidate' else 1}
+                        for label in ['baseline', 'candidate', 'candidate', 'baseline']*2]}
+    assert reload.accepted_local_measurement(proof)
+    for field, bad in [('source_preserved', False), ('source_writes', 1), ('code_stable', False),
+                       ('source_rows', 0), ('configuration_sha256', None), ('status_writes_per_trial', 0),
+                       ('target_queue_device', 8), ('benchmark_device', None), ('boot_id', ''),
+                       ('trials', proof['trials'][:4]), ('medians', {'baseline': 4, 'candidate': 1})]:
+        assert not reload.accepted_local_measurement({**proof, field: bad})
+    for field, bad in [('wall_seconds', float('nan')), ('max_claimed_responses', 17),
+                       ('max_publication_workers', 16), ('max_response_slots', 32),
+                       ('existing_parquet_inodes_preserved', False), ('queue_writer_thread_verified', False),
+                       ('same_filesystem_as_target_queue', False),
+                       ('output_sha256', 'c'*64), ('passes', [expected])]:
+        broken = copy.deepcopy(proof); broken['trials'][1][field] = bad
+        assert not reload.accepted_local_measurement(broken)
+
+
+def test_reservation_reload_requires_balanced_full_local_cycle_and_exact_parity():
+    proof = {'measurement_contract': 'finmind_live_reservation_readers_local_dispatch_v1',
+             'state': 'measurement_complete', 'snapshot_preserved': True, 'exact_output_parity': True,
+             'code_stable': True, 'status_connection': 'native_StatusConnection_fresh_memo_per_trial',
+             'local_dispatch_wall_improvement_observed': True, 'production_queue_mutations': 0,
+             'provider_calls': 0, 'medians_seconds': {'baseline': 2.0, 'candidate': 1.0},
+             'trials': [{'label': label, 'admissions': 120, 'status_writes': 5,
+                         'wall_seconds': 2.0 if label == 'baseline' else 1.0, 'output_sha256': 'a'*64}
+                        for label in ('baseline', 'candidate', 'candidate', 'baseline')]}
+    assert reload.accepted_local_measurement(proof)
+    for key in ('snapshot_preserved', 'exact_output_parity', 'code_stable', 'local_dispatch_wall_improvement_observed'):
+        assert not reload.accepted_local_measurement({**proof, key: False})
+    assert not reload.accepted_local_measurement({**proof, 'medians_seconds': {'baseline': 3, 'candidate': 1}})
+    assert not reload.accepted_local_measurement({**proof, 'provider_calls': 1})
+    assert not reload.accepted_local_measurement({**proof, 'trials': proof['trials'][:2]})
+    changed = [{**row, 'output_sha256': 'b'*64} if index == 0 else row
+               for index, row in enumerate(proof['trials'])]
+    assert not reload.accepted_local_measurement({**proof, 'trials': changed})
+
+def test_eta_index_reload_requires_full_eta_and_exact_durable_write_trials():
+    proof = {'measurement_contract': 'finmind_full_eta_queue_indexes_v1',
+             'state': 'accepted_bounded_replay', 'scope': 'full_offline_finmind_eta_snapshot',
+             'exact_full_output_parity': True, 'read_snapshot_preserved': True,
+             'production_queue_writes': 0, 'provider_calls': 0,
+             'queue_index_setup': {name: {'task_changes': 0} for name in ('sponsor', 'complement')},
+             'medians': {name: {'elapsed_seconds': cost, 'cpu_seconds': cost, 'peak_rss_bytes': 100}
+                         for name, cost in (('baseline', 2.0), ('candidate', 1.0))},
+             'trials': [{'variant': name, 'elapsed_seconds': 2.0 if name == 'baseline' else 1.0,
+                         'cpu_seconds': 2.0 if name == 'baseline' else 1.0, 'peak_rss_bytes': 100,
+                         'output_sha256': 'a' * 64}
+                        for name in ('baseline', 'candidate', 'candidate', 'baseline') * 2],
+             'claim_release_trials': [{'variant': name, 'wall_seconds': 0.3, 'cpu_seconds': 0.2,
+                                      'tasks': 32, 'transactions': 64, 'exact_task_rows_restored': True}
+                                     for name in ('baseline', 'candidate', 'candidate', 'baseline')]}
+    assert reload.accepted_local_measurement(proof)
+    for key in ('exact_full_output_parity', 'read_snapshot_preserved'):
+        assert not reload.accepted_local_measurement({**proof, key: False})
+    assert not reload.accepted_local_measurement({**proof, 'production_queue_writes': 1})
+    assert not reload.accepted_local_measurement({**proof, 'trials': proof['trials'][:4]})
+    assert not reload.accepted_local_measurement({**proof, 'claim_release_trials': []})
+    assert not reload.accepted_local_measurement({**proof, 'queue_index_setup': {'complement': {'task_changes': 0}}})
+    changed = [dict(row) for row in proof['trials']]
+    changed[1]['output_sha256'] = 'b' * 64
+    assert not reload.accepted_local_measurement({**proof, 'trials': changed})
+    with_wake = {**proof, 'measurement_contract': 'finmind_full_eta_queue_indexes_v2',
+                 'scope': 'full_offline_finmind_eta_and_wake_snapshot',
+                 'trials': [{**row, 'wake_delays': {'sponsor': 60.0, 'complement': 30.0}}
+                            for row in proof['trials']]}
+    assert reload.accepted_local_measurement(with_wake)
+    assert not reload.accepted_local_measurement({**with_wake, 'trials': proof['trials']})
+
+
 def test_preparation_guard_rechecks_frozen_claims_and_always_thaws(tmp_path, monkeypatch):
     import sqlite3
     root = tmp_path
@@ -132,6 +243,48 @@ def test_idle_reload_requires_nonreactive_window_deadline_and_empty_claims(tmp_p
     other = tmp_path / "reactive"
     setup_idle(other, now, reason="incremental_reserve", seconds=60)
     assert reload.idle_proof(other, now) is None
+
+
+def test_idle_without_claim_table_entry_still_rejects_an_inflight_task(tmp_path):
+    now = datetime.now(UTC)
+    root = tmp_path / 'sponsor'
+    setup_idle(root, now, reason='current_queue', seconds=60)
+    with worker._db(root / 'queue.sqlite3') as connection:
+        connection.execute("INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
+                           "VALUES ('GoldPrice','','2026','year',1,'inflight')")
+        connection.commit()
+    assert reload.idle_proof(root, now) is None
+
+
+def test_sponsor_reload_is_bound_to_its_measured_owner_and_never_uses_preparation(tmp_path, monkeypatch):
+    root = tmp_path / 'data_finmind/sponsor'
+    root.parent.mkdir()
+    setup_idle(root, datetime.now(UTC), reason='current_queue', seconds=60)
+    monkeypatch.setattr(reload, 'REPO', tmp_path)
+    monkeypatch.setattr(reload, 'code_matches', lambda _: True)
+    monkeypatch.setattr(reload, 'accepted_local_measurement', lambda _: True)
+    monkeypatch.setattr(reload, 'identity', lambda _: {'ActiveState': 'active', 'MainPID': '1', 'InvocationID': 'same'})
+    monkeypatch.setattr(reload.shutil, 'disk_usage', lambda _: type('Disk', (), {'free': 64 * 2**30})())
+    monkeypatch.setattr(reload.subprocess, 'run', lambda *_a, **_k: pytest.fail('dry run dispatched an action'))
+    acceptance = tmp_path / 'acceptance.json'
+    payload = {'exact_output_parity': True, 'code_stable': True,
+               'measurement_contract': 'finmind_full_eta_queue_indexes_v2',
+               'source_manifest': {'source': str(root.parent), 'files': {'data/sponsor/queue.sqlite3': 'a' * 64}}}
+    acceptance.write_text(json.dumps(payload))
+    output = tmp_path / 'sponsor-readback.json'
+    argv = ['--owner', 'sponsor', '--acceptance', str(acceptance), '--output', str(output), '--wait-seconds', '0']
+    assert reload.main(argv) == 0
+    result = json.loads(output.read_bytes())
+    assert result['unit'] == 'stockagent-finmind-sponsor.service'
+    assert result['state'] == 'idle_observed_no_action'
+    assert result['idle_proof']['claims']['inflight_tasks'] == 0
+    output.unlink()
+    with pytest.raises(SystemExit):
+        reload.main(argv + ['--allow-preparation-boundary'])
+    payload['source_manifest']['files'].clear()
+    acceptance.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match='sponsor_queue_requires_its_full_measured_snapshot'):
+        reload.main(argv)
 
 
 def test_mismatched_cycle_and_active_task_never_authorize_restart(tmp_path):

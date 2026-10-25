@@ -26,6 +26,51 @@ def test_listing_accepts_original_roc_and_chinese_periods() -> None:
     assert [row["period"] for row in rows] == ["2026-07", "2004-03"]
 
 
+def test_listing_nested_items_keep_document_order_and_full_page_proof() -> None:
+    body = """<li>outer<ul>
+    <li><time>2026-08-24</time><a href="/tw/cp-302-123.html">115年7月金融情況</a></li>
+    </ul></li>
+    <li><time>2004-04-26</time><a href="/tw/cp-302-124.html">九十三年三月金融情況</a></li>
+    <div class="total">第2/3頁 共61筆資料</div>
+    <select id="PageSize"><option value="30" selected>30</option></select>""".encode()
+    page = money._parse_listing_page(body)
+    first = {"period": "2026-07", "published_on": "2026-08-24", "title": "115年7月金融情況",
+             "release_url": "https://www.cbc.gov.tw/tw/cp-302-123.html"}
+    second = {"period": "2004-03", "published_on": "2004-04-26", "title": "九十三年三月金融情況",
+              "release_url": "https://www.cbc.gov.tw/tw/cp-302-124.html"}
+    assert page.rows == [first, first, second]
+    assert (page.page, page.total_pages, page.total_rows, page.raw_rows, page.page_size) == (2, 3, 61, 3, 30)
+
+
+@pytest.mark.parametrize("first_time", [
+    "<time>2026-08-24</time>", "<section><span><time>2026-08-24</time></span></section>",
+])
+def test_listing_uses_first_descendant_time(first_time: str) -> None:
+    body = ("<li>" + first_time + '<time>2026-09-24</time>'
+            '<a href="/tw/cp-302-123.html">115年7月金融情況</a></li><p>第1/1頁</p>').encode()
+    page = money._parse_listing_page(body)
+    assert page.raw_rows == 1
+    assert page.rows == [{"period": "2026-07", "published_on": "2026-08-24", "title": "115年7月金融情況",
+                          "release_url": "https://www.cbc.gov.tw/tw/cp-302-123.html"}]
+
+
+def test_listing_keeps_time_and_link_within_each_item() -> None:
+    body = """<time>2026-08-24</time>
+    <li><a href="/tw/cp-302-123.html">115年7月金融情況</a></li>
+    <li><time>2026-09-24</time><a href="/tw/unrelated">115年8月金融情況</a></li>
+    <li><time>2026-10-24</time></li><p>第1/1頁</p>""".encode()
+    page = money._parse_listing_page(body)
+    assert page.rows == []
+    assert page.raw_rows == 2
+
+
+def test_listing_invalid_first_date_still_raises() -> None:
+    body = """<li><time>invalid</time><time>2026-08-24</time>
+    <a href="/tw/cp-302-123.html">115年7月金融情況</a></li><p>第1/1頁</p>""".encode()
+    with pytest.raises(ValueError, match="invalid"):
+        money._parse_listing_page(body)
+
+
 def test_undated_early_headline_requires_matching_body_period() -> None:
     listing = """<li><time>2000-01-25</time><a href="/tw/cp-302-23076-460B9-1.html">金融情況</a></li>
     <p>第1/1頁</p>""".encode()

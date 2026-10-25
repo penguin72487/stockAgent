@@ -633,6 +633,8 @@ def build_model(
                 futures_notional_score_coordinates=fin_cfg.futures_notional_score_coordinates,
                 futures_margin_amount_context=fin_cfg.futures_margin_amount_context,
                 futures_causal_account_policy=fin_cfg.futures_causal_account_policy,
+                futures_net_notional_cap=fin_cfg.futures_net_notional_cap,
+                futures_beta_notional_cap=fin_cfg.futures_beta_notional_cap,
                 futures_opening_reference_feature=(
                     config.trading.tw_futures_portfolio_opening_reference_path is not None
                 ),

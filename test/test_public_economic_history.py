@@ -268,3 +268,67 @@ def test_safe_census_invalid_key_redirect_not_followed():
     with pytest.raises(CatalogError, match="credential_rejected"):
         client._accept_redirect("https://api.census.gov/data/timeseries/eits/mrts?key=secret",
                                 "https://api.census.gov/data/invalid_key.html")
+
+
+def test_acquire_clocks_distinguish_current_cache_and_publication(tmp_path):
+    from downloader.operation_timing import CONTRACT
+    job = source.core_jobs()[0]
+    calls = []
+    kwargs = dict(max_bytes=1024**2, min_free_bytes=0, transport_factory=fake_transport(census_body("-0.000"), calls))
+    first = worker.acquire(job, tmp_path, {"CENSUS_API_KEY": "timing-secret"}, RequestBudget(1), **kwargs)
+    durable = worker.read_json(worker.receipt_path(tmp_path, job))
+    assert durable["query_fingerprint"] == first["query_fingerprint"] == worker.job_fingerprint(job)
+    assert durable["operation_timing"]["scope"] == "payloads_verified_before_receipt_publication"
+    assert first["operation_timing"]["scope"] == "acquire_return_including_receipt_publication"
+    stages = {row["stage"] for row in first["operation_timing"]["stages"]}
+    assert {"transport_fetch_inclusive", "publish_receipt_history", "publish_receipt_head"} <= stages
+    cached = worker.acquire(job, tmp_path, {"CENSUS_API_KEY": "timing-secret"}, RequestBudget(0), **kwargs)
+    assert cached["status"] == "current_cached" and len(calls) == 1
+    assert cached["operation_timing"]["contract"] == CONTRACT
+    assert [row["stage"] for row in cached["operation_timing"]["stages"]] == ["existing_receipt_verification"]
+    assert worker.read_json(worker.receipt_path(tmp_path, job)) == durable
+    assert "timing-secret" not in str(first["operation_timing"])
+    assert worker.pq.read_table(tmp_path / first["files"][-1]["path"])["cell_value"][0].as_py() == "-0.000"
+
+
+def test_failed_parse_clock_is_retained_without_a_good_receipt(tmp_path):
+    row = worker.acquire(source.core_jobs()[0], tmp_path, {"CENSUS_API_KEY": "secret"}, RequestBudget(1),
+                         max_bytes=1024**2, min_free_bytes=0, transport_factory=fake_transport(b"{}", []))
+    assert row["status"] != "acquired"
+    stages = row["operation_timing"]["stages"]
+    assert any(stage["stage"] == "parse_economic_json" and stage["outcome"] == "raised" for stage in stages)
+    attempt = worker.read_json(tmp_path / "attempts" / source.core_jobs()[0].provider / f"{source.core_jobs()[0].dataset}.json")
+    assert attempt["operation_timing"]["scope"] == "failure_before_attempt_publication"
+    assert not worker.receipt_path(tmp_path, source.core_jobs()[0]).exists()
+
+
+def test_receipt_verification_preserves_escape_and_root_generation_gates(tmp_path, monkeypatch):
+    from pathlib import Path
+    job = source.core_jobs()[0]
+    receipt = worker.acquire(job, tmp_path, {"CENSUS_API_KEY": "key"}, RequestBudget(1),
+                             max_bytes=1024**2, min_free_bytes=0,
+                             transport_factory=fake_transport(census_body(), []))
+    head = worker.receipt_path(tmp_path, job)
+    raw = head.read_bytes()
+    outside = tmp_path.parent / (tmp_path.name + "-outside")
+    outside.write_bytes(b"outside")
+    link = tmp_path / "escape"
+    link.symlink_to(outside)
+    for value in ("../outside", str(outside), "escape"):
+        invalid = {**receipt, "files": [{"path": value, "bytes": 7, "sha256": worker.sha256_file(outside)}]}
+        head.write_text(json.dumps(invalid))
+        assert worker.verified_receipt(tmp_path, job) == {}
+    head.write_bytes(raw)
+    original = Path.resolve
+    root_calls = []
+
+    def changed_root(path, *args, **kwargs):
+        if path == tmp_path:
+            root_calls.append(1)
+            if len(root_calls) == 2:
+                return outside.parent / "changed-root"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", changed_root)
+    assert worker.verified_receipt(tmp_path, job) == {}
+    assert len(root_calls) == 2

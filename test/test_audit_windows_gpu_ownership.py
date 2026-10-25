@@ -1,4 +1,6 @@
 import json
+import os
+import socket
 import subprocess
 from types import SimpleNamespace
 
@@ -84,3 +86,67 @@ def test_query_failure_does_not_claim_zero_gpu_or_export_private_stderr(monkeypa
     result = audit.snapshot()
     assert result["state"] == "unavailable" and "processes" not in result
     assert "private diagnostic" not in json.dumps(result)
+
+
+def test_explicit_socket_reaches_only_the_child_environment(monkeypatch, tmp_path):
+    path = tmp_path / "caller_interop"
+    monkeypatch.setenv("WSL_INTEROP", "/original/unavailable_interop")
+    monkeypatch.setattr(audit.shutil, "which", lambda *_args: "/test/powershell.exe")
+
+    def run(argv, **options):
+        assert options["env"]["WSL_INTEROP"] == str(path)
+        assert options["timeout"] == 30 and options["check"]
+        assert os.environ["WSL_INTEROP"] == "/original/unavailable_interop"
+        return SimpleNamespace(stdout=json.dumps(fixture()).encode())
+
+    monkeypatch.setattr(audit.subprocess, "run", run)
+    monkeypatch.chdir(tmp_path)
+    with socket.socket(socket.AF_UNIX) as endpoint:
+        endpoint.bind(path.name)
+        assert audit.snapshot(interop_socket=path)["state"] == "observed"
+    assert os.environ["WSL_INTEROP"] == "/original/unavailable_interop"
+
+
+@pytest.mark.parametrize("kind", ["missing", "regular", "relative", "symlink"])
+def test_invalid_explicit_socket_does_not_fall_back_or_start_windows(kind, monkeypatch, tmp_path):
+    path = tmp_path / "endpoint"
+    if kind == "regular":
+        path.write_text("not a socket")
+    elif kind == "relative":
+        path = type(path)("relative_interop")
+    elif kind == "symlink":
+        target = tmp_path / "regular"
+        target.write_text("not a socket")
+        path.symlink_to(target)
+    monkeypatch.setattr(audit.shutil, "which", lambda *_args: "/test/powershell.exe")
+    monkeypatch.setattr(audit.subprocess, "run", lambda *_a, **_k: pytest.fail("no fallback query"))
+    result = audit.snapshot(interop_socket=path)
+    assert result["state"] == "unavailable" and "processes" not in result
+
+
+def test_cli_records_explicit_transport_without_starting_gpu_or_windows(monkeypatch, tmp_path):
+    path = tmp_path / "interop"
+    output = tmp_path / "artifacts/operations/observation.json"
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
+    monkeypatch.setattr(audit, "gpu_snapshot", lambda: {"state": "fixture_board"})
+    received = []
+
+    def observe(*, interop_socket):
+        received.append(interop_socket)
+        return {"state": "observed", "processes": []}
+
+    monkeypatch.setattr(audit, "snapshot", observe)
+    monkeypatch.setattr(audit.sys, "argv", ["audit", "--output", str(output), "--samples", "2",
+                                         "--wsl-interop-socket", str(path)])
+    monkeypatch.chdir(tmp_path)
+    with socket.socket(socket.AF_UNIX) as endpoint:
+        endpoint.bind(path.name)
+        audit.main()
+    result = json.loads(output.read_bytes())
+    assert received == [path, path]
+    assert result["contract"] == "windows_wddm_gpu_owner_observation_v2"
+    assert result["windows_transport"] == {
+        "interop_socket_selection": "explicit", "explicit_socket_path": str(path),
+        "parent_environment_modified": False}
+    assert result["cuda_initialized_by_probe"] is False
+    assert result["provider_requests"] == 0 and result["services_or_applications_stopped"] is False

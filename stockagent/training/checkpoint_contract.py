@@ -44,6 +44,9 @@ from stockagent.backtest.tw_futures_portfolio import (
 )
 from stockagent.config import ExperimentConfig
 from stockagent.training.optimizer_config import optimizer_checkpoint_fields, sharpness_checkpoint_fields
+from stockagent.training.finite_checks import (
+    TRAJECTORY_DEVICE_FINITE_GUARD_ABI, trajectory_device_finite_guard_enabled,
+)
 from stockagent.data.panel import PanelData, _TIFRS_MAX_CARRY_DAYS
 from stockagent.data.tw_index_derivatives_day import (
     TAIFEX_DERIVATIVE_CANDIDATE_CONTRACT_VERSION,
@@ -209,6 +212,16 @@ def _project_temporal_basis_model_config(
     """Keep disabled model branches compatible with pre-feature checkpoints."""
 
     projected = dict(values)
+    if projected.get("futures_net_notional_cap") is None:
+        projected.pop("futures_net_notional_cap", None)
+    else:
+        projected["futures_net_notional_projection_contract"] = (
+            "prior_notional_orthogonal_net_cap_then_margin_budget_downscale_v1")
+    if projected.get("futures_beta_notional_cap") is None:
+        projected.pop("futures_beta_notional_cap", None)
+    else:
+        projected["futures_beta_notional_projection_contract"] = (
+            "prior_tx_simple_return_ols_shrunk8_beta_cap_then_margin_budget_downscale_v1")
     if projected.get("portfolio_risk_calibration", "off") == "off":
         projected.pop("portfolio_risk_calibration", None)
     else:
@@ -296,7 +309,7 @@ def _project_temporal_basis_model_config(
         projected.pop("factorized_sparse_projection", None)
         projected.pop("factorized_sparse_cache_bytes", None)
     else:
-        projected["factorized_sparse_projection_contract"] = "full_schema_csr_fixed_row_fp32_forward_v3"
+        projected["factorized_sparse_projection_contract"] = "full_schema_csr_fixed_row_fp32_date_view_forward_v4"
         from stockagent.models.factorized_sparse_projection import sparse_adjoint_contract
         if (adjoint := sparse_adjoint_contract()) is not None:
             projected["factorized_sparse_adjoint_contract"] = adjoint
@@ -997,6 +1010,8 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "use_tensor_cores": bool(config.environment.use_tensor_cores),
         },
     }
+    if trajectory_device_finite_guard_enabled():
+        contract["finite_checks"]["trajectory_device_guard"] = TRAJECTORY_DEVICE_FINITE_GUARD_ABI
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
     covariance_lag_batch_size = min(
         int(training.lookback),
@@ -1710,20 +1725,35 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             })
             if config.training.financial_transformer.futures_causal_account_policy:
                 from stockagent.models.futures_account_policy import (
-                    FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+                    futures_account_policy_version, futures_account_policy_width,
                     FUTURES_ACCOUNT_STATE_COLUMNS, FUTURES_ACCOUNT_OBSERVATION_COLUMNS,
                 )
                 section = contract["taiwan_stock_context_futures_portfolio"]
+                packet_width = futures_account_policy_width(
+                    config.training.financial_transformer.futures_net_notional_cap,
+                    config.training.financial_transformer.futures_beta_notional_cap)
                 section["candidate_feature_columns"] += list(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
                 section["causal_account_policy"] = {
-                    "version": FUTURES_ACCOUNT_POLICY_VERSION,
-                    "packet_width": FUTURES_ACCOUNT_PACKET_WIDTH,
+                    "version": futures_account_policy_version(packet_width),
+                    "packet_width": packet_width,
                     "state_columns": list(FUTURES_ACCOUNT_STATE_COLUMNS),
                     "risk_lookback": config.training.lookback,
                     "decision_clock": "actual_carried_contracts_previous_settled_nav_before_current_gap_pnl",
                     "gradient": "exact_state_forward_recurrent_anchored_shadow_feedback_backward_v1_batch_boundary_detached",
                     "initialization": "ordinary_market_policy_zero_feedback_residual",
                 }
+                if config.training.financial_transformer.futures_net_notional_cap is not None:
+                    section["causal_account_policy"]["requested_prior_net_notional_cap"] = (
+                        config.training.financial_transformer.futures_net_notional_cap)
+                    section["causal_account_policy"]["output_projection"] = (
+                        "prior_notional_orthogonal_net_cap_then_margin_budget_downscale_v1")
+                if config.training.financial_transformer.futures_beta_notional_cap is not None:
+                    from stockagent.models.futures_account_policy import FUTURES_BETA_OBSERVATION_COLUMNS
+                    section["candidate_feature_columns"] += list(FUTURES_BETA_OBSERVATION_COLUMNS)
+                    section["causal_account_policy"].update(
+                        requested_prior_beta_notional_cap=config.training.financial_transformer.futures_beta_notional_cap,
+                        beta_estimator='prior_simple_settlement_vs_TX_close_OLS_shrunk8_to_one_v1',
+                        output_projection='orthogonal_beta_notional_cap_then_learned_margin_budget_downscale_v1')
     if execution_mode in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",

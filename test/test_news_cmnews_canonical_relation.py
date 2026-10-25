@@ -72,8 +72,9 @@ def test_no_prior_witness_cannot_buy_another_get(queue, settings):
     assert not (queue.root/'reviewed_repairs/candidate_diagnostics/pending').exists()
 
 
-def test_completed_literal_evidence_from_original_failure_prevents_duplicate_question(queue, settings):
-    finished_identity(queue, settings); witness = saved_literal_witness(queue)
+@pytest.mark.parametrize('version', [1, 2])
+def test_completed_literal_evidence_from_original_failure_prevents_duplicate_question(queue, settings, version):
+    finished_identity(queue, settings); witness = saved_literal_witness(queue, contract_version=version)
     target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
     result = jobs.recorded_cmnews_canonical(queue.db, queue.registry.sources['cmnews'], target)
     assert result['canonical_url'] == DECLARED and result['metadata_sha256'] == hashlib.sha256(witness.read_bytes()).hexdigest()
@@ -83,7 +84,34 @@ def test_completed_literal_evidence_from_original_failure_prevents_duplicate_que
     assert witness.read_bytes() == before and not result['article_or_alias_accepted']
 
 
+def test_current_failure_writer_output_is_reused_without_a_second_request(queue, settings):
+    from downloader.news_fulltext import fetch_article
+    from downloader.news_fulltext_diagnostics import IDENTITY_METADATA_CONTRACT_VERSION
+    row = queue.claim_url(URL, 300, refresh=True)
+    client = http_stub(queue, response=response(page(canonical=DECLARED, schema_url=URL)))
+    get = client.get
+    client.get = lambda url, **_options: get(url)
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        fetch_article(client, row)
+    queue.failed(row, caught.value, 6)
+    after = head(queue)
+    paths = list((queue.root/'identity_metadata').glob('*/cmnews/*.json'))
+    assert len(paths) == 1
+    value = json.loads(paths[0].read_bytes())
+    assert value['contract_version'] == IDENTITY_METADATA_CONTRACT_VERSION
+    immutable = paths[0].read_bytes()
+    calls = list(client.calls)
+    result = jobs.recorded_cmnews_canonical(queue.db, queue.registry.sources['cmnews'], jobs._head(after))
+    assert result and result['canonical_url'] == DECLARED
+    assert result['metadata_sha256'] == hashlib.sha256(immutable).hexdigest()
+    assert not result['article_or_alias_accepted']
+    assert client.calls == calls and head(queue) == after and paths[0].read_bytes() == immutable
+    assert after['body_sha256'] is None
+    assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+
+
 @pytest.mark.parametrize('changes', [
+    *({'contract_version': value} for value in [True, False, 1.0, 2.0, '2', 3, None]),
     {'data_fingerprint': 'a'*64}, {'authorization_fingerprint': 'b'*64}, {'request_url': DECLARED},
     {'final_url': DECLARED}, {'request_url_sha256': 'a'*64}, {'diagnostic_only': False},
     {'raw_response_retained': True}, {'accepted_as_article': True}, {'http_status': 404},

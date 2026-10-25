@@ -12,6 +12,46 @@ from downloader import download_finmind_free as free
 from downloader import download_finmind_complement as complement
 
 
+@pytest.mark.parametrize('lane', ['free', 'complement'])
+def test_success_clocks_start_after_quota_and_durable_preflight_and_survive_response_parse(tmp_path, monkeypatch, lane):
+    from downloader import finmind_updates as updates
+    rows = [{'date': '2026-10-23', 'close': -0.0, 'volume': None}]
+    state = {'clock': 0.}
+
+    def wait():
+        state['clock'] = 100.  # This quota wait must not enter HTTP cost.
+
+    def claim(*args):
+        assert state['clock'] == 100.
+        state['clock'] = 200.  # Neither does pre-request durable accounting.
+
+    def get(*args, **kwargs):
+        assert state['clock'] == 200.
+        state['clock'] = 201.
+        response = Mock(status_code=200)
+
+        def parse():
+            state['clock'] = 202.5
+            return {'status': 200, 'msg': 'success', 'data': rows}
+
+        response.json.side_effect = parse
+        return response
+
+    module = free if lane == 'free' else complement
+    monkeypatch.setattr(module, '_record_request_start', claim)
+    monkeypatch.setattr(updates.time, 'monotonic', lambda: state['clock'])
+    session, limiter = Mock(), Mock()
+    limiter.wait.side_effect = wait
+    session.get.side_effect = get
+    observed = (free._request(session, limiter, 'test', start_date=None, token='private-test-token', traffic_root=tmp_path)
+                if lane == 'free' else complement._fetch_rows(session, limiter, tmp_path, 'test', 'private-test-token', {}))
+    assert observed == rows and observed[0] is rows[0]
+    assert observed.observation['transport_timing'] == {'contract': updates.TRANSPORT_TIMING_CONTRACT, 'seconds': 2.5}
+    assert observed.observation['response_rows'] == 1
+    limiter.wait.assert_called_once()
+    session.get.assert_called_once()
+
+
 def test_wal_reader_does_not_block_three_writers_and_preserves_old_rows(tmp_path):
     path = tmp_path / 'request_traffic.sqlite3'
     with closing(sqlite3.connect(path)) as connection, connection:

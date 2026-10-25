@@ -1,0 +1,21 @@
+[Unit]
+Description=Observe native public TW opening revision paint without source or ledger writes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.benchmark_dashboard_browser --scheduled --cdp-port 9241'
+TimeoutStartSec=1150
+KillMode=control-group
+Nice=10
+CPUWeight=10
+IOWeight=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=@REPO_ROOT@/artifacts/operations
+UMask=0077

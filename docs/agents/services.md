@@ -230,12 +230,21 @@ Use the section for the service being changed. Operational acceptance requires f
   shared leases; escalate and revalidate only for real source mutations. See
   [the 11-second investigation](../tw_opening_latency_stages_2026-10-14.md#finmind-開盤補查與-11-秒目標2026-10-16).
   A mode's retry must not starve source repair between actual inference attempts.
-  After publishing the immutable original model weights once, an unpriced target
+  Under the default `opening_once_v1` signal-update policy, after publishing
+  the immutable original model weights once, an unpriced target
   remains a per-symbol unsized `waiting_source` order, not a discarded cash target
   or a reason to rerun the whole model. Freeze its original session NAV; size only
   after real same-session price/limits and causal non-trial evidence arrive, and
   cancel unopened targets when the 13:20 exit window begins. Preserve eligibility,
   short permissions, lot/tick rules, causal quotes, and the original fill policy.
+  The explicitly authorized candidate `progressive_open_reference_rebalance_v1`
+  instead publishes immutable revisions when genuine session-opening inputs
+  change, coalesces superseded work, and reconciles targets against actual paper
+  inventory. It requires `known_prior_trade_provisional_v1`, a causal full-target
+  paper fill policy, and matching revision/model fingerprints. Source-receipt
+  churn or later Bid/Ask ticks alone do not rerun a session-open model. A default
+  configuration, a candidate benchmark, or a source freeze does not enable this
+  policy in production. See [the candidate contract and measured boundary](../tw_opening_latency_stages_2026-10-14.md#逐版訊號與已成交庫存再平衡候選2026-10-24).
   Exchange timestamps and local receipt timestamps remain distinct; a fresh
   delivery of yesterday's row is not today's opening. See the initial
   [2026-10-07 repair](../tw_opening_source_recovery_2026-10-07.md) and its

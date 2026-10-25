@@ -6,10 +6,13 @@ import pytest
 
 from downloader.news_fulltext import seed_discovery
 from downloader.news_fulltext_bulk import cnyes_history_priority, cnyes_url
-from downloader.news_fulltext_cnyes_seed import PLANNED_QUERY, planned_intervals
+from downloader.news_fulltext_cnyes_seed import (
+    PLANNED_QUERY, PLANNED_SCOPE_INDEX_NAME, PLANNED_SCOPE_INDEX_SQL, planned_intervals,
+)
 from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue
 from scripts.benchmark_news_cnyes_scope_maintenance import benchmark, legacy_intervals
+from scripts.benchmark_news_discovery_maintenance import benchmark as maintenance_benchmark
 from test_cnyes_news_bulk import BASE, cfg
 
 
@@ -53,6 +56,48 @@ def test_scope_reader_seeks_exact_endpoint_not_neighbor_category(queue):
     plan = [r[3] for r in queue.db.execute('EXPLAIN QUERY PLAN ' + PLANNED_QUERY,
             {'prefix': prefix, 'prefix_length': len(prefix), 'lower': BASE + '?', 'upper': BASE + '@'})]
     assert any('SEARCH discovery' in p for p in plan)
+
+
+def test_covering_scope_index_preserves_archived_refused_and_unusual_ranges(queue):
+    variants = [cnyes_url(BASE, page, start=1, end=2) for page in (1, 2, 3)]
+    variants += [BASE + '?page=01&limit=30&startAt=3&endAt=4&endAt=5']
+    with queue.db:
+        queue.db.executemany("INSERT INTO discovery(url,kind,provider,due,attempts,error_code,"
+                             "superseded_by_windows_json) VALUES (?,'cnyes_news','cnyes',12345,4,"
+                             "'discovery_http_403','{}')", [(url,) for url in variants])
+        queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'index','cnyes')",
+                         (BASE + '?startAt=100&endAt=200',))
+    before = [tuple(row) for row in queue.db.execute('SELECT * FROM discovery ORDER BY url')]
+    expected = legacy_intervals(queue.db, BASE, {})
+    with queue.db:
+        queue.db.execute(PLANNED_SCOPE_INDEX_SQL)
+        queue.db.execute(PLANNED_SCOPE_INDEX_SQL)  # Reopening an owner is idempotent.
+    prefix = BASE + '?limit=30&page='
+    plan = [row[3] for row in queue.db.execute('EXPLAIN QUERY PLAN ' + PLANNED_QUERY,
+            {'prefix': prefix, 'prefix_length': len(prefix), 'lower': BASE + '?', 'upper': BASE + '@'})]
+    assert any('COVERING INDEX ' + PLANNED_SCOPE_INDEX_NAME in item for item in plan)
+    assert planned_intervals(queue.db, BASE) == expected == [(1, 2), (3, 4)]
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM discovery ORDER BY url')] == before
+
+
+def test_covering_scope_benchmark_compares_complete_maintenance_without_source_writes(queue, monkeypatch):
+    seed_discovery(queue)
+    with queue.db:
+        queue.db.execute("INSERT INTO discovery(url,kind,provider,due,attempts,error_code,"
+                         "superseded_by_windows_json) VALUES (?,'cnyes_news','cnyes',12345,4,"
+                         "'discovery_http_403','{}')", (cnyes_url(BASE, 2, start=1, end=2),))
+    before = [tuple(row) for row in queue.db.execute('SELECT * FROM discovery ORDER BY url')]
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.get',
+                        lambda *a, **k: pytest.fail('benchmark issued HTTP'))
+    result = maintenance_benchmark(queue.root, queue.registry, repetitions=2, max_seconds=10,
+                                   index_axis='cnyes_planned_scope')
+    assert result['accepted'] and result['exact_complete_maintenance_results_equal']
+    assert [row['method'] for row in result['samples']] == ['legacy', 'indexed', 'indexed', 'legacy']
+    assert not any(PLANNED_SCOPE_INDEX_NAME in item for item in result['query_plans']['legacy'])
+    assert any('COVERING INDEX ' + PLANNED_SCOPE_INDEX_NAME in item
+               for item in result['query_plans']['indexed'])
+    assert not result['source_states_mutated'] and not result['source_schema_mutated']
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM discovery ORDER BY url')] == before
 
 
 def test_priority_migration_is_once_per_contract_and_keeps_retry_state(queue):

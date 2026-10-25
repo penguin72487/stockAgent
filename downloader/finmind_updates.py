@@ -10,13 +10,16 @@ from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
+import math
 from pathlib import Path
 import sqlite3
+import time
 from types import SimpleNamespace
 from typing import Any
 import uuid
 
 CONTRACT_VERSION = 1
+TRANSPORT_TIMING_CONTRACT = "finmind_request_to_parsed_response_monotonic_v1"
 DB_NAME = "update_observations.sqlite3"
 PUBLIC_FIELDS = frozenset({
     'checked_at_utc', 'last_data_observed_at_utc', 'last_changed_at_utc',
@@ -35,15 +38,20 @@ class ResponseRows(list):
         self.observation = observation
 
 
-def received_rows(rows: list, started: datetime) -> ResponseRows:
+def received_rows(rows: list, started: datetime, *, monotonic_started: float | None = None) -> ResponseRows:
     completed = datetime.now(UTC)
-    return ResponseRows(rows, observation={
+    observation = {
         "request_id": uuid.uuid4().hex,
         "request_started_at_utc": started.astimezone(UTC).isoformat(),
         "response_received_at_utc": completed.isoformat(),
         "response_rows": len(rows),
         "network_seconds": max(0, (completed - started).total_seconds()),
-    })
+    }
+    if monotonic_started is not None:
+        elapsed = time.monotonic() - monotonic_started
+        if math.isfinite(elapsed) and elapsed >= 0:
+            observation["transport_timing"] = {"contract": TRANSPORT_TIMING_CONTRACT, "seconds": elapsed}
+    return ResponseRows(rows, observation=observation)
 
 
 def retain_observation(rows: list, original: list) -> list:
@@ -153,6 +161,11 @@ def record_success(root: Path, task: Any, rows: list, receipt: dict,
             "network_seconds": transport.get("network_seconds"),
             "request_id": request_id,
         }
+        timing = transport.get("transport_timing")
+        if (isinstance(timing, dict) and timing.get("contract") == TRANSPORT_TIMING_CONTRACT
+                and type(timing.get("seconds")) in (int, float)
+                and math.isfinite(timing["seconds"]) and timing["seconds"] >= 0):
+            evidence["transport_timing"] = {"contract": TRANSPORT_TIMING_CONTRACT, "seconds": timing["seconds"]}
         # Commit comparisons and the check together; a retry of the same batch
         # cannot manufacture another update or advance the observation clock.
         conn.execute("INSERT INTO checks(request_id,dataset,data_id,partition,checked_at_utc,kind,metadata_json) "

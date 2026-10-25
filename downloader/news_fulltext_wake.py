@@ -1,6 +1,6 @@
 """Kernel mailbox hints for the existing owner, never source admission.
 
-Linux watches complete writes/atomic moves in the two bounded private inboxes.
+Linux watches complete writes/atomic moves in the bounded private inboxes.
 The queue still validates and dispatches every request. No worker, polling
 thread, article scan, signal handler or new persistent transport is introduced.
 Unsupported platforms and broken watches retain the prior interruptible wait.
@@ -73,7 +73,8 @@ class OwnerMailboxWake:
         try:
             from downloader.news_fulltext_repairs import _directory
             directories = (_directory(self.queue.root, 'pending'),
-                _directory(self.queue.root, 'candidate_diagnostics', 'pending'))
+                _directory(self.queue.root, 'candidate_diagnostics', 'pending'),
+                _directory(self.queue.root, 'url_metadata', 'pending'))
             libc = ctypes.CDLL(None, use_errno=True)
             init = libc.inotify_init1
             init.argtypes, init.restype = [ctypes.c_int], ctypes.c_int
@@ -111,11 +112,12 @@ class OwnerMailboxWake:
     def has_pending(self, *, include_repairs=False):
         from downloader.news_fulltext_candidate_diagnostics import has_unadmitted_candidates
         from downloader.news_fulltext_repairs import _directory, _pending
+        from downloader.news_fulltext_url_metadata import has_pending as has_url_metadata
         try:
             # Repair files are edge hints only. A failed archive may leave one
             # present after its job is complete; that must not force an empty
             # cycle repeatedly. Candidate admission has its indexed job guard.
-            return (has_unadmitted_candidates(self.queue) or include_repairs
+            return (has_url_metadata(self.queue) or has_unadmitted_candidates(self.queue) or include_repairs
                 and bool(_pending(_directory(self.queue.root, 'pending'))))
         except (OSError, ValueError):
             return False  # The normal owner retains malformed-input handling.

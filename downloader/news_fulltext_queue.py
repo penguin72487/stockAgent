@@ -63,6 +63,10 @@ FAILURE_OBSERVATION_CONTRACT_VERSION = 2
 DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
 DISCOVERY_STATUS_PROJECTION_CONTRACT_VERSION = 1
 DISCOVERY_READINESS_PROBE_CONTRACT_VERSION = 2
+DISCOVERY_PARSER_CONTRACT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS discovery_parser_contract ON discovery(provider,parser_fingerprint) "
+    "WHERE kind='index' AND error_code IS NULL AND parser_fingerprint IS NOT NULL"
+)
 DISCOVERY_DUE_LOOKAHEAD_ROWS = 256
 DISCOVERY_READINESS_PROBE_SQL = (
     "SELECT 1 FROM discovery INDEXED BY discovery_due_frontier "
@@ -282,11 +286,14 @@ def native_body_only_layout(source):
         or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'
         or source.provider == 'setn_inews_scope'
             and INEWS_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2
+        or source.provider == 'policy_setn_fuhouse'
+            and source.embedded_article_layout in {'setn_fuhouse_native_article_v2', 'setn_fuhouse_native_article_v3', 'setn_fuhouse_native_article_v4'}
         or source.provider == 'upmedia' and source.embedded_article_layout in {
             'upmedia_public_modern_article_v2', 'upmedia_public_modern_article_v3', 'upmedia_public_modern_article_v4'}))
 
 
 _NATIVE_TEXT_REPAIR_SPECS = {
+    'contentplatform': (frozenset({'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}), ('article_identity_not_verified',)),
     'pocket': (frozenset({'pocket_visible_article_v2', 'pocket_visible_article_v3', 'pocket_visible_article_v4', 'pocket_visible_article_v5', 'pocket_visible_article_v6', 'pocket_visible_article_v7', 'pocket_visible_article_v8', 'pocket_visible_article_v9'}), ('article_identity_not_verified', 'invalid_bulk_publication_clock')),
     'watchmedia': (frozenset({'watchmedia_visible_article_v2', 'watchmedia_visible_article_v3'}), ('article_identity_not_verified',)),
     'pinview': (frozenset({'pinview_visible_article_v2'}), ('article_rights_or_scope_excluded',)),
@@ -830,6 +837,19 @@ class NewsQueue:
         with self.metrics.measure('discovery_due_index_initialization'):
             self.db.execute("CREATE INDEX IF NOT EXISTS discovery_due_frontier ON discovery(provider,due) "
                             "WHERE superseded_by_windows_json IS NULL")
+        # Parser invalidation includes superseded pages, unlike dispatch.
+        # Seek only successful index pages instead of scanning every historical
+        # bulk/feed job once per provider on each resident maintenance cycle.
+        # Keep the original invalidation predicates and all retry clocks.
+        with self.metrics.measure('discovery_parser_index_initialization'):
+            self.db.execute(DISCOVERY_PARSER_CONTRACT_INDEX_SQL)
+        # Range reconstruction reads every planned bulk page, including
+        # refusals and archived parents. The URL primary key needs scattered
+        # table reads for kind; a narrow covering index preserves all rows and
+        # retry clocks while avoiding those reads on each owner/day refresh.
+        from downloader.news_fulltext_cnyes_seed import PLANNED_SCOPE_INDEX_SQL
+        with self.metrics.measure('cnyes_planned_scope_index_initialization'):
+            self.db.execute(PLANNED_SCOPE_INDEX_SQL)
         with self.metrics.measure('article_body_state_counter_initialization'):
             initialize_article_body_states(self.db)
         if not self.db.execute("SELECT 1 FROM hosts LIMIT 1").fetchone():
@@ -1446,7 +1466,11 @@ class NewsQueue:
                         # Only an explicitly witnessed missing-head repair may
                         # enter the shared mailbox, never every old failure.
                         self._activate_authorized_metadata(host, source)
-                    if (parser_changed and source.provider != 'cnyes'
+                    if (parser_changed and source.provider not in {'cnyes', 'moneyweekly'}
+                            # Moneyweekly short-prose repairs use the explicit
+                            # missing-head mailbox and reviewed retained original.
+                            # A new byline/parser must not reset unrelated failed
+                            # heads, attempts, deadlines or stored observations.
                             # Static/native body revisions grant no bulk
                             # reset of historical failure/permission state.
                             and not (source.provider == 'taiwannews'
@@ -1462,6 +1486,10 @@ class NewsQueue:
                             and not ettoday_clock_only_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
                             and not ettoday_literal_value_parser_repair(source, prior_sources.get('source_capture_fingerprint:ettoday'))
                             and not native_body_only_layout(source)
+                            and not (source.provider == 'gvm'
+                                     and source.embedded_article_layout in {'gvm_public_native_article_v2', 'gvm_public_native_article_v3', 'gvm_public_native_article_v4', 'gvm_public_native_article_v5', 'gvm_public_native_article_v6', 'gvm_public_native_article_v7', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10', 'gvm_public_native_article_v11'})
+                            and not (source.provider == 'knews'
+                                     and source.embedded_article_layout in {'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7'})
                             and not (source.provider in _NATIVE_TEXT_REPAIR_SPECS
                                      and source.embedded_article_layout in _NATIVE_TEXT_REPAIR_SPECS[source.provider][0])
                             and not (source.provider == 'pocket'
@@ -1559,7 +1587,8 @@ class NewsQueue:
                         for key, url in failures:
                             if re.fullmatch(source.pdf_path_pattern, urlsplit(url).path):
                                 self.db.execute("UPDATE articles SET state='pending',due=0,attempts=0 WHERE id=?", (key,))
-                    if (parser_changed and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body)
+                    if (parser_changed and source.provider != 'moneyweekly'
+                            and (source.provider == 'inside' or source.source_not_found_paths or source.allow_short_configured_body)
                             and not (source.provider == 'taiwanhot'
                                      and source.embedded_article_layout == 'taiwanhot_visible_article_v3')):
                         # Reviewed namespace/soft-404 and exact short-body
@@ -1843,6 +1872,12 @@ class NewsQueue:
         source = self.registry.sources.get(provider)
         if not native_text_parser_repair(source, previous_capture):
             return
+        if provider == 'contentplatform' and source.embedded_article_layout == 'contentplatform_native_article_v3':
+            # Its exact retained h3 witness is materialized locally. Other
+            # identity failures have different, still-unproved header/body
+            # causes; a parser upgrade must not re-fetch that whole cohort.
+            # Keep them for explicit reviewed work, without changing deadlines.
+            return
         if (provider == 'bastillepost' and BASTILLE_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 3
                 and BASTILLE_LAYOUT_VERSIONS[source.embedded_article_layout] != 4):
             # These repairs select only the reviewed unfinished cohort via the
@@ -1850,7 +1885,9 @@ class NewsQueue:
             # container/unretained shape or erase attempts through a generic
             # parser reset. New ordinary incremental articles use the current ABI.
             return
-        if provider == 'pocket':
+        if provider == 'contentplatform':
+            from downloader.news_fulltext_contentplatform import contentplatform_article_id as article_id
+        elif provider == 'pocket':
             from downloader.news_fulltext_pocket import pocket_article_id as article_id
         elif provider == 'pinview':
             from downloader.news_fulltext_pinview import pinview_article_id as article_id
@@ -4696,8 +4733,22 @@ class NewsQueue:
             item_errors = bulk_item_error_count(self.db)
         with self.metrics.measure('status_http_capacity_snapshot'):
             capacity = self.http_capacity_snapshot() if hasattr(self, 'http_capacity_snapshot') else None
+        if 'cnyes' in providers:
+            from downloader.news_fulltext_cnyes_work import request_scope_progress
+            item = providers['cnyes']
+            with self.metrics.measure('status_cnyes_request_scope_progress'):
+                scope_work = request_scope_progress(self.db, item['body_work_progress'],
+                    (capacity or {}).get('providers', {}).get('cnyes'), now_epoch=time.time())
+            item['body_work_progress']['request_scope_progress'] = scope_work
+            if (item['body_work_progress']['active_missing_body_urls']
+                    and (not scope_work['available'] or scope_work['source_paused_missing_body_urls'])):
+                # This estimate covers every queued missing URL, not just the
+                # healthy desktop/API lane. A probe deadline is not recovery.
+                item['remaining_eligible_estimate_seconds'] = None
+                eta = None
         result = {
             "contract_version": CONTRACT_VERSION, "updated_at_utc": utc_now(), "activity": activity,
+            **({'disk_admission': dict(self.disk_admission)} if hasattr(self, 'disk_admission') else {}),
             "status_projection_contract_version": STATUS_PROJECTION_CONTRACT_VERSION,
             "status_query_timing_contract_version": STATUS_QUERY_TIMING_CONTRACT_VERSION,
             "bulk_item_error_count_contract_version": BULK_ERROR_COUNT_CONTRACT_VERSION,

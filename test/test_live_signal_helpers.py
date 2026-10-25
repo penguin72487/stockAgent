@@ -51,6 +51,18 @@ def _isolate_opening_quote_receipts(monkeypatch, tmp_path):
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening_receipts"))
 
 
+@pytest.mark.parametrize("prefetch_age,own_work", [(0., .004), (.3, .004), (2., .021)])
+def test_post_quote_prepare_clock_separates_local_work_without_hiding_quote_age(prefetch_age, own_work):
+    result = signal_engine._post_quote_prepare_timing(quote_finished=10.,
+        local_input_started=10. + prefetch_age, inference_started=10. + prefetch_age + own_work)
+    assert result["pre_inference_prepare_ms"] == pytest.approx((prefetch_age + own_work) * 1000)
+    assert result["quote_age_before_local_prepare_ms"] == pytest.approx(prefetch_age * 1000)
+    assert result["post_quote_local_prepare_ms"] == pytest.approx(own_work * 1000)
+    assert result["pre_inference_prepare_ms"] == pytest.approx(
+        result["quote_age_before_local_prepare_ms"] + result["post_quote_local_prepare_ms"])
+    assert result["prepare_clock_contract"] == "quote_age_split_local_input_work_v1"
+
+
 def test_live_panel_workers_are_bounded_by_host_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -257,6 +269,150 @@ def test_confirmed_no_first_print_uses_previous_close_only_for_model_not_open_or
     assert next_observed.tolist() == [True, True, False]
     assert next_window[-1, 1, 1] == pytest.approx(np.log(52. / 50.))
     assert not signal_engine.tw_session_no_open_print_mask(snapshot, session_date="2026-10-16")[1]
+
+
+def _provisional_reference_fixture():
+    panel = PanelData(
+        dates=np.array(["2026-10-14", "2026-10-15"], dtype="datetime64[D]"),
+        symbols=["OPEN", "NO_PRINT", "UNKNOWN", "NO_HISTORY"],
+        feature_names=["base", "next_session_open_gap_logret"],
+        features=np.zeros((2, 4, 2), dtype=np.float32),
+        returns_1d=np.zeros((2, 4), dtype=np.float32),
+        tradable_mask=np.ones((2, 4), dtype=bool), alive_mask=np.ones((2, 4), dtype=bool),
+        benchmark_returns=np.zeros(2, dtype=np.float32),
+        close_prices=np.array([[100., 50., 80., 90.], [100., 50., 81., 91.]], dtype=np.float32),
+        daily_volumes=np.array([[100., 100., 100., 0.], [100., 100., 0., 0.]], dtype=np.float32))
+    stamp = int(datetime.fromisoformat("2026-10-16T09:00:00.100+08:00").timestamp() * 1000)
+    snapshot = PriceSnapshot(prices=np.array([102., 50., 81., 91.]),
+        source="opening:shared_opening_snapshot", timestamp="2026-10-16T09:00:00.100+08:00",
+        open_prices=np.array([101., np.nan, np.nan, np.nan]),
+        available_mask=np.array([True, True, False, False]),
+        timestamps_ms=np.array([stamp, stamp, 0, 0]), exchange_timestamps_ms=np.array([stamp, stamp, 0, 0]),
+        no_open_print_timestamps_ms=np.array([0, stamp, 0, 0]))
+    return panel, snapshot
+
+
+def test_provisional_unknown_reference_is_not_no_first_or_executable_price():
+    panel, snapshot = _provisional_reference_fixture()
+    original_open, original_available = snapshot.open_prices.copy(), snapshot.available_mask.copy()
+    strict, *_ = _day_trade_live_model_window(panel, panel_idx=1, lookback=2,
+        price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:01", source_timezone="Asia/Taipei")
+    window, cutoff, decision, live, observed = _day_trade_live_model_window(panel, panel_idx=1, lookback=2,
+        price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:01", source_timezone="Asia/Taipei",
+        opening_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    assert live and cutoff == "2026-10-15" and decision == "2026-10-16 09:00:01"
+    assert strict[-1, 2, 1] == 0.
+    assert window[-1, 2, 1] == pytest.approx(np.log(80. / 81.))
+    assert window[-1, 3, 1] == 0.  # Adjusted, zero-volume prices cannot prove a trade.
+    assert observed.tolist() == [True, False, False, False]
+    proof = signal_engine.tw_session_no_open_print_mask(snapshot, session_date="2026-10-16")
+    carried = signal_engine._provisional_opening_reference_mask(
+        policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY,
+        last_trades=signal_engine._last_completed_trade_reference(panel, 1)[0],
+        observed_open=observed, no_print_proof=proof)
+    assert carried.tolist() == [False, False, True, False]
+    assert proof.tolist() == [False, True, False, False]
+    np.testing.assert_equal(snapshot.open_prices, original_open)
+    np.testing.assert_equal(snapshot.available_mask, original_available)
+    assert snapshot.timestamp == "2026-10-16T09:00:00.100+08:00"
+    args = dict(live_session=True, active=4, opens=1, responses=2, no_prints=1,
+        provisional_references=1, model_observation="session_open",
+        reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    signal_engine._require_day_trade_opening_coverage(required=3, **args)
+    with pytest.raises(signal_engine.TWOpeningInputCoveragePending):
+        signal_engine._require_day_trade_opening_coverage(required=4, **args)
+    with pytest.raises(ValueError, match="explicit model-only"):
+        signal_engine._require_day_trade_opening_coverage(required=3,
+            **dict(args, reference_policy=signal_engine.OPENING_OBSERVED_REFERENCE_POLICY))
+
+
+@pytest.mark.parametrize("decision", ["2026-10-15 09:00:01", "2026-10-16 08:59:59"])
+def test_provisional_policy_does_not_advance_the_decision_clock(decision):
+    panel, snapshot = _provisional_reference_fixture()
+    with pytest.raises(ValueError, match="at or after 09:00"):
+        _day_trade_live_model_window(panel, panel_idx=1, lookback=2, price_snapshot=snapshot,
+            resolved_asof=decision, source_timezone="Asia/Taipei",
+            opening_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+
+
+def test_provisional_policy_rejects_latest_quote_or_unknown_policy():
+    for policy, observation in [(signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY, "latest_quote"),
+                                ("unversioned_fallback", "session_open")]:
+        with pytest.raises(ValueError):
+            signal_engine._opening_reference_policy(policy, observation=observation)
+    with pytest.raises(ValueError, match="unsupported opening reference policy"):
+        _price_snapshot(source="panel", symbols=["2330"], fallback_prices=np.array([100.]),
+            parquet_root="unused", prices_csv=None, yahoo_chunk_size=80,
+            opening_model_reference_policy="unversioned_fallback")
+
+
+def test_market_config_loads_and_fingerprints_only_named_reference_policies(tmp_path):
+    from stockagent.live.market_config import load_market_config
+    path = tmp_path / "test.yaml"
+    path.write_text("market: test\nlabel: test\nconfig_path: unused.yaml\n")
+    assert load_market_config(path).day_trade_opening_reference_policy == signal_engine.OPENING_OBSERVED_REFERENCE_POLICY
+    path.write_text("market: test\nday_trade_opening_reference_policy: known_prior_trade_provisional_v1\n")
+    cfg = load_market_config(path)
+    assert cfg.signal_kwargs()["day_trade_opening_reference_policy"] == signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY
+    latest = cfg.signal_kwargs(day_trade_model_observation="latest_quote")
+    assert latest["day_trade_opening_reference_policy"] == signal_engine.OPENING_OBSERVED_REFERENCE_POLICY
+    path.write_text("market: test\nday_trade_opening_reference_policy: typo\n")
+    with pytest.raises(ValueError, match="Unsupported day_trade_opening_reference_policy"):
+        load_market_config(path)
+
+
+def test_provisional_fresh_price_still_wins_when_latest_completed_close_is_missing():
+    panel, snapshot = _provisional_reference_fixture()
+    panel.close_prices[-1, 0] = np.nan
+    window, _, _, live, observed = _day_trade_live_model_window(panel, panel_idx=1,
+        lookback=2, price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:01",
+        source_timezone="Asia/Taipei", opening_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    assert live and observed[0]
+    assert window[-1, 0, 1] == pytest.approx(np.log(101. / 100.))
+
+
+@pytest.mark.parametrize("invalid_source", ["previous_session", "trial", "unavailable", "unclocked_broker"])
+def test_provisional_decision_clock_cannot_promote_an_invalid_open(invalid_source):
+    panel, snapshot = _provisional_reference_fixture()
+    if invalid_source == "previous_session":
+        snapshot.exchange_timestamps_ms[0] -= 86_400_000
+    elif invalid_source == "trial":
+        snapshot.simtrade_flags = np.array([1, 0, 0, 0])
+    elif invalid_source == "unavailable":
+        snapshot.available_mask[0] = False
+    else:
+        snapshot.source = "shioaji:stock_snapshot"
+        snapshot.exchange_timestamps_ms = None
+    window, _, _, live, observed = _day_trade_live_model_window(panel, panel_idx=1,
+        lookback=2, price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:01",
+        source_timezone="Asia/Taipei", opening_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    assert live and not observed[0]
+    assert window[-1, 0, 1] == 0.  # Known real close, not yesterday's carried Snapshot.open.
+
+
+def test_provisional_transport_reads_shared_facts_without_network_or_broker_login(monkeypatch, tmp_path):
+    panel, snapshot = _provisional_reference_fixture()
+    calls = []
+
+    def cached(symbols, fallback, **kwargs):
+        calls.append(kwargs)
+        assert symbols == panel.symbols and kwargs["allow_network"] is False
+        return snapshot
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("provisional signal transport must never fetch or log in")
+
+    monkeypatch.setattr(signal_engine, "fetch_tw_mis_opening_snapshot", cached)
+    monkeypatch.setattr(signal_engine, "_fetch_tw_opening_source", forbidden)
+    monkeypatch.setattr(signal_engine, "fetch_shared_day_trade_stock_snapshots", forbidden)
+    monkeypatch.setattr(signal_engine, "fetch_shioaji_stock_snapshots", forbidden)
+    result = _price_snapshot(source="tw", symbols=panel.symbols,
+        fallback_prices=panel.close_prices[-1], parquet_root=tmp_path,
+        prices_csv=None, yahoo_chunk_size=80, require_official_tw_session_open=True,
+        opening_model_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    assert len(calls) == 1 and result.available_count == snapshot.available_count
+    assert result.transport_timing["model_transport_policy"] == "canonical_received_facts_only_no_network_v1"
+    np.testing.assert_equal(result.open_prices, [101., np.nan, np.nan, np.nan])
 
 
 def test_historical_opening_panel_slices_before_factorized_coverage_gate(monkeypatch):
@@ -553,6 +709,108 @@ def test_normalized_window_preserves_values_and_private_live_copy() -> None:
         np.testing.assert_array_equal(features, before)
     finally:
         signal_engine.clear_live_panel_memory_cache()
+def test_dense_opening_overlay_materializes_without_mutating_history() -> None:
+    import torch
+
+    base = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    base.flags.writeable = False
+    before = base.tobytes()
+    gap = np.array([-0.0, 0.125, -0.25], dtype=np.float32)
+    overlay = signal_engine.DenseOpeningWindow(base, 2, gap)
+    expected = base.copy()
+    expected[-1, :, 2] = gap
+    assert overlay.last_row().tobytes() == expected[-1].tobytes()
+    assert not np.shares_memory(overlay.last_row(), base)
+    actual = signal_engine._live_input_tensor(overlay, runtime_device=torch.device("cpu"),
+        config=SimpleNamespace(), non_blocking=False)
+    assert actual.numpy().tobytes() == expected[None].tobytes()
+    actual.zero_()
+    assert base.tobytes() == before
+    assert overlay.transport_stats["cpu_full_window_copy"] is True
+    assert not overlay.transport_stats["base_cache_used"]
+
+
+def test_dense_device_input_invalidation_retains_idle_allocator_release_obligation(monkeypatch):
+    monkeypatch.setattr(signal_engine, "_LIVE_DENSE_DEVICE_CACHE", {"retained": object()})
+    monkeypatch.setattr(signal_engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
+    assert signal_engine._live_inference_cpu_cache_retained()
+    signal_engine.clear_live_panel_memory_cache()
+    assert not signal_engine._LIVE_DENSE_DEVICE_CACHE
+    assert signal_engine._LIVE_CUDA_CACHE_RELEASE_PENDING
+
+
+def test_dense_preparation_is_only_for_an_authorized_private_progressive_warmup():
+    from dataclasses import replace
+    from stockagent.live.market_config import SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE
+
+    cfg = LiveMarketConfig(market="fixture", label="fixture", config_path="fixture.yaml",
+        day_trade_simulation_enabled=True, day_trade_signal_update_policy=SIGNAL_UPDATE_PROGRESSIVE)
+    warm = cfg.signal_kwargs(price_source="panel", write=False)
+    assert warm["day_trade_signal_update_policy"] == SIGNAL_UPDATE_ONCE
+    assert warm["_prepare_progressive_opening_input"] is True
+    assert "_prepare_progressive_opening_input" not in cfg.signal_kwargs(price_source="tw_mis")
+    assert "_prepare_progressive_opening_input" not in cfg.signal_kwargs(price_source="panel", write=True)
+    assert "_prepare_progressive_opening_input" not in cfg.signal_kwargs(
+        price_source="panel", write=False, day_trade_model_observation="latest_quote")
+    assert "_prepare_progressive_opening_input" not in replace(cfg,
+        day_trade_signal_update_policy=SIGNAL_UPDATE_ONCE).signal_kwargs(price_source="panel", write=False)
+
+
+def test_once_only_transport_does_not_allocate_a_progressive_device_cache(monkeypatch):
+    import torch
+    base = np.ones((2, 3, 4), dtype=np.float32)
+    base.flags.writeable = False
+    monkeypatch.setattr(signal_engine, "_live_dense_base", lambda *_: pytest.fail("unused cache allocation"))
+    output = signal_engine._live_input_tensor(base, runtime_device=torch.device("cpu"),
+        config=SimpleNamespace(), non_blocking=False, retain_base=False)
+    assert output.numpy().tobytes() == base[None].tobytes()
+    output.zero_()
+    assert base.sum() == 24
+
+
+@pytest.mark.skipif(not signal_engine.torch.cuda.is_available(), reason="requires real CUDA transport")
+def test_dense_opening_cuda_overlay_reuses_only_owned_base_and_preserves_bits(monkeypatch):
+    import torch
+
+    signal_engine.clear_live_panel_memory_cache()
+    features = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    features[0, 0, 0] = -0.0
+    panel = SimpleNamespace(features=features, num_symbols=3, feature_names=list("abcd"))
+    config = SimpleNamespace(training=SimpleNamespace(vram_safety_margin_gb=0.5))
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        base = signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+        first_gap = np.array([-0.0, 0.125, -0.25], dtype=np.float32)
+        first = signal_engine.DenseOpeningWindow(base, 2, first_gap)
+        with torch.inference_mode():
+            first_x = signal_engine._live_input_tensor(first, runtime_device=device,
+                config=config, non_blocking=False)
+            assert first_x.cpu().numpy().tobytes() == first.materialize()[None].tobytes()
+            assert first.transport_stats["base_cache_used"]
+            second = signal_engine.DenseOpeningWindow(base, 2, -first_gap)
+            with torch.cuda.stream(torch.cuda.Stream(device=device)):
+                second_x = signal_engine._live_input_tensor(second, runtime_device=device,
+                    config=config, non_blocking=False)
+            torch.cuda.synchronize(device)
+            assert second.transport_stats["base_cache_hit"]
+            assert second.transport_stats["host_to_device_bytes"] == first_gap.nbytes
+            assert second_x.cpu().numpy().tobytes() == second.materialize()[None].tobytes()
+            assert first_x.cpu().numpy().tobytes() == first.materialize()[None].tobytes()
+            # The model can mutate its private input, never the cached base.
+            second_x.zero_()
+            third = signal_engine._live_input_tensor(second, runtime_device=device,
+                config=config, non_blocking=False)
+            assert third.cpu().numpy().tobytes() == second.materialize()[None].tobytes()
+        signal_engine.clear_live_panel_memory_cache()
+        assert signal_engine._live_dense_base(base, device, config) == (None, False)
+        base = signal_engine._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (0, 1))
+        assert signal_engine._live_dense_base(base, device, config) == (None, False)
+        assert not signal_engine._LIVE_DENSE_DEVICE_CACHE
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
+
+
 def test_live_panel_cache_identity_ignores_worker_count(tmp_path) -> None:
     config = type(
         "ConfigStub",
@@ -949,6 +1207,49 @@ def test_build_decision_rows_records_scores_constraints_and_reasons() -> None:
     assert rows[-1]["constraint"] == "not_tradable"
 
 
+@pytest.mark.parametrize("dtype", (np.float32, np.float64, np.int64))
+def test_nullable_column_matches_scalar_serialization_without_mutating_input(dtype):
+    values = np.array([0, -0., 1, -3, 1e6], dtype=dtype)
+    if dtype != np.int64:
+        values = np.concatenate((values, np.array([np.nan, np.inf, -np.inf], dtype=dtype)))
+    before = values.tobytes()
+    expected = [signal_engine._finite_float_or_none(value) for value in values]
+    actual = signal_engine._finite_float_column(values)
+    assert actual == expected
+    assert json.dumps(actual, allow_nan=False) == json.dumps(expected, allow_nan=False)
+    assert values.tobytes() == before
+    assert signal_engine._finite_float_column(np.array([], dtype=dtype)) == []
+    with pytest.raises(ValueError, match="one symbol axis"):
+        signal_engine._finite_float_column(values.reshape(1, -1))
+
+
+@pytest.mark.parametrize("has_score", (False, True))
+@pytest.mark.parametrize("has_raw_score", (False, True))
+def test_decision_row_reuse_is_same_inference_exact_output(has_score, has_raw_score):
+    args = dict(symbols=["A", "B", "C", "D"], symbol_names={"A": "甲"},
+        asof_date="2026-10-22", panel_date="2026-10-21",
+        model_weights=np.array([.1, -.2, 0, .7], dtype=np.float32),
+        current_weights=np.array([-.0, .1, -.7, .2], dtype=np.float32),
+        target_weights=np.array([.1, -.2, 0, .2], dtype=np.float32),
+        current_prices=np.array([-0., 12.25, np.nan, np.inf]),
+        base_prices=np.array([5., np.nan, -0., 3.]),
+        price_returns=np.array([-.0, .01, np.inf, np.nan]),
+        scores=np.array([.1, np.nan, -.2, 0.]) if has_score else None,
+        raw_scores=np.array([np.inf, -.2, .5, -0.]) if has_raw_score else None,
+        tradable_mask=np.array([True, True, False, True]),
+        can_buy_mask=np.array([True, False, False, True]),
+        can_sell_mask=np.array([True, True, False, False]), aux=None)
+    expected = _build_decision_rows(**args)
+    # The production weights row has the identical per-inference values. It is
+    # NOT a cross-request cache and cannot provide another session's prices.
+    metadata = {row["symbol"]: dict(row) for row in expected}
+    actual = _build_decision_rows(**args, weight_rows_by_symbol=metadata)
+    assert json.dumps(actual, ensure_ascii=False, allow_nan=False) == json.dumps(expected, ensure_ascii=False, allow_nan=False)
+    del metadata["B"]
+    with pytest.raises(KeyError):
+        _build_decision_rows(**args, weight_rows_by_symbol=metadata)
+
+
 def test_daily_bar_timestamp_uses_market_close_time_for_midnight_dates() -> None:
     assert _daily_bar_timestamp("2026-06-23", "13:30") == "2026-06-23 13:30:00"
     assert _daily_bar_timestamp("2026-06-23 00:00:00", "13:30") == "2026-06-23 13:30:00"
@@ -1129,6 +1430,11 @@ def test_period_title_ends_at_price_timestamp_when_live_quote_falls_back() -> No
 
 def test_tw_quote_with_zero_coverage_falls_back_without_claiming_realtime(monkeypatch) -> None:
     fallback = np.array([10.0, 20.0])
+    # This test's premise is that ALL quote sources lack coverage. Do not let
+    # a previous test's Shioaji cache (or a real account in the environment)
+    # silently supply rows when only the MIS source was stubbed out.
+    monkeypatch.setattr(signal_engine, "fetch_shioaji_stock_snapshots", lambda *a, **k: PriceSnapshot(
+        prices=fallback.copy(), source="shioaji:fixture_unavailable", available_count=0))
     monkeypatch.setattr(
         "stockagent.live.signal_engine.fetch_tw_mis_last_prices",
         lambda *args, **kwargs: PriceSnapshot(

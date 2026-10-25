@@ -103,12 +103,21 @@ def _parse_listing_page(content: bytes) -> ListingPage:
     soup = BeautifulSoup(content, "html.parser")
     rows: list[dict[str, str]] = []
     raw_rows = 0
-    for item in soup.select("li"):
-        time_tag = item.find("time")
-        if time_tag is not None:
-            raw_rows += 1
-        link = item.find("a", href=re.compile(r"^/tw/cp-302-"))
-        if time_tag is None or link is None:
+    items = soup.select("li")
+    item_ids = {id(item) for item in items}
+    first_times = {}
+    for time_tag in soup.find_all("time"):
+        for ancestor in time_tag.parents:
+            if id(ancestor) in item_ids:
+                first_times.setdefault(id(ancestor), time_tag)
+    link_pattern = re.compile(r"^/tw/cp-302-")
+    for item in items:
+        time_tag = first_times.get(id(item))
+        if time_tag is None:
+            continue
+        raw_rows += 1
+        link = item.find("a", href=link_pattern)
+        if link is None:
             continue
         title = link.get_text(" ", strip=True)
         match = TITLE_RE.search(title)

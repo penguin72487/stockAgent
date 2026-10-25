@@ -580,9 +580,10 @@ function groupCard(row) {
   const publication = publicationLines(row);
   const acquisition = row.acquisition_progress || {};
   for (const [label, value] of [
-    ["實存最早一筆", recordDate(row.record_stats?.first, row.record_stats)],
-    ["實存最新一筆", recordDate(row.record_stats?.last, row.record_stats)],
+    ["實存最早一筆", recordDate(row.record_stats?.earliest_date ?? row.record_stats?.first, row.record_stats)],
+    ["實存最新一筆", recordDate(row.record_stats?.latest_date ?? row.record_stats?.last, row.record_stats)],
     ["實存總筆數", recordCount(row.record_stats)],
+    ...(number(row.record_stats?.days) === null ? [] : [["實際有資料天數", `${formatInteger(row.record_stats.days)} 天`]]),
     ["實存檔案", recordFiles(row.record_stats)],
     ["資料截至", row.data_through || "連續／未提供"],
     ["下一資料日", acquisition.preparing_for_date || "連續／未判定"],
@@ -730,9 +731,10 @@ function tableRow(row) {
 
   const through = document.createElement("td");
   through.dataset.label = "實存首末筆／總筆數";
-  through.append(make("span", "source-name", `最早：${recordDate(row.record_stats?.first, row.record_stats)}`));
-  through.append(make("span", "cell-note", `最新：${recordDate(row.record_stats?.last, row.record_stats)}`));
+  through.append(make("span", "source-name", `最早：${recordDate(row.record_stats?.earliest_date ?? row.record_stats?.first, row.record_stats)}`));
+  through.append(make("span", "cell-note", `最新：${recordDate(row.record_stats?.latest_date ?? row.record_stats?.last, row.record_stats)}`));
   through.append(make("span", number(row.record_stats?.count) !== null ? "cell-note record-count" : "cell-note record-unknown", `總筆數：${recordCount(row.record_stats)}`));
+  if (number(row.record_stats?.days) !== null) through.append(make("span", "cell-note", `實際有資料：${formatInteger(row.record_stats.days)} 天`));
   through.append(make("span", "cell-note", `檔案：${recordFiles(row.record_stats)}`));
   if (row.record_stats?.basis) {
     const basis = make("span", "cell-note record-basis", row.record_stats.basis);

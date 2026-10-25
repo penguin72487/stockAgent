@@ -753,14 +753,24 @@
   function queueVisibilityChecks() {
     if (visibilityCheckQueued) return;
     visibilityCheckQueued = true;
+    let completed = false, frameId = null, fallbackId = null;
     const check = () => {
+      if (completed) return;
+      completed = true;
+      if (fallbackId !== null) global.clearTimeout?.(fallbackId);
+      if (frameId !== null) global.cancelAnimationFrame?.(frameId);
       visibilityCheckQueued = false;
       for (const update of visibilityChecks) {
         try { update(); }
         catch { global.console?.error?.("Dashboard visibility callback failed"); }
       }
     };
-    if (global.requestAnimationFrame) global.requestAnimationFrame(check);
+    if (global.requestAnimationFrame) {
+      // A suspended compositor must not strand a revealed section forever.
+      // This only rechecks real visibility; it is NOT a paint observation.
+      fallbackId = global.setTimeout?.(check, 100) ?? null;
+      frameId = global.requestAnimationFrame(check);
+    }
     else Promise.resolve().then(check);
   }
 
@@ -1017,11 +1027,12 @@
     });
   }
 
-  function subscribeRevisions(input, onRevision, fallback, {fallbackMs = 1000, reconcileMs = 15000} = {}) {
+  function subscribeRevisions(input, onRevision, fallback, {fallbackMs = 1000, reconcileMs = 15000, onStatus = null} = {}) {
     sameOriginUrl(input);
     let source = null;
     let opened = false;
     let disposed = false;
+    let statusRequested = false;
     let lastReconcile = 0;
     const disconnect = () => {
       source?.close();
@@ -1031,7 +1042,9 @@
     const connect = () => {
       if (disposed || global.document?.hidden || source || typeof global.EventSource !== "function") return;
       try {
-        const active = new global.EventSource(input);
+        const streamUrl = statusRequested ? new global.URL(input, global.location.href) : input;
+        if (statusRequested) streamUrl.searchParams.set("status", "1");
+        const active = new global.EventSource(statusRequested ? streamUrl.href : streamUrl);
         source = active;
         active.onopen = () => { if (source === active) opened = true; };
         active.onerror = () => { if (source === active) opened = false; };
@@ -1039,7 +1052,22 @@
           if (source !== active || disposed) return;
           try {
             const payload = validateJsonRoot(JSON.parse(event.data), "object");
-            onRevision(payload, {transport: "sse"});
+            onRevision(payload, {transport: "sse", statusExpected: statusRequested});
+            // Negotiate before opting in. Older gateways keep their ordinary
+            // revision+GET flow; a static-file update cannot break their SSE.
+            if (!statusRequested && typeof onStatus === "function" &&
+                payload.status_stream_contract === "verified_compact_status_v1") {
+              disconnect();
+              statusRequested = true;
+              connect();
+            }
+          } catch (_error) { opened = false; }
+        });
+        if (typeof onStatus === "function") active.addEventListener("status", (event) => {
+          if (source !== active || disposed) return;
+          try {
+            const payload = validateJsonRoot(JSON.parse(event.data), "object");
+            onStatus(payload, {transport: "sse", receivedAt: global.performance?.now?.()});
           } catch (_error) { opened = false; }
         });
       } catch (_error) { disconnect(); }

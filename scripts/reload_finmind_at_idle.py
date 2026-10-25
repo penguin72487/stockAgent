@@ -10,11 +10,13 @@ import argparse
 from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime, timedelta
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import signal
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -24,7 +26,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from downloader.artifact_io import atomic_write_json
-from downloader.finmind_queue_indexes import STATUS_INDEX
+from downloader.finmind_queue_indexes import (STATUS_INDEX, ETA_WORK_INDEX, ETA_RECENT_INDEX,
+                                             eta_work_index, eta_recent_index)
 from downloader.finmind_runtime import idle_heartbeat
 from downloader.finmind_scheduling import protected_stock_opening
 from scripts.benchmark_finmind_status import AGGREGATE_SQL, file_sha
@@ -32,6 +35,9 @@ from scripts.benchmark_finmind_status import AGGREGATE_SQL, file_sha
 UNIT = "stockagent-finmind-complement.service"
 PROTECTED = ("stockagent-tw-day-trade-simulation.service", "stockagent-shioaji-taifex-bidask.service")
 ROOT = REPO / "data_finmind/complement"
+ETA_MEASUREMENTS = frozenset({'finmind_full_eta_queue_indexes_v1', 'finmind_full_eta_queue_indexes_v2'})
+STORE_MEASUREMENT = 'finmind_content_addressed_store_fence_v1'
+PUBLICATION_MEASUREMENT = 'finmind_bounded_json_publication_pipeline_v1'
 
 
 def metadata(path, maximum=4 * 1024**2):
@@ -146,6 +152,7 @@ def idle_proof(root, now):
         for table in ("finmind_object_prefetch_claims", "complement_year_batch_claims"):
             if connection.execute("SELECT 1 FROM sqlite_master WHERE name=?", (table,)).fetchone():
                 claims[table] = connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        claims['inflight_tasks'] = connection.execute("SELECT count(*) FROM tasks WHERE state='inflight'").fetchone()[0]
         if any(claims.values()):
             return None
     return {"cycle_observed_at_utc": status["observed_at_utc"], "reason": status["state"],
@@ -233,12 +240,145 @@ def code_matches(accepted):
                 str(REPO / "downloader/finmind_queue_indexes.py")}
     if "whole_publication_wall_improvement_observed" in accepted:
         required.add(str(REPO / "downloader/finmind_status_aggregates.py"))
+    if accepted.get('measurement_contract') == 'finmind_live_reservation_readers_local_dispatch_v1':
+        required.update(str(REPO / 'downloader' / name) for name in (
+            'finmind_scheduling.py', 'finmind_supplemental.py', 'finmind_json_pipeline.py'))
+    if accepted.get('measurement_contract') in ETA_MEASUREMENTS:
+        required.update(str(REPO / 'downloader' / name) for name in (
+            'finmind_eta_work.py', 'finmind_eta_telemetry.py', 'finmind_eta.py'))
+        required.add(str(REPO / 'scripts/benchmark_finmind_eta_runtime.py'))
+        if accepted.get('measurement_contract') == 'finmind_full_eta_queue_indexes_v2':
+            required.add(str(REPO / 'downloader/finmind_runtime.py'))
+    if accepted.get('measurement_contract') == STORE_MEASUREMENT:
+        required.update(str(REPO / 'downloader' / name) for name in (
+            'artifact_io.py', 'finmind_parent_recovery.py', 'finmind_updates.py', 'finmind_json_pipeline.py'))
+    if accepted.get('measurement_contract') == PUBLICATION_MEASUREMENT:
+        required.update(str(REPO / 'downloader' / name) for name in (
+            'artifact_io.py', 'finmind_parent_recovery.py', 'finmind_updates.py',
+            'finmind_json_pipeline.py', 'finmind_object_pipeline.py', 'finmind_status_aggregates.py'))
+        required.add(str(REPO / 'configs/finmind_json_pipeline.json'))
     return (required.issubset(hashes)
             and all(file_sha(Path(path)) == digest for path, digest in hashes.items()))
 
 
 def accepted_local_measurement(accepted):
     """An exact full local publication quantum, not only a fast status query."""
+    if accepted.get('measurement_contract') == PUBLICATION_MEASUREMENT:
+        trials = accepted.get('trials', [])
+        fingerprint = accepted.get('configuration_sha256')
+        if (accepted.get('state') != 'eight_full_pipeline_trials_verified'
+                or any(accepted.get(key) is not True for key in
+                       ('exact_output_parity', 'outputs_identical', 'source_preserved', 'code_stable'))
+                or any(accepted.get(key) != 0 for key in
+                       ('provider_calls', 'production_queue_mutations', 'source_writes'))
+                or accepted.get('tasks_per_pass') != 48 or accepted.get('passes_per_trial') != 2
+                or accepted.get('status_writes_per_trial') != 5
+                or type(accepted.get('benchmark_device')) is not int
+                or accepted.get('benchmark_device') != accepted.get('target_queue_device')
+                or not isinstance(accepted.get('boot_id'), str) or not accepted['boot_id']
+                or type(accepted.get('source_rows')) is not int or accepted['source_rows'] <= 0
+                or not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or [row.get('variant') for row in trials] != ['baseline', 'candidate', 'candidate', 'baseline'] * 2):
+            return False
+        expected = {'calls': 48, 'accepted_requests': 48, 'nonempty_requests': 48, 'failed_tasks': 0}
+        for row in trials:
+            if (row.get('passes') != [expected, expected]
+                    or any(row.get(key) is not True for key in
+                           ('existing_parquet_inodes_preserved', 'full_source_readback', 'queue_writer_thread_verified'))
+                    or row.get('same_filesystem_as_target_queue') is not True
+                    or row.get('max_response_slots') != 16
+                    or type(row.get('max_claimed_responses')) is not int
+                    or not 1 <= row['max_claimed_responses'] <= 16
+                    or row.get('max_publication_workers') != (2 if row['variant'] == 'candidate' else 1)
+                    or not isinstance(row.get('output_sha256'), str) or len(row['output_sha256']) != 64
+                    or any(type(row.get(key)) not in (int, float) or not math.isfinite(row[key]) or row[key] <= 0
+                           for key in ('wall_seconds', 'cpu_seconds'))):
+                return False
+        medians = {label: statistics.median(row['wall_seconds'] for row in trials if row['variant'] == label)
+                   for label in ('baseline', 'candidate')}
+        return (len({row['output_sha256'] for row in trials}) == 1
+                and accepted.get('medians') == medians and medians['candidate'] < medians['baseline'])
+    if accepted.get('measurement_contract') == STORE_MEASUREMENT:
+        trials, records = accepted.get('trials', []), accepted.get('records', {})
+        if (accepted.get('state') != 'accepted_bounded_store_replay'
+                or accepted.get('scope') != 'canonical_store_first_publish_and_same_value_refresh_with_full_footer_and_sha_readback'
+                or accepted.get('exact_output_parity') is not True
+                or accepted.get('source_parquet_preserved') is not True
+                or accepted.get('code_stable') is not True
+                or any(accepted.get(key) != 0 for key in
+                       ('provider_calls', 'production_queue_mutations', 'production_source_writes'))
+                or records.get('tasks') != 48 or records.get('stores_per_trial') != 96
+                or type(records.get('rows_per_payload')) is not int or records['rows_per_payload'] <= 0
+                or [row.get('variant') for row in trials] != ['baseline', 'candidate', 'candidate', 'baseline'] * 2):
+            return False
+        if any(row.get('stores') != 96 or row.get('exact_existing_final_inode_preserved') is not True
+               or not isinstance(row.get('output_sha256'), str) or len(row['output_sha256']) != 64
+               or any(type(row.get(key)) not in (int, float) or not math.isfinite(row[key]) or row[key] <= 0
+                      for key in ('elapsed_seconds', 'cpu_seconds')) for row in trials):
+            return False
+        if len({row['output_sha256'] for row in trials}) != 1:
+            return False
+        medians = {variant: {key: statistics.median(row[key] for row in trials if row['variant'] == variant)
+                             for key in ('elapsed_seconds', 'cpu_seconds')}
+                   for variant in ('baseline', 'candidate')}
+        return (accepted.get('medians') == medians
+                and medians['candidate']['elapsed_seconds'] < medians['baseline']['elapsed_seconds'])
+    if accepted.get('measurement_contract') in ETA_MEASUREMENTS:
+        trials, writes = accepted.get('trials', []), accepted.get('claim_release_trials', [])
+        with_wake = accepted.get('measurement_contract') == 'finmind_full_eta_queue_indexes_v2'
+        if (accepted.get('state') != 'accepted_bounded_replay'
+                or accepted.get('scope') != ('full_offline_finmind_eta_and_wake_snapshot' if with_wake else
+                                             'full_offline_finmind_eta_snapshot')
+                or accepted.get('exact_full_output_parity') is not True
+                or accepted.get('read_snapshot_preserved') is not True
+                or accepted.get('production_queue_writes') != 0 or accepted.get('provider_calls') != 0
+                or [row.get('variant') for row in trials] != ['baseline', 'candidate', 'candidate', 'baseline'] * 2
+                or [row.get('variant') for row in writes] != ['baseline', 'candidate', 'candidate', 'baseline']):
+            return False
+        if with_wake and (any(set(row.get('wake_delays', {})) != {'sponsor', 'complement'} for row in trials)
+                          or any(row['wake_delays'] != trials[0]['wake_delays'] for row in trials)):
+            return False
+        if (any(not row.get('output_sha256') for row in trials)
+                or len({row['output_sha256'] for row in trials}) != 1
+                or any(type(row.get('peak_rss_bytes')) is not int or row['peak_rss_bytes'] <= 0 for row in trials)
+                or any(row.get('tasks') != 32 or row.get('transactions') != 64
+                       or row.get('exact_task_rows_restored') is not True for row in writes)):
+            return False
+        for row in trials + writes:
+            keys = ('elapsed_seconds', 'cpu_seconds') if 'elapsed_seconds' in row else ('wall_seconds', 'cpu_seconds')
+            if any(type(row.get(key)) not in (int, float) or not math.isfinite(row[key]) or row[key] <= 0 for key in keys):
+                return False
+        medians = {variant: {key: statistics.median(row[key] for row in trials if row['variant'] == variant)
+                             for key in ('elapsed_seconds', 'cpu_seconds', 'peak_rss_bytes')}
+                   for variant in ('baseline', 'candidate')}
+        setup = accepted.get('queue_index_setup', {})
+        return bool(accepted.get('medians') == medians
+                    and all(medians['candidate'][key] < medians['baseline'][key]
+                            for key in ('elapsed_seconds', 'cpu_seconds'))
+                    and set(setup) == {'sponsor', 'complement'}
+                    and all(row.get('task_changes') == 0 for row in setup.values()))
+    if accepted.get('measurement_contract') == 'finmind_live_reservation_readers_local_dispatch_v1':
+        trials = accepted.get('trials', [])
+        if (accepted.get('state') != 'measurement_complete'
+                or accepted.get('snapshot_preserved') is not True
+                or accepted.get('code_stable') is not True
+                or accepted.get('exact_output_parity') is not True
+                or accepted.get('status_connection') != 'native_StatusConnection_fresh_memo_per_trial'
+                or accepted.get('local_dispatch_wall_improvement_observed') is not True
+                or accepted.get('production_queue_mutations') != 0 or accepted.get('provider_calls') != 0
+                or not 4 <= len(trials) <= 20 or len(trials) % 4
+                or [row.get('label') for row in trials] != ['baseline', 'candidate', 'candidate', 'baseline'] * (len(trials)//4)):
+            return False
+        if any(row.get('admissions') != 120 or row.get('status_writes') != 5
+               or not isinstance(row.get('wall_seconds'), (int, float))
+               or not math.isfinite(row['wall_seconds']) or row['wall_seconds'] <= 0
+               or not row.get('output_sha256') for row in trials):
+            return False
+        if len({row['output_sha256'] for row in trials}) != 1:
+            return False
+        medians = {label: statistics.median(row['wall_seconds'] for row in trials if row['label'] == label)
+                   for label in ('baseline', 'candidate')}
+        return accepted.get('medians_seconds') == medians and medians['candidate'] < medians['baseline']
     if "whole_publication_wall_improvement_observed" not in accepted:
         return accepted.get("status_wall_improvement_observed") is True
     return bool(accepted.get("state") == "measurement_complete"
@@ -252,37 +392,75 @@ def accepted_local_measurement(accepted):
                     == ["baseline", "candidate", "candidate", "baseline"])
 
 
+def eta_projection_readback(connection, now):
+    """Prove that the original owner installed both exact physical contracts."""
+    if not eta_work_index(connection) or not eta_recent_index(connection):
+        return None
+    work = [row[3] for row in connection.execute(
+        f"EXPLAIN QUERY PLAN SELECT dataset,kind,priority,state,count(*),min(next_attempt_at_utc) "
+        f"FROM tasks{eta_work_index(connection)} GROUP BY 1,2,3,4")]
+    recent = [row[3] for row in connection.execute(
+        f"EXPLAIN QUERY PLAN SELECT state,kind,sum(rows),sum(bytes) FROM tasks{eta_recent_index(connection)} "
+        "WHERE last_attempt_at_utc>? AND last_attempt_at_utc<=? GROUP BY state,kind",
+        ((now - timedelta(days=7)).isoformat(), now.isoformat()))]
+    stats = dict(connection.execute("SELECT idx,stat FROM sqlite_stat1 WHERE idx IN (?,?)",
+                                    (ETA_WORK_INDEX, ETA_RECENT_INDEX)))
+    if (set(stats) != {ETA_WORK_INDEX, ETA_RECENT_INDEX}
+            or not any('COVERING INDEX ' + ETA_WORK_INDEX in row for row in work)
+            or not any('SEARCH tasks USING COVERING INDEX ' + ETA_RECENT_INDEX in row for row in recent)):
+        return None
+    return {'inventory_plan': work, 'recent_outcomes_plan': recent, 'index_statistics': stats}
+
+
 def _main(argv, resources):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acceptance", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wait-seconds", type=int, default=300)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument('--owner', choices=('complement', 'sponsor'), default='complement',
+                        help='Original queue owner; Sponsor permits only its existing nonreactive idle window')
     parser.add_argument('--allow-preparation-boundary', action='store_true',
                         help='Also permit a frozen, zero-claim preparation boundary; never interrupts an HTTP batch')
     args = parser.parse_args(argv)
+    root = ROOT if args.owner == 'complement' else REPO / 'data_finmind/sponsor'
+    unit = UNIT if args.owner == 'complement' else 'stockagent-finmind-sponsor.service'
+    if args.owner == 'sponsor' and args.allow_preparation_boundary:
+        parser.error('Sponsor reload requires its natural, drained idle window')
     if args.output.exists() or not 0 <= args.wait_seconds <= 600:
         parser.error("new output required; bounded wait must be 0..600 seconds")
     accepted = metadata(args.acceptance)
+    source_queue = Path(accepted.get('source_queue', ''))
+    if args.owner == 'sponsor':
+        manifest = accepted.get('source_manifest', {})
+        if (accepted.get('measurement_contract') not in ETA_MEASUREMENTS
+                or 'data/sponsor/queue.sqlite3' not in manifest.get('files', {})):
+            raise ValueError('sponsor_queue_requires_its_full_measured_snapshot')
+        source_queue = Path(manifest.get('source', '')) / 'sponsor/queue.sqlite3'
     if (not accepted.get("exact_output_parity") or not accepted.get("code_stable")
             or not accepted_local_measurement(accepted)
-            or Path(accepted["source_queue"]).resolve() != (ROOT / "queue.sqlite3").resolve()
+            or source_queue.resolve() != (root / "queue.sqlite3").resolve()
             or not code_matches(accepted)):
         raise ValueError("current_code_not_bound_to_accepted_measurement")
-    if shutil.disk_usage(ROOT).free < 26 * 1024**3:
+    if accepted.get('measurement_contract') == PUBLICATION_MEASUREMENT:
+        if (source_queue.stat().st_dev != accepted['benchmark_device']
+                or Path('/proc/sys/kernel/random/boot_id').read_text().strip() != accepted['boot_id']):
+            raise ValueError('publication_measurement_requires_current_storage_and_boot')
+    if shutil.disk_usage(root).free < 26 * 1024**3:
         raise ValueError("queue_index_headroom_guard")
-    before = identity(UNIT)
+    before = identity(unit)
     if before.get("ActiveState") != "active" or not before.get("InvocationID") or before.get("MainPID") in {None, "0"}:
         raise ValueError("reload_requires_the_current_running_owner")
-    protected = {unit: identity(unit) for unit in PROTECTED}
+    protected_units = PROTECTED + ((UNIT,) if args.owner == 'sponsor' else ())
+    protected = {name: identity(name) for name in protected_units}
     end = time.monotonic() + args.wait_seconds
     proof = None
     while True:
         try:
-            proof = idle_proof(ROOT, datetime.now(UTC))
+            proof = idle_proof(root, datetime.now(UTC))
             if proof is None and args.apply and args.allow_preparation_boundary:
                 with ExitStack() as attempt:
-                    proof = attempt.enter_context(preparation_boundary(ROOT, before))
+                    proof = attempt.enter_context(preparation_boundary(root, before))
                     if proof:
                         resources.enter_context(attempt.pop_all())
         except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError):
@@ -290,7 +468,7 @@ def _main(argv, resources):
         if proof or time.monotonic() >= end or not args.apply:
             break
         time.sleep(.5)
-    report = {"schema_version": 1, "observed_at_utc": datetime.now(UTC).isoformat(), "unit": UNIT,
+    report = {"schema_version": 1, "observed_at_utc": datetime.now(UTC).isoformat(), "unit": unit,
               "service_before": before, "idle_proof": proof, "apply_requested": args.apply,
               "restart_requested": False, "provider_calls_by_this_command": 0, "source_writes": 0,
               "queue_task_mutations": 0, "protected_services_before": protected}
@@ -298,13 +476,13 @@ def _main(argv, resources):
         report["state"] = "deferred_no_safe_idle_window" if not proof else "idle_observed_no_action"
         atomic_write_json(args.output, report)
         return 0
-    samples = prior_files(ROOT, proof["last_task"])
+    samples = prior_files(root, proof["last_task"])
     report["sampled_prior_files"] = samples
     # The short batch-complete sleep is non-reactive. Check the exact same
     # service generation and remaining deadline immediately before dispatch.
     frozen = proof.get('mode') == 'frozen_drained_preparation'
-    if (identity(UNIT) != before or not code_matches(accepted)
-            or not frozen and (idle_proof(ROOT, datetime.now(UTC)) != proof
+    if (identity(unit) != before or not code_matches(accepted)
+            or not frozen and (idle_proof(root, datetime.now(UTC)) != proof
                 or datetime.fromisoformat(proof["deadline"]) - datetime.now(UTC) < timedelta(seconds=1))):
         report["state"] = "deferred_generation_or_deadline_changed"
         atomic_write_json(args.output, report)
@@ -314,27 +492,34 @@ def _main(argv, resources):
     atomic_write_json(args.output, report)  # Retain action evidence even if interrupted.
     if frozen:
         terminate_frozen_preparation(proof)
-    subprocess.run(["systemctl", "restart", UNIT], check=True, timeout=30)
-    until = time.monotonic() + 90
+    subprocess.run(["systemctl", "restart", unit], check=True, timeout=30)
+    # A measured first-time projection build can exceed the old 90-second
+    # status window. Wait for the owner; never build indexes from this reader.
+    until = time.monotonic() + (300 if accepted.get('measurement_contract') in ETA_MEASUREMENTS else 90)
     while time.monotonic() < until:
-        after = identity(UNIT)
+        after = identity(unit)
         try:
-            status = metadata(ROOT / "status.json")
-            with closing(sqlite3.connect((ROOT / "queue.sqlite3").resolve().as_uri() + "?mode=ro", uri=True, timeout=.2)) as connection:
+            status = metadata(root / "status.json")
+            with closing(sqlite3.connect((root / "queue.sqlite3").resolve().as_uri() + "?mode=ro", uri=True, timeout=.2)) as connection:
                 plan = [row[3] for row in connection.execute("EXPLAIN QUERY PLAN " + AGGREGATE_SQL)]
                 statistics = connection.execute("SELECT stat FROM sqlite_stat1 WHERE idx=?", (STATUS_INDEX,)).fetchone()
+                eta_proof = (eta_projection_readback(connection, datetime.now(UTC))
+                             if accepted.get('measurement_contract') in ETA_MEASUREMENTS else None)
             if (after["ActiveState"] == "active" and after["InvocationID"] != before["InvocationID"]
                     and datetime.fromisoformat(status["observed_at_utc"]) > stamp
-                    and statistics and any("COVERING INDEX " + STATUS_INDEX in row for row in plan)):
+                    and statistics and any("COVERING INDEX " + STATUS_INDEX in row for row in plan)
+                    and (accepted.get('measurement_contract') not in ETA_MEASUREMENTS or eta_proof)):
                 report.update(state="canonical_owner_schema_and_status_verified", service_after=after,
                               status_observed_at_utc=status["observed_at_utc"], index_stat=statistics[0], aggregate_plan=plan)
+                if eta_proof:
+                    report['eta_index_readback'] = eta_proof
                 break
         except (OSError, ValueError, KeyError, sqlite3.Error):
             pass
         time.sleep(1)
     else:
         report["state"] = "restart_readback_unverified"
-    report["protected_services_after"] = {unit: identity(unit) for unit in PROTECTED}
+    report["protected_services_after"] = {name: identity(name) for name in protected_units}
     report["protected_service_identities_unchanged"] = report["protected_services_after"] == protected
     report["sampled_prior_files_unchanged"] = all(
         Path(item["path"]).is_file() and file_sha(Path(item["path"])) == item["sha256"] for item in samples

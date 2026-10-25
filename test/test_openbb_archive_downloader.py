@@ -1094,6 +1094,10 @@ def test_worker_disables_openbb_http_cache_without_changing_task_identity(
     assert seen["provider"] == "econdb"
     assert seen["use_cache"] is False
     assert task.kwargs["use_cache"] is True
+    assert result.operation_timing["scope"] == "worker_return_before_discovery_and_manifest_commit"
+    stages = {row["stage"]: row for row in result.operation_timing["stages"]}
+    assert {"provider_slot_wait", "provider_adapter_inclusive", "normalize_records", "publish_record_payload"} <= stages.keys()
+    assert all(row["provider"] == "econdb" and row["seconds"] >= 0 for row in stages.values())
 
 
 def test_worker_learns_pageable_limit_and_preserves_continuation_contract(
@@ -11754,7 +11758,6 @@ def test_executor_waits_for_provider_cooldown_without_task_churn(
         ("fmp",),
     )
     runtime = ProviderRuntime({"fmp": 1000.0}, {"fmp": 1}, 1.0)
-    runtime._blocked_until["fmp"] = time.time() + 0.05
     called_at: list[float] = []
 
     class Worker:
@@ -11769,6 +11772,7 @@ def test_executor_waits_for_provider_cooldown_without_task_churn(
     try:
         manifest.upsert_tasks([task], plan_token="cooldown")
         started = time.time()
+        runtime._blocked_until["fmp"] = started + 0.05
         attempted, totals = execute_download_tasks(
             context,
             manifest,
@@ -12703,6 +12707,65 @@ def test_manifest_completion_batch_uses_one_durable_commit(tmp_path: Path) -> No
         assert manifest.counts("manifest-completion-batch") == {"empty": 3}
     finally:
         manifest.connection.set_trace_callback(None)
+        manifest.close()
+
+
+def test_operation_timing_rolls_back_with_task_and_keeps_one_commit(tmp_path: Path) -> None:
+    from downloader.operation_timing import OPENBB_META_PREFIX, OperationTiming
+    task = make_task(_context(tmp_path), "economy.timing", "US", {}, ("timed_provider",))
+    manifest = Manifest(tmp_path / "timing.sqlite3")
+    result = TaskResult(task, "success", "timed_provider", 1, task.output_path, 1)
+    result.operation_timing = OperationTiming().snapshot("worker_return_before_discovery_and_manifest_commit")
+    try:
+        manifest.upsert_tasks([task], plan_token="timing")
+        with pytest.raises(RuntimeError, match="rollback"):
+            with manifest.completion_batch():
+                manifest.complete(result)
+                raise RuntimeError("rollback")
+        assert manifest.connection.execute("SELECT status FROM tasks WHERE task_id=?", (task.task_id,)).fetchone()[0] == "pending"
+        assert manifest.connection.execute("SELECT COUNT(*) FROM archive_meta WHERE key LIKE ?", (OPENBB_META_PREFIX + "%",)).fetchone()[0] == 0
+        statements = []
+        manifest.connection.set_trace_callback(statements.append)
+        with manifest.completion_batch():
+            manifest.complete(result)
+            manifest.complete(result)
+        manifest.connection.set_trace_callback(None)
+        assert statements.count("COMMIT") == 1
+        row = manifest.connection.execute("SELECT value FROM archive_meta WHERE key LIKE ?", (OPENBB_META_PREFIX + "%",)).fetchall()
+        assert len(row) == 1
+        payload = json.loads(row[0][0])
+        assert payload["task_id"] == task.task_id and payload["declared_providers"] == ["timed_provider"]
+        assert payload["operation_timing"] == result.operation_timing
+    finally:
+        manifest.close()
+
+
+def test_scheduler_operation_timing_is_durable_without_changing_task(tmp_path: Path) -> None:
+    from downloader.operation_timing import OPENBB_META_PREFIX
+    context = _context(tmp_path)
+    context.commands = {".economy.timing": ["timed_provider"]}
+    task = make_task(context, "economy.timing", "US", {}, ("timed_provider",))
+    manifest = Manifest(tmp_path / "_state/openbb_archive.sqlite3")
+
+    def worker(current):
+        assert current.task_id == task.task_id and current.kwargs == {}
+        return TaskResult(current, "success", "timed_provider", 1, current.output_path, 1)
+
+    try:
+        manifest.upsert_tasks([task], plan_token="timing")
+        attempted, _ = execute_download_tasks(context, manifest, worker, plan_token="timing", workers=1,
+                                             batch_size=1, max_tasks=1, max_total_attempts=10,
+                                             no_discovery=True, no_progress=True)
+        assert attempted == 1
+        row = manifest.connection.execute("SELECT value FROM archive_meta WHERE key LIKE ?", (OPENBB_META_PREFIX + "%",)).fetchone()
+        timing = json.loads(row[0])["scheduler_timing"]
+        assert timing["contract"] == "openbb_scheduler_monotonic_v1"
+        assert timing["submit_to_reap_seconds"] >= timing["executor_queue_seconds"] >= 0
+        assert timing["worker_and_discovery_seconds"] >= timing["discovery_seconds"] >= 0
+        state = json.loads((tmp_path / "_state/provider_scheduler.json").read_text())
+        assert state["last_completion_timing"]["task_ids"] == [task.task_id]
+        assert state["last_completion_timing"]["scope"] == "manifest_completion_batch_including_commit_and_terminal_quarantine"
+    finally:
         manifest.close()
 
 

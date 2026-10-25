@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Iterable
 
 from downloader.artifact_io import atomic_write_json
+from downloader.finmind_queue_indexes import deadline_index
 from downloader.finmind_scheduling import (
     TAIPEI, STOCK_OPENING_PROTECTION_END, Source, calendar_next_check,
     stock_opening_protection_deadline,
@@ -90,6 +91,26 @@ def idle_heartbeat(root: Path, status: dict[str, Any], now: datetime) -> dict[st
     return result
 
 
+def _next_retry_boundary(connection: sqlite3.Connection, now: datetime) -> str | None:
+    """Seek one future boundary per priority; do not enumerate future history.
+
+    A global MIN on the existing (priority,time,state) index visits every
+    matching future row. DISTINCT leading priorities plus a bounded inner MIN
+    permits one time seek per cohort. IS also preserves nullable legacy keys.
+    Older/unrecognized schemas retain the original exact query.
+    """
+    hint = deadline_index(connection)
+    if hint:
+        query = (f"SELECT min((SELECT min(t.next_attempt_at_utc) FROM tasks AS t{hint} "
+                 "WHERE t.priority IS p.priority AND t.state IN ('pending','failed','complete','observed_empty') "
+                 "AND t.next_attempt_at_utc>?)) "
+                 f"FROM (SELECT DISTINCT priority FROM tasks{hint}) AS p")
+    else:
+        query = ("SELECT MIN(next_attempt_at_utc) FROM tasks WHERE "
+                 "state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc>?")
+    return connection.execute(query, (now.isoformat(),)).fetchone()[0]
+
+
 def next_cycle_delay(root: Path, now: datetime, maximum: float, *,
                      sources: Iterable[Source] = (), snapshot_hours: tuple[int, ...] = ()) -> float:
     """Wake at an existing future retry/release boundary, not one poll late."""
@@ -98,16 +119,19 @@ def next_cycle_delay(root: Path, now: datetime, maximum: float, *,
         # Free's calendar has an independent expiry/publication clock; waking
         # solely at midnight/14:00 left a 20-hour-old calendar in use.
         deadline = min(deadline, max(now + timedelta(seconds=1), calendar_next_check(root, now)))
+        # Free has receipt-backed tasks, not a tasks SQLite queue. Its latest
+        # retry deadlines are also the account-wide incremental reservations.
+        # Sleeping past them otherwise makes every history owner yield to a
+        # request whose own worker is still asleep. Read the same receipt heads
+        # as reservation; do not scan history, probe the API or alter cooldowns.
+        from downloader.finmind_scheduling import _free_refresh_events
+        for event in _free_refresh_events(root, now):
+            deadline = min(deadline, max(now + timedelta(seconds=1), event['due_at']))
     path = root / 'queue.sqlite3'
     if path.is_file():
         try:
             with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
-                row = conn.execute(
-                    "SELECT MIN(next_attempt_at_utc) FROM tasks WHERE "
-                    "state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc>?",
-                    (now.isoformat(),),
-                ).fetchone()
-            retry = _stamp(row[0]) if row else None
+                retry = _stamp(_next_retry_boundary(conn, now))
             if retry:
                 deadline = min(deadline, retry)
         except sqlite3.Error:
@@ -181,6 +205,7 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
     while (remaining := stop - monotonic()) > 0:
         atomic_write_json(root / 'worker_status.json', {
             'schema_version': 1, 'phase': 'waiting', 'reason': result.get('state'),
+            'loaded_runtime_sha256': LOADED_RUNTIME_SHA256,
             'observed_at_utc': clock().isoformat(), 'next_check_at_utc': until.isoformat(),
             'cycle_observed_at_utc': cycle_observed,
         })
@@ -196,4 +221,5 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
     # running-task status heartbeats then own acquisition liveness as before.
     atomic_write_json(root / 'worker_status.json', {
         'schema_version': 1, 'phase': 'running', 'observed_at_utc': clock().isoformat(),
+        'loaded_runtime_sha256': LOADED_RUNTIME_SHA256,
     })

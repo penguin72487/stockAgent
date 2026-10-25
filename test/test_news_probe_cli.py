@@ -69,6 +69,11 @@ def test_representation_question_skips_extraction_without_inventing_body_failure
             assert item['diagnostic_mode'] == 'representation_metadata_only'
             assert item['article_extraction'] == 'not_run'
             assert 'extraction_error' not in item and 'extraction_failure_location' not in item
+            identity = item['public_document_identity']
+            assert identity['html_title'] == 'Known title'
+            assert identity['raw_or_body_retained'] is False
+            assert identity['article_identity_verified'] is False
+            assert 'Native structure' not in json.dumps(identity)
         else:
             assert item['source_probe_contract_version'] == 2
             assert item['extraction_error'] == 'body_not_found'
@@ -78,6 +83,95 @@ def test_representation_question_skips_extraction_without_inventing_body_failure
     finally:
         http.close()
     capsys.readouterr()
+
+
+def test_public_identity_metadata_keeps_source_declarations_without_nested_prose():
+    from bs4 import BeautifulSoup
+    declaration = {'@context': 'https://schema.org', '@graph': [{
+        '@type': ['NewsArticle'], 'url': URL, 'headline': 'Native title',
+        'datePublished': '2012-10-23T00:00:00',
+        'dateModified': '2017-05-09T22:17:15+08:00',
+        'mainEntityOfPage': {'@id': URL, 'articleBody': 'NESTED_BODY_MUST_NOT_ESCAPE'},
+        'author': [{'@type': 'Person', 'name': 'Declared author',
+                    'description': 'AUTHOR_DESCRIPTION_MUST_NOT_ESCAPE'},
+                   {'@type': 'Organization', 'name': 'Declared source'}],
+        'publisher': {'@type': 'Organization', 'name': 'MSN'},
+        'articleBody': 'ARTICLE_BODY_MUST_NOT_ESCAPE',
+        'description': 'SUMMARY_MUST_NOT_ESCAPE'}]}
+    payload = '<link rel="canonical" href="' + URL + '"><script type="application/ld+json">' + json.dumps(declaration) + '</script>'
+    result = probes.public_document_identity_shape(BeautifulSoup(payload, 'lxml'))
+    article, = result['declared_articles']
+    assert article['datePublished'] == '2012-10-23T00:00:00'
+    assert article['dateModified'] == '2017-05-09T22:17:15+08:00'
+    assert article['mainEntityOfPage'] == {'@id': URL}
+    assert [row['name'] for row in article['author']] == ['Declared author', 'Declared source']
+    assert result['canonical_links'] == [URL]
+    assert 'MUST_NOT_ESCAPE' not in json.dumps(result)
+    assert not result['original_source_alias_admitted']
+    assert not result['historical_publication_verified']
+
+
+def test_public_identity_metadata_bounds_graph_work_and_preserves_oversized_value_identity():
+    import hashlib
+    from bs4 import BeautifulSoup
+    long_url = URL + 'x' * 3000
+    graph = [{} for _ in range(300)] + [{'@type': 'NewsArticle', 'headline': 'UNEXAMINED'}]
+    payload = ('<link rel="canonical" href="' + long_url + '">'
+        '<script type="application/ld+json">invalid</script>'
+        '<script type="application/ld+json">' + json.dumps({'@graph': graph}) + '</script>')
+    result = probes.public_document_identity_shape(BeautifulSoup(payload, 'lxml'))
+    assert result['jsonld_errors'] == ['invalid_jsonld']
+    assert result['jsonld_nodes_examined'] <= 256
+    assert result['declared_articles'] == []
+    assert result['canonical_links'] == [{'value_omitted': True, 'characters': len(long_url),
+                                         'sha256': hashlib.sha256(long_url.encode()).hexdigest()}]
+    assert 'UNEXAMINED' not in json.dumps(result)
+
+
+def test_metadata_original_link_declarations_keep_literal_targets_without_aliases_or_prose():
+    from bs4 import BeautifulSoup
+    payload = ('<a href="https://publisher.test/original/7?edition=tw">閱<span>讀原文</span></a>'
+        '<a rel="nofollow via" href="https://other.test/8">ARTICLE_TEXT_NOT_METADATA</a>'
+        '<a href="https://other.test/unrelated">Similar title</a>'
+        '<a href="/relative-original">原文</a>'
+        '<article><p>BODY_MUST_NOT_ESCAPE</p></article>')
+    soup = BeautifulSoup(payload, 'lxml')
+    before = str(soup)
+    result = probes.public_document_identity_shape(soup)
+    assert result['contract_version'] == 2
+    links = result['original_link_declarations']
+    assert links['candidates'] == [
+        {'href': 'https://publisher.test/original/7?edition=tw', 'node': 'a',
+         'relations': [], 'explicit_original_label': True},
+        {'href': 'https://other.test/8', 'node': 'a',
+         'relations': ['via'], 'explicit_original_label': False}]
+    assert not links['relative_links_resolved'] and links['automatic_requests'] == 0
+    assert not links['original_source_alias_admitted'] and not result['article_identity_verified']
+    assert str(soup) == before
+    assert 'BODY_MUST_NOT_ESCAPE' not in json.dumps(result)
+    assert 'ARTICLE_TEXT_NOT_METADATA' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('href', ['javascript:alert(1)', 'data:text/plain,source',
+    'https://user:password@publisher.test/1', 'https://publisher.test:bad/1',
+    'https://publisher.test/line\nbreak', 'https://publisher.test/' + 'a' * 2048])
+def test_metadata_original_links_reject_unsafe_or_unbounded_targets(href):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup('<a>原文</a>', 'lxml')
+    soup.a['href'] = href
+    assert probes.public_original_link_shape(soup)['candidates'] == []
+
+
+def test_metadata_original_link_sampling_is_bounded_and_not_an_exhaustive_claim():
+    from bs4 import BeautifulSoup
+    first = ''.join(f'<a rel="cite" href="https://publisher.test/{i}">x</a>' for i in range(10))
+    body = first + '<a href="https://publisher.test/navigation">x</a>' * 510
+    body += '<a href="https://publisher.test/unexamined">原文</a>'
+    result = probes.public_original_link_shape(BeautifulSoup(body, 'lxml'))
+    assert len(result['candidates']) == 8
+    assert result['nodes_examined'] == 512
+    assert result['node_limit_reached'] and result['candidate_limit_reached']
+    assert 'unexamined' not in json.dumps(result)
 
 
 def test_default_probe_still_validates_article_and_preserves_legacy_contract(config, tmp_path, capsys):

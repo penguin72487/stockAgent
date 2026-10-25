@@ -32,6 +32,8 @@ from stockagent.config import load_config  # noqa: E402
 from stockagent.data.tw_current_trading_universe import load_current_universe  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
     LiveMarketConfig,
+    SIGNAL_UPDATE_ONCE,
+    SIGNAL_UPDATE_PROGRESSIVE,
     load_market_configs,
     resolved_live_output_dir,
 )
@@ -692,6 +694,8 @@ def _mode_specs(
                         live.day_trade_terminal_liquidation_unlimited_capacity
                     ),
                     strict_intraday=live.day_trade_strict_intraday,
+                    opening_reference_policy=live.day_trade_opening_reference_policy,
+                    signal_update_policy=live.day_trade_signal_update_policy,
                     odd_lot_execution_policy=live.day_trade_odd_lot_execution_policy,
                     margin_corporate_action_reference_path=((_repo_path(live.day_trade_margin_action_data_dir)
                         if live.day_trade_margin_action_data_dir else resolve_day_trade_rule_data_dir(
@@ -2440,11 +2444,13 @@ def main(argv: list[str] | None = None) -> int:
                 "critical_ledger_state_divergence"
             ):
                 continue
-            if str(
+            session_already_entered = str(
                 mode.get("session_date") or ""
-            ) == observed.date().isoformat() and mode.get("entry_completed_at"):
+            ) == observed.date().isoformat() and bool(mode.get("entry_completed_at"))
+            if session_already_entered and (spec.signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE
+                    or mode.get("simulation_replay")):
                 continue
-            if opening_batch_active:
+            if opening_batch_active and not session_already_entered:
                 batched = opening_signals.get(spec.market)
                 if batched is None:
                     continue
@@ -2479,7 +2485,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 pending_retry_after[spec.market] = time_module.monotonic() + 0.5
                 continue
-            missed_opening_recovery = _missed_opening_recovery_required(detected_at)
+            # A genuine intraday revision executes now at later causal books;
+            # it must never be backdated into the late-opening 09:01 replay.
+            missed_opening_recovery = (not session_already_entered
+                and _missed_opening_recovery_required(detected_at))
             candidate_symbols, candidate_fallback = (
                 _missed_opening_quote_symbols(
                     spec=spec, rows=rows, eligibility=eligibility, mode=mode, observed=observed
@@ -2846,9 +2855,15 @@ def main(argv: list[str] | None = None) -> int:
                         spec,
                         entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                         entry_price_offset_ticks=0,
+                        signal_update_policy=SIGNAL_UPDATE_ONCE,
                     )
                     register_summary = {
                         **summary,
+                        # A late opening remains an explicit 09:01 replay,
+                        # not permission to replay later live revisions into it.
+                        "missed_opening_original_signal_revision": summary.get("opening_signal_revision"),
+                        "opening_signal_revision": None,
+                        "day_trade_signal_update_policy": SIGNAL_UPDATE_ONCE,
                         "simulation_replay": True,
                         "replay_basis": (
                             "official_09_00_open_inference_to_observed_09_01_minute_price"

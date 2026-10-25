@@ -599,8 +599,17 @@ def fetch_one(key: str, output_root: Path, *, refresh: bool = False,
             if not stats["rows_with_values"]:
                 evidence = capture_empty_evidence(key, output_root, stem)
                 raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"], evidence=evidence)
-            from scripts.finlab_columnar import source_attrs, write_parquet
-            write_parquet(table, temp, attrs=source_attrs(frame))
+            from scripts.finlab_columnar import (
+                HISTORY_PARQUET_STORAGE_CONTRACT, history_parquet_options, source_attrs, write_parquet,
+            )
+            storage_options = history_parquet_options(key, table)
+            write_parquet(table, temp, attrs=source_attrs(frame), **storage_options)
+            if storage_options:
+                stats['parquet_storage_layout'] = {
+                    'contract': HISTORY_PARQUET_STORAGE_CONTRACT,
+                    **storage_options,
+                    'raw_values_or_processing_contract_changed': False,
+                }
         if not stats["rows_with_values"]:
             raise EmptyProviderFrame(rows=stats["rows"], fields=stats["field_columns"])
         digest = hashlib.sha256()

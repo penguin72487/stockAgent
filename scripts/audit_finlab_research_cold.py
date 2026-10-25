@@ -30,7 +30,14 @@ def audit(sync_root: Path, staged_root: Path) -> dict:
     if release.get("status") != "complete" or release.get("private_personal_research") is not True:
         raise RuntimeError("staged research release is not complete/private")
     resolved = resolve_latest_packed(sync_root, DATASET)
-    proof = verify_packed_snapshot(sync_root, resolved)
+    # Keep full object/member verification. Only the enrolled D authority may
+    # reuse its native byte reader, avoiding WSL 9p overhead for the same bytes.
+    native_d = (sync_root.resolve() == Path("/srv/stockagent-packed")
+                and (sync_root / ".stockagent-d-primary").is_file())
+    proof = verify_packed_snapshot(
+        sync_root, resolved, d_primary_native_blob_reads=native_d,
+        d_primary_native_pack_reads=native_d, d_primary_native_chunk_reads=native_d,
+    )
     inventory_info = resolved.manifest["archive"]["inventory"]
     with gzip.open(sync_root / inventory_info["relpath"], "rt", encoding="utf-8") as handle:
         inventory = {row["path"]: row["sha256"] for row in map(json.loads, handle) if row.get("kind") == "file"}

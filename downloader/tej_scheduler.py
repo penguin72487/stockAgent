@@ -27,7 +27,11 @@ from downloader.tej_history import CONTRACT_VERSION, connect, recover_evidence, 
 from downloader.tej_operation_clock import source_operation_clock
 RESPONSE_RECOVERY_CONTRACT = 'exact_retained_preview_no_resubmission_recovery_v1'
 
+# The public supervisor status shape remains backward compatible. Version the
+# internal retry-admission behavior separately so installed read-only panels do
+# not discard a live publisher merely because its wake calculation improved.
 CONTRACT = "persistent_serial_evidence_preserving_supervision_v1"
+RETRY_WAKE_CONTRACT = "effective_shared_table_retry_due_v1"
 PROGRESS_STATES = frozenset({
     "completed_task", "source_key_layout_replanned", "source_capacity_replanned",
     "metadata_preparation_failed_deferred", "vendor_metadata_allocation_failed_deferred",
@@ -517,11 +521,26 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
 
 
 def queue_wait(root: Path, observed: datetime, fallback: float) -> float:
-    """Bounded metadata-only next wake; no historical blobs or provider calls."""
+    """Wake at actual retry admission, including a shared table backoff.
+
+    An old fragment due time must neither mask the shared wake with a full
+    fallback sleep nor poll a quarantined/table-nonowner task repeatedly.
+    Match _ready_task's isolation while reading only indexed live metadata.
+    """
+    from downloader.tej_planning import COMPANY_MEMBERSHIP_DEFERRED
     with closing(connect(root)) as con:
         row = con.execute(
-            "SELECT MIN(next_attempt_at_utc) FROM tasks WHERE state='pending' "
-            "AND next_attempt_at_utc IS NOT NULL"
+            "SELECT MIN(CASE WHEN retry.table_id IS NOT NULL AND "
+            "(retry.error_code<>? OR COALESCE(tasks.last_error_code,'')=?) "
+            "THEN MAX(COALESCE(tasks.next_attempt_at_utc,?),retry.next_attempt_at_utc) "
+            "ELSE COALESCE(tasks.next_attempt_at_utc,?) END) FROM tasks "
+            "LEFT JOIN desktop_retry_windows AS retry ON retry.table_id=tasks.table_id "
+            "WHERE tasks.state='pending' AND (retry.table_id IS NULL OR retry.error_code=? "
+            "OR retry.task_id=tasks.task_id) AND NOT EXISTS (SELECT 1 FROM tasks AS blocked "
+            "WHERE blocked.table_id=tasks.table_id AND blocked.state='blocked' "
+            "AND blocked.last_error_code='source_validation_failed_deferred')",
+            (COMPANY_MEMBERSHIP_DEFERRED,COMPANY_MEMBERSHIP_DEFERRED,
+             observed.isoformat(),observed.isoformat(),COMPANY_MEMBERSHIP_DEFERRED)
         ).fetchone()
     if not row or not row[0]:
         return fallback
@@ -598,6 +617,7 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
             "desktop_readiness": desktop_readiness,
             "query_deadline_renewed_by_heartbeat": False,
             "query_interval_contract": policy.interval_contract,
+            "retry_wake_contract": RETRY_WAKE_CONTRACT,
         })
 
     def wait(state: str, seconds: float) -> None:

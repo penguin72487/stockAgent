@@ -29,7 +29,10 @@ from scripts.manage_packed_retention import _syncthing, _wait_for_convergence
 from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.artifact_maintenance import artifact_process_references, artifact_process_references_many
 from stockagent.data_sync.artifact_retirement import load_retirement_peer_names
-from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence as benchmark_evidence
+from stockagent.data_sync.benchmark_fixtures import (
+    external_benchmark_contract,
+    completed_benchmark_evidence as benchmark_evidence, standalone_benchmark_contract,
+)
 from stockagent.data_sync.cold_primary import _check_d_primary_mount
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json, _safe_relative_path, validate_slug
 from stockagent.data_sync.legacy_artifact_archive import (
@@ -40,7 +43,8 @@ from stockagent.data_sync.legacy_artifact_archive import (
     MANUAL_MINUTE_DERIVED_VIEW_CONTRACT, reviewed_minute_derived_view_root,
     apply_archive_stage_prune, load_legacy_specs, plan_archive_stage_prune,
     prepare_archive, publish_archive, verify_archive_directory, verify_cold_archive,
-    C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT,
+    C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT,
+    reviewed_offline_scratch_root,
 )
 from stockagent.data_sync.legacy_artifact_retirement import (
     plan_legacy_retirement, apply_legacy_retirement, plan_legacy_quarantine_resume,
@@ -58,6 +62,7 @@ HOT_MIRROR_ORIGIN = 'retained-hot-mirror-preservation-v1'
 TRANSFER_QUARANTINE_ORIGIN = 'retained-transfer-quarantine-preservation-v1'
 MINUTE_DERIVED_VIEW_ORIGIN = 'retained-minute-derived-view-preservation-v1'
 D_BENCHMARK_STAGE_PROFILE = 'completed-benchmark-d-scratch-v1'
+D_OFFLINE_STAGE_PROFILE = 'completed-offline-d-scratch-v1'
 MINUTE_VIEW_NAMES = {
     'developing-v5': 'data_tw_minute/research_dataset_developing_v5',
     'schema2-volume-bug': 'data_tw_minute/research_dataset_schema2_volume_bug_20260807',
@@ -104,6 +109,36 @@ def reusable_publication(target: Path, spec: LegacyArchiveSpec, sync_root: Path)
             or published.get('snapshot_id') != resolved.manifest['snapshot_id']
             or published.get('manifest_sha256') != resolved.manifest_sha256):
         raise SnapshotError('completed publication differs from its fixed D release')
+    return published
+
+
+def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, repo_root):
+    """Resume a fixed commit, not an acceptance or a cached byte audit.
+
+    The caller must still perform independent D recovery, the fresh complete
+    source/mirror/D audit and all current consumer/quarantine/unlink gates.
+    A committed version with an existing stage need not repeat preparation's
+    decode before those mandatory verifications.
+    """
+    published = reusable_publication(target, spec, sync_root)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    if not (archive / 'legacy_archive_manifest.json').exists():
+        with phase(target, 'prepare-exact-source-archive'):
+            from stockagent.data_sync.legacy_artifact_archive import recover_complete_archive_manifest
+            resumed = recover_complete_archive_manifest(
+                spec, artifact_root, manual_capture=True, repo_root=repo_root)
+            if resumed is None:
+                prepare_archive(spec, artifact_root, manual_capture=True, repo_root=repo_root)
+    if published is None:
+        # A complete uncommitted stage is fully verified inside the canonical
+        # publisher before any commit, and again afterwards. Repeating that
+        # entire read here adds no proof. Cold recovery and retirement still
+        # independently validate the fixed release and current originals.
+        with phase(target, 'publish-to-D'):
+            _check_d_primary_mount(sync_root)
+            published = publish_archive(spec, artifact_root, sync_root, repo_root=repo_root,
+                manual_capture=True, pack_buckets=4, publication_owner=lambda: publication_owner(target))
+        atomic_write_json(target/'publication.json', published)
     return published
 
 
@@ -186,7 +221,8 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
             'newest_mtime_ns': newest, 'blockers': sorted(set(blockers))}
     if path.parts[0] == 'benchmarks':
         try:
-            result['benchmark_evidence'] = benchmark_evidence(source)
+            required = standalone_benchmark_contract(path.parts[1]) if len(path.parts) == 2 else None
+            result['benchmark_evidence'] = benchmark_evidence(source, required_contract=required)
         except (OSError, SnapshotError) as error:
             result['blockers'] = sorted(set(result['blockers']) | {str(error)})
     return result
@@ -216,18 +252,57 @@ def shared_link_observation_drift(before: dict, after: dict):
     return drift or None
 
 
+def uniform_device_renumber_drift(before: dict, after: dict):
+    """Admit only one whole-tree device renumber; never certify source bytes.
+
+    WSL can assign a different st_dev after boot while preserving inode and
+    every other observation. Original capture, complete source/cold SHA and
+    current quarantine/reference fences still decide whether retirement is safe.
+    """
+    if (any(before.get(key) != after.get(key) for key in
+            ('relative_root', 'files', 'logical_bytes')) or not before.get('files')):
+        return None
+    old, current = before.get('observation_rows'), after.get('observation_rows')
+    if not isinstance(old, list) or not isinstance(current, list) or not old or len(old) != len(current):
+        return None
+    devices = set()
+    for left, right in zip(old, current, strict=True):
+        if (left.get('kind') not in ('file', 'directory')
+                or any(left.get(key) != right.get(key) for key in ('path', 'kind'))
+                or left.get('cross_filesystem') is not False or right.get('cross_filesystem') is not False):
+            return None
+        first, second = left.get('signature'), right.get('signature')
+        if (not isinstance(first, list) or not isinstance(second, list)
+                or len(first) != 7 or len(second) != 7 or first[1:] != second[1:]
+                or type(first[0]) is not int or type(second[0]) is not int
+                or first[0] < 0 or second[0] < 0 or first[0] == second[0]):
+            return None
+        devices.add((first[0], second[0]))
+    if len(devices) != 1:
+        return None
+    original_device, current_device = next(iter(devices))
+    return {'contract': 'uniform-device-renumber-admission-v1',
+            'original_device': original_device, 'current_device': current_device,
+            'unchanged_other_observation_rows': len(old), 'source_bytes_verified': False,
+            'full_original_and_cold_verification_required': True}
+
+
 def inventory(relatives: list[str], output: Path, existing_datasets: list[str] | None = None,
               *, hot_mirror: bool = False, transfer_quarantine: bool = False,
-              minute_derived_view: bool = False, guarded_d_scratch: bool = False) -> dict:
+              minute_derived_view: bool = False, guarded_d_scratch: bool = False,
+              guarded_d_offline_scratch: bool = False) -> dict:
     if sum((hot_mirror,transfer_quarantine,minute_derived_view))>1:
         raise SnapshotError('different physical source roles cannot share an inventory')
     if (hot_mirror or transfer_quarantine or minute_derived_view) and existing_datasets:
         raise SnapshotError('historical hot mirrors require their own new exact archive identity')
-    if guarded_d_scratch:
+    if guarded_d_scratch and guarded_d_offline_scratch:
+        raise SnapshotError('select only one fixed temporary staging profile')
+    if guarded_d_scratch or guarded_d_offline_scratch:
+        reviewed = (lambda relative: relative.startswith('benchmarks/')
+                    and reviewed_wsl_artifact_root(relative)) if guarded_d_scratch else reviewed_offline_scratch_root
         if (hot_mirror or transfer_quarantine or minute_derived_view or existing_datasets
-                or len(relatives) != 1 or not relatives[0].startswith('benchmarks/')
-                or not reviewed_wsl_artifact_root(relatives[0])):
-            raise SnapshotError('guarded D scratch requires one new completed benchmark case')
+                or len(relatives) != 1 or not reviewed(relatives[0])):
+            raise SnapshotError('guarded D scratch requires one new reviewed offline case')
         _check_d_primary_mount(Path('/srv/stockagent-packed'))
     retained = {}
     catalog_sha = None
@@ -278,6 +353,8 @@ def inventory(relatives: list[str], output: Path, existing_datasets: list[str] |
         result['existing_catalog_sha256'] = catalog_sha
     if guarded_d_scratch:
         result['staging_profile'] = D_BENCHMARK_STAGE_PROFILE
+    if guarded_d_offline_scratch:
+        result['staging_profile'] = D_OFFLINE_STAGE_PROFILE
     atomic_write_json(output, result)
     return result
 
@@ -288,12 +365,19 @@ def stage_profile(inventory: dict) -> tuple[Path, bool]:
     if profile is None:
         return C_TEMP_STAGE_ROOT, False
     rows = inventory.get('items', [])
-    if (profile != D_BENCHMARK_STAGE_PROFILE or inventory.get('source_origin') is not None
+    if (profile not in (D_BENCHMARK_STAGE_PROFILE, D_OFFLINE_STAGE_PROFILE)
+            or inventory.get('source_origin') is not None
             or inventory.get('existing_catalog_sha256') is not None
             or not isinstance(rows, list) or len(rows) != 1
             or not isinstance(rows[0], dict) or rows[0].get('existing_dataset')
-            or not str(rows[0].get('relative_root', '')).startswith('benchmarks/')
-            or not reviewed_wsl_artifact_root(rows[0]['relative_root'])):
+            or not isinstance(rows[0].get('relative_root'), str)):
+        raise SnapshotError('unsupported frozen temporary staging profile or scope')
+    relative = rows[0]['relative_root']
+    if profile == D_OFFLINE_STAGE_PROFILE:
+        if not reviewed_offline_scratch_root(relative):
+            raise SnapshotError('unsupported frozen temporary staging profile or scope')
+        return D_OFFLINE_STAGE_ROOT, True
+    if not relative.startswith('benchmarks/') or not reviewed_wsl_artifact_root(relative):
         raise SnapshotError('unsupported frozen temporary staging profile or scope')
     return D_BENCHMARK_STAGE_ROOT, True
 
@@ -358,6 +442,21 @@ def verify_for_retirement(spec, sync_root: Path, target: Path):
     return proof
 
 
+def verified_retained_benchmark(target, original_source):
+    """Bind retained receipts to the admitted source, before and after unlink."""
+    saved = json.loads((target / 'retained-benchmark-evidence.json').read_bytes())
+    if not isinstance(saved, dict) or not isinstance(saved.get('producer_contract'), str):
+        raise SnapshotError('retained benchmark evidence has no producer binding')
+    options = {'required_contract': saved['producer_contract']}
+    if saved['producer_contract'] == external_benchmark_contract(original_source):
+        # The source comes from the frozen archive spec, never the report.
+        # Other producer ABIs retain their existing inline interpretation.
+        options['original_source'] = original_source
+    if benchmark_evidence(target / 'retained-evidence', **options) != saved:
+        raise SnapshotError('local benchmark evidence changed since its frozen inventory')
+    return saved
+
+
 def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict):
     """Wait for transient scans without discarding or extending a full audit.
 
@@ -370,32 +469,50 @@ def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict)
     if set(plan['blockers']) - transport_blockers or not plan.get('full_verification'):
         raise SnapshotError('canonical retirement blocked: ' + str(plan['blockers']))
     verified_at = plan['full_verification']['verified_at_epoch']
-    with phase(target, 'wait-for-retirement-owner'):
-        with COMMON_OWNER.open('a') as common:
-            fcntl.flock(common, fcntl.LOCK_EX)
+    for attempt in range(3):
+        while True:
             age = time.time() - verified_at
             if not 0 <= age <= 1500:
                 return None
-            # Holding the mutation owner prevents another publisher from
-            # starting a new scan while an existing scan finishes. No gate is
-            # bypassed: apply probes transport again, including after quarantine.
-            peer = _wait_for_convergence(cfg, min(300, max(0, int(1500 - age))))
+            # A long healthy scan does not invalidate the unchanged full audit.
+            # Wait outside the mutation owner; each canonical apply still
+            # refreshes every source/consumer/transport gate under that owner.
+            with phase(target, 'wait-for-transport-convergence'):
+                peer = _wait_for_convergence(cfg, min(60, max(0, int(1500 - age))))
             atomic_write_json(target / 'retirement-peer-wait.json', {
                 'peer_proof': peer, 'original_verified_at_epoch': verified_at,
                 'checked_at_epoch': time.time(), 'proof_time_extended': False,
+                'transport_preflight_attempt': attempt + 1,
             })
             if not 0 <= time.time() - verified_at <= 1500:
                 return None
-            if peer.get('ok') is not True:
-                raise SnapshotError('canonical retirement transport remains unconverged')
-            if Path(spec.relative_root).parts[0] == 'benchmarks':
-                saved = json.loads((target / 'retained-benchmark-evidence.json').read_bytes())
-                if benchmark_evidence(target / 'retained-evidence') != saved:
-                    raise SnapshotError('local benchmark evidence changed before source retirement')
-            with phase(target, 'verify-and-retire-hot-source'):
-                return apply_legacy_retirement(spec,
-                    expected_fingerprint=plan['plan_fingerprint'],
-                    owned_verified_plan=plan, **options)
+            if peer.get('ok') is True:
+                break
+        with phase(target, 'wait-for-retirement-owner'):
+            with COMMON_OWNER.open('a') as common:
+                fcntl.flock(common, fcntl.LOCK_EX)
+                if not 0 <= time.time() - verified_at <= 1500:
+                    return None
+                if Path(spec.relative_root).parts[0] == 'benchmarks':
+                    verified_retained_benchmark(target, options['artifact_root'] / spec.relative_root)
+                try:
+                    with phase(target, 'verify-and-retire-hot-source'):
+                        return apply_legacy_retirement(spec,
+                            expected_fingerprint=plan['plan_fingerprint'],
+                            owned_verified_plan=plan, **options)
+                except SnapshotError as error:
+                    # This EXACT canonical preflight error precedes all state,
+                    # activation and quarantine writes. Never retry an unlink
+                    # or quarantine error, nor a combined/new blocker.
+                    if (str(error) != 'legacy retirement blocked: cold-peer-not-converged'
+                            or attempt == 2):
+                        raise
+                    atomic_write_json(target / f'transport-preflight-retry-{time.time_ns()}.json', {
+                        'state': 'retry_transport_preflight_without_mutation',
+                        'attempt': attempt + 1, 'error': str(error),
+                        'original_verified_at_epoch': verified_at,
+                        'checked_at_epoch': time.time(), 'proof_time_extended': False,
+                    })
 
 
 def finish_retirement(spec, cfg, target, retired, *, source_origin=None):
@@ -426,9 +543,7 @@ def finish_retirement(spec, cfg, target, retired, *, source_origin=None):
     if source_origin is not None:
         accepted.update(source_origin=source_origin, artifact_root=str(artifact_root))
     if Path(spec.relative_root).parts[0] == 'benchmarks':
-        saved = json.loads((target / 'retained-benchmark-evidence.json').read_bytes())
-        if benchmark_evidence(target / 'retained-evidence') != saved:
-            raise SnapshotError('retired benchmark local evidence failed exact readback')
+        saved = verified_retained_benchmark(target, artifact_root / spec.relative_root)
         accepted.update(local_benchmark_evidence=str(target / 'retained-evidence'),
                         local_benchmark_evidence_bytes=saved['bytes'])
     atomic_write_json(target / 'acceptance.json', accepted)
@@ -569,18 +684,27 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             current = observe(artifact_root, relative, repo_root=ROOT)
             drift=(shared_link_observation_drift(row,current)
                    if current['fingerprint'] != row['fingerprint'] else [])
-            if current['blockers'] or (current['fingerprint'] != row['fingerprint'] and drift is None):
+            renumber = (uniform_device_renumber_drift(row, current)
+                        if current['fingerprint'] != row['fingerprint'] and drift is None else None)
+            if current['blockers'] or (current['fingerprint'] != row['fingerprint'] and drift is None and renumber is None):
                 raise SnapshotError('offline source changed or has current consumers: ' + str(current['blockers'][:3]))
             if drift:
                 atomic_write_json(target/'inventory-shared-link-drift.json',{
                     'before_fingerprint':row['fingerprint'],'current_fingerprint':current['fingerprint'],
                     'changed_observations':drift,'source_bytes_verified':False,
                     'admission_only':True})
+            if renumber is not None:
+                atomic_write_json(target / 'inventory-device-renumber.json', {
+                    **renumber, 'before_fingerprint': row['fingerprint'],
+                    'current_fingerprint': current['fingerprint'], 'admission_only': True})
             if path.parts[0] == 'benchmarks':
                 retained = benchmark_evidence(artifact_root / relative, destination=target / 'retained-evidence')
                 if retained != row.get('benchmark_evidence'):
                     raise SnapshotError('completed benchmark evidence changed after inventory')
                 atomic_write_json(target / 'retained-benchmark-evidence.json', retained)
+                # Fail before archive I/O if the retained receipt reader cannot
+                # reproduce the same original producer/source binding.
+                verified_retained_benchmark(target, artifact_root / relative)
             atomic_write_json(target / 'catalog.json', {'schema_version': 1, 'authority_node_id': 'penguin',
                 'archives': [{'dataset': dataset, 'relative_root': relative, 'minimum_stable_days': 7,
                               'manual_capture_min_stable_hours': 12, 'durable_staging': spec.durable_staging,
@@ -591,22 +715,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             # Encoding only mutates this run's private stage. Keep unrelated D
             # publishers progressing while the canonical preparation completes.
             if not row.get('existing_dataset'):
-                with phase(target, 'prepare-exact-source-archive'):
-                    archive=spec.stage_root/spec.dataset/'archive'
-                    if (archive/'legacy_archive_manifest.json').exists():
-                        verify_archive_directory(archive,artifact_root/relative,spec=spec,
-                                                 manual_capture=True,artifact_root=artifact_root,
-                                                 repo_root=ROOT)
-                    else:
-                        prepare_archive(spec, artifact_root, manual_capture=True, repo_root=ROOT)
-                published = reusable_publication(target, spec, cfg.sync_root)
-                if published is None:
-                    with phase(target, 'publish-to-D'):
-                        _check_d_primary_mount(cfg.sync_root)
-                        published = publish_archive(spec, artifact_root, cfg.sync_root, repo_root=ROOT,
-                            manual_capture=True, pack_buckets=4,
-                            publication_owner=lambda: publication_owner(target))
-                    atomic_write_json(target / 'publication.json', published)
+                published = prepare_or_resume_publication(spec, artifact_root, cfg.sync_root, target, repo_root=ROOT)
             with phase(target, 'independent-D-original-recovery'):
                 proof = verify_for_retirement(spec, cfg.sync_root, target)
                 if not row.get('existing_dataset') and any(
@@ -658,6 +767,8 @@ def main():
                         help='Select a retired minute view without putting source path operands in an invoker argv')
     parser.add_argument('--guarded-d-scratch', action='store_true',
                         help='Freeze the separate guarded D temporary stage for one completed benchmark case')
+    parser.add_argument('--guarded-d-offline-scratch', action='store_true',
+                        help='Freeze the separate guarded D temporary stage for one reviewed operations case')
     parser.add_argument('--inventory', type=Path, required=True)
     parser.add_argument('--receipt-dir', type=Path)
     parser.add_argument('--wait-for-owner', action='store_true',
@@ -681,10 +792,14 @@ def main():
                        minute_derived_view=args.minute_derived_view)
         if args.guarded_d_scratch:
             options['guarded_d_scratch'] = True
+        if args.guarded_d_offline_scratch:
+            options['guarded_d_offline_scratch'] = True
         result = inventory(args.relative_root or [], args.inventory, args.existing_dataset, **options)
         print(json.dumps({'items':len(result['items']), 'blocked':sum(bool(r['blockers']) for r in result['items'])}))
         return 0
-    if args.relative_root or args.existing_dataset or args.hot_mirror or args.transfer_quarantine or args.minute_derived_view or args.minute_view_name or args.guarded_d_scratch or not args.receipt_dir:
+    if (args.relative_root or args.existing_dataset or args.hot_mirror or args.transfer_quarantine
+            or args.minute_derived_view or args.minute_view_name or args.guarded_d_scratch
+            or args.guarded_d_offline_scratch or not args.receipt_dir):
         parser.error('apply needs the fixed inventory and receipt directory')
     frozen = hashlib.sha256(args.inventory.read_bytes()).hexdigest()
     for round_index in range(args.retry_rounds):

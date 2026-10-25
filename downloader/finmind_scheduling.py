@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import UTC, date, datetime, time as wall_time, timedelta
 from pathlib import Path
 import json
@@ -395,13 +396,96 @@ SESSION_DAY_DATASETS = frozenset({
 })
 
 
+_RESERVATION_READS: ContextVar[ReservationReads | None] = ContextVar('finmind_reservation_reads', default=None)
+
+
+class ReservationReads:
+    """Reuse local readers for one owner cycle, without caching queue results.
+
+    Every SQL statement still observes committed work. No read transaction is
+    held between calls. File metadata is reused only while its exact local
+    generation is unchanged, so publication/retry/calendar boundaries remain
+    visible on the next admission. The scope never grants provider quota.
+    """
+    def __init__(self, root: Path):
+        self.root = root.resolve()
+        self.connections: dict[Path, tuple[tuple[int, int], sqlite3.Connection]] = {}
+        self.metadata: dict[Path, tuple[tuple[int, ...], dict]] = {}
+        self.token = None
+
+    def __enter__(self):
+        if self.token is not None:
+            raise RuntimeError('reservation_reader_already_entered')
+        self.token = _RESERVATION_READS.set(self)
+        return self
+
+    def __exit__(self, *_args):
+        try:
+            for _, connection in self.connections.values():
+                connection.close()
+        finally:
+            self.connections.clear()
+            self.metadata.clear()
+            if self.token is not None:
+                _RESERVATION_READS.reset(self.token)
+                self.token = None
+
+    def connection(self, path: Path) -> sqlite3.Connection:
+        path = path.resolve()
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            previous = self.connections.pop(path, None)
+            if previous:
+                previous[1].close()
+            raise sqlite3.OperationalError('reservation_queue_unavailable') from exc
+        generation = (stat.st_dev, stat.st_ino)
+        previous = self.connections.get(path)
+        if previous is not None and previous[0] != generation:
+            previous[1].close()
+            del self.connections[path]
+            previous = None
+        if previous is None:
+            connection = sqlite3.connect(path.as_uri() + '?mode=ro', uri=True,
+                                         timeout=0.2, isolation_level=None)
+            self.connections[path] = (generation, connection)
+            return connection
+        return previous[1]
+
+
+@contextmanager
+def _reservation_connection(path: Path):
+    scope = _RESERVATION_READS.get()
+    if scope is not None and path.resolve().is_relative_to(scope.root):
+        yield scope.connection(path)
+    else:
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as connection:
+            yield connection
+
+
 def _read_metadata(path: Path) -> dict:
+    scope = _RESERVATION_READS.get()
+    cache = scope.metadata if scope is not None and path.resolve().is_relative_to(scope.root) else None
+    generation = None
     try:
+        if cache is not None:
+            stat = path.stat()
+            generation = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            previous = cache.get(path)
+            if previous is not None and previous[0] == generation:
+                return previous[1]
         with path.open('rb') as stream:
             body = stream.read(512 * 1024 + 1)
         value = json.loads(body) if len(body) <= 512 * 1024 else {}
-        return value if isinstance(value, dict) else {}
+        value = value if isinstance(value, dict) else {}
+        if cache is not None:
+            if len(cache) >= 64:
+                cache.clear()  # Fixed small receipt heads, never a growing archive cache.
+            cache[path] = (generation, value)
+        return value
     except (OSError, ValueError):
+        if cache is not None:
+            cache.pop(path, None)
         return {}
 
 
@@ -468,8 +552,9 @@ def _free_refresh_events(root: Path, now: datetime) -> list[dict]:
     candidates = [('TaiwanStockInfoWithWarrant', local.date(), boundary)]
     calendar = _read_metadata(root / 'calendar.json')
     cutoff = local.date() if local >= boundary else local.date() - timedelta(days=1)
+    cutoff_iso = cutoff.isoformat()
     raw_dates = calendar.get('dates')
-    dates = [day for day in raw_dates if isinstance(day, str) and day <= str(cutoff)] if isinstance(raw_dates, list) else []
+    dates = [day for day in raw_dates if isinstance(day, str) and day <= cutoff_iso] if isinstance(raw_dates, list) else []
     try:
         latest = date.fromisoformat(max(dates)) if dates else None
     except ValueError:
@@ -487,6 +572,36 @@ def _free_refresh_events(root: Path, now: datetime) -> list[dict]:
                        'due_at': max(release.astimezone(UTC), retry) if retry else release.astimezone(UTC),
                        'requests': 1})
     return events
+
+
+def _reservation_rows(conn: sqlite3.Connection, horizon: datetime) -> list[tuple]:
+    """Seek disjoint NULL/due ranges rather than every priority-zero key."""
+    from downloader.finmind_retry_cohorts import admission_clause
+    from downloader.finmind_queue_indexes import release_reserve_index
+
+    retry_filter, retry_args = admission_clause(conn, horizon)
+    index = release_reserve_index(conn)
+    cutoff = horizon.isoformat()
+    predicate = "priority=0 AND kind!='derived'"
+    if not index:
+        return conn.execute(
+            f"SELECT dataset,next_attempt_at_utc,count(*) FROM tasks WHERE {predicate} AND "
+            "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
+            "OR (state IN ('complete','observed_empty','failed') AND next_attempt_at_utc<=?))"
+            + retry_filter + " GROUP BY dataset,next_attempt_at_utc",
+            (cutoff, cutoff, *retry_args),
+        ).fetchall()
+    # These ranges cannot overlap. Keep the original grouping and retry
+    # predicates while giving SQLite each leading index key and time bound.
+    return conn.execute(
+        "SELECT dataset,next_attempt_at_utc,count(*) FROM ("
+        f"SELECT dataset,next_attempt_at_utc FROM tasks{index} WHERE {predicate} "
+        "AND state='pending' AND next_attempt_at_utc IS NULL" + retry_filter
+        + f" UNION ALL SELECT dataset,next_attempt_at_utc FROM tasks{index} WHERE {predicate} "
+        "AND state IN ('pending','complete','observed_empty','failed') AND next_attempt_at_utc<=?"
+        + retry_filter + ") GROUP BY dataset,next_attempt_at_utc",
+        (*retry_args, cutoff, *retry_args),
+    ).fetchall()
 
 
 def incremental_reservation(root: Path, now: datetime, *,
@@ -512,18 +627,8 @@ def incremental_reservation(root: Path, now: datetime, *,
         if not path.is_file():
             continue
         try:
-            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.2)) as conn:
-                from downloader.finmind_retry_cohorts import admission_clause
-                from downloader.finmind_queue_indexes import release_reserve_index
-                retry_filter, retry_args = admission_clause(conn, horizon)
-                release_index = release_reserve_index(conn)
-                rows = conn.execute(
-                    f"SELECT dataset,next_attempt_at_utc,count(*) FROM tasks{release_index} WHERE priority=0 AND kind!='derived' AND "
-                    "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
-                    "OR (state IN ('complete','observed_empty','failed') "
-                    "AND next_attempt_at_utc<=?))" + retry_filter + " GROUP BY dataset,next_attempt_at_utc",
-                    (horizon.isoformat(), horizon.isoformat(), *retry_args),
-                ).fetchall()
+            with _reservation_connection(path) as conn:
+                rows = _reservation_rows(conn, horizon)
             for dataset, raw_due, count in rows:
                 # These are the canonical ownership contracts, not additive
                 # aliases. Derivations and delegated states are excluded above.

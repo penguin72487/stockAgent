@@ -29,6 +29,118 @@ from stockagent.data_sync.packed_snapshots import (
 )
 
 
+@pytest.mark.parametrize('prefix', ['stockagent-completed-benchmark-scratch', 'stockagent-completed-offline-scratch'])
+@pytest.mark.parametrize('outcome', ['normal', 'checksum', 'native_error', 'replace', 'append', 'mode', 'link'])
+def test_native_materialized_full_hash_keeps_generation_and_closes_fd(tmp_path, monkeypatch, prefix, outcome):
+    from stockagent.data_sync import windows_cold_io as native
+    root = tmp_path / 'materialized'
+    root.mkdir()
+    path = root / 'payload.bin'
+    payload = b'complete original bytes\x00\xff'
+    path.write_bytes(payload)
+    expected = hashlib.sha256(payload).hexdigest()
+    manifest = {'source': scan_tree(root)}
+    entries = [{'path': path.name, 'kind': 'file', 'size': len(payload), 'sha256': expected}]
+    monkeypatch.setattr(packed_snapshots, 'MIN_NATIVE_MATERIALIZED_STAGE_BYTES', 1)
+    monkeypatch.setattr(native, 'windows_path', lambda p: 'D:\\' + prefix + '\\case\\payload.bin')
+    calls, held = [], []
+    original_open = os.open
+
+    def opened(p, flags, *args, **kwargs):
+        fd = original_open(p, flags, *args, **kwargs)
+        if Path(p) == path:
+            held.append(fd)
+            assert flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK
+        return fd
+
+    def full_hash(p):
+        calls.append(Path(p))
+        assert held and os.fstat(held[-1]).st_size == len(payload)
+        digest = hashlib.sha256(Path(p).read_bytes()).hexdigest()
+        if outcome == 'native_error':
+            raise OSError('native reader failed')
+        if outcome == 'checksum':
+            return '0' * 64
+        if outcome == 'replace':
+            replacement = tmp_path / 'replacement'
+            replacement.write_bytes(payload)
+            os.replace(replacement, p)
+        elif outcome == 'append':
+            with Path(p).open('ab') as stream:
+                stream.write(b'changed')
+        elif outcome == 'mode':
+            Path(p).chmod(0o600 if stat.S_IMODE(Path(p).stat().st_mode) != 0o600 else 0o640)
+        elif outcome == 'link':
+            os.link(p, tmp_path / 'other-name')
+        return digest
+
+    monkeypatch.setattr(os, 'open', opened)
+    monkeypatch.setattr(native, 'hash_file', full_hash)
+    monkeypatch.setattr(packed_snapshots, 'sha256_file', lambda p: pytest.fail('no slow fallback after native selection'))
+    if outcome == 'normal':
+        packed_snapshots._verify_materialized(root, manifest, entries)
+    elif outcome == 'native_error':
+        with pytest.raises(OSError, match='native reader failed'):
+            packed_snapshots._verify_materialized(root, manifest, entries)
+    else:
+        with pytest.raises(SnapshotError, match='checksum mismatch|generation changed'):
+            packed_snapshots._verify_materialized(root, manifest, entries)
+    assert calls == [path] and len(held) == 1
+    with pytest.raises(OSError):
+        os.fstat(held[0])
+
+
+@pytest.mark.parametrize('size,native_path', [
+    (64 * 1024**2 - 1, 'D:\\stockagent-completed-benchmark-scratch\\case\\file'),
+    (8 * 1024**3 + 1, 'D:\\stockagent-completed-offline-scratch\\case\\file'),
+    (64 * 1024**2, None),
+    (64 * 1024**2, 'D:\\stockagent-cold-primary\\packed\\file'),
+    (64 * 1024**2, 'D:\\stockagent-backup-ingress-lab203\\file'),
+])
+def test_native_materialized_non_enrolled_paths_and_sizes_keep_reader(tmp_path, monkeypatch, size, native_path):
+    from stockagent.data_sync import windows_cold_io as native
+    path = tmp_path / 'file'
+    path.write_bytes(b'complete local input')
+    expected = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(native, 'windows_path', lambda p: native_path)
+    monkeypatch.setattr(native, 'hash_file', lambda p: pytest.fail('unreviewed native path'))
+    assert packed_snapshots._materialized_file_sha256(path, size) == expected
+
+
+@pytest.mark.parametrize('kind', ['fifo', 'symlink', 'size'])
+def test_native_materialized_bad_opened_input_fails_without_native_read(tmp_path, monkeypatch, kind):
+    from stockagent.data_sync import windows_cold_io as native
+    path = tmp_path / 'input'
+    if kind == 'fifo':
+        os.mkfifo(path)
+    elif kind == 'symlink':
+        target = tmp_path / 'target'
+        target.write_bytes(b'old')
+        path.symlink_to(target)
+    else:
+        path.write_bytes(b'old')
+    monkeypatch.setattr(packed_snapshots, 'MIN_NATIVE_MATERIALIZED_STAGE_BYTES', 0)
+    monkeypatch.setattr(native, 'windows_path', lambda p: 'D:\\stockagent-completed-offline-scratch\\case\\file')
+    monkeypatch.setattr(native, 'hash_file', lambda p: pytest.fail('invalid input entered native read'))
+    with pytest.raises((OSError, SnapshotError)):
+        packed_snapshots._materialized_file_sha256(path, 0 if kind == 'fifo' else 4)
+
+
+def test_native_materialized_checksum_still_requires_full_tree_inventory(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io as native
+    path = tmp_path / 'input'
+    path.write_bytes(b'complete file')
+    manifest = {'source': scan_tree(tmp_path)}
+    entries = [{'path': path.name, 'kind': 'file', 'size': path.stat().st_size,
+                'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}]
+    (tmp_path / 'unexpected').touch()
+    monkeypatch.setattr(packed_snapshots, 'MIN_NATIVE_MATERIALIZED_STAGE_BYTES', 1)
+    monkeypatch.setattr(native, 'windows_path', lambda p: 'D:\\stockagent-completed-benchmark-scratch\\case\\file')
+    monkeypatch.setattr(native, 'hash_file', lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest())
+    with pytest.raises(SnapshotError, match='fingerprint mismatch'):
+        packed_snapshots._verify_materialized(tmp_path, manifest, entries)
+
+
 def test_full_pack_recovery_reports_member_progress_before_counting_verified_object(tmp_path, monkeypatch):
     monkeypatch.setattr(packed_snapshots, 'MAX_PACK_MEMBERS', 5000)
     source, cold = tmp_path / 'source', tmp_path / 'cold'

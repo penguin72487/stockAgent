@@ -36,8 +36,8 @@ export OPENBLAS_NUM_THREADS="$finlab_processing_threads"
 export MKL_NUM_THREADS="$finlab_processing_threads"
 export NUMEXPR_NUM_THREADS="$finlab_processing_threads"
 finlab_general_batch_size="${FINLAB_SYNC_BATCH_SIZE:-$finlab_general_default_limit}"
-if ! [[ "$finlab_general_batch_size" =~ ^[0-9]+$ ]] || ! (( finlab_general_batch_size >= 1 && finlab_general_batch_size <= 16 )); then
-  echo "[finlab] FINLAB_SYNC_BATCH_SIZE must be 1..16" >&2
+if ! [[ "$finlab_general_batch_size" =~ ^[0-9]+$ ]] || ! (( finlab_general_batch_size >= 1 && finlab_general_batch_size <= 64 )); then
+  echo "[finlab] FINLAB_SYNC_BATCH_SIZE must be 1..64" >&2
   exit 2
 fi
 
@@ -216,15 +216,109 @@ finlab_refresh_research() {
             echo "[finlab] cold release committed; scan intent retained for the existing retry timer" >&2
           fi
         fi
+        # stockagent-data enrolls its own child environment. The audit runs
+        # in this parent, so reuse the same unattended native-reader bootstrap.
+        ensure_enrolled_wsl_identity "$finlab_repo_root"
         run_fintech_python "$finlab_repo_root/scripts/audit_finlab_research_cold.py"
       fi
     fi
 }
 
-# Only build/package the derived research ABI after a complete current sweep.
-# This avoids repeated ~million-row table work during a long quota backfill.
-# Expected dependency contention defers this branch only. Unexpected source,
-# schema, hash or permission failures still stop the run and retain evidence.
+# Minutes precede Tick. Both use the same account owner, quota and receipts;
+# previously acquired Tick partitions supply local minutes without an API call.
+# Run minutes before expensive research derivation/publication, so available
+# account bandwidth does not wait behind those local computations. Residual
+# Tick follows minutes, then research consumes the acquired inputs. A fresh
+# local selection recheck closes the gap between the last sync receipt and
+# this request boundary.
+# Minutes reserve 50 MB independently of Tick's future-work reserve. During
+# the configured last hour before reset, both local floors become zero;
+# official quota and due general work still own admission on every boundary.
+finlab_minute_succeeded=0
+finlab_minute_cleared=false
+finlab_acquire_minutes() {
+  if [[ "$finlab_state" == "pass_complete" ]]; then
+    if finlab_general_status="$(
+      run_fintech_python "$finlab_repo_root/scripts/download_finlab_history.py" pending \
+        --refresh-days "${FINLAB_SYNC_REFRESH_DAYS:-1}"
+    )"; then
+      finlab_tick_allowed="$(run_fintech_python -c \
+        'import json,sys; p=json.loads(sys.argv[1]); print(str(p.get("minute_residual_allowed", p.get("supplemental_allowed", False))).lower())' \
+        "$finlab_general_status")"
+      if [[ "$finlab_tick_allowed" == "true" ]]; then
+        # Do not initialize an SDK pool or rebuild the partition index merely
+        # to rediscover an already full disk. General/research work is
+        # independent and must retain its opportunity to make progress.
+        if run_fintech_python "$finlab_repo_root/scripts/check_finlab_refresh_due.py" --intraday-disk-only; then
+          :
+        else
+          finlab_disk_exit=$?
+          if [[ "$finlab_disk_exit" == "1" ]]; then
+            echo "[finlab] intraday disk reserve reached; no pool, provider call or partition scan started"
+            return 0
+          fi
+          return "$finlab_disk_exit"
+        fi
+        finlab_tick_reserve_mb="$(run_fintech_python -c \
+          'import json,os,sys; from dotenv import dotenv_values; status=json.loads(sys.argv[1]); configured=os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB"); print(max(float(status.get("scheduled_reserve_mb",500)), float(configured) if configured else 50))' \
+          "$finlab_general_status")"
+        finlab_minute_succeeded=0
+        finlab_minute_cleared=false
+        for ((finlab_intraday_pass=1; finlab_intraday_pass<=finlab_max_intraday_passes; finlab_intraday_pass++)); do
+          if timeout --signal=TERM --kill-after=10s 1200s \
+            "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
+              --kind tw_minute \
+              --limit "${FINLAB_MINUTE_PARTITIONS_PER_RUN:-$finlab_minute_default_limit}" \
+              --sync-lock-fd 9 \
+              --max-run-seconds 1140; then
+            finlab_minute_succeeded=1
+          else
+            finlab_minute_succeeded=0
+            echo "[finlab] minute pass incomplete; keeping its cursor for recovery; Tick deferred" >&2
+            break
+          fi
+          finlab_minute_result="$(run_fintech_python -c \
+            'import json; from pathlib import Path; p=json.loads(Path("data_finlab/intraday/market_status.json").read_text()); priority=p.get("minute_priority",{}); print(p.get("state", "unverified").split(";", 1)[0], str(p.get("active_kind")=="tw_minute" and priority.get("tick_residual_allowed") is True and p.get("state") not in {"running","interrupted","quota_unknown","authentication_failed","waiting_required_general_data","disk_reserve_reached","quota_margin_reached","quota_exhausted","opening_window_yield"}).lower(), str(priority.get("actionable_known_window_partitions", priority.get("pending_known_window_partitions",0))>0 or priority.get("due_publication_rechecks",0)>0).lower())')"
+          read -r finlab_minute_state finlab_minute_cleared finlab_minute_actionable <<< "$finlab_minute_result"
+          if [[ "$finlab_minute_cleared" == "true" ]]; then
+            break
+          fi
+          if [[ "$finlab_minute_state" != "batch_limit" && "$finlab_minute_state" != "run_time_budget_reached" ]] &&
+             ! [[ "$finlab_minute_state" == "waiting_older_publication" && "$finlab_minute_actionable" == "true" ]]; then
+            break  # Due general work, real quota/source/disk waits must yield.
+          fi
+          echo "[finlab] continuing minute pass under the same account owner ($finlab_intraday_pass/$finlab_max_intraday_passes)"
+        done
+      else
+          echo "[finlab] minutes and Tick deferred: actionable general acquisition remains"
+      fi
+    else
+      echo "[finlab] Tick deferred: general-work inventory is unverified" >&2
+    fi
+  else
+    echo "[finlab] Tick deferred: general history sweep state=$finlab_state"
+  fi
+}
+finlab_acquire_minutes
+
+if [[ "$finlab_minute_succeeded" == "1" && "$finlab_minute_cleared" == "true" ]]; then
+  # Tick's own per-dispatch checks revalidate due minutes/general work. The
+  # bounded pool, disk guard, quota reserve and 1,140-second watchdog keep
+  # their original authority.
+  if ! timeout --signal=TERM --kill-after=10s 1200s \
+      "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
+        --kind tw_tick --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-$finlab_tick_default_limit}" \
+        --sync-lock-fd 9 --max-run-seconds 1140 --reserve-mb "$finlab_tick_reserve_mb"; then
+    echo "[finlab] residual Tick pass incomplete; next invocation starts with minutes" >&2
+  fi
+else
+  echo "[finlab] minute history / publication rechecks have priority; Tick deferred"
+fi
+
+# Build/package only after the account's acquisition opportunities. A long
+# local verification must not let minutes become due again before Tick even
+# starts. Expected dependency contention still defers this branch; unexpected
+# source/hash/permission failures retain their original nonzero exit/evidence.
 if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2014_v3.parquet" ]]; then
   if run_fintech_python "$finlab_repo_root/scripts/finlab_release_gate.py"; then
     finlab_refresh_research
@@ -233,89 +327,4 @@ if [[ -f "$finlab_repo_root/artifacts/research_features/tw_public_research_all_2
   fi
 else
   echo "[finlab] research base is absent; raw acquisition succeeded, overlay deferred"
-fi
-
-# Minutes precede Tick. Both use the same account owner, quota and receipts;
-# previously acquired Tick partitions supply local minutes without an API call.
-# Tick is the lowest-priority consumer of this FinLab account quota.  It may
-# use only residual capacity after the general history sweep and its private
-# research publication have had their turn.  A fresh local selection recheck
-# closes the gap between the last sync receipt and this request boundary.
-# Minutes reserve 50 MB independently of Tick's future-work reserve. During
-# the configured last hour before reset, both local floors become zero;
-# official quota and due general work still own admission on every boundary.
-if [[ "$finlab_state" == "pass_complete" ]]; then
-  if finlab_general_status="$(
-    run_fintech_python "$finlab_repo_root/scripts/download_finlab_history.py" pending \
-      --refresh-days "${FINLAB_SYNC_REFRESH_DAYS:-1}"
-  )"; then
-    finlab_tick_allowed="$(run_fintech_python -c \
-      'import json,sys; p=json.loads(sys.argv[1]); print(str(p.get("minute_residual_allowed", p.get("supplemental_allowed", False))).lower())' \
-      "$finlab_general_status")"
-    if [[ "$finlab_tick_allowed" == "true" ]]; then
-      # Do not initialize an SDK pool or rebuild the partition index merely
-      # to rediscover an already full disk. General/research work above is
-      # independent and must retain its opportunity to make progress.
-      if run_fintech_python "$finlab_repo_root/scripts/check_finlab_refresh_due.py" --intraday-disk-only; then
-        :
-      else
-        finlab_disk_exit=$?
-        if [[ "$finlab_disk_exit" == "1" ]]; then
-          echo "[finlab] intraday disk reserve reached; no pool, provider call or partition scan started"
-          exit 0
-        fi
-        exit "$finlab_disk_exit"
-      fi
-      finlab_tick_reserve_mb="$(run_fintech_python -c \
-        'import json,os,sys; from dotenv import dotenv_values; status=json.loads(sys.argv[1]); configured=os.environ.get("FINLAB_TICK_QUOTA_RESERVE_MB") or dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB"); print(max(float(status.get("scheduled_reserve_mb",500)), float(configured) if configured else 50))' \
-        "$finlab_general_status")"
-      finlab_minute_succeeded=0
-      finlab_minute_cleared=false
-      for ((finlab_intraday_pass=1; finlab_intraday_pass<=finlab_max_intraday_passes; finlab_intraday_pass++)); do
-        if timeout --signal=TERM --kill-after=10s 1200s \
-          "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
-            --kind tw_minute \
-            --limit "${FINLAB_MINUTE_PARTITIONS_PER_RUN:-$finlab_minute_default_limit}" \
-            --sync-lock-fd 9 \
-            --max-run-seconds 1140; then
-          finlab_minute_succeeded=1
-        else
-          finlab_minute_succeeded=0
-          echo "[finlab] minute pass incomplete; keeping its cursor for recovery; Tick deferred" >&2
-          break
-        fi
-        finlab_minute_result="$(run_fintech_python -c \
-          'import json; from pathlib import Path; p=json.loads(Path("data_finlab/intraday/market_status.json").read_text()); priority=p.get("minute_priority",{}); print(p.get("state", "unverified").split(";", 1)[0], str(p.get("active_kind")=="tw_minute" and priority.get("tick_residual_allowed") is True and p.get("state") not in {"running","interrupted","quota_unknown","authentication_failed","waiting_required_general_data","disk_reserve_reached","quota_margin_reached","quota_exhausted","opening_window_yield"}).lower(), str(priority.get("actionable_known_window_partitions", priority.get("pending_known_window_partitions",0))>0 or priority.get("due_publication_rechecks",0)>0).lower())')"
-        read -r finlab_minute_state finlab_minute_cleared finlab_minute_actionable <<< "$finlab_minute_result"
-        if [[ "$finlab_minute_cleared" == "true" ]]; then
-          break
-        fi
-        if [[ "$finlab_minute_state" != "batch_limit" && "$finlab_minute_state" != "run_time_budget_reached" ]] &&
-           ! [[ "$finlab_minute_state" == "waiting_older_publication" && "$finlab_minute_actionable" == "true" ]]; then
-          break  # Due general work, real quota/source/disk waits must yield.
-        fi
-        echo "[finlab] continuing minute pass under the same account owner ($finlab_intraday_pass/$finlab_max_intraday_passes)"
-      done
-      if [[ "$finlab_minute_succeeded" == "1" && "$finlab_minute_cleared" == "true" ]]; then
-        # Amortize SDK/pool/index startup and the timer's idle gap across useful
-        # stock-days. This is a work quantum, never 1,024 in-flight objects:
-        # the existing bounded pool, per-dispatch quota and minute/general
-        # preemption, disk guard and 1,140-second watchdog remain unchanged.
-        if ! timeout --signal=TERM --kill-after=10s 1200s \
-            "$finlab_python_bin" "$finlab_repo_root/scripts/download_finlab_market_intraday.py" \
-              --kind tw_tick --limit "${FINLAB_INTRADAY_PARTITIONS_PER_RUN:-$finlab_tick_default_limit}" \
-              --sync-lock-fd 9 --max-run-seconds 1140 --reserve-mb "$finlab_tick_reserve_mb"; then
-          echo "[finlab] residual Tick pass incomplete; next invocation starts with minutes" >&2
-        fi
-      else
-        echo "[finlab] minute history / publication rechecks have priority; Tick deferred"
-      fi
-    else
-        echo "[finlab] minutes and Tick deferred: actionable general acquisition remains"
-    fi
-  else
-    echo "[finlab] Tick deferred: general-work inventory is unverified" >&2
-  fi
-else
-  echo "[finlab] Tick deferred: general history sweep state=$finlab_state"
 fi

@@ -3,6 +3,7 @@ import gc
 import hashlib
 import json
 from pathlib import Path
+import random
 import shutil
 import struct
 import subprocess
@@ -103,6 +104,27 @@ def test_cached_descriptor_preserves_order_units_redaction_and_numeric_identity(
         assert all(row["reported_value"] is ref["reported_value"] for row, ref in zip(actual, expected))
     assert cache.cache_info()["hits"] > cache.cache_info()["misses"]
     assert struct.pack("!d", actual[0]["reported_value"]) == struct.pack("!d", -0.0)
+
+
+def test_native_matches_full_python_oracle_for_nested_json(compiled, monkeypatch):
+    monkeypatch.setattr(profile, "_METRIC_TREE", compiled[1])
+    monkeypatch.setattr(profile, "_METRIC_DESCRIPTOR", compiled[1].cache_descriptor(profile._metric_descriptor))
+    rng = random.Random(20261023)
+    names = ["seconds", "wall_seconds", "elapsed_ms", "elapsed_s", "latency_ms",
+             "median_seconds", "total_s", "milliseconds", "seconds_more", "elapsed_s\n",
+             "a~/字", "ſecret", "authorızation", "secret_seconds", "x" * 300,
+             "字" * 270 + "_seconds", "emoji😀", ""]
+    scalars = [None, True, False, 0, -1, -0.0, 1.25, 10**70, "seconds", ""]
+    for _ in range(300):
+        payload = {name: rng.choice(scalars) for name in rng.sample(names, 10)}
+        payload["container_without_suffix"] = [{"elapsed_ms": -0.0}, {"seconds": 10**70}, payload.copy()]
+        payload["secret"] = {"seconds": 99}
+        actual, expected = profile._metric_rows(payload), list(profile.reported_metrics(payload))
+        assert actual == expected
+        assert all(row["reported_value"] is ref["reported_value"] for row, ref in zip(actual, expected))
+        for row, ref in zip(actual, expected):
+            if type(ref["reported_value"]) is float:
+                assert struct.pack("!d", row["reported_value"]) == struct.pack("!d", ref["reported_value"])
 
 
 def test_native_cache_has_cardinality_and_unicode_length_bounds(compiled):

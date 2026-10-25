@@ -67,6 +67,8 @@ CHUNKED_ARCHIVE_FORMAT = "stockagent-chunked-path-bucket-zip-v2"
 DEFAULT_FILE_CHUNK_BYTES = 8 * 1024 * 1024
 MAX_FILE_CHUNK_BYTES = 64 * 1024 * 1024
 MIN_NATIVE_CHUNK_STREAM_BYTES = 64 * 1024 * 1024
+MIN_NATIVE_MATERIALIZED_STAGE_BYTES = 64 * 1024 * 1024
+MAX_NATIVE_MATERIALIZED_STAGE_BYTES = 8 * 1024**3
 INVENTORY_FORMAT = "jsonl-gzip-v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_STAGING_RULES = frozenset({"artifact_io_atomic_sibling_v1", "finmind_parquet_promote_v1",
@@ -3326,6 +3328,35 @@ def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
                     on_copy(row)
 
 
+def _materialized_file_sha256(path: Path, expected_bytes: int) -> str:
+    """Hash large reviewed D scratch natively, retaining the held Linux inode.
+
+    All bytes are still hashed on every verification. Other namespaces and
+    sizes keep their existing reader; the adapter admits only the two fixed
+    read-only staging prefixes and checks the real D backing mount itself.
+    """
+    if MIN_NATIVE_MATERIALIZED_STAGE_BYTES <= expected_bytes <= MAX_NATIVE_MATERIALIZED_STAGE_BYTES:
+        from stockagent.data_sync.windows_cold_io import (
+            READ_ONLY_STAGE_PREFIXES, hash_file, windows_path,
+        )
+        native = windows_path(path)
+        if native is not None and native.startswith(READ_ONLY_STAGE_PREFIXES):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode) or opened.st_size != expected_bytes:
+                    raise SnapshotError('materialized native input type or size differs')
+                signature = (_source_stat(opened), opened.st_mode, opened.st_nlink)
+                digest = hash_file(path)
+                for current in (os.fstat(fd), path.lstat()):
+                    if (_source_stat(current), current.st_mode, current.st_nlink) != signature:
+                        raise SnapshotError('materialized native input generation changed')
+                return digest
+            finally:
+                os.close(fd)
+    return sha256_file(path)
+
+
 def _verify_materialized(
     materialized_path: Path,
     manifest: Mapping[str, Any],
@@ -3342,7 +3373,7 @@ def _verify_materialized(
         if kind == "file":
             if not path.is_file() or path.stat().st_size != int(row["size"]):
                 raise SnapshotError(f"materialized file differs: {path}")
-            if sha256_file(path) != row["sha256"]:
+            if _materialized_file_sha256(path, int(row["size"])) != row["sha256"]:
                 raise SnapshotError(f"materialized file checksum mismatch: {path}")
     inventory = scan_tree(materialized_path)
     expected = manifest["source"]["portable_fingerprint_sha256"]

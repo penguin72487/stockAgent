@@ -75,6 +75,39 @@ Mechanism/adjoint tests, retained numeric rejections, full artifact/financial-ow
 checks and CPU-readable off-node results are in
 [the resident rewrite report](../gpu_architecture_rewrite_2026-10-14.md).
 
+The 2026-10-23 stock-futures date-view integration exposed a separate boundary:
+compressed manifest block starts remain physical, while sliced base/common
+arrays use local dates. Intersect physical blocks with the visible date view
+before normalizing and projecting; nested offsets, partial tails and reordered
+symbols need an independent original-calendar output/parameter-adjoint oracle.
+The repaired sparse-only checkpoint ABI is
+`full_schema_csr_fixed_row_fp32_date_view_forward_v4`; it does not authorize
+resuming an old sparse optimizer. Share training-only fitted transforms through
+the existing content-keyed transform owner, and version normalized CSR disk rows
+by source view and normalizer. The new two-card unit evidence establishes this
+mapping, not a full-market throughput ceiling. See
+[the paired-clock study](../tw_stock_futures_conditioning_2026-10-23.md#1023-續修日期座標梯度來源與測速產物生命週期).
+
+In that study, the completed 08:45 four-epoch A/B/B/A measured full steady
+MAX-rank means 103.965 -> 27.828 seconds (3.736x), but complete cold/warm case
+means 650.204 -> 522.328 seconds (1.245x). The later completed 09:00 A/B/B/A
+measured 103.566 -> 27.721 seconds (3.736x), with complete four-epoch case
+means 648.193 -> 395.265 seconds (1.640x); both clocks admitted the sparse path.
+These cold/warm case means include initial preparation and cache reuse, and
+do not establish new-node startup or a pure-compute ceiling. Per-batch host finite-check
+timings include outstanding GPU work and are not removable-compute estimates.
+The subsequent opt-in trajectory device guard observes every loss and gradient
+on device, retains intermediate failures, and collectively rejects before the
+only update. Its CPU/Gloo tests establish this rejection boundary, not GPU speed;
+keep its distinct checkpoint contract and require the queued full-workflow
+comparison before selecting it. See
+[the synchronization experiment](../tw_stock_futures_conditioning_2026-10-23.md#1655-續修減少每批次-cpu-同步追加四組條件與步長實驗).
+The subsequent absolute validation plotting failure left five engineering
+cases unstarted. Bind calendar acceptance to the verified futures decision
+clock, preserving wider feature context and the exact live period contract;
+repair reporting and continue the omitted cases without retraining a completed
+control. See [the current scope and queue evidence](../tw_futures_universe_and_progress_2026-10-23.md).
+
 ### Buffered ledger graphs: 2026-10-15 observation
 
 The same selected d32/lookback32 workload uses event-compressed accounting in

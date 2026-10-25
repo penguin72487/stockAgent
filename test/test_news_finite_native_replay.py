@@ -262,11 +262,17 @@ def test_finite_rep_redirect_cannot_expand_literal_scope(tmp_path):
     config.pop('provider_catalog', None)
     config.update(settings(), exclusive_http_owner=False, adaptive_rate={'enabled': False})
     robots = 'https://www.gvm.com.tw/robots.txt'
+    home = 'https://www.gvm.com.tw/'
     http, session = http_fixture(config, tmp_path, {
-        robots: FakeResponse(status=302, headers={'Location': 'https://www.gvm.com.tw/'})})
+        robots: FakeResponse(status=302, headers={'Location': home}),
+        home: FakeResponse(b'<html><title>Publisher home</title><main>No REP rules</main></html>')})
     try:
-        with pytest.raises(NewsError, match='article_rights_or_scope_excluded'):
+        # A same-authority REP Location is a policy probe, not a finite article
+        # grant. The representation still has to contain usable policy rules.
+        with pytest.raises(NewsError, match='^robots_not_plain_rules$'):
             http.get(URL)
-        assert [url for url, _ in session.calls] == [robots]
+        with pytest.raises(NewsError, match='^article_rights_or_scope_excluded$'):
+            http.get(home)
+        assert [url for url, _ in session.calls] == [robots, home]
     finally:
         http.close()

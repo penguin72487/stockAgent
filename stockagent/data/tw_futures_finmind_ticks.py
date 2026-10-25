@@ -19,6 +19,7 @@ from downloader.artifact_io import sha256_file
 SOURCE = 'finmind_futures_tick_contract_day_v1'
 SCHEMA_VERSION = 1
 BULK_SOURCE = 'finmind_whole_market_stock_prints_v1'
+BULK_EQUITY_SOURCE = 'finmind_whole_market_dated_equity_prints_v2'
 BULK_PRICE_POLICY = 'unique_dated_legal_quote_with_identical_float32_encoding_raw_retained_v1'
 BULK_INVENTORY = 'finmind_whole_market_tick_inventory_v1'
 
@@ -88,7 +89,8 @@ def pin_bulk_tick_inventory(root: Path, dates: list[date]) -> list[dict]:
     return sources
 
 
-def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndarray) -> np.ndarray:
+def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndarray,
+                             asset_classes='stock_future') -> np.ndarray:
     """Recover a unique legal decimal quote from the provider's F32 encoding.
 
     This is a declared source representation conversion, not arbitrary price
@@ -104,11 +106,11 @@ def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndar
     if not np.array_equal(values, raw.astype(np.float64)):
         raise ValueError('bulk price is not the declared Float32 source encoding')
     ticks = taifex_futures_tick_size_numpy(values, np.datetime64(day),
-        product_codes=products, asset_classes='stock_future')
+        product_codes=products, asset_classes=asset_classes)
     with np.errstate(invalid='ignore', divide='ignore'):
         decoded = np.rint(np.rint(values / ticks) * ticks * 100.) / 100.
     valid = price_on_taifex_futures_tick_grid_numpy(decoded, np.datetime64(day),
-        product_codes=products, asset_classes='stock_future')
+        product_codes=products, asset_classes=asset_classes)
     if (not valid.all() or not np.array_equal(decoded.astype(np.float32), raw)
             or np.any((decoded + ticks).astype(np.float32) == raw)
             or np.any((decoded - ticks).astype(np.float32) == raw)):
@@ -154,23 +156,29 @@ def stock_print_views(prints: pl.DataFrame, *, day: date, source_sha256: str):
 
 
 def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.DataFrame,
-                               source_sha256: str):
+                               source_sha256: str, asset_scope='stock_only'):
     """Columnar daily adapter for all selected delivery months, including zeros."""
     from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
+    from stockagent.data.tw_futures_decision_clock import clock_asset_classes
+    classes = clock_asset_classes(asset_scope)
     keys = ['date', 'physical_contract']
-    mapping = expected.select('product', 'contract', 'physical_contract').unique()
+    mapping = expected.select('product', 'contract', 'physical_contract', 'asset_class').unique()
     if (expected.select(keys).is_duplicated().any() or mapping.select('product', 'contract').is_duplicated().any()
-            or expected.filter((pl.col('date') != day) | (pl.col('asset_class') != 'stock_future')).height):
-        raise ValueError('bulk reader needs unique dated stock physical identities')
+            or mapping.select('product', 'asset_class').unique()['product'].is_duplicated().any()
+            or expected.filter((pl.col('date') != day) | pl.col('asset_class').is_null()
+                | ~pl.col('asset_class').is_in(classes)).height):
+        raise ValueError('bulk reader needs unique dated physical identities within its asset scope')
     required = {'date', 'futures_id', 'contract_date', 'price', 'volume'}
     if not required <= set(frame.columns):
         raise ValueError('incomplete global tick schema')
     # Resolve dated sessions once per selected product, not once per tick.
-    sessions = [dict(product=p, _start=a*60, _end=b*60) for p in mapping['product'].unique()
-                for a, b in [taifex_futures_day_session_minutes(day, product_code=p, asset_class='stock_future')]]
+    sessions = [dict(product=p, _start=a*60, _end=b*60)
+                for p, asset in mapping.select('product', 'asset_class').unique().iter_rows()
+                for a, b in [taifex_futures_day_session_minutes(day, product_code=p, asset_class=asset)]]
+    delivery_pattern = r'^\d{6}$' if asset_scope == 'stock_only' else r'^\d{6}(?:W[1-5])?$'
     raw = frame.with_row_index('source_row_index').filter(
         pl.col('futures_id').is_in(mapping['product'].unique().implode())
-        & pl.col('contract_date').str.contains(r'^\d{6}$')).rename(
+        & pl.col('contract_date').str.contains(delivery_pattern)).rename(
             {'futures_id': 'product', 'contract_date': 'contract'}).join(mapping,
                 on=['product', 'contract'], how='inner', validate='m:1').with_columns(
                     pl.col('date').str.to_datetime(time_unit='us', strict=True).alias('event_ts'))
@@ -183,7 +191,8 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
     if raw.filter(pl.col('price').is_null() | pl.col('volume').is_null() | (pl.col('volume') <= 0)
                   | (pl.col('volume') % 2 != 0) | (pl.col('volume') != pl.col('volume').floor())).height:
         raise ValueError('bulk outright volume must be positive even double-sided contracts')
-    decoded = decode_bulk_stock_prices(raw['price'].to_numpy(), day=day, products=raw['product'].to_numpy())
+    decoded = decode_bulk_stock_prices(raw['price'].to_numpy(), day=day, products=raw['product'].to_numpy(),
+                                      asset_classes=raw['asset_class'].to_numpy())
     prints = raw.with_columns(pl.Series('price', decoded), (pl.col('volume').cast(pl.Int64)//2).alias('volume'))
     bars, stats, events = stock_print_views(prints, day=day, source_sha256=source_sha256)
     coverage = expected.select(*keys, 'product', 'contract', 'high', 'low', 'close', 'outright_volume', 'block_volume').join(
@@ -200,7 +209,7 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
     return bars, coverage, events
 
 
-def read_bulk_stock_tick_day(item: dict, expected: pl.DataFrame):
+def read_bulk_stock_tick_day(item: dict, expected: pl.DataFrame, *, asset_scope='stock_only'):
     """Independent SHA/row/stability readback of a pinned active source object."""
     path, receipt_path = Path(item['path']), Path(item['receipt_path'])
     before = path.stat()
@@ -210,7 +219,7 @@ def read_bulk_stock_tick_day(item: dict, expected: pl.DataFrame):
     if frame.height != item['rows'] or before.st_size != item['bytes']:
         raise ValueError('pinned global tick row/byte count mismatch')
     result = normalize_bulk_stock_ticks(frame, day=date.fromisoformat(item['date']),
-        expected=expected, source_sha256=item['sha256'])
+        expected=expected, source_sha256=item['sha256'], asset_scope=asset_scope)
     after = path.stat()
     if ((before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
             != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)

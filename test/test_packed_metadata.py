@@ -119,6 +119,112 @@ def record(path, **extra):
     return {"path": path, "kind": "file", "size": 7, **extra}
 
 
+@pytest.fixture
+def empty_metadata_index(failed_metadata_index):
+    metadata, scratch, attempt, receipt = failed_metadata_index
+    index = scratch / 'index.sqlite'
+    with sqlite3.connect(index) as db:
+        db.execute('DELETE FROM entries')
+        db.commit()
+        db.execute('VACUUM')
+    db.close()
+    # Reproduce an interrupted uncommitted spill: valid initial database plus
+    # allocated bytes not committed in SQLite's header, with no unique rows.
+    with index.open('ab') as stream:
+        stream.write(b'abandoned census pages' * 1024)
+    return metadata, scratch, attempt, receipt
+
+
+def test_empty_initial_metadata_index_requires_explicit_proof_and_reclaims_tail(empty_metadata_index):
+    metadata, scratch, attempt, receipt = empty_metadata_index
+    with pytest.raises(ValueError, match='explicit empty-index proof'):
+        metadata.plan_failed_metadata_scratch(scratch)
+    attempt.unlink()  # Empty logical state supplies its own exact rebuild proof.
+    plan = metadata.plan_failed_metadata_scratch(scratch, empty_index=True)
+    assert plan['contract'] == 'empty_metadata_index_retirement_v1'
+    assert plan['empty_index_reconstruction']['logical_rows'] == 0
+    assert plan['empty_index_reconstruction']['trailing_bytes'] > 0
+    assert plan['index']['sha256'] == hashlib.sha256((scratch / 'index.sqlite').read_bytes()).hexdigest()
+    result = metadata.retire_failed_metadata_scratch(plan, receipt)
+    assert result['state'] == 'retired' and not scratch.exists()
+    assert result['allocated_bytes_reclaimed'] == plan['index']['allocated']
+    assert result['source_data_files_deleted'] == result['cold_objects_deleted'] == 0
+
+
+def test_empty_index_mode_never_adopts_a_populated_census(failed_metadata_index):
+    metadata, scratch, _attempt, receipt = failed_metadata_index
+    with pytest.raises(ValueError, match='empty initial database'):
+        metadata.plan_failed_metadata_scratch(scratch, empty_index=True)
+    assert scratch.exists() and not receipt.exists()
+
+
+@pytest.mark.parametrize('defect', ['other-table', 'application-id', 'user-version', 'freelist', 'corrupt', 'shared', 'extra-member'])
+def test_empty_index_proof_rejects_other_state_and_unknown_bytes(empty_metadata_index, defect):
+    metadata, scratch, _attempt, receipt = empty_metadata_index
+    index = scratch / 'index.sqlite'
+    if defect in ('other-table', 'application-id', 'user-version', 'freelist'):
+        with sqlite3.connect(index) as db:
+            if defect == 'other-table':
+                db.execute('CREATE TABLE original_observations(value BLOB)')
+            elif defect == 'application-id':
+                db.execute('PRAGMA application_id=42')
+            elif defect == 'user-version':
+                db.execute('PRAGMA user_version=7')
+            else:
+                db.execute('INSERT INTO entries VALUES (?,?,?,?,?,?)', (b'large', 'file', 0, None, None, 'x' * 100000))
+                db.commit()
+                db.execute('DELETE FROM entries')
+        db.close()
+    elif defect == 'corrupt':
+        with index.open('r+b') as stream:
+            stream.write(b'not an intact SQLite database')
+    elif defect == 'shared':
+        os.link(index, scratch.parent / 'another-owner.sqlite')
+    else:
+        (scratch / 'unknown.bin').write_bytes(b'retain')
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        metadata.plan_failed_metadata_scratch(scratch, empty_index=True)
+    assert scratch.exists() and not receipt.exists()
+
+
+@pytest.mark.parametrize('mutation', ['committed-row', 'changed-tail'])
+def test_empty_index_apply_revalidates_logical_state_and_entire_trailing_bytes(empty_metadata_index, mutation):
+    metadata, scratch, _attempt, receipt = empty_metadata_index
+    plan = metadata.plan_failed_metadata_scratch(scratch, empty_index=True)
+    index = scratch / 'index.sqlite'
+    if mutation == 'committed-row':
+        with sqlite3.connect(index) as db:
+            db.execute('INSERT INTO entries VALUES (?,?,?,?,?,?)',
+                       (b'unique', 'file', 7, None, None, json.dumps(record('unique'))))
+        db.close()
+    else:
+        with index.open('r+b') as stream:
+            stream.seek(-1, os.SEEK_END)
+            stream.write(b'!')
+    with pytest.raises(ValueError):
+        metadata.retire_failed_metadata_scratch(plan, receipt)
+    assert scratch.exists() and not receipt.exists()
+
+
+def test_empty_index_gate_includes_its_own_open_descriptor(empty_metadata_index):
+    metadata, scratch, _attempt, _receipt = empty_metadata_index
+    with (scratch / 'index.sqlite').open('rb'):
+        with pytest.raises(ValueError, match='process reference'):
+            metadata.plan_failed_metadata_scratch(scratch, empty_index=True)
+
+
+def test_metadata_retirement_cli_requires_one_explicit_origin(tmp_path):
+    from scripts.packed_snapshot import build_parser
+    parser = build_parser()
+    command = ['metadata-scratch-plan', str(tmp_path / 'index'), '--output', str(tmp_path / 'plan.json')]
+    with pytest.raises(SystemExit):
+        parser.parse_args(command)
+    with pytest.raises(SystemExit):
+        parser.parse_args(command + ['--empty-index', '--failed-attempt', str(tmp_path / 'old.json')])
+    args = parser.parse_args(command + ['--empty-index'])
+    assert args.empty_index and args.failed_attempt is None
+
+
 @pytest.mark.parametrize('limit', [1, 100])
 def test_census_order_survives_spill_and_releases_early_closed_cursor(limit):
     with MetadataRows(dict, dict, memory_rows=limit) as rows:

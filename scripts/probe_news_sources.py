@@ -197,6 +197,52 @@ def select_current_failure_urls(root, provider, registry, *, maximum=4, now=None
         db.close()
 
 
+def moneyweekly_public_structure(soup, source, *, page_url):
+    """Describe a missing original without exporting prose or granting scope.
+
+    Only the configured article/header nodes participate. Character counts
+    distinguish a short paragraph from an empty editor or an image caption;
+    they never prove completeness. Unreviewed names remain declarations.
+    """
+    if source.provider != 'moneyweekly':
+        raise ValueError('moneyweekly_structural_question_required')
+    from downloader.news_fulltext_diagnostics import _display_url
+    from downloader.news_fulltext_publishers import moneyweekly_article_identity
+
+    def node_shape(node):
+        return {'tag': node.name, 'id': str(node.get('id', ''))[:100] or None,
+            'classes': [str(value)[:100] for value in node.get('class', [])[:8]],
+            'characters': len(node.get_text(' ', strip=True)),
+            'children': [{'tag': child.name,
+                'classes': [str(value)[:100] for value in child.get('class', [])[:8]],
+                'characters': len(child.get_text(' ', strip=True))}
+                for child in islice(node.find_all(recursive=False), 32)],
+            'paragraphs': len(node.find_all('p')), 'images': len(node.find_all('img')),
+            'embedded_media': len(node.find_all(['iframe', 'video', 'audio'])),
+            'normalized_characters': len(_plain_text_node(node, source.exclude_selectors,
+                                                         parser=source.html_parser))}
+
+    error = None
+    try:
+        moneyweekly_article_identity(soup, page_url=page_url)
+    except NewsError as failure:
+        error = failure.code
+    canonical = soup.find('link', rel='canonical')
+    return {'contract_version': 1, 'article_identity_or_access_error': error,
+        'declared_canonical': _display_url(canonical.get('href', '')) if canonical else None,
+        'body_nodes': [node_shape(node) for selector in source.selectors
+            for node in soup.select(selector)[:4]],
+        'current_header_authors': [{'label': node.get_text(' ', strip=True)[:200],
+            'reviewed_name': node.get_text(' ', strip=True) in source.permitted_author_names,
+            'links': [{'label': link.get_text(' ', strip=True)[:160],
+                       'href': _display_url(link.get('href', ''))} for link in node.select('a[href]')[:4]]}
+            for selector in source.author_selectors for node in soup.select(selector)[:4]],
+        'current_header_clocks': [node.get_text(' ', strip=True)[:160]
+            for selector in source.publication_selectors for node in soup.select(selector)[:4]],
+        'source_permission_changed': False, 'raw_retained': False, 'article_accepted': False,
+        'counts_are_not_complete_body_or_original_authorship_proof': True}
+
+
 def wordpress_public_metadata_shape(data, headers):
     """Bounded source declarations, never bodies, credentials or guessed names.
 
@@ -224,6 +270,31 @@ def wordpress_public_metadata_shape(data, headers):
             'name': value.get('name')[:200] if isinstance(value.get('name'), str) else None,
             'error_code': value.get('code')[:100] if isinstance(value.get('code'), str) else None}
 
+    def public_link(value):
+        if (not isinstance(value, str) or not 1 <= len(value) <= 2048
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            return None
+        try:
+            parts = urlsplit(value)
+            if (parts.scheme not in {'http', 'https'} or not parts.hostname
+                    or parts.username is not None or parts.password is not None
+                    or parts.query or parts.fragment
+                    or parts.port not in {None, 80 if parts.scheme == 'http' else 443}):
+                return None
+        except ValueError:
+            return None
+        return value  # A source declaration, not an identity/alias decision.
+
+    def clock(value):
+        if (not isinstance(value, str) or not re.fullmatch(
+                r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})?', value)):
+            return None
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return value  # Preserve raw naive clocks; never infer UTC/PIT here.
+
     def post_shape(post):
         if not isinstance(post, dict):
             return {'type': type(post).__name__}
@@ -234,6 +305,11 @@ def wordpress_public_metadata_shape(data, headers):
         head = post.get('yoast_head_json')
         meta = post.get('meta')
         return {'id': post.get('id') if type(post.get('id')) is int else None,
+            'public_link': public_link(post.get('link')),
+            'source_clocks': {key: clock(post.get(key)) for key in
+                ('date', 'date_gmt', 'modified', 'modified_gmt')},
+            'source_declared_type': post.get('type') if post.get('type') in ('post', 'page') else None,
+            'source_declared_status': post.get('status') if post.get('status') in ('publish', 'draft', 'private') else None,
             'keys': keys(post), 'author_type': type(post.get('author')).__name__,
             'author_id': post.get('author') if type(post.get('author')) is int else None,
             'title_characters': len(title.get('rendered', '')) if isinstance(title, dict)
@@ -259,7 +335,7 @@ def wordpress_public_metadata_shape(data, headers):
                 and len(value) <= 8 and int(value) <= 10_000_000 else None)
 
     posts = [post for post in data if isinstance(post, dict)]
-    return {'contract_version': 1, 'rows': len(data), 'object_rows': len(posts),
+    return {'contract_version': 2, 'rows': len(data), 'object_rows': len(posts),
         'declared_total_posts': total('x-wp-total'), 'declared_total_pages': total('x-wp-totalpages'),
         'posts_with_embedded_author_name': sum(any(isinstance(author, dict)
             and isinstance(author.get('name'), str) and bool(author['name'].strip())
@@ -392,6 +468,127 @@ def globalvoices_public_identity_shape(soup, source, *, page_url):
         'article_durably_accepted': False, 'automatic_profile_requests': 0}
 
 
+def public_original_link_shape(soup):
+    """Inspect literal original-link declarations, without routing or prose.
+
+    Ordinary publisher anchors need not carry rel=cite/via. Explicit labels
+    are discovery witnesses only: neither their target nor article equivalence
+    is verified here. Reuse this DOM and bound both traversal and output.
+    """
+    labels = {'原文', '原文連結', '閱讀原文', '查看原文', '看原文', '完整原文',
+              '原始文章', '原始新聞', 'originalarticle', 'readoriginal'}
+    nodes = soup.find_all(['a', 'link'], href=True, limit=513)
+    candidates, matched = [], 0
+    for node in nodes[:512]:
+        relations = sorted(set(node.get('rel', ())) & {'cite', 'via'})
+        pieces, length = [], 0
+        for text in node.stripped_strings:
+            length += len(text)
+            if length > 128:
+                break
+            pieces.append(text)
+        label_matches = length <= 128 and re.sub(r'\s+', '', ''.join(pieces)).casefold() in labels
+        if not relations and not label_matches:
+            continue
+        href = node.get('href')
+        if (not isinstance(href, str) or not 0 < len(href) <= 2048
+                or any(ord(char) <= 32 or ord(char) == 127 for char in href)):
+            continue
+        try:
+            parts = urlsplit(href)
+            if (parts.scheme not in {'http', 'https'} or not parts.hostname
+                    or parts.username is not None or parts.password is not None):
+                continue
+            parts.port  # Reject malformed ports without issuing a request.
+        except ValueError:
+            continue
+        matched += 1
+        if len(candidates) < 8:
+            candidates.append({'href': href, 'node': node.name,
+                'relations': relations, 'explicit_original_label': label_matches})
+    return {'contract_version': 1, 'candidates': candidates,
+        'nodes_examined': min(len(nodes), 512), 'node_limit_reached': len(nodes) > 512,
+        'candidate_limit_reached': matched > 8,
+        'sampling_limits': {'link_nodes': 512, 'candidates': 8, 'label_characters': 128,
+                            'href_characters': 2048},
+        'scope': 'literal_absolute_HTTP_link_declarations_only_not_original_identity',
+        'relative_links_resolved': False, 'body_text_exported': False,
+        'automatic_requests': 0, 'original_source_alias_admitted': False}
+
+
+def public_document_identity_shape(soup):
+    """Bounded native identity declarations; no prose or identity admission.
+
+    Reuse the diagnostic's parsed DOM. Entity projections explicitly discard
+    descriptions/articleBody, including nested values; raw clock strings stay
+    declarations rather than verified historical publication timestamps.
+    """
+    def scalar(value):
+        if isinstance(value, str):
+            if len(value) <= 2048:
+                return value
+            return {'value_omitted': True, 'characters': len(value),
+                    'sha256': hashlib.sha256(value.encode()).hexdigest()}
+        return value if value is None or type(value) in {bool, int} else {'type': type(value).__name__}
+
+    def entity(value, depth=0):
+        if depth > 2:
+            return {'nested_value_omitted': True, 'type': type(value).__name__}
+        if isinstance(value, list):
+            return [entity(item, depth + 1) for item in value[:8]]
+        if isinstance(value, dict):
+            return {key: scalar(value[key]) for key in ('@type', '@id', 'name', 'url') if key in value}
+        return scalar(value)
+
+    metas = []
+    permitted = {'og:url', 'og:title', 'og:site_name', 'article:published_time',
+                 'article:modified_time', 'author'}
+    for node in soup.find_all('meta'):
+        field = node.get('property') or node.get('name')
+        if field in permitted:
+            metas.append({'field': field, 'value': scalar(node.get('content'))})
+            if len(metas) == 16:
+                break
+    articles, errors, examined = [], [], 0
+    for node in islice(soup.find_all('script', type='application/ld+json'), 8):
+        if examined >= 256 or len(articles) >= 8:
+            break
+        try:
+            stack = [(json.loads(node.get_text()), 0)]
+        except (ValueError, TypeError, RecursionError):
+            errors.append('invalid_jsonld')
+            continue
+        while stack and examined < 256 and len(articles) < 8:
+            value, depth = stack.pop()
+            examined += 1
+            if depth > 8:
+                continue
+            if isinstance(value, list):
+                stack.extend((child, depth + 1) for child in reversed(value[:256]))
+            elif isinstance(value, dict):
+                kinds = value.get('@type')
+                kinds = kinds if isinstance(kinds, list) else [kinds]
+                if any(kind in ('Article', 'NewsArticle', 'BlogPosting') for kind in kinds):
+                    articles.append({key: entity(value[key]) for key in (
+                        '@type', '@id', 'url', 'mainEntityOfPage', 'headline', 'author',
+                        'publisher', 'datePublished', 'dateModified', 'isBasedOn',
+                        'isAccessibleForFree') if key in value})
+                if '@graph' in value:
+                    stack.append((value['@graph'], depth + 1))
+    return {'contract_version': 2,
+        'html_title': scalar(soup.title.get_text(' ', strip=True)) if soup.title else None,
+        'canonical_links': [scalar(node.get('href'))
+                            for node in islice(soup.select('link[rel~=canonical][href]'), 8)],
+        'head_metadata': metas, 'declared_articles': articles, 'jsonld_errors': errors,
+        'jsonld_nodes_examined': examined,
+        'original_link_declarations': public_original_link_shape(soup),
+        'metadata_sampling_limits': {'head_fields': 16, 'canonical_links': 8,
+            'jsonld_scripts': 8, 'jsonld_nodes': 256, 'jsonld_depth': 8, 'articles': 8,
+            'entity_list_items': 8, 'scalar_characters': 2048},
+        'raw_or_body_retained': False, 'article_identity_verified': False,
+        'original_source_alias_admitted': False, 'historical_publication_verified': False}
+
+
 def probe_provider(http, urls, *, retain=False, output_root=None, candidate_source=None, metadata_only=False):
     # A representation question must not need a deliberately invalid selector
     # (and a misleading body_not_found) to avoid article extraction. This opt-in
@@ -442,8 +639,16 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                 for hop in getattr(response, 'redirects', ())]
             if response.status == 200 and "html" in response.headers.get("content-type", ""):
                 soup = BeautifulSoup(response.body, "lxml")
+                if metadata_only:
+                    item['public_document_identity'] = public_document_identity_shape(soup)
+                if source.provider == 'ibmi':
+                    from downloader.news_source_ibmi import ibmi_validation_metadata
+                    item['ibmi_native_validation'] = ibmi_validation_metadata(soup, page_url=response.url)
                 if source.provider == 'globalvoices':
                     item['globalvoices_public_identity'] = globalvoices_public_identity_shape(
+                        soup, source, page_url=response.url)
+                if source.provider == 'moneyweekly':
+                    item['moneyweekly_public_structure'] = moneyweekly_public_structure(
                         soup, source, page_url=response.url)
                 if source.provider == 'watchmedia':
                     from downloader.news_fulltext_watchmedia import watchmedia_validation_metadata
@@ -715,6 +920,9 @@ def probe_provider(http, urls, *, retain=False, output_root=None, candidate_sour
                                                                 "article_license_not_verified", "article_rights_not_verified"} and (
                         source.provider != 'cnyes' or item.get('cnyes_structure', {}).get('raw_public_scope', False)) and (
                         source.provider not in {"voa_chinese", "voa_cantonese"} or item.get("reviewed_current_byline_scope") is True):
+                    if source.provider == 'contentplatform':
+                        from downloader.news_fulltext_contentplatform import contentplatform_private_failure_permit
+                        item['native_private_permit'] = contentplatform_private_failure_permit(response, source)
                     # Private diagnosis is not article acceptance. Keep the raw
                     # fetched public response and its source policy, never a
                     # refused/paid/member response or a body in the browser.
@@ -901,7 +1109,7 @@ def main(argv=None):
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
     parser.add_argument('--enqueue-candidate', action='store_true',
         help='Submit one reviewed finite candidate to the resident owner; do not stop it or issue HTTP here')
-    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2, 6, 7, 8, 9, 10, 11, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33), default=1,
+    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2, 6, 7, 8, 9, 10, 11, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45), default=1,
         help='Resident finite evidence: v1 candidate; v2 Videoland credit/clock; v6 Watchmedia legacy credit; v7 Pocket non-School boundary; v8 Bastille written boundary; v9 private native short original; v10 Bastille resource/body relationships; v11 private Bastille two-container original; v24 current iNEWS editor/credit shapes; v25 private printed-credit original after completed v24; v26 private named-header editor original after completed v24; v27 current ETtoday editor/identity/credit relations, metadata only; v28 private WWW leading-credit original after completed v27; v29 private inline-credit original after completed v28 scope refusal; v30 private visible reporter/Person/clock original after completed v29 scope refusal, with bounded refusal-stage facts')
     parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
                         help='Explicit observed missing-article failure; validation diagnosis is metadata-only')
@@ -915,6 +1123,8 @@ def main(argv=None):
     parser.add_argument('--candidate-embedded-layout', choices=[
         *[name for name, version in MAX_LAYOUT_VERSIONS.items() if version >= 4],
         'ettoday_visible_article_v39', 'videoland_visible_article_v4', 'watchmedia_visible_article_v3', 'pocket_visible_article_v12',
+        'gvm_public_native_article_v2', 'gvm_public_native_article_v3', 'gvm_public_native_article_v4', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10',
+        'contentplatform_native_article_v2', 'contentplatform_native_article_v3',
         *INEWS_LAYOUT_VERSIONS,
         *(k for k, v in BASTILLE_LAYOUT_VERSIONS.items() if v >= 2)],
         help='One reviewed candidate or current Watchmedia/Pocket structural question; same envelope, metadata only, no acceptance/requeue')
@@ -924,15 +1134,31 @@ def main(argv=None):
             or args.candidate_embedded_layout or args.enqueue_candidate or args.candidate_evidence_contract != 1
             or args.failure_code != 'body_not_found'):
         parser.error('metadata-only requires explicit probes without retention, failed-body assertions or parser candidates')
+    retained_contentplatform_failure = (args.failure_code == 'article_identity_not_verified'
+        and args.retain_reviewed_response and args.require_current_missing_body_failure
+        and len(args.probe) == 1 and not args.current_failure_provider
+        and not args.candidate_embedded_layout and not args.enqueue_candidate)
     if args.failure_code != 'body_not_found' and (
             not (args.current_failure_provider or args.require_current_missing_body_failure)
-            or args.retain_reviewed_response):
+            or args.retain_reviewed_response and not retained_contentplatform_failure):
         parser.error('validation failure diagnosis requires current failed-head preflight and metadata-only output')
     if len(args.probe) > 16:
         parser.error("at most sixteen explicitly selected probes")
     config, registry, repo = load_config(args.config)
     canonical_config, canonical_registry, _ = load_config(repo / 'configs/news_fulltext.json')
+    if retained_contentplatform_failure:
+        selected = registry.match(args.probe[0])
+        if (selected is None or selected.provider != 'contentplatform' or not selected.allowed
+                or (repo/config['root']).resolve() != (repo/canonical_config['root']).resolve()
+                or selected.data_fingerprint != canonical_registry.sources['contentplatform'].data_fingerprint
+                or selected.authorization_fingerprint != canonical_registry.sources['contentplatform'].authorization_fingerprint):
+            parser.error('retained validation original requires the current canonical Contentplatform source')
     require_diagnostic_owner_scope(config, registry, canonical_config, canonical_registry, repo)
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
+    if (args.candidate_evidence_contract in CONTENTPLATFORM_EVIDENCE_VERSIONS or args.candidate_embedded_layout in {'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}) and (
+            not args.enqueue_candidate or args.candidate_evidence_contract not in CONTENTPLATFORM_EVIDENCE_VERSIONS
+            or args.candidate_embedded_layout not in {'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}):
+        parser.error('reviewed_contentplatform_signed_geometry_resident_evidence_required')
     if args.candidate_request_status:
         if (args.candidate_embedded_layout or args.enqueue_candidate or args.retain_reviewed_response
                 or args.candidate_evidence_contract != 1):
@@ -942,11 +1168,39 @@ def main(argv=None):
         return 0
     if args.enqueue_candidate and not args.candidate_embedded_layout:
         parser.error('resident_candidate_requires_reviewed_candidate_layout')
+    if (args.candidate_evidence_contract == 42 or args.candidate_embedded_layout == 'gvm_public_native_article_v10') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract != 42
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v10'):
+        parser.error('reviewed_GVM_v10_ordered_two_credit_resident_evidence_required')
+    if (args.candidate_evidence_contract == 41 or args.candidate_embedded_layout == 'gvm_public_native_article_v9') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract != 41
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v9'):
+        parser.error('reviewed_GVM_v9_header_relations_resident_evidence_required')
+    if (args.candidate_evidence_contract == 40 or args.candidate_embedded_layout == 'gvm_public_native_article_v8') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract != 40
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v8'):
+        parser.error('reviewed_GVM_v8_private_original_resident_evidence_required')
+    if (args.candidate_evidence_contract == 37 or args.candidate_embedded_layout == 'gvm_public_native_article_v4') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract != 37
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v4'):
+        parser.error('reviewed_GVM_v4_received_failure_resident_evidence_required')
+    if (args.candidate_evidence_contract == 36 or args.candidate_embedded_layout == 'gvm_public_native_article_v3') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract != 36
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v3'):
+        parser.error('reviewed_GVM_v3_remaining_resident_evidence_required')
+    if (args.candidate_evidence_contract in {34, 35} or args.candidate_embedded_layout == 'gvm_public_native_article_v2') and (
+            not args.enqueue_candidate or args.candidate_evidence_contract not in {34, 35}
+            or args.candidate_embedded_layout != 'gvm_public_native_article_v2'):
+        parser.error('reviewed_GVM_current_resident_boundary_evidence_required')
     if args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33} and (
             not args.enqueue_candidate or args.candidate_embedded_layout != 'ettoday_visible_article_v39'):
         parser.error('reviewed_ETtoday_current_resident_boundary_evidence_required')
-    if (args.candidate_evidence_contract in {24, 25, 26} or args.candidate_embedded_layout in INEWS_LAYOUT_VERSIONS) and (
-            not args.enqueue_candidate or args.candidate_evidence_contract not in {24, 25, 26}
+    if args.candidate_evidence_contract in {38, 39} and (
+            args.candidate_embedded_layout != 'setn_inews_native_article_v8'
+            or args.failure_code != 'body_not_found'):
+        parser.error('reviewed_inews_v8_body_failure_evidence_required')
+    if (args.candidate_evidence_contract in {24, 25, 26, 38, 39} or args.candidate_embedded_layout in INEWS_LAYOUT_VERSIONS) and (
+            not args.enqueue_candidate or args.candidate_evidence_contract not in {24, 25, 26, 38, 39}
             or args.candidate_embedded_layout not in INEWS_LAYOUT_VERSIONS):
         parser.error('reviewed_inews_resident_shape_evidence_required')
     if args.candidate_evidence_contract == 2 and (not args.enqueue_candidate
@@ -1000,6 +1254,8 @@ def main(argv=None):
     candidate = None
     if args.candidate_embedded_layout:
         candidate_provider = ('videoland' if args.candidate_embedded_layout == 'videoland_visible_article_v4'
+            else 'contentplatform' if args.candidate_embedded_layout in {'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}
+            else 'gvm' if args.candidate_embedded_layout in {'gvm_public_native_article_v2', 'gvm_public_native_article_v3', 'gvm_public_native_article_v4', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10'}
             else 'setn_inews_scope' if args.candidate_embedded_layout in INEWS_LAYOUT_VERSIONS
             else 'watchmedia' if args.candidate_embedded_layout == 'watchmedia_visible_article_v3'
             else 'bastillepost' if BASTILLE_LAYOUT_VERSIONS.get(args.candidate_embedded_layout, 0) >= 2
@@ -1007,10 +1263,10 @@ def main(argv=None):
             else 'ettoday' if args.candidate_embedded_layout in ETTODAY_LAYOUT_VERSIONS else 'maxfinanciallife')
         if (set(groups) != {candidate_provider} or len(args.probe) != 1 or args.retain_reviewed_response
                 or not args.require_current_missing_body_failure
-                or args.failure_code == 'body_not_found' and args.candidate_evidence_contract not in BASTILLE_RESIDENT_EVIDENCE_VERSIONS):
+                or args.failure_code == 'body_not_found' and args.candidate_evidence_contract not in {38, 39, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}):
             parser.error('one_current_reviewed_validation_failure_metadata_only_candidate_required')
         factory = (videoland_candidate_source if candidate_provider == 'videoland'
-            else native_candidate_source if candidate_provider in {'watchmedia', 'pocket', 'bastillepost', 'setn_inews_scope'}
+            else native_candidate_source if candidate_provider in {'watchmedia', 'pocket', 'bastillepost', 'setn_inews_scope', 'gvm', 'contentplatform'}
                 or candidate_provider == 'ettoday' and args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33}
             else ettoday_candidate_source if candidate_provider == 'ettoday' else max_candidate_source)
         candidate = factory(config, registry, repo, args.candidate_embedded_layout)

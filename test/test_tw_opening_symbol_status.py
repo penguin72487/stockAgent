@@ -9,6 +9,32 @@ from scripts.audit_tw_opening_symbol_status import classify_symbols, receipt_sna
 from scripts import audit_tw_opening_symbol_status as audit
 
 
+def test_symbol_cli_keeps_unknowns_on_closed_day_and_skips_unneeded_refresh(tmp_path, monkeypatch):
+    from stockagent.live import market_config
+
+    receipt, official = fixtures()
+    source, output = tmp_path / "receipt.json", tmp_path / "audit.json"
+    source.write_text(json.dumps(receipt))
+    expected = classify_symbols(receipt, official)
+    source_before = source.read_bytes()
+    cfg = market_config.LiveMarketConfig(market="A", label="A", config_path="unused",
+        day_trade_simulation_enabled=True, holidays=(receipt["session_date"],))
+    monkeypatch.setattr(market_config, "load_market_configs", lambda _: {"A": cfg})
+    monkeypatch.setattr(audit, "load_current_universe", lambda _: official)
+    def unexpected_provider(*args, **kwargs):
+        raise AssertionError("a verified closure must not trigger a full quote refresh")
+    monkeypatch.setattr(audit.quotes, "fetch_tw_mis_last_prices", unexpected_provider)
+    monkeypatch.setattr(audit.sys, "argv", ["audit", "--receipt", str(source),
+        "--output", str(output), "--refresh-unknown-mis"])
+    assert audit.main() == 0
+    report = json.loads(output.read_text())
+    assert all(report[key] == value for key, value in expected.items())
+    assert report["session_applicability"]["state"] == "not_applicable_closed"
+    assert report["provider_requests_requested"] and not report["provider_requests_enabled"]
+    assert report["fresh_mis"] == {"state": "skipped_verified_calendar_closed", "provider_requests": 0}
+    assert source.read_bytes() == source_before and not report["production_ledger_modified"]
+
+
 def test_journal_deadlines_keep_all_symbols_early_failures_and_late_recovery(tmp_path):
     receipt, official = fixtures()
     gate = datetime.fromisoformat("2026-10-22T09:00:00+08:00")
@@ -147,6 +173,59 @@ def test_invalid_state_late_in_event_cannot_publish_earlier_symbols(tmp_path):
     result = audit.journal_symbol_timeline(path, receipt, official)
     assert result["journal_prefix"]["malformed_lines"] == [1]
     assert all(row["first_valid_open_after_open_ms"] is None for row in result["symbols"])
+
+
+@pytest.mark.parametrize("project_headers", [False, True])
+@pytest.mark.parametrize("received,validated,reason,gap_ms", [
+    ("2026-10-22T09:00:00.100+08:00", "2026-10-22T09:00:00.400+08:00",
+     "full_market_validation_after_event", 200.0),
+    ("2026-10-22T09:00:00.300+08:00", "2026-10-22T09:00:00.150+08:00",
+     "full_market_receive_after_validation", 150.0),
+    ("2026-10-22T08:59:59.900+08:00", "2026-10-22T09:00:00.150+08:00",
+     "preopen_full_market_receipt", None),
+    ("2026-10-22T09:00:00.100", "2026-10-22T09:00:00.150+08:00",
+     "naive_full_market_clock", None),
+    ("2026-10-22T09:00:00.100+08:00", "2026-10-22T09:00:00.150",
+     "naive_full_market_clock", None),
+])
+def test_full_market_clock_rejection_is_diagnostic_not_a_repaired_observation(
+    tmp_path, project_headers, received, validated, reason, gap_ms,
+):
+    receipt, official = fixtures()
+    row = {"session_date": receipt["session_date"], "provider": "finmind_snapshot",
+        "event": "provider_snapshot", "observed_at_taipei": "2026-10-22T09:00:00.200+08:00",
+        "coverage": {"contract": "finmind_unfiltered_market_snapshot_coverage_v1",
+            "received_at_taipei": received, "validated_at_taipei": validated,
+            "valid_open_symbols": ["OPEN"], "rejected_symbols": {"no_positive_volume_rows": ["ZERO"]}}}
+    path = tmp_path / "journal.jsonl"
+    original = (json.dumps(row) + "\n").encode()
+    path.write_bytes(original)
+    result = audit.journal_symbol_timeline(path, receipt, official, project_headers=project_headers)
+    diagnostic = {"line": 1, "reason": reason}
+    if gap_ms is not None:
+        diagnostic["clock_order_gap_ms"] = gap_ms
+    assert result["contract"] == "official_axis_opening_symbol_deadlines_v3"
+    assert result["state"] == "degraded"
+    assert result["journal_prefix"]["malformed_lines"] == [1]
+    assert result["journal_prefix"]["invalid_event_diagnostics"] == [diagnostic]
+    assert all(row["first_valid_open_after_open_ms"] is None for row in result["symbols"])
+    assert all(row["deadlines"]["11000"]["state"] == "unknown" for row in result["symbols"])
+    with pytest.raises(ValueError, match="verified journal generation"):
+        audit.journal_reference_receipt(receipt, result, 11000)
+    assert path.read_bytes() == original, "do not repair clocks or rewrite source evidence"
+
+
+def test_rejection_diagnostics_distinguish_partial_line_without_exposing_payload(tmp_path):
+    receipt, official = fixtures()
+    path = tmp_path / "journal.jsonl"
+    bad_clock = {"session_date": receipt["session_date"], "provider": "mis", "event": "unknown",
+        "observed_at_taipei": "invalid-clock", "private": "do-not-expose"}
+    path.write_bytes((json.dumps(bad_clock) + '\n{"unfinished":').encode())
+    result = audit.journal_symbol_timeline(path, receipt, official)
+    diagnostics = result["journal_prefix"]["invalid_event_diagnostics"]
+    assert diagnostics == [{"line": 1, "reason": "invalid_event"},
+                           {"line": 2, "reason": "partial_journal_line"}]
+    assert "do-not-expose" not in json.dumps(diagnostics)
 
 
 def test_projected_headers_retain_full_decoder_error_semantics(tmp_path):

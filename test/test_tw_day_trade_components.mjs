@@ -126,6 +126,37 @@ test("withheld public quotes remain pending without inventing zero notional or u
   assert.doesNotMatch(html, /class="negative">開盤計價/);
 });
 
+test("progressive targets show actual inventory without attributing old fills to the new decision", () => {
+  const {view} = components({formatOverrides: {number: (value) => String(value ?? 0)}});
+  const row = {symbol: "2330", target_weight: .2, requested_shares: 0, filled_shares: 0,
+    reduction_filled_shares: 2000, current_target_inventory: {
+      signed_shares: 2000, target_signed_shares: 2000, signal_revision: 3, cohort_count: 1}};
+  const html = view.signalRow(row);
+  assert.match(html, /版本 3 · 庫存 2000 股／目標 2000 股/);
+  assert.match(html, /本版增倉成交 0 股 · 減倉成交 2000 股/);
+  assert.match(html, /本版無增倉成交；既有成交與費用另行保留/);
+  assert.doesNotMatch(html, /未成交不納入|0 股紙上成交/);
+  assert.match(view.signalRow({...row, target_weight: 0}), /零目標・減倉至零/);
+  assert.match(view.signalRow({...row, current_target_inventory: {
+    ...row.current_target_inventory, target_signed_shares: null}}), /目標 待取價/);
+});
+
+test("progressive completion follows inventory deltas rather than addition-only fill counts", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("  const revisionHtml ="), app.indexOf('  setHtml("signal-direction-summary"'));
+  const row = {market: "unit", day_trade_signal_update_policy: "progressive_open_reference_rebalance_v1",
+    opening_signal_revision: {index: 2}, inventory_rebalance: {
+      contract_valid: true, target_complete: false, remaining_delta_shares: 2000, unresolved_symbol_count: 1}};
+  const context = vm.createContext({snapshot: {modes: [row]}, esc: String, strategyLabel: String,
+    number: String, shortTime: String});
+  vm.runInContext(`function render() { ${source}\n return revisionHtml; }`, context);
+  assert.match(context.render(), /庫存仍差 2000 股 · 1 檔待取價/);
+  row.inventory_rebalance.target_complete = "not-a-boolean";
+  assert.doesNotMatch(context.render(), /實際庫存已達本版完整目標/);
+  row.inventory_rebalance.target_complete = true;
+  assert.match(context.render(), /實際庫存已達本版完整目標/);
+});
+
 test("price withholding does not turn a closed day-trade or overnight position into an open position", () => {
   for (const product of ["tw_day_trade", "tw_overnight"]) {
     const {view} = components({product});

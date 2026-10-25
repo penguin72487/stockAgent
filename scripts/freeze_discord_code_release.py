@@ -17,11 +17,20 @@ from downloader.artifact_io import atomic_write_json
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify", type=Path)
+    parser.add_argument("--base-release", type=Path,
+                        help="Derive from this verified compatible release, not the entire development tree")
+    parser.add_argument("--include-source", action="append", default=[],
+                        help="Explicit source member to overlay from the current workspace; repeat for each reviewed file")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.verify and (args.base_release or args.include_source):
+        parser.error("verify and source overlays are separate operations")
+    if bool(args.base_release) != bool(args.include_source):
+        parser.error("base-release and at least one include-source are required together")
     if args.output.exists():
         raise FileExistsError("preserve source release preparation evidence")
-    receipt = args.verify or freeze_source(ROOT, ROOT / "artifacts/operations/service_code_releases")
+    receipt = args.verify or freeze_source(ROOT, ROOT / "artifacts/operations/service_code_releases",
+        base_receipt=args.base_release, include_sources=tuple(args.include_source))
     proof = verify_frozen_source(receipt, ROOT)
     native = namespace_identity(receipt, ROOT)
     result = {"status": "prepared_not_adopted", "release": proof, "namespace_identity": native,

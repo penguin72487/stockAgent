@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
 
@@ -9,6 +9,8 @@ from downloader.finmind_queue_indexes import STATUS_COLUMNS, STATUS_INDEX, dispa
 from downloader.finmind_queue_indexes import (
     RELEASE_RESERVE_INDEX, RELEASE_RESERVE_COLUMNS, ensure_release_reserve_index, release_reserve_index,
     PERIODIC_INDEX, PERIODIC_COLUMNS, ensure_periodic_index, periodic_index,
+    ETA_WORK_INDEX, ETA_RECENT_INDEX, ETA_WORK_COLUMNS, ETA_RECENT_COLUMNS,
+    ensure_eta_read_indexes, eta_work_index, eta_recent_index,
 )
 from scripts.benchmark_finmind_status import AGGREGATE_SQL, claim_release, main
 
@@ -29,6 +31,102 @@ def test_index_is_idempotent_and_changes_no_rows_or_triggers(tmp_path):
         assert tuple(row[2] for row in columns) == STATUS_COLUMNS
         assert any("COVERING INDEX " + STATUS_INDEX in row[3]
                    for row in connection.execute("EXPLAIN QUERY PLAN " + AGGREGATE_SQL))
+
+
+def test_eta_covering_reads_preserve_due_classes_nulls_and_recent_time_bounds(tmp_path):
+    from downloader import finmind_eta_work as work, finmind_eta_telemetry as telemetry
+
+    now = datetime(2026, 10, 24, tzinfo=UTC)
+    root = tmp_path / "complement"
+    root.mkdir()
+    with worker._db(root / "queue.sqlite3") as connection:
+        states = ("pending", "complete", "observed_empty", "failed", "inflight", "retry_exhausted",
+                  "disabled", "non_session", "not_entitled")
+        dates = (None, now - timedelta(days=8), now - timedelta(minutes=1), now, now + timedelta(seconds=1))
+        for i, state in enumerate(states):
+            for j, stamp in enumerate(dates):
+                connection.execute("INSERT INTO tasks(dataset,data_id,partition,kind,priority,state,"
+                                   "last_attempt_at_utc,next_attempt_at_utc,rows,bytes) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                                   ("USStockPriceMinute", str(i), str(j), "id_day" if j % 2 else "derived",
+                                    0 if i % 2 else 12, state, stamp.isoformat() if stamp else None,
+                                    stamp.isoformat() if stamp else None, 2**40 if j % 2 else 0, 2**42))
+        connection.commit()
+        for index in (ETA_WORK_INDEX, ETA_RECENT_INDEX):
+            connection.execute(f"DROP INDEX {index}")
+        before_work = work._queue(root / "queue.sqlite3", "complement", now)
+        before_recent = telemetry._queue_worker(root, "complement", now)
+        changes = connection.total_changes
+        ensure_eta_read_indexes(connection)
+        ensure_eta_read_indexes(connection)
+        connection.commit()
+        assert connection.total_changes == changes
+        assert work._queue(root / "queue.sqlite3", "complement", now) == before_work
+        assert telemetry._queue_worker(root, "complement", now) == before_recent
+        for index, columns in ((ETA_WORK_INDEX, ETA_WORK_COLUMNS), (ETA_RECENT_INDEX, ETA_RECENT_COLUMNS)):
+            assert tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index})")) == columns
+        plan = list(connection.execute("EXPLAIN QUERY PLAN SELECT state,kind,sum(rows),sum(bytes) "
+                                       f"FROM tasks{eta_recent_index(connection)} "
+                                       "WHERE last_attempt_at_utc>? AND last_attempt_at_utc<=? GROUP BY state,kind",
+                                       (dates[1].isoformat(), now.isoformat())))
+        assert any(f"COVERING INDEX {ETA_RECENT_INDEX}" in row[3]
+                   and "last_attempt_at_utc>? AND last_attempt_at_utc<?" in row[3] for row in plan)
+        inventory = list(connection.execute("EXPLAIN QUERY PLAN SELECT dataset,kind,priority,state,"
+                                           "count(*),min(next_attempt_at_utc),max(next_attempt_at_utc) "
+                                           f"FROM tasks{eta_work_index(connection)} GROUP BY 1,2,3,4"))
+        assert any(f"COVERING INDEX {ETA_WORK_INDEX}" in row[3] for row in inventory)
+        from downloader.finmind_runtime import optimize_queue
+        from scripts.reload_finmind_at_idle import eta_projection_readback
+        optimize_queue(connection)
+        assert eta_projection_readback(connection, now)
+        # An exact-schema hint cannot trust only a matching index name.
+        for index, reader in ((ETA_WORK_INDEX, eta_work_index), (ETA_RECENT_INDEX, eta_recent_index)):
+            connection.execute(f"DROP INDEX {index}")
+            assert reader(connection) == ""
+            connection.execute(f"CREATE INDEX {index} ON tasks(dataset)")
+            assert reader(connection) == ""
+        assert eta_projection_readback(connection, now) is None
+        assert work._queue(root / "queue.sqlite3", "complement", now) == before_work
+        assert telemetry._queue_worker(root, "complement", now) == before_recent
+
+
+def test_eta_cohort_range_counts_match_all_null_keys_and_avoid_per_row_grouping():
+    from downloader.finmind_eta_work import _indexed_work_rows
+    from itertools import product
+
+    now = datetime(2026, 10, 24, tzinfo=UTC)
+    with sqlite3.connect(':memory:') as connection:
+        connection.execute('CREATE TABLE tasks(dataset TEXT,kind TEXT,priority INTEGER,state TEXT,'
+                           'next_attempt_at_utc TEXT,last_attempt_at_utc TEXT,rows INTEGER,bytes INTEGER)')
+        for dataset, kind, priority, state, stamp in product(
+                (None, 'D'), (None, 'id_day'), (None, 0, 12), (None, 'pending', 'complete'),
+                (None, (now-timedelta(seconds=1)).isoformat(), now.isoformat(),
+                 (now+timedelta(seconds=1)).isoformat(), 'invalid')):
+            connection.execute('INSERT INTO tasks(dataset,kind,priority,state,next_attempt_at_utc) VALUES (?,?,?,?,?)',
+                               (dataset, kind, priority, state, stamp))
+        ensure_eta_read_indexes(connection)
+        hint = eta_work_index(connection)
+        query = ('SELECT dataset,kind,priority,state,CASE WHEN (state=\'pending\' AND next_attempt_at_utc IS NULL) '
+                 'OR next_attempt_at_utc<=? THEN 1 ELSE 0 END,count(*),min(next_attempt_at_utc),'
+                 f'max(next_attempt_at_utc),count(next_attempt_at_utc) FROM tasks{hint} '
+                 'GROUP BY dataset,kind,priority,state,5')
+        expected = list(connection.execute(query, (now.isoformat(),)))
+        changes = connection.total_changes
+        assert list(_indexed_work_rows(connection, now, hint)) == expected
+        assert connection.total_changes == changes
+        connection.execute('DELETE FROM tasks')
+        connection.executemany('INSERT INTO tasks(dataset,kind,priority,state,next_attempt_at_utc) VALUES (?,?,?,?,?)',
+                               [('D', 'id_day', 12, 'complete', now.isoformat())] * 10000)
+        connection.execute('ANALYZE')
+        counts, results = [], []
+        for optimized in (False, True):
+            steps = []
+            connection.set_progress_handler(lambda: steps.append(1) or 0, 100)
+            results.append(list(_indexed_work_rows(connection, now, hint)) if optimized else
+                           list(connection.execute(query, (now.isoformat(),))))
+            connection.set_progress_handler(None, 0)
+            counts.append(len(steps))
+        assert results[0] == results[1]
+        assert counts[0] > 3 * counts[1]
 
 
 def test_release_projection_is_exact_read_only_hint_and_legacy_safe(tmp_path):

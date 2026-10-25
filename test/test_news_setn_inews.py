@@ -471,7 +471,11 @@ def test_received_failure_keeps_new_context_in_the_old_daily_budget_without_acce
 
 
 def test_diagnostic_regression_cases_cover_every_registered_native_layout():
-    assert {factory()['embedded_article_layout'] for factory in (entry,v2_entry,v3_entry,v4_entry,v5_entry,v6_entry,v7_entry,v8_entry)} == set(INEWS_LAYOUT_VERSIONS)
+    entries = [factory() for factory in (entry,v2_entry,v3_entry,v4_entry,v5_entry,v6_entry,v7_entry,v8_entry)]
+    entries.append({**v8_entry(), 'embedded_article_layout':'setn_inews_native_article_v9'})
+    entries.append({**v8_entry(), 'embedded_article_layout':'setn_inews_native_article_v10'})
+    entries.append({**v8_entry(), 'embedded_article_layout':'setn_inews_native_article_v11'})
+    assert {item['embedded_article_layout'] for item in entries} == set(INEWS_LAYOUT_VERSIONS)
 
 
 def test_native_diagnostic_upgrade_does_not_refill_the_same_day_budget(tmp_path, monkeypatch):

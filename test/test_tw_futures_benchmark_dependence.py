@@ -1,12 +1,14 @@
 """Return dependence must use the right units, dates and physical action axis."""
 from datetime import date
+import io
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from scripts.analyze_tw_futures_benchmark_dependence import (
-    aligned_comparison, dependence, product_scope,
+    aligned_comparison, dependence, product_scope, read_product_scope_table,
 )
 
 
@@ -67,3 +69,15 @@ def test_physical_slot_identity_is_one_based_and_reconciles_every_position():
         product_scope(days, q, pa.Table.from_pylist(rows[:1] + rows[2:]))
     with pytest.raises(ValueError, match='duplicate'):
         product_scope(days, q, pa.Table.from_pylist(rows + rows[:1]))
+
+
+@pytest.mark.parametrize('name', [None, '臺股期貨'])
+def test_product_scope_accepts_new_physical_schema_without_display_names(name):
+    row = dict(date=date(2026, 1, 2), portfolio_slot=1, product='TX', executable=True)
+    if name is not None:
+        row['product_name'] = name
+    payload = io.BytesIO()
+    pq.write_table(pa.Table.from_pylist([row]), payload)
+    table = read_product_scope_table(payload.getvalue())
+    result = product_scope(np.array(['2026-01-02'], dtype='datetime64[D]'), np.array([[1]]), table)
+    assert result['held_products']['TX']['name'] == (name or 'TX')

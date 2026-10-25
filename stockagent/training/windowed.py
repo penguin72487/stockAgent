@@ -353,6 +353,13 @@ class WindowedSplitTensors:
                 + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
                 + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
                 + len(OPENING_REFERENCE_FEATURES),
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
+                + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS) + 1,
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
+                + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS) + 1
+                + len(OPENING_REFERENCE_FEATURES),
             }
             if (
                 self.derivative_candidate_features is None

@@ -84,6 +84,51 @@ def test_same_files_move_and_idempotent_receipts_preserve_inodes(example):
     assert layout.apply_plan(fixed, state)["state"] == "complete"
 
 
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_prepared_data_move_preserves_receipts_and_recovers_alias_intent(example, interrupted):
+    root, _, _, _, state = example
+    source = root / 'artifacts/data_preparation/futures-v1'
+    source.mkdir(parents=True)
+    (source / 'manifest.json').write_text('{"original": true}')
+    inode = (source / 'manifest.json').stat().st_ino
+    destination = root / 'data_tw_index_futures/training_prepared/futures-v1'
+    move = dict(source=str(source.relative_to(root)), destination=str(destination.relative_to(root)),
+                role='prepared', compatibility_alias=True)
+    fixed = layout.plan(root, [move])
+    if interrupted:
+        destination.parent.mkdir(parents=True)
+        source.rename(destination)
+        source.symlink_to(destination, target_is_directory=True)
+    result = layout.apply_plan(fixed, state)
+    assert result['state'] == 'complete'
+    assert source.is_symlink() and source.resolve() == destination
+    assert (source / 'manifest.json').read_text() == '{"original": true}'
+    assert (destination / 'manifest.json').stat().st_ino == inode
+    assert layout.apply_plan(fixed, state)['state'] == 'complete'
+
+
+def test_completed_benchmark_alias_is_removed_without_following_payload(example):
+    root, _, _, _, state = example
+    destination = root / 'artifacts/benchmarks/suite/_capacity/case/training'
+    destination.mkdir(parents=True)
+    (destination / 'checkpoint.pt').write_bytes(b'owned engineering checkpoint')
+    source = root / 'artifacts/benchmarks/suite/case'
+    source.symlink_to(destination, target_is_directory=True)
+    fixed = layout.plan(root, [dict(source=str(source.relative_to(root)),
+        destination=str(destination.relative_to(root)), role='benchmark', action='remove-alias')])
+    assert layout.apply_plan(fixed, state)['state'] == 'complete'
+    assert not source.exists() and not source.is_symlink()
+    assert (destination / 'checkpoint.pt').read_bytes() == b'owned engineering checkpoint'
+
+
+@pytest.mark.parametrize('destination', ['artifacts/markets/result', 'data_/../escape', 'data_fake'])
+def test_prepared_relocation_rejects_unsafe_destinations(example, destination):
+    root, _, _, _, _ = example
+    with pytest.raises(SnapshotError):
+        layout.validate_moves([dict(source='artifacts/data_preparation/futures',
+                                   destination=destination, role='prepared', compatibility_alias=True)])
+
+
 def test_busy_source_does_not_block_independent_move_and_retries(example, monkeypatch):
     root, a, b, moves, state = example
     fixed = layout.plan(root, moves)

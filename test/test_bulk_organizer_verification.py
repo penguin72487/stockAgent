@@ -213,6 +213,117 @@ def test_false_recovery_receipt_never_enters_source_retirement(tmp_path, monkeyp
                            {"scope": "cache", "compressed_sha256": "a" * 64})
 
 
+@pytest.mark.parametrize("recovery_fails", [False, True])
+def test_stale_inode_proof_requires_complete_recovery_and_preserves_old_evidence(
+        tmp_path, monkeypatch, recovery_fails):
+    index = {"compressed_sha256": "a" * 64}
+    (tmp_path / "cache.original-index.json").write_text(json.dumps(index))
+    proof = {"dataset": "exact", "snapshot_id": "fixed", "manifest_sha256": "b" * 64,
+             "cold_verified": True, "decoded_originals_verified": True, "verified_at_epoch": 1}
+    proof_path = tmp_path / "cache.cold-proof.json"
+    proof_path.write_text(json.dumps(proof))
+    original_bytes = proof_path.read_bytes()
+    refreshed = {**proof, "verified_at_epoch": 2}
+    calls = []
+
+    def retained(received):
+        calls.append(("inode", received["verified_at_epoch"]))
+        if received == proof:
+            raise organizer.PreservationProofExpired("changed after independent decode")
+
+    def recover(publication, originals, **kwargs):
+        assert publication == proof and originals == index
+        calls.append(("complete_recovery", publication["snapshot_id"]))
+        if recovery_fails:
+            raise SnapshotError("canonical original decode differs")
+        return refreshed
+
+    def retire(*args):
+        assert args[4] == refreshed
+        assert json.loads(proof_path.read_bytes()) == refreshed
+        calls.append(("retire", refreshed["snapshot_id"]))
+        return False
+
+    monkeypatch.setattr(organizer, "verify_retained_proof", retained)
+    monkeypatch.setattr(organizer, "verify_preservation", recover)
+    monkeypatch.setattr(organizer, "retire_roots", retire)
+    monkeypatch.setattr(organizer, "publish_preservation", lambda *_: pytest.fail("republished preserved data"))
+    args, receipt = SimpleNamespace(apply=True, retire=True), {"scope": "cache", "compressed_sha256": "a" * 64}
+    if recovery_fails:
+        with pytest.raises(SnapshotError, match="original decode"):
+            organizer.organize(args, tmp_path, receipt)
+        assert proof_path.read_bytes() == original_bytes
+        assert calls == [("inode", 1), ("complete_recovery", "fixed")]
+    else:
+        assert organizer.organize(args, tmp_path, receipt) is False
+        assert calls == [("inode", 1), ("complete_recovery", "fixed"), ("inode", 2), ("retire", "fixed")]
+    prior = tmp_path / ("cache.cold-proof-" + organizer.digest(proof) + ".json")
+    assert prior.read_bytes() == original_bytes
+
+
+def test_canonical_identity_failure_cannot_refresh_or_retire(tmp_path, monkeypatch):
+    (tmp_path / "cache.original-index.json").write_text(json.dumps({"compressed_sha256": "a" * 64}))
+    proof = {"cold_verified": True, "decoded_originals_verified": True}
+    (tmp_path / "cache.cold-proof.json").write_text(json.dumps(proof))
+
+    def reject(_):
+        raise SnapshotError("canonical identity differs")
+
+    monkeypatch.setattr(organizer, "verify_retained_proof", reject)
+    monkeypatch.setattr(organizer, "verify_preservation", lambda *_: pytest.fail("refreshed invalid identity"))
+    monkeypatch.setattr(organizer, "retire_roots", lambda *_: pytest.fail("retired invalid identity"))
+    with pytest.raises(SnapshotError, match="identity differs"):
+        organizer.organize(SimpleNamespace(apply=True, retire=True), tmp_path,
+                           {"scope": "cache", "compressed_sha256": "a" * 64})
+    assert not list(tmp_path.glob("cache.cold-proof-*.json"))
+
+
+@pytest.mark.parametrize("cohort_code,expected", [(0, 75), (75, 75), (2, 2)])
+def test_remote_inventory_unavailable_defers_without_hiding_cohort_failure(tmp_path, monkeypatch, cohort_code, expected):
+    import sys
+    from scripts import capture_inactive_training_cache as capture
+    from scripts.inventory_remote_training_cache import RemoteCacheInventoryUnavailable
+
+    monkeypatch.setattr(organizer, "COORDINATOR_LOCK", tmp_path / "owner.lock")
+    monkeypatch.setattr(organizer, "COORDINATOR_STATUS", tmp_path / "private/status.json")
+    monkeypatch.setattr(organizer, "native_guard", lambda: None)
+    monkeypatch.setattr(organizer.socket, "gethostname", lambda: "penguin")
+    monkeypatch.setattr(organizer.os, "umask", lambda *_: 0o022)
+    monkeypatch.setattr(organizer, "received_batches", lambda: [])
+    monkeypatch.setattr(organizer, "run_batches", lambda *_: cohort_code)
+    monkeypatch.setattr(sys, "argv", ["organizer", "--apply", "--retire", "--capture-inactive-caches"])
+
+    def disconnected(*_):
+        raise RemoteCacheInventoryUnavailable("private SSH failure")
+
+    monkeypatch.setattr(capture, "capture", disconnected)
+    assert organizer.main() == expected
+    status = json.loads(organizer.COORDINATOR_STATUS.read_bytes())
+    assert status["exit_code"] == expected and status["full_history_verified"] is False
+    deferred = json.loads((organizer.COORDINATOR_STATUS.parent / "remote-inventory-deferred.json").read_bytes())
+    assert deferred["cohort_exit_code"] == cohort_code and deferred["source_deleted"] is False
+    assert "private SSH failure" not in json.dumps(deferred)
+
+
+@pytest.mark.parametrize("exit_code", [255, 1])
+def test_inventory_transport_failure_is_typed_and_private(tmp_path, monkeypatch, exit_code):
+    from scripts import inventory_remote_training_cache as inventory
+
+    monkeypatch.setattr(inventory.subprocess, "run", lambda *_, **__: SimpleNamespace(
+        returncode=exit_code, stdout="", stderr="private transport diagnostic"))
+    args = SimpleNamespace(output=tmp_path / "inventory.json", identity_file=tmp_path / "identity",
+                           ssh_target="root@host", ssh_port=22)
+    args.identity_file.write_text("engineering identity fixture; no real SSH call")
+    args.identity_file.chmod(0o600)
+    expected = inventory.RemoteCacheInventoryUnavailable if exit_code == 255 else RuntimeError
+    with pytest.raises(expected) as caught:
+        inventory.observe(args)
+    assert isinstance(caught.value, inventory.RemoteCacheInventoryUnavailable) == (exit_code == 255)
+    assert "private transport diagnostic" not in str(caught.value)
+    assert not args.output.exists()
+    assert json.loads(args.output.with_suffix(".error.json").read_bytes())["stderr"] == "private transport diagnostic"
+
+
 def test_busy_publication_owner_defers_without_ignoring_next_batch(tmp_path, monkeypatch):
     (tmp_path / "cache.original-index.json").write_text(json.dumps({"compressed_sha256": "a" * 64}))
     @contextmanager

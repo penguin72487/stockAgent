@@ -172,8 +172,10 @@ function rowNode(row) {
   const storage = make("td");
   storage.dataset.label = "實存資料";
   storage.append(make("strong", "source-name", sourceCount(row.record_stats)),
-    make("span", "cell-note", `最早：${sourceDate(row.record_stats?.first, row.record_stats)}`),
-    make("span", "cell-note", `最新：${sourceDate(row.record_stats?.last, row.record_stats)}`));
+    make("span", "cell-note", `最早：${sourceDate(row.record_stats?.earliest_date ?? row.record_stats?.first, row.record_stats)}`),
+    make("span", "cell-note", `最新：${sourceDate(row.record_stats?.latest_date ?? row.record_stats?.last, row.record_stats)}`));
+  if (numeric(row.record_stats?.days) !== null) storage.append(make("span", "cell-note",
+    `實際有資料：${integer(row.record_stats.days)} 天`));
   if (numeric(row.record_stats?.files_total) !== null) storage.append(make("span", "cell-note",
     `檔案核實 ${integer(row.record_stats.files_inspected)}/${integer(row.record_stats.files_total)}`));
   const schedule = make("td");

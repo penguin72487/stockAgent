@@ -21,6 +21,7 @@ from downloader.finmind_account import backfill_budget
 from downloader.finmind_scheduling import incremental_reservation
 from downloader.finmind_history_order import BY_DATASET, STAGES
 from downloader.finmind_eta_work import QueueAggregateSnapshot
+from downloader.finmind_queue_indexes import eta_recent_index
 
 
 WINDOWS = {"15m": 900, "1h": 3600, "24h": 86400, "7d": 604800}
@@ -251,8 +252,9 @@ def _queue_worker(root: Path, owner: str, now: datetime, *,
         with _connect(path) as connection:
             result["queue_states"] = (dict(snapshot.states) if snapshot and snapshot.matches(path, now)
                                       else dict(connection.execute("SELECT state,count(*) FROM tasks GROUP BY state")))
-            # Four windows in one bounded scan. Queues can have hundreds of
-            # thousands of rows and are not indexed by last_attempt_at_utc.
+            # Four windows share one observation-time range seek. The owner
+            # maintains the covering index; legacy queues retain their plan.
+            recent_index = eta_recent_index(connection)
             measures = ",".join(
                 "sum(CASE WHEN last_attempt_at_utc>? THEN 1 ELSE 0 END),"
                 "sum(CASE WHEN last_attempt_at_utc>? THEN rows ELSE 0 END),"
@@ -264,7 +266,7 @@ def _queue_worker(root: Path, owner: str, now: datetime, *,
                 for seconds in WINDOWS.values() for _ in range(3)
             ] + [(now - timedelta(days=7)).isoformat(), now.isoformat()]
             all_windows = list(connection.execute(
-                f"SELECT state,kind,{measures} FROM tasks "
+                f"SELECT state,kind,{measures} FROM tasks{recent_index} "
                 "WHERE last_attempt_at_utc>? AND last_attempt_at_utc<=? GROUP BY state,kind",
                 parameters,
             ))
@@ -283,7 +285,7 @@ def _queue_worker(root: Path, owner: str, now: datetime, *,
                     "not_a_network_completion_count": True,
                 }
             result["last_attempt_at_utc"] = connection.execute(
-                "SELECT max(last_attempt_at_utc) FROM tasks WHERE last_attempt_at_utc<=?",
+                f"SELECT max(last_attempt_at_utc) FROM tasks{recent_index} WHERE last_attempt_at_utc<=?",
                 (now.isoformat(),),
             ).fetchone()[0]
             table = {"sponsor": "request_batch_failure_audit",

@@ -162,10 +162,21 @@ $drive=[System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($base))
 @{free_bytes=[int64]$drive.AvailableFreeSpace;distribution=$distribution} | ConvertTo-Json -Compress
 }""" + " '" + distro + "'"
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
-    from stockagent.data_sync.windows_cold_io import retryable_interop_startup
+    from stockagent.data_sync.windows_cold_io import (
+        _windows_process_environment, retryable_interop_startup,
+    )
+    # An unattended init alias can exist while its Windows process context
+    # rejects launches. Use the same bounded, verified bridge as native I/O;
+    # never mutate the global environment of concurrent recovery activities.
+    try:
+        native_environment = _windows_process_environment()
+    except SnapshotError as error:
+        raise ValueError("actual Windows backing-drive capacity is unavailable: no-verified-interop") from error
+    if native_environment is None:
+        raise ValueError("actual Windows backing-drive capacity is unavailable: no-verified-interop")
     for attempt in range(3):
         result = subprocess.run([configuration["powershell"], "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                                 encoded], capture_output=True, timeout=30)
+                                 encoded], capture_output=True, timeout=30, env=native_environment)
         if not result.returncode:
             break
         if attempt < 2 and not result.stdout and retryable_interop_startup(result.stderr):

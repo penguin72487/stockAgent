@@ -7,7 +7,7 @@ ledger, or broker order. Its midday/hot-cache timing is NOT a 09:00 latency.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import fcntl
 import hashlib
 import json
@@ -41,6 +41,47 @@ def quote_session_phase(observed_at: datetime) -> str:
     seconds = local.hour * 3600 + local.minute * 60 + local.second
     return ("preopen" if seconds < 9 * 3600 else "opening" if seconds < 9 * 3600 + 60
             else "intraday" if seconds < 13 * 3600 + 30 * 60 else "postclose")
+
+
+def opening_session_context(configs, session_date: str, *, observed_at: datetime | None = None) -> dict:
+    """Calendar applicability, separate from untouched source/fill diagnostics.
+
+    A registry's membership is not proof that its market opened. In particular,
+    annual schedules may miss an emergency closure already recorded in the
+    canonical market configuration. Current configuration is NOT a historical
+    owner attestation, nor does scheduled-open prove actual trading occurred.
+    """
+    from stockagent.live.market_status import tw_stock_day_decision
+
+    day = date.fromisoformat(session_date)
+    now = observed_at or datetime.now(ZoneInfo("Asia/Taipei"))
+    if now.tzinfo is None:
+        raise ValueError("opening session applicability requires an aware clock")
+    configs = list(configs)
+    if not configs or len({cfg.market for cfg in configs}) != len(configs):
+        raise ValueError("opening session applicability requires a nonempty unique mode scope")
+    decisions = {}
+    for cfg in sorted(configs, key=lambda cfg: cfg.market):
+        rule_root = Path(cfg.day_trade_rule_data_dir or "data_tw_public")
+        holidays = tuple(cfg.holidays)
+        decision = tw_stock_day_decision(day, holidays, parquet_root=rule_root, observed=now)
+        projection = {"market": cfg.market, "rule_data_dir": str(rule_root), "holidays": list(holidays)}
+        decisions[cfg.market] = {"status": decision.status, "reason": decision.reason,
+            "configured_holiday": session_date in holidays,
+            "configuration_projection": projection,
+            "configuration_projection_sha256": hashlib.sha256(
+                json.dumps(projection, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+    statuses = {row["status"] for row in decisions.values()}
+    eligible = False if statuses == {"closed"} else True if statuses <= {"actual_open", "scheduled_open"} else None
+    return {"contract": "opening_session_applicability_v1", "session_date": session_date,
+        "evaluated_at_taipei": now.astimezone(ZoneInfo("Asia/Taipei")).isoformat(),
+        "configuration_basis": "provided_current_configs_not_historical_loaded_owner_attestation",
+        "state": "not_applicable_closed" if eligible is False else
+            "scheduled_session" if eligible is True else "calendar_unverified_or_mixed",
+        "native_opening_latency_sample_eligible": eligible, "market_decisions": decisions,
+        "scheduled_session_is_actual_trading_proof": False,
+        "source_counts_and_original_failures_retained": True,
+        "broker_fill_claim": False}
 
 
 def _source_failure_reasons(job):
@@ -101,6 +142,7 @@ def provider_phase_latency(events, symbols, session_start):
             "full_scope_verified": False, "requested_count": None,
             "first_valid_open_ms": None, "first_observation_response_ms": None,
             "observation_response_coverage_ms": {}, "positive_coverage_ms": {}, "resolved_coverage_ms": {},
+            "all_percent_completion_ms": None,
             "raw_payload_coverage": None,
             "source_total_ms": None, "source_and_persistence_ms": None,
             "coverage_evidence": "missing_per_job_coverage_not_zero"})
@@ -112,6 +154,9 @@ def provider_phase_latency(events, symbols, session_start):
                 full_scope_verified=(row.get("requested_count") == requested_count and (
                     row.get("requested_scope_sha256") == scope_hash or
                     row.get("requested_symbols_sha256") == ordered_hash)))
+            if job["full_scope_verified"]:
+                job["all_percent_completion_ms"] = {field: {str(p): None for p in range(1, 101)}
+                    for field in ("response", "positive_open", "resolved")}
         elif row["event"] == "coverage_progress":
             count = row.get("requested_count")
             positive, no_print, responses = (row.get(field) for field in (
@@ -139,6 +184,15 @@ def provider_phase_latency(events, symbols, session_start):
                     job["positive_coverage_ms"].setdefault(str(fraction), duration)
                 if positive + no_print >= math.ceil(count * fraction):
                     job["resolved_coverage_ms"].setdefault(str(fraction), duration)
+            # Keep all-percent detail only for a proven complete official axis.
+            # Thousands of shrinking model deltas must not balloon this audit
+            # or be mistaken for full-market latency; their legacy spans stay.
+            if job["all_percent_completion_ms"] is not None:
+                for percent in range(1, 101):
+                    threshold = math.ceil(count * percent / 100)
+                    for field, covered in (("response", responses), ("positive_open", positive), ("resolved", positive + no_print)):
+                        if covered >= threshold and job["all_percent_completion_ms"][field][str(percent)] is None:
+                            job["all_percent_completion_ms"][field][str(percent)] = duration
         elif row["event"] == "provider_snapshot":
             coverage = row["coverage"]
             # The full raw response can contain every requested row while
@@ -895,8 +949,12 @@ def main() -> int:
             stats["last"] = row
             if row["status"] == "ready":
                 stats["ready"].append(row)
-    expected_markets = sorted(cfg.market for cfg in bot._market_configs().values()
-        if cfg.day_trade_simulation_enabled and bot._market_enabled(cfg))
+    configured_modes = [cfg for cfg in bot._market_configs().values()
+        if cfg.day_trade_simulation_enabled and bot._market_enabled(cfg)]
+    expected_markets = sorted(cfg.market for cfg in configured_modes)
+    report["session_applicability"] = opening_session_context(configured_modes, args.session_date)
+    if args.infer and report["session_applicability"]["native_opening_latency_sample_eligible"] is not True:
+        parser.error("current-open inference requires a verified scheduled session, not a closed or unknown calendar")
     report["opening_publication_slo"] = opening_publication_slo(
         args.session_date, report["real_opening_attempts"], expected_markets,
     )

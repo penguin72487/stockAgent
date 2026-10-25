@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import time
 
@@ -20,6 +21,43 @@ sys.path.insert(0, str(ROOT))
 from stockagent.data_sync.desync_snapshots import atomic_write_json, resolve_node_id
 from stockagent.data_sync.materialized_cache import process_references_many, _path_is_under
 from stockagent.remote_build import observe_node
+
+
+def filesystem_inventory(paths: list[Path], *, run=subprocess.run) -> dict:
+    """Query mounts/capacity without walking or reading project payloads.
+
+    Paths may share a filesystem; their capacities must not be added. DrvFS
+    reports 9p here; the Windows backing volume format is a separate probe.
+    """
+    rows = []
+    for path in dict.fromkeys(p.absolute() for p in paths):
+        row = {"path": str(path)}
+        try:
+            before = path.stat()
+            space = os.statvfs(path)
+            result = run(["findmnt", "--json", "--target", str(path), "--output", "TARGET,FSTYPE"],
+                         capture_output=True, text=True, timeout=10, check=True)
+            mounts = json.loads(result.stdout)["filesystems"]
+            if (not isinstance(mounts, list) or len(mounts) != 1
+                    or not isinstance(mounts[0], dict)
+                    or not all(isinstance(mounts[0].get(key), str) and mounts[0][key]
+                               for key in ("target", "fstype"))):
+                raise ValueError("mount probe omitted its filesystem identity")
+            if path.stat().st_dev != before.st_dev:
+                raise ValueError("mount changed during observation")
+            row.update(mount=mounts[0], device=before.st_dev,
+                       block_bytes=space.f_frsize, total_bytes=space.f_blocks * space.f_frsize,
+                       free_bytes=space.f_bfree * space.f_frsize,
+                       available_bytes=space.f_bavail * space.f_frsize,
+                       reserved_free_bytes=(space.f_bfree - space.f_bavail) * space.f_frsize,
+                       complete=True)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            row.update(complete=False, error_type=type(error).__name__)
+        rows.append(row)
+    return {"contract": "stockagent.filesystem_observation.v1", "observed_at_epoch": time.time(),
+            "filesystems": rows, "inventory_complete": all(row["complete"] for row in rows),
+            "source_payload_reads": 0, "source_payload_writes": 0, "deletion_authorized": False,
+            "scope": "mounts and statvfs only; repeated filesystems are not summed; not recovery or filesystem repair proof"}
 
 
 def inventory(path: Path, *, max_files: int = 5_000_000) -> dict:
@@ -124,7 +162,13 @@ def main():
     parser.add_argument("--policy", type=Path, default=ROOT / "configs/data_sync/node_storage_roles.json")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--node-id", choices=("penguin", "vastai1T"))
+    parser.add_argument("--filesystems-only", action="store_true",
+                        help="bounded mount/capacity observation; no source or artifact tree scan")
+    parser.add_argument("--filesystem-path", action="append", type=Path,
+                        help="explicit path for --filesystems-only; repeat to inspect multiple mount boundaries")
     args = parser.parse_args()
+    if args.filesystem_path and not args.filesystems_only:
+        parser.error("explicit filesystem paths require --filesystems-only")
     policy = json.loads(args.policy.read_text())
     if policy.get("schema_version") != 1 or policy.get("authority_node_id") != "penguin":
         parser.error("unsupported node role authority/schema")
@@ -132,6 +176,12 @@ def main():
     if actual not in {"penguin", "vastai1T"} or args.node_id and actual != args.node_id:
         parser.error("requested inventory node differs from the local cold identity")
     os.umask(0o077)
+    if args.filesystems_only:
+        value = filesystem_inventory(args.filesystem_path or [ROOT, Path(policy["nodes"][actual]["cold_root"])])
+        value["node_id"] = actual
+        atomic_write_json(args.output, value)
+        print(json.dumps(value, ensure_ascii=False, indent=2))
+        return 0 if value["inventory_complete"] else 75
     value = audit(ROOT, actual, policy)
     atomic_write_json(args.output, value)
     print(json.dumps({k: value[k] for k in ("node_id", "root_count", "inventory_complete", "counts_by_role")}))

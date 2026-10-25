@@ -78,6 +78,22 @@ def test_selected_etfs_keep_etf_bands_instead_of_stock_bands(product):
     ).tolist() == [True, True, True, False]
 
 
+@pytest.mark.parametrize('product', ['NY1', 'SR1'])
+def test_0050_adjusted_etfs_inherit_only_dated_price_family(product):
+    assert price_on_taifex_futures_tick_grid_numpy(
+        np.array([49.99,50.05,50.01]),'2025-06-18',product_codes=product,
+        asset_classes='etf_future').tolist() == [True,True,False]
+    assert taifex_futures_day_session_minutes('2025-07-18',product_code=product,
+        asset_class='etf_future') == (525,825)
+    for day in ['2025-06-17','2026-04-01']:
+        with pytest.raises(ValueError,match='adjusted ETF window'):
+            taifex_futures_tick_size_numpy(np.array([50.]),day,
+                product_codes=product,asset_classes='etf_future')
+    with pytest.raises(ValueError,match='disagree'):
+        taifex_futures_tick_size_numpy(np.array([50.]),'2025-07-18',
+            product_codes=product,asset_classes='stock_future')
+
+
 def test_mixed_product_array_broadcast_and_stock_amendment():
     prices = np.array([[1001., 50.05, 100.05], [1001., 50.05, 100.05]])
     actual = price_on_taifex_futures_tick_grid_numpy(
@@ -138,7 +154,7 @@ def test_float32_input_and_legacy_index_api_keep_existing_contract():
         np.array([12345.]), product_codes="TMF",
     ).item() == 1.
     assert TW_DERIVATIVE_PRICE_CONTRACT_VERSION == 2
-    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 3
+    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 4
 
 
 def test_earlier_registry_extension_keeps_unreviewed_index_and_etf_periods_closed():

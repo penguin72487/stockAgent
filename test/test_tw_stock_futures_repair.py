@@ -68,6 +68,29 @@ def test_repair_tasks_validate_identity_and_bounded_archived_queries():
     assert repair_tasks(inventory, gaps.head(0)) == []
 
 
+def test_official_weekly_monthly_spread_legs_are_not_outright_capacity(tmp_path):
+    raw=tmp_path/'weekly.csv'
+    with raw.open('w',encoding='cp950',newline='') as f:
+        writer=csv.writer(f)
+        writer.writerow(['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段'])
+        writer.writerows([
+            ['2020/11/20','MTX','202011W4',305,13700,13757,13673,13757,'一般'],
+            ['2020/11/20','MTX','202012',1010,13700,13757,13673,13757,'一般'],
+            ['2020/11/20','MTX','202011W4/202012',10,1,1,1,1,'一般'],
+            ['2020/11/20','MTX','202012W0/202012',900,1,1,1,1,'一般'],
+        ])
+    manifest=tmp_path/'source.json'
+    atomic_write_json(manifest,dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
+    keys=pl.DataFrame(dict(date=[date(2020,11,20)]*2,
+        physical_contract=['MTX:202011W4','MTX:202012']))
+    got=official_day_evidence(manifest,keys,tmp_path/'proof').sort('physical_contract')
+    assert got['spread_leg_volume'].to_list()==[10,10]
+    assert got['outright_volume'].to_list()==[295,1000]
+    assert got['official_high'].to_list()==['13757','13757']
+    proof=json.loads((tmp_path/'proof/official_evidence_manifest.json').read_text())
+    assert proof['spread_delivery_contract_version']==2
+
+
 def test_official_zero_spread_only_and_absence_are_independent_of_carried_prices(tmp_path):
     raw = tmp_path/'all.csv'
     columns=['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段','結算價']

@@ -157,6 +157,8 @@ class TaiwanStockContextFuturesPortfolioDaily:
     futures_backtest_contract_version: int = (
         TAIFEX_FUTURES_PORTFOLIO_BACKTEST_CONTRACT_VERSION
     )
+    # False at benchmark inception and before source coverage; zero is not proof.
+    benchmark_observed_returns_mask: np.ndarray | None = None
 
     def execution_tensor(
         self,
@@ -1048,10 +1050,12 @@ def attach_stock_context_futures_portfolio_daily(
         raise ValueError("active TAIFEX rows require finite non-negative fee rates")
 
     if benchmark_mode == TX_FRONT_ROLLING_BENCHMARK_MODE:
-        benchmark = load_tx_front_rolling_benchmark(benchmark_data_path or source_path, dates)[
-            "benchmark_log_returns"
-        ]
+        benchmark_facts = load_tx_front_rolling_benchmark(benchmark_data_path or source_path, dates)
+        benchmark = benchmark_facts["benchmark_log_returns"]
+        benchmark_observed = (benchmark_facts["source_covered"]
+                              & np.isfinite(benchmark_facts["prior_same_contract_close"]))
     elif benchmark_mode == "legacy_front_holding_return":
+        benchmark_observed = None
         benchmark = np.zeros(dates.size, dtype=np.float32)
         benchmark_assigned = np.zeros(dates.size, dtype=bool)
         products = frame["product"].to_numpy()
@@ -1102,6 +1106,7 @@ def attach_stock_context_futures_portfolio_daily(
             close_prices=closes,
             volumes=volumes,
             benchmark_log_returns=benchmark,
+            benchmark_observed_returns_mask=benchmark_observed,
             integer_execution=integer_execution,
             carry_valuation_quarantine_mask=carry_valuation_quarantine,
             expiry_settlement_quarantine_mask=expiry_settlement_quarantine,

@@ -2,6 +2,7 @@
 from datetime import date
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -47,6 +48,72 @@ def test_legacy_reader_keeps_values_schema_and_identity(tmp_path):
     same(parts.read_table(path), value)
     assert parts.source_paths([path]) == [path]
     assert parts.discover_sources(tmp_path) == [path]
+
+
+@pytest.mark.parametrize("rows", [False, True])
+def test_same_snapshot_reuses_verified_footers_and_closes_owned_readers(tmp_path, monkeypatch, rows):
+    path = tmp_path / "source.parquet"
+    value = table().replace_schema_metadata({b"source": b"literal"})
+    write(path, value, **(dict(period="rows", date_column=None, partition_rows=2) if rows else {}))
+    original, observations = pq.ParquetFile, []
+
+    class ObservedFile:
+        def __init__(self, path, **kwargs):
+            self.file = original(path, **kwargs)
+            self.record = {"path": Path(path), "metadata": kwargs.get("metadata"), "closed": False}
+            observations.append(self.record)
+
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.file.close()
+            self.record["closed"] = True
+
+    monkeypatch.setattr(pq, "ParquetFile", ObservedFile)
+    with parts.ParquetSource(path) as source:
+        assert len(observations) == len(source.members)
+        assert all(row["closed"] and row["metadata"] is None for row in observations)
+        same(source.table(), value)
+        same(source.table(columns=["value"]), value.select(["value"]))
+        same(source.table(tail_rows=1), value.slice(value.num_rows - 1))
+        stored = dict(zip(source.members, source._metadata, strict=True))
+        reads = observations[len(source.members):]
+        assert len(reads) == 2 * len(source.members) + 1
+        assert all(row["metadata"] is stored[row["path"]] and row["closed"] for row in reads)
+    # Returned Arrow buffers must survive closing every owned mmap reader.
+    same(parts.read_table(path), value)
+
+
+def test_partition_decode_failure_closes_the_reader_and_preserves_generation(tmp_path, monkeypatch):
+    path = tmp_path / "source.parquet"
+    write(path, table())
+    with parts.ParquetSource(path) as source:
+        original, closed = pq.ParquetFile, []
+
+        class BrokenFile:
+            def __init__(self, path, **kwargs):
+                self.file = original(path, **kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.file.close()
+                closed.append(True)
+
+            def read(self, **kwargs):
+                raise OSError("independent decode failure")
+
+        monkeypatch.setattr(pq, "ParquetFile", BrokenFile)
+        before = source.fingerprints()
+        with pytest.raises(OSError, match="independent decode failure"):
+            source.table()
+        assert closed == [True]
+        assert source.fingerprints() == before
 
 
 def _live_source_keys(root, *, external=None):
@@ -192,6 +259,253 @@ def test_correction_and_deletion_rebuild_only_changed_members(tmp_path):
     result = write(path, changed.slice(0, 2))
     assert result["written_partitions"] == 0
     same(parts.read_table(path), changed.slice(0, 2))
+
+
+def _ordered_rows():
+    # This is an ordered provider index, not a publication/trading clock.
+    bits = np.array([0x8000000000000000, 0x7ff8000000000001,
+                     0x3ff0000000000000, 0xbff0000000000000], dtype=np.uint64)
+    return pa.table({"source_index": ["2024-Q4", "2024-Q4", "other", None],
+        "raw": pa.array(bits.view(np.float64)),
+        "optional": pa.array([None, 0, -1, 2], type=pa.int64())}).replace_schema_metadata(
+            {b"source": b"original", b"raw-index": b"\x00\xff"})
+
+
+def _write_rows(path, value, **kwargs):
+    return write(path, value, period="rows", date_column=None, partition_rows=2, **kwargs)
+
+
+def test_ordered_rows_reuse_closed_members_and_read_old_sealed_generation(tmp_path):
+    path, original = tmp_path / "raw.parquet", _ordered_rows().slice(0, 3)
+    first = _write_rows(path, original)
+    before = json.loads(parts.manifest_path(path).read_bytes())
+    closed = path.parent / before["members"][0]["path"]
+    old_stat = closed.stat()
+    result = _write_rows(path, _ordered_rows())
+    assert result["written_partitions"] == result["reused_partitions"] == 1
+    assert result["written_rows"] == result["reused_rows"] == 2
+    assert (closed.stat().st_ino, closed.stat().st_mtime_ns) == (old_stat.st_ino, old_stat.st_mtime_ns)
+    same(parts.read_table(path), _ordered_rows())
+    same(parts.read_table(first["immutable_manifest"]), original)
+    assert parts.is_partition_manifest(first["immutable_manifest"])
+    with parts.ParquetSource(path) as source:
+        same(source.table(columns=["source_index", "raw"], tail_rows=1),
+             _ordered_rows().select(["source_index", "raw"]).slice(3))
+        assert source.scan().collect().to_dicts()[0]["source_index"] == "2024-Q4"
+        assert result["current_payload_bytes"] == sum(p.stat().st_size for p in source.members)
+
+
+def test_ordered_rows_correction_shrink_and_noop_keep_exact_history(tmp_path):
+    path, original = tmp_path / "raw.parquet", _ordered_rows()
+    first = _write_rows(path, original)
+    changed = original.set_column(2, "optional", pa.array([7, 0, -1, 2], type=pa.int64()))
+    result = _write_rows(path, changed)
+    assert result["written_partitions"] == result["reused_partitions"] == 1
+    same(parts.read_table(path), changed)
+    result = _write_rows(path, changed.slice(0, 2))
+    assert result["written_partitions"] == 0 and result["reused_partitions"] == 1
+    same(parts.read_table(path), changed.slice(0, 2))
+    result = _write_rows(path, changed.slice(0, 2))
+    assert result["written_partitions"] == 0
+    same(parts.read_table(first["immutable_manifest"]), original)
+
+
+@pytest.mark.parametrize("ordered", [False, True])
+def test_verified_noop_preserves_an_already_open_reader_and_needs_no_write_capacity(
+        tmp_path, monkeypatch, ordered):
+    from stockagent.data_sync import cache_capacity
+
+    path = tmp_path / "unchanged.parquet"
+    value, writer = (_ordered_rows(), _write_rows) if ordered else (table(), write)
+    first = writer(path, value)
+    with parts.ParquetSource(path) as reader:
+        before = {p: parts.payload_info(p) for p in [reader.path, *reader.members,
+                  Path(first["immutable_manifest"])]}
+        namespace_before = sorted(reader.path.parent.iterdir())
+
+        def no_capacity(*_args, **_kwargs):
+            pytest.fail("a complete unchanged version must not request new-write capacity")
+
+        monkeypatch.setattr(cache_capacity, "reserve_cache_write", no_capacity)
+        result = writer(path, value)
+        assert result["manifest_changed"] is False
+        assert result["written_payload_bytes"] == result["written_partitions"] == 0
+        assert result["reused_rows"] == value.num_rows
+        assert result["immutable_manifest"] == first["immutable_manifest"]
+        assert {p: parts.payload_info(p) for p in before} == before
+        assert sorted(reader.path.parent.iterdir()) == namespace_before
+        same(reader.table(), value)
+
+
+@pytest.mark.parametrize("change", ["identity", "metadata", "shrink"])
+def test_reused_payload_still_admits_a_changed_manifest_and_retains_the_last_good(
+        tmp_path, monkeypatch, change):
+    from stockagent.data_sync import cache_capacity
+
+    path, value = tmp_path / "source.parquet", _ordered_rows()
+    first = _write_rows(path, value)
+    before = parts.manifest_path(path).read_bytes()
+    original_reserve = cache_capacity.reserve_cache_write
+    reservations = []
+
+    def observe(*args, **kwargs):
+        reservations.append(kwargs["maximum_growth_bytes"])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(cache_capacity, "reserve_cache_write", observe)
+    changed = (value.replace_schema_metadata({b"source": b"new evidence"})
+               if change == "metadata" else value.slice(0, 2) if change == "shrink" else value)
+    kwargs = {"source_identity": {"new_observation": True}} if change == "identity" else {}
+    result = parts.write_partitioned_table(changed, path, period="rows", date_column=None,
+        partition_rows=2, **({"source_identity": {"input": table_content_sha256(changed)}} | kwargs))
+    assert result["manifest_changed"] is True
+    assert len(reservations) == 1
+    assert result["written_payload_bytes"] == result["written_partitions"] == 0
+    assert parts.manifest_path(path).read_bytes() != before
+    same(parts.read_table(path), changed)
+    same(parts.read_table(first["immutable_manifest"]), value)
+
+
+@pytest.mark.parametrize("corrupt", ["member", "archive"])
+def test_noop_still_rejects_corrupt_stored_evidence_before_capacity(tmp_path, monkeypatch, corrupt):
+    from stockagent.data_sync import cache_capacity
+
+    path, value = tmp_path / "corrupt.parquet", table()
+    first = write(path, value)
+    with parts.ParquetSource(path) as source:
+        target = source.members[0] if corrupt == "member" else Path(first["immutable_manifest"])
+    # Do not mutate the hardlinked pointer when exercising the archive proof.
+    if corrupt == "archive":
+        replacement = target.with_name("replacement.json")
+        replacement.write_bytes(b'{"different": true}')
+        replacement.chmod(0o444)
+        replacement.replace(target)
+    else:
+        target.chmod(0o644)
+        target.write_bytes(b"broken immutable original")
+        target.chmod(0o444)
+
+    def no_capacity(*_args, **_kwargs):
+        pytest.fail("invalid prior evidence must fail before a new write reservation")
+
+    monkeypatch.setattr(cache_capacity, "reserve_cache_write", no_capacity)
+    with pytest.raises(ValueError, match="content proof|archive changed"):
+        write(path, value)
+
+
+def test_missing_archive_is_repaired_with_capacity_and_full_previous_proof(tmp_path, monkeypatch):
+    from stockagent.data_sync import cache_capacity
+
+    path, value = tmp_path / "missing-archive.parquet", table()
+    first = write(path, value)
+    Path(first["immutable_manifest"]).unlink()
+    original_reserve = cache_capacity.reserve_cache_write
+    reservations = []
+
+    def observe(*args, **kwargs):
+        reservations.append(kwargs["maximum_growth_bytes"])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(cache_capacity, "reserve_cache_write", observe)
+    result = write(path, value)
+    assert result["manifest_changed"] is True
+    assert len(reservations) == 1
+    assert result["written_payload_bytes"] == 0
+    same(parts.read_table(result["immutable_manifest"]), value)
+
+
+def test_append_capacity_estimate_counts_new_partitions_without_rewriting_history(tmp_path, monkeypatch):
+    from stockagent.data_sync import cache_capacity
+
+    path = tmp_path / "sized.parquet"
+    original = pa.table({"v": pa.array(np.arange(1024, dtype=np.float64))})
+    options = dict(period="rows", date_column=None, partition_rows=1024,
+                   source_identity={"source": "fixed"})
+    parts.write_partitioned_table(original, path, **options)
+    original_reserve = cache_capacity.reserve_cache_write
+    reservations = []
+
+    def observe(*args, **kwargs):
+        reservations.append(kwargs["maximum_growth_bytes"])
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(cache_capacity, "reserve_cache_write", observe)
+    appended = pa.concat_tables([original, pa.table({"v": [123.0]})])
+    result = parts.write_partitioned_table(appended, path, **options)
+    assert result["written_rows"] == 1 and result["reused_rows"] == original.num_rows
+    assert reservations == [3 * 8 + 2 * parts.MAX_MANIFEST_BYTES + 512 * 1024]
+    same(parts.read_table(path), appended)
+
+
+@pytest.mark.parametrize("options", [
+    {"partition_rows": 0}, {"partition_rows": True}, {"partition_rows": 1024**2 + 1},
+    {"date_column": "source_index"}, {"replace_from": date(2024, 1, 1)},
+    {"parquet_options": {"row_group_size": True}},
+    {"parquet_options": {"compression": "invalid"}}, {"parquet_options": ["snappy"]},
+])
+def test_ordered_rows_invalid_contract_fails_before_payload_write(tmp_path, options):
+    path = tmp_path / "raw.parquet"
+    with pytest.raises(ValueError):
+        write(path, _ordered_rows(), **{"period": "rows", "date_column": None,
+            "partition_rows": 2, **options})
+    assert not list(tmp_path.rglob("*.parquet"))
+    assert not parts.manifest_path(path).exists()
+
+
+@pytest.mark.parametrize("failure", ["row_start", "row_count", "archive_name", "archive_writable"])
+def test_ordered_rows_rejects_incomplete_members_and_misidentified_archive(tmp_path, failure):
+    path = tmp_path / "raw.parquet"
+    result = _write_rows(path, _ordered_rows())
+    target = parts.manifest_path(path)
+    if failure in {"row_start", "row_count"}:
+        manifest = json.loads(target.read_bytes())
+        manifest["members"][1]["row_start" if failure == "row_start" else "rows"] += 1
+        manifest["manifest_sha256"] = parts._digest({k: v for k, v in manifest.items() if k != "manifest_sha256"})
+        target.unlink()  # Do not mutate the sealed archive's hard-linked inode.
+        target.write_text(json.dumps(manifest))
+    else:
+        target = parts.Path(result["immutable_manifest"])
+        if failure == "archive_name":
+            wrong = target.with_name("generation_" + "0" * 64 + ".json")
+            os.link(target, wrong)
+            target = wrong
+        else:
+            target.chmod(0o644)
+    with pytest.raises(ValueError):
+        parts.read_table(target)
+
+
+def test_period_archive_is_readable_without_following_new_pointer(tmp_path):
+    path, original = tmp_path / "dated.parquet", table()
+    first = write(path, original)
+    write(path, table([date(2025, 1, 2)], [3.]), replace_from=date(2025, 1, 2))
+    same(parts.read_table(first["immutable_manifest"]), original)
+
+
+def test_ordered_rows_explicit_codec_preserves_original_raw_values(tmp_path):
+    path, value = tmp_path / "raw.parquet", _ordered_rows()
+    _write_rows(path, value, parquet_options={"compression": "zstd", "row_group_size": 2,
+        "use_dictionary": False, "use_byte_stream_split": True})
+    with parts.ParquetSource(path) as snapshot:
+        same(snapshot.table(), value)
+        assert all(pq.ParquetFile(member).metadata.row_group(0).column(1).compression == "ZSTD"
+                   for member in snapshot.members)
+
+
+def test_complete_shared_row_benchmark_keeps_two_cold_versions_and_all_readers(tmp_path):
+    from scripts.benchmark_finlab_incremental_parquet import trial
+    value = pa.table({'source_index': ['a', 'a', 'b', 'c'],
+        'raw': pa.array([-0.0, None, 3., -1.], type=pa.float64())}).replace_schema_metadata(
+            {b'original': b'complete schema'})
+    result = trial(value, tmp_path / 'complete-case', None,
+        partition_rows=2, native_key='price:收盤價', shared_manifest=True, verify_other_readers=True)
+    assert result['cold_versions_fully_reconstructed'] == 2
+    assert result['previous_version_readback_after_append'] is True
+    assert result['readers_verified'] == ['pyarrow', 'polars', 'duckdb']
+    assert result['stages'][1]['source_reused_files'] == 1
+    assert result['stages'][1]['source_written_files'] == 1
+    assert result['stages'][1]['writer_options'] == {'compression': 'zstd', 'row_group_size': None,
+        'use_dictionary': True, 'use_byte_stream_split': False}
 
 
 @pytest.mark.parametrize("fault", ["missing", "same_size_mtime", "writable", "symlink", "schema", "checksum", "row_count", "reorder"])

@@ -50,6 +50,47 @@ def stock_futures_preparation_scope(universe: pl.DataFrame) -> pl.DataFrame:
     return selected
 
 
+FUTURES_UNIVERSE_SCOPE_CONTRACT = 'source_declared_twd_futures_no_legacy_deferrals_v1'
+
+
+def futures_preparation_universe(universe: pl.DataFrame, *, scope: str) -> pl.DataFrame:
+    """Select an explicit research universe, before financial/day admission.
+
+    The old parent's unsupported-code list is not a product-universe rule.
+    Keep historical/adjusted identities and let the dated accounting compiler
+    report missing evidence. Settlement currency does not establish quote
+    currency, executable prices, current listing or a dated contract value.
+    """
+    required = {'product', 'asset_class', 'region', 'settlement_currency',
+                'currency_source_url', 'currency_source_content_sha256'}
+    if required - set(universe.columns):
+        raise ValueError('futures universe requires explicit class, region and currency evidence')
+    if (universe['product'].null_count() or universe['product'].is_duplicated().any()
+            or universe['product'].str.strip_chars().eq('').any()):
+        raise ValueError('futures universe has duplicate/null/empty product identities')
+    if scope not in {'all_twd', 'domestic_equity'}:
+        raise ValueError(f'unsupported futures universe scope: {scope}')
+    selected = universe.filter(pl.col('settlement_currency') == 'TWD')
+    if scope == 'domestic_equity':
+        selected = selected.filter(pl.col('region').eq('domestic') & pl.col('asset_class').is_in(
+            ['stock_future', 'etf_future', 'index_future']))
+    if selected.is_empty():
+        raise ValueError('requested futures universe is empty')
+    supported = ['stock_future', 'etf_future', 'index_future',
+                 'commodity_future', 'interest_rate_future']
+    if selected.filter(pl.col('asset_class').is_null() | ~pl.col('asset_class').is_in(supported)
+            | pl.col('region').is_null() | ~pl.col('region').is_in(['domestic', 'foreign'])
+            | pl.col('currency_source_url').is_null()
+            | ~pl.col('currency_source_url').str.starts_with('https://')
+            | pl.col('currency_source_content_sha256').is_null()
+            | ~pl.col('currency_source_content_sha256').str.contains(r'^[0-9a-f]{64}$')).height:
+        raise ValueError('requested futures universe has unresolved class/region/currency evidence')
+    stocks = selected.filter(pl.col('asset_class') == 'stock_future')
+    if stocks.height:
+        stock_futures_preparation_scope(stocks)
+    return selected
+
+
 def align_product_margin_intervals(days: pl.DataFrame, intervals: pl.DataFrame) -> pl.DataFrame:
     """Bind product-relative rules at both regular-session account phases.
 

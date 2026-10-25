@@ -38,7 +38,7 @@ def _scratch_document(path: Path) -> tuple[dict, str]:
     return value, digest
 
 
-def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path) -> dict:
+def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path | None = None, *, empty_index: bool = False) -> dict:
     """Explicit failed-operation indexes only; never discover/delete by prefix.
 
     These SQLite rows are disposable census/reuse metadata, not original
@@ -51,7 +51,11 @@ def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path) -> dict:
     from stockagent.data_sync.materialized_cache import process_references_many
     import re
 
-    scratch, failed_attempt = scratch.absolute(), failed_attempt.absolute()
+    if type(empty_index) is not bool or (empty_index and failed_attempt is not None):
+        raise ValueError('select one explicit metadata retirement provenance')
+    if not empty_index and failed_attempt is None:
+        raise ValueError('a superseded failure or explicit empty-index proof is required')
+    scratch = scratch.absolute()
     if (scratch.parent != METADATA_SCRATCH_ROOT or scratch.resolve(strict=True) != scratch
             or re.fullmatch(r'stockagent-packed-metadata-[a-z0-9_]{8}', scratch.name) is None):
         raise ValueError('not an explicit canonical metadata scratch directory')
@@ -59,22 +63,27 @@ def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path) -> dict:
     if (not stat.S_ISDIR(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o700
             or before.st_uid != os.geteuid()):
         raise ValueError('metadata scratch is not an owned private directory')
-    attempt, attempt_sha = _scratch_document(failed_attempt)
-    operation = failed_attempt.parent.parent.parent
-    plan, plan_sha = _scratch_document(operation / 'plan.json')
-    progress, _ = _scratch_document(operation / 'progress.json')
-    dataset = failed_attempt.parent.name
-    if (failed_attempt.parent.parent.name != 'attempts' or failed_attempt.suffix != '.json'
-            or attempt.get('attempt_id') != failed_attempt.stem
-            or plan.get('contract') != 'all_catalog_incremental_migration_v1'
-            or progress.get('plan_sha256') != plan.get('plan_sha256')
-            or dataset not in {row['dataset'] for row in plan['catalog']}
-            or attempt.get('state') != 'waiting_retry' or attempt.get('error_type') != 'OSError'
-            or attempt.get('error') != f"[Errno 24] Too many open files: '{scratch}'"
-            or not attempt.get('finished_at_utc') or not attempt.get('owner_activity_id')
-            or not progress.get('runtime_owner', {}).get('activity_id')
-            or progress['runtime_owner']['activity_id'] == attempt['owner_activity_id']):
-        raise ValueError('scratch has no exact superseded canonical failure provenance')
+    provenance = {}
+    if not empty_index:
+        failed_attempt = failed_attempt.absolute()
+        attempt, attempt_sha = _scratch_document(failed_attempt)
+        operation = failed_attempt.parent.parent.parent
+        plan, plan_sha = _scratch_document(operation / 'plan.json')
+        progress, _ = _scratch_document(operation / 'progress.json')
+        dataset = failed_attempt.parent.name
+        if (failed_attempt.parent.parent.name != 'attempts' or failed_attempt.suffix != '.json'
+                or attempt.get('attempt_id') != failed_attempt.stem
+                or plan.get('contract') != 'all_catalog_incremental_migration_v1'
+                or progress.get('plan_sha256') != plan.get('plan_sha256')
+                or dataset not in {row['dataset'] for row in plan['catalog']}
+                or attempt.get('state') != 'waiting_retry' or attempt.get('error_type') != 'OSError'
+                or attempt.get('error') != f"[Errno 24] Too many open files: '{scratch}'"
+                or not attempt.get('finished_at_utc') or not attempt.get('owner_activity_id')
+                or not progress.get('runtime_owner', {}).get('activity_id')
+                or progress['runtime_owner']['activity_id'] == attempt['owner_activity_id']):
+            raise ValueError('scratch has no exact superseded canonical failure provenance')
+        provenance = {'failed_attempt': str(failed_attempt), 'failed_attempt_sha256': attempt_sha,
+                      'operation_plan_sha256': plan_sha}
     if {p.name for p in scratch.iterdir()} != {'index.sqlite'}:
         raise ValueError('retain unknown metadata scratch members')
     database = scratch / 'index.sqlite'
@@ -98,13 +107,27 @@ def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path) -> dict:
                 or db.execute('PRAGMA quick_check(1)').fetchall() != [('ok',)]
                 or db.execute("SELECT 1 FROM entries WHERE kind NOT IN ('file','directory','symlink') LIMIT 1").fetchone()):
             raise ValueError('scratch is not an intact producer metadata index')
+        if empty_index:
+            # Interrupted, uncommitted spills can leave GB of trailing pages
+            # behind an intact, empty initial SQLite database. Prove this exact
+            # logical state, not emptiness by name, mtime or file size. A populated
+            # index still needs its original superseded-operation provenance.
+            committed = db.execute('PRAGMA page_count').fetchone()[0] * db.execute('PRAGMA page_size').fetchone()[0]
+            if (db.execute('SELECT 1 FROM entries LIMIT 1').fetchone() is not None
+                    or db.execute('PRAGMA freelist_count').fetchone()[0] != 0
+                    or db.execute('PRAGMA user_version').fetchone()[0] != 0
+                    or db.execute('PRAGMA application_id').fetchone()[0] != 0
+                    or not 0 < committed <= min(info['size'], 65536)):
+                raise ValueError('explicit empty-index proof requires the intact empty initial database')
+            provenance = {'empty_index_reconstruction': {
+                'schema': [list(row) for row in schema], 'logical_rows': 0,
+                'committed_database_bytes': committed, 'trailing_bytes': info['size'] - committed}}
     digest = stable_payload_hash(database, info)
     after = scratch.lstat()
     if (before.st_dev, before.st_ino, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_mtime_ns):
         raise ValueError('metadata scratch directory changed during inspection')
-    result = {'contract': 'failed_metadata_index_retirement_v1', 'state': 'eligible',
-              'scratch': str(scratch), 'failed_attempt': str(failed_attempt),
-              'failed_attempt_sha256': attempt_sha, 'operation_plan_sha256': plan_sha,
+    result = {'contract': 'empty_metadata_index_retirement_v1' if empty_index else 'failed_metadata_index_retirement_v1',
+              'state': 'eligible', 'scratch': str(scratch), **provenance,
               'directory_identity': [before.st_dev, before.st_ino],
               'index': {**info, 'sha256': digest}, 'source_data_files_deleted': 0,
               'cold_objects_deleted': 0}
@@ -124,7 +147,11 @@ def retire_failed_metadata_scratch(plan: dict, receipt: Path) -> dict:
     scratch = Path(plan['scratch'])
     if receipt.absolute().is_relative_to(scratch):
         raise ValueError('retirement evidence must remain outside its disposable index')
-    if plan_failed_metadata_scratch(scratch, Path(plan['failed_attempt'])) != plan:
+    if plan.get('contract') == 'empty_metadata_index_retirement_v1':
+        current_plan = plan_failed_metadata_scratch(scratch, empty_index=True)
+    else:
+        current_plan = plan_failed_metadata_scratch(scratch, Path(plan['failed_attempt']))
+    if current_plan != plan:
         raise ValueError('metadata scratch retirement plan changed')
     quarantine = scratch.with_name('.retired-packed-metadata-' + uuid.uuid4().hex)
     result = {**plan, 'state': 'quarantine_planned', 'quarantine': str(quarantine),

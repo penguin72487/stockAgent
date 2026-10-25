@@ -12,6 +12,44 @@ from stockagent.live.opening_execution_latency import (
 GATE = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
 
 
+def test_phase_timer_never_subtracts_cpu_clocks_from_different_threads(monkeypatch):
+    from stockagent.live import opening_execution_latency as latency
+
+    elapsed = iter([1., 2., 3., 4.])
+    cpu = iter([10., 11., .1, .5])
+    threads = iter([101, 101, 202, 202])
+    monkeypatch.setattr(latency.time, "perf_counter", lambda: next(elapsed))
+    monkeypatch.setattr(latency.time, "thread_time", lambda: next(cpu))
+    monkeypatch.setattr(latency, "_phase_thread_identity", lambda: next(threads))
+    wall, owner_cpu = {}, {}
+    timer = latency.OpeningPhaseTimer(wall, owner_cpu)
+    timer.transition("prepare")
+    timer.transition("transport")
+    timer.finish()
+    assert wall == {"prepare": 1000., "transport": 1000.}
+    assert owner_cpu["prepare"] is None  # Unknown, not negative CPU or fictitious wait.
+    assert owner_cpu["transport"] == pytest.approx(400.)
+    timer.finish()  # Idempotent: no clocks, callbacks or synthetic progress.
+
+
+def test_phase_timer_detects_foreign_progress_even_if_phase_name_does_not_change(monkeypatch):
+    from stockagent.live import opening_execution_latency as latency
+
+    elapsed = iter([1., 2., 3.])
+    cpu = iter([.1, .2, .4])
+    threads = iter([101, 101, 202, 101])
+    monkeypatch.setattr(latency.time, "perf_counter", lambda: next(elapsed))
+    monkeypatch.setattr(latency.time, "thread_time", lambda: next(cpu))
+    monkeypatch.setattr(latency, "_phase_thread_identity", lambda: next(threads))
+    wall, owner_cpu = {}, {}
+    timer = latency.OpeningPhaseTimer(wall, owner_cpu)
+    timer.transition("panel_join")
+    timer.transition("panel_join")  # A shared panel builder notifies its waiter.
+    timer.finish()  # Original thread again; A -> B -> A still has unknown CPU.
+    assert wall == {"panel_join": 1000.}
+    assert owner_cpu == {"panel_join": None}
+
+
 def mode(**overrides):
     return {"market": "mode", "signal_id": "mode-original", "session_date": "2026-10-14",
             "entry_requested_shares": 10000, "entry_filled_shares": 0,

@@ -1,4 +1,6 @@
 import os
+import json
+import sys
 
 import pytest
 
@@ -79,3 +81,80 @@ def test_closed_fd_is_tolerated_and_inventory_has_explicit_scope(tmp_path, monke
     assert result["all_windows_allocations_attributed"] is False
     assert result["atomic_whole_host_snapshot"] is False
     assert result["cuda_initialized_by_probe"] is False
+
+
+def test_explicit_visible_scope_finds_unmanaged_owner_without_exporting_private_paths(tmp_path):
+    managed = proc(tmp_path)
+    other = proc(tmp_path, pid="456", unit="desktop.service")
+    (managed / "fd" / "3").symlink_to("/private/credentials.env")
+    (other / "fd" / "7").symlink_to("/dev/dxg")
+    (other / "fd" / "8").symlink_to("/private/other.env")
+    default = audit.inventory(tmp_path)
+    assert default["contract"] == "stockagent_linux_managed_gpu_fd_sample_v1"
+    assert default["managed_processes"] == default["observed_processes"] == 1
+    assert default["gpu_owner_count"] == 0
+    assert "selected_processes" not in default and "managed" not in default["rows"][0]
+    result = audit.inventory(tmp_path, include_unmanaged=True)
+    assert result["contract"] == "stockagent_linux_visible_gpu_fd_sample_v1"
+    assert result["proc_candidates"] == result["selected_processes"] == result["observed_processes"] == 2
+    assert result["managed_processes"] == result["unmanaged_processes"] == 1
+    assert result["ownership_unknown_processes"] == 0
+    assert result["gpu_owner_count"] == result["gpu_device_handles"] == 1
+    owner, = [row for row in result["rows"] if row["gpu_device_handles"]]
+    assert owner["pid"] == 456 and owner["managed"] is False and owner["unit"] is None
+    assert "private" not in repr(result) and "credentials" not in repr(result)
+    assert result["all_windows_allocations_attributed"] is False
+    assert result["atomic_whole_host_snapshot"] is False
+
+
+@pytest.mark.parametrize("error,state", [(PermissionError, "unreadable"), (FileNotFoundError, "exited"),
+                                        (ValueError, "identity_invalid"), (IndexError, "identity_invalid")])
+def test_visible_scope_retains_initial_identity_failures_as_unknown(tmp_path, monkeypatch, error, state):
+    proc(tmp_path)
+    monkeypatch.setattr(audit, "process_identity", lambda _path: (_ for _ in ()).throw(error()))
+    result = audit.inventory(tmp_path, include_unmanaged=True)
+    assert result["state"] == "partial_visibility"
+    assert result["proc_candidates"] == result["selected_processes"] == result["ownership_unknown_processes"] == 1
+    assert result["observed_processes"] == result["gpu_owner_count"] == 0
+    row, = result["rows"]
+    assert row["state"] == state and row["start_time_ticks"] is None and row["managed"] is None
+    assert row["gpu_device_handles"] is None and row["error_type"] == error.__name__
+
+
+def test_visible_scope_identity_change_preserves_unknown_handles(tmp_path, monkeypatch):
+    path = proc(tmp_path, unit="desktop.service")
+    before = audit.process_identity(path)
+    answers = iter([before, {**before, "start_time_ticks": before["start_time_ticks"] + 1}])
+    monkeypatch.setattr(audit, "process_identity", lambda _path: next(answers))
+    row = audit.inspect_process(path, include_unmanaged=True)
+    assert row["state"] == "identity_changed" and row["gpu_device_handles"] is None
+    assert row["managed"] is False and row["unit"] is None
+
+
+def test_visible_scope_unreadable_fd_keeps_known_unmanaged_identity(tmp_path, monkeypatch):
+    path = proc(tmp_path, unit="desktop.service")
+    (path / "fd" / "7").symlink_to("/dev/dxg")
+    monkeypatch.setattr(audit.os, "readlink", lambda _path: (_ for _ in ()).throw(PermissionError()))
+    result = audit.inventory(tmp_path, include_unmanaged=True)
+    row, = result["rows"]
+    assert result["state"] == "partial_visibility" and result["unmanaged_processes"] == 1
+    assert result["ownership_unknown_processes"] == result["observed_processes"] == 0
+    assert row["state"] == "unreadable" and row["gpu_device_handles"] is None
+
+
+@pytest.mark.parametrize("flags", [[], ["--include-unmanaged"]])
+def test_cli_selects_explicit_scope_and_writes_new_receipt(tmp_path, monkeypatch, flags):
+    fake_proc = tmp_path / "proc"
+    fake_proc.mkdir()
+    proc(fake_proc, unit="desktop.service")
+    original = audit.inventory
+    monkeypatch.setattr(audit, "inventory", lambda *, include_unmanaged: original(
+        fake_proc, include_unmanaged=include_unmanaged))
+    monkeypatch.setattr(audit, "ROOT", tmp_path)
+    output = tmp_path / "artifacts/operations/owners.json"
+    monkeypatch.setattr(sys, "argv", ["audit", "--output", str(output), *flags])
+    audit.main()
+    result = json.loads(output.read_bytes())
+    assert result["contract"] == ("stockagent_linux_visible_gpu_fd_sample_v1" if flags else
+                                  "stockagent_linux_managed_gpu_fd_sample_v1")
+    assert result["observed_processes"] == (1 if flags else 0)

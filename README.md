@@ -182,7 +182,13 @@ run_fintech_python -m pytest -q test/test_explainability_cross_asset.py
 
 ```bash
 stockagent-data status --human
+stockagent-data layout --layout-output /var/tmp/stockagent-data-layout.json
 ```
+
+`layout` 唯讀核對所有 `data_*` 的增量版本入口、保存位置及遷移狀態，
+沿正式 release wrapper 使用冷庫掛載；不發布、下載或解封資料。
+版本共用未變內容，來源逐期分區與空間回收各有獨立驗收，見
+[增量儲存方案](docs/filesystem_incremental_plan_2026-10-25.md)。
 
 只有真的要訓練或查詢時，才人工執行
 `stockagent-data use DATASET [--link PATH]`；它不是部署或同步的必要步驟。

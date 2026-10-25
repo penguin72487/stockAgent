@@ -15,6 +15,7 @@ from scripts.backup_delivery_receipt import DISPATCH, atomic_public, signed
 from scripts.install_lab203_recovery_queue import dropin
 from scripts.verify_backup_delivery import verify
 from stockagent.data_sync import recovery_queue as module
+from stockagent.data_sync import windows_cold_io as windows_io
 from stockagent.data_sync.backup_auxiliary import export_auxiliary
 from stockagent.data_sync.nas_recovery_acceptance import PLAN, validate_acceptance
 from stockagent.data_sync.offhost_backup import ResticBackup, capture_plan, export_delivery
@@ -245,14 +246,19 @@ def test_windows_capacity_uses_encoded_fixed_registry_query(queue_configuration,
     original_read = Path.read_text
     monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: "microsoft-standard-WSL2" if str(self) == "/proc/sys/kernel/osrelease" else original_read(self, *a, **k))
     monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+    inherited = dict(os.environ)
+    bridge = {**inherited, "WSL_INTEROP": "/run/WSL/2468_interop"}
+    monkeypatch.setattr(windows_io, "_windows_process_environment", lambda: bridge)
     def execute(argv, **kwargs):
         assert "-EncodedCommand" in argv and kwargs["timeout"] == 30
+        assert kwargs["env"] is bridge
         program = base64.b64decode(argv[-1]).decode("utf-16-le")
         assert "ext4.vhdx" in program and "AvailableFreeSpace" in program and "HKCU:" in program
         assert program.endswith(" 'Ubuntu'")
         return subprocess.CompletedProcess(argv, 0, stdout=b'{"free_bytes":99999999,"distribution":"Ubuntu"}', stderr="無關的中文診斷".encode("cp950"))
     monkeypatch.setattr(module.subprocess, "run", execute)
     assert module.physical_free_bytes(c) == 99999999
+    assert dict(os.environ) == inherited
     monkeypatch.setenv("WSL_DISTRO_NAME", "DifferentDistro")
     with pytest.raises(ValueError): module.physical_free_bytes(c)
 
@@ -270,9 +276,12 @@ def test_physical_capacity_retry_never_substitutes_virtual_space(queue_configura
     original_read=Path.read_text
     monkeypatch.setattr(Path,'read_text',lambda self,*a,**k:'microsoft-standard-WSL2' if str(self)=='/proc/sys/kernel/osrelease' else original_read(self,*a,**k))
     monkeypatch.setenv('WSL_DISTRO_NAME','Ubuntu')
+    bridge={**os.environ,'WSL_INTEROP':'/run/WSL/2468_interop'}
+    monkeypatch.setattr(windows_io,'_windows_process_environment',lambda:bridge)
     monkeypatch.setattr(module.time,'sleep',lambda n:None)
     calls=[]
     def execute(argv,**kwargs):
+        assert kwargs['env'] is bridge
         calls.append(argv)
         if failure=='startup-once' and len(calls)>1:
             return subprocess.CompletedProcess(argv,0,stdout=b'{"free_bytes":12345,"distribution":"Ubuntu"}',stderr=b'')
@@ -284,6 +293,46 @@ def test_physical_capacity_retry_never_substitutes_virtual_space(queue_configura
     else:
         with pytest.raises(ValueError,match='unavailable'):module.physical_free_bytes(c)
         assert len(calls)==(3 if failure=='startup-exhausted' else 1)
+
+
+@pytest.mark.parametrize('bridge_failure', ['unavailable', 'missing'])
+def test_physical_capacity_requires_a_verified_bridge_before_query(queue_configuration, monkeypatch, bridge_failure):
+    c = {**queue_configuration, 'windows_distribution': 'Ubuntu'}
+    monkeypatch.setattr(module, 'physical_free_bytes', ACTUAL_PHYSICAL_FREE_BYTES)
+    read_text = Path.read_text
+    monkeypatch.setattr(Path, 'read_text', lambda self, *a, **k:
+        'microsoft-standard-WSL2' if str(self) == '/proc/sys/kernel/osrelease' else read_text(self, *a, **k))
+    monkeypatch.setenv('WSL_DISTRO_NAME', 'Ubuntu')
+    def bridge():
+        if bridge_failure == 'unavailable':
+            raise module.SnapshotError('no verified local bridge')
+        return None
+    monkeypatch.setattr(windows_io, '_windows_process_environment', bridge)
+    monkeypatch.setattr(module.subprocess, 'run', lambda *a, **k: pytest.fail('capacity query before bridge admission'))
+    with pytest.raises(ValueError, match='no-verified-interop'):
+        module.physical_free_bytes(c)
+
+
+@pytest.mark.parametrize('reply', [
+    b'{"free_bytes":12345,"distribution":"Other"}',
+    b'{"free_bytes":true,"distribution":"Ubuntu"}',
+    b'{"free_bytes":1.5,"distribution":"Ubuntu"}',
+    b'{"free_bytes":-1,"distribution":"Ubuntu"}',
+    b'not capacity JSON',
+])
+def test_verified_bridge_never_replaces_exact_physical_capacity_validation(queue_configuration, monkeypatch, reply):
+    c = {**queue_configuration, 'windows_distribution': 'Ubuntu'}
+    monkeypatch.setattr(module, 'physical_free_bytes', ACTUAL_PHYSICAL_FREE_BYTES)
+    read_text = Path.read_text
+    monkeypatch.setattr(Path, 'read_text', lambda self, *a, **k:
+        'microsoft-standard-WSL2' if str(self) == '/proc/sys/kernel/osrelease' else read_text(self, *a, **k))
+    monkeypatch.setenv('WSL_DISTRO_NAME', 'Ubuntu')
+    bridge = {**os.environ, 'WSL_INTEROP': '/run/WSL/2468_interop'}
+    monkeypatch.setattr(windows_io, '_windows_process_environment', lambda: bridge)
+    monkeypatch.setattr(module.subprocess, 'run', lambda argv, **k:
+        subprocess.CompletedProcess(argv, 0, stdout=reply, stderr=b''))
+    with pytest.raises(ValueError):
+        module.physical_free_bytes(c)
 
 
 def test_public_queue_status_rejects_secret_fields(queue_configuration, monkeypatch):

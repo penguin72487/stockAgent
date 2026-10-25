@@ -28,6 +28,37 @@ def snapshot():
         no_open_print_timestamps_ms=np.array([0, stamp, 0, stamp]))
 
 
+@pytest.mark.parametrize("policy", [signals.OPENING_OBSERVED_REFERENCE_POLICY,
+                                  signals.OPENING_PROVISIONAL_REFERENCE_POLICY])
+def test_fully_missing_subset_preserves_model_axis_without_creating_prices(monkeypatch, tmp_path, policy):
+    data = panel()
+    stamp = int(datetime.fromisoformat("2026-10-22T09:00:00+08:00").timestamp() * 1000)
+    missing = PriceSnapshot(prices=np.array([102., 62.]), source="opening:shared_opening_snapshot",
+        timestamp="2026-10-22T09:00:00+08:00", requested_count=2,
+        available_mask=np.zeros(2, dtype=bool), open_prices=np.full(2, np.nan),
+        timestamps_ms=np.full(2, stamp), exchange_timestamps_ms=np.zeros(2, dtype=np.int64),
+        no_open_print_timestamps_ms=np.zeros(2, dtype=np.int64))
+    monkeypatch.setattr(signals, "_fetch_tw_opening_source", lambda *a, **kw: (missing, False))
+    monkeypatch.setattr(signals, "fetch_tw_mis_opening_snapshot", lambda *a, **kw: missing)
+    def no_write(*a, **kw):
+        raise AssertionError("empty evidence must not seed a new observation")
+    monkeypatch.setattr(signals, "seed_tw_opening_snapshot_cache", no_write)
+    result = signals._price_snapshot(source="tw", symbols=data.symbols,
+        fallback_prices=data.close_prices[2], parquet_root=tmp_path, prices_csv=None, yahoo_chunk_size=80,
+        request_mask=np.array([True, False, True, False]), require_official_tw_session_open=True,
+        opening_model_reference_policy=policy)
+    assert result.prices.shape == result.open_prices.shape == result.available_mask.shape == (4,)
+    assert result.requested_count == 2 and result.available_count == 0
+    assert not result.available_mask.any() and np.isnan(result.open_prices).all()
+    assert not result.no_open_print_timestamps_ms.any()
+    if policy == signals.OPENING_PROVISIONAL_REFERENCE_POLICY:
+        _, _, _, live, observed = signals._day_trade_live_model_window(data,
+            panel_idx=2, lookback=3, price_snapshot=result,
+            resolved_asof="2026-10-22 09:00:00", source_timezone="Asia/Taipei",
+            opening_reference_policy=policy)
+        assert live and not observed.any()
+
+
 def test_last_trade_skips_zero_volume_adjusted_references_and_missing_observations():
     data = panel()
     prices, dates = signals._last_completed_trade_reference(data, 2)

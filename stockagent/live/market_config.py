@@ -8,6 +8,11 @@ import shlex
 
 import yaml
 
+OPENING_OBSERVED_REFERENCE_POLICY = "observed_session_or_no_first_v1"
+OPENING_PROVISIONAL_REFERENCE_POLICY = "known_prior_trade_provisional_v1"
+SIGNAL_UPDATE_ONCE = "opening_once_v1"
+SIGNAL_UPDATE_PROGRESSIVE = "progressive_open_reference_rebalance_v1"
+
 
 def live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
     """Resolve the shared panel location without loading models or data.
@@ -78,6 +83,8 @@ class LiveMarketConfig:
     initial_capital: float | None = None
     current_capital: float | None = None
     day_trade_simulation_enabled: bool = False
+    day_trade_opening_reference_policy: str = OPENING_OBSERVED_REFERENCE_POLICY
+    day_trade_signal_update_policy: str = SIGNAL_UPDATE_ONCE
     day_trade_residual_margin_conversion: bool = False
     day_trade_terminal_liquidation_unlimited_capacity: bool = False
     day_trade_strict_intraday: bool = False
@@ -120,11 +127,28 @@ class LiveMarketConfig:
             "daily_bar_time": self.close_time,
             "previous_signal_backfill_limit": self.previous_signal_backfill_limit,
             "day_trade_rule_data_dir": self.day_trade_rule_data_dir,
+            "day_trade_opening_reference_policy": self.day_trade_opening_reference_policy,
+            "day_trade_signal_update_policy": self.day_trade_signal_update_policy,
             "write": True,
         }
         for key, value in overrides.items():
             if value is not None:
                 values[key] = value
+        if (values.get("day_trade_model_observation") == "latest_quote"
+                and "day_trade_opening_reference_policy" not in overrides):
+            # An opening-only preference must not turn manual latest-price
+            # or an overnight request into a previous-trade approximation.
+            values["day_trade_opening_reference_policy"] = OPENING_OBSERVED_REFERENCE_POLICY
+        if (values.get("price_source") == "panel"
+                or values.get("day_trade_model_observation", "session_open") != "session_open"):
+            # Warming and manual latest-tick previews are not opening cohorts.
+            values["day_trade_signal_update_policy"] = SIGNAL_UPDATE_ONCE
+        if (self.day_trade_signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+                and values.get("price_source") == "panel" and not values.get("write")
+                and values.get("day_trade_model_observation", "session_open") == "session_open"):
+            # Transport preparation is not a published/rebalanced cohort.
+            # Do not retain CUDA inputs for modes that never use this policy.
+            values["_prepare_progressive_opening_input"] = True
         return values
 
 
@@ -279,6 +303,16 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
     market = str(raw.get("market") or raw.get("id") or path.stem).strip()
     if not market:
         raise ValueError(f"Market config missing market id: {path}")
+    opening_reference_policy = str(raw.get("day_trade_opening_reference_policy") or OPENING_OBSERVED_REFERENCE_POLICY)
+    if opening_reference_policy not in {OPENING_OBSERVED_REFERENCE_POLICY, OPENING_PROVISIONAL_REFERENCE_POLICY}:
+        raise ValueError(f"Unsupported day_trade_opening_reference_policy: {opening_reference_policy!r}")
+    signal_update_policy = str(raw.get("day_trade_signal_update_policy") or SIGNAL_UPDATE_ONCE)
+    if signal_update_policy not in {SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE}:
+        raise ValueError(f"Unsupported day_trade_signal_update_policy: {signal_update_policy!r}")
+    if signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE and (
+            not _bool_value(raw.get("day_trade_simulation_enabled"), False)
+            or opening_reference_policy != OPENING_PROVISIONAL_REFERENCE_POLICY):
+        raise ValueError("progressive signals require day-trade paper mode and provisional references")
 
     return LiveMarketConfig(
         market=market,
@@ -346,6 +380,8 @@ def load_market_config(path: str | Path) -> LiveMarketConfig:
         day_trade_simulation_enabled=_bool_value(
             raw.get("day_trade_simulation_enabled"), False
         ),
+        day_trade_opening_reference_policy=opening_reference_policy,
+        day_trade_signal_update_policy=signal_update_policy,
         day_trade_residual_margin_conversion=_bool_value(raw.get("day_trade_residual_margin_conversion"), False),
         day_trade_terminal_liquidation_unlimited_capacity=_bool_value(
             raw.get("day_trade_terminal_liquidation_unlimited_capacity"), False

@@ -95,6 +95,18 @@ def test_namespace_and_source_roots_cannot_be_discarded(tmp_path, relative):
         policy(tmp_path, [{"base": "artifact", "relative": relative, "kind": "directory", "reason": "smoke-test"}])
 
 
+def test_explicit_completed_benchmark_discard_uses_the_same_guards(setup, tmp_path):
+    _, _, args = setup
+    target = dict(base='artifact', relative='benchmarks/futures-abba', kind='directory', reason='benchmark')
+    _, p = policy(tmp_path, [target])
+    source = args['repo_root'] / 'artifacts' / target['relative']
+    source.mkdir(parents=True)
+    (source / 'measured-output').write_bytes(b'disposable measurement')
+    dry = d.discard_target(p, target, **args)
+    result = d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    assert result['deleted'] and not result['recovery_claimed'] and not source.exists()
+
+
 def test_overlapping_and_duplicate_targets_rejected(tmp_path):
     target = {"base": "artifact", "relative": "smoke/trial", "kind": "directory", "reason": "smoke-test"}
     for other in [target, {**target, "relative": "smoke/trial/output"}]:

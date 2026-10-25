@@ -423,6 +423,135 @@ def document_inventory(root: Path, products: set[str], reviews: Path | None = No
     return documents, mentions, unresolved, counts
 
 
+def training_universe_coverage(universe, daily, requested_products, deferred_products):
+    """Inventory actual dated model rows, keeping absent products visible.
+
+    Counts are historical product codes, not today's listed instruments.
+    An executable daily row is not proof of a decision-window fill.
+    """
+    required = {'date', 'product', 'asset_class', 'physical_contract', 'executable'}
+    if required - set(daily.columns):
+        raise ValueError('training scope audit requires canonical physical daily rows')
+    if (universe['product'].is_duplicated().any() or universe['product'].null_count()
+            or set(daily['product']) - set(universe['product'])
+            or set(requested_products) - set(universe['product'])):
+        raise ValueError('training scope identities differ from the source universe')
+    classes = daily.select('product', 'asset_class').unique().join(
+        universe.select('product', pl.col('asset_class').alias('source_asset_class')),
+        on='product', validate='m:1')
+    if classes.filter(pl.col('asset_class') != pl.col('source_asset_class')).height:
+        raise ValueError('training asset class differs from source evidence')
+    if daily.select('date', 'physical_contract').is_duplicated().any():
+        raise ValueError('duplicate physical contract-day in training universe')
+    observed = daily.group_by('product').agg(
+        pl.len().alias('model_contract_days'),
+        pl.col('physical_contract').n_unique().alias('model_physical_contracts'),
+        pl.col('date').min().alias('model_start'), pl.col('date').max().alias('model_end'),
+        pl.col('executable').fill_null(False).sum().alias('executable_daily_rows'))
+    return universe.join(observed, on='product', how='left', validate='1:1').with_columns(
+        pl.col('product').is_in(list(requested_products)).alias('financial_build_requested'),
+        pl.col('product').is_in(list(deferred_products)).alias('legacy_deferred'),
+        pl.col('model_contract_days', 'model_physical_contracts', 'executable_daily_rows').fill_null(0),
+    ).with_columns(
+        pl.when(pl.col('model_contract_days') > 0).then(pl.lit('admitted_subset_requires_dated_coverage'))
+        .when(pl.col('financial_build_requested')).then(pl.lit('no_financial_component_admitted'))
+        .otherwise(pl.lit('outside_financial_build_scope')).alias('training_scope_status'),
+    ).sort('asset_class', 'product')
+
+
+def audit_training_universe(a):
+    """Read back source, accepted financial bytes and paired clock rows."""
+    from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
+    from stockagent.data.tw_futures_decision_clock import validate_clock_source
+
+    root = a.financial_root.resolve(strict=True)
+    source = a.source_bundle.resolve(strict=True)
+    source_manifest_path = source / 'source_manifest.json'
+    source_manifest = json.loads(source_manifest_path.read_text())
+    evidence = {str(source_manifest_path): sha256_file(source_manifest_path)}
+    for relative in ('universe/products.csv', 'deferred_54_products.csv'):
+        path = source / relative
+        digest = sha256_file(path)
+        if source_manifest['files'][relative]['sha256'] != digest:
+            raise ValueError(f'source universe SHA differs: {relative}')
+        evidence[str(path)] = digest
+    universe = futures_preparation_universe(
+        pl.read_csv(source / 'universe/products.csv', infer_schema=False), scope=a.universe_scope)
+    deferred = pl.read_csv(source / 'deferred_54_products.csv', infer_schema=False)
+    accepted_path = root / 'build_acceptance.json'
+    accepted = json.loads(accepted_path.read_text())
+    if accepted['source_manifest_sha256'] != evidence[str(source_manifest_path)]:
+        raise ValueError('financial build belongs to a different source bundle')
+    daily_path = root / 'release/daily/continuous_daily.parquet'
+    rules_path = root / 'release/rules/rules.parquet'
+    for path, key in ((daily_path, 'daily_sha256'), (rules_path, 'rules_sha256')):
+        digest = sha256_file(path)
+        if accepted[key] != digest:
+            raise ValueError(f'accepted financial output changed: {path}')
+        evidence[str(path)] = digest
+    evidence[str(accepted_path)] = sha256_file(accepted_path)
+    daily = pl.read_parquet(daily_path, columns=[
+        'date', 'product', 'asset_class', 'physical_contract', 'executable'])
+    # A narrower scope intentionally inventories only that source category.
+    daily = daily.filter(pl.col('product').is_in(universe['product']))
+    requested = set(accepted['requested_products']) & set(universe['product'])
+    table = training_universe_coverage(universe, daily, requested, set(deferred['product']))
+    clock_details = {}
+    for clock, entries_path in (('08:45', a.clock_0845), ('09:00', a.clock_0900)):
+        if entries_path is None:
+            continue
+        entries, manifest = validate_clock_source(entries_path, daily_path=daily_path,
+            rules_path=rules_path, decision_time=clock)
+        selected_daily = daily.filter(pl.col('date').is_between(
+            pl.lit(manifest['start_date']).str.to_date(), pl.lit(manifest['end_date']).str.to_date()))
+        axis = ['date', 'physical_contract']
+        scoped_entries = entries.join(selected_daily.select(axis), on=axis, how='semi')
+        if scoped_entries.height != selected_daily.height:
+            raise ValueError('decision clock does not cover every model physical contract-day')
+        clock_details[clock] = dict(start=manifest['start_date'], end=manifest['end_date'],
+            rows=scoped_entries.height, observed_window_rows=scoped_entries.filter(
+                pl.col('status') == 'observed_minute').height,
+            pair_identity=manifest['pair_identity'], entries_sha256=manifest['entries_sha256'])
+        count = scoped_entries.join(selected_daily.select(*axis, 'product'), on=axis, validate='1:1')
+        name = 'clock' + clock.replace(':', '')
+        count = count.group_by('product').agg(pl.len().alias(name + '_rows'),
+            pl.col('status').eq('observed_minute').sum().alias(name + '_observed_window_rows'))
+        table = table.join(count, on='product', how='left', validate='1:1').with_columns(
+            pl.col(name + '_rows', name + '_observed_window_rows').fill_null(0))
+        evidence[str(entries_path)] = manifest['entries_sha256']
+        evidence[str(entries_path.with_name('manifest.json'))] = sha256_file(entries_path.with_name('manifest.json'))
+    if len(clock_details) == 2 and len({v['pair_identity'] for v in clock_details.values()}) != 1:
+        raise ValueError('paired clocks come from different preparations')
+    a.output_dir.mkdir(parents=True, exist_ok=False)
+    csv_path = a.output_dir / 'training_universe_coverage.csv'
+    table.write_csv(csv_path)
+    missing = table.filter(pl.col('model_contract_days') == 0)
+    summary = dict(schema_version=1, status='readback_scope_inventory_not_new_admission',
+        observed_at_utc=datetime.now(timezone.utc).isoformat(), requested_scope=a.universe_scope,
+        historical_source_product_codes=table.height,
+        financial_build_requested_product_codes=len(requested),
+        model_product_codes=table.filter(pl.col('model_contract_days') > 0).height,
+        model_contract_days=daily.height,
+        executable_daily_rows=int(daily['executable'].fill_null(False).sum()),
+        missing_product_codes=missing['product'].to_list(),
+        all_source_product_codes_in_model=missing.is_empty(),
+        all_dated_tradable_contracts_verified=False,
+        current_exchange_listing_complete_verified=False,
+        asset_classes=table.group_by('asset_class').agg(pl.len().alias('source_product_codes'),
+            pl.col('model_contract_days').gt(0).sum().alias('model_product_codes'),
+            pl.col('model_contract_days').sum()).sort('asset_class').to_dicts(),
+        clocks=clock_details, source_sha256=evidence,
+        outputs={csv_path.name:dict(sha256=sha256_file(csv_path))},
+        limitations=['Historical product codes are not the number of simultaneously tradable instruments.',
+            'Daily executable rows do not prove clock-window liquidity or a broker fill.',
+            'Financial component admission can omit periods within an included product.',
+            'TWD settlement evidence alone does not establish quote currency or contract value.'])
+    atomic_write_json(a.output_dir / 'manifest.json', summary)
+    print(json.dumps({k:v for k,v in summary.items() if k not in ('source_sha256', 'missing_product_codes')},
+                     ensure_ascii=False))
+    return 0
+
+
 def audit_numeric_rules(root: Path, output: Path) -> int:
     """Check numeric semantics without building any contract-day account.
 
@@ -522,9 +651,18 @@ def main() -> int:
     p.add_argument('--candidate-events',type=Path)
     p.add_argument('--reviews',type=Path)
     p.add_argument('--numeric-rules',type=Path,help='Audit bound candidate/interval numeric values without an accounting rebuild')
+    p.add_argument('--financial-root',type=Path,help='Read back actual training universe against source product evidence')
+    p.add_argument('--source-bundle',type=Path,help='Canonical source bundle used by the accepted financial build')
+    p.add_argument('--universe-scope',choices=['all_twd', 'domestic_equity'],default='all_twd')
+    p.add_argument('--clock-0845',type=Path)
+    p.add_argument('--clock-0900',type=Path)
     a = p.parse_args()
     if (a.output_dir / "manifest.json").exists():
         raise FileExistsError("use a new immutable audit output directory")
+    if a.financial_root:
+        if not a.source_bundle or a.numeric_rules or a.physical_history:
+            p.error('training scope readback requires --source-bundle and no other audit mode')
+        return audit_training_universe(a)
     if a.numeric_rules:
         return audit_numeric_rules(a.numeric_rules,a.output_dir)
     if a.physical_history:

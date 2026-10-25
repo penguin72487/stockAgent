@@ -205,13 +205,27 @@
         || String(row.entry_fill_policy || "").startsWith("official_open_signal_0900_execute_0901");
       const fillLabel = minuteReplay ? "09:01 首分鐘價反事實模擬" : "因果報價紙上模擬";
       const targetGap = Math.max(0, Number(row.requested_shares || 0) - Number(row.filled_shares || 0));
+      const inventory = row.current_target_inventory;
+      const inventoryHtml = inventory
+        ? `<small>版本 ${number(inventory.signal_revision)} · 庫存 ${number(inventory.signed_shares)} 股／目標 ${inventory.target_signed_shares == null ? "待取價" : `${number(inventory.target_signed_shares)} 股`}</small><small>本版增倉成交 ${number(row.filled_shares)} 股 · 減倉成交 ${number(row.reduction_filled_shares)} 股</small>`
+        : "";
+      const entryHeading = hasTarget
+        ? `<strong class="${openingPrice == null && !withheld(row, "sizing_open_price") && !withheld(row, "execution_price") ? "negative" : ""}">開盤計價 ${quoteText(row, row.counterfactual_open_replay ? ["sizing_open_price", "execution_price"] : "sizing_open_price")}</strong>`
+        : `<strong>${inventory ? "零目標・減倉至零" : "零權重・不下單"}</strong>`;
+      const entryDescription = hasFill
+        ? `${fillLabel} ${row.execution_price != null || withheld(row, "execution_price") ? quoteText(row, "execution_price") : quoteText(position, "entry_price")} · 名目 ${money(entryNotional)}`
+        : inventory ? "本版無增倉成交；既有成交與費用另行保留"
+        : hasTarget ? "完整模型訊號已保留 · 0 股紙上成交" : "不需開盤計價";
+      const entryCounters = inventory
+        ? `本版增倉委託 ${number(row.requested_shares)}／增倉成交 ${number(row.filled_shares)}／尚未成交 ${number(targetGap)} 股 · 減倉委託 ${number(row.reduction_requested_shares)}／減倉成交 ${number(row.reduction_filled_shares)} 股`
+        : `${hasTarget && !hasFill ? `${esc(signalReasonLabel(row.reason || row.status))} · ` : ""}模型目標 ${number(row.requested_shares)}／紙上成交 ${number(row.filled_shares)}／${minuteReplay ? "容量限制未建立委託" : "尚未成交"} ${number(targetGap)} 股${minuteReplay ? ` · 09:01 容量 ${number(row.minute_kbar_capacity_shares)}` : ` · L1 ${number(row.top_book_capacity_shares)}`}`;
       const modeTotalEquity = row.session_date === sessionDate ? Number(mode?.total_equity_twd) : NaN;
       const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
         ? Number(positionPnl.total) / modeTotalEquity * 100
         : null;
       const currentPrice = isOpen ? position.last_mark_price : position?.exit_price ?? position?.last_exit_price;
-      const currentLabel = isOpen ? (indicative ? "參考快照估值（非成交證據）" : "現在可清算價") : hasPosition ? "已平倉價" : hasFill ? "紙上已成交・估值未取得" : "未成交";
-      const missingPnlLabel = hasFill ? "估值資料未取得" : "不計盈虧";
+      const currentLabel = isOpen ? (indicative ? "參考快照估值（非成交證據）" : "現在可清算價") : hasPosition ? "已平倉價" : hasFill ? "紙上已成交・估值未取得" : inventory ? "本版無新增持倉" : "未成交";
+      const missingPnlLabel = hasFill ? "估值資料未取得" : inventory ? "請見原成交生命週期" : "不計盈虧";
       const currentAt = isOpen ? position.last_quote_at : position?.exit_at ?? position?.last_exit_at;
       const reasonText = signalReasonLabel(row.reason || row.status);
       const eligibility = row.day_trade_eligible
@@ -245,10 +259,10 @@
       return `<tr data-signal-key="${esc(signalRowKey(row))}" data-public-signal-key="${esc(row.public_signal_key || "")}" class="signal-row${selected}">
         <td><strong>${esc(strategyLabel(row))}</strong><small>${esc(signalTimingText(row))}</small></td>
         <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
-        <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(reasonText)}</small></td>
-        <td>${hasTarget ? `<strong class="${openingPrice == null && !withheld(row, "sizing_open_price") && !withheld(row, "execution_price") ? "negative" : ""}">開盤計價 ${quoteText(row, row.counterfactual_open_replay ? ["sizing_open_price", "execution_price"] : "sizing_open_price")}</strong>` : `<strong>零權重・不下單</strong>`}<small>${hasFill ? `${fillLabel} ${row.execution_price != null || withheld(row, "execution_price") ? quoteText(row, "execution_price") : quoteText(position, "entry_price")} · 名目 ${money(entryNotional)}` : hasTarget ? `完整模型訊號已保留 · 0 股紙上成交` : "不需開盤計價"}</small><small>${hasTarget && !hasFill ? `${esc(reasonText)} · ` : ""}模型目標 ${number(row.requested_shares)}／紙上成交 ${number(row.filled_shares)}／${minuteReplay ? "容量限制未建立委託" : "尚未成交"} ${number(targetGap)} 股${minuteReplay ? ` · 09:01 容量 ${number(row.minute_kbar_capacity_shares)}` : ` · L1 ${number(row.top_book_capacity_shares)}`}</small></td>
+        <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small>${inventoryHtml}<small>${esc(reasonText)}</small></td>
+        <td>${entryHeading}<small>${entryDescription}</small><small>${entryCounters}</small></td>
         <td><strong>${currentLabel} ${hasPosition ? quoteText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${quoteText(row, "bid", sourceNumber)}／${quoteText(row, "ask", sourceNumber)}`}</small>${hasPosition ? priceDistanceText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : ""}<small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : missingPnlLabel}</small></td>
-        <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : hasFill ? "已成交；待取得對應持倉估值" : "未成交不納入"}</small></td>
+        <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : hasFill ? "已成交；待取得對應持倉估值" : inventory ? "庫存盈虧歸屬原成交，不重複歸入本版" : "未成交不納入"}</small></td>
       </tr>`;
 
     }

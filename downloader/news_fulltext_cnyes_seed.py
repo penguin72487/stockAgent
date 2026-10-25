@@ -12,6 +12,15 @@ from urllib.parse import parse_qs, urlsplit
 
 CONTRACT_VERSION = 1
 
+# The URL primary key alone still needs a table-page lookup for each row's
+# kind. Keep this physical index separate from the planned-range contract:
+# refused and superseded pages remain part of the same complete query.
+PLANNED_SCOPE_INDEX_NAME = 'discovery_cnyes_planned_scope'
+PLANNED_SCOPE_INDEX_SQL = (
+    'CREATE INDEX IF NOT EXISTS ' + PLANNED_SCOPE_INDEX_NAME
+    + " ON discovery(kind,url) WHERE kind='cnyes_news'"
+)
+
 
 PLANNED_QUERY = """
     SELECT DISTINCT CASE WHEN substr(url,1,:prefix_length)=:prefix

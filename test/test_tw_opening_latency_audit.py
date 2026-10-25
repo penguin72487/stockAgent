@@ -7,6 +7,57 @@ import pytest
 from scripts.audit_tw_opening_latency import opening_coverage_milestones, opening_publication_slo
 
 
+def test_emergency_closure_applicability_reuses_configured_holidays_without_reclassifying_prices(tmp_path):
+    from scripts.audit_tw_opening_latency import opening_session_context
+    from stockagent.live.market_config import LiveMarketConfig
+
+    modes = [LiveMarketConfig(market=name, label=name, config_path="not-loaded.yaml",
+        day_trade_rule_data_dir=str(tmp_path), holidays=("2026-10-23",)) for name in ("B", "A")]
+    result = opening_session_context(modes, "2026-10-23",
+        observed_at=datetime.fromisoformat("2026-10-23T18:20:00+08:00"))
+    assert result["state"] == "not_applicable_closed"
+    assert result["native_opening_latency_sample_eligible"] is False
+    assert result["source_counts_and_original_failures_retained"]
+    assert list(result["market_decisions"]) == ["A", "B"]
+    assert all(row["status"] == "closed" and row["configured_holiday"]
+        for row in result["market_decisions"].values())
+    assert "not_historical_loaded_owner_attestation" in result["configuration_basis"]
+    assert all(len(row["configuration_projection_sha256"]) == 64 for row in result["market_decisions"].values())
+
+
+@pytest.mark.parametrize("statuses,state,eligible", [
+    (["scheduled_open", "actual_open"], "scheduled_session", True),
+    (["unknown", "unknown"], "calendar_unverified_or_mixed", None),
+    (["closed", "scheduled_open"], "calendar_unverified_or_mixed", None),
+    (["closed", "unknown"], "calendar_unverified_or_mixed", None),
+])
+def test_session_applicability_never_calls_unknown_or_mixed_a_pass(monkeypatch, statuses, state, eligible):
+    from scripts.audit_tw_opening_latency import opening_session_context
+    from stockagent.live import market_status
+    from stockagent.live.market_config import LiveMarketConfig
+
+    results = iter(statuses)
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", lambda *args, **kwargs:
+        market_status.TwStockDayDecision(next(results), "fixture source evidence"))
+    modes = [LiveMarketConfig(market=name, label=name, config_path="unused") for name in ("A", "B")]
+    result = opening_session_context(modes, "2026-10-23")
+    assert result["state"] == state and result["native_opening_latency_sample_eligible"] is eligible
+    assert result["scheduled_session_is_actual_trading_proof"] is False
+    assert result["broker_fill_claim"] is False
+
+
+def test_session_applicability_rejects_naive_clock_and_missing_or_duplicate_scope():
+    from scripts.audit_tw_opening_latency import opening_session_context
+    from stockagent.live.market_config import LiveMarketConfig
+
+    cfg = LiveMarketConfig(market="A", label="A", config_path="unused")
+    with pytest.raises(ValueError, match="aware clock"):
+        opening_session_context([cfg], "2026-10-23", observed_at=datetime(2026, 10, 23))
+    for modes in ([], [cfg, cfg]):
+        with pytest.raises(ValueError, match="unique mode scope"):
+            opening_session_context(modes, "2026-10-23")
+
+
 def event(provider, observed_elapsed_ms, observations=(), **overrides):
     start = datetime.fromisoformat("2026-10-13T09:00:00+08:00")
     return {"session_date": "2026-10-13", "provider": provider,
@@ -630,6 +681,10 @@ def test_phase_latency_separates_full_scope_delta_no_print_and_failures(tmp_path
     assert job["first_observation_response_ms"] == job["observation_response_coverage_ms"]["1.0"] == 12.5
     assert job["first_valid_open_ms"] == job["resolved_coverage_ms"]["1.0"] == 12.5
     assert "1.0" not in job["positive_coverage_ms"]
+    all_percent = job["all_percent_completion_ms"]
+    assert set(all_percent["response"]) == {str(p) for p in range(1, 101)}
+    assert all_percent["response"]["100"] == all_percent["resolved"]["100"] == 12.5
+    assert all_percent["positive_open"]["50"] == 12.5 and all_percent["positive_open"]["51"] is None
     assert job["unknown_count"] == 0 and job["source_and_persistence_ms"] == 19.
     assert job["stage_timing"] == {"transport_timing": stage, "last_cache_merge_ms": .25,
         "provider_call_offset_ms": .1, "dispatch_telemetry_wait_ms": .2, "dispatch_telemetry_recorded": False}

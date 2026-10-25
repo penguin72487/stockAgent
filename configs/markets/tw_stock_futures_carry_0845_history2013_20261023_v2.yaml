@@ -1,0 +1,19 @@
+# Same from-scratch strategy/account; date-view-safe sparse execution and data roles.
+base_config: tw_stock_futures_carry_0845_history2013_20261023_v1.yaml
+experiment_name: tw-stock-futures-carry-0845-history2013-20261023-v2
+data:
+  panel_cache_root: data_tw_index_futures/training_cache/history2013_20261023_v2/base_panel
+  factorized_feature_manifest: data_tw_index_futures/training_prepared/tw_stock_futures_history2011_20261021_v5/features/factorized_manifest.json
+  tw_public_feature_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2011_20261021_v5/features/execution_rules.parquet
+trading:
+  tw_futures_portfolio_final_settlement_path: data_tw_index_futures/training_prepared/tw_stock_futures_final_reference_20261021_v1/futures_final_settlement_history.parquet
+  tw_futures_portfolio_benchmark_data_path: data_tw_index_futures/training_prepared/tx_front_reference_20261021_v1/continuous_daily.parquet
+  tw_futures_portfolio_data_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2011_20261021_v5/financial/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2011_20261021_v5/financial/release/rules/rules.parquet
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2013_20261023_v1/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2013_20261023_v1/clocks/0845/opening_reference.parquet
+training:
+  financial_transformer:
+    factorized_sparse_cache_bytes: 12884901888
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_history2013_20261023_v2/clock__0845

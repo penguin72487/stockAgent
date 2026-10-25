@@ -5587,6 +5587,11 @@ def _fetch_tw_mis_last_prices(
         fetch_indices(missing_indices)
 
     exchange_timestamps_ms = np.zeros(len(symbols), dtype=np.int64)
+    submitted_destinations = {index for submitted in submitted_indices
+                              for index, _ in chunks[submitted]} if len(submitted_indices) < len(chunks) else None
+    unsubmitted_symbols = list(dict.fromkeys(
+        symbols[index] for items in chunks for index, _ in items if index not in submitted_destinations
+    )) if submitted_destinations is not None else []
     final_rows = [row for rows in chunk_results for row in rows]
     final_times = [chunk_received_ms[index] for index, rows in enumerate(chunk_results) for _row in rows]
     final_indices = [row[0] for row in final_rows]
@@ -5638,6 +5643,7 @@ def _fetch_tw_mis_last_prices(
             "mis_dispatch_stop_reason": dispatch_stop_reason,
             "mis_deferred_channel_count": sum(len(items) for i, items in enumerate(chunks)
                                               if i not in submitted_indices),
+            "mis_unsubmitted_symbols": unsubmitted_symbols,
             "mis_error_chain_types": sorted({name for item in chunk_failures
                                             for name in item["error_chain_types"]}),
         },

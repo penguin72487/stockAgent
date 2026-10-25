@@ -332,8 +332,11 @@ class PublisherCapacity:
         # observation cadence they cover the whole <=600-second ETA horizon,
         # including bad/zero windows. Never select just healthy/fast samples.
         # Slice BEFORE copying; avoid copying discarded diagnostic subtrees.
-        from downloader.news_fulltext_status import CAPACITY_STATUS_HISTORY_LIMIT
-        providers = ({provider: {key: deepcopy(value[-CAPACITY_STATUS_HISTORY_LIMIT:]
+        from downloader.news_fulltext_status import (
+            CAPACITY_STATUS_HISTORY_LIMIT, STATUS_VALUE_COPY_CONTRACT_VERSION, copy_status_value,
+        )
+        copy_value = copy_status_value if for_status else deepcopy
+        providers = ({provider: {key: copy_value(value[-CAPACITY_STATUS_HISTORY_LIMIT:]
                          if key == 'history' else value) for key, value in state.items()}
                       for provider, state in self.states.items()}
                      if for_status else deepcopy(self.states))
@@ -348,13 +351,14 @@ class PublisherCapacity:
         for provider, state in providers.items():
             observation = self.completion_observations.get(provider, {'history': [], 'last_window': None})
             state['completion_observation'] = {
-                'history': deepcopy(observation['history'][-CAPACITY_STATUS_HISTORY_LIMIT:]
+                'history': copy_value(observation['history'][-CAPACITY_STATUS_HISTORY_LIMIT:]
                                     if for_status else observation['history']),
-                'last_window': deepcopy(observation['last_window']),
+                'last_window': copy_value(observation['last_window']),
             }
         if for_status:
             result['heartbeat_projection'] = {
                 'contract_version': 1, 'history_limit': CAPACITY_STATUS_HISTORY_LIMIT,
+                'value_copy_contract_version': STATUS_VALUE_COPY_CONTRACT_VERSION,
                 'selection': 'latest consecutive windows, including errors and zero progress',
                 'full_history_preserved': True, 'detail_authority': 'rate_calibration.json',
                 'omitted_history_windows': {provider: max(0, len(state['history']) - CAPACITY_STATUS_HISTORY_LIMIT)

@@ -15,6 +15,10 @@ from scripts.ingest_remote_cold_artifacts import _ssh_base, _validate_ssh_target
 from stockagent.data_sync.desync_snapshots import atomic_write_json
 
 
+class RemoteCacheInventoryUnavailable(RuntimeError):
+    """An SSH transport failure retained its private failure receipt."""
+
+
 def observe(args):
     code = "import sys,types\n"
     for name, relative in (
@@ -70,6 +74,8 @@ print(json.dumps({'schema_version':1,'observed_at_epoch':time.time(),'available_
         atomic_write_json(args.output.with_suffix(".error.json"),
                           {"state": "inventory_failed", "stderr": result.stderr,
                            "returncode": result.returncode, "observed_at_epoch": time.time()})
+        if result.returncode == 255:
+            raise RemoteCacheInventoryUnavailable("private SSH cache inventory unavailable; failure receipt retained")
         raise RuntimeError("private cache inventory failed; failure receipt retained")
     value = json.loads(result.stdout.splitlines()[-1])
     return value

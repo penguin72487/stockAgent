@@ -204,6 +204,28 @@ def has_dispatchable_missing_body_work(db, source, owner, now, *, excluded_hosts
                            (source.provider, owner, now)).fetchone())
 
 
+def observed_provider_control(status, provider):
+    """An owner blocked before HTTP initialization has no capacity observation.
+
+    Missing telemetry is distinct from an observed empty pause set. Invalid
+    telemetry remains an audit error; neither case grants dispatch readiness.
+    """
+    capacity = status.get('http_capacity')
+    if capacity is None:
+        return None
+    if not isinstance(capacity, dict):
+        raise ValueError('invalid_http_capacity_snapshot')
+    providers = capacity.get('providers')
+    if providers is None:
+        return None
+    if not isinstance(providers, dict):
+        raise ValueError('invalid_http_capacity_snapshot')
+    control = providers.get(provider)
+    if control is not None and not isinstance(control, dict):
+        raise ValueError('invalid_http_capacity_snapshot')
+    return control
+
+
 def source_readiness_snapshot(db, source, owner, control, *, queue_observed_at_utc, metric_snapshot_at_utc):
     """Do not invent a policy-probe result between two observation clocks.
 
@@ -217,12 +239,19 @@ def source_readiness_snapshot(db, source, owner, control, *, queue_observed_at_u
         for value in (queue_observed_at_utc, metric_snapshot_at_utc))
     if queue_clock.utcoffset() is None or metric_clock.utcoffset() is None:
         raise ValueError('timezone_aware_readiness_clocks_required')
+    if control is None:
+        return False, {'contract_version':2,'available':False,
+            'unavailable_reason':'http_capacity_not_yet_observed',
+            'evaluated_at_utc':queue_observed_at_utc,'scope_snapshot_at_utc':metric_snapshot_at_utc,
+            'has_unfiltered_due_work':has_dispatchable_missing_body_work(db,source,owner,queue_clock.timestamp()),
+            'active_gateway_hosts':{},'active_robots_origins':{},
+            'permission_after_snapshot_inferred':False}
     scopes = active_request_scope_pauses(control, metric_clock.timestamp())
     unfiltered = has_dispatchable_missing_body_work(db, source, owner, queue_clock.timestamp())
     ready = unfiltered and (not any(scopes.values()) or has_dispatchable_missing_body_work(
         db, source, owner, queue_clock.timestamp(), excluded_hosts=tuple(scopes['active_gateway_hosts']),
         excluded_origins=tuple(scopes['active_robots_origins'])))
-    return ready, {'contract_version': 2, 'evaluated_at_utc': queue_observed_at_utc,
+    return ready, {'contract_version': 2, 'available':True, 'evaluated_at_utc': queue_observed_at_utc,
         'scope_snapshot_at_utc': metric_snapshot_at_utc, 'pause_evaluated_at_utc': metric_snapshot_at_utc,
         'has_unfiltered_due_work': unfiltered, **scopes,
         'scope_filter_clock_basis': 'HTTP metric snapshot; queue deadlines and leases use SQLite observation',
@@ -262,7 +291,7 @@ def main(argv=None):
             clause, params = NewsQueue.discovery_dispatch_filter(source)
             disabled_jobs[p] = db.execute("SELECT count(*) FROM discovery WHERE provider=? AND kind IN "
                 "('wordpress_posts','cnyes_news','rss_fulltext') AND NOT " + clause, (p, *params)).fetchone()[0]
-            control = status.get('http_capacity', {}).get('providers', {}).get(p, {})
+            control = observed_provider_control(status,p)
             readiness[p], scope_readiness[p] = source_readiness_snapshot(db, source, owner, control,
                 queue_observed_at_utc=observed, metric_snapshot_at_utc=metric_stamp.isoformat())
     finally:
@@ -271,6 +300,7 @@ def main(argv=None):
         (s.provider, s.allowed, s.domains, s.data_fingerprint) for s in registry.sources.values()
     ], sort_keys=True).encode()).hexdigest()
     result = {"runtime_acceptance_contract_version": RUNTIME_ACCEPTANCE_CONTRACT_VERSION,
+        "http_scope_observation_contract_version":1,
         "audit_implementation_sha256": sha256_file(Path(__file__)),
         "metrics_snapshot_at_utc": metric_stamp.isoformat(), "metrics_snapshot_clock_verified": metrics_clock_verified,
         "observed_at_utc": observed, "service": service, "config_sha256": sha256_file(args.config),
@@ -295,7 +325,7 @@ def main(argv=None):
         states = {r['state']: r['articles'] for r in state_rows if r['provider'] == p}
         ready_states = {'pending', 'retry', 'retry_cooldown', 'inflight'}
         bodied_ready = sum(r['articles'] for r in stored_not_complete if r['provider'] == p and r['state'] in ready_states)
-        control = capacity.get('providers', {}).get(p, {})
+        control = observed_provider_control(status,p) or {}
         result['providers'][p] = {"enabled": source.allowed, "interval_seconds": control.get('effective_interval_seconds', source.interval_seconds),
             "parallelism": control.get('parallelism', source.parallelism), "configured_baseline_interval_seconds": source.interval_seconds,
             "runtime_capacity": control, "calibration": calibration.get('providers', {}).get(p),

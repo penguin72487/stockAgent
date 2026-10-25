@@ -10,7 +10,7 @@ const decimal = value => value == null ? "—" : Dashboard.formatNumber(value, {
 const bytes = value => value == null ? "—" : Dashboard.formatBytes(value, {maximumFractionDigits: 2});
 const labels = Object.freeze({
   running: "正在抓取", backfilling: "等待回補", rechecking: "正文已存，等待重查", inventorying: "清點新網址", idle: "等待到期工作", waiting: "等待來源",
-  cooldown: "來源冷卻", known_queue_clear: "已知待辦已清", attention: "需注意", not_enabled: "未啟用／待確認",
+  cooldown: "等待下次請求", known_queue_clear: "已知待辦已清", attention: "需注意", not_enabled: "未啟用／待確認",
   finite_complete: "固定批次正文已存", waiting_cohort: "新文章等待納入批次",
   authorized_api_pending: "授權 API 待接線",
   metadata_polling: "RSS 資訊追新，非全文",
@@ -82,6 +82,8 @@ function live(data) {
   return currentSnapshot(data) && ["running", "idle", "waiting", "inventorying"].includes(data.health);
 }
 function eta(source, data) {
+  if (live(data) && source.conditional_eta_unavailable_reason === "source_request_scope_paused") return "等待來源重新核對，完成時間未知";
+  if (live(data) && source.conditional_eta_unavailable_reason === "source_request_scope_unknown") return "缺文端點狀態尚未核對，完成時間未知";
   return live(data) ? duration(source.conditional_eta_seconds) : "目前階段暫無有效估時";
 }
 function progress(id, ratio) {
@@ -202,6 +204,8 @@ function renderSources(data) {
     const dispositionNote = !disposition ? "" : `<details class="news-provider-list" data-news-outcome-provider="${escape(source.id)}"${state.outcomeOpen.has(source.id) ? " open" : ""}><summary>缺口分類與下一步</summary><div class="table-scroll"><table><caption>全部網址狀態，拆分尚缺正文與已有正文</caption><thead><tr><th scope="col">分類</th><th scope="col">全部</th><th scope="col">缺正文</th><th scope="col">已有正文</th></tr></thead><tbody>${outcomeRows(disposition, coverage, source.id)}</tbody></table></div><p class="news-provider-note">缺正文與已有正文互斥，相加為全部網址；無交叉統計時顯示未知。不覆寫正文、收據或重試期限。原站不存在不代表所有可用替代都已找過；尚無全途徑不可取得／結案比例的驗收。</p></details>`;
     const apiNote = source.authorized_api_setup ? '<p class="news-provider-eta">已確認 API 授權；先設定 CNA_API_KEY 並核對實際工具、全文範圍與配額。目前未開始 API 全文下載，完成時間未知；舊網頁佇列保留，不算完成。</p>' : '';
     const work = source.body_work_progress;
+    const scopeWork = source.body_request_scope_progress;
+    const scopeNote = !scopeWork?.available ? '' : `<p class="news-provider-note" data-news-request-scope>最近核對：缺文端點暫緩 <span data-news-scope-paused>${count(scopeWork.source_paused_missing_body_urls)}</span> · 其餘待排／執行中 <span data-news-scope-other>${count(scopeWork.other_missing_body_urls)}</span>，合計 ${count(scopeWork.active_missing_body_urls)} 個缺文網址。${scopeWork.source_paused_missing_body_urls ? `最早重新核對 ${escape(scopeWork.source_probe_ready ? '已到期，等待排程' : stamp(scopeWork.next_source_probe_at_utc))}；到期不代表來源恢復，不借用其他端點的新增速度倒數。` : '未受這兩類端點暫緩，不代表全部已到期或獲准存取。'}此分類不暫停追新與其他健康端點；是否正在執行依目前程序狀態判定。</p>`;
     const forecast = source.completion_forecast;
     const displayedRate = forecast ? forecast.new_url_heads_per_second : source.owner_articles_per_second;
     const forecastLabels = { collecting_recent_samples: "正在累積目前程序的完整視窗，暫不推算完成時間", stale_recent_measurement: "近期量測已過期，暫不沿用舊速率估時", unavailable: "近期量測無法核對，完成時間未知", no_recent_new_heads: "近期完整視窗沒有新增正文，不以零速率推算完成時間" };
@@ -211,7 +215,7 @@ function renderSources(data) {
       : '<p class="news-provider-note news-provider-work">正文工作分類尚未就緒；不以未知數當成零或完成。</p>';
     return `<article class="pipeline-card"><header class="pipeline-card-header"><div class="news-provider-identity"><strong>${escape(source.name)}</strong><small>${escape(source.id)}</small></div><span class="pipeline-status ${badge}">${escape(labels[source.state] || "待觀測")}</span></header>${apiNote}
       <dl class="news-provider-facts"><div><dt>${progressLabel}</dt><dd>${progressCount}</dd></div><div><dt>${coverage ? "尚缺正文（含阻塞）" : "待排網址（含重查）"}</dt><dd data-news-missing-body-urls>${count(coverage ? coverage.missing_body_urls : source.remaining_urls)}</dd></div><div><dt>正文 UTF-8</dt><dd>${bytes(source.text_bytes)}</dd></div><div><dt>${metadataOnly ? "新增正文速率尚未量測" : source.authorized_api_setup ? "API 新增正文／分鐘，未量測" : forecast ? "近期新增正文／分鐘" : source.forecast_rate_basis === "new_stored_url_heads" ? "本程序新增正文／分鐘" : "舊快照版本速率／分鐘"}</dt><dd data-news-rate="completion">${decimal(displayedRate == null ? null : displayedRate * 60)}</dd></div></dl>
-      ${referenceNote}${coverageNote}${feedNote}${metadataNote}${workNote}${cnyesListProgress(source)}${fulltextFeedInventory(source)}
+      ${referenceNote}${coverageNote}${feedNote}${metadataNote}${workNote}${scopeNote}${cnyesListProgress(source)}${fulltextFeedInventory(source)}
       <progress class="news-provider-progress mini-progress-track" max="1"${bodyRatio == null ? "" : ` value="${bodyRatio}"`} aria-label="${escape(source.name)} ${hasStoredCounters ? '已存正文占全部已知網址的比例' : cohort ? '固定批次正文比例' : '已完成狀態占已知網址的比例'}"></progress><div class="news-provider-states">${hasStoredCounters ? '全部已知網址' : cohort ? '固定批次' : '已知範圍'} ${ratio} · ${escape(statesText || (metadataOnly ? "已有原始網址線索，尚未建立正文工作" : "尚無已發現網址"))}${cohortNote ? `<p>${escape(cohortNote)}</p>` : ''}</div>${dispositionNote}
       <p class="news-provider-note">剩餘 ${escape(eta(source, data))} · ${escape(finish)}</p>${forecastNote}<p class="news-provider-note">${escape(reviewLabels[source.source_policy_review] || "來源審閱紀錄不可用")}${source.source_reviewed_at_utc ? ` · 核對 ${escape(stamp(source.source_reviewed_at_utc))}` : ""}</p><p class="news-provider-note">${source.authorized_api_setup ? "官方 API 能力檢查已實作，全文管線未啟用" : source.adapter_registered ? "共用下載器已接線" : "來源尚未註冊"} · ${source.adapter_acceptance === "committed_body_heads_observed" ? "已觀測正文入庫" : "尚無正文入庫證據"}${source.source_role === "redirector" ? " · 轉址來源，須找到原始媒體 URL" : ""}</p><p class="news-provider-note">${escape(errorLabel(source))}</p></article>`;
   }).join(""));
@@ -282,7 +286,7 @@ function render(data) {
   text("global-eta", "未知");
   text("global-eta-basis", "未啟用／被拒絕來源與未知歷史仍存在；不是成功倒數。");
   text("eligible-eta", live(data) ? duration(acquisition.eligible_eta_seconds) : "目前階段暫無有效估時");
-  text("eligible-eta-basis", acquisition.eligible_eta_seconds == null ? "有來源缺有效落盤速率或正在冷卻，請看逐來源條件估時。" : "各來源並行，採最長條件工時；未含新探索或阻塞來源。");
+  text("eligible-eta-basis", data.health === "waiting_disk" ? "磁碟不足，新增抓取暫停；容量恢復前沒有有效完成估時。" : acquisition.eligible_eta_seconds == null ? "有來源缺有效落盤速率或正在冷卻，請看逐來源條件估時。" : "各來源並行，採最長條件工時；未含新探索或阻塞來源。");
   text("metadata-count", `${count(acquisition.metadata_partitions)} 個來源分區`);
   text("discovery-count", `到期清點 ${count(acquisition.discovery_due)} 個 · 清點錯誤 ${count(acquisition.discovery_errors)} 個 · 端點暫停 ${count(acquisition.temporarily_blocked_bulk_pages)} 頁`);
   text("retry-count", coverage ? `缺文待重試 ${count((coverage.missing_body_states.retry || 0) + (coverage.missing_body_states.retry_cooldown || 0))} · 已有正文重試 ${count((coverage.retained_body_states.retry || 0) + (coverage.retained_body_states.retry_cooldown || 0))}` : `${count(acquisition.retry_urls)} 個待重試（含重查）`);
@@ -301,7 +305,10 @@ function render(data) {
   text("source-review-summary", data.source_reviews_state === "loaded"
     ? `需取得來源同意 ${count(reviews.permission_required || 0)} 個 · 尚未審閱 ${count(reviews.not_reviewed || 0)} 個 · 審閱未完成 ${count(reviews.review_incomplete || 0)} 個。這是來源審閱，不是抓取失敗或下載授權。`
     : "來源審閱紀錄暫無法讀取；既有下載狀態與數量仍保留，不因此啟用來源。");
-  text("capture-next", live(data) ? "到期 feed 優先；就緒正文立即續抓，按來源限流／退避自動續排。" : `${labels[data.health] || "狀態待確認"}；不從瀏覽器啟動／重啟下載器。`);
+  const disk = data.worker.disk_admission;
+  text("capture-next", data.health === "waiting_disk" && disk?.available
+    ? `磁碟可用 ${bytes(disk.free_bytes)}／保留線 ${bytes(disk.required_free_bytes)}，尚差 ${bytes(disk.shortfall_bytes)}；原服務約每 ${count(disk.automatic_recheck_seconds)} 秒重查，容量足夠才續抓。${data.worker.source_activity === "inventorying" ? "目前仍在整理清冊。" : ""}`
+    : live(data) ? "到期 feed 優先；就緒正文立即續抓，按來源限流／退避自動續排。" : `${labels[data.health] || "狀態待確認"}；不從瀏覽器啟動／重啟下載器。`);
   text("association-count", `${count(acquisition.metadata_association_rows)} 筆（不是唯一文章數）`);
   text("disabled-bulk", count(acquisition.disabled_bulk_pages));
   text("updated-at", `面板 ${stamp(data.generated_at_utc)} · 來源 ${stamp(data.observed_at_utc)}`);

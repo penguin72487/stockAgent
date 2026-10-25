@@ -233,8 +233,9 @@ class FinLabHistoryTest(unittest.TestCase):
         self.assertIn("finlab_runway_seconds <= finlab_key_timeout_seconds + 30", wrapper)
         self.assertLess(wrapper.index('download_finlab_history.py" sync'),
                         wrapper.index('download_finlab_market_intraday.py'))
-        self.assertLess(wrapper.index('finlab_release_gate.py'),
-                        wrapper.index('download_finlab_market_intraday.py'))
+        self.assertLess(wrapper.index('download_finlab_market_intraday.py'),
+                        wrapper.index('finlab_release_gate.py'))
+        self.assertLess(wrapper.index('--kind tw_tick'), wrapper.index('finlab_release_gate.py'))
         self.assertIn('if [[ "$finlab_state" == "pass_complete" ]]; then', wrapper)
         self.assertIn('download_finlab_history.py" pending', wrapper)
         self.assertIn('dotenv_values(".env").get("FINLAB_TICK_QUOTA_RESERVE_MB")', wrapper)

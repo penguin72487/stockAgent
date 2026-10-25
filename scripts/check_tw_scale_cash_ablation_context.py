@@ -15,6 +15,35 @@ import sys
 from types import SimpleNamespace
 
 
+def calendar_for_config(config, dates):
+    """Apply the canonical entry adapter's saved horizon to metadata dates.
+
+    Futures retain earlier cash-stock feature context on disk, while their
+    entry adapter crops the model panel to the verified paired-clock horizon.
+    Do not assign validation dates from that uncropped feature inventory.
+    """
+    import numpy as np
+    from downloader.artifact_io import sha256_file
+    from stockagent.data.tw_futures_decision_clock import validate_clock_source
+
+    values = np.asarray(dates, dtype='datetime64[D]')
+    entry = getattr(config.trading, 'tw_futures_portfolio_entry_clock_path', None)
+    if not entry:
+        return values, {}
+    daily = config.trading.tw_futures_portfolio_data_path
+    rules = config.trading.tw_futures_portfolio_margin_rules_path
+    _, manifest = validate_clock_source(entry, daily_path=daily, rules_path=rules,
+        decision_time=config.trading.tw_futures_portfolio_decision_time)
+    start, end = np.datetime64(manifest['start_date']), np.datetime64(manifest['end_date'])
+    selected = values[(values >= start) & (values <= end)]
+    if not selected.size or selected[0] != start or selected[-1] != end:
+        raise ValueError('feature calendar does not cover the verified entry-clock horizon')
+    path = Path(entry).with_name('manifest.json')
+    return selected, {'entry_clock_manifest': str(path), 'sha256': sha256_file(path),
+        'pair_identity': manifest['pair_identity'], 'source_context_sessions': len(values),
+        'model_panel_sessions': len(selected)}
+
+
 def assess_calendar(config, dates, *, build_folds, split_indices, validate_annual) -> dict:
     import numpy as np
 
@@ -89,9 +118,12 @@ def main() -> int:
         config = load_config(args.config_root / f'{name}.yaml')
         if asdict(config.data) != asdict(baseline.data):
             raise ValueError('selected configuration changed the accepted source')
-        cases[name] = assess_calendar(config, manifest['dates'],
+        dates, source_clock = calendar_for_config(config, manifest['dates'])
+        cases[name] = assess_calendar(config, dates,
             build_folds=build_expanding_year_folds, split_indices=_split_valid_indices,
             validate_annual=_validate_annual_day_trade_training_boundaries)
+        if source_clock:
+            cases[name]['source_clock'] = source_clock
     blocked = [name for name, case in cases.items() if case['state'].startswith('blocked')]
     report = {'contract': 'selected_last_fold_shifted_calendar_preflight_v3',
               'state': 'blocked_calendar_context' if blocked else 'accepted_calendar_context',

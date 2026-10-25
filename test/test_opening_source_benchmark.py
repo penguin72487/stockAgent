@@ -467,8 +467,60 @@ def test_mis_probe_does_not_burst_after_failed_single_symbol_prewarm(monkeypatch
     assert "secret" not in str(result)
 
 
+@pytest.mark.parametrize("circuit_open", [False, True])
+def test_mis_network_rounds_retain_failure_without_resetting_source_circuit(monkeypatch, tmp_path, circuit_open):
+    now = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=10, minute=0)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    source, target = tmp_path / "scope.json", tmp_path / "result.json"
+    source.write_text(json.dumps({"session_date": now.date().isoformat(), "requested_symbols": ["2330"],
+        "rows": {}, "parquet_root": str(tmp_path)}))
+    for module in (benchmark, benchmark.acquisition, quotes):
+        monkeypatch.setattr(module, "datetime", Clock)
+    monkeypatch.setattr(sys, "argv", ["probe", "--receipt", str(source), "--output", str(target),
+        "--rounds", "3", "--mis-only"])
+    monkeypatch.setattr(quotes, "warm_tw_mis_quote_client", lambda: {"ready": True})
+    monkeypatch.setattr(benchmark.acquisition, "configured_opening_providers", lambda *_: pytest.fail("MIS-only has no broker"))
+    calls = []
+    def provider(names, fallback, **kwargs):
+        calls.append(list(names))
+        result = quotes.PriceSnapshot(prices=np.array([100.]), open_prices=np.array([100.]),
+            source="official_mis:round_guard_test_not_live", available_mask=np.array([True]),
+            timestamps_ms=np.array([int(now.timestamp()*1000)]),
+            exchange_timestamps_ms=np.array([int(now.timestamp()*1000)]),
+            transport_timing={"mis_dispatch_stopped": circuit_open,
+                "mis_dispatch_stop_reason": "consecutive_transport_failures" if circuit_open else None,
+                "mis_failed_request_count": 4 if circuit_open else 0})
+        kwargs["on_progress"](names, result)
+        return result
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", provider)
+    assert benchmark.main() == 0
+    report = json.loads(target.read_bytes())
+    assert report["requested_rounds"] == 3
+    assert len(calls) == len(report["rounds"]) == (1 if circuit_open else 3)
+    assert report["rounds_complete"] is not circuit_open
+    assert not report["opening_slo_claim"]
+    assert all(row["durable_receipt_retained"] for row in report["rounds"])
+    if circuit_open:
+        assert report["unstarted_rounds"] == [2, 3]
+        assert report["network_rounds_stopped"] == "canonical_mis_source_circuit_open"
+        assert report["rounds"][0]["providers"]["official_mis"]["transport_timing"]["mis_failed_request_count"] == 4
+    else:
+        assert "network_rounds_stopped" not in report
+
+
 def test_mis_retention_keeps_original_body_scope_and_clock_without_request_secrets(monkeypatch, tmp_path):
-    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    # This tests body retention, not the live wall-clock opening admission.
+    # Running the suite before 09:00 must not fail for an unrelated reason.
+    now = datetime.fromisoformat("2026-10-22T09:00:05+08:00")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+    for module in (benchmark, benchmark.acquisition, quotes):
+        monkeypatch.setattr(module, "datetime", Clock)
     source, output = tmp_path / "scope.json", tmp_path / "result.json"
     source.write_text(json.dumps({"session_date": now.date().isoformat(), "requested_symbols": ["2330"],
         "rows": {}, "parquet_root": str(tmp_path)}))
@@ -519,6 +571,159 @@ def test_source_completion_diagnostic_budget_rejects_unbounded_values(monkeypatc
         benchmark.main()
     assert exc.value.code == 2
     assert not (tmp_path / "unused.json").exists()
+
+
+def test_all_integer_completion_percentages_keep_ceiling_and_explicit_missing():
+    result = benchmark.completion_percentages([
+        {"elapsed_ms": 1., "count": 1}, {"elapsed_ms": 2., "count": 2}], 3, "count")
+    assert set(result) == {str(p) for p in range(1, 101)}
+    assert result["1"] == result["33"] == 1.
+    assert result["34"] == result["66"] == 2.
+    assert result["67"] is result["100"] is None
+    assert all(v is None for v in benchmark.completion_percentages([], 3, "count").values())
+    for samples, count in (([], 0), ([{"elapsed_ms": 0., "count": 4}], 3),
+            ([{"elapsed_ms": 2., "count": 1}, {"elapsed_ms": 1., "count": 2}], 3)):
+        with pytest.raises(ValueError):
+            benchmark.completion_percentages(samples, count, "count")
+
+
+def _after_hours_scope(tmp_path):
+    return {"session_date": "2026-10-22", "requested_symbols": ["A", "B", "C"],
+        "parquet_root": str(tmp_path / "stocks"), "official_trading_universe": {
+            "contract": "tw_official_current_regular_stock_etf_universe_v3", "session_date": "2026-10-22",
+            "symbols": ["C", "A", "B"], "official_trading_count": 3}}
+
+
+def _after_hours_calendar(monkeypatch):
+    from stockagent.live import market_status
+    def decision(day, *args, **kwargs):
+        return SimpleNamespace(status="actual_open" if day.isoformat() == "2026-10-22" else "closed",
+            is_session=day.isoformat() == "2026-10-22", reason="fixture_verified_actual_session")
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", decision)
+
+
+def test_after_hours_context_uses_actual_completed_day_not_friday_or_request_day(monkeypatch, tmp_path):
+    _after_hours_calendar(monkeypatch)
+    source = _after_hours_scope(tmp_path)
+    observed = datetime.fromisoformat("2026-10-24T00:05:00+08:00")
+    result = benchmark.after_hours_context(source, observed)
+    assert result["price_session_date"] == "2026-10-22"
+    assert result["request_observed_at_taipei"].startswith("2026-10-24")
+    assert result["request_day_is_session"] is False
+    with pytest.raises(ValueError, match="aware"):
+        benchmark.after_hours_context(source, observed.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="live/protected"):
+        benchmark.after_hours_context(source, datetime.fromisoformat("2026-10-22T09:01:00+08:00"))
+    source["official_trading_universe"]["official_trading_count"] = 2
+    with pytest.raises(ValueError, match="full-market"):
+        benchmark.after_hours_context(source, observed)
+
+
+@pytest.mark.parametrize("source_name", ["fixture:not_market_data", "twse_tpex:mis"])
+def test_after_hours_probe_keeps_original_clocks_failures_and_private_readback(monkeypatch, tmp_path, source_name):
+    _after_hours_calendar(monkeypatch)
+    fixed = datetime.fromisoformat("2026-10-24T00:05:00+08:00")
+    trade = int(datetime.fromisoformat("2026-10-22T13:30:00+08:00").timestamp() * 1000)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+    monkeypatch.setattr(benchmark, "datetime", Clock)
+    monkeypatch.setattr(benchmark, "load_dotenv", lambda *a, **k: None)
+    def primary(names, fallback, progress):
+        value = quotes.PriceSnapshot(prices=np.array([100., -0., np.nan]), source=source_name,
+            open_prices=np.array([100., np.nan, np.nan]), available_mask=np.ones(3, dtype=bool),
+            requested_count=3, available_count=3, volumes=np.array([1., 0., 0.]),
+            timestamps_ms=np.full(3, int(fixed.timestamp() * 1000), dtype=np.int64),
+            exchange_timestamps_ms=np.full(3, trade, dtype=np.int64),
+            transport_timing={"provider_snapshot_coverage": {"valid_open_symbols": ["A"],
+                "rejected_symbols": {"no_positive_volume_rows": ["B", "C"]}}})
+        progress(names, value)
+        return value
+    def failed(*args):
+        raise PermissionError("must not retain exception text or credentials")
+    def forbidden(*args):
+        pytest.fail("closed-session broker must not be requested or logged in")
+    output = tmp_path / "probe.json"
+    result = benchmark.after_hours_probe(_after_hours_scope(tmp_path), output,
+        providers={"primary": primary, "failed": failed, "shioaji_shared": forbidden})
+    row = result["rounds"][0]
+    assert row["providers"]["primary"]["financial_and_clock_readback_parity"]
+    assert row["providers"]["primary"]["progress_calls"] == 1
+    assert row["providers"]["shioaji_shared"]["state"] == "skipped_closed_session_owner"
+    assert row["providers"]["failed"]["error_type"] == "PermissionError"
+    assert all(v is None for v in row["providers"]["failed"]["completion_ms"]["raw_response_count"].values())
+    assert row["merged"]["final_counts"]["positive_open_count"] == 1
+    assert row["merged"]["completion_ms"]["raw_response_count"]["100"] is not None
+    assert row["merged"]["completion_ms"]["positive_open_count"]["100"] is None
+    assert row["merged"]["final_counts"]["historical_zero_volume_count"] == (2 if source_name == "twse_tpex:mis" else 0)
+    assert row["merged"]["final_counts"]["unknown_count"] == 2, "historical zero volume cannot claim a fresh opening proof"
+    assert not result["positive_prices_complete"]
+    assert result["historical_observations_classified"] == (source_name == "twse_tpex:mis")
+    assert result["state"] == "degraded" and not result["opening_slo_claim"]
+    assert "must not retain" not in output.read_text()
+    with pytest.raises(ValueError, match="overwritten"):
+        benchmark.after_hours_probe(_after_hours_scope(tmp_path), output, providers={"primary": primary})
+
+
+def test_retained_finmind_comparison_requires_original_hash_bound_clock_and_scope_clock(monkeypatch, tmp_path):
+    body = json.dumps({"status": 200, "data": [{"stock_id": "A", "date": "2026-10-22T09:00:01+08:00",
+        "open": 100., "total_volume": 1}]}).encode()
+    payload, baseline, journal = tmp_path / "body.json", tmp_path / "before.py", tmp_path / "original.jsonl"
+    payload.write_bytes(body)
+    shutil.copyfile(benchmark.acquisition.__file__, baseline)
+    original = "2026-10-22T09:00:03.000001+08:00"
+    event = {"event": "provider_snapshot", "observed_at_taipei": "2026-10-22T09:00:03.000003+08:00",
+        "transport_timing": {"body_sha256": hashlib.sha256(body).hexdigest()},
+        "coverage": {"received_at_taipei": original, "validated_at_taipei": "2026-10-22T09:00:03.000002+08:00",
+            "snapshot_id": "original:test:not_market_data"}}
+    journal.write_text(json.dumps(event) + "\n")
+    checks = []
+    def scope(_root):
+        checks.append(benchmark.universe.datetime.now(ZoneInfo("Asia/Taipei")).isoformat())
+        assert checks[-1] == original
+        return False  # Explicit unmanaged fixture; no authority/source gate bypass.
+    monkeypatch.setattr(benchmark.universe, "official_scope_required", scope)
+    result = benchmark.compare_finmind_decoder(["A"], tmp_path / "stocks", baseline, payload,
+        rounds=1, clock_journal=journal)
+    assert result["source_clock_proof"]["original_received_at_taipei"] == original
+    assert result["financial_and_clock_parity"] and result["durable_rows_parity"]
+    assert checks and all(row["valid_open_count"] == 1 for row in result["samples"])
+    event["transport_timing"]["body_sha256"] = "foreign_body"
+    journal.write_text(json.dumps(event) + "\n")
+    with pytest.raises(ValueError, match="clock proof"):
+        benchmark.compare_finmind_decoder(["A"], tmp_path / "stocks", baseline, payload,
+            rounds=1, clock_journal=journal)
+
+
+def test_after_hours_failed_single_symbol_mis_probe_never_fans_out(monkeypatch, tmp_path):
+    _after_hours_calendar(monkeypatch)
+    fixed = datetime.fromisoformat("2026-10-24T01:00:00+08:00")
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+    monkeypatch.setattr(benchmark, "datetime", Clock)
+    monkeypatch.setattr(benchmark, "load_dotenv", lambda *a, **k: None)
+    monkeypatch.setattr(benchmark.acquisition, "configured_opening_providers", lambda *a: {})
+    calls = []
+    monkeypatch.setattr(quotes, "warm_tw_mis_quote_client", lambda **k: (calls.append(k) or {"ready": False}))
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", lambda *a, **k: pytest.fail("failed transport cannot burst a full sweep"))
+    result = benchmark.after_hours_probe(_after_hours_scope(tmp_path), tmp_path / "failed.json")
+    assert len(calls) == 1
+    row = result["rounds"][0]["providers"]["official_mis"]
+    assert row["state"] == "failed" and row["failure_timing"]["network_sweep_skipped"] == "failed_single_symbol_transport_probe"
+    assert all(v is None for v in row["completion_ms"]["raw_response_count"].values())
+
+
+@pytest.mark.parametrize("extra", [["--no-connection-prewarm"], ["--mis-parallel-requests", "8"],
+    ["--finmind-clock-journal", "unused.jsonl"], ["--retain-mis-responses"]])
+def test_after_hours_probe_rejects_ignored_daytime_options_before_source_read(monkeypatch, tmp_path, extra):
+    monkeypatch.setattr(sys, "argv", ["probe", "--after-hours", "--receipt", str(tmp_path / "absent.json"),
+        "--output", str(tmp_path / "unused.json"), *extra])
+    with pytest.raises(SystemExit) as exc:
+        benchmark.main()
+    assert exc.value.code == 2 and not (tmp_path / "unused.json").exists()
 
 
 def test_all_source_probe_skips_refused_mis_but_runs_healthy_sources(monkeypatch, tmp_path):

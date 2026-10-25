@@ -11,7 +11,7 @@ import requests
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext_host_circuit import host_filtered_query
-from downloader.news_fulltext_policy import NewsError, PolicyRegistry
+from downloader.news_fulltext_policy import NewsError, PolicyRegistry, public_address_check
 from downloader.news_fulltext_queue import NewsQueue
 from downloader.news_fulltext_robots import policy_origin, robots_policy_retry
 from scripts.audit_news_transport_observations import audit
@@ -38,6 +38,99 @@ def clock_fixture(monkeypatch):
         time=lambda: clock.value, time_ns=time.time_ns, monotonic=time.monotonic,
         thread_time=time.thread_time))
     return clock
+
+
+@pytest.mark.parametrize('addresses', [[], ['10.0.0.1'], ['93.184.216.34', '10.0.0.1']])
+def test_non_public_rep_addresses_fail_closed_once_per_origin_not_per_article(config, tmp_path, monkeypatch, addresses):
+    lookups = []
+    def resolve(host, port, **kwargs):
+        lookups.append(host)
+        return [(2, 1, 6, '', (address, port)) for address in (
+            addresses if host == 'bad.publisher.test' else ['93.184.216.34'])]
+    monkeypatch.setattr('downloader.news_fulltext_policy.socket.getaddrinfo', resolve)
+    http, session = http_fixture(config, tmp_path, {
+        GOOD + '/robots.txt': FakeResponse(ALLOW), GOOD + '/article': FakeResponse(b'body')})
+    http.address_check = public_address_check
+    with closing(http):
+        with pytest.raises(NewsError, match='^robots_non_public_address$') as failure:
+            http.get(BAD + '/article')
+        assert failure.value.retry and failure.value.robots_origin_isolation
+        checkpoint = json.loads(cache_path(tmp_path).read_bytes())
+        assert checkpoint['policy_retry']['error_code'] == 'robots_non_public_address'
+        assert checkpoint['policy_retry']['delay_seconds'] == 30
+        for index in range(20):
+            with pytest.raises(NewsError, match='robots_origin_policy_cooldown') as deferred:
+                http.get(BAD + '/article/' + str(index))
+            assert deferred.value.request_deferred
+        assert lookups == ['bad.publisher.test'] and not session.calls
+        assert http.get(GOOD + '/article').body == b'body'
+        assert [url for url, _ in session.calls] == [GOOD + '/robots.txt', GOOD + '/article']
+        assert not http.provider_not_before and not http.blocked_gateway_hosts('publisher')
+        assert http.metrics.snapshot()['providers']['publisher']['counts']['robots_pretransport_address_rejections'] == 1
+        assert json.loads(cache_path(tmp_path).read_bytes()) == checkpoint
+
+
+def test_rep_address_negative_cache_survives_restart_and_requires_real_policy(config, tmp_path, monkeypatch):
+    clock, public, lookups = clock_fixture(monkeypatch), [False], []
+    def resolve(host, port, **kwargs):
+        lookups.append(host)
+        return [(2, 1, 6, '', ('93.184.216.34' if public[0] else '10.0.0.1', port))]
+    monkeypatch.setattr('downloader.news_fulltext_policy.socket.getaddrinfo', resolve)
+    http, session = http_fixture(config, tmp_path, {})
+    http.address_check = public_address_check
+    with closing(http), pytest.raises(NewsError, match='robots_non_public_address'):
+        http.get(BAD + '/article')
+    assert not session.calls and len(lookups) == 1
+    http, session = http_fixture(config, tmp_path, {
+        BAD + '/robots.txt': FakeResponse(b'User-agent: *\nDisallow: /\n')})
+    http.address_check = public_address_check
+    with closing(http):
+        with pytest.raises(NewsError, match='robots_origin_policy_cooldown'):
+            http.get(BAD + '/article')
+        assert len(lookups) == 1 and not session.calls
+        clock.value += 31
+        with pytest.raises(NewsError, match='robots_non_public_address'):
+            http.get(BAD + '/article')
+        retry = json.loads(cache_path(tmp_path).read_bytes())['policy_retry']
+        assert retry['generation'] == 2 and retry['delay_seconds'] == 60
+        assert len(lookups) == 2 and not session.calls
+        public[0] = True
+        clock.value += 61
+        with pytest.raises(NewsError, match='^robots_disallowed$') as refusal:
+            http.get(BAD + '/article')
+        assert not refusal.value.retry
+        assert [url for url, _ in session.calls] == [BAD + '/robots.txt']
+        assert not http.blocked_robots_origins('publisher')
+        assert 'policy_retry' not in json.loads(cache_path(tmp_path).read_bytes())
+
+
+def test_non_public_rep_redirect_is_never_requested_and_keeps_initial_scope(config, tmp_path, monkeypatch):
+    def resolve(host, port, **kwargs):
+        return [(2, 1, 6, '', ('10.0.0.1' if host == 'good.publisher.test' else '93.184.216.34', port))]
+    monkeypatch.setattr('downloader.news_fulltext_policy.socket.getaddrinfo', resolve)
+    http, session = http_fixture(config, tmp_path, {
+        BAD + '/robots.txt': FakeResponse(status=302, headers={'Location': GOOD + '/policy'})})
+    http.address_check = public_address_check
+    with closing(http), pytest.raises(NewsError, match='robots_non_public_address'):
+        http.get(BAD + '/article')
+    assert [url for url, _ in session.calls] == [BAD + '/robots.txt']
+    assert set(http.blocked_robots_origins('publisher')) == {BAD}
+    assert not http.provider_not_before
+
+
+def test_private_article_address_after_public_rep_is_still_terminal(config, tmp_path, monkeypatch):
+    lookups = []
+    def resolve(host, port, **kwargs):
+        lookups.append(host)
+        return [(2, 1, 6, '', ('93.184.216.34' if len(lookups) == 1 else '10.0.0.1', port))]
+    monkeypatch.setattr('downloader.news_fulltext_policy.socket.getaddrinfo', resolve)
+    http, session = http_fixture(config, tmp_path, {BAD + '/robots.txt': FakeResponse(ALLOW)})
+    http.address_check = public_address_check
+    with closing(http), pytest.raises(NewsError, match='^non_public_address$') as failure:
+        http.get(BAD + '/article')
+    assert not failure.value.retry and not getattr(failure.value, 'robots_origin_isolation', False)
+    assert len(lookups) == 2 and [url for url, _ in session.calls] == [BAD + '/robots.txt']
+    assert not http.blocked_robots_origins('publisher')
 
 
 @pytest.mark.parametrize('status', [502, 504])

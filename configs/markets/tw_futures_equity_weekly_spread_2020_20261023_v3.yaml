@@ -1,0 +1,13 @@
+# Same equity-universe study, with exact weekly/monthly spread-leg accounting.
+base_config: tw_futures_equity_universe_2020_20261023_v2.yaml
+experiment_name: tw-futures-equity-weekly-spread-2020-20261023-v3
+data:
+  panel_cache_root: data_tw_index_futures/training_cache/equity_weekly_spread_20261023_v3/base_panel
+trading:
+  tw_futures_portfolio_data_path: data_tw_index_futures/training_prepared/tw_all_twd_futures_history2011_20261023_v2/financial/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: data_tw_index_futures/training_prepared/tw_all_twd_futures_history2011_20261023_v2/financial/release/rules/rules.parquet
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_futures_equity_weekly_spread_20261023_v3/twd_equity__0845
+  resume: false

@@ -41,9 +41,23 @@ def child(keys: list[str], root: Path) -> int:
     return 0 if result["attempted"] == len(keys) and result["provider_errors"] == 0 else 1
 
 
-def benchmark(root: Path, output: Path) -> dict:
+def benchmark(root: Path, output: Path, *, cohort_size: int = 8,
+              baseline_group: int = 1, candidate_group: int = 8, wait_lock_seconds: int = 0) -> dict:
+    if (not 1 <= baseline_group < candidate_group <= cohort_size <= 64
+            or cohort_size % baseline_group or cohort_size % candidate_group):
+        raise ValueError('bounded matched cohort must divide both groups: 1 <= baseline < candidate <= cohort <= 64')
+    if not 0 <= wait_lock_seconds <= 600:
+        raise ValueError('account writer lock wait must be 0..600 seconds')
     with (root / ".sync.lock").open("a") as owner:
-        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + wait_lock_seconds
+        while True:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.5)
         keys = []
         for path in sorted((root / "receipts").glob("*.json")):
             row = json.loads(path.read_text())
@@ -51,12 +65,14 @@ def benchmark(root: Path, output: Path) -> dict:
             if (key.startswith("financial_statement:") and 0 < row.get("parquet_size_bytes", 0) <= 4*1024**2
                     and collector.has_local_download(key, root)):
                 keys.append(key)
-            if len(keys) == 8:
+            if len(keys) == cohort_size:
                 break
-        if len(keys) != 8:
-            raise ValueError("eight small acquired financial tables required")
+        if len(keys) != cohort_size:
+            raise ValueError("matched cohort requires enough small acquired financial tables")
+        before = {key: collector.read_key_state(key, root) for key in keys}
         cases = []
-        for index, group_size in enumerate((1, 8, 8, 1)):
+        order = (baseline_group, candidate_group, candidate_group, baseline_group)
+        for index, group_size in enumerate(order):
             started = time.monotonic()
             records, child_pids = [], []
             for offset in range(0, len(keys), group_size):
@@ -88,14 +104,21 @@ def benchmark(root: Path, output: Path) -> dict:
                 "sdk_frame_releases": sum(row["sdk_frame_releases"] for row in records), "records": records})
             print(json.dumps({"case": index, "group_size": group_size, "owner_seconds": seconds}), flush=True)
             collector._atomic_json(output, {"state": "running", "keys": keys, "cases": cases})
-        old = sum(row["owner_seconds"] for row in cases if row["group_size"] == 1)
-        new = sum(row["owner_seconds"] for row in cases if row["group_size"] == 8)
-        result = {"contract_version": 1, "state": "accepted", "observed_at_utc": datetime.now(UTC).isoformat(),
-            "keys": keys, "cases": cases, "single_key_seconds": old, "eight_key_seconds": new,
-            "matched_general_owner_speed_ratio": old/new, "order": "1,8,8,1",
-            "scope": "matched_eight_small_financial_tables; full_catalog_plans/native_check/conversion/receipt/process_wall",
+        old = sum(row["owner_seconds"] for row in cases if row["group_size"] == baseline_group)
+        new = sum(row["owner_seconds"] for row in cases if row["group_size"] == candidate_group)
+        after = {key: collector.read_key_state(key, root) for key in keys}
+        stable = all(before[key].get('sha256') == after[key].get('sha256') for key in keys)
+        result = {"contract_version": 2, "state": "accepted" if stable else "source_changed",
+            "observed_at_utc": datetime.now(UTC).isoformat(), "cohort_size": cohort_size,
+            "keys": keys, "cases": cases, "baseline_group_size": baseline_group,
+            "candidate_group_size": candidate_group, "baseline_seconds": old, "candidate_seconds": new,
+            "matched_general_owner_speed_ratio": old/new, "order": list(order),
+            "canonical_parquet_hashes_stable": stable,
+            "scope": "matched_small_financial_tables; full_catalog_plans/native_check/conversion/receipt/process_wall",
             "cache_and_order_effects_not_fully_eliminated": True,
             "all_tables_or_intraday_speedup_claim": False, "official_maximum_proven": False}
+        if (baseline_group, candidate_group) == (1, 8):
+            result.update(single_key_seconds=old, eight_key_seconds=new)
         collector._atomic_json(output, result)
         return result
 
@@ -106,6 +129,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--child-keys")
     parser.add_argument("--owner-lock-fd", type=int)
+    parser.add_argument('--cohort-size', type=int, default=8)
+    parser.add_argument('--baseline-group', type=int, default=1)
+    parser.add_argument('--candidate-group', type=int, default=8)
+    parser.add_argument('--wait-lock-seconds', type=int, default=0)
     args = parser.parse_args()
     if args.child_keys:
         if args.owner_lock_fd is None:
@@ -114,9 +141,13 @@ def main() -> int:
             return child(json.loads(args.child_keys), args.source_root)
     if not args.output:
         parser.error("--output is required")
-    result = benchmark(args.source_root, args.output)
-    print(json.dumps({key: result[key] for key in ("state", "single_key_seconds", "eight_key_seconds", "matched_general_owner_speed_ratio")}))
-    return 0
+    if args.output.exists():
+        parser.error('a new output path is required')
+    result = benchmark(args.source_root, args.output, cohort_size=args.cohort_size,
+                       baseline_group=args.baseline_group, candidate_group=args.candidate_group,
+                       wait_lock_seconds=args.wait_lock_seconds)
+    print(json.dumps({key: result[key] for key in ("state", "baseline_seconds", "candidate_seconds", "matched_general_owner_speed_ratio")}))
+    return 0 if result['state'] == 'accepted' else 1
 
 
 if __name__ == "__main__":

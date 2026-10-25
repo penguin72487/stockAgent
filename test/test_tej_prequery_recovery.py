@@ -273,6 +273,54 @@ def test_table_window_excludes_all_other_fragments_but_not_other_tables(ready,ki
         assert _ready_task(con,result['next_attempt_at_utc'],'download',{},task['table_id'])['task_id']==task['task_id']
 
 
+@pytest.mark.parametrize('kind',[None,'download','discover'])
+@pytest.mark.parametrize('last_table',[None,'a','0'])
+def test_company_retry_window_coalesces_old_due_fragments_without_starving_other_work(ready,kind,last_table):
+    from downloader.tej_history import _ready_task
+    from downloader.tej_planning import COMPANY_MEMBERSHIP_DEFERRED
+    root,_,_=ready
+    due='2099-01-01T00:00:00+00:00'
+    now='2026-10-23T00:00:00+00:00'
+    with closing(connect(root)) as con,con:
+        for identity in ('a-owner','a-sibling'):
+            con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,"
+                        "last_error_code,next_attempt_at_utc) VALUES(?,?,'download','P1',0,'{}',?,?)",
+                        (identity,'a',COMPANY_MEMBERSHIP_DEFERRED,'2000-01-01T00:00:00+00:00'))
+        con.execute('INSERT INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+                    ('a','a-owner','retained-original-attempt',900,due,
+                     COMPANY_MEMBERSHIP_DEFERRED,'retained-original-audit.json'))
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json) "
+                    "VALUES('b-ready','b',?,'P2',200,'{}')",(kind or 'download',))
+        if last_table is not None:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('scheduler_last_download_table',?)",(last_table,))
+            con.execute("INSERT OR REPLACE INTO meta VALUES('scheduler_table_consecutive_downloads','1')")
+        before_tasks=[dict(r) for r in con.execute('SELECT * FROM tasks ORDER BY task_id')]
+        before_windows=[dict(r) for r in con.execute('SELECT * FROM desktop_retry_windows')]
+        policy={'download_table_locality_burst':4}
+        assert _ready_task(con,now,kind,policy)['task_id']=='b-ready'
+        assert _ready_task(con,now,'download',policy,'a') is None
+        assert _ready_task(con,due,'download',policy,'a')['task_id']=='a-owner'
+        assert [dict(r) for r in con.execute('SELECT * FROM tasks ORDER BY task_id')]==before_tasks
+        assert [dict(r) for r in con.execute('SELECT * FROM desktop_retry_windows')]==before_windows
+
+
+@pytest.mark.parametrize('kind',[None,'download'])
+def test_company_fragment_cooldown_does_not_block_present_companies_in_the_same_table(ready,kind):
+    from downloader.tej_history import _ready_task
+    from downloader.tej_planning import COMPANY_MEMBERSHIP_DEFERRED
+    root,_,_=ready
+    with closing(connect(root)) as con,con:
+        for identity,code in [('a-absent',COMPANY_MEMBERSHIP_DEFERRED),('z-present',None)]:
+            con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,"
+                        "last_error_code,next_attempt_at_utc) VALUES(?,'a','download','P1',0,'{}',?,?)",
+                        (identity,code,'2000-01-01T00:00:00+00:00'))
+        con.execute('INSERT INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+                    ('a','a-absent','retained-original-attempt',900,'2099-01-01T00:00:00+00:00',
+                     COMPANY_MEMBERSHIP_DEFERRED,'retained-original-audit.json'))
+        assert _ready_task(con,'2026-10-23T00:00:00+00:00',kind,{})['task_id']=='z-present'
+        assert _ready_task(con,'2026-10-23T00:00:00+00:00','download',{},'a')['task_id']=='z-present'
+
+
 def test_accepted_source_response_clears_only_its_own_retry_window(ready):
     from downloader.tej_desktop_attempts import defer_unsent_prequery
     from downloader.tej_history import run_one
@@ -362,6 +410,7 @@ class PrequeryNoticeBridge(HealthyReadback):
 
 
 @pytest.mark.parametrize('messages',[['MySql:malloc'],['Cannot find table 0.'],
+                                    ["MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'"],
                                     ['MySql:malloc','Cannot find table 0.']])
 def test_proved_unsent_download_repairs_only_known_owned_runtime_notices(ready,messages):
     from downloader.tej_desktop_attempts import defer_unsent_prequery
@@ -385,13 +434,18 @@ def test_proved_unsent_download_repairs_only_known_owned_runtime_notices(ready,m
     assert result['provider_queries_sent']==0 and result['data_query_repeated'] is False
 
 
-@pytest.mark.parametrize('fault',['permission','quota','auth','foreign','unknown','disabled','provider','clock','policy'])
+@pytest.mark.parametrize('fault',['permission','quota','auth','foreign','unknown','disabled','provider','clock','policy',
+                                'dns_foreign_host','dns_suffix','dns_changed_message'])
 def test_unsent_notice_repair_preserves_barrier_for_unknown_or_unproved_interface(ready,fault):
     from downloader.tej_desktop_attempts import defer_unsent_prequery
     from test_tej_history import runtime_notice
     root,_,_=ready;task,proof,prepared=exhausted(root)
     notice=runtime_notice({'permission':'Permission denied','quota':'Quota exhausted',
-        'auth':'Please login','unknown':'Other runtime failure'}.get(fault,'MySql:malloc'))
+        'auth':'Please login','unknown':'Other runtime failure',
+        'dns_foreign_host':"MySql:request error : The remote name could not be resolved: 'other.example'",
+        'dns_suffix':"MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw.evil.example'",
+        'dns_changed_message':"MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw' Quota exhausted"
+        }.get(fault,'MySql:malloc'))
     if fault=='foreign':notice['owner']=999
     inspection=({'root_enabled':False,'root_automation_enabled':False} if fault=='disabled' else
                 {'provider':'foreign'} if fault=='provider' else

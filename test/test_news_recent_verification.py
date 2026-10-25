@@ -7,12 +7,80 @@ from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue
 from scripts.verify_news_recent_batches import verify_recent_batches
 from scripts.audit_news_runtime import (baseline_progress_requirements, has_dispatchable_missing_body_work,
-    active_request_scope_pauses, source_readiness_snapshot, heartbeat_clock, completion_owner_check, frontier_snapshot_counts)
+    active_request_scope_pauses, source_readiness_snapshot, heartbeat_clock, completion_owner_check, frontier_snapshot_counts,
+    observed_provider_control)
 from scripts.audit_news_selected_articles import audit as audit_selected
 from scripts.benchmark_cnyes_acquisition import verify_batches
 from types import SimpleNamespace
 from test_news_fulltext import FakeResponse, article_html, config as config, http_fixture
 from test_cnyes_news_bulk import cfg as cnyes_config
+
+
+@pytest.mark.parametrize('status',[{}, {'http_capacity':None}, {'http_capacity':{}},
+    {'http_capacity':{'providers':None}}, {'http_capacity':{'providers':{}}}])
+def test_uninitialized_http_capacity_is_unknown_and_never_ready(config,tmp_path,status):
+    registry=PolicyRegistry(config,base=tmp_path)
+    queue=NewsQueue(tmp_path,registry)
+    try:
+        queue.add_articles([{'url':'https://publisher.test/a'}])
+        control=observed_provider_control(status,'publisher')
+        assert control is None
+        ready,scope=source_readiness_snapshot(queue.db,registry.sources['publisher'],queue.owner,control,
+            queue_observed_at_utc='2026-10-23T01:00:00+00:00',
+            metric_snapshot_at_utc='2026-10-23T01:00:00+00:00')
+        assert not ready and not scope['available'] and scope['has_unfiltered_due_work']
+        assert not scope['permission_after_snapshot_inferred']
+        assert scope['unavailable_reason']=='http_capacity_not_yet_observed'
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('status',[{'http_capacity':[]}, {'http_capacity':False},
+    {'http_capacity':{'providers':[]}}, {'http_capacity':{'providers':{'publisher':[]}}}])
+def test_malformed_http_capacity_still_rejects_audit(status):
+    with pytest.raises(ValueError,match='invalid_http_capacity_snapshot'):
+        observed_provider_control(status,'publisher')
+
+
+def test_observed_provider_control_preserves_original_pause_data():
+    control={'temporarily_paused_robots_origins':{'https://publisher.test':1800000000}}
+    assert observed_provider_control({'http_capacity':{'providers':{'publisher':control}}},'publisher') is control
+
+
+def test_main_retains_unknown_http_capacity_and_writes_read_only_audit(config,tmp_path,monkeypatch):
+    import hashlib
+    import json
+    from scripts import audit_news_runtime as audit
+    settings={**config,'root':'news'}
+    registry=PolicyRegistry(settings,base=tmp_path)
+    queue=NewsQueue(tmp_path/'news',registry)
+    try:
+        with queue.db:
+            queue.add_articles([{'url':'https://publisher.test/a'}])
+        status=queue.status(activity='waiting_disk')
+        status['http_capacity']=None
+    finally:
+        queue.close()
+    root=tmp_path/'news'
+    (root/'status.json').write_text(json.dumps(status))
+    config_path=tmp_path/'config.json'
+    config_path.write_text('{}')
+    monkeypatch.setattr(audit,'load_config',lambda _:(settings,registry,tmp_path))
+    monkeypatch.setattr(audit,'configuration_paths',lambda _:[config_path])
+    monkeypatch.setattr(audit,'runtime_source_paths',lambda _:[])
+    monkeypatch.setattr(audit,'service_snapshot',lambda:{'MainPID':'0','ActiveState':'inactive'})
+    monkeypatch.setattr(audit,'owner_process_clock_check',lambda *_:{'accepted':False})
+    before=hashlib.sha256((root/'queue.sqlite3').read_bytes()).hexdigest()
+    output=tmp_path/'audit.json'
+    assert audit.main(['--config',str(config_path),'--output',str(output)])==0
+    result=json.loads(output.read_text())
+    provider=result['providers']['publisher']
+    assert result['http_scope_observation_contract_version']==1
+    assert not provider['has_dispatchable_missing_body_work']
+    assert not provider['request_scope_readiness']['available']
+    assert provider['request_scope_readiness']['has_unfiltered_due_work']
+    assert not result['all_history_complete'] and not result['owner_process_clock_check']['accepted']
+    assert hashlib.sha256((root/'queue.sqlite3').read_bytes()).hexdigest()==before
 
 
 def test_recent_verification_is_read_only_and_can_run_with_active_writer(config, tmp_path):

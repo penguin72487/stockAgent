@@ -1,0 +1,11 @@
+# From-scratch relative-value outputs, paired against the same free policy.
+# Source-admitted stock/ETF/index futures; this is not an all-TWD coverage claim.
+base_config: tw_futures_equity_weekly_spread_2020_20261023_v3.yaml
+experiment_name: tw-futures-residual-policy-20261024-v1
+training:
+  financial_transformer:
+    futures_notional_score_coordinates: true
+    futures_net_notional_cap: null
+runner:
+  output_dir: artifacts/markets/tw_futures_residual_policy_20261024_v1/twd_equity__free_0845
+  resume: false

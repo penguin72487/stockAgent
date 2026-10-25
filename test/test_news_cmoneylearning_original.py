@@ -15,6 +15,12 @@ from downloader.news_fulltext_cmoneylearning import (
     CMONEY_LEARNING_DECLARED_20261023_PATH, CMONEY_LEARNING_V4_PATHS,
     CMONEY_LEARNING_V4_PATH_PATTERN, CMONEY_LEARNING_V4_AUTH_SCOPE,
     CMONEY_LEARNING_V4_NOTE, CMONEY_LEARNING_V4_HTTP_BINDING,
+    CMONEY_LEARNING_DECLARED_20261024_PATHS, CMONEY_LEARNING_V5_PATHS,
+    CMONEY_LEARNING_V5_PATH_PATTERN, CMONEY_LEARNING_V5_AUTH_SCOPE,
+    CMONEY_LEARNING_V5_NOTE, CMONEY_LEARNING_V5_HTTP_BINDING,
+    CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS, CMONEY_LEARNING_V6_PATHS,
+    CMONEY_LEARNING_V6_PATH_PATTERN, CMONEY_LEARNING_V6_AUTH_SCOPE,
+    CMONEY_LEARNING_V6_NOTE, CMONEY_LEARNING_V6_HTTP_BINDING,
 )
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry, extract_article
 from test_news_fulltext import config
@@ -200,7 +206,7 @@ def test_old_v1_does_not_inherit_the_new_original_scope(settings,path):
         parse(settings,page(path),path)
 
 
-@pytest.mark.parametrize('settings_fixture', ['supplemental_settings', 'navigation_settings'])
+@pytest.mark.parametrize('settings_fixture', ['supplemental_settings', 'navigation_settings', 'six_declared_settings'])
 @pytest.mark.parametrize('old,new,code',[
     ('rel="canonical"','rel="alternate"','article_identity_not_verified'),
     ('理財內容編輯林序安</span>','另一個人</span>','article_attribution_not_verified'),
@@ -694,6 +700,154 @@ def test_v4_only_the_closed_candidate_inherits_prior_transport_controls():
     source = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
     assert (source.data_fingerprint, source.authorization_fingerprint,
         source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint) == CMONEY_LEARNING_V4_HTTP_BINDING
+    entry['parallelism'] += 1
+    altered = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
+    assert not altered.http_capacity_source_fingerprint and not altered.http_capacity_authorization_fingerprint
+
+
+@pytest.fixture
+def current_failure_original_settings(declared_original_settings):
+    result = deepcopy(declared_original_settings)
+    entry = result['providers'][0]
+    entry.update(embedded_article_layout='cmoneylearning_visible_article_v5',
+                 article_path_pattern=CMONEY_LEARNING_V5_PATH_PATTERN)
+    entry['authorization']['scope'] = CMONEY_LEARNING_V5_AUTH_SCOPE
+    return result
+
+
+@pytest.mark.parametrize('parser', ['lxml', 'html.parser'])
+@pytest.mark.parametrize('path', CMONEY_LEARNING_DECLARED_20261024_PATHS)
+def test_current_failure_originals_need_their_own_explicit_scope(current_failure_original_settings,
+        declared_original_settings, path, parser):
+    current_failure_original_settings['providers'][0]['html_parser'] = parser
+    article = parse(current_failure_original_settings, title_variant_page(path), path)
+    assert article['body'].count('不取對數') == 32
+    assert 'BlogPosting_v5; not_CMNews_alias_equivalence' in article['article_identity_basis']
+    assert not article['historical_point_in_time'] and not article['per_article_license_verified']
+    with pytest.raises(NewsError):
+        parse(declared_original_settings, title_variant_page(path), path)
+    for unreviewed in (path.upper(), path + 'extra/'):
+        with pytest.raises(NewsError):
+            parse(current_failure_original_settings, title_variant_page(unreviewed), unreviewed)
+    assert len(set(CMONEY_LEARNING_V5_PATHS)) == 22
+    assert set(CMONEY_LEARNING_V5_PATHS) - set(CMONEY_LEARNING_V4_PATHS) == set(CMONEY_LEARNING_DECLARED_20261024_PATHS)
+
+
+@pytest.mark.parametrize('path', CMONEY_LEARNING_V4_PATHS)
+def test_current_failure_scope_keeps_previous_body_semantics(declared_original_settings,
+        current_failure_original_settings, path):
+    raw = title_variant_page(path)
+    old = parse(declared_original_settings, raw, path)
+    new = parse(current_failure_original_settings, raw, path)
+    assert old.pop('article_identity_basis') != new.pop('article_identity_basis')
+    assert old == new
+
+
+@pytest.mark.parametrize('old_fixture,new_fixture,old_paths,new_paths', [
+    ('declared_original_settings', 'current_failure_original_settings',
+     CMONEY_LEARNING_V4_PATHS, CMONEY_LEARNING_DECLARED_20261024_PATHS),
+    ('current_failure_original_settings', 'six_declared_settings',
+     CMONEY_LEARNING_V5_PATHS, CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS),
+])
+def test_scope_expansion_preserves_heads_and_does_not_release_unreviewed_urls(
+        request, old_fixture, new_fixture, old_paths, new_paths, tmp_path):
+    from downloader.news_fulltext_queue import NewsQueue
+    root = tmp_path/'news'
+    queue = NewsQueue(root, PolicyRegistry(request.getfixturevalue(old_fixture), base=tmp_path))
+    try:
+        with queue.db:
+            queue.add_articles([{'url': CMONEY_LEARNING_ORIGIN+p} for p in old_paths])
+        queue.sync_finite_cohorts()
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='complete',body_sha256=?", ('a'*64,))
+        before = [dict(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY url')]
+        cohort = dict(queue.db.execute('SELECT * FROM finite_cohorts').fetchone())
+        receipt = (root/cohort['receipt_path']).read_bytes()
+    finally:
+        queue.close()
+    queue = NewsQueue(root, PolicyRegistry(request.getfixturevalue(new_fixture), base=tmp_path))
+    try:
+        assert [dict(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY url')] == before
+        assert dict(queue.db.execute('SELECT * FROM finite_cohorts').fetchone()) == cohort
+        assert (root/cohort['receipt_path']).read_bytes() == receipt
+        urls = [CMONEY_LEARNING_ORIGIN+p for p in new_paths]
+        with queue.db:
+            queue.add_articles([{'url': url} for url in urls])
+        queue.sync_finite_cohorts()
+        for url in urls:
+            assert queue.db.execute('SELECT state FROM articles WHERE url=?', (url,)).fetchone()[0] == 'waiting_cohort'
+            assert queue.claim_url(url, 300) is None
+    finally:
+        queue.close()
+
+
+def test_current_failure_scope_binds_only_its_exact_prior_http_identity():
+    from downloader.news_fulltext import load_config
+    installed, _, repo = load_config(Path('configs/news_fulltext.json'))
+    entry = next(row for row in installed['providers'] if row['id'] == 'cmoneylearning')
+    entry.update(embedded_article_layout='cmoneylearning_visible_article_v5',
+        article_path_pattern=CMONEY_LEARNING_V5_PATH_PATTERN,
+        adapter_verification='native_canonical_BlogPosting_editor_clock_v5_declared_20261024',
+        note=CMONEY_LEARNING_V5_NOTE)
+    entry['authorization'].update(reviewed_on='2026-10-24', scope=CMONEY_LEARNING_V5_AUTH_SCOPE)
+    source = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
+    assert (source.data_fingerprint, source.authorization_fingerprint,
+        source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint) == CMONEY_LEARNING_V5_HTTP_BINDING
+    entry['parallelism'] += 1
+    altered = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
+    assert not altered.http_capacity_source_fingerprint and not altered.http_capacity_authorization_fingerprint
+
+
+@pytest.fixture
+def six_declared_settings(current_failure_original_settings):
+    result = deepcopy(current_failure_original_settings)
+    entry = result['providers'][0]
+    entry.update(embedded_article_layout='cmoneylearning_visible_article_v6',
+                 article_path_pattern=CMONEY_LEARNING_V6_PATH_PATTERN)
+    entry['authorization']['scope'] = CMONEY_LEARNING_V6_AUTH_SCOPE
+    return result
+
+
+@pytest.mark.parametrize('parser', ['lxml', 'html.parser'])
+@pytest.mark.parametrize('path', CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS)
+def test_six_literal_originals_require_new_scope(six_declared_settings,
+        current_failure_original_settings, path, parser):
+    six_declared_settings['providers'][0]['html_parser'] = parser
+    article = parse(six_declared_settings, title_variant_page(path), path)
+    assert article['body'].count('不取對數') == 32
+    assert 'BlogPosting_v6; not_CMNews_alias_equivalence' in article['article_identity_basis']
+    assert not article['historical_point_in_time'] and not article['per_article_license_verified']
+    with pytest.raises(NewsError):
+        parse(current_failure_original_settings, title_variant_page(path), path)
+    for unreviewed in (path.upper(), path + 'extra/'):
+        with pytest.raises(NewsError):
+            parse(six_declared_settings, title_variant_page(unreviewed), unreviewed)
+    assert len(CMONEY_LEARNING_V6_PATHS) == len(set(CMONEY_LEARNING_V6_PATHS)) == 28
+    assert set(CMONEY_LEARNING_V6_PATHS) - set(CMONEY_LEARNING_V5_PATHS) == set(CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS)
+
+
+@pytest.mark.parametrize('path', CMONEY_LEARNING_V5_PATHS)
+def test_six_original_scope_keeps_all_previous_body_semantics(current_failure_original_settings,
+        six_declared_settings, path):
+    raw = title_variant_page(path)
+    old = parse(current_failure_original_settings, raw, path)
+    new = parse(six_declared_settings, raw, path)
+    assert old.pop('article_identity_basis') != new.pop('article_identity_basis')
+    assert old == new
+
+
+def test_six_original_scope_binds_only_its_exact_prior_http_identity():
+    from downloader.news_fulltext import load_config
+    installed, _, repo = load_config(Path('configs/news_fulltext.json'))
+    entry = next(row for row in installed['providers'] if row['id'] == 'cmoneylearning')
+    entry.update(embedded_article_layout='cmoneylearning_visible_article_v6',
+        article_path_pattern=CMONEY_LEARNING_V6_PATH_PATTERN,
+        adapter_verification='native_canonical_BlogPosting_editor_clock_v6_six_declared_20261024',
+        note=CMONEY_LEARNING_V6_NOTE)
+    entry['authorization'].update(reviewed_on='2026-10-24', scope=CMONEY_LEARNING_V6_AUTH_SCOPE)
+    source = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
+    assert (source.data_fingerprint, source.authorization_fingerprint,
+        source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint) == CMONEY_LEARNING_V6_HTTP_BINDING
     entry['parallelism'] += 1
     altered = PolicyRegistry(installed, base=repo).sources['cmoneylearning']
     assert not altered.http_capacity_source_fingerprint and not altered.http_capacity_authorization_fingerprint

@@ -52,6 +52,7 @@ from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
     valid_feature_source_pages,
 )
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status  # noqa: E402
+from stockagent.live.tick_inventory import build_tick_inventory  # noqa: E402
 
 _SHARED_IMPORT_OBSERVATION = {
     "schema_version": 1,
@@ -84,6 +85,8 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("artifacts/live/data_monitor/feature_inventory.json"),
     )
+    parser.add_argument("--tick-audit-seconds", type=float, default=2.,
+                        help="Bound cold Tick metadata audit per snapshot (0 < seconds <= 30).")
     return parser.parse_args()
 
 
@@ -546,12 +549,26 @@ def main() -> int:
     public_status_timing_ms.update({
         f"shioaji.{key}": value for key, value in shioaji_timing_ms.items()
     })
+    tick_started = time.perf_counter()
+    tick_cache_path = public_status_output.with_name("tick_inventory_cache.json")
+    try:
+        tick_previous = json.loads(tick_cache_path.read_bytes())
+        if not isinstance(tick_previous, dict):
+            tick_previous = {}
+    except (OSError, ValueError):
+        tick_previous = {}
+    tick_inventory, tick_cache = build_tick_inventory(REPO_ROOT, previous=tick_previous, now=observed,
+                                                     audit_seconds=args.tick_audit_seconds)
+    if tick_cache != tick_previous:
+        _atomic_json(tick_cache_path, tick_cache, compact=True)
+    public_status_timing_ms["tick_inventory"] = round((time.perf_counter() - tick_started) * 1_000, 3)
     public_status = build_data_monitor_public_status(
         REPO_ROOT,
         now=observed,
         refresh_services=services,
         shioaji_status=shioaji_status,
         record_inventory=record_inventory,
+        tick_inventory=tick_inventory,
         timing_ms=public_status_timing_ms,
     )
     # This snapshot is rebuilt and read every 30 seconds.  Compact encoding

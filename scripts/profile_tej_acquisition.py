@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT
 
-PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v5_transport_and_prebridge'
+PROFILE_CONTRACT = 'tej_bounded_acquisition_timing_profile_v7_table_selection'
 SCOPE_TIMING_PHASES = frozenset({
     'context_and_source_binding', 'field_selection',
     'company_universe_and_lookup', 'date_model_and_lookup',
@@ -76,33 +76,67 @@ def _flow_metadata(path: Path, task_id: str, attempt: str) -> dict:
         return {}
 
 
-def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
+def _select_tasks(con: sqlite3.Connection, limit: int, selection: str):
+    conditions = (SOURCE_SCOPE_CONTRACT, 'complete', 'download', 'fresh_end_to_end')
+    columns = ('task_id,table_id,active_attempt_id,attempted_at_utc,'
+               'completed_at_utc,seconds,actual_rows')
+    if selection == 'latest_tasks':
+        query = (f'SELECT {columns} FROM tasks '
+                 'WHERE scope_contract=? AND state=? AND kind=? AND timing_basis=? '
+                 'ORDER BY completed_at_utc DESC LIMIT ?')
+        args = (*conditions, limit)
+        plan = [dict(row) for row in con.execute('EXPLAIN QUERY PLAN '+query, args)]
+        rows = [dict(row) for row in con.execute(query, args)]
+        return rows, plan, {'mode': selection, 'limit': limit,
+                           'tables_observed': len({row['table_id'] for row in rows})}
+    # The existing index is ordered by completion, then table. Streaming its
+    # covered metadata avoids sorting all completed tasks just to keep one
+    # winner per table. Fetch task payload metadata only for selected winners.
+    query = ('SELECT table_id,completed_at_utc FROM tasks INDEXED BY tasks_scope_timing '
+             'WHERE scope_contract=? AND state=? AND kind=? AND timing_basis=? '
+             'ORDER BY completed_at_utc DESC')
+    detail = (f'SELECT {columns} FROM tasks INDEXED BY tasks_scope_timing '
+              'WHERE scope_contract=? AND state=? AND kind=? AND timing_basis=? '
+              'AND completed_at_utc=? AND table_id=? ORDER BY task_id DESC LIMIT 1')
+    plan = [dict(row) for row in con.execute('EXPLAIN QUERY PLAN '+query, conditions)]
+    plan += [dict(row) for row in con.execute('EXPLAIN QUERY PLAN '+detail, (*conditions, '', ''))]
+    latest, scanned = {}, 0
+    for row in con.execute(query, conditions):
+        scanned += 1
+        if row['completed_at_utc'] is not None:
+            latest.setdefault(row['table_id'], row['completed_at_utc'])
+    rows = [dict(con.execute(detail, (*conditions, latest[table], table)).fetchone())
+            for table in sorted(latest)[:limit]]
+    return rows, plan, {'mode': selection, 'limit': limit, 'tables_observed': len(rows),
+                       'eligible_tables': len(latest), 'selection_truncated': len(latest) > limit,
+                       'scanned_index_rows': scanned,
+                       'scope': 'latest one complete fresh task per selected table; not full source history'}
+
+
+def profile(root: Path, output: Path, *, limit: int = 60, selection: str = 'latest_tasks') -> dict:
     if output.exists():
         raise FileExistsError('Retain the original timing profile')
     if type(limit) is not int or not 1 <= limit <= 256:
         raise ValueError('Timing sample must be bounded to 1..256 tasks')
+    if selection not in {'latest_tasks', 'latest_per_table'}:
+        raise ValueError('Unknown TEJ timing selection')
     root = root.resolve()
-    query = ('SELECT task_id,table_id,active_attempt_id,attempted_at_utc,'
-             'completed_at_utc,seconds,actual_rows FROM tasks '
-             'WHERE scope_contract=? AND state=? AND kind=? AND timing_basis=? '
-             'ORDER BY completed_at_utc DESC LIMIT ?')
-    args = (SOURCE_SCOPE_CONTRACT, 'complete', 'download', 'fresh_end_to_end', limit)
     started = time.monotonic()
     with closing(sqlite3.connect(f'file:{root / "queue.sqlite3"}?mode=ro', uri=True, timeout=2)) as con:
         con.row_factory = sqlite3.Row
+        con.execute('PRAGMA query_only=ON')
         deadline = time.monotonic()+2
         con.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
         con.execute('BEGIN')
         observed = datetime.now(UTC).isoformat()
-        plan = [dict(r) for r in con.execute('EXPLAIN QUERY PLAN '+query, args)]
-        rows = [dict(r) for r in con.execute(query, args)]
+        rows, plan, selection_metadata = _select_tasks(con, limit, selection)
         names = {r['table_id']:r['name'] for r in con.execute('SELECT table_id,name FROM tables')}
         con.rollback()
     query_seconds = time.monotonic()-started
     samples = []
     for row in rows:
         attempt = row['active_attempt_id']
-        sample = {k:row[k] for k in ('task_id','seconds','actual_rows','completed_at_utc')}
+        sample = {k:row[k] for k in ('task_id','table_id','active_attempt_id','seconds','actual_rows','completed_at_utc')}
         sample['table'] = names[row['table_id']]
         prepared = root/'requests'/(attempt+'.json') if attempt else None
         stage = root/'raw'/(attempt+'.json.stage.json') if attempt else None
@@ -156,8 +190,9 @@ def profile(root: Path, output: Path, *, limit: int = 60) -> dict:
     preparations = [r['before_submission_seconds'] for r in samples if 'before_submission_seconds' in r]
     result = {'contract':PROFILE_CONTRACT,'sql_snapshot_at_utc':observed,
               'provider_queries_sent':0,'queue_modified':False,'raw_values_exposed':False,
-              'timing_basis':'fresh_end_to_end','selection_seconds':query_seconds,
-              'selection_plan':plan,'sample_limit':limit,'samples':samples,
+              'timing_basis':'fresh_end_to_end','source_scope_contract':SOURCE_SCOPE_CONTRACT,
+              'selection_seconds':query_seconds,
+              'selection_plan':plan,'selection':selection_metadata,'sample_limit':limit,'samples':samples,
               'all':summary(samples),'nonempty':summary([r for r in samples if r['actual_rows']]),
               'empty':summary([r for r in samples if not r['actual_rows']]),
               'median_before_submission_seconds':statistics.median(preparations) if preparations else None,
@@ -171,8 +206,10 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=ROOT/'data_tej')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--limit', type=int, default=60)
+    parser.add_argument('--selection', choices=('latest_tasks', 'latest_per_table'), default='latest_tasks',
+                        help='Latest tasks, or one latest completed fresh task per table with an explicit table limit')
     args = parser.parse_args(argv)
-    result = profile(args.root, args.output, limit=args.limit)
+    result = profile(args.root, args.output, limit=args.limit, selection=args.selection)
     print(json.dumps({k:v for k,v in result.items() if k not in ('samples','selection_plan')}, ensure_ascii=False))
     return 0
 

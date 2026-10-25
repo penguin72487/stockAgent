@@ -22,6 +22,7 @@ import requests
 from stockagent import private_json
 from stockagent.live import quote_provider as quotes
 from stockagent.live.opening_price_journal import pack_observation_details
+from stockagent.live.opening_price_priority import priority_indices
 
 Progress = Callable[[list[str], quotes.PriceSnapshot], None]
 Provider = Callable[[list[str], np.ndarray, Progress], quotes.PriceSnapshot]
@@ -162,6 +163,7 @@ class _Session:
     provider_snapshot_ids: set[str] = field(default_factory=set)
     durable_completed_jobs: dict[str, str] = field(default_factory=dict)
     jobs: set[Future] = field(default_factory=set)
+    deferred_priority_symbols: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 class OpeningPriceFanIn:
@@ -320,6 +322,8 @@ class OpeningPriceFanIn:
             quotes.persist_tw_opening_snapshot_cache(parquet_root=key[0], session_date=date_text, timings=flush_timing)
             observed.transport_timing = {**(observed.transport_timing or {}), "opening_acquisition_policy": "parallel_incremental_fan_in_v1", "opening_cache_ready": True, "opening_durable_flush": flush_timing, "opening_quorum_wait_ms": round((time.perf_counter() - started) * 1000, 3)}
             return observed
+        ordered_indices, priority_evidence = priority_indices(
+            symbols, parquet_root=key[0], session_date=date_text)
         # Record the entire requested universe even if only an early partial
         # batch reaches quorum and a later provider disconnects completely.
         quotes.seed_tw_opening_snapshot_cache(symbols, quotes.PriceSnapshot(prices=fallback, source="opening_request_scope", available_mask=np.zeros(len(symbols), dtype=bool)), parquet_root=key[0], session_date=date_text, persist=False)
@@ -356,11 +360,22 @@ class OpeningPriceFanIn:
                 # modes to send overlapping full-market HTTP requests.
                 if active and _snapshot_poll_interval(name, observed_at) is not None:
                     continue
-                indices = [i for i, symbol in enumerate(symbols) if symbol not in active and (name not in session.metrics or not resolved[i])]
+                indices = [i for i in ordered_indices if symbols[i] not in active
+                           and (name not in session.metrics or not resolved[i])]
                 if not indices:
                     continue
+                priority = dict(priority_evidence)
                 if recovery_probe:
                     indices = indices[:1]
+                elif name == "official_mis" and session.deferred_priority_symbols.get(name):
+                    # Transport failure may have prevented tail batches from
+                    # being submitted. Give those exact symbols the next full
+                    # sweep's first slots, rather than retrying the same prefix.
+                    deferred = session.deferred_priority_symbols[name]
+                    deferred_order = {symbol: i for i, symbol in enumerate(deferred)}
+                    indices.sort(key=lambda i: deferred_order.get(symbols[i], len(deferred)))
+                    priority["fairness_policy"] = "previous_unsubmitted_tail_first_v1"
+                    priority["deferred_tail_count"] = sum(symbols[i] in deferred_order for i in indices)
                 requested = [symbols[i] for i in indices]
                 active.update(requested)
                 metric = session.metrics.setdefault(name, {"attempts": 0, "requested_count": 0, "state": "pending"})
@@ -373,12 +388,12 @@ class OpeningPriceFanIn:
                 scope["requested"].update(requested)
                 metric["unique_requested_count"] = len(scope["requested"])
                 job_id = f"{name}:{metric['attempts']}:{self._owner_id}"
-                jobs.append((name, provider, requested, fallback[indices].copy(), job_id, recovery_probe))
+                jobs.append((name, provider, requested, fallback[indices].copy(), job_id, recovery_probe, priority))
             # Enqueue all sources under a short lock. Workers perform no I/O
             # until the lock is released; a fast winner cannot cancel a loser.
-            for name, provider, requested, values, job_id, recovery_probe in jobs:
+            for name, provider, requested, values, job_id, recovery_probe, priority in jobs:
                 job = self._pool.submit(self._run, session, generation, key, name, provider,
-                    requested, values, started, job_id, time.perf_counter(), recovery_probe)
+                    requested, values, started, job_id, time.perf_counter(), recovery_probe, priority)
                 session.jobs.add(job)
                 job.add_done_callback(lambda completed, state=session: self._job_finished(state, completed))
         with session.condition:
@@ -431,6 +446,7 @@ class OpeningPriceFanIn:
             "opening_resolved_count": int(resolved.sum()), "opening_required_count": required,
             "opening_quorum_ready": ready, "opening_background_pending": pending,
             "opening_snapshot_poll_owner": "bounded_shared_fan_in" if poll_opening_snapshots else "caller",
+            "opening_quote_priority": priority_evidence,
             "opening_durable_flush": flush_timing,
             "opening_providers": metrics,
             "opening_source_errors": [f"{name}_{row['error_type']}" for name, row in metrics.items() if row.get("error_type")],
@@ -438,7 +454,7 @@ class OpeningPriceFanIn:
         observed.transport_timing["opening_telemetry_recorded"] = _record_source_event(key, "merged", "quorum" if ready else "waiting_source", {"requested_count": len(symbols), "valid_open_count": int(opens.sum()), "resolved_count": int(resolved.sum()), "required_count": required, "elapsed_ms": observed.transport_timing["opening_quorum_wait_ms"], "background_pending": pending, "input_flush": flush_timing, "providers": journal_metrics, "provider_metric_layout": "inline_until_durable_finished_reference_v1"})
         return observed
 
-    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id, enqueued_at=None, recovery_probe=False):
+    def _run(self, session, generation, key, name, provider, symbols, fallback, caller_started, job_id, enqueued_at=None, recovery_probe=False, priority=None):
         started = time.perf_counter()
         source_call_started = time.monotonic()
         poll_interval = _snapshot_poll_interval(name, datetime.now(TAIPEI))
@@ -446,6 +462,7 @@ class OpeningPriceFanIn:
         # delta used to overwrite the simultaneous 2,293-symbol batch receipt.
         metric = {"job_id": job_id, "requested_count": len(symbols), "state": "running",
                   "transport_recovery_probe": recovery_probe,
+                  "quote_priority": priority or {"status": "unavailable"},
                   "requested_symbols_sha256": hashlib.sha256("\n".join(symbols).encode()).hexdigest(),
                   "requested_scope_sha256": hashlib.sha256("\n".join(sorted(symbols)).encode()).hexdigest(),
                   "measurement_clock": "provider_job_perf_counter_v1"}
@@ -471,6 +488,7 @@ class OpeningPriceFanIn:
             "job_id": job_id, "requested_count": len(symbols),
             "requested_symbols_sha256": metric["requested_symbols_sha256"],
             "requested_scope_sha256": metric["requested_scope_sha256"],
+            "quote_priority": metric["quote_priority"],
             "dispatch_ms": metric["last_dispatch_ms"], "worker_queue_ms": metric["worker_queue_ms"],
             "observed_at_taipei": metric["last_started_at_taipei"]})
         metric["dispatch_journal_policy"] = "request_overlaps_start_receipt_join_before_progress_v1"
@@ -605,6 +623,12 @@ class OpeningPriceFanIn:
                         "coverage": source_snapshot, "transport_timing": transport})
             with session.condition:
                 responses = int(snapshot.available_count)
+                if name == "official_mis" and not recovery_probe:
+                    # This private scheduler state is not copied to JSON DTOs.
+                    # Preserve it across a one-symbol half-open probe.
+                    deferred_symbols = transport.get("mis_unsubmitted_symbols", ())
+                    session.deferred_priority_symbols[name] = tuple(dict.fromkeys(
+                        symbol for symbol in deferred_symbols if symbol in requested_set))
                 valid_opens = int(quotes.tw_session_open_observed_mask(snapshot, session_date=key[1]).sum())
                 no_prints = int(quotes.tw_session_no_open_print_mask(snapshot, session_date=key[1]).sum())
                 state = "complete" if valid_opens or no_prints else "waiting_source"
@@ -724,12 +748,15 @@ def _opening_only_snapshot(symbols, fallback, rows, *, source, session_date, rec
     opens, prices = np.full(size, np.nan), np.asarray(fallback, dtype=np.float64).copy()
     available = np.zeros(size, dtype=bool)
     stamps, received = np.zeros(size, dtype=np.int64), np.zeros(size, dtype=np.int64)
+    midnight, end = quotes._taipei_session_bounds(session_date)
+    opening_gate = midnight + 9 * 60 * 60 * 1000
     for i, symbol in enumerate(symbols):
         value = rows.get(symbol)
         if value is None:
             continue
         opening, market_ms = value
-        if quotes._float_or_none(opening) is None or not quotes._same_taipei_open_timestamp(market_ms, session_date) or market_ms > received_ms + 1000:
+        if (quotes._float_or_none(opening) is None or not (market_ms > 0 and opening_gate <= market_ms < end)
+                or market_ms > received_ms + 1000):
             continue
         opens[i], prices[i], stamps[i], received[i], available[i] = opening, opening, market_ms, received_ms, True
     return quotes.PriceSnapshot(prices=prices, open_prices=opens, available_mask=available, available_count=int(available.sum()), requested_count=size, source=source, timestamps_ms=received, exchange_timestamps_ms=stamps)
@@ -809,11 +836,22 @@ class _FinMindSnapshotOwner:
         self.error = None
         self.failures = 0
 
-    def read(self, *, force_network=False):
+    def read(self, *, force_network=False, price_session_date=None):
         queued = time.perf_counter()
         with self.lock:
             acquired = time.perf_counter()
             now = datetime.now(TAIPEI)
+            # A read-only after-hours probe may inspect the last completed
+            # session without pretending the HTTP request happened that day.
+            # Production callers omit this argument. Fence the decoded view
+            # by its explicit price day; never reuse yesterday's diagnostic
+            # projection as today's opening inputs. Transport-error backoff is
+            # independent of this view, so changing price day cannot bypass it.
+            session_date = price_session_date or now.date().isoformat()
+            if datetime.fromisoformat(session_date).date().isoformat() != session_date:
+                raise ValueError("price session requires an ISO date")
+            if session_date > now.date().isoformat():
+                raise ValueError("price session cannot be in the future")
             token = os.environ["FINMIND_TOKEN"]
             identity = (os.getpid(), now.date().isoformat(), now.time() >= daytime(9),
                         hashlib.sha256(token.encode()).digest())
@@ -828,7 +866,8 @@ class _FinMindSnapshotOwner:
                 self.error.opening_transport_timing = {
                     **getattr(self.error, "opening_transport_timing", {}), "provider_failure_reused": True}
                 raise self.error
-            if not force_network and self.value is not None and clock < self.retry_at:
+            if (not force_network and self.value is not None and clock < self.retry_at
+                    and self.value["session_date"] == session_date):
                 return self.value, True, (acquired - queued) * 1000
             if self.session is None:
                 self.session = _http_session()
@@ -850,7 +889,7 @@ class _FinMindSnapshotOwner:
                 json_decoded = time.perf_counter()
                 received_ms = int(received.timestamp() * 1000)
                 value = _decode_finmind_opening_payload(payload, received_ms=received_ms,
-                                                       session_date=now.date().isoformat())
+                                                       session_date=session_date)
                 validated = time.perf_counter()
                 coverage = {"contract": "finmind_unfiltered_market_snapshot_coverage_v1",
                     "snapshot_id": f"{os.getpid()}:{time.time_ns()}",
@@ -875,7 +914,7 @@ class _FinMindSnapshotOwner:
                     "body_sha256": hashlib.sha256(body).hexdigest() if isinstance(body, bytes) else None,
                     "provider_snapshot_coverage": coverage}
                 self.value = {**value, "timing": timing, "received_ms": received_ms,
-                              "session_date": now.date().isoformat()}
+                              "session_date": session_date}
                 self.error, self.failures = None, 0
                 self.retry_at = clock + (_snapshot_poll_interval("finmind_snapshot", now) or 10.)
             except Exception as exc:
@@ -900,9 +939,10 @@ class _FinMindSnapshotOwner:
 _FINMIND_SNAPSHOT_OWNER = _FinMindSnapshotOwner()
 
 
-def fetch_finmind_opening_prices(symbols, fallback, progress, *, force_network=False):
+def fetch_finmind_opening_prices(symbols, fallback, progress, *, force_network=False, price_session_date=None):
     projection_started = time.perf_counter()
-    value, reused, queue_ms = _FINMIND_SNAPSHOT_OWNER.read(force_network=force_network)
+    options = {"price_session_date": price_session_date} if price_session_date is not None else {}
+    value, reused, queue_ms = _FINMIND_SNAPSHOT_OWNER.read(force_network=force_network, **options)
     requested = set(symbols)
     counts = Counter(reason for symbol, reason in value["quality_records"] if symbol in requested)
     quality = {key: counts[key] for key in ("malformed_rows", "trial_rows", "no_positive_volume_rows",

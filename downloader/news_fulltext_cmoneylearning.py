@@ -115,6 +115,66 @@ CMONEY_LEARNING_V4_HTTP_BINDING = (
     'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
     '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
 )
+# These two URLs come from the current failure writer's retained canonical
+# witnesses. Reading their metadata does not require another CMNews request.
+CMONEY_LEARNING_DECLARED_20261024_PATHS = (
+    '/%e8%96%94%e7%90%b5%e9%a2%b1%e9%a2%a8%e4%ba%a4%e5%89%b2%e9%a0%86%e5%bb%b6%e5%88%b0%e5%93%aa%e5%a4%a9%ef%bc%9f%e5%8f%b0%e8%82%a1%e4%bc%91%e5%b8%82%e8%88%87%e5%a7%94%e8%a8%97%e5%96%ae%e8%99%95%e7%90%86/',
+    '/%e8%82%a1%e7%a5%a8%e7%8f%be%e9%87%91%e6%b8%9b%e8%b3%87%e9%80%80%e6%ac%be%e8%a6%81%e7%b9%b3%e7%a8%85%e5%97%8e%ef%bc%9f%e9%80%80%e5%9b%9e%e6%9c%ac%e9%87%91%e5%85%8d%e7%a8%85%e8%a6%8f%e5%ae%9a%e3%80%81/',
+)
+CMONEY_LEARNING_V5_PATHS = CMONEY_LEARNING_V4_PATHS + CMONEY_LEARNING_DECLARED_20261024_PATHS
+CMONEY_LEARNING_V5_PATH_PATTERN = '^(?:' + '|'.join(re.escape(p) for p in CMONEY_LEARNING_V5_PATHS) + ')$'
+CMONEY_LEARNING_V5_AUTH_SCOPE = (
+    'Bounded private personal research of the twenty completed originals and exactly two additional '
+    'literal canonical originals declared by retained CMNews failure metadata on 2026-10-24. '
+    'New originals require explicit same-response source/body/credit/clock verification and shared '
+    'immutable supplemental receipts. No paid/member, third-party rights override, publication, training '
+    'export, alias equivalence or whole-site scope. Not a reuse license or fair-use verdict; '
+    'preserve credits, REP and actual refusals.'
+)
+CMONEY_LEARNING_V5_NOTE = (
+    'Reuse the twenty completed originals and their frozen cohort/supplements. Only two new literal '
+    'originals from retained CMNews canonical metadata may enter separately verified supplements. '
+    'No recursive discovery, guessed slugs, AI polling, public body, automatic training export, CMNews '
+    'alias equivalence or historical-release guarantee. Ten-second spacing is not a measured source maximum.'
+)
+CMONEY_LEARNING_V5_HTTP_BINDING = (
+    '0785e5cd2d6eeb26c7312650ddbb0a654a341ae0b302c63111918cbbb7dff656',
+    '86838c2ab710f3f3ec64104154176e4c8f6661e3bba5a99513444bfdb8e7b8d9',
+    'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
+    '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
+)
+# Exact new originals from six completed canonical-locator observations.
+# Existing twenty-two bodies retain their accepted heads and payloads.
+CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS = (
+    '/%e7%be%8e%e5%85%89%e7%bd%b7%e5%b7%a5%e6%9c%89%e8%bd%89%e5%96%ae%e8%a1%8c%e6%83%85%e5%97%8e%ef%bc%9fipp%e5%88%86%e7%b4%85%e7%88%ad%e8%ad%b0%e3%80%81%e8%a8%98%e6%86%b6%e9%ab%94%e5%a0%b1%e5%83%b9/',
+    '/%e5%a4%96%e8%b3%87%e8%b2%b7%e8%b6%85%e7%82%ba%e4%bd%95%e9%9a%94%e5%a4%a9%e5%8f%8d%e6%89%8b%e5%80%92%e8%b2%a8%ef%bc%9f%e7%9c%8b%e7%a9%bf%e5%81%87%e5%a4%96%e8%b3%87%e9%9a%94%e6%97%a5%e6%b2%96%e8%88%87/',
+    '/%e9%96%8b%e9%ab%98%e8%b5%b0%e4%bd%8e%e7%82%ba%e4%bd%95%e8%b2%b7%e9%80%b2%e5%b0%b1%e7%bf%bb%e9%bb%91%ef%bc%9f%e9%9a%94%e6%97%a5%e6%b2%96%e5%80%92%e8%b2%a8%e6%a9%9f%e5%88%b6%e3%80%81%e7%95%b6%e6%b2%96/',
+    '/%e9%87%91%e5%83%8f%e9%9b%bb%e7%8d%b2%e4%ba%9e%e9%a6%ac%e9%81%9c856%e5%85%83%e7%a7%81%e5%8b%9f%e5%85%a5%e8%82%a1%e9%82%84%e8%83%bd%e8%bf%bd%ef%bc%9f34%e9%9a%8ehdi%e6%8a%80%e8%a1%93%e8%88%87%e5%8d%83/',
+    '/%e7%be%8e%e8%82%a1%e8%b2%a1%e5%a0%b1%e8%b6%85%e9%a0%90%e6%9c%9f%e7%82%ba%e4%bd%95%e7%9b%a4%e5%be%8c%e6%9a%b4%e8%b7%8c%ef%bc%9f%e7%9c%8b%e6%87%82%e5%89%8d%e7%9e%bb%e6%8c%87%e5%bc%95%e3%80%811-2/',
+    '/%e7%a7%91%e6%9e%97%e7%a0%94%e7%99%bc%e8%b2%a1%e5%a0%b1%e5%89%b5%e9%ab%98%e8%82%a1%e5%83%b9%e5%8d%bb%e8%b7%8c%ef%bc%9f82-2%e5%84%84%e7%be%8e%e5%85%83%e8%b2%a1%e6%b8%ac%e8%90%bd%e5%b7%ae/',
+)
+CMONEY_LEARNING_V6_PATHS = CMONEY_LEARNING_V5_PATHS + CMONEY_LEARNING_SIX_DECLARED_20261024_PATHS
+CMONEY_LEARNING_V6_PATH_PATTERN = '^(?:' + '|'.join(re.escape(p) for p in CMONEY_LEARNING_V6_PATHS) + ')$'
+CMONEY_LEARNING_V6_AUTH_SCOPE = (
+    'Bounded private personal research of the twenty-two completed originals and exactly six additional '
+    'literal originals declared by six completed CMNews canonical observations on 2026-10-24. '
+    'New originals require explicit same-response source/body/credit/clock verification and shared '
+    'immutable supplemental receipts. No paid/member, third-party rights override, publication, training '
+    'export, alias equivalence or whole-site scope. Not a reuse license or fair-use verdict; '
+    'preserve credits, REP and actual refusals.'
+)
+CMONEY_LEARNING_V6_NOTE = (
+    'Reuse twenty-two completed originals and all429 closed metadata questions. Only the six newly '
+    'declared literal originals may enter independently verified supplements. No recursive discovery, '
+    'guessed slugs, AI polling, public body, automatic training export, CMNews alias equivalence or '
+    'historical-release guarantee. Ten-second spacing is not a measured source maximum.'
+)
+CMONEY_LEARNING_V6_HTTP_BINDING = (
+    '8bc2f9eed765201756bade7ae4fb4de524329d5e422154c815d18e2549c8c7ff',
+    '950348fd9fa2891cf66559479468cc2bb0b8c2b632e7ede847499e902b8459f1',
+    'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
+    '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
+)
 CMONEY_LEARNING_BODY_SELECTOR = ':scope > .articleContent__body > .articleContent__content--main > .articleContent__textContent'
 _EDITOR = '理財內容編輯林序安'
 _PERSON = CMONEY_LEARNING_ORIGIN + '/author/rowan_lin/#person'
@@ -141,7 +201,8 @@ def cmoneylearning_visible_article(soup, *, page_url, adapter_contract_version=1
     navigation cohort joins its own visible credit to exactly one Person.
     """
     paths = {1: CMONEY_LEARNING_PATHS, 2: CMONEY_LEARNING_V2_PATHS,
-             3: CMONEY_LEARNING_V3_PATHS, 4: CMONEY_LEARNING_V4_PATHS}.get(adapter_contract_version, ())
+             3: CMONEY_LEARNING_V3_PATHS, 4: CMONEY_LEARNING_V4_PATHS,
+             5: CMONEY_LEARNING_V5_PATHS, 6: CMONEY_LEARNING_V6_PATHS}.get(adapter_contract_version, ())
     if (type(adapter_contract_version) is not int
             or page_url not in {CMONEY_LEARNING_ORIGIN + p for p in paths}):
         raise NewsError('article_identity_not_verified')

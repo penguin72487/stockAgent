@@ -439,8 +439,12 @@ def frontier_status(connection: sqlite3.Connection, now: datetime | None = None)
             for partition, queued in connection.execute(
                 "SELECT t.partition,COUNT(*) FROM tasks t JOIN finmind_source_frontiers f "
                 'ON f.dataset=t.dataset AND f.data_id=t.data_id '
-                "WHERE t.dataset=? AND t.partition BETWEEN CASE WHEN t.dataset='TaiwanStockKBar' "
-                f"AND t.data_id='TAIEX' THEN '2005-01-03' ELSE ? END AND f.older_than{task_identity_clause} GROUP BY t.partition",
+                # Both bounds must depend on the outer frontier row. Using
+                # t.data_id here prevents SQLite from seeking the lower date
+                # bound of the existing (dataset,data_id,partition) index.
+                "WHERE f.dataset=? AND f.older_than IS NOT NULL "
+                "AND t.partition BETWEEN CASE WHEN f.dataset='TaiwanStockKBar' "
+                f"AND f.data_id='TAIEX' THEN '2005-01-03' ELSE ? END AND f.older_than{task_identity_clause} GROUP BY t.partition",
                 (dataset, spec.first.isoformat())):
                 day = date.fromisoformat(partition)
                 if not closures.count(dataset, day, day):

@@ -978,6 +978,7 @@ def runtime_notice(message='MySql:malloc',owner=1234):
 
 
 @pytest.mark.parametrize('notices',[[],[runtime_notice()],
+                                  [runtime_notice("MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'")],
                                   [runtime_notice(),runtime_notice('Cannot find table 0.')]])
 def test_verified_metadata_only_failure_is_isolated_without_retry_or_fake_completion(registry,notices):
     repo,root,_,config=registry

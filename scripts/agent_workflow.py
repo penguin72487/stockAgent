@@ -59,6 +59,7 @@ RUNTIME_ENV_KEYS = (
     "PYTHON_BIN",
     "CUDA_VISIBLE_DEVICES",
     "STOCKAGENT_REPO_ROOT",
+    "WSL_DISTRO_NAME",
 )
 
 
@@ -746,6 +747,10 @@ class Workflow:
         environment = {
             key: os.environ[key] for key in RUNTIME_ENV_KEYS if key in os.environ
         }
+        if "WSL_DISTRO_NAME" in environment and not re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,80}", environment["WSL_DISTRO_NAME"]
+        ):
+            raise ValueError("WSL distribution must be a valid explicit runtime identity")
         environment["STOCKAGENT_REPO_ROOT"] = str(self.root)
         environment["PYTHON_BIN"] = sys.executable
         if backend == "systemd":

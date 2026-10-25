@@ -142,19 +142,24 @@ def test_capture_rejects_already_verified_file_changing_later(tmp_path, monkeypa
     manifest = prepare_archive(spec, artifact_root, manual_capture=True)
     archive = spec.stage_root / spec.dataset / "archive"
     second_encoded = archive / manifest["files"][1]["encoded_path"]
-    sha = archive_module.sha256_file
-    def mutate_later(path):
-        result = sha(path)
+    decode = archive_module._encoded_original_hashes
+    mutations = []
+    def mutate_later(path, codec):
+        result = decode(path, codec)
         if path == second_encoded:
             first = source / manifest["files"][0]["path"]
             info = first.stat()
             first.write_bytes(b"x" * info.st_size)
             os.utime(first, ns=(info.st_atime_ns, info.st_mtime_ns))
+            mutations.append(first)
         return result
-    monkeypatch.setattr(archive_module, "sha256_file", mutate_later)
+    # Encoded SHA and decode now share one pass. Mutate at that real boundary,
+    # after the first original has already passed its own full-SHA check.
+    monkeypatch.setattr(archive_module, "_encoded_original_hashes", mutate_later)
     with pytest.raises(SnapshotError, match="changed during verification"):
         verify_archive_directory(archive, source, spec=spec, manual_capture=True,
                                  artifact_root=artifact_root)
+    assert mutations == [source / manifest["files"][0]["path"]]
 
 
 def test_capture_digest_is_bound_to_original_inventory(tmp_path):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -36,7 +36,10 @@ from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 try:
+    from msgspec import DecodeError as _ProjectionDecodeError
     from msgspec import Struct as _HistoryPointStorage
+    from msgspec import UNSET as _PROJECTION_UNSET, defstruct as _projection_struct
+    from msgspec.json import Decoder as _ProjectionDecoder
 except ImportError:
     class _HistoryPointStorage:
         __slots__ = ()
@@ -80,6 +83,7 @@ from stockagent.live.tw_day_trade_service_sync import (
     DISCORD_SERVICE_STATUS_FILENAME,
     age_seconds,
     load_service_sync,
+    paper_journal_generations,
     read_json_object,
 )
 
@@ -115,10 +119,22 @@ CHART_RANGE_SECONDS: Final[dict[str, int | None]] = {
 _LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
 _LINE_COUNT_LOCK = threading.Lock()
 _TAIL_CACHE: dict[
-    tuple[Path, int], tuple[int, int, int, int, list[dict[str, Any]]]
+    tuple[Any, ...], tuple[tuple[int, ...], list[dict[str, Any]]]
 ] = {}
 _TAIL_CACHE_LOCK = threading.Lock()
 _TAIL_CACHE_MAX_ENTRIES: Final[int] = 16
+_OPENING_FAILED_ATTEMPT_FIELDS: Final[tuple[str, ...]] = (
+    "source", "status", "session_date", "market", "recorded_at",
+    "error_type", "error_code", "error_message", "failure_stage",
+    "opening_input_coverage",
+)
+_OPENING_FAILURE_DECODER = (
+    _ProjectionDecoder(_projection_struct(
+        "_OpeningFailedAttempt",
+        [(name, Any, _PROJECTION_UNSET) for name in _OPENING_FAILED_ATTEMPT_FIELDS],
+    ))
+    if _NATIVE_HISTORY_POINTS else None
+)
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1152,28 @@ def _signal_position_overlays(
                 "entry_price_guard_contract": order.get("entry_price_guard_contract"),
             }
             overlays[identity] = overlay
+        if raw_mode.get("day_trade_signal_update_policy") == "progressive_open_reference_rebalance_v1":
+            inventory: dict[str, list[int]] = {}
+            for position in (raw_mode.get("positions") or {}).values():
+                signed = int(position.get("signed_shares") or 0)
+                if signed:
+                    value = inventory.setdefault(str(position["symbol"]), [0, 0])
+                    value[0] += signed
+                    value[1] += 1
+            for symbol, target in (raw_mode.get("signal_inventory_targets") or {}).items():
+                identity = (str(raw_mode.get("session_date") or ""), str(raw_mode.get("market") or ""),
+                            symbol, str(raw_mode.get("signal_id") or ""))
+                # This is current inventory, NOT a fill attributed to the
+                # latest signal. Original acquisition cohorts stay separate.
+                overlay = dict(overlays.get(identity) or {"_entry_rejection_only": True})
+                signed, cohorts = inventory.get(symbol, [0, 0])
+                reduction = (raw_mode.get("signal_reductions") or {}).get(symbol) or {}
+                overlay["current_target_inventory"] = {"signed_shares": signed, "cohort_count": cohorts,
+                    "reduction_requested_shares": int(reduction.get("requested_shares") or 0),
+                    "reduction_filled_shares": int(reduction.get("filled_shares") or 0),
+                    "target_signed_shares": target,
+                    "signal_revision": (raw_mode.get("opening_signal_revision") or {}).get("index")}
+                overlays[identity] = overlay
     if not overlays:
         return overlays, ""
     material = []
@@ -1153,6 +1191,7 @@ def _signal_position_overlays(
             str(completion.get("broker_fill")),
             None if position.get("_entry_rejection_only") else _signal_valuation_position(position),
             position.get("entry_remainder_rejection"),
+            position.get("current_target_inventory"),
         ))
     encoded = json.dumps(material, separators=(",", ":")).encode("utf-8")
     return overlays, hashlib.sha256(encoded).hexdigest()
@@ -1201,6 +1240,10 @@ def _overlay_signal_page_rows(
                         completion.get("broker_fill")
                     )
         rejection = overlay.get("entry_remainder_rejection") if isinstance(overlay, Mapping) else None
+        if isinstance(overlay, Mapping) and "current_target_inventory" in overlay:
+            row["current_target_inventory"] = dict(overlay["current_target_inventory"])
+            for field in ("reduction_requested_shares", "reduction_filled_shares"):
+                row[field] = row["current_target_inventory"].get(field, 0)
         if isinstance(rejection, Mapping):
             row["entry_remainder_rejection"] = dict(rejection)
             row["initial_execution_reason"] = row.get("reason")
@@ -1217,58 +1260,185 @@ def _overlay_signal_page_rows(
     return page
 
 
-def _tail(path: Path, maximum_rows: int) -> list[dict[str, Any]]:
+class _VerifiedTailRows(list):
+    """Projected rows plus bounded physical-line provenance for append reuse."""
+
+    __slots__ = ("line_slots", "source_size", "prefix_sha256", "terminated")
+
+    def __init__(self, slots, size, digest, terminated):
+        super().__init__(row for _, row in slots if row is not None)
+        self.line_slots = tuple(slots)
+        self.source_size = size
+        self.prefix_sha256 = digest.hexdigest()
+        self.terminated = terminated
+
+
+def _jsonl_tail_start(handle, size_bytes: int, maximum_rows: int, *, minimum_offset: int = 0) -> int:
+    cursor = size_bytes
+    remaining = maximum_rows
+    if cursor:
+        handle.seek(cursor - 1)
+        remaining += handle.read(1) == b"\n"
+    while cursor > minimum_offset:
+        chunk_size = min(1 << 20, cursor - minimum_offset)
+        cursor -= chunk_size
+        handle.seek(cursor)
+        chunk = handle.read(chunk_size)
+        newline_count = chunk.count(b"\n")
+        if newline_count >= remaining:
+            boundary = len(chunk)
+            for _ in range(remaining):
+                boundary = chunk.rfind(b"\n", 0, boundary)
+            return cursor + boundary + 1
+        remaining -= newline_count
+    return minimum_offset
+
+
+def _hash_jsonl_prefix(handle, size_bytes: int):
+    digest = hashlib.sha256()
+    handle.seek(0)
+    remaining = size_bytes
+    while remaining:
+        chunk = handle.read(min(1 << 20, remaining))
+        if not chunk:
+            raise OSError("JSONL source truncated while validating its prefix")
+        digest.update(chunk)
+        remaining -= len(chunk)
+    return digest
+
+
+def _tail_file_signature(stat) -> tuple[int, ...]:
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _read_jsonl_tail(
+    path: Path,
+    maximum_rows: int,
+    size_bytes: int,
+    row_projection: Callable[[dict[str, Any]], dict[str, Any]] | None,
+    row_decoder: Callable[[bytes], Any] | None = None,
+    *,
+    verified_append: bool = False,
+) -> list[dict[str, Any]]:
+    """Read the last N physical JSONL lines without retaining the raw tail.
+
+    Find its byte boundary in bounded blocks, then decode one line at a time.
+    Blank lines still count toward N, and LF/CRLF and an unterminated last line
+    retain the original tail semantics. Never consume a concurrent append past
+    the observed size. Projection happens before a decoded row is retained.
+    """
+    result: list[dict[str, Any]] = []
+    with path.open("rb") as handle:
+        start = _jsonl_tail_start(handle, size_bytes, maximum_rows)
+        digest = _hash_jsonl_prefix(handle, start) if verified_append else None
+        slots = []
+        terminated = True
+        handle.seek(start)
+        while handle.tell() < size_bytes:
+            offset = handle.tell()
+            line = handle.readline(size_bytes - handle.tell())
+            if not line:
+                break
+            if digest is not None:
+                digest.update(line)
+            terminated = line.endswith(b"\n")
+            row = None
+            if not line.strip():
+                payload = None
+            else:
+                payload = row_decoder(line) if row_decoder else json.loads(line.decode("utf-8"))
+            if isinstance(payload, dict):
+                row = row_projection(payload) if row_projection else payload
+                result.append(row)
+            if verified_append:
+                slots.append((offset, row))
+        if verified_append:
+            return _VerifiedTailRows(slots, size_bytes, digest, terminated)
+    return result
+
+
+def _read_verified_jsonl_append(path, maximum_rows, signature, cached, row_projection, row_decoder):
+    """Validate ALL old bytes before reusing a single previously decoded row.
+
+    This deliberately retains O(source bytes) hashing and source stat fences.
+    Only JSON decoding/projection is incremental; an inode/size-only shortcut
+    could hide a same-inode rewrite during growth. Ordinary small tails do not
+    opt into this extra verification cost.
+    """
+    previous_signature, previous = cached
+    if (not isinstance(previous, _VerifiedTailRows)
+            or previous_signature[:2] != signature[:2]
+            or signature[2] <= previous.source_size):
+        return None
+    with path.open("rb") as handle:
+        if _tail_file_signature(os.fstat(handle.fileno())) != signature:
+            return None
+        decode_start = previous.source_size
+        if not previous.terminated and previous.line_slots:
+            decode_start = previous.line_slots[-1][0]
+        # The old physical-line offsets already locate that part of the tail.
+        # Scan only appended bytes (plus a previously unterminated final line),
+        # not the same potentially-huge N-line window again.
+        start = _jsonl_tail_start(handle, signature[2], maximum_rows, minimum_offset=decode_start)
+        if start >= previous.source_size:
+            if start != decode_start:
+                # No old physical line survives. Decode only the new last N
+                # lines, ignoring corrupt older lines exactly as a cold read.
+                return None
+        digest = _hash_jsonl_prefix(handle, previous.source_size)
+        if digest.hexdigest() != previous.prefix_sha256:
+            return None
+        # A valid unterminated object may acquire more bytes or split CRLF.
+        # Remove and re-read it. Blank/nonobject rows still occupy deque slots.
+        slots = deque(((offset, row) for offset, row in previous.line_slots
+                       if offset < decode_start), maxlen=maximum_rows)
+        handle.seek(max(start, decode_start))
+        terminated = True
+        while handle.tell() < signature[2]:
+            offset = handle.tell()
+            line = handle.readline(signature[2] - offset)
+            if not line:
+                break
+            digest.update(line[max(0, previous.source_size - offset):])
+            terminated = line.endswith(b"\n")
+            payload = (row_decoder(line) if row_decoder else json.loads(line.decode("utf-8"))) if line.strip() else None
+            row = (row_projection(payload) if row_projection else payload) if isinstance(payload, dict) else None
+            slots.append((offset, row))
+        return _VerifiedTailRows(slots, signature[2], digest, terminated)
+
+
+def _tail(
+    path: Path,
+    maximum_rows: int,
+    *,
+    row_projection: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    row_decoder: Callable[[bytes], Any] | None = None,
+    verified_append: bool = False,
+) -> list[dict[str, Any]]:
     if maximum_rows <= 0 or not path.is_file():
         return []
-    stat = path.stat()
-    cache_key = (path.resolve(), int(maximum_rows))
-    with _TAIL_CACHE_LOCK:
-        cached = _TAIL_CACHE.get(cache_key)
-        if cached and cached[:4] == (
-            stat.st_dev,
-            stat.st_ino,
-            stat.st_size,
-            stat.st_mtime_ns,
-        ):
-            return list(cached[4])
-    rows: deque[dict[str, Any]] = deque(maxlen=maximum_rows)
-    with path.open("rb") as handle:
-        cursor = handle.seek(0, 2)
-        chunks: list[bytes] = []
-        newline_count = 0
-        while cursor > 0 and newline_count <= maximum_rows:
-            chunk_size = min(1 << 20, cursor)
-            cursor -= chunk_size
-            handle.seek(cursor)
-            chunk = handle.read(chunk_size)
-            chunks.append(chunk)
-            newline_count += chunk.count(b"\n")
-    encoded = b"".join(reversed(chunks))
-    for line in encoded.splitlines()[-maximum_rows:]:
-        if not line.strip():
-            continue
-        payload = json.loads(line.decode("utf-8"))
-        if isinstance(payload, dict):
-            rows.append(payload)
-    result = list(rows)
-    final_stat = path.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) == (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns):
+    cache_key = (path.resolve(), int(maximum_rows), row_projection, row_decoder, verified_append)
+    # Public/member/owner requests join one identical cold read. Other sources
+    # and projections stay independent; this is not a global concurrency cap.
+    with _shared_query_lock(("jsonl_tail", *cache_key)):
+        stat = path.stat()
+        signature = _tail_file_signature(stat)
         with _TAIL_CACHE_LOCK:
-            if len(_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
-                _TAIL_CACHE.pop(next(iter(_TAIL_CACHE)))
-            _TAIL_CACHE[cache_key] = (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_mtime_ns,
-                result,
-            )
-    return list(result)
+            cached = _TAIL_CACHE.get(cache_key)
+            if cached and cached[0] == signature:
+                return list(cached[1])
+        result = (_read_verified_jsonl_append(path, maximum_rows, signature, cached, row_projection, row_decoder)
+                  if verified_append and cached else None)
+        if result is None:
+            kwargs = {"verified_append": True} if verified_append else {}
+            result = _read_jsonl_tail(path, maximum_rows, stat.st_size, row_projection, row_decoder, **kwargs)
+        final_stat = path.stat()
+        if _tail_file_signature(final_stat) == signature:
+            with _TAIL_CACHE_LOCK:
+                if cache_key not in _TAIL_CACHE and len(_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
+                    _TAIL_CACHE.pop(next(iter(_TAIL_CACHE)))
+                _TAIL_CACHE[cache_key] = (signature, result)
+        return list(result)
 
 
 def _ledger_row_session_date(
@@ -2538,6 +2708,49 @@ def _latency_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "simulation_only": True,
         "not_external_order_or_venue_rtt": True,
     }
+
+
+def _opening_latency_row_projection(row: dict[str, Any]) -> dict[str, Any]:
+    """Retain exactly the failed-attempt inputs consumed by the summary below.
+
+    Failed attempts can embed full-universe transport diagnostics on every
+    retry. Keep the append-only receipt intact, but do not cache those unused
+    fields in a web worker. Ready/registered rows retain their complete timing,
+    transport and publication contracts, including unknown future fields.
+    """
+    if row.get("source") != "discord_scheduled_signal" or row.get("status") == "ready":
+        return row
+    return {
+        name: row[name]
+        for name in _OPENING_FAILED_ATTEMPT_FIELDS
+        if name in row
+    }
+
+
+def _decode_opening_latency_row(line: bytes) -> Any:
+    """Skip constructing unused failure payloads; retain stdlib compatibility.
+
+    A typed partial decoder scans unknown JSON fields without materializing
+    full-universe transport maps. Non-failures retain the complete raw schema.
+    Missing msgspec or JSON extensions it rejects use the original decoder;
+    corrupt receipts still raise rather than disappearing from the audit.
+    """
+    # A partial decoder may skip UTF-8 validation inside unknown fields. Keep
+    # the original whole-line validation even for discarded diagnostics.
+    text = line.decode("utf-8")
+    if _OPENING_FAILURE_DECODER is not None:
+        try:
+            row = _OPENING_FAILURE_DECODER.decode(text)
+        except _ProjectionDecodeError:
+            pass
+        else:
+            if row.source == "discord_scheduled_signal" and row.status != "ready":
+                return {
+                    name: value for name in _OPENING_FAILED_ATTEMPT_FIELDS
+                    if (value := getattr(row, name)) is not _PROJECTION_UNSET
+                }
+    payload = json.loads(text)
+    return _opening_latency_row_projection(payload) if isinstance(payload, dict) else payload
 
 
 def _opening_signal_latency_summary(
@@ -7465,6 +7678,37 @@ def _historical_position_count(root: Path) -> int:
     return total
 
 
+class DashboardSnapshotChanged(OSError):
+    """A snapshot crossed an incomplete/replaced engine commit; retry a new view."""
+
+
+def _snapshot_commit_identity(payload: Mapping[str, Any] | None, *, state: bool = False) -> tuple:
+    payload = payload or {}
+    return (payload.get("engine_run_id"), payload.get("state_revision"),
+            payload.get("dashboard_content_revision" if state else "content_revision"))
+
+
+def _require_snapshot_commit(state, status, receipt) -> tuple:
+    identity = _snapshot_commit_identity(receipt)
+    run, revision, content = identity
+    if (not isinstance(run, str) or not run or type(revision) is not int or revision <= 0
+            or type(content) is not int or content < 0
+            or _snapshot_commit_identity(state, state=True) != identity
+            or _snapshot_commit_identity(status) != identity):
+        raise DashboardSnapshotChanged("dashboard commit is missing, incomplete or inconsistent")
+    return identity
+
+
+def _snapshot_input_generations(paths: tuple[Path, ...]) -> tuple:
+    generations = []
+    for path in paths:
+        try:
+            generations.append(metadata_signature(path.stat()))
+        except FileNotFoundError:
+            generations.append(None)
+    return tuple(generations)
+
+
 def build_dashboard_snapshot(
     *,
     state_dir: Path,
@@ -7482,10 +7726,27 @@ def build_dashboard_snapshot(
     unattended_guardian_path: Path = DEFAULT_UNATTENDED_GUARDIAN_PATH,
     discord_markets_field: str = "day_trade_markets",
     discord_engine_revision_field: str = "engine_state_revision",
+    require_committed_revision: bool = False,
 ) -> dict[str, Any]:
     root = Path(state_dir)
+    # Interactive views must not stamp a committed revision onto a mixture of
+    # individually atomic files. Legacy forensic/report readers may still ask
+    # for the explicitly stale diagnostic view. This guard reads only compact
+    # receipts/metadata; it neither locks the executor nor reparses state twice.
+    commit_paths = (root / "state.json", root / "status.json") + (
+        (Path(preopen_readiness_path),) if preopen_readiness_path is not None else ())
+    commit_receipt = load_service_sync(root) if require_committed_revision else None
+    commit_generations = _snapshot_input_generations(commit_paths) if require_committed_revision else ()
     state = _object(root / "state.json")
     status = _object(root / "status.json")
+    commit_identity = (
+        _require_snapshot_commit(state, status, commit_receipt)
+        if require_committed_revision else None)
+    journal_generations = (commit_receipt.get("journal_generations")
+                           if isinstance(commit_receipt, Mapping) else None)
+    if (require_committed_revision and journal_generations is not None
+            and paper_journal_generations(root) != journal_generations):
+        raise DashboardSnapshotChanged("paper journals are ahead of the committed snapshot")
     observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     resolved_discord_status_path = (
         Path(discord_service_status_path)
@@ -7503,6 +7764,13 @@ def build_dashboard_snapshot(
         discord_engine_revision_field=discord_engine_revision_field,
         now=observed,
     )
+    if require_committed_revision and (
+        service_sync.get("state_revision") != commit_identity[1]
+        or service_sync.get("content_revision") != commit_identity[2]
+        or service_sync.get("engine_generation") != hashlib.sha256(
+            ("public_paper_engine_v1:" + commit_identity[0]).encode()).hexdigest()[:32]
+    ):
+        raise DashboardSnapshotChanged("dashboard commit changed before snapshot projection")
     session_rollover_time = (
         datetime_time(13, 0)
         if discord_markets_field == "overnight_markets"
@@ -7706,6 +7974,9 @@ def build_dashboard_snapshot(
                 ),
                 "feature_cutoff_date": mode.get("feature_cutoff_date"),
                 "signal_counts": mode.get("signal_counts") or {},
+                "day_trade_signal_update_policy": mode.get("day_trade_signal_update_policy"),
+                "opening_signal_revision": mode.get("opening_signal_revision") or {},
+                "inventory_rebalance": mode.get("inventory_rebalance"),
                 "signal_reason_counts": mode.get("signal_reason_counts") or {},
                 "entry_price_guard_contract": mode.get("entry_price_guard_contract"),
                 "configured_entry_price_guard_contract": mode.get("configured_entry_price_guard_contract"),
@@ -8004,6 +8275,8 @@ def build_dashboard_snapshot(
     opening_attempt_rows = _tail(
         root / "opening_signal_latency.jsonl",
         10_000,
+        row_decoder=_decode_opening_latency_row,
+        verified_append=True,
     )
     latency_rows = selected_session_rows(
         "latency.jsonl",
@@ -8435,6 +8708,14 @@ def build_dashboard_snapshot(
     )
     events = events[-min(maximum_event_rows, 2_000):] if maximum_event_rows > 0 else []
 
+    if require_committed_revision and (
+        _snapshot_input_generations(commit_paths) != commit_generations
+        or _snapshot_commit_identity(load_service_sync(root)) != commit_identity
+        or (journal_generations is not None
+            and paper_journal_generations(root) != journal_generations)
+    ):
+        raise DashboardSnapshotChanged("dashboard commit changed during snapshot projection")
+
     return {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "generated_at_utc": observed.isoformat(timespec="seconds"),
@@ -8701,15 +8982,7 @@ def _summarize_columnar_signals(
     return direction_summary, audit
 
 
-def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
-    key = (name, Path(arguments["state_dir"]).resolve(), *(
-        arguments.get(field, default) for field, default in (
-            ("session_date", None), ("start_date", None), ("end_date", None),
-            ("mode", ""), ("symbol", ""), ("status", "all"),
-            ("hide_zero_targets", False),
-            ("offset", 0), ("limit", 250), ("maximum_scan_rows", 100_000),
-        )
-    ))
+def _shared_query_lock(key: tuple[Any, ...]) -> Any:
     with _DETAIL_QUERY_LOCKS_GUARD:
         lock = _DETAIL_QUERY_LOCKS.get(key)
         if lock is None:
@@ -8717,6 +8990,17 @@ def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
             lock = threading.RLock()
             _DETAIL_QUERY_LOCKS[key] = lock
         return lock
+
+
+def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
+    return _shared_query_lock((name, Path(arguments["state_dir"]).resolve(), *(
+        arguments.get(field, default) for field, default in (
+            ("session_date", None), ("start_date", None), ("end_date", None),
+            ("mode", ""), ("symbol", ""), ("status", "all"),
+            ("hide_zero_targets", False),
+            ("offset", 0), ("limit", 250), ("maximum_scan_rows", 100_000),
+        )
+    )))
 
 
 def _singleflight_detail_page(builder):

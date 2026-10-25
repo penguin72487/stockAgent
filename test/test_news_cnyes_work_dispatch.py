@@ -190,9 +190,107 @@ def test_progress_migration_restart_and_heartbeat_are_constant_table_reads(queue
         current = progress(reopened.db)
         assert current['active_missing_body_urls'] == expected['active_missing_body_urls']
         assert reopened.db.execute("SELECT count(*) FROM articles WHERE state='inflight'").fetchone()[0] == 0
-        assert reopened.status(activity='running')['providers']['cnyes']['body_work_progress'] == current
+        status_work = reopened.status(activity='running')['providers']['cnyes']['body_work_progress']
+        assert status_work.pop('request_scope_progress')['available'] is False
+        assert status_work == current
     finally:
         reopened.close()
+
+
+def test_request_scope_progress_reads_only_indexed_missing_heads_and_never_mutates(queue):
+    from downloader.news_fulltext_cnyes_work import progress, request_scope_progress
+    now = time.time()
+    with queue.db:
+        queue.add_articles([{'url': f'https://amp-news.cnyes.com/news/id/{i}'} for i in (1, 2, 3)])
+        queue.add_articles([{'url': 'https://news.cnyes.com/news/id/1'},
+                            {'url': 'https://m.cnyes.com/news/id/4'},
+                            {'url': 'https://news.cnyes.com/news/id/5'}])
+        queue.db.execute("UPDATE articles SET body_sha256=?,state='retry' WHERE host='news.cnyes.com'", ('a' * 64,))
+        queue.db.execute("UPDATE articles SET state='inflight',lease_owner='owner',lease_until=? WHERE url LIKE '%/3'", (now + 300,))
+        queue.db.execute("UPDATE articles SET state='retry_cooldown',due=? WHERE url LIKE '%/2'", (now + 3600,))
+    before = [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    work = progress(queue.db)
+    control = {'temporarily_paused_robots_origins': {'https://amp-news.cnyes.com': now + 30},
+               'temporarily_paused_gateway_hosts': {'amp-news.cnyes.com': now + 60}}
+    queries = []; changes = queue.db.total_changes
+    queue.db.set_trace_callback(queries.append)
+    actual = request_scope_progress(queue.db, work, control, now_epoch=now)
+    queue.db.set_trace_callback(None)
+    assert actual['available'] and actual['active_missing_body_urls'] == 4
+    assert actual['source_paused_missing_body_urls'] == 2
+    assert actual['policy_paused_missing_body_urls'] == actual['gateway_paused_missing_body_urls'] == 2
+    assert actual['other_missing_body_urls'] == 2  # mobile plus already in-flight AMP
+    from datetime import UTC, datetime
+    assert actual['next_source_probe_at_utc'] == datetime.fromtimestamp(now + 60, UTC).isoformat()
+    assert not actual['source_recovery_verified'] and 'cnyes.com' not in json.dumps(actual)
+    assert queue.db.total_changes == changes
+    assert before == [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    assert len(queries) == 2
+    for query in queries:
+        plan = ' '.join(r['detail'] for r in queue.db.execute('EXPLAIN QUERY PLAN ' + query))
+        assert 'SEARCH articles USING INDEX dispatch' in plan and 'SCAN articles' not in plan
+
+
+@pytest.mark.parametrize('control', [None, {}, {'temporarily_paused_robots_origins': {}},
+    {'temporarily_paused_robots_origins': {}, 'temporarily_paused_gateway_hosts': {'x': True}},
+    {'temporarily_paused_robots_origins': {'x': float('nan')}, 'temporarily_paused_gateway_hosts': {}},
+    {'temporarily_paused_robots_origins': {'x': '300'}, 'temporarily_paused_gateway_hosts': {}}])
+def test_request_scope_missing_or_invalid_controls_stay_unknown(queue, control):
+    from downloader.news_fulltext_cnyes_work import progress, request_scope_progress
+    result = request_scope_progress(queue.db, progress(queue.db), control, now_epoch=time.time())
+    assert not result['available'] and result['source_paused_missing_body_urls'] is None
+    assert result['other_missing_body_urls'] is None and result['next_source_probe_at_utc'] is None
+
+
+def test_request_scope_large_frontier_is_unknown_without_an_article_scan(queue):
+    from downloader.news_fulltext_cnyes_work import MAX_REQUEST_SCOPE_URLS, request_scope_progress
+    queries = []
+    queue.db.set_trace_callback(queries.append)
+    result = request_scope_progress(queue.db, {'active_missing_body_urls': MAX_REQUEST_SCOPE_URLS + 1}, {},
+                                    now_epoch=time.time())
+    queue.db.set_trace_callback(None)
+    assert not result['available'] and queries == []
+
+
+def test_request_scope_expired_policy_is_not_a_new_body_or_provider_recovery(queue):
+    from downloader.news_fulltext_cnyes_work import progress, request_scope_progress
+    now = time.time()
+    with queue.db:
+        queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
+    result = request_scope_progress(queue.db, progress(queue.db), {
+        'temporarily_paused_robots_origins': {'https://amp-news.cnyes.com': now - 1},
+        'temporarily_paused_gateway_hosts': {}}, now_epoch=now)
+    assert result['available'] and result['source_paused_missing_body_urls'] == 0
+    # Registering AMP also discovers the unverified desktop lookup in this
+    # same queue. Neither URL has a body; an expired gate accepts neither.
+    assert result['active_missing_body_urls'] == result['other_missing_body_urls'] == 2
+    assert result['next_source_probe_at_utc'] is None
+    assert not result['source_recovery_verified'] and queue.db.execute('SELECT body_sha256 FROM articles').fetchone()[0] is None
+
+
+@pytest.mark.parametrize('gated,paused', [(None, None), ('https://amp-news.cnyes.com', 1),
+                                        ('https://unrelated.example', 0)])
+def test_owner_status_does_not_price_paused_or_unknown_scope_at_healthy_ingestion_rate(queue, gated, paused):
+    with queue.db:
+        queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
+    if gated is not None:
+        queue.http_capacity_snapshot = lambda: {'providers': {'cnyes': {
+            'temporarily_paused_robots_origins': {gated: time.time() + 300},
+            'temporarily_paused_gateway_hosts': {}}}}
+    queue.metrics.started -= 120
+    queue.metrics.count('cnyes', 'durably_accepted_new_url_heads', 10)
+    snapshot = queue.status(activity='running')
+    current = snapshot['providers']['cnyes']
+    assert current['observed_owner_articles_per_second'] > 0
+    scope = current['body_work_progress']['request_scope_progress']
+    assert scope['source_paused_missing_body_urls'] == paused
+    assert current['body_work_progress']['active_missing_body_urls'] == 2
+    assert not scope['source_recovery_verified']
+    if paused == 0:
+        assert current['remaining_eligible_estimate_seconds'] > 0
+    else:
+        assert current['remaining_eligible_estimate_seconds'] is None
+        assert snapshot['eligible_eta_seconds'] is None
 
 
 def test_bounded_backfill_is_indexed_resumable_and_cancellable(queue, tmp_path):

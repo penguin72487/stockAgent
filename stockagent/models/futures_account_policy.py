@@ -8,6 +8,7 @@ No current execution price, current PnL or future account state enters this map.
 
 from __future__ import annotations
 
+import math
 import torch
 
 from stockagent.models.normalization import masked_score_entmax_log_cash_weights
@@ -17,6 +18,7 @@ FUTURES_ACCOUNT_OBSERVATION_COLUMNS = (
     "prior_observed_settlement_return_rms",
     "prior_observed_settlement_return_fraction",
 )
+FUTURES_BETA_OBSERVATION_COLUMNS = ("prior_observed_tx_beta_shrunk8",)
 FUTURES_ACCOUNT_STATE_COLUMNS = (
     "signed_notional_nav_asinh", "signed_margin_nav_asinh",
     "held_margin_nav_asinh", "one_contract_margin_nav_asinh",
@@ -37,10 +39,74 @@ ACCOUNT_SIDE_COST = ACCOUNT_MASK + 4
 ACCOUNT_RMS = ACCOUNT_MASK + 5
 ACCOUNT_OBSERVATION_FRACTION = ACCOUNT_MASK + 6
 FUTURES_ACCOUNT_PACKET_WIDTH = ACCOUNT_MASK + 7
+ACCOUNT_NET_NOTIONAL_CAP = FUTURES_ACCOUNT_PACKET_WIDTH
+FUTURES_NET_EXPOSURE_PACKET_WIDTH = FUTURES_ACCOUNT_PACKET_WIDTH + 1
+# Version 3 has a factor loading and its cap instead of version 2's net cap.
+ACCOUNT_TX_BETA = FUTURES_ACCOUNT_PACKET_WIDTH
+ACCOUNT_BETA_NOTIONAL_CAP = FUTURES_ACCOUNT_PACKET_WIDTH + 1
+FUTURES_BETA_EXPOSURE_PACKET_WIDTH = FUTURES_ACCOUNT_PACKET_WIDTH + 2
+
+
+def futures_account_policy_version(packet_width: int) -> int:
+    if packet_width == FUTURES_ACCOUNT_PACKET_WIDTH:
+        return FUTURES_ACCOUNT_POLICY_VERSION
+    if packet_width == FUTURES_NET_EXPOSURE_PACKET_WIDTH:
+        return 2
+    if packet_width == FUTURES_BETA_EXPOSURE_PACKET_WIDTH:
+        return 3
+    raise ValueError('unknown futures account policy packet width')
+
+
+def futures_account_policy_width(net_notional_cap: float | None, beta_notional_cap: float | None = None) -> int:
+    if beta_notional_cap is not None:
+        if net_notional_cap is not None:
+            raise ValueError('net and beta notional caps are separate experiments')
+        return FUTURES_BETA_EXPOSURE_PACKET_WIDTH
+    return (FUTURES_ACCOUNT_PACKET_WIDTH if net_notional_cap is None
+            else FUTURES_NET_EXPOSURE_PACKET_WIDTH)
 
 
 def is_futures_account_policy_packet(value: torch.Tensor) -> bool:
-    return value.ndim == 3 and value.size(-1) == FUTURES_ACCOUNT_PACKET_WIDTH
+    return value.ndim == 3 and value.size(-1) in (
+        FUTURES_ACCOUNT_PACKET_WIDTH, FUTURES_NET_EXPOSURE_PACKET_WIDTH,
+        FUTURES_BETA_EXPOSURE_PACKET_WIDTH)
+
+
+def project_prior_net_notional(
+    weights: torch.Tensor, mask: torch.Tensor, known_notional: torch.Tensor,
+    known_initial: torch.Tensor, cap: torch.Tensor,
+    *, factor_beta: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Bound requested prior-mark net notional, preserving the cash budget.
+
+    This is an O(S) orthogonal projection in prior-notional coordinates followed
+    by a common downscale if required to retain the learned L1 margin budget.
+    Optional factor_beta replaces the unit loading by a prior factor estimate.
+    It cannot guarantee realized beta neutrality: current prices, dated margin
+    rules, whole contracts, fills and carried inventory still own execution.
+    """
+    valid = mask & (known_notional > 0) & (known_initial > 0)
+    notional_per_margin = torch.where(valid, known_notional / known_initial.clamp_min(1e-12), 1.)
+    original = torch.where(valid, weights.float(), 0.)
+    notional = original * notional_per_margin
+    if factor_beta is None:
+        net = notional.sum(-1, keepdim=True)
+    else:
+        loading = torch.where(valid, factor_beta.detach().float(), 0.)
+        net = (notional * loading).sum(-1, keepdim=True)
+    # clamp(x, 0, 0) chooses an input subgradient of one at x=0 in PyTorch.
+    # Exact neutrality instead needs a constant bound with zero derivative.
+    bounded = torch.where(cap > 0, net.clamp(-cap, cap), torch.zeros_like(net))
+    excess = net - bounded
+    if factor_beta is None:
+        correction = excess / valid.sum(-1, keepdim=True).clamp_min(1)
+    else:
+        squared_loading = loading.square().sum(-1, keepdim=True).clamp_min(1e-12)
+        correction = loading * excess / squared_loading
+    projected = torch.where(valid, notional - correction, 0.) / notional_per_margin
+    budget = original.abs().sum(-1, keepdim=True)
+    scale = (budget / projected.abs().sum(-1, keepdim=True).clamp_min(1e-12)).clamp(max=1.)
+    return projected * scale
 
 
 def pack_futures_account_policy(
@@ -49,6 +115,8 @@ def pack_futures_account_policy(
     known_notional: torch.Tensor, known_initial: torch.Tensor,
     known_maintenance: torch.Tensor, known_side_cost: torch.Tensor,
     prior_rms: torch.Tensor, prior_observation_fraction: torch.Tensor,
+    *, net_notional_cap: float | None = None,
+    beta_notional_cap: float | None = None, prior_beta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Keep FP32 financial observations even when the backbone uses AMP."""
     if coefficients.shape != (*base_weights.shape, len(FUTURES_ACCOUNT_STATE_COLUMNS)):
@@ -58,9 +126,28 @@ def pack_futures_account_policy(
                      prior_rms, prior_observation_fraction)
     if any(field.shape != base_weights.shape for field in scalar_fields):
         raise ValueError("account policy observations must align with [T,S]")
-    return torch.cat((base_weights.float().unsqueeze(-1), base_logits.float().unsqueeze(-1),
+    if beta_notional_cap is not None:
+        if (net_notional_cap is not None or isinstance(beta_notional_cap, bool)
+                or not math.isfinite(beta_notional_cap) or beta_notional_cap < 0
+                or prior_beta is None or prior_beta.shape != base_weights.shape):
+            raise ValueError('beta cap requires aligned prior beta and no net cap')
+        base_weights = project_prior_net_notional(base_weights, candidate_mask,
+            known_notional.detach(), known_initial.detach(), base_weights.new_tensor(beta_notional_cap),
+            factor_beta=prior_beta)
+    if net_notional_cap is not None:
+        if isinstance(net_notional_cap, bool) or not math.isfinite(net_notional_cap) or net_notional_cap < 0:
+            raise ValueError('prior net notional cap must be finite and nonnegative')
+        base_weights = project_prior_net_notional(base_weights, candidate_mask,
+            known_notional.detach(), known_initial.detach(), base_weights.new_tensor(net_notional_cap))
+    packet = torch.cat((base_weights.float().unsqueeze(-1), base_logits.float().unsqueeze(-1),
                       coefficients.float(), candidate_mask.float().unsqueeze(-1),
                       *(field.detach().float().unsqueeze(-1) for field in scalar_fields[3:])), dim=-1)
+    if net_notional_cap is not None:
+        packet = torch.cat((packet, torch.full_like(base_weights.float().unsqueeze(-1), net_notional_cap)), -1)
+    if beta_notional_cap is not None:
+        packet = torch.cat((packet, prior_beta.detach().float().unsqueeze(-1),
+            torch.full_like(base_weights.float().unsqueeze(-1), beta_notional_cap)), -1)
+    return packet
 
 
 def futures_account_state_features(
@@ -124,4 +211,14 @@ def resolve_futures_account_policy(
                                           previous_inventory_marks=previous_inventory_marks)
     logits = packet_row[:, 1] + (packet_row[:, ACCOUNT_COEFFICIENT_START:ACCOUNT_COEFFICIENT_END] * state).sum(-1)
     mask = (packet_row[:, ACCOUNT_MASK] > 0.5) & alive & advance
-    return masked_score_entmax_log_cash_weights(logits.unsqueeze(0), mask.unsqueeze(0)).squeeze(0)
+    weights = masked_score_entmax_log_cash_weights(logits.unsqueeze(0), mask.unsqueeze(0)).squeeze(0)
+    if packet_row.size(-1) == FUTURES_NET_EXPOSURE_PACKET_WIDTH:
+        weights = project_prior_net_notional(weights, mask,
+            packet_row[:, ACCOUNT_NOTIONAL].detach(), packet_row[:, ACCOUNT_INITIAL_MARGIN].detach(),
+            packet_row[0, ACCOUNT_NET_NOTIONAL_CAP].detach())
+    if packet_row.size(-1) == FUTURES_BETA_EXPOSURE_PACKET_WIDTH:
+        weights = project_prior_net_notional(weights, mask,
+            packet_row[:, ACCOUNT_NOTIONAL].detach(), packet_row[:, ACCOUNT_INITIAL_MARGIN].detach(),
+            packet_row[0, ACCOUNT_BETA_NOTIONAL_CAP].detach(),
+            factor_beta=packet_row[:, ACCOUNT_TX_BETA].detach())
+    return weights

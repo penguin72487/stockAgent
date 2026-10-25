@@ -55,11 +55,17 @@ def test_exact_discovery_projection_empty_due_boundary_and_archived_errors(confi
         queue.close()
 
 
-def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows(config, tmp_path, monkeypatch):
+@pytest.mark.parametrize('comparison', ['compare_discovery_summary', 'compare_capacity_copy'])
+def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows(config, tmp_path, monkeypatch,
+                                                                              comparison):
     queue = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
     try:
         with queue.db:
             add_discovery_cases(queue, 100)
+        if comparison == 'compare_capacity_copy':
+            queue.http_capacity_snapshot = lambda: {'providers': {}, 'calibration': {'providers': {
+                'publisher': {'history': [{'new_stored_url_heads': 10**90, 'errors': [0, 3],
+                                           'signed_zero': -0.0, 'clock': 1234.5}]}}}}
         queue.status(activity='fixture')
         before_status = sha256_file(tmp_path / 'status.json')
         before_settings = list(queue.db.execute('SELECT * FROM queue_settings ORDER BY key'))
@@ -71,7 +77,7 @@ def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows
 
         monkeypatch.setattr(NewsQueue, '__init__', no_owner_or_http)
         monkeypatch.setattr(NewsHTTP, '__init__', no_owner_or_http)
-        result = profile_current_status(tmp_path, queue.registry, 3, compare_discovery_summary=True)
+        result = profile_current_status(tmp_path, queue.registry, 3, **{comparison: True})
         assert result['accepted']
         assert result['publisher_requests'] == 0
         assert result['source_states_mutated'] is False
@@ -79,6 +85,9 @@ def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows
         assert set(result['measurements']) == {'legacy', 'summary'}
         assert all(len(samples) == 3 for samples in result['measurements'].values())
         assert result['deterministic_projection_sha256']['legacy'] == result['deterministic_projection_sha256']['summary']
+        if comparison == 'compare_capacity_copy':
+            assert result['capacity_copy']['all_published_values_preserved']
+            assert result['capacity_copy']['profiled_implementation'] == 'summary'
         assert len(result['top_query_execution_times']) <= 12
         assert sha256_file(tmp_path / 'status.json') == before_status
         assert queue.db.total_changes == changes
@@ -95,6 +104,9 @@ def test_status_benchmark_rejects_old_owner_or_unbounded_repetitions(config, tmp
         for repetitions in (0, 2, 16):
             with pytest.raises(ValueError, match='bounded_repetition_count_required'):
                 profile_current_status(tmp_path, queue.registry, repetitions)
+        with pytest.raises(ValueError, match='one_projection_comparison_per_snapshot_required'):
+            profile_current_status(tmp_path, queue.registry, 3, compare_capacity_copy=True,
+                                   compare_discovery_summary=True)
         status = json.loads((tmp_path / 'status.json').read_text())
         status['owner_id'] = 'previous-owner'
         atomic_write_json(tmp_path / 'status.json', status)

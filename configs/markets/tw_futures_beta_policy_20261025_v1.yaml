@@ -1,0 +1,11 @@
+# Causal TX-factor exposure experiment; all cases start from scratch.
+# Admitted TWD stock/ETF/index subset, not all listed TWD futures.
+base_config: tw_futures_residual_policy_20261024_v1.yaml
+experiment_name: tw-futures-beta-policy-20261025-v1
+training:
+  financial_transformer:
+    futures_net_notional_cap: null
+    futures_beta_notional_cap: 0.0
+runner:
+  output_dir: artifacts/markets/tw_futures_beta_policy_20261025_v1/twd_equity__beta0_0845
+  resume: false

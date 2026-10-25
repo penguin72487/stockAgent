@@ -173,6 +173,71 @@ def test_unsized_opening_target_survives_restart_and_recovers_without_new_infere
     assert mode["processed_signal_ids"] == ["signal-1"]
 
 
+def _provisional_summary():
+    from stockagent.live.market_config import OPENING_PROVISIONAL_REFERENCE_POLICY
+    return {**_summary(), "opening_source_complete": False, "opening_model_inputs_ready": True,
+        "live_session_open_feature_applied": False, "live_session_open_reference_applied": True,
+        "opening_coverage_gate_basis": "observed_or_known_prior_trade_model_only",
+        "day_trade_opening_reference_policy": OPENING_PROVISIONAL_REFERENCE_POLICY,
+        "day_trade_opening_reference_policy_fingerprint": hashlib.sha256(OPENING_PROVISIONAL_REFERENCE_POLICY.encode()).hexdigest(),
+        "opening_price_active_symbol_count": 1, "opening_price_active_count": 0,
+        "opening_no_print_active_count": 0, "opening_provisional_reference_active_count": 1,
+        "opening_input_resolved_count": 1, "opening_input_required_count": 1}
+
+
+def test_provisional_signal_admission_never_fills_from_its_carried_price(tmp_path):
+    from stockagent.live.market_config import OPENING_PROVISIONAL_REFERENCE_POLICY
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+        opening_reference_policy=OPENING_PROVISIONAL_REFERENCE_POLICY)
+    row = {**_row(), "open_price": None, "can_buy": False,
+        "model_input_price": 1_000., "model_input_price_is_provisional": True,
+        "model_input_price_source_date": "2026-08-13",
+        "model_input_price_basis": "last_real_trade_provisional_source_unknown",
+        "opening_price_wait_reason": "opening_price_unavailable"}
+    assert engine.register_signal(spec=spec, summary=_provisional_summary(), signal_rows=[row],
+        quotes={}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 0, 7)) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert not mode["positions"] and mode["pending_entry_source_count"] == 1
+    assert not engine.fills_path.exists() or not engine.fills_path.read_text().strip()
+    recorded = json.loads(engine.signals_path.read_text().splitlines()[-1])
+    assert recorded["model_input_price_is_provisional"] is True
+    assert recorded["model_input_price_source_date"] == "2026-08-13"
+    assert recorded["opening_reference_policy"] == OPENING_PROVISIONAL_REFERENCE_POLICY
+    assert "model_input_price" not in recorded  # Not an executable quote or public-price grant.
+    assert mode["opening_reference_policy"] == OPENING_PROVISIONAL_REFERENCE_POLICY
+    engine._mode(replace(spec, opening_reference_policy="observed_session_or_no_first_v1"))
+    assert mode["opening_reference_policy"] == OPENING_PROVISIONAL_REFERENCE_POLICY
+    assert mode["configured_opening_reference_policy"] == "observed_session_or_no_first_v1"
+    quote = {**_quote(), "quote_at": _now(9, 0, 8).isoformat(), "simtrade": False}
+    engine.process_quotes(quotes={"2330": quote}, now=_now(9, 0, 9))
+    assert mode["entry_filled_shares"] > 0 and mode["pending_entry_source_count"] == 0
+
+
+@pytest.mark.parametrize("damage", ["unconfigured", "wrong_policy", "bad_count", "missing_reference_flag",
+    "boolean_resolved_count", "boolean_required_count"])
+def test_provisional_signal_requires_matching_policy_and_complete_references(tmp_path, damage):
+    from stockagent.live.market_config import OPENING_PROVISIONAL_REFERENCE_POLICY
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    spec = replace(_spec(tmp_path), opening_reference_policy=OPENING_PROVISIONAL_REFERENCE_POLICY)
+    summary = _provisional_summary()
+    if damage == "unconfigured":
+        spec = replace(spec, opening_reference_policy="observed_session_or_no_first_v1")
+    elif damage == "wrong_policy":
+        summary["day_trade_opening_reference_policy"] = "wrong"
+    elif damage == "bad_count":
+        summary["opening_provisional_reference_active_count"] = 0
+    elif damage == "boolean_resolved_count":
+        summary["opening_input_resolved_count"] = True
+    elif damage == "boolean_required_count":
+        summary["opening_input_required_count"] = True
+    else:
+        summary["live_session_open_reference_applied"] = False
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row()], quotes={},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 0, 7)) == "waiting_source"
+    assert not engine.state["modes"][spec.market]["positions"]
+
+
 def test_unsized_source_wait_is_cancelled_at_exit_priority(tmp_path):
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
     spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
@@ -401,6 +466,69 @@ def test_engine_publishes_one_compact_revision_after_related_state_files(
     assert heartbeat is not None
     assert heartbeat["state_revision"] == revision + 1
     assert heartbeat["content_revision"] == content_revision
+
+
+@pytest.mark.parametrize("change", ["state_ahead", "status_ahead", "different_run", "content_ahead", "missing_receipt"])
+def test_dashboard_strict_commit_read_rejects_unpublished_state(tmp_path, verified_dashboard_calendar, change):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    if change == "missing_receipt":
+        engine.service_sync_path.unlink()
+    else:
+        path = engine.status_path if change == "status_ahead" else engine.state_path
+        payload = json.loads(path.read_bytes())
+        if change == "different_run":
+            payload["engine_run_id"] = "uncommitted-run"
+        elif change == "content_ahead":
+            payload["dashboard_content_revision"] += 1
+        else:
+            payload["state_revision"] += 1
+        path.write_text(json.dumps(payload))
+    with pytest.raises(DashboardSnapshotChanged, match="commit"):
+        build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(8, 59),
+            include_ledger_session_dates=False, require_committed_revision=True)
+
+
+@pytest.mark.parametrize("change", ["commit", "rewrite_preserved_mtime", "replace", "heartbeat"])
+def test_dashboard_strict_commit_read_fences_mutation_but_not_liveness(
+    tmp_path, verified_dashboard_calendar, monkeypatch, change,
+):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    original = dashboard_module._unattended_guardian_status
+
+    def mutate(**kwargs):
+        if change == "commit":
+            engine.update_readiness([spec], now=_now(8, 59, 1))
+        elif change == "heartbeat":
+            engine.publish_liveness(_now(8, 59, 1))
+        else:
+            path = engine.state_path
+            before = path.stat()
+            if change == "replace":
+                replacement = path.with_suffix(".next")
+                replacement.write_bytes(path.read_bytes())
+                replacement.replace(path)
+            else:
+                path.write_bytes(path.read_bytes())
+                os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return original(**kwargs)
+
+    monkeypatch.setattr(dashboard_module, "_unattended_guardian_status", mutate)
+    kwargs = dict(state_dir=engine.state_dir, now=_now(8, 59, 1),
+        include_ledger_session_dates=False, require_committed_revision=True)
+    if change == "heartbeat":
+        payload = build_dashboard_snapshot(**kwargs)
+        assert payload["service_sync"]["state_revision"] == engine.state["state_revision"]
+    else:
+        with pytest.raises(DashboardSnapshotChanged, match="commit"):
+            build_dashboard_snapshot(**kwargs)
 
 
 @pytest.mark.parametrize("overnight", [False, True])
@@ -1276,6 +1404,190 @@ def test_jsonl_batch_uses_one_durability_sync(tmp_path: Path, monkeypatch) -> No
 
     assert calls == 1
     assert len(path.read_text(encoding="utf-8").splitlines()) == 2_744
+
+
+def test_persist_group_keeps_file_barriers_and_durable_commit_order(tmp_path, monkeypatch):
+    import stat
+    import stockagent.live.tw_day_trade_simulation as module
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    actions = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def sync(fd):
+        actions.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        real_fsync(fd)
+
+    def replace(source, target):
+        actions.append(Path(target).name)
+        real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "fsync", sync)
+    monkeypatch.setattr(module.os, "replace", replace)
+    engine._persist(_now(9, 0, 5))
+    assert actions == ["file", "state.json", "file", "positions.json", "file",
+                       "status.json", "directory", "file", "service_sync.json", "directory",
+                       "file", "service_sync_durable_ack.json"]
+    receipt = json.loads(engine.service_sync_path.read_text())
+    assert set(receipt["journal_generations"]) == {
+        "signals.jsonl", "orders.jsonl", "fills.jsonl", "events.jsonl",
+        "marks.jsonl", "benchmark_marks.jsonl"}
+    assert engine.last_persist_metrics["durability_contract"] == "file_fsync_group_directory_then_commit_marker_and_ack_v2"
+
+
+@pytest.mark.parametrize("failure", [None, "marker_directory", "ack_file", "ack_replace"])
+def test_post_fsync_ack_fences_marker_visibility_and_recovers(tmp_path, monkeypatch, failure):
+    import stockagent.live.tw_day_trade_simulation as module
+    from stockagent.live.tw_day_trade_service_sync import (
+        SERVICE_SYNC_DURABLE_ACK_FILENAME, PaperReadChanged, committed_paper_read_guard,
+    )
+    engine = TwDayTradeSimulationEngine(tmp_path)
+    engine._persist(_now(9, 0, 5))
+    before = load_service_sync(tmp_path)
+    ack_path = tmp_path / SERVICE_SYNC_DURABLE_ACK_FILENAME
+    old_ack = ack_path.read_bytes()
+    real_directory, real_atomic, real_replace = module._fsync_directory, module._atomic_json, os.replace
+    directories = 0
+    rejected_before_ack = []
+
+    def directory(path):
+        nonlocal directories
+        directories += 1
+        if directories == 2:
+            # New marker is renamed, but its financial directory barrier has
+            # not completed. Even identical content with a new revision must
+            # not be acknowledged by the old hint.
+            assert json.loads(engine.service_sync_path.read_bytes())["state_revision"] == before["state_revision"] + 1
+            assert load_service_sync(tmp_path) is None
+            with pytest.raises(PaperReadChanged):
+                with committed_paper_read_guard(tmp_path):
+                    pytest.fail("uncommitted reader body must not run")
+            rejected_before_ack.append(True)
+            if failure == "marker_directory":
+                raise OSError("marker directory failed")
+        real_directory(path)
+
+    def atomic(path, payload, **kwargs):
+        if path == ack_path:
+            assert load_service_sync(tmp_path) is None
+            if failure == "ack_file":
+                raise OSError("ack file failed")
+        return real_atomic(path, payload, **kwargs)
+
+    def replace(source, target):
+        if Path(target) == ack_path and failure == "ack_replace":
+            raise OSError("ack replace failed")
+        return real_replace(source, target)
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(module, "_fsync_directory", directory)
+        scoped.setattr(module, "_atomic_json", atomic)
+        scoped.setattr(module.os, "replace", replace)
+        if failure:
+            with pytest.raises(OSError):
+                engine._persist(_now(9, 0, 6))
+            assert load_service_sync(tmp_path) is None
+            assert engine.last_persist_metrics is None
+            assert ack_path.read_bytes() == old_ack
+            assert not list(tmp_path.glob("*.tmp.*"))
+        else:
+            engine._persist(_now(9, 0, 6))
+            assert load_service_sync(tmp_path)["state_revision"] == before["state_revision"] + 1
+    assert rejected_before_ack == [True]
+    engine._persist(_now(9, 0, 7))
+    assert load_service_sync(tmp_path)["state_revision"] == engine.state["state_revision"]
+    restored = TwDayTradeSimulationEngine(tmp_path)
+    assert restored.state["modes"] == engine.state["modes"]
+
+
+@pytest.mark.parametrize("change", ["missing", "corrupt", "commit_id", "generation", "identity", "marker_rewrite"])
+def test_durable_ack_rejects_missing_tampered_and_stale_hints(tmp_path, change):
+    from stockagent.live.tw_day_trade_service_sync import SERVICE_SYNC_DURABLE_ACK_FILENAME
+    engine = TwDayTradeSimulationEngine(tmp_path)
+    engine._persist(_now(9, 0, 5))
+    path = tmp_path / SERVICE_SYNC_DURABLE_ACK_FILENAME
+    value = json.loads(path.read_bytes())
+    if change == "missing":
+        path.unlink()
+    elif change == "corrupt":
+        path.write_text("{")
+    elif change == "marker_rewrite":
+        engine.service_sync_path.write_bytes(engine.service_sync_path.read_bytes())
+    else:
+        if change == "commit_id":
+            value["durability_ack"]["commit_id"] = "different"
+        elif change == "generation":
+            value["marker_generation"][2] += 1
+        else:
+            value["state_revision"] += 1
+        path.write_text(json.dumps(value))
+    assert load_service_sync(tmp_path) is None
+
+
+def test_liveness_republishes_only_post_fsync_ack_without_changing_commit(tmp_path):
+    engine = TwDayTradeSimulationEngine(tmp_path)
+    engine._persist(_now(9, 0, 5))
+    before = load_service_sync(tmp_path)
+    files = {name: (tmp_path / name).read_bytes() for name in ("state.json", "positions.json", "status.json")}
+    engine.publish_liveness(_now(9, 0, 15))
+    after = load_service_sync(tmp_path)
+    assert after["state_revision"] == before["state_revision"]
+    assert after["content_revision"] == before["content_revision"]
+    assert after["durability_ack"] != before["durability_ack"]
+    assert after["heartbeat_at"] != before["heartbeat_at"]
+    assert all((tmp_path / name).read_bytes() == value for name, value in files.items())
+
+
+def test_ack_actual_file_fsync_failure_does_not_publish_success(tmp_path, monkeypatch):
+    import stat
+    engine = TwDayTradeSimulationEngine(tmp_path)
+    engine._persist(_now(9, 0, 5))
+    sync, count = os.fsync, 0
+
+    def failed_ack(fd):
+        nonlocal count
+        count += not stat.S_ISDIR(os.fstat(fd).st_mode)
+        if count == 5:
+            raise OSError("fifth file is the post-commit acknowledgement")
+        sync(fd)
+
+    monkeypatch.setattr(os, "fsync", failed_ack)
+    with pytest.raises(OSError):
+        engine._persist(_now(9, 0, 6))
+    assert load_service_sync(tmp_path) is None
+    assert engine.last_persist_metrics is None
+    assert not list(tmp_path.glob("*.tmp.*"))
+
+
+@pytest.mark.parametrize("failure", ["positions_replace", "group_directory", "commit_file"])
+def test_failed_group_never_publishes_a_new_commit_receipt(tmp_path, monkeypatch, failure):
+    import stat
+    import stockagent.live.tw_day_trade_simulation as module
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine._persist(_now(9, 0, 5))
+    before = engine.service_sync_path.read_bytes()
+    real_fsync, real_replace = os.fsync, os.replace
+    file_syncs = 0
+
+    def sync(fd):
+        nonlocal file_syncs
+        directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+        file_syncs += not directory
+        if (failure == "group_directory" and directory) or (failure == "commit_file" and file_syncs == 4):
+            raise OSError("injected durable publication failure")
+        real_fsync(fd)
+
+    def replace(source, target):
+        if failure == "positions_replace" and Path(target).name == "positions.json":
+            raise OSError("injected replace failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "fsync", sync)
+    monkeypatch.setattr(module.os, "replace", replace)
+    with pytest.raises(OSError):
+        engine._persist(_now(9, 0, 6))
+    assert engine.service_sync_path.read_bytes() == before
+    assert engine.last_persist_metrics is None
+    assert not list(engine.state_dir.glob("*.tmp.*"))
 
 
 def _row(weight: float = 0.1) -> dict[str, object]:

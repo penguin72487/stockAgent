@@ -20,6 +20,7 @@ from stockagent.data_sync.immutable_replication import digest
 
 def worker_code_identity():
     paths = ('stockagent/control/lakehouse.py', 'stockagent/control/storage_workflow.py',
+             'stockagent/data_sync/catalog_incremental.py',
              'stockagent/data_sync/immutable_replication.py', 'stockagent/data_sync/offhost_backup.py',
              'stockagent/data_sync/immutable_transport_cache.py',
              'stockagent/data_sync/packed_snapshots.py', 'stockagent/data_sync/packed_backup.py',

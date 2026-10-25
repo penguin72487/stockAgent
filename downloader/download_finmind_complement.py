@@ -27,7 +27,7 @@ import time
 from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
 from downloader.finmind_queue_indexes import (dispatch_indexes, ensure_status_index, ensure_release_reserve_index,
                                              ensure_us_publication_index, ensure_periodic_index,
-                                             periodic_index, PERIODIC_PREDICATE)
+                                             ensure_eta_read_indexes, periodic_index, PERIODIC_PREDICATE)
 from downloader.finmind_status_aggregates import StatusConnection, task_status_aggregates
 from typing import Any
 
@@ -176,6 +176,7 @@ def _db(path: Path) -> sqlite3.Connection:
         ensure_release_reserve_index(connection)
         ensure_us_publication_index(connection)
         ensure_periodic_index(connection)
+        ensure_eta_read_indexes(connection)
         retry_cohorts.ensure_schema(connection)
         retry_policy.migrate(connection, path.parent, _now())
         retry_cohorts.reconcile(connection, _now())
@@ -1120,12 +1121,14 @@ def _fetch_rows(session: requests.Session, limiter: SharedRateLimiter, root: Pat
         # uses this same request function; neither lane may bypass the ledger.
         raise SourceError(error.code, retry_after=int(error.retry_after)) from None
     started = datetime.now(UTC)
+    monotonic_started = time.monotonic()
     try:
         response = session.get(endpoint, params=params, headers={"Authorization": f"Bearer {token}"},
                                timeout=(10, 90),
                                **({"stream": True} if max_response_bytes is not None else {}))
         try:
-            return received_rows(_response_rows(response, limiter, max_response_bytes=max_response_bytes), started)
+            return received_rows(_response_rows(response, limiter, max_response_bytes=max_response_bytes),
+                                 started, monotonic_started=monotonic_started)
         finally:
             if max_response_bytes is not None:
                 response.close()
@@ -1358,7 +1361,10 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
                           for name, column in zip(table.column_names, table.columns)}
         if not any(field_non_null.values()):
             raise SourceError("all_null_response", retry_after=3600)
-        atomic_write_parquet(staged, table, compression="zstd", durable=True)
+        # The staging name is unacknowledged preparation. durable_replace
+        # syncs the final bytes and directory before any receipt is published;
+        # syncing this intermediate name as well repeats the same I/O fence.
+        atomic_write_parquet(staged, table, compression="zstd", durable=False)
         digest = _sha256(staged)
         final = folder / f"{digest}.parquet"
         if final.exists():

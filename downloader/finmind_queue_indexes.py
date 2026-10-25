@@ -26,6 +26,51 @@ PERIODIC_INDEX = "idx_finmind_periodic_covering"
 PERIODIC_COLUMNS = ("kind", "partition", "state", "dataset", "data_id", "last_attempt_at_utc",
                     "next_attempt_at_utc", "priority")
 PERIODIC_PREDICATE = "kind IN ('snapshot','year')"
+ETA_WORK_INDEX = "idx_finmind_eta_work_covering"
+ETA_WORK_COLUMNS = ("dataset", "kind", "priority", "state", "next_attempt_at_utc")
+ETA_RECENT_INDEX = "idx_finmind_eta_recent_covering"
+ETA_RECENT_COLUMNS = ("last_attempt_at_utc", "state", "kind", "rows", "bytes")
+ETA_RECENT_PREDICATE = "last_attempt_at_utc IS NOT NULL"
+DEADLINE_INDEX = "idx_finmind_complement_queue"
+DEADLINE_COLUMNS = ("priority", "next_attempt_at_utc", "state")
+
+
+def ensure_eta_read_indexes(connection: sqlite3.Connection) -> None:
+    """Owner-maintained projections for the minute-sampled exact ETA.
+
+    Inventory still reads every registered task, but only these narrow keys.
+    Recent outcomes seek by observation time instead of scanning all history.
+    No counters, task changes, triggers or additional refresh owner are needed.
+    Run the owner's bounded optimize_queue after setup, as for status indexes.
+    """
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {ETA_WORK_INDEX} "
+                       f"ON tasks({','.join(ETA_WORK_COLUMNS)})")
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {ETA_RECENT_INDEX} "
+                       f"ON tasks({','.join(ETA_RECENT_COLUMNS)}) WHERE {ETA_RECENT_PREDICATE}")
+
+
+def _eta_index(connection: sqlite3.Connection, name: str, columns: tuple[str, ...],
+               predicate: str = "") -> str:
+    row = connection.execute("SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (name,)).fetchone()
+    expected = f"CREATE INDEX {name} ON tasks({','.join(columns)})"
+    if predicate:
+        expected += f" WHERE {predicate}"
+    return (f" INDEXED BY {name}"
+            if row and isinstance(row[0], str) and ''.join(row[0].split()) == ''.join(expected.split()) else "")
+
+
+def eta_work_index(connection: sqlite3.Connection) -> str:
+    """Read-only, exact-schema hint; older owners keep their original query."""
+    return _eta_index(connection, ETA_WORK_INDEX, ETA_WORK_COLUMNS)
+
+
+def eta_recent_index(connection: sqlite3.Connection) -> str:
+    return _eta_index(connection, ETA_RECENT_INDEX, ETA_RECENT_COLUMNS, ETA_RECENT_PREDICATE)
+
+
+def deadline_index(connection: sqlite3.Connection) -> str:
+    """The original priority/time projection, shared by both queue owners."""
+    return _eta_index(connection, DEADLINE_INDEX, DEADLINE_COLUMNS)
 
 
 def ensure_release_reserve_index(connection: sqlite3.Connection) -> None:

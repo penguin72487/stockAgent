@@ -119,6 +119,12 @@ def test_watch_continues_without_finite_batch_cap_and_releases_lock(queue):
     assert status["state"] == "stopped" and status["completed_tasks"] == 4
     assert status["unknown_outcome_auto_retry"] is False
     assert status["query_deadline_renewed_by_heartbeat"] is False
+    from datetime import UTC,datetime
+    from downloader.tej_scheduler import RETRY_WAKE_CONTRACT
+    from stockagent.live.tej_dashboard import _scheduler_public
+    assert status['retry_wake_contract']==RETRY_WAKE_CONTRACT
+    public=_scheduler_public(root,datetime.now(UTC))
+    assert public['continuous'] is True and public['completed_tasks']==4
     from downloader.dataset_lock import exclusive_dataset_lock
     with exclusive_dataset_lock(root / ".download.lock", provider="test", timeout_seconds=0):
         pass
@@ -131,6 +137,48 @@ def test_safe_input_retry_is_waited_and_then_actually_runs(queue):
     assert watch_queue(root, None, config, stop=stop, runner=lambda *_: next(replies), max_cycles=3, emit=emit) == 0
     assert stop.waits == [5, 2, 30, 30]
     assert json.loads((root / "scheduler_status.json").read_text())["completed_tasks"] == 1
+
+
+@pytest.mark.parametrize('task_due,window_due,error,owner,expected',[
+    (-100,7,'source_company_labels_absent_fragment','task',7),
+    (9,7,'source_company_labels_absent_fragment','task',9),
+    (3,7,None,'other',3),
+    (-100,7,'prequery_failure_deferred','task',7),
+    (3,7,'prequery_failure_deferred','other',60),
+])
+def test_idle_wake_matches_effective_shared_retry_admission(queue,task_due,window_due,error,owner,expected):
+    from datetime import UTC,datetime,timedelta
+    from downloader.tej_scheduler import queue_wait
+    from downloader.tej_history import _ready_task
+    root,_=queue;now=datetime(2026,10,23,tzinfo=UTC)
+    add_task(root,state='pending',error=error)
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE tasks SET next_attempt_at_utc=?',((now+timedelta(seconds=task_due)).isoformat(),))
+        con.execute('INSERT INTO desktop_retry_windows VALUES(?,?,?,?,?,?,?)',
+            ('table',owner,'retained-attempt',12,(now+timedelta(seconds=window_due)).isoformat(),
+             'source_company_labels_absent_fragment' if error in (None,'source_company_labels_absent_fragment') else error,
+             'retained-original-audit.json'))
+        assert _ready_task(con,now.isoformat(),None,{}) is None
+        if expected<60:
+            assert _ready_task(con,(now+timedelta(seconds=expected)).isoformat(),None,{})['task_id']=='task'
+        before=list(con.iterdump())
+    assert queue_wait(root,now,60)==expected
+    with closing(connect(root)) as con:
+        assert list(con.iterdump())==before
+
+
+def test_quarantined_table_does_not_hide_next_healthy_retry_wake(queue):
+    from datetime import UTC,datetime,timedelta
+    from downloader.tej_scheduler import queue_wait
+    root,_=queue;now=datetime(2026,10,23,tzinfo=UTC)
+    add_task(root,state='pending',error=None)
+    with closing(connect(root)) as con,con:
+        con.execute('UPDATE tasks SET next_attempt_at_utc=?',((now+timedelta(seconds=1)).isoformat(),))
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,state,last_error_code) "
+            "VALUES('quarantine','table','download','P1',100,'{}','blocked','source_validation_failed_deferred')")
+        con.execute("INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,next_attempt_at_utc) "
+            "VALUES('healthy','healthy','download','P1',200,'{}',?)",((now+timedelta(seconds=7)).isoformat(),))
+    assert queue_wait(root,now,60)==7
 
 
 def test_foreground_availability_is_waited_without_spin_or_unknown_retry(queue):

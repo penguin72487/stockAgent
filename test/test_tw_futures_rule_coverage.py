@@ -45,6 +45,28 @@ def test_numeric_rule_audit_separates_candidates_intervals_rates_and_source_iden
     assert report['new_accounting_builds']==0 and not report['training_release_approved']
 
 
+def test_training_scope_distinguishes_excluded_missing_and_actual_contract_days():
+    from scripts.audit_tw_futures_rule_coverage import training_universe_coverage
+    raw = pl.DataFrame(dict(product=['CAF', 'CA1', 'TX', 'TGF'],
+        asset_class=['stock_future', 'stock_future', 'index_future', 'commodity_future']))
+    daily = pl.DataFrame(dict(date=[date(2026, 1, 2), date(2026, 1, 5)],
+        product=['CAF', 'CAF'], asset_class=['stock_future'] * 2,
+        physical_contract=['CAF:202601'] * 2, executable=[True, False]))
+    result = training_universe_coverage(raw, daily, {'CAF', 'CA1'}, {'TX', 'TGF'})
+    rows = {r['product']: r for r in result.to_dicts()}
+    assert rows['CAF']['model_contract_days'] == 2
+    assert rows['CAF']['model_physical_contracts'] == 1
+    assert rows['CAF']['executable_daily_rows'] == 1
+    assert rows['CA1']['training_scope_status'] == 'no_financial_component_admitted'
+    assert rows['TX']['training_scope_status'] == 'outside_financial_build_scope'
+    assert rows['TX']['legacy_deferred'] and rows['TGF']['model_contract_days'] == 0
+    with pytest.raises(ValueError, match='asset class'):
+        training_universe_coverage(raw, daily.with_columns(pl.lit('index_future').alias('asset_class')),
+                                  {'CAF'}, set())
+    with pytest.raises(ValueError, match='duplicate physical'):
+        training_universe_coverage(raw, pl.concat([daily, daily]), {'CAF'}, set())
+
+
 def frames():
     daily = pl.DataFrame({
         'date': [date(2011, 1, 3), date(2011, 1, 4), date(2011, 1, 3)],

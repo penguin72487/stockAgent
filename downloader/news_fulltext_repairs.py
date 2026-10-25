@@ -9,6 +9,10 @@ ABI4 also admits exactly witnessed legacy zero-byte saved-body rechecks;
 ordinary missing-only requests still cannot alter a retained body head.
 ABI5 admits one missing-only source recovery after an immutable successful
 current native observation; old parser-repair and question markers stay intact.
+ABI6 permits one explicit missing-only address-validation recheck per URL,
+independent of parser generations. It grants no permission or DNS exemption.
+ABI7 permits one reviewed missing-only publication-clock recheck per parser.
+The current parser still owns clock validation; no timestamp is rewritten.
 """
 from __future__ import annotations
 
@@ -40,6 +44,16 @@ from downloader.news_fulltext_native_rechecks import (
 CONTRACT_VERSION = 2
 EMPTY_RESPONSE_RECHECK_VERSION = 4
 EMPTY_RESPONSE_RECHECK_KIND = 'reviewed_stored_empty_response_recheck'
+ADDRESS_RECHECK_VERSION = 6
+ADDRESS_RECHECK_KIND = 'reviewed_address_validation_recheck'
+ADDRESS_RECHECK_OUTCOME = 'address_validation_recheck_enqueued'
+ADDRESS_RECHECK_STATES = frozenset({'non_public_address'})
+PUBLICATION_CLOCK_RECHECK_VERSION = 7
+PUBLICATION_CLOCK_RECHECK_KIND = 'reviewed_publication_clock_recheck'
+PUBLICATION_CLOCK_RECHECK_OUTCOME = 'publication_clock_recheck_enqueued'
+PUBLICATION_CLOCK_RECHECK_STATES = frozenset({'invalid_bulk_publication_clock'})
+ADMITTED_OUTCOMES = frozenset({'enqueued', 'revalidation_enqueued', NATIVE_SUCCESS_OUTCOME,
+                              ADDRESS_RECHECK_OUTCOME, PUBLICATION_CLOCK_RECHECK_OUTCOME})
 STORED_HEAD_FIELDS = ('body_sha256', 'body_bytes', 'parquet_path', 'captured_at_utc',
                       'etag', 'last_modified', 'validator_url')
 MAX_TARGETS = 512
@@ -266,8 +280,18 @@ def _pending(directory):
             (entry for entry in entries if entry.name.endswith(".json")), MAX_PENDING + 1)), key=lambda p: p.name)
 
 
+def _already_admitted(db, provider, parser_fingerprint, article_id, outcome):
+    # A parser change must not mint another security recheck for this URL.
+    if outcome == ADDRESS_RECHECK_OUTCOME:
+        return db.execute('SELECT 1 FROM reviewed_repair_items WHERE provider=? AND article_id=? AND outcome=?',
+                          (provider, article_id, outcome)).fetchone() is not None
+    return db.execute('SELECT 1 FROM reviewed_repair_items WHERE provider=? AND parser_fingerprint=? '
+                      'AND article_id=? AND outcome=?',
+                      (provider, parser_fingerprint, article_id, outcome)).fetchone() is not None
+
+
 def submit_repairs(root, registry, urls, *, reason, retained_originals=None, empty_response_witnesses=None,
-                   native_success_witnesses=None):
+                   native_success_witnesses=None, address_recheck=False, publication_clock_recheck=False):
     """Seal explicit eligible failures while the canonical owner stays alive."""
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
         raise ValueError("repair_requires_bounded_review_reason")
@@ -275,6 +299,12 @@ def submit_repairs(root, registry, urls, *, reason, retained_originals=None, emp
     if not 1 <= len(selected) <= MAX_TARGETS:
         raise ValueError("repair_requires_one_to_512_urls")
     selected = list(dict.fromkeys(normalize_url(url) for url in selected))
+    if type(address_recheck) is not bool or address_recheck and (publication_clock_recheck or any(
+            value is not None for value in (retained_originals, empty_response_witnesses, native_success_witnesses))):
+        raise ValueError('invalid_address_recheck_mode')
+    if type(publication_clock_recheck) is not bool or publication_clock_recheck and any(
+            value is not None for value in (retained_originals, empty_response_witnesses, native_success_witnesses)):
+        raise ValueError('invalid_publication_clock_recheck_mode')
     native_recheck = native_success_witnesses is not None
     if native_recheck:
         if (retained_originals is not None or empty_response_witnesses is not None
@@ -303,7 +333,10 @@ def submit_repairs(root, registry, urls, *, reason, retained_originals=None, emp
         has_markers = db.execute("SELECT 1 FROM sqlite_master WHERE name='reviewed_repair_items' AND type='table'").fetchone()
         for url in selected:
             row = db.execute("SELECT * FROM articles WHERE url=?", (url,)).fetchone()
-            problem = _head_problem(row, now, registry=registry, stored_recheck=empty_recheck)
+            problem = _head_problem(row, now, registry=None if address_recheck or publication_clock_recheck else registry,
+                allowed_failure_states=(PUBLICATION_CLOCK_RECHECK_STATES if publication_clock_recheck
+                                        else ADDRESS_RECHECK_STATES if address_recheck else REPAIRABLE),
+                stored_recheck=empty_recheck)
             if problem is None:
                 try:
                     source, identity = _source(db, registry, url)
@@ -315,11 +348,13 @@ def submit_repairs(root, registry, urls, *, reason, retained_originals=None, emp
                         _verify_empty_response(root, source, row, empty_response_witnesses[url])
                     if native_recheck:
                         verify_native_success(db, source, row, native_success_witnesses[url])
-                    outcome = NATIVE_SUCCESS_OUTCOME if native_recheck else 'revalidation_enqueued' if empty_recheck else 'enqueued'
-                    if retained_originals is None and has_markers and db.execute(
-                            "SELECT 1 FROM reviewed_repair_items WHERE provider=? AND parser_fingerprint=? "
-                            "AND article_id=? AND outcome=?", (source.provider, identity["parser_fingerprint"], row["id"], outcome)).fetchone():
-                        raise ValueError("already_admitted_for_parser")
+                    outcome = (PUBLICATION_CLOCK_RECHECK_OUTCOME if publication_clock_recheck
+                               else ADDRESS_RECHECK_OUTCOME if address_recheck else NATIVE_SUCCESS_OUTCOME
+                               if native_recheck else 'revalidation_enqueued' if empty_recheck else 'enqueued')
+                    if retained_originals is None and has_markers and _already_admitted(
+                            db, source.provider, identity['parser_fingerprint'], row['id'], outcome):
+                        raise ValueError('already_admitted_for_address_validation' if address_recheck
+                                         else 'already_admitted_for_parser')
                 except (ValueError, NewsError, OSError, TypeError, KeyError, OverflowError, RecursionError, pa.ArrowException) as error:
                     problem = error.code if isinstance(error, NewsError) else str(error)
             if problem:
@@ -331,13 +366,19 @@ def submit_repairs(root, registry, urls, *, reason, retained_originals=None, emp
                     empty_responses[row['id'].hex()] = {
                         'reference': empty_response_witnesses[url],
                         'stored_head': {key: row[key] for key in STORED_HEAD_FIELDS}}
-    result = {"contract_version": NATIVE_SUCCESS_VERSION if native_recheck else CONTRACT_VERSION,
+    result = {"contract_version": (PUBLICATION_CLOCK_RECHECK_VERSION if publication_clock_recheck
+                                  else ADDRESS_RECHECK_VERSION if address_recheck
+                                  else NATIVE_SUCCESS_VERSION if native_recheck else CONTRACT_VERSION),
               "submitted_targets": len(targets), "excluded": excluded,
               "publisher_requests": 0, "queue_mutations": False, "accepted_as_bodies": False}
     if not targets:
         return dict(result, submitted=False, request_id=None)
     request = {"contract_version": CONTRACT_VERSION, "kind": "reviewed_missing_body_repair",
                "created_at_utc": utc_now(), "reason": reason.strip(), "sources": sources, "targets": targets}
+    if address_recheck:
+        request.update(contract_version=ADDRESS_RECHECK_VERSION, kind=ADDRESS_RECHECK_KIND)
+    if publication_clock_recheck:
+        request.update(contract_version=PUBLICATION_CLOCK_RECHECK_VERSION, kind=PUBLICATION_CLOCK_RECHECK_KIND)
     if retained_originals is not None:
         from downloader.news_fulltext_replay import RETAINED_NONTEXT_OUTCOME_KIND
         request.update(contract_version=3,kind=RETAINED_NONTEXT_OUTCOME_KIND,
@@ -383,16 +424,23 @@ def _read_private_request(path):
 
 def _load(path):
     request = _read_private_request(path)
+    from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, validate_request
+    if isinstance(request, dict) and request.get('contract_version') == QUALITY_VERSION:
+        return validate_request(request)
     retained=isinstance(request,dict) and request.get('contract_version')==3
     empty = isinstance(request, dict) and request.get('contract_version') == EMPTY_RESPONSE_RECHECK_VERSION
     native = isinstance(request, dict) and request.get('contract_version') == NATIVE_SUCCESS_VERSION
+    address = isinstance(request, dict) and request.get('contract_version') == ADDRESS_RECHECK_VERSION
+    clock = isinstance(request, dict) and request.get('contract_version') == PUBLICATION_CLOCK_RECHECK_VERSION
     fields=({"contract_version", "kind", "created_at_utc", "reason", "sources", "targets"}
             | ({'originals'} if retained else {'empty_responses'} if empty else {'native_successes'} if native else set()))
     from downloader.news_fulltext_replay import RETAINED_NONTEXT_OUTCOME_KIND,validate_nontext_original_reference
     if (not isinstance(request, dict) or set(request) != fields
-            or type(request["contract_version"]) is not int or request["contract_version"] not in {1, CONTRACT_VERSION,3,EMPTY_RESPONSE_RECHECK_VERSION,NATIVE_SUCCESS_VERSION}
+            or type(request["contract_version"]) is not int or request["contract_version"] not in {1, CONTRACT_VERSION,3,EMPTY_RESPONSE_RECHECK_VERSION,NATIVE_SUCCESS_VERSION,ADDRESS_RECHECK_VERSION,PUBLICATION_CLOCK_RECHECK_VERSION}
             or request["kind"] != (RETAINED_NONTEXT_OUTCOME_KIND if retained else
-                                   EMPTY_RESPONSE_RECHECK_KIND if empty else NATIVE_SUCCESS_KIND if native else "reviewed_missing_body_repair")
+                                   EMPTY_RESPONSE_RECHECK_KIND if empty else NATIVE_SUCCESS_KIND if native else
+                                   ADDRESS_RECHECK_KIND if address else PUBLICATION_CLOCK_RECHECK_KIND if clock
+                                   else "reviewed_missing_body_repair")
             or not isinstance(request["reason"], str) or not request["reason"].strip() or len(request["reason"]) > 240
             or _clock(request["created_at_utc"]) > time.time()
             or not isinstance(request["targets"], list) or not 1 <= len(request["targets"]) <= MAX_TARGETS
@@ -400,7 +448,8 @@ def _load(path):
         raise ValueError("invalid_repair_request")
     seen = set()
     # ABI 1 requests retain their original semantic-only state contract.
-    states = REPAIRABLE | ({_REVIEWED_SCOPE_FAILURE} if request["contract_version"] == 2 else set())
+    states = PUBLICATION_CLOCK_RECHECK_STATES if clock else ADDRESS_RECHECK_STATES if address else REPAIRABLE | (
+        {_REVIEWED_SCOPE_FAILURE} if request["contract_version"] == 2 else set())
     for target in request["targets"]:
         if (not isinstance(target, dict) or set(target) != set(HEAD_FIELDS)
                 or not isinstance(target["url"], str) or normalize_url(target["url"]) != target["url"]
@@ -465,14 +514,25 @@ def _schema(queue):
                          "provider,parser_fingerprint,article_id) WHERE outcome='revalidation_enqueued'")
         queue.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewed_native_success_once ON reviewed_repair_items("
                          "provider,parser_fingerprint,article_id) WHERE outcome='native_success_recheck_enqueued'")
+        queue.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewed_address_validation_once ON reviewed_repair_items("
+                         "provider,article_id) WHERE outcome='address_validation_recheck_enqueued'")
+        queue.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewed_publication_clock_once ON reviewed_repair_items("
+                         "provider,parser_fingerprint,article_id) WHERE outcome='publication_clock_recheck_enqueued'")
     queue.reviewed_repair_schema_ready = True
 
 
 def _admit(queue, request, target):
+    from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, admit as admit_quality
+    if request['contract_version'] == QUALITY_VERSION:
+        return admit_quality(queue, request, target)
     row = queue.db.execute("SELECT * FROM articles WHERE id=?", (bytes.fromhex(target["id"]),)).fetchone()
     empty = request['contract_version'] == EMPTY_RESPONSE_RECHECK_VERSION
     native = request['contract_version'] == NATIVE_SUCCESS_VERSION
-    problem = _head_problem(row, time.time(), registry=queue.registry, stored_recheck=empty)
+    address = request['contract_version'] == ADDRESS_RECHECK_VERSION
+    clock = request['contract_version'] == PUBLICATION_CLOCK_RECHECK_VERSION
+    problem = _head_problem(row, time.time(), registry=None if address or clock else queue.registry,
+        allowed_failure_states=(PUBLICATION_CLOCK_RECHECK_STATES if clock
+                                else ADDRESS_RECHECK_STATES if address else REPAIRABLE), stored_recheck=empty)
     if problem:
         return problem
     if _head(row) != target:
@@ -483,7 +543,8 @@ def _admit(queue, request, target):
         return error.code if isinstance(error, NewsError) else str(error)
     if source.provider != target["provider"] or identity != request["sources"][source.provider]:
         return "source_identity_changed"
-    outcome = NATIVE_SUCCESS_OUTCOME if native else 'revalidation_enqueued' if empty else 'enqueued'
+    outcome = (PUBLICATION_CLOCK_RECHECK_OUTCOME if clock else ADDRESS_RECHECK_OUTCOME if address else NATIVE_SUCCESS_OUTCOME if native
+               else 'revalidation_enqueued' if empty else 'enqueued')
     if native:
         try:
             verify_native_success(queue.db, source, row, request['native_successes'][target['id']])
@@ -503,10 +564,8 @@ def _admit(queue, request, target):
             return classify_retained_nontext_outcome(queue,source,target,request['originals'][target['id']])
         except (NewsError,ValueError,TypeError,KeyError,OverflowError,RecursionError,pa.ArrowException):
             return 'retained_outcome_evidence_invalid'
-    if queue.db.execute("SELECT 1 FROM reviewed_repair_items WHERE provider=? AND parser_fingerprint=? "
-                        "AND article_id=? AND outcome=?",
-                        (source.provider, identity["parser_fingerprint"], row["id"], outcome)).fetchone():
-        return "already_admitted_for_parser"
+    if _already_admitted(queue.db, source.provider, identity['parser_fingerprint'], row['id'], outcome):
+        return 'already_admitted_for_address_validation' if address else 'already_admitted_for_parser'
     # No attempts/deadline/error/check reset, no lease or saved-body mutation.
     queue.db.execute("UPDATE articles SET state='retry' WHERE id=?", (row["id"],))
     return outcome
@@ -518,8 +577,16 @@ def _archive(queue, path, request=None):
         "SELECT target_index,lower(hex(article_id)) AS article_id,provider,outcome,recorded_at_utc,owner_id "
         "FROM reviewed_repair_items WHERE request_id=? ORDER BY target_index", (path.stem,))]
     receipt = {"contract_version": CONTRACT_VERSION, **job, "outcomes": outcomes,
-               "admitted_targets": sum(row["outcome"] in {"enqueued", 'revalidation_enqueued', NATIVE_SUCCESS_OUTCOME} for row in outcomes),
+               "admitted_targets": sum(row["outcome"] in ADMITTED_OUTCOMES for row in outcomes),
                "accepted_as_bodies": False, "request_sha256": path.stem}
+    from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, KIND as QUALITY_KIND
+    if request is not None and request['contract_version'] == QUALITY_VERSION:
+        receipt.update(contract_version=QUALITY_VERSION, kind=QUALITY_KIND, originals=request['originals'],
+            expected_error=request['expected_error'], publisher_requests=0, body_acceptances=0,
+            reclassified_targets=sum(row['outcome'] == 'stored_quality_reclassified' for row in outcomes),
+            immutable_bodies_preserved=True, source_observation_clocks_changed=False,
+            review_clock_basis='reviewed_repair_items.recorded_at_utc',
+            source_freshness_verified=False)
     if request is not None and request['contract_version']==3:
         receipt.update(contract_version=3,kind=request['kind'],originals=request['originals'],
             reclassified_targets=sum(row['outcome']=='classified_source_body_image_only' for row in outcomes),
@@ -533,6 +600,16 @@ def _archive(queue, path, request=None):
             native_successes=request['native_successes'], publisher_requests=0, body_acceptances=0,
             attempts_deadlines_errors_checks_and_saved_bodies_changed=False,
             previous_parser_repair_marker_preserved=True, full_body_still_requires_normal_capture=True)
+    if request is not None and request['contract_version'] == ADDRESS_RECHECK_VERSION:
+        receipt.update(contract_version=ADDRESS_RECHECK_VERSION, kind=ADDRESS_RECHECK_KIND,
+            publisher_requests=0, body_acceptances=0, permission_granted=False,
+            attempts_deadlines_errors_checks_and_saved_bodies_changed=False,
+            full_body_still_requires_normal_capture=True, address_and_robots_checks_still_required=True)
+    if request is not None and request['contract_version'] == PUBLICATION_CLOCK_RECHECK_VERSION:
+        receipt.update(contract_version=PUBLICATION_CLOCK_RECHECK_VERSION, kind=PUBLICATION_CLOCK_RECHECK_KIND,
+            publisher_requests=0, body_acceptances=0,
+            attempts_deadlines_errors_checks_and_saved_bodies_changed=False,
+            publication_clocks_rewritten=False, full_body_still_requires_normal_capture=True)
     directory = _directory(queue.root, "processed")
     _write_once(directory / (path.stem + ".outcome.json"), _bytes(receipt))
     archived = directory / path.name
@@ -612,7 +689,8 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                 try:
                     outcome = _admit(queue, request, target)
                 except OSError:
-                    if request['contract_version'] not in {3, EMPTY_RESPONSE_RECHECK_VERSION}:
+                    from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION
+                    if request['contract_version'] not in {3, EMPTY_RESPONSE_RECHECK_VERSION, QUALITY_VERSION}:
                         raise
                     # A temporarily unavailable retained file must not stop
                     # the resident HTTP owner or consume the local outcome.
@@ -627,20 +705,25 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                 processed += 1
                 cursor += 1
                 queue.counter("reviewed_repair_targets_processed", 1)
-                if outcome in {"enqueued", 'revalidation_enqueued', NATIVE_SUCCESS_OUTCOME}:
+                if outcome in ADMITTED_OUTCOMES:
                     queue.counter("reviewed_repair_targets_admitted", 1)
                     if outcome == 'revalidation_enqueued':
                         queue.counter('reviewed_empty_response_rechecks_admitted', 1)
                     elif outcome == NATIVE_SUCCESS_OUTCOME:
                         queue.counter('reviewed_native_success_rechecks_admitted', 1)
-                elif outcome=='classified_source_body_image_only':
+                    elif outcome == ADDRESS_RECHECK_OUTCOME:
+                        queue.counter('reviewed_address_validation_rechecks_admitted', 1)
+                    elif outcome == PUBLICATION_CLOCK_RECHECK_OUTCOME:
+                        queue.counter('reviewed_publication_clock_rechecks_admitted', 1)
+                elif outcome in {'classified_source_body_image_only', 'stored_quality_reclassified'}:
                     queue.counter('reviewed_retained_outcomes_classified',1)
             complete = cursor == len(request["targets"])
             queue.db.execute("UPDATE reviewed_repair_jobs SET next_index=?,completed_at_utc=coalesce(completed_at_utc,?) "
                              "WHERE request_id=?", (cursor, utc_now() if complete else None, path.stem))
         if complete:
             try:
-                if request['contract_version'] in {3, EMPTY_RESPONSE_RECHECK_VERSION, NATIVE_SUCCESS_VERSION}:
+                from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION
+                if request['contract_version'] in {3, EMPTY_RESPONSE_RECHECK_VERSION, NATIVE_SUCCESS_VERSION, ADDRESS_RECHECK_VERSION, PUBLICATION_CLOCK_RECHECK_VERSION, QUALITY_VERSION}:
                     _archive(queue,path,request=request)
                 else:
                     _archive(queue,path)

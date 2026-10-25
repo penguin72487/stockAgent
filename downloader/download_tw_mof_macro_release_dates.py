@@ -23,10 +23,12 @@ try:
     from downloader.common import SharedRateLimiter, retry_delay_seconds
     from downloader.download_tw_cbc_fx_release_archive import _save_raw
     from downloader.tw_public_source_lock import source_update_lock
+    from downloader.release_archive_timing import timed_release_archive
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter, retry_delay_seconds
     from download_tw_cbc_fx_release_archive import _save_raw
     from tw_public_source_lock import source_update_lock
+    from release_archive_timing import timed_release_archive
 
 
 NAME = "mof_macro_release_dates"
@@ -191,6 +193,7 @@ def _fetch_tax_pdf(url: str, limiter: SharedRateLimiter) -> bytes | None:
     raise RuntimeError(f"MOF tax PDF exhausted retries: {url}")
 
 
+@timed_release_archive(NAME)
 def collect(root: Path, *, request_interval: float = 0.5,
             recent_pages: int = 2) -> dict:
     if request_interval <= 0 or recent_pages < 0:

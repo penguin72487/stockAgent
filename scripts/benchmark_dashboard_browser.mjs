@@ -4,7 +4,7 @@
 import fs from "node:fs";
 
 const port = Number(process.argv[2] || 9224);
-const url = process.argv[3] || "https://www.penguin72487.dpdns.org/tw-day-trade/";
+const url = process.argv[3] || "https://penguin72487.dpdns.org/tw-day-trade/";
 const output = process.argv[4];
 const watchOption = process.argv.slice(5).find(value => value.startsWith("--watch-ms="));
 const watchMs = watchOption ? Number(watchOption.split("=")[1]) : 0;

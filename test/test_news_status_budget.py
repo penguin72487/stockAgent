@@ -1,6 +1,8 @@
 """Heartbeat bounds cannot discard authoritative gaps, recovery or ETA evidence."""
 from copy import deepcopy
 import json
+import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,13 +11,41 @@ from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue
 from downloader.news_fulltext_status import (
     BULK_GAP_STATUS_SAMPLE_LIMIT, CAPACITY_STATUS_HISTORY_LIMIT,
-    summarize_bulk_window_gaps,
+    copy_status_value, summarize_bulk_window_gaps,
 )
 from stockagent.live.news_dashboard import _completion_forecast
 from test_news_capacity import controller_fixture
 from test_news_completion_forecast import samples
 from test_news_dashboard import NOW
 from test_news_fulltext import config
+
+
+def test_status_copy_preserves_values_container_isolation_and_foreign_values():
+    shared = {'negative_zero': -0.0, 'large_count': 10**100, '原始': '\n\u00a0',
+              'flags': [None, False, True], 'foreign': SimpleNamespace(buffer=bytearray(b'raw'))}
+    original = {'first': shared, 'second': shared, 3: (shared,)}
+    result = copy_status_value(original)
+    assert result == deepcopy(original)
+    assert result is not original and result['first'] is not shared
+    assert result['first'] is result['second'] is result[3][0]
+    assert math.copysign(1, result['first']['negative_zero']) == -1
+    result['first']['flags'].append('new')
+    result['first']['foreign'].buffer[0] = 0
+    assert shared['flags'] == [None, False, True]
+    assert shared['foreign'].buffer == b'raw'
+
+
+def test_status_copy_preserves_cycles_and_container_subclasses():
+    class Rows(list):
+        pass
+
+    original = {'rows': Rows([1])}
+    original['self'] = original
+    original['rows'].append(original)
+    result = copy_status_value(original)
+    assert result is not original and result['self'] is result
+    assert type(result['rows']) is Rows and result['rows'] is not original['rows']
+    assert result['rows'][1] is result
 
 
 def test_compact_json_keeps_exact_values_and_legacy_default(tmp_path):

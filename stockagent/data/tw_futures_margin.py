@@ -408,15 +408,53 @@ def prior_observed_return_risk(log_returns, observed, *, lookback):
     return np.stack((rms, count / int(lookback)), axis=-1).astype(np.float32)
 
 
+def prior_observed_tx_beta(log_returns, observed, prior_benchmark, benchmark_observed, *, lookback):
+    """Rolling simple-return OLS using only supplied prior-session observations.
+
+    Eight pseudo-observations shrink beta toward the explicit prior of one.
+    Unknown/constant-market windows use that prior, never synthetic source
+    returns. Fixed-window prefix sums cost O(T*S), with no S*S covariance.
+    """
+    if (int(lookback) < 2 or log_returns.ndim != 2 or log_returns.shape != observed.shape
+            or np.shape(prior_benchmark) != log_returns.shape[:1]
+            or np.shape(benchmark_observed) != log_returns.shape[:1]):
+        raise ValueError('prior beta requires aligned past returns and lookback >= 2')
+    valid = (observed & np.isfinite(log_returns)
+             & benchmark_observed[:, None] & np.isfinite(prior_benchmark[:, None]))
+    with np.errstate(over='raise', invalid='raise'):
+        x = np.where(valid, np.expm1(np.where(valid, log_returns, 0).astype(np.float64)), 0.)
+        y = np.where(valid, np.expm1(np.where(benchmark_observed, prior_benchmark, 0).astype(np.float64))[:, None], 0.)
+    end = np.arange(1, len(x) + 1)
+    begin = np.maximum(0, end - int(lookback))
+
+    def rolling_sum(values):
+        prefix = np.concatenate((np.zeros((1, x.shape[1])), np.cumsum(values, axis=0)), axis=0)
+        return prefix[end] - prefix[begin]
+
+    count = rolling_sum(valid.astype(np.float64))
+    sx, sy = rolling_sum(x), rolling_sum(y)
+    covariance = rolling_sum(x * y) - sx * sy / np.maximum(count, 1.)
+    market_sum_squares = np.maximum(0., rolling_sum(y * y) - sy * sy / np.maximum(count, 1.))
+    market_variance = market_sum_squares / np.maximum(count, 1.)
+    pseudo_variance = 8. * market_variance
+    estimate = (covariance + pseudo_variance) / np.maximum(market_sum_squares + pseudo_variance, 1e-30)
+    return np.where((count >= 2) & (market_variance > 1e-12), estimate, 1.).astype(np.float32)
+
+
 def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidation_ratio=0.25, participation=0.5,
                                 benchmark_mode="legacy_front_holding_return", include_margin_amount=False,
-                                include_account_policy_observations=False, account_policy_lookback=32):
+                                include_account_policy_observations=False, account_policy_lookback=32,
+                                include_beta_observation=False):
     """Attach executor-only marks and prior-observable margin model context."""
     if benchmark_mode not in {"legacy_front_holding_return", "tx_front_rolling_1x_gross"}:
         raise ValueError(f"unsupported futures margin benchmark mode: {benchmark_mode}")
     daily = panel.stock_context_futures_portfolio_daily
     if daily is None or daily.integer_execution is None or daily.intraday_execution is not None:
         raise ValueError("margin requires the canonical carrying whole-contract sidecar")
+    if include_beta_observation and (not include_account_policy_observations
+            or benchmark_mode != 'tx_front_rolling_1x_gross'
+            or daily.benchmark_observed_returns_mask is None):
+        raise ValueError('beta observations require causal account observations and observed TX source returns')
     rules, rule_manifest = validate_margin_rule_source(path, daily.source_path)
     corporate = rule_manifest["schema_version"] >= MARGIN_CORPORATE_CONTRACT_VERSION
     multiple_limits = rule_manifest["schema_version"] >= MARGIN_MULTI_LIMIT_CONTRACT_VERSION
@@ -603,6 +641,15 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         prior_observed[di[has_next] + 1, si[has_next]] = frame["_risk_observed"].to_numpy()[has_next]
         risk = prior_observed_return_risk(prior_returns, prior_observed, lookback=account_policy_lookback)
         model_features = np.concatenate((model_features, risk), axis=-1)
+        if include_beta_observation:
+            # Shift benchmark and its evidence once, matching prior_returns.
+            benchmark = np.zeros(len(panel.dates), dtype=np.float32)
+            benchmark_mask = np.zeros(len(panel.dates), dtype=bool)
+            benchmark[1:] = daily.benchmark_log_returns[:-1]
+            benchmark_mask[1:] = daily.benchmark_observed_returns_mask[:-1]
+            beta = prior_observed_tx_beta(prior_returns, prior_observed, benchmark, benchmark_mask,
+                                         lookback=account_policy_lookback)
+            model_features = np.concatenate((model_features, beta[..., None]), axis=-1)
     return replace(panel, stock_context_futures_portfolio_daily=replace(
         daily, integer_execution=ex,
         candidate_features=model_features,

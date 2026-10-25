@@ -83,6 +83,49 @@ def test_bulk_all_months_double_sided_quantity_exact_closing_print_and_real_refe
     assert late['reference_available_by'][0].minute==46
 
 
+def test_expanded_bulk_axis_preserves_weeklies_mixed_grids_and_provenance():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
+    products = ['DDF', 'NYF', 'TF', 'TX', 'MTX']
+    assets = ['stock_future', 'etf_future', 'index_future', 'index_future', 'index_future']
+    contracts = ['202004'] * 4 + ['202004W1']
+    quotes = [10.05, 10.03, 1200.2, 9001., 9002.]
+    expected = pl.DataFrame(dict(date=[DAY] * 5, product=products, asset_class=assets,
+        contract=contracts, physical_contract=[p + ':' + c for p,c in zip(products,contracts)],
+        high=quotes, low=quotes, close=quotes, outright_volume=[3] * 5, block_volume=[0] * 5))
+    raw = pl.DataFrame(dict(date=[str(DAY) + ' 08:46:01'] * 5,
+        futures_id=products, contract_date=contracts, price=pl.Series(quotes, dtype=pl.Float32), volume=[6] * 5))
+    with pytest.raises(ValueError, match='asset scope'):
+        normalize_bulk_stock_ticks(raw, day=DAY, expected=expected, source_sha256='a'*64)
+    bars, coverage, events = normalize_bulk_stock_ticks(raw, day=DAY, expected=expected,
+        source_sha256='a'*64, asset_scope='twd_equity')
+    assert coverage['verified'].all()
+    assert bars.height == 5 and bars['volume'].to_list() == [3.] * 5
+    assert set(bars['physical_contract']) == set(expected['physical_contract'])
+    assert events['source_sha256'].unique().to_list() == ['a'*64]
+    assert raw['price'].dtype == pl.Float32  # retained source is never rewritten
+    wrong = expected.with_columns(pl.when(pl.col('product') == 'TX').then(pl.lit('commodity_future'))
+                                 .otherwise(pl.col('asset_class')).alias('asset_class'))
+    with pytest.raises(ValueError, match='asset scope'):
+        normalize_bulk_stock_ticks(raw, day=DAY, expected=wrong, source_sha256='a'*64, asset_scope='twd_equity')
+
+
+def test_expanded_bulk_respects_product_session_and_verified_history_window():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks, decode_bulk_stock_prices
+    raw, expected = bulk_fixture()
+    # Foreign ETF prints after the stock close are still inside their dated day session.
+    expected = expected.head(1).with_columns(pl.lit('OAF').alias('product'),
+        pl.lit('etf_future').alias('asset_class'), pl.lit('OAF:202004').alias('physical_contract'))
+    raw = raw.head(1).with_columns(pl.lit(str(DAY)+' 16:00:00').alias('date'),
+        pl.lit('OAF').alias('futures_id'), pl.lit(12).alias('volume'), pl.lit(10.05).cast(pl.Float32).alias('price'))
+    expected = expected.with_columns(pl.lit(10.05).alias('high'))
+    bars, coverage, _ = normalize_bulk_stock_ticks(raw,day=DAY,expected=expected,
+        source_sha256='b'*64,asset_scope='twd_equity')
+    assert coverage['verified'].all() and bars['minute'].item() == 961
+    with pytest.raises(ValueError,match='verified historical window'):
+        decode_bulk_stock_prices(raw['price'].to_numpy(),day=date(2019,12,31),
+            products=raw['futures_id'].to_numpy(),asset_classes='etf_future')
+
+
 def test_bulk_full_day_certificate_rejects_quantity_deficit_instead_of_inventing_absence():
     from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
     raw, expected=bulk_fixture()

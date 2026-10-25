@@ -99,21 +99,34 @@ def inventory_version_layout(
         descriptions = document["datasets"]
     selected: dict[str, list[dict[str, Any]]] = {name: [] for name in configured}
     heads: dict[str, dict[str, Any]] = {}
+    private_root = None
+    if sync_root is not None:
+        # Observation must never create a private store or grant export rights.
+        candidate = sync_root / policy['private_history']['relative_root']
+        if candidate.exists() or candidate.is_symlink():
+            from stockagent.data_sync.dataset_migration import private_history_root
+            try:
+                private_root = private_history_root(sync_root, policy, initialize=False)
+            except (SnapshotError, OSError, ValueError) as error:
+                errors.append(f'private history unreadable: {type(error).__name__}')
     for entry in catalog:
         path = Path(str(entry["source"]))
         path = path if path.is_absolute() else repo_root / path
         for root in dataset_roots(repo_root, path, policy):
             selected[root].append(entry)
-        if sync_root is None or not (sync_root / "heads" / entry["dataset"]).is_dir():
+        head_root = sync_root if entry.get('publish') else private_root
+        scope = 'shared' if entry.get('publish') else 'host_private'
+        if head_root is None or not (head_root / "heads" / entry["dataset"]).is_dir():
             continue
         try:
-            resolved = resolve_latest_packed(sync_root, str(entry["dataset"]), require_objects=False)
+            resolved = resolve_latest_packed(head_root, str(entry["dataset"]), require_objects=False)
             heads[entry["dataset"]] = {"snapshot_id": resolved.manifest["snapshot_id"],
                 "manifest_sha256": resolved.manifest_sha256, "schema_version": resolved.manifest["schema_version"],
                 "file_chunk_bytes": resolved.manifest["archive"].get("file_chunk_bytes"),
-                "objects_verified": False}
+                "storage_scope": scope, "objects_verified": False}
         except (SnapshotError, OSError, ValueError) as error:
-            heads[entry["dataset"]] = {"state": "head_unreadable", "error_type": type(error).__name__}
+            heads[entry["dataset"]] = {"state": "head_unreadable", "storage_scope": scope,
+                                       "error_type": type(error).__name__}
     rows = []
     for name, spec in policy["roots"].items():
         bindings = selected[name]
@@ -143,7 +156,11 @@ def inventory_version_layout(
                 "payload_reverified_this_inventory": False}
         current_heads = [heads[item["dataset"]] for item in bindings if item["dataset"] in heads]
         shared_v2 = any(item.get("schema_version") == CHUNKED_SNAPSHOT_SCHEMA_VERSION
+                        and item.get('storage_scope') == 'shared'
                         for item in current_heads)
+        private_v2 = any(item.get("schema_version") == CHUNKED_SNAPSHOT_SCHEMA_VERSION
+                         and item.get('storage_scope') == 'host_private'
+                         for item in current_heads)
         enrolled = [item["dataset"] for item in bindings
                     if item.get("reader_contract") == "packed-v2-chunks"
                     and item.get("file_chunk_bytes") == policy["file_chunk_bytes"]]
@@ -156,15 +173,19 @@ def inventory_version_layout(
                 "publish": bool(item.get("publish")), "excluded_subtrees": item.get("excluded_subtrees", []),
                 "head": heads.get(item["dataset"])} for item in bindings],
             "shared_v2_head_observed": shared_v2,
+            "private_v2_head_observed": private_v2,
+            "current_v2_head_observed": shared_v2 or private_v2,
             "configured_v2_publication_branches": enrolled,
             "native_workspace_migrated": native_acceptance is not None and native_acceptance["state"] == "verified_receipt",
             **({"native_acceptance": native_acceptance} if native_acceptance is not None else {}),
             "rollout_state": ("local_news_v2_verified_receipt" if native_acceptance and native_acceptance["state"] == "verified_receipt"
                               else "local_news_v2_acceptance_pending" if native_acceptance
                               else "shared_v2_head_observed" if shared_v2
+                              else "host_private_v2_head_observed" if private_v2
                               else "policy_enrolled_head_pending" if enrolled
                               else "reader_first_rollout_required"),
             "coverage_claim": "layout_inventory_only_not_download_or_recovery_acceptance"})
-    return {"contract_version": 2, "roots": rows, "root_count": len(rows), "errors": errors,
+    return {"contract_version": 2, "head_observation_contract": "shared_and_host_private_heads_v1",
+            "roots": rows, "root_count": len(rows), "errors": errors,
             "network_calls": 0, "source_payload_reads": 0, "source_payload_writes": 0,
             "legacy_deletions": 0, "state": "accepted" if not errors else "failed"}

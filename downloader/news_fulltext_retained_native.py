@@ -30,15 +30,21 @@ RESIDENT_NATIVE_REPLAY_VERSION = 2
 _RESIDENT_KIND = 'reviewed_resident_native_materialization_v2'
 FINITE_NATIVE_REPLAY_VERSION = 3
 _FINITE_KIND = 'reviewed_finite_native_materialization_v3'
+REGISTRATION_NATIVE_REPLAY_VERSION = 4
+_REGISTRATION_KIND = 'reviewed_native_source_registration_v4'
 _MAX_RAW = 16 << 20
 
 
 def _approval_kind(version):
     return {RETAINED_NATIVE_REPLAY_VERSION: _KIND, RESIDENT_NATIVE_REPLAY_VERSION: _RESIDENT_KIND,
-        FINITE_NATIVE_REPLAY_VERSION: _FINITE_KIND}.get(version)
+        FINITE_NATIVE_REPLAY_VERSION: _FINITE_KIND,
+        REGISTRATION_NATIVE_REPLAY_VERSION: _REGISTRATION_KIND}.get(version)
 
 
 def _scope_reviewed(scope, version):
+    if version == REGISTRATION_NATIVE_REPLAY_VERSION:
+        return (scope.get('diagnostic_scope_rewording_reviewed') is True
+            and scope.get('diagnostic_source_registration_reviewed') is True)
     if version == FINITE_NATIVE_REPLAY_VERSION:
         return (scope.get('diagnostic_scope_rewording_reviewed') is True
             and scope.get('original_author_scope_evidence_addition_reviewed') is True)
@@ -50,20 +56,79 @@ def _article_digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def _resident_transition(source):
+    """Exact, reviewed transitions for existing originals; never a host grant."""
+    from downloader.news_fulltext_taiwannews import (
+        TAIWANNEWS_INLINE_ORIGINAL_QUESTION, TAIWANNEWS_V2_LAYOUT, TAIWANNEWS_V3_HTTP_BINDING,
+        private_taiwannews_inline_original_permit, taiwannews_resident_source,
+    )
+    if taiwannews_resident_source(source):
+        return (17, TAIWANNEWS_V2_LAYOUT, TAIWANNEWS_V3_HTTP_BINDING[0],
+            TAIWANNEWS_INLINE_ORIGINAL_QUESTION, private_taiwannews_inline_original_permit,
+            'article_title_not_verified', 'source_declared_corporate_author_not_verified_person')
+    from downloader.news_fulltext_setn import INEWS_PROVIDER, INEWS_V8_HTTP_BINDING, INEWS_V9_HTTP_BINDING
+    from downloader.news_fulltext_candidate_originals import (
+        INEWS_SHORT_CREDIT_ORIGINAL_QUESTION, private_inews_short_credit_original_permit,
+    )
+    if (source and source.allowed and source.provider == INEWS_PROVIDER
+            and source.embedded_article_layout == 'setn_inews_native_article_v9'
+            and source.domains == ('inews.setn.com',) and source.known_url_only
+            and source.acquisition_mode == 'continuous'
+            and (source.data_fingerprint, source.authorization_fingerprint) == tuple(INEWS_V9_HTTP_BINDING[:2])
+            and source.authorization_fingerprint == INEWS_V8_HTTP_BINDING[1]):
+        return (39, 'setn_inews_native_article_v8', INEWS_V8_HTTP_BINDING[0],
+            INEWS_SHORT_CREDIT_ORIGINAL_QUESTION, private_inews_short_credit_original_permit,
+            'body_not_found', None)
+    from downloader.news_fulltext_gvm import (
+        GVM_V8_ORIGINAL_BINDING, GVM_WRITTEN_FORMAT_LAYOUT, gvm_static_editor_source,
+    )
+    from downloader.news_fulltext_candidate_originals import GVM_ORIGINAL_QUESTION, private_gvm_original_permit
+    if (source and gvm_static_editor_source(source)
+            and source.parser_repair_prior_capture_fingerprint == GVM_V8_ORIGINAL_BINDING[0]
+            and source.authorization_fingerprint == GVM_V8_ORIGINAL_BINDING[1]):
+        return (40, GVM_WRITTEN_FORMAT_LAYOUT, GVM_V8_ORIGINAL_BINDING[0],
+            GVM_ORIGINAL_QUESTION, private_gvm_original_permit, 'article_identity_not_verified', None)
+    from downloader.news_fulltext_gvm import GVM_HEADER_QUESTION, GVM_STATIC_EDITOR_LAYOUT, GVM_V9_ORIGINAL_BINDING, gvm_presentation_source
+    from downloader.news_fulltext_candidate_originals import private_gvm_header_original_permit
+    if (source and gvm_presentation_source(source)
+            and source.parser_repair_prior_capture_fingerprint == GVM_V9_ORIGINAL_BINDING[0]
+            and source.authorization_fingerprint == GVM_V9_ORIGINAL_BINDING[1]):
+        return (41, GVM_STATIC_EDITOR_LAYOUT, GVM_V9_ORIGINAL_BINDING[0],
+            GVM_HEADER_QUESTION, private_gvm_header_original_permit, 'article_identity_not_verified', None)
+    from downloader.news_fulltext_gvm import (
+        GVM_MULTIPLE_CREDIT_QUESTION, GVM_PRESENTATION_LAYOUT, GVM_V10_ORIGINAL_BINDING, gvm_ordered_credit_source,
+    )
+    from downloader.news_fulltext_candidate_originals import private_gvm_multiple_credit_original_permit
+    if (source and gvm_ordered_credit_source(source)
+            and source.parser_repair_prior_capture_fingerprint == GVM_V10_ORIGINAL_BINDING[0]
+            and source.authorization_fingerprint == GVM_V10_ORIGINAL_BINDING[1]):
+        return (42, GVM_PRESENTATION_LAYOUT, GVM_V10_ORIGINAL_BINDING[0],
+            GVM_MULTIPLE_CREDIT_QUESTION, private_gvm_multiple_credit_original_permit, 'article_identity_not_verified', None)
+    from downloader.news_fulltext_contentplatform import (
+        CONTENTPLATFORM_ORIGINAL_LAYOUT, CONTENTPLATFORM_ORIGINAL_QUESTION,
+        CONTENTPLATFORM_V2_ORIGINAL_BINDING, contentplatform_original_source,
+    )
+    from downloader.news_fulltext_candidate_originals import private_contentplatform_original_permit
+    if (contentplatform_original_source(source)
+            and source.embedded_article_layout == 'contentplatform_native_article_v3'
+            and source.parser_repair_prior_capture_fingerprint == CONTENTPLATFORM_V2_ORIGINAL_BINDING[0]
+            and source.authorization_fingerprint == CONTENTPLATFORM_V2_ORIGINAL_BINDING[1]):
+        return (43, CONTENTPLATFORM_ORIGINAL_LAYOUT, CONTENTPLATFORM_V2_ORIGINAL_BINDING[0],
+            CONTENTPLATFORM_ORIGINAL_QUESTION, private_contentplatform_original_permit, 'article_identity_not_verified', None)
+    raise ValueError('reviewed resident current source invalid')
+
+
 def _resident_original(queue, source, item, probe, approved):
-    """Read the canonical evidence17 original; never synthesize HTTP or auth.
+    """Read an exact reviewed resident original; never synthesize HTTP or auth.
 
     This closed source transition does not generalize old diagnostic policies
     into new permissions. The writer's observation clock is retained as such;
     the original did not store a receive clock or authorization JSON.
     """
     from downloader.news_fulltext_queue import source_path
-    from downloader.news_fulltext_taiwannews import (
-        TAIWANNEWS_INLINE_ORIGINAL_QUESTION, TAIWANNEWS_V2_LAYOUT, TAIWANNEWS_V3_HTTP_BINDING,
-        private_taiwannews_inline_original_permit, taiwannews_resident_source,
-    )
+    evidence, old_layout, old_fingerprint, question, permit, _, _ = _resident_transition(source)
     identifier = item.get('request_id')
-    if (not taiwannews_resident_source(source) or not isinstance(identifier, str)
+    if (not isinstance(identifier, str)
             or not re.fullmatch('[0-9a-f]{64}', identifier)):
         raise ValueError('reviewed resident source transition invalid')
     relative = 'reviewed_repairs/candidate_diagnostics/originals/'+identifier+'.parquet'
@@ -81,10 +146,10 @@ def _resident_original(queue, source, item, probe, approved):
             or hashlib.sha256(job['request_json'].encode()).hexdigest() != identifier):
         raise ValueError('reviewed resident completed candidate changed')
     request, result = json.loads(job['request_json']), json.loads(job['result_json'])
-    if (request.get('evidence_contract_version') != 17 or request.get('candidate_layout') != TAIWANNEWS_V2_LAYOUT
-            or request.get('candidate_fingerprint') != TAIWANNEWS_V3_HTTP_BINDING[0]
+    if (request.get('evidence_contract_version') != evidence or request.get('candidate_layout') != old_layout
+            or request.get('candidate_fingerprint') != old_fingerprint
             or request.get('target', {}).get('url') != item['url']
-            or request.get('source', {}).get('data_fingerprint') != TAIWANNEWS_V3_HTTP_BINDING[0]
+            or request.get('source', {}).get('data_fingerprint') != old_fingerprint
             or request.get('source', {}).get('authorization_fingerprint') != source.authorization_fingerprint
             or result.get('private_original') != reference or result.get('accepted_as_article') is not False
             or result.get('raw_or_names_or_body_retained') is not True):
@@ -99,7 +164,7 @@ def _resident_original(queue, source, item, probe, approved):
     receipt, receipt_bytes = _json(source_path(queue.root, receipt_relative), 65536)
     if (hashlib.sha256(receipt_bytes).hexdigest() != item.get('diagnostic_receipt_sha256')
             or receipt.get('contract_version') != 1 or receipt.get('request_id') != identifier
-            or receipt.get('question') != TAIWANNEWS_INLINE_ORIGINAL_QUESTION or receipt.get('original') != reference):
+            or receipt.get('question') != question or receipt.get('original') != reference):
         raise ValueError('reviewed resident diagnostic receipt invalid')
     parquet = pq.ParquetFile(pa.BufferReader(payload))
     if (parquet.metadata.num_rows != 1 or parquet.metadata.num_row_groups != 1
@@ -110,10 +175,13 @@ def _resident_original(queue, source, item, probe, approved):
     if (not isinstance(body, bytes) or not 0 < len(body) <= 2 << 20 or b'\x00' in body
             or len(body) != item.get('response_bytes') or raw.get('request_id') != identifier
             or raw.get('provider') != source.provider or raw.get('request_url') != item['url']
-            or raw.get('final_url') != probe.get('final_url') or raw.get('source_document_url') != raw.get('final_url')
+            or raw.get('final_url') != probe.get('final_url')
+            or evidence == 17 and raw.get('source_document_url') != raw.get('final_url')
+            or evidence in {39, 40, 41, 42, 43} and ('source_document_url' in raw or 'transport_redirects_json' in raw
+                or raw.get('final_url') != item['url'])
             or raw.get('response_sha256') != item.get('response_sha256')
             or hashlib.sha256(body).hexdigest() != item.get('response_sha256')
-            or raw.get('data_fingerprint') != TAIWANNEWS_V3_HTTP_BINDING[0]
+            or raw.get('data_fingerprint') != old_fingerprint
             or raw.get('authorization_fingerprint') != source.authorization_fingerprint
             or any(raw.get(k) is not v or receipt.get(k) is not v for k, v in {
                 'diagnostic_only': True, 'accepted_as_article': False, 'publish': False,
@@ -124,7 +192,10 @@ def _resident_original(queue, source, item, probe, approved):
     if raw['observed_at_utc'] != item.get('captured_at_utc') or observed > approved:
         raise ValueError('reviewed resident writer observation clock invalid')
     headers = json.loads(raw['headers_json'])
-    hops = json.loads(raw['transport_redirects_json'])
+    # Evidence39/40/41/42/43 did not store hop arrays. Their checked permits reject
+    # every redirect and require the literal request/final URL pair.
+    # Keep that provenance distinct from evidence17's recorded hop chain.
+    hops = json.loads(raw['transport_redirects_json']) if evidence == 17 else []
     if (not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items())
             or not isinstance(hops, list) or len(hops) > 1):
         raise ValueError('reviewed resident transport evidence invalid')
@@ -139,9 +210,8 @@ def _resident_original(queue, source, item, probe, approved):
                 or _clock(hop.observed_at_utc) > observed):
             raise ValueError('reviewed resident redirect evidence invalid')
     response = Response(raw['final_url'], 200, {k.lower(): v for k, v in headers.items()}, body, redirects)
-    captured_source = replace(source, embedded_article_layout=TAIWANNEWS_V2_LAYOUT,
-        data_fingerprint=TAIWANNEWS_V3_HTTP_BINDING[0])
-    expected = private_taiwannews_inline_original_permit(response, captured_source, item['url'])
+    captured_source = replace(source, embedded_article_layout=old_layout, data_fingerprint=old_fingerprint)
+    expected = permit(response, captured_source, item['url'])
     if receipt.get('permit') != expected:
         raise ValueError('reviewed resident original source permit invalid')
     return raw, response, payload, receipt_bytes, parquet.metadata.row_group(0).total_byte_size
@@ -154,6 +224,16 @@ def _reviewed_source_scope(source, version=RETAINED_NATIVE_REPLAY_VERSION):
     keeps its exact current native container, byline and private-reading scope;
     explicit URL/frontier, immutable approval and source checks still apply.
     """
+    if version == REGISTRATION_NATIVE_REPLAY_VERSION:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_BODY, CONTENTPLATFORM_TITLE
+        return bool(source and source.allowed and source.provider == 'contentplatform'
+            and source.domains == ('www.contentplatform.info',) and source.known_url_only
+            and source.acquisition_mode == 'continuous'
+            and source.embedded_article_layout == 'contentplatform_native_article_v1'
+            and source.selectors == (CONTENTPLATFORM_BODY,) and source.title_selector == CONTENTPLATFORM_TITLE
+            and source.require_configured_container and source.require_author_attribution
+            and source.authorization.get('kind') == 'personal_research'
+            and source.authorization.get('evidence_url') == 'https://www.contentplatform.info/copyright/')
     if version == FINITE_NATIVE_REPLAY_VERSION:
         # These are individually reviewed native contracts, not a generic
         # permission for every finite provider or related publisher subsite.
@@ -177,8 +257,20 @@ def _reviewed_source_scope(source, version=RETAINED_NATIVE_REPLAY_VERSION):
         and source.embedded_article_layout == 'cmnews_visible_article_v1'
         and source.selectors == ('.articleContent__textContent',)
         and source.require_configured_container and source.require_author_attribution)
+    moneyweekly = bool(source and source.provider == 'moneyweekly'
+        and source.domains == ('moneyweekly.com.tw',) and source.known_url_only
+        and not source.embedded_article_layout
+        and source.selectors == ('.div_Article_Info[itemprop=articleBody]',)
+        and source.title_selector == 'h1'
+        and source.author_selectors == ('h1 + div > div:nth-child(2)',)
+        and source.publication_selectors == ('h1 + div > div:first-child',)
+        and source.require_configured_container and source.require_author_attribution
+        and source.permitted_author_names
+        and source.authorization.get('evidence_url') ==
+            'https://www.moneyweekly.com.tw/ArticleData/Info/%E7%BD%AE%E5%BA%95%E6%96%87%E7%AB%A0/7')
     return bool(source and source.allowed and (source.known_url_only or cmnews)
-        and source.acquisition_mode == 'continuous' and source.embedded_article_layout
+        and source.acquisition_mode == 'continuous' and (source.embedded_article_layout or moneyweekly)
+        and (source.provider != 'moneyweekly' or moneyweekly)
         and source.authorization.get('kind') == 'personal_research')
 
 
@@ -214,6 +306,15 @@ def _original_authorization_matches(original, source, version):
         ignored.add(key)
     return ({k: v for k, v in original.items() if k not in ignored}
         == {k: v for k, v in source.authorization.items() if k not in ignored})
+
+
+def _registered_original(source, url, response_sha256, original_provider, original_authorization):
+    """No general cross-provider import: only the exact retained registration."""
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_RETAINED_REGISTRATIONS
+    identity = (url, response_sha256, original_provider, _article_digest(original_authorization))
+    if (not _reviewed_source_scope(source, REGISTRATION_NATIVE_REPLAY_VERSION)
+            or identity not in CONTENTPLATFORM_RETAINED_REGISTRATIONS):
+        raise ValueError('reviewed native original registration invalid')
 
 
 def _json(path, limit):
@@ -334,10 +435,11 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             parse_started = time.monotonic()
             with queue.metrics.measure('article_extraction', provider):
                 article = extract_article_response(response, source)
+            expected_attribution = _resident_transition(source)[-1]
             if (sorted(article) != item.get('article_keys') or _article_digest(article) != item.get('article_fields_sha256')
                     or any(article.get(key) != item.get(key) for key in (
                         'body_sha256', 'authors_json', 'published_at_raw', 'modified_at_raw'))
-                    or article.get('attribution_status') != 'source_declared_corporate_author_not_verified_person'):
+                    or expected_attribution is not None and article.get('attribution_status') != expected_attribution):
                 raise ValueError('reviewed resident approved extraction changed')
             head = queue.db.execute('SELECT * FROM articles WHERE url=? AND provider=?', (url, provider)).fetchone()
             if head is None:
@@ -354,6 +456,9 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
                 original_diagnostic_authorization_fingerprint=raw['authorization_fingerprint'],
                 original_diagnostic_authorization_basis='captured_fingerprint; original_authorization_JSON_not_stored',
                 metadata_title_raw=head.get('title'), historical_point_in_time=False)
+            if _resident_transition(source)[0] in {39, 40, 41, 42, 43}:
+                record.update(original_transport_redirects_stored=False,
+                    original_transport_redirect_basis='original_private_permit_requires_no_redirect_and_literal_request_final_URL')
             _resident_entry(source, manifest, record)
             # The original already belongs to this canonical root. The shared
             # durable acceptance writer must reference it, not create another
@@ -366,10 +471,11 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
         path = (manifest_path.parent/item['diagnostic_path']).resolve()
         if not path.is_relative_to(diagnostic_root.resolve()):
             raise ValueError('reviewed native diagnostic outside approved scope')
-        if (version == FINITE_NATIVE_REPLAY_VERSION or explicit_directory) and any(
+        if (version in {FINITE_NATIVE_REPLAY_VERSION, REGISTRATION_NATIVE_REPLAY_VERSION} or explicit_directory) and any(
                 target.stat().st_mode & 0o077 for target in (diagnostic_root, path, path.with_suffix('.receipt.json'))):
             raise ValueError('reviewed native original is not private')
-        if (probe.get('provider') != provider or probe.get('status') != 200
+        diagnostic_provider = item.get('original_provider') if version == REGISTRATION_NATIVE_REPLAY_VERSION else provider
+        if (not isinstance(diagnostic_provider, str) or probe.get('provider') != diagnostic_provider or probe.get('status') != 200
                 or probe.get('response_sha256') != item.get('response_sha256')
                 or Path(probe.get('private_diagnostic_path', '')).resolve() != path):
             raise ValueError('reviewed native original status or identity invalid')
@@ -404,7 +510,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
         total_bytes += len(body)
         if total_bytes > _MAX_RAW:
             raise ValueError('reviewed native aggregate response bound exceeded')
-        if (raw.get('provider') != provider or raw.get('request_url') != url or raw.get('final_url') != url
+        if (raw.get('provider') != diagnostic_provider or raw.get('request_url') != url or raw.get('final_url') != url
                 or raw.get('response_sha256') != item['response_sha256']
                 or hashlib.sha256(body).hexdigest() != item['response_sha256']
                 or raw.get('diagnostic_only') is not True or raw.get('accepted_as_article') is not False
@@ -419,6 +525,8 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
                 or not isinstance(original_auth, dict) or original_auth != item.get('original_authorization')
                 or not _original_authorization_matches(original_auth, source, version)):
             raise ValueError('reviewed native original authorization or HTTP clock invalid')
+        if version == REGISTRATION_NATIVE_REPLAY_VERSION:
+            _registered_original(source, url, raw['response_sha256'], diagnostic_provider, original_auth)
         response = Response(url, 200, {k.lower(): v for k, v in headers.items()}, body)
         parse_started = time.monotonic()
         with queue.metrics.measure('article_extraction', provider):
@@ -426,6 +534,9 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
         if any(article.get(key) != item.get(key) for key in (
                 'body_sha256', 'authors_json', 'published_at_raw', 'modified_at_raw')):
             raise ValueError('reviewed native approved extraction changed')
+        if version == REGISTRATION_NATIVE_REPLAY_VERSION and (
+                sorted(article) != item.get('article_keys') or _article_digest(article) != item.get('article_fields_sha256')):
+            raise ValueError('reviewed registered original approved extraction changed')
         head = queue.db.execute('SELECT * FROM articles WHERE url=? AND provider=?', (url, provider)).fetchone()
         if head is None:
             raise ValueError('reviewed native original absent from canonical frontier')
@@ -440,6 +551,8 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             replay_source_parquet=private, reviewed_native_replay_contract_version=version,
             original_diagnostic_authorization_json=json.dumps(original_auth, ensure_ascii=False, sort_keys=True),
             metadata_title_raw=head.get('title'), historical_point_in_time=False)
+        if version == REGISTRATION_NATIVE_REPLAY_VERSION:
+            record['original_diagnostic_provider'] = diagnostic_provider
         prepared.append((url, head, record, private, payload, receipt_bytes))
     # Store the explicit approval and originals by content hash. The ordinary
     # body receipt/recovery path references them; no second queue or writer.
@@ -495,9 +608,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
 
 
 def _resident_entry(source, scope, record):
-    from downloader.news_fulltext_taiwannews import taiwannews_resident_source
-    if not taiwannews_resident_source(source):
-        raise ValueError('reviewed resident current source invalid')
+    expected_error = _resident_transition(source)[-2]
     entries = scope.get('entries')
     if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
         raise ValueError('reviewed resident approval entries invalid')
@@ -512,7 +623,7 @@ def _resident_entry(source, scope, record):
             or _article_digest({key: record[key] for key in keys}) != item.get('article_fields_sha256')
             or not isinstance(before, dict) or set(before) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
             or before['url'] != record['requested_url'] or before['provider'] != source.provider
-            or before['state'] != 'article_title_not_verified' or before['error_code'] != 'article_title_not_verified'
+            or before['state'] != expected_error or before['error_code'] != expected_error
             or before['body_sha256'] is not None or before['lease_owner'] is not None or before['lease_until'] is not None
             or record.get('original_diagnostic_authorization_json') is not None
             or record.get('original_diagnostic_authorization_fingerprint') != source.authorization_fingerprint
@@ -582,6 +693,11 @@ def reviewed_native_head_matches(queue, record):
         if record['requested_url'] not in source.finite_article_urls:
             raise ValueError('reviewed finite record outside literal scope')
     entry = [item for item in scope['entries'] if item.get('url') == record['requested_url']]
+    if version == REGISTRATION_NATIVE_REPLAY_VERSION:
+        _registered_original(source, record['requested_url'], record['response_sha256'],
+            record.get('original_diagnostic_provider'), json.loads(record['original_diagnostic_authorization_json']))
+        if len(entry) != 1 or entry[0].get('original_provider') != record.get('original_diagnostic_provider'):
+            raise ValueError('reviewed native registered provider changed')
     if version == RESIDENT_NATIVE_REPLAY_VERSION:
         item = _resident_entry(source, scope, record)
         before = item['expected_missing_head']

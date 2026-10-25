@@ -27,6 +27,7 @@ from stockagent.data.news_source_catalog import adapter_summary
 
 
 ENDPOINT_INVENTORY_CONTRACT_VERSION = 2
+FULL_FRONTIER_SCAN_CONTRACT_VERSION = 1
 
 
 def endpoint_inventory(registry, *, status=None, owner_matches=False):
@@ -124,6 +125,8 @@ def inventory(config_path: Path) -> dict:
         db.execute("BEGIN")
         owner = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()[0]
         result = {"observed_at_utc": utc_now(), "queue_owner_id": owner,
+                  "full_frontier_scan_contract_version": FULL_FRONTIER_SCAN_CONTRACT_VERSION,
+                  "inventory_implementation_sha256": sha256_file(Path(__file__)),
                   "config_sha256": sha256_file(config_path), "providers": {},
                   "metadata_date_basis": "local sorting dates, not verified publisher clocks or historical completeness",
                   "article_grain": "normalized source URL; stock associations and body revisions are separate",
@@ -137,12 +140,15 @@ def inventory(config_path: Path) -> dict:
         controls = (status.get("http_capacity") or {}).get("providers", {}) if result["status_owner_matches"] else {}
         # One full frontier aggregation, not a repeated full scan for each
         # metric. Provider/host groups retain the original inventory grain.
+        # Both full-frontier aggregates must read table fields for every
+        # applicable row. Walking the dispatch index first adds scattered
+        # table lookups; use a sequential table scan for these audits only.
         for row in db.execute("SELECT provider,host,count(*) AS articles,sum(body_sha256 IS NOT NULL) AS stored_bodies,"
                               "min(nullif(metadata_order_day,'')) AS earliest_metadata_day,"
                               "max(nullif(metadata_order_day,'')) AS latest_metadata_day,max(captured_at_utc) AS latest_body_capture_utc,"
                               "sum(state IN ('retry','retry_cooldown') AND body_sha256 IS NOT NULL) AS stored_body_rechecks,"
                               "sum(state IN ('pending','retry','retry_cooldown','inflight') AND body_sha256 IS NULL) AS missing_body_work "
-                              "FROM articles GROUP BY provider,host"):
+                              "FROM articles NOT INDEXED GROUP BY provider,host"):
             item = result["providers"].setdefault(row["provider"], {"hosts": [], "states": {}, "errors": []})
             item["hosts"].append({"host": row["host"], "articles": row["articles"]})
             item["known_urls"] = item.get("known_urls", 0) + row["articles"]
@@ -161,7 +167,7 @@ def inventory(config_path: Path) -> dict:
         for row in db.execute("SELECT provider,state,articles FROM state_metrics WHERE articles>0"):
             result["providers"][row["provider"]]["states"][row["state"]] = row["articles"]
         for row in db.execute("SELECT provider,state,error_code,body_sha256 IS NOT NULL AS has_stored_body,count(*) AS articles "
-                              "FROM articles WHERE error_code IS NOT NULL GROUP BY provider,state,error_code,has_stored_body"):
+                              "FROM articles NOT INDEXED WHERE error_code IS NOT NULL GROUP BY provider,state,error_code,has_stored_body"):
             result["providers"][row["provider"]]["errors"].append(dict(row))
         discoveries = {}
         for row in db.execute("SELECT provider,kind,count(*) AS jobs,sum(error_code IS NOT NULL) AS errors,"

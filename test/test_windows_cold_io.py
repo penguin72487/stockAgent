@@ -138,6 +138,37 @@ def test_enrolled_lake_allows_only_native_hash_on_its_actual_d_volume(monkeypatc
             native._configuration(path,mode='write' if damage=='write' else 'hash',expected_bytes=9*1024**2)
 
 
+@pytest.mark.parametrize('namespace', ['stockagent-completed-benchmark-scratch', 'stockagent-completed-offline-scratch'])
+@pytest.mark.parametrize('damage', ['none', 'overlay', 'wrong-drive', 'write', 'copy', 'hash'])
+def test_completed_encoding_native_access_is_read_only_on_its_actual_d_volume(monkeypatch, namespace, damage):
+    from stockagent.data_sync import cold_primary, packed_backup
+    path = Path('/srv/stockagent-d-volume')/namespace/'fixed/archive/payload/aa/encoding.zst'
+    monkeypatch.setattr(Path, 'resolve', lambda self:self)
+    monkeypatch.setattr(Path, 'is_symlink', lambda self:False)
+    monkeypatch.setattr(Path, 'stat', lambda self:SimpleNamespace(st_dev=9 if self==path and damage=='overlay' else 7))
+    checked=[]
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda root:checked.append(root))
+    monkeypatch.setattr(packed_backup, 'mounted_volume', lambda root:(None, None, 'C:' if damage=='wrong-drive' else 'D:'))
+    mode = damage if damage in {'write', 'copy', 'hash'} else 'read'
+    if damage == 'none':
+        config = native._configuration(path, mode=mode, expected_bytes=9*1024**2)
+        assert config['path'] == str(native.PureWindowsPath('D:/')/namespace/'fixed/archive/payload/aa/encoding.zst')
+        assert config['mode'] == 'read' and config['expected_bytes'] == 9*1024**2
+    else:
+        with pytest.raises(SnapshotError, match='actual D volume and read-only'):
+            native._configuration(path, mode=mode, expected_bytes=9*1024**2)
+    assert checked == [Path('/srv/stockagent-packed')]
+
+
+def test_windows_stage_namespace_guard_also_requires_read_mode():
+    code = native.SCRIPT.read_text()
+    guard = code.split('$stream = $null', 1)[0]
+    assert "$completedStageRead = $config.mode -eq 'read' -and" in guard
+    assert "D:\\stockagent-completed-benchmark-scratch\\" in guard
+    assert "D:\\stockagent-completed-offline-scratch\\" in guard
+    assert '!$completedStageRead' in guard and '$path -ne [string]$config.path' in guard
+
+
 @pytest.mark.parametrize('count',[1,2])
 def test_measured_mid_size_copy_uses_native_batch_or_single_tail_without_changing_bytes(tmp_path,monkeypatch,count):
     from stockagent.data_sync import offhost_backup

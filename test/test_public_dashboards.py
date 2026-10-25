@@ -120,6 +120,10 @@ def test_tw_status_keeps_opening_timing_history_without_repeating_mode_receipts(
         "production_order_possible": False,
         "opening_signal_latency": {
             "modes": [{"market": "today", "ready_from_0900_ms": 800}],
+            "failure_count": 2,
+            "failures": [{"reason_code": "old_attempt"}, {"reason_code": "source_pending"}],
+            "latest_failures": [{"market": "today", "reason_code": "source_pending",
+                                 "opening_input_coverage": {"active": 2309, "opens": 434}}],
             "trend": [
                 {
                     "session_date": "2026-09-22",
@@ -133,6 +137,10 @@ def test_tw_status_keeps_opening_timing_history_without_repeating_mode_receipts(
     }
     public = sanitize_tw_status(source)["opening_signal_latency"]
     assert public["modes"][0]["market"] == "today"
+    assert "failures" not in public
+    assert public["failure_count"] == 2
+    assert public["latest_failures"] == source["opening_signal_latency"]["latest_failures"]
+    assert len(source["opening_signal_latency"]["failures"]) == 2
     assert public["trend"] == [
         {"session_date": "2026-09-22", "final_ready_ms": 800, "failure_count": 1}
     ]
@@ -777,6 +785,7 @@ def test_both_public_signal_routes_forward_zero_target_display_filter(monkeypatc
     handler.server = SimpleNamespace(
         repo_root=Path("/test"), content_token=lambda *args: "revision",
         cached_local_json=lambda **kwargs: kwargs["builder"](),
+        cached_paper_json=lambda _topic, **kwargs: kwargs["builder"](),
         public_quote_source=None, is_owner=False,
     )
     for value in ("1", "0"):
@@ -1143,7 +1152,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f"dashboard-core.css?v={core_version}" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        script_version = 16 if relative == "tw_day_trade_dashboard/index.html" else 15
+        script_version = 17 if relative == "tw_day_trade_dashboard/index.html" else 15
         assert f'dashboard-core.js?v={script_version}" defer' in html
         assert html.index(f"dashboard-core.js?v={script_version}") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
@@ -1904,6 +1913,142 @@ def test_data_monitor_provider_page_and_filtered_api(tmp_path: Path) -> None:
         server.server_close()
 
 
+def test_tick_catalog_route_projects_snapshot_without_database_or_api(monkeypatch, tmp_path):
+    from stockagent.live import tick_inventory
+
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        row = tick_inventory._row("sample", "期貨", "FinMind", "taiwan_derivatives",
+                                  count=12, days=2, first="2026-10-21", last="2026-10-22")
+        payload = server.cached_local_json(cache_key="tick-fixture", ttl_seconds=60,
+            cache_control="no-store", builder=lambda: {"tick_inventory": {
+                "version": 1, "revision": "sample-revision", "groups": [row], "datasets": [row],
+                "providers": ["FinMind"], "observed_at_utc": "2026-10-25T03:00:00Z"}})
+        server.data_monitor_status = lambda: payload
+        def forbidden(*args, **kwargs):
+            raise AssertionError("HTTP inventory reads cannot query source databases")
+        monkeypatch.setattr(tick_inventory, "_database", forbidden)
+        result = json.loads(server.data_monitor_ticks(provider="FinMind", kind="trade").body)
+        assert result["rows"][0]["count"] == 12 and result["rows"][0]["days"] == 2
+        assert result["rows"][0]["latest_date"] == "2026-10-22"
+        assert "last" not in result["rows"][0]
+        assert result["read_only"] and not result["production_control_possible"]
+        assert result["revision"] == "sample-revision"
+        handler = SimpleNamespace(server=server)
+        for asset in ("ticks.js", "ticks.css"):
+            assert PublicDashboardHandler._static_response(handler, "/data-monitor/" + asset) is not None
+        parsed = PublicDashboardHandler._tick_query("provider=FinMind&market=taiwan_derivatives&kind=trade&detail=1")
+        assert parsed == {"provider": "FinMind", "market": "taiwan_derivatives", "kind": "trade",
+                          "search": "", "detail": True, "offset": 0, "limit": 30}
+        handler._tick_query = PublicDashboardHandler._tick_query
+        response = PublicDashboardHandler._api_response(handler, "/data-monitor/api/ticks", "provider=FinMind")
+        assert json.loads(response.body)["rows"][0]["id"] == "sample"
+    finally:
+        server.server_close()
+
+
+@pytest.mark.parametrize("query", ["limit=101", "offset=-1", "provider=a&provider=b", "kind=ticks",
+                                  "market=unknown", "detail=true", "q=%00", "q=" + "x" * 121,
+                                  "provider=", "file=/secret", "offset=nan"])
+def test_tick_catalog_query_rejects_invalid_or_unbounded_requests(query):
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._tick_query(query)
+
+
+def test_tick_summary_omits_contract_list_and_preserves_days_in_provider_projection():
+    from stockagent.live.data_monitor_dashboard import project_data_monitor_summary
+    from stockagent.live.data_monitor_providers import project_provider_detail
+    snapshot = {"tick_inventory": {"version": 1, "groups": [{"id": "g"}],
+                                    "datasets": [{"id": "private-heavy-list"}]},
+                "sources": [{"id": "source", "provider": "FinMind", "record_stats": {
+                    "count": 9, "days": 2, "first": "2026-10-21", "last": "2026-10-22",
+                    "date_basis": "event dates", "private_path": "/secret"}}]}
+    result = project_data_monitor_summary(snapshot)
+    assert "datasets" not in result["tick_inventory"] and "sources" not in result
+    provider = project_provider_detail(snapshot, "FinMind")
+    assert provider["sources"][0]["record_stats"]["days"] == 2
+    assert "private_path" not in str(provider)
+
+
+def test_tick_browser_filters_paging_provider_scope_and_mobile_layout(protocol_server):
+    from playwright.sync_api import sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+    from stockagent.live.tick_inventory import _row, tick_page
+    from urllib.parse import parse_qs, urlsplit
+
+    groups = [_row("finlab:tw_tick", "台股逐筆", "FinLab", "taiwan_equity", count=9, days=2,
+                   first="2026-05-14", last="2026-10-22", statistics_state="receipt_index")]
+    groups += [_row("finmind:" + name, name, "FinMind", market, count=index + 10, days=3)
+               for index, (name, market) in enumerate([
+                   ("Stock", "taiwan_equity"), ("Futures", "taiwan_derivatives"),
+                   ("Options", "taiwan_derivatives"), ("Spread", "taiwan_derivatives")])]
+    groups += [_row("continuous", "連續期貨", "永豐 Shioaji", "taiwan_derivatives", count=99),
+               _row("crypto", "尚未啟用逐筆", "Binance", "crypto", statistics_state="not_enabled")]
+    datasets = [row for row in groups if row["id"] != "continuous"] + [
+        _row(f"contract:{i:02}", f"合約 {i:02}", "永豐 Shioaji", "taiwan_derivatives", count=i + 1)
+        for i in range(40)]
+    inventory = {"version": 1, "revision": "first", "observed_at_utc": "2026-10-25T03:00:00Z",
+                 "groups": groups, "datasets": datasets, "providers": ["FinLab", "FinMind", "永豐 Shioaji", "Binance"],
+                 "dataset_count": len(datasets), "group_count": len(groups)}
+    observed_requests = []
+    def respond(route):
+        query = parse_qs(urlsplit(route.request.url).query)
+        value = lambda key, default: query.get(key, [default])[0]
+        payload = tick_page(inventory, provider=value("provider", "all"), market=value("market", "all"),
+            kind=value("kind", "all"), search=value("q", ""), detail=value("detail", "0") == "1",
+            offset=int(value("offset", "0")), limit=int(value("limit", "30")))
+        observed_requests.append({"query": query, "revision": payload["revision"], "rows": len(payload["rows"])})
+        route.fulfill(content_type="application/json", body=json.dumps(payload))
+
+    with sync_playwright() as runtime:
+        browser = runtime.chromium.launch(**browser_profile_launch_options("cpu-2d"))
+        try:
+            for width in (1280, 390):
+                page = browser.new_page(viewport={"width": width, "height": 844})
+                errors = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+                page.route("**/data-monitor/api/ticks?*", respond)
+                page.route("**/data-monitor/api/summary", lambda route: route.fulfill(content_type="application/json",
+                    body=json.dumps({"summary": {}, "groups": [], "sources": [], "provider_summaries": []})))
+                page.goto(f"http://127.0.0.1:{protocol_server.port}/data-monitor/#tick-inventory", wait_until="domcontentloaded")
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 7")
+                assert page.locator("#acq-ticks").get_attribute("open") is not None
+                assert "筆數待核實" in page.locator('[data-tick-id="crypto"]').inner_text()
+                page.locator("#tick-provider").select_option("FinMind")
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 4")
+                page.locator("#tick-market").select_option("taiwan_derivatives")
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 3")
+                page.locator("#tick-kind").select_option("book")
+                page.locator("#tick-empty").wait_for(state="visible")
+                assert page.locator("#tick-rows tr").count() == 0
+                page.locator("#tick-kind").select_option("all")
+                page.locator("#tick-search").fill("Options")
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 1")
+                assert "Options" in page.locator("#tick-rows").inner_text()
+                page.locator("#tick-search").fill("")
+                page.locator("#tick-provider").select_option("永豐 Shioaji")
+                page.locator("#tick-detail").select_option("1")
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 30")
+                # A changed producer generation must reset the page, not mix
+                # contracts from two different snapshots during append.
+                inventory["revision"] = f"changed-{width}"
+                page.locator("#tick-more").click()
+                try:
+                    page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 30 && !document.querySelector('#tick-more').disabled", timeout=8000)
+                except Exception:
+                    print(json.dumps({"width": width, "requests": observed_requests[-8:], "dom": page.evaluate("() => ({rows:document.querySelectorAll('#tick-rows tr').length, error:document.querySelector('#tick-error').textContent, disabled:document.querySelector('#tick-more').disabled, count:document.querySelector('#tick-result-count').textContent})")}, ensure_ascii=False))
+                    raise
+                page.locator("#tick-more").click()
+                page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 40")
+                assert page.locator("#tick-more").is_hidden()
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                assert not errors
+                page.close()
+        finally:
+            browser.close()
+
+
 def test_provider_browser_deep_link_search_and_mobile_layout(protocol_server) -> None:
     playwright = pytest.importorskip("playwright.sync_api")
     from playwright.sync_api import Error as PlaywrightError
@@ -2397,6 +2542,91 @@ def test_tw_status_wall_clock_boundary_reuses_same_content_revision(
         server.server_close()
 
 
+@pytest.mark.parametrize("product", ["tw", "overnight"])
+@pytest.mark.parametrize("advance", ["before_admission", "during_build"])
+def test_status_revision_is_bound_to_the_actual_committed_snapshot(monkeypatch, product, advance):
+    server = _test_server()
+    version = [1]
+    reads = []
+    builds = []
+
+    def revision_reader():
+        reads.append(version[0])
+        current = version[0]
+        if advance == "before_admission" and len(reads) == 1:
+            version[0] = 2  # The query was queued behind a previous build.
+        return server.cached_local_json(
+            cache_key=f"fixture-{product}-{current}", ttl_seconds=60, cache_control="no-store",
+            builder=lambda: {"revision_token": f"{current}:history:quotes",
+                "engine_revision_token": str(current), "content_revision": current,
+                "engine_generation": "one-run", "history_revision": "history"})
+
+    def snapshot(**kwargs):
+        assert kwargs["require_committed_revision"] is True
+        current = version[0]
+        builds.append(current)
+        if advance == "during_build" and len(builds) == 1:
+            version[0] = 2
+        return {"simulation_only": True, "production_order_possible": False,
+            "service_sync": {"revision_token": str(current), "content_revision": current,
+                "engine_generation": "one-run"},
+            "modes": [{"market": f"mode-{index}", "session_date": "2026-10-22",
+                       "signal_id": f"s-{index}-{current}"}
+                      for index in range(6)]}
+
+    setattr(server, f"{product}_revision", revision_reader)
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", snapshot)
+    try:
+        payload = json.loads(getattr(server, f"{product}_status")().body)
+        assert payload["service_sync"]["revision_token"] == "2:history:quotes"
+        assert payload["service_sync"]["content_revision"] == 2
+        assert all(row["public_signal_key"] == public_paper_signal_key({
+            "market": row["market"], "session_date": "2026-10-22",
+            "signal_id": f"s-{index}-2"}) for index, row in enumerate(payload["modes"]))
+        assert builds == ([2] if advance == "before_admission" else [1, 2])
+        prefix = "tw-status:" if product == "tw" else "overnight-status:"
+        keys = [key for key in server._cache if key.startswith(prefix)]
+        assert keys and all("2:history:quotes" in key for key in keys)
+    finally:
+        server.server_close()
+
+
+@pytest.mark.parametrize("product", ["tw", "overnight"])
+@pytest.mark.parametrize("failure", ["wrong_snapshot", "continuous_commits"])
+def test_status_revision_races_are_bounded_and_never_cached(monkeypatch, product, failure):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+
+    server = _test_server()
+    version = [1]
+    builds = []
+
+    def reader():
+        current = version[0]
+        return server.cached_local_json(cache_key=f"fixture-{current}", ttl_seconds=60,
+            cache_control="no-store", builder=lambda: {
+                "revision_token": str(current), "engine_revision_token": str(current),
+                "engine_generation": "one-run", "content_revision": current})
+
+    def snapshot(**_kwargs):
+        current = version[0]
+        builds.append(current)
+        if failure == "continuous_commits":
+            version[0] += 1
+        return {"simulation_only": True, "production_order_possible": False, "modes": [],
+            "service_sync": {"revision_token": str(current + (failure == "wrong_snapshot")),
+                "content_revision": current, "engine_generation": "one-run"}}
+
+    setattr(server, f"{product}_revision", reader)
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", snapshot)
+    try:
+        with pytest.raises(DashboardSnapshotChanged):
+            getattr(server, f"{product}_status")()
+        assert len(builds) == 2  # No unbounded busy retry under continuous commits.
+        assert not any(key.startswith(("tw-status:", "overnight-status:")) for key in server._cache)
+    finally:
+        server.server_close()
+
+
 def test_tw_history_revision_tracks_marks_without_engine_commit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2418,6 +2648,7 @@ def test_tw_history_revision_tracks_marks_without_engine_commit(
             "simulation_only": True,
             "production_order_possible": False,
             "modes": [],
+            "service_sync": {"revision_token": "engine-7", "content_revision": 7},
         },
     )
     try:
@@ -2510,6 +2741,244 @@ def test_tw_status_new_revision_returns_verified_stale_while_rebuilding(
         assert calls == 2
     finally:
         release_build.set()
+        server.server_close()
+
+
+def test_revision_burst_coalesces_to_latest_without_concurrent_query_rebuilds():
+    """Changing source generations must not fan out the same expensive query."""
+    server = _test_server()
+    prefix = "tw-status:2026-10-23:"
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    lock = threading.Lock()
+    calls, active, peak = [], 0, 0
+
+    def rebuild(index):
+        def build():
+            nonlocal active, peak
+            with lock:
+                calls.append(index)
+                active += 1
+                peak = max(peak, active)
+            try:
+                entered.set()
+                assert release.wait(5)
+                return server.cached_local_json(
+                    cache_key=f"{prefix}{index}", ttl_seconds=55,
+                    stale_grace_seconds=120, cache_control="no-store",
+                    builder=lambda: {"revision": index})
+            finally:
+                with lock:
+                    active -= 1
+                if index == 32:
+                    finished.set()
+        return build
+
+    try:
+        original = server.cached_local_json(
+            cache_key=prefix + "0", ttl_seconds=55, stale_grace_seconds=120,
+            cache_control="no-store", builder=lambda: {"revision": 0})
+        for index in range(1, 33):
+            response = server._revision_stale_or_build(
+                cache_prefix=prefix, cache_key=prefix + str(index),
+                revision_token=str(index), builder=rebuild(index))
+            assert response.body == original.body
+            if index == 1:
+                assert entered.wait(2)
+        # A duplicate older in-flight request must not replace latest pending.
+        server._revision_stale_or_build(
+            cache_prefix=prefix, cache_key=prefix + "1",
+            revision_token="1", builder=rebuild(1))
+        release.set()
+        assert finished.wait(5)
+        with lock:
+            assert peak == 1
+            assert calls == [1, 32]
+        assert json.loads(server._cache[prefix + "32"].response.body) == {"revision": 32}
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_revision_query_coalescing_keeps_dates_independent():
+    server = _test_server()
+    entered = [threading.Event(), threading.Event()]
+    release = threading.Event()
+    try:
+        for index, day in enumerate(("2026-10-22", "2026-10-23")):
+            prefix = f"tw-status:{day}:"
+            original = server.cached_local_json(
+                cache_key=prefix + "old", ttl_seconds=55,
+                cache_control="no-store", builder=lambda d=day: {"day": d})
+
+            def build(i=index, d=day, p=prefix):
+                entered[i].set()
+                assert release.wait(5)
+                return server.cached_local_json(
+                    cache_key=p + "new", ttl_seconds=55,
+                    cache_control="no-store", builder=lambda: {"day": d, "new": True})
+
+            response = server._revision_stale_or_build(
+                cache_prefix=prefix, cache_key=prefix + "new",
+                revision_token="new", builder=build)
+            assert response.body == original.body
+        assert all(event.wait(2) for event in entered)
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_revision_rebuild_failure_retains_view_drains_latest_and_allows_retry(capsys):
+    server = _test_server()
+    prefix = "tw-status:failure-fixture:"
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    try:
+        original = server.cached_local_json(
+            cache_key=prefix + "0", ttl_seconds=55, cache_control="no-store",
+            builder=lambda: {"revision": 0})
+
+        def broken():
+            entered.set()
+            assert release.wait(5)
+            raise OSError("ledger changed during indexed read\nprivate diagnostic")
+
+        def replacement():
+            response = server.cached_local_json(
+                cache_key=prefix + "2", ttl_seconds=55, cache_control="no-store",
+                builder=lambda: {"revision": 2})
+            completed.set()
+            return response
+
+        assert server._revision_stale_or_build(
+            cache_prefix=prefix, cache_key=prefix + "1", revision_token="1",
+            builder=broken).body == original.body
+        assert entered.wait(2)
+        assert server._revision_stale_or_build(
+            cache_prefix=prefix, cache_key=prefix + "2", revision_token="2",
+            builder=replacement).body == original.body
+        release.set()
+        assert completed.wait(5)
+        deadline = time.monotonic() + 2
+        while prefix in server._revision_active:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        assert prefix not in server._revision_pending
+        assert json.loads(server._cache[prefix + "2"].response.body)["revision"] == 2
+        private_log = capsys.readouterr().err
+        assert 'error=OSError detail={"errno": null' in private_log
+        assert "changed during indexed read\\nprivate diagnostic" in private_log
+        timings = [row for line in private_log.splitlines() if "revision_timing " in line
+                   if (row := json.loads(line.split("revision_timing ", 1)[1]))["query"] == prefix]
+        assert [row["ready"] for row in timings] == [False, True]
+        assert all(row["build_ms"] >= 0 and row["queue_ms"] >= 0 for row in timings)
+        assert all(row["clock_basis"] == "gateway_monotonic_not_acquisition_or_paper_fill"
+                   for row in timings)
+        # The failed key was not poisoned or cached as a successful response.
+        assert prefix + "1" not in server._cache
+        assert server._revision_stale_or_build(
+            cache_prefix=prefix, cache_key=prefix + "1", revision_token="1",
+            builder=lambda: server.cached_local_json(
+                cache_key=prefix + "1", ttl_seconds=55, cache_control="no-store",
+                builder=lambda: {"revision": 1})).body != b""
+        while prefix in server._revision_active or prefix + "1" not in server._cache:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_revision_log_sink_failure_cannot_pin_the_query(monkeypatch):
+    from scripts import serve_public_dashboards as gateway
+    server = _test_server()
+    prefix = "tw-status:log-failure:"
+    try:
+        server.cached_local_json(cache_key=prefix + "old", ttl_seconds=55,
+            cache_control="no-store", builder=lambda: {"old": True})
+
+        def unavailable_log(_message):
+            raise OSError("log sink unavailable")
+
+        monkeypatch.setattr(gateway.sys, "stderr", SimpleNamespace(write=unavailable_log))
+        server._revision_stale_or_build(cache_prefix=prefix, cache_key=prefix + "new",
+            revision_token="new", builder=lambda: server.cached_local_json(
+                cache_key=prefix + "new", ttl_seconds=55, cache_control="no-store",
+                builder=lambda: {"new": True}))
+        deadline = time.monotonic() + 2
+        while prefix in server._revision_active:
+            assert time.monotonic() < deadline
+            time.sleep(.005)
+        assert json.loads(server._cache[prefix + "new"].response.body) == {"new": True}
+        assert server.traffic_observer._cache_lifetime["revision_log_failed"] == 1
+    finally:
+        server.server_close()
+
+
+def test_expired_stale_view_waits_for_its_query_owner_and_never_crosses_the_bound():
+    from concurrent.futures import ThreadPoolExecutor
+    server = _test_server()
+    prefix = "tw-status:expired-bound:"
+    entered, release, cold_entered = threading.Event(), threading.Event(), threading.Event()
+    try:
+        server.cached_local_json(cache_key=prefix + "old", ttl_seconds=55,
+            cache_control="no-store", builder=lambda: {"revision": 0})
+
+        def first():
+            entered.set()
+            assert release.wait(5)
+            return server.cached_local_json(cache_key=prefix + "1", ttl_seconds=55,
+                cache_control="no-store", builder=lambda: {"revision": 1})
+
+        def cold():
+            cold_entered.set()
+            return server.cached_local_json(cache_key=prefix + "2", ttl_seconds=55,
+                cache_control="no-store", builder=lambda: {"revision": 2})
+
+        server._revision_stale_or_build(cache_prefix=prefix, cache_key=prefix + "1",
+            revision_token="1", builder=first)
+        assert entered.wait(2)
+        server._cache[prefix + "old"].stale_until = time.monotonic() - 1
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(server._revision_stale_or_build,
+                cache_prefix=prefix, cache_key=prefix + "2", revision_token="2", builder=cold)
+            try:
+                assert not cold_entered.wait(.05)
+                assert not pending.done()
+            finally:
+                release.set()
+            assert json.loads(pending.result(timeout=5).body) == {"revision": 2}
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_tw_status_expired_current_revision_uses_the_same_query_refresh_owner(monkeypatch):
+    server = _test_server()
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    server.tw_revision = lambda: server.cached_local_json(
+        cache_key="ttl-current-generation", ttl_seconds=60, cache_control="no-store",
+        builder=lambda: {"revision_token": "current"})
+
+    def build_snapshot(**kwargs):
+        calls.append(True)
+        if len(calls) > 1:
+            entered.set()
+            assert release.wait(5)
+        return {"simulation_only": True, "production_order_possible": False, "modes": []}
+
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", build_snapshot)
+    try:
+        original = server.tw_status()
+        key = next(k for k in server._cache if k.startswith("tw-status:"))
+        server._cache[key].expires_at = time.monotonic() - 1
+        for _ in range(16):
+            assert server.tw_status().body == original.body
+        assert entered.wait(2)
+        assert len(calls) == 2
+        assert not server._refreshing  # No nested per-key TTL refresh thread.
+        assert len(server._revision_active) == 1
+    finally:
+        release.set()
         server.server_close()
 
 

@@ -38,6 +38,10 @@ INCOMING = Path("/mnt/d/stockagent-cold-primary/remote-artifact-incoming")
 POLICY_PATH = Path(__file__).resolve().parents[2] / "configs/data_sync/vastai_bulk_preservation.json"
 
 
+class PreservationProofExpired(SnapshotError):
+    """Canonical identity is valid, but inode evidence needs full recovery."""
+
+
 def atomic_write_json(path, value):
     return _atomic_write_json(metadata_path(path), value)
 
@@ -736,7 +740,7 @@ def verify_retained_preservation(proof):
         unchanged = (signature(files["payload.tar.zst"]) == proof.get("cold_blob_signature")
                      and signature(files["member_inventory.json"]) == proof.get("cold_index_signature"))
     if not unchanged:
-        raise SnapshotError("cold object changed after independent decode; full verification required")
+        raise PreservationProofExpired("cold object changed after independent decode; full verification required")
     return files
 
 

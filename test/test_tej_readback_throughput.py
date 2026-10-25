@@ -51,6 +51,10 @@ def queue(tmp_path):
 def test_profile_indexed_complete_end_to_end_metadata_only(queue,tmp_path):
     report = profile(queue,tmp_path/'profile.json')
     assert report['contract'] == PROFILE_CONTRACT
+    assert report['source_scope_contract'] == SOURCE_SCOPE_CONTRACT
+    assert {key:report['samples'][0][key] for key in ('task_id','table_id','active_attempt_id')} == {
+        'task_id':'a'*24, 'table_id':'table', 'active_attempt_id':'a'*24+'-'+'b'*32,
+    }
     assert report['all']['tasks'] == 1
     assert report['nonempty']['median_end_to_end_seconds'] == 30
     assert report['median_before_submission_seconds'] == 18
@@ -61,6 +65,41 @@ def test_profile_indexed_complete_end_to_end_metadata_only(queue,tmp_path):
     assert any('tasks_scope_timing' in r['detail'] for r in report['selection_plan'])
     with pytest.raises(FileExistsError):
         profile(queue,tmp_path/'profile.json')
+
+
+def test_latest_per_table_keeps_older_tables_ties_scope_and_explicit_limit(queue, tmp_path):
+    with sqlite3.connect(queue/'queue.sqlite3') as con:
+        con.executemany('INSERT INTO tables VALUES(?,?)', [('older', 'Older'), ('legacy', 'Legacy')])
+        original = con.execute('SELECT * FROM tasks LIMIT 1').fetchone()
+        def add(identifier, table, completed, *, basis='fresh_end_to_end', scope=SOURCE_SCOPE_CONTRACT):
+            row = list(original)
+            row[0], row[1], row[4], row[5], row[9], row[10] = identifier, table, scope, None, completed, basis
+            con.execute('INSERT INTO tasks VALUES('+','.join('?' for _ in row)+')', row)
+        add('b'*24, 'table', '2026-10-04T16:00:30+00:00')
+        add('c'*24, 'table', '2026-10-04T16:00:30+00:00')
+        add('d'*24, 'older', '2026-10-01T16:00:30+00:00')
+        add('e'*24, 'legacy', '2026-10-05T16:00:30+00:00', basis='legacy_bridge_only')
+        add('f'*24, 'older', '2026-10-06T16:00:30+00:00', scope='unreviewed')
+    full = profile(queue, tmp_path/'per-table.json', limit=256, selection='latest_per_table')
+    assert [(row['table_id'], row['task_id']) for row in full['samples']] == [
+        ('older', 'd'*24), ('table', 'c'*24)]
+    assert full['selection'] == {'mode':'latest_per_table', 'limit':256, 'tables_observed':2,
+        'eligible_tables':2, 'selection_truncated':False, 'scanned_index_rows':4,
+        'scope':'latest one complete fresh task per selected table; not full source history'}
+    limited = profile(queue, tmp_path/'limited.json', limit=1, selection='latest_per_table')
+    assert limited['selection']['selection_truncated'] is True
+    assert limited['selection']['eligible_tables'] == 2
+    assert limited['samples'][0]['table_id'] == 'older'
+    default = profile(queue, tmp_path/'default.json', limit=2)
+    assert {row['table_id'] for row in default['samples']} == {'table'}
+    assert default['selection']['mode'] == 'latest_tasks'
+    assert full['provider_queries_sent'] == 0 and full['queue_modified'] is False
+
+
+def test_unknown_profile_selection_does_not_create_output_or_database(tmp_path):
+    with pytest.raises(ValueError, match='selection'):
+        profile(tmp_path/'missing', tmp_path/'unexpected.json', selection='unknown')
+    assert not (tmp_path/'unexpected.json').exists() and not (tmp_path/'missing').exists()
 
 
 def test_scope_timings_only_expose_known_finite_numeric_phases(queue,tmp_path):

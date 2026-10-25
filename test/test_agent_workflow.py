@@ -93,6 +93,46 @@ printf '%s\\n' "$@"
     assert not (tmp_path/'SHOULD_NOT_EXIST').exists()
 
 
+@pytest.mark.parametrize("backend", ["systemd", "tmux"])
+@pytest.mark.parametrize("distribution", [None, "Ubuntu-26.04"])
+def test_managed_launch_preserves_explicit_wsl_identity_only(
+    workflow, monkeypatch, backend, distribution
+):
+    workflow.start_task("repair", "Repair storage", "Verify physical capacity")
+    if distribution is None:
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+    else:
+        monkeypatch.setenv("WSL_DISTRO_NAME", distribution)
+    monkeypatch.setenv("STOCKAGENT_TEST_SECRET_API_KEY", "must-stay-out-of-launch-arguments")
+    monkeypatch.setenv("WSL_INTEROP", "/run/WSL/unverified-test-bridge")
+    launches = []
+    monkeypatch.setattr(workflow_module, "command", lambda argv, **kwargs: launches.append(argv) or "")
+    monkeypatch.setattr(workflow, "session", lambda _: {"session": "test-session"})
+    record = workflow.launch("repair", ["true"], backend, "physical-capacity")
+    assert record["state"] == "queued" and len(launches) == 1
+    launch = launches[0]
+    if backend == "systemd":
+        assignments = [value.removeprefix("--setenv=") for value in launch if value.startswith("--setenv=")]
+    else:
+        assignments = [launch[index + 1] for index, value in enumerate(launch) if value == "-e"]
+    forwarded = dict(value.split("=", 1) for value in assignments)
+    assert forwarded.get("WSL_DISTRO_NAME") == distribution
+    assert ("WSL_DISTRO_NAME" in forwarded) == (distribution is not None)
+    assert "WSL_INTEROP" not in forwarded and "STOCKAGENT_TEST_SECRET_API_KEY" not in forwarded
+    assert not any("must-stay-out-of-launch-arguments" in value for value in launch)
+
+
+@pytest.mark.parametrize("distribution", ["", "Ubuntu name", "Ubuntu'", "Ubuntu\n", "../Ubuntu", "a" * 81])
+def test_managed_launch_rejects_malformed_wsl_identity(workflow, monkeypatch, distribution):
+    workflow.start_task("repair", "Repair storage", "Verify physical capacity")
+    monkeypatch.setenv("WSL_DISTRO_NAME", distribution)
+    launches = []
+    monkeypatch.setattr(workflow_module, "command", lambda argv, **kwargs: launches.append(argv) or "")
+    with pytest.raises(ValueError, match="valid explicit runtime identity"):
+        workflow.launch("repair", ["true"], "systemd", "physical-capacity")
+    assert launches == [] and workflow.runs("repair") == []
+
+
 @pytest.mark.parametrize("task_id", ("../escape", "a/b", "a; touch bad", "", "a" * 97))
 def test_task_id_cannot_escape_receipt_directory(workflow, task_id):
     with pytest.raises(ValueError, match="id must"):

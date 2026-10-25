@@ -32,8 +32,17 @@ DATE_AXIS = "requested_smart_wizard_grid_not_native_observation_dates"
 MAX_CELLS = 400_000
 NORMALIZATION_CONTRACT = "explicit_field_units_v2_exact_power10_with_scale_guard"
 PHASE_LABELS = {"P1": "候選新增特徵", "P2": "補歷史／口徑缺口", "P3": "多源校驗候選"}
-METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_v1"
-BATCH_SCHEDULER_CONTRACT = "phase_preserving_discovery_download_interleave_v1"
+METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_reviewed_dns_v2"
+BATCH_SCHEDULER_CONTRACT = "phase_preserving_interleave_coalesced_company_retry_v2"
+# Exact, independently reviewed TEJ notices. A notice never proves a query was
+# unsent: callers still need their original finished negative/metadata proof.
+# The native bridge checks this allowlist again against fresh owned controls.
+REVIEWED_RUNTIME_NOTICES = {
+    'MySql:malloc':'vendor_mysql_allocation_failed',
+    'Cannot find table 0.':'vendor_source_table_unresolved',
+    "MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'":
+        'vendor_source_dns_resolution_failed',
+}
 PREVIEW_SUBMISSION_CONTRACT = 'owned_msaa_default_action_once_no_foreground_result_transition_v2'
 DESKTOP_INPUT_CONTRACT = 'owned_edit_messages_acknowledged_date_model_no_foreground_v6'
 NEGATIVE_STDERR_PREFIX = 'STOCKAGENT_TEJ_UNSENT_V1:'
@@ -1438,7 +1447,7 @@ def settle_metadata_failure(root: Path, task_id: str, bridge: Any, evidence: Pat
     ack=json.loads(evidence.read_text(encoding='utf-8-sig'))
     if (ack.get('contract_version')!=CONTRACT_VERSION or ack.get('provider')!='tej_smart_wizard'
             or ack.get('task_id')!=task_id or ack.get('action')!='ack_source_memory_error'
-            or ack.get('error_code') not in {'vendor_mysql_allocation_failed','vendor_source_table_unresolved'}
+            or ack.get('error_code') not in REVIEWED_RUNTIME_NOTICES.values()
             or ack.get('data_query_repeated') is not False or ack.get('credentials_read') is not False
             or any(ack.get(k)!=req.get(k) for k in ('type','smart_id','table'))):
         raise ValueError('Runtime acknowledgement does not match the failed metadata scope')
@@ -1522,15 +1531,13 @@ def restore_owned_metadata_interface(root: Path, task: dict, req: dict, bridge: 
     """Share only owned UI repair, never failed-plan/download classification.
 
     Callers must prove their original action finished before entering. Only the
-    two existing exact runtime notices may be acknowledged. Unknown, auth/quota,
+    reviewed exact runtime notices may be acknowledged. Unknown, auth/quota,
     foreign and disabled-without-notice states remain barriers; no Preview,
     replacement axes, process restart or credential access is performed here.
     """
     if check_action not in {'confirm_metadata_error_cleared', 'repair_source_binding'}:
         raise ValueError('Unreviewed metadata interface verification action')
     task_id = task['task_id']
-    known = {'MySql:malloc':'vendor_mysql_allocation_failed',
-             'Cannot find table 0.':'vendor_source_table_unresolved'}
     evidence_paths, codes = [], []
     def execute_checked(request):
         started = datetime.now(UTC)
@@ -1567,7 +1574,7 @@ def restore_owned_metadata_interface(root: Path, task: dict, req: dict, bridge: 
         notice = notices[0]; nodes = notice.get('controls',[])
         texts = [n for n in nodes if n.get('class') == 'Static' and n.get('name')]
         buttons = [n for n in nodes if n.get('class') == 'Button']
-        code = known.get(texts[0].get('name')) if len(texts) == 1 else None
+        code = REVIEWED_RUNTIME_NOTICES.get(texts[0].get('name')) if len(texts) == 1 else None
         owner = getattr(bridge,'session',{}).get('ExpectedWindow')
         handle = notice.get('handle')
         if (not code or not isinstance(handle,int) or isinstance(handle,bool) or handle <= 0
@@ -2046,12 +2053,16 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     value discovery, and neither changes source safety/retry admission.
     """
     # A proved terminal response quarantines its entire table, not just one
-    # fragment. Indexed metadata lookup keeps other sources progressing.
+    # fragment. A company-absence window delays ONLY known absent fragments:
+    # hundreds of old per-fragment due times must not each trigger a new UI
+    # probe during the same shared backoff. Present/unchecked company scopes
+    # still pass fresh native verification; no evidence or work is discarded.
     isolation = (" AND NOT EXISTS (SELECT 1 FROM tasks AS blocked WHERE blocked.table_id=tasks.table_id "
                  "AND blocked.state='blocked' AND blocked.last_error_code='source_validation_failed_deferred')"
                  " AND NOT EXISTS (SELECT 1 FROM desktop_retry_windows AS retry WHERE retry.table_id=tasks.table_id "
-                 "AND retry.error_code<>'source_company_labels_absent_fragment' "
-                 "AND (retry.next_attempt_at_utc>? OR retry.task_id<>tasks.task_id))")
+                 "AND ((retry.error_code<>'source_company_labels_absent_fragment' AND retry.task_id<>tasks.task_id) "
+                 "OR (retry.next_attempt_at_utc>? AND (retry.error_code<>'source_company_labels_absent_fragment' "
+                 "OR COALESCE(tasks.last_error_code,'')='source_company_labels_absent_fragment'))))")
     def candidate(selected: str):
         if table_id is not None:
             return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,task_id LIMIT 1",(selected,table_id,now,now)).fetchone()

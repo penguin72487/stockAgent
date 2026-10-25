@@ -137,6 +137,7 @@ def _request(
     if token:
         params["token"] = token
     started = _utc_now()
+    monotonic_started = time.monotonic()
     try:
         response = session.get(API_URL, params=params, timeout=(10, 45))
     except requests.RequestException as exc:
@@ -189,7 +190,7 @@ def _request(
     rows = payload.get("data")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise ProviderError("invalid_rows")
-    return received_rows(rows, started)
+    return received_rows(rows, started, monotonic_started=monotonic_started)
 
 
 def _record_request_start(root: Path, dataset: str) -> None:

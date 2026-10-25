@@ -419,6 +419,12 @@ def sanitize_tw_status(
         # remain in the top-level summary. Repeating every mode and failure
         # receipt in each trend row adds >100 KiB to every status refresh.
         latency_summary = dict(opening_latency)
+        # Full per-attempt history belongs to the canonical append-only audit,
+        # not every polling response. The page consumes failure_count,
+        # latest_failures and historical aggregates, never this raw array.
+        # Project before scrubbing/encoding; keep all retained financial and
+        # error fields unchanged and do not mutate the private source receipt.
+        latency_summary.pop("failures", None)
         trend = latency_summary.get("trend")
         if isinstance(trend, list):
             latency_summary["trend"] = [
@@ -852,6 +858,9 @@ def sanitize_tw_signals(
             "target_unsubmitted_shares",
             "temporary_day_trade_model_adapter",
             "top_book_capacity_shares",
+            "current_target_inventory",
+            "reduction_requested_shares",
+            "reduction_filled_shares",
             "order_limit_price",
             "position",
             "upper_limit",

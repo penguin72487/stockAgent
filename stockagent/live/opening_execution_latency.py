@@ -8,7 +8,127 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import threading
+import time
 from typing import Any, Mapping
+
+from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
+
+
+_phase_thread_identity = threading.current_thread
+
+
+class OpeningPhaseTimer:
+    """Wall spans plus CPU only where both observations share one thread.
+
+    Shared input builders may notify a waiter's callback on another thread.
+    Such CPU spans are unknown, not negative durations or evidence of provider
+    wait. All elapsed spans use the one process clock. No timers write files,
+    renew progress watchdogs, or create synthetic completion callbacks.
+    """
+
+    def __init__(self, stages, cpu_stages=None):
+        self.stages, self.cpu_stages = stages, cpu_stages
+        self._lock = threading.Lock()
+        self._clock = time.perf_counter()
+        self._cpu_clock = time.thread_time() if cpu_stages is not None else None
+        self._thread = _phase_thread_identity()
+        self._phase = None
+        self._ambiguous_cpu = False
+        self._closed = False
+
+    def transition(self, phase):
+        with self._lock:
+            if self._closed:
+                return
+            thread = _phase_thread_identity()
+            if phase == self._phase:
+                self._ambiguous_cpu |= thread is not self._thread
+                return
+            observed = time.perf_counter()
+            cpu = time.thread_time() if self.cpu_stages is not None else None
+            self._close_span(observed, cpu, thread)
+            self._phase, self._clock, self._cpu_clock = phase, observed, cpu
+            self._thread, self._ambiguous_cpu = thread, False
+
+    def _close_span(self, observed, cpu, thread):
+        if self._phase is None:
+            return
+        phase = self._phase
+        self.stages[phase] = self.stages.get(phase, 0.) + (observed - self._clock) * 1000
+        if self.cpu_stages is not None:
+            previous = self.cpu_stages.get(phase, 0.)
+            duration = ((cpu - self._cpu_clock) * 1000
+                        if not self._ambiguous_cpu and thread is self._thread else None)
+            self.cpu_stages[phase] = (
+                previous + duration if previous is not None and duration is not None
+                and duration >= 0 else None)
+
+    def finish(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._close_span(time.perf_counter(),
+                time.thread_time() if self.cpu_stages is not None else None, _phase_thread_identity())
+            self._closed = True
+
+
+def call_with_opening_stage_timing(function, kwargs, stages, cpu_stages=None):
+    """Observe an unchanged synchronous call, retaining its callback and errors."""
+    timer = OpeningPhaseTimer(stages, cpu_stages)
+    original = kwargs.get("progress_callback")
+
+    def progress(event):
+        timer.transition(str(event.get("message") or ""))
+        if original is not None:
+            original(event)
+
+    try:
+        return function(**dict(kwargs, progress_callback=progress))
+    finally:
+        timer.finish()
+
+
+def inventory_rebalance_quantities(mode):
+    """Derived inventory completion, never an order or a synthetic fill."""
+    targets, positions = mode.get("signal_inventory_targets"), mode.get("positions")
+    valid = isinstance(targets, dict) and isinstance(positions, dict)
+    targets = targets if isinstance(targets, dict) else {}
+    positions = positions if isinstance(positions, dict) else {}
+    held, unknown, remaining = {}, 0, 0
+    for position in positions.values():
+        if not isinstance(position, Mapping):
+            valid = False
+            continue
+        shares = position.get("signed_shares")
+        if type(shares) is not int:
+            valid = False
+            continue
+        symbol = position.get("symbol")
+        if not isinstance(symbol, str) or not symbol or held.get(symbol, 0) * shares < 0:
+            valid = False
+        held[symbol] = held.get(symbol, 0) + shares
+    for symbol, target in targets.items():
+        if target is None:
+            unknown += 1
+        elif type(target) is not int:
+            valid = False
+        else:
+            remaining += abs(target - held.get(symbol, 0))
+    if any(shares and symbol not in targets for symbol, shares in held.items()):
+        valid = False
+    return {"contract": "signed_target_minus_actual_inventory_v1", "contract_valid": valid,
+            "unresolved_symbol_count": unknown, "remaining_delta_shares": remaining,
+            "target_complete": valid and not unknown and not remaining}
+
+
+def _executed_progress(mode):
+    filled = mode.get("entry_filled_shares")
+    if (type(filled) is int and mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+            and type(mode.get("rebalance_reduction_fill_count")) is int
+            and mode["rebalance_reduction_fill_count"] > 0):
+        return filled + 1  # Presence token only; not reported as share quantity.
+    return filled
 
 
 def unsized_target_count(mode):
@@ -49,7 +169,26 @@ def execution_quantities(mode: Mapping[str, Any]) -> dict[str, Any]:
                 and not quantities["pending_entry_shares"]
                 and not quantities["pending_entry_source_count"])
     no_order = no_order and registered and unsized_valid and unsized == 0
+    revision_progress = {}
+    if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE:
+        inventory = mode.get("inventory_rebalance")
+        inventory = inventory if isinstance(inventory, Mapping) else {}
+        reductions = mode.get("rebalance_reduction_fill_count")
+        inventory_valid = (inventory.get("contract") == "signed_target_minus_actual_inventory_v1"
+            and inventory.get("contract_valid") is True
+            and type(inventory.get("remaining_delta_shares")) is int and inventory["remaining_delta_shares"] >= 0
+            and type(inventory.get("unresolved_symbol_count")) is int and inventory["unresolved_symbol_count"] >= 0
+            and type(reductions) is int and reductions >= 0)
+        at_target = (inventory_valid and inventory.get("target_complete") is True
+                     and inventory["remaining_delta_shares"] == 0 and inventory["unresolved_symbol_count"] == 0)
+        valid = valid and inventory_valid
+        no_order = no_order and at_target and reductions == 0
+        complete = ((complete or (registered and valid and requested == 0 and reductions > 0
+                                 and unsized_valid and unsized == 0)) and at_target)
+        revision_progress = {"day_trade_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+            "inventory_rebalance": inventory, "rebalance_reduction_fill_count": reductions}
     return {**quantities, "quantity_contract_valid": valid,
+            **revision_progress,
             "known_sized_target_complete": bool(valid and requested > 0 and filled == requested),
             "all_target_complete": bool(complete), "no_execution_required": bool(no_order),
             "source_blocking_reason_counts": source_blockers,
@@ -73,7 +212,7 @@ class OpeningExecutionObserver:
     def __init__(self, modes: Mapping[str, Mapping[str, Any]]) -> None:
         self._seen = {market: self._signature(mode) for market, mode in modes.items()}
         self._prior_filled = {self._identity(market, mode): (
-            mode.get("entry_filled_shares") if signal_registration_committed(mode) else 0)
+            _executed_progress(mode) if signal_registration_committed(mode) else 0)
                               for market, mode in modes.items()}
         self._restored_filled = {identity for identity, filled in self._prior_filled.items()
                                  if isinstance(filled, int) and not isinstance(filled, bool) and filled > 0}
@@ -106,7 +245,7 @@ class OpeningExecutionObserver:
                 "engine_run_id": engine_run_id, "simulation_only": True,
                 "production_order_possible": False, **quantities,
                 "first_fill_observed_this_commit": bool(quantities["signal_registration_committed"] and prior_filled == 0 and isinstance(
-                    quantities["entry_filled_shares"], int) and quantities["entry_filled_shares"] > 0),
+                    _executed_progress(mode), int) and _executed_progress(mode) > 0),
                 "first_fill_clock_unknown_after_restore": identity in self._restored_filled,
             })
         return rows
@@ -117,7 +256,7 @@ class OpeningExecutionObserver:
         for market, mode in modes.items():
             self._seen[market] = self._signature(mode)
             self._prior_filled[self._identity(market, mode)] = (
-                mode.get("entry_filled_shares") if signal_registration_committed(mode) else 0)
+                _executed_progress(mode) if signal_registration_committed(mode) else 0)
 
 
 def opening_execution_slo(session_date, publication, current_modes, samples, *, observed_at):

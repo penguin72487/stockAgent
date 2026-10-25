@@ -60,6 +60,8 @@ class TaskResult:
     provider_evidence: dict[str, str] = field(default_factory=dict, repr=False)
     retry_not_before: str | None = None
     transient_failures: int = 0
+    operation_timing: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+    scheduler_timing: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 

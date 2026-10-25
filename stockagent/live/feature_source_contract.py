@@ -7,8 +7,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+import copy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+class _ManifestMetadataInvalid(ValueError):
+    def __init__(self, message: str, sha256: str):
+        super().__init__(message)
+        self.sha256 = sha256
+
+
+@lru_cache(maxsize=8)
+def _manifest_metadata(path: Path, generation: tuple) -> dict[str, Any]:
+    """Cache only bounded metadata, not feature blocks or readiness decisions."""
+    from stockagent.live.completed_inference_cache import file_generation
+
+    raw = path.read_bytes()
+    if file_generation(path) != generation:
+        raise OSError("factorized manifest changed during metadata read")
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        manifest = json.loads(raw)
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must be an object")
+    except (ValueError, UnicodeError) as exc:
+        raise _ManifestMetadataInvalid(str(exc), digest) from exc
+    result = {key: manifest.get(key) for key in (
+        "contract", "status", "live_eligible", "research_only", "historical_point_in_time",
+        "use_restriction", "logical_model_channels", "paper_inference")}
+    dates = manifest.get("dates") or [None]
+    result.update(manifest_sha256=digest,
+                  first_date=dates[0], last_date=dates[-1])
+    return result
 
 
 class LiveFeatureContractError(RuntimeError):
@@ -28,6 +59,8 @@ def inspect_live_feature_source(data: Any) -> dict[str, Any]:
     configured = str(getattr(data, "factorized_feature_manifest", "") or "")
     if not configured:
         return {"required": False, "ready": True, "blockers": []}
+    from stockagent.live.completed_inference_cache import file_generation
+
     path = Path(configured).resolve()
     blockers: list[dict[str, str]] = []
     evidence: dict[str, Any] = {
@@ -36,21 +69,22 @@ def inspect_live_feature_source(data: Any) -> dict[str, Any]:
         "blockers": blockers,
     }
     try:
-        raw = path.read_bytes()
+        generation = file_generation(path)
+        manifest = copy.deepcopy(_manifest_metadata(path, generation))
+        if file_generation(path) != generation:
+            raise OSError("factorized manifest changed during metadata validation")
     except FileNotFoundError:
         blockers.append({"code": "factorized_manifest_missing", "detail": str(path)})
         return evidence
     except OSError as exc:
         blockers.append({"code": "factorized_manifest_unreadable", "detail": str(exc)})
         return evidence
-    evidence["manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-    try:
-        manifest = json.loads(raw)
-        if not isinstance(manifest, dict):
-            raise ValueError("manifest must be an object")
     except (ValueError, UnicodeError) as exc:
+        if isinstance(exc, _ManifestMetadataInvalid):
+            evidence["manifest_sha256"] = exc.sha256
         blockers.append({"code": "factorized_manifest_invalid", "detail": str(exc)})
         return evidence
+    evidence["manifest_sha256"] = manifest["manifest_sha256"]
     from stockagent.data.factorized_panel import SUPPORTED_CONTRACTS
 
     evidence.update({
@@ -60,8 +94,8 @@ def inspect_live_feature_source(data: Any) -> dict[str, Any]:
         "historical_point_in_time": manifest.get("historical_point_in_time"),
         "use_restriction": manifest.get("use_restriction"),
         "logical_model_channels": manifest.get("logical_model_channels"),
-        "first_date": (manifest.get("dates") or [None])[0],
-        "last_date": (manifest.get("dates") or [None])[-1],
+        "first_date": manifest["first_date"],
+        "last_date": manifest["last_date"],
         "raw_source_publication_requested": False,
         "notices": [],
     })

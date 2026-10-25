@@ -19,6 +19,7 @@ import csv
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -30,6 +31,7 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
+from stockagent.private_json import ledger_bytes
 
 from stockagent.backtest.tw_day_trade_contract import (
     AUCTION_SUBMIT_MINUTE,
@@ -78,14 +80,20 @@ from stockagent.live.benchmark_accounting import (
     settle_roll_wealth,
 )
 from stockagent.live.quote_provider import PriceSnapshot
+from stockagent.live.market_config import (OPENING_OBSERVED_REFERENCE_POLICY,
+    OPENING_PROVISIONAL_REFERENCE_POLICY, SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE)
 from stockagent.live.opening_execution_latency import (
     OpeningExecutionObserver, signal_registration_committed, unsized_target_count,
 )
 from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_FILENAME,
+    SERVICE_SYNC_DURABLE_ACK_FILENAME,
+    SERVICE_SYNC_DURABLE_ACK_CONTRACT,
     SERVICE_SYNC_SCHEMA_VERSION,
     load_service_sync,
+    paper_journal_generations,
+    paper_projection_generations,
 )
 from stockagent.research.taifex_capital_returns import taifex_initial_margin_twd
 from stockagent.research.taifex_transaction_tax import (
@@ -583,6 +591,23 @@ def realized_account_nav(
     )
 
 
+def _progressive_funding_headroom(mode: Mapping[str, Any]) -> float:
+    """Reuse actual inventory, not historical acquired shares, as reservation.
+
+    Closed FIFO cohorts remain visible but release their principal. Realized
+    losses/fees reduce buying power; unearned intraday gains never increase
+    the frozen session target NAV. Both sides reserve full notional.
+    """
+    ceiling = min(float(mode["session_sizing_nav_twd"]), realized_account_nav(mode))
+    reserved = sum(
+        abs(int(p.get("signed_shares") or 0)) * max(float(p["entry_price"]),
+            _finite(p.get("last_mark_price")) or float(p["entry_price"]))
+        + float(p.get("remaining_entry_fee_twd") or 0.)
+        for p in (mode.get("positions") or {}).values() if int(p.get("signed_shares") or 0)
+    )
+    return max(0., ceiling - reserved - float(mode.get("corporate_action_receivable_twd") or 0.))
+
+
 def entry_bracket_prices(
     *, side: str, upper_limit: object, lower_limit: object,
     offset_ticks: int, trading_date: date, security_type: str,
@@ -592,6 +617,17 @@ def entry_bracket_prices(
     if side not in {"long", "short"}:
         return None, None
     upper, lower = _finite(upper_limit), _finite(lower_limit)
+    upper, lower = _entry_bracket_limits(upper, lower, offset_ticks, trading_date, security_type)
+    return (upper, lower) if side == "long" else (lower, upper)
+
+
+@lru_cache(maxsize=16_384)
+def _entry_bracket_limits(upper, lower, offset_ticks, trading_date, security_type):
+    """Pure, bounded tick arithmetic shared across modes and revisions.
+
+    Key every price/date/product input. Cache immutable derived boundaries,
+    never quotes, clocks, eligibility, target sizing or execution permission.
+    """
     if offset_ticks:
         if upper is not None:
             upper = float(move_price_ticks_numpy(
@@ -603,7 +639,7 @@ def entry_bracket_prices(
                 np.asarray([lower]), offset_ticks, np.asarray([trading_date]),
                 security_types=security_type,
             )[0])
-    return (upper, lower) if side == "long" else (lower, upper)
+    return upper, lower
 
 
 def entry_price_guard_reason(
@@ -654,7 +690,9 @@ def _prepare_entry_plan(
     status = "ready"
     reason: str | None = None
     sizing_price = _finite(quote_values.get("open")) or _finite(row.get("open_price"))
-    pending_opening_price = bool(row.get("opening_price_wait_reason"))
+    pending_opening_price = bool(row.get("opening_price_wait_reason")) or (
+        spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE and sizing_price is None
+    )
     synthetic_open_fill = (
         spec.entry_fill_policy == ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK
     )
@@ -986,6 +1024,7 @@ def _prepare_entry_plan(
 
 def _atomic_json(
     path: Path, payload: Mapping[str, Any], *, timings: dict[str, Any] | None = None,
+    sync_directory: bool = True,
 ) -> None:
     started = perf_counter()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -994,12 +1033,9 @@ def _atomic_json(
         # Indentation sends the stdlib encoder through recursive Python code.
         # Machine-read state keeps every value/precision but uses the compact
         # C encoder; both durability barriers below are intentionally retained.
-        encoded = json.dumps(
-            payload, ensure_ascii=False, indent=None, separators=(",", ":"),
-            sort_keys=True, default=str,
-        ) + "\n"
+        encoded = ledger_bytes(payload) + b"\n"
         encoded_at = perf_counter()
-        with temporary.open("w", encoding="utf-8") as handle:
+        with temporary.open("wb") as handle:
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
@@ -1009,12 +1045,8 @@ def _atomic_json(
         # synced.  This state is the exactly-once boundary for the append-only
         # paper ledgers, so a merely atomic-but-not-durable replace is not
         # sufficient.
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(path.parent, directory_flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if sync_directory:
+            _fsync_directory(path.parent)
         completed_at = perf_counter()
         if timings is not None:
             timings.update({
@@ -1023,9 +1055,61 @@ def _atomic_json(
                 "file_write_fsync_ms": round((file_synced_at - encoded_at) * 1000.0, 3),
                 "replace_directory_fsync_ms": round((completed_at - file_synced_at) * 1000.0, 3),
                 "total_ms": round((completed_at - started) * 1000.0, 3),
+                "directory_sync": "per_file" if sync_directory else "commit_group",
             })
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _dashboard_material_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Private UI invalidation only, never a source/artifact/financial hash.
+
+    The v2 material contract admits the same guarded, lossless encoding as the
+    private ledger. Native finite-float spelling may differ from stdlib; a
+    codec change can invalidate one view, but cannot change any persisted
+    financial value or hide a material change. Unsupported/legacy values keep
+    the exact existing stdlib fallback. Cross-runtime canonical hashes do not
+    use this helper.
+    """
+    return hashlib.sha256(ledger_bytes(payload)).hexdigest()
+
+
+def _publish_service_sync(
+    path: Path, payload: Mapping[str, Any], *,
+    timings: dict[str, Any] | None = None, ack_timings: dict[str, Any] | None = None,
+) -> None:
+    """Expose a compact ACK only AFTER the financial marker is durable.
+
+    No reader or model/history query holds an execution lock. The ACK's own
+    namespace need not survive power loss: losing it makes admission unknown,
+    never a false commit. Its mere existence is not proof; readers bind its
+    unique commit id and exact marker metadata. Keep this owner shared by full
+    commits and heartbeat replacement so an idle heartbeat cannot launder a
+    failed commit or leave the previous ACK matching a changed marker.
+    """
+    receipt = dict(payload)
+    receipt["durability_ack"] = {
+        "contract": SERVICE_SYNC_DURABLE_ACK_CONTRACT, "commit_id": uuid.uuid4().hex,
+    }
+    _atomic_json(path, receipt, timings=timings)
+    stat = path.stat()
+    _atomic_json(path.parent / SERVICE_SYNC_DURABLE_ACK_FILENAME, {
+        "schema_version": 1,
+        "durability_ack": receipt["durability_ack"],
+        "engine_run_id": receipt.get("engine_run_id"),
+        "state_revision": receipt.get("state_revision"),
+        "content_revision": receipt.get("content_revision"),
+        "marker_generation": [stat.st_dev, stat.st_ino, stat.st_size,
+                              stat.st_mtime_ns, stat.st_ctime_ns],
+    }, timings=ack_timings, sync_directory=False)
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -1070,10 +1154,10 @@ def _append_jsonl_many(
     if not payloads:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = "".join(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str) + "\n"
+    encoded = b"".join(
+        ledger_bytes(payload) + b"\n"
         for payload in payloads
-    ).encode("utf-8")
+    )
     with minute_curve_write_lock(path.parent) if path.name == "marks.jsonl" else nullcontext():
         descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
         try:
@@ -1115,6 +1199,8 @@ class ModeSpec:
     margin_short_handling_fee_rate: float = 0.001
     entry_sweep_funding_policy: str = "legacy_sequential"
     terminal_liquidation_unlimited_capacity: bool = False
+    opening_reference_policy: str = OPENING_OBSERVED_REFERENCE_POLICY
+    signal_update_policy: str = SIGNAL_UPDATE_ONCE
 
     @property
     def uses_realistic_execution(self) -> bool:
@@ -1125,6 +1211,14 @@ class ModeSpec:
         }
 
     def __post_init__(self) -> None:
+        if self.signal_update_policy not in {SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE}:
+            raise ValueError("unknown signal update policy")
+        if self.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE and (
+                self.opening_reference_policy != OPENING_PROVISIONAL_REFERENCE_POLICY
+                or self.entry_fill_policy != ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET):
+            raise ValueError("progressive rebalance requires causal full-target paper execution")
+        if self.opening_reference_policy not in {OPENING_OBSERVED_REFERENCE_POLICY, OPENING_PROVISIONAL_REFERENCE_POLICY}:
+            raise ValueError("unknown opening reference policy")
         if self.entry_sweep_funding_policy not in {"legacy_sequential", "proportional_net_reservation_v1"}:
             raise ValueError("unknown entry sweep funding policy")
         if self.historical_full_fill_at_0901 and self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE:
@@ -3379,6 +3473,8 @@ class TwDayTradeSimulationEngine:
         # it to rewrite a completed counterfactual replay makes state and the
         # append-only fill ledger disagree immediately after a service restart.
         mode["configured_entry_fill_policy"] = spec.entry_fill_policy
+        mode["configured_opening_reference_policy"] = spec.opening_reference_policy
+        mode["configured_signal_update_policy"] = spec.signal_update_policy
         mode["configured_entry_price_guard_contract"] = ENTRY_PRICE_GUARD_CONTRACT
         mode["configured_intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
         mode["configured_terminal_close_contract"] = (
@@ -3556,7 +3652,7 @@ class TwDayTradeSimulationEngine:
         if heartbeat_at is not None and 0 <= (observed - heartbeat_at).total_seconds() < 9:
             return
         receipt["heartbeat_at"] = observed.isoformat(timespec="milliseconds")
-        _atomic_json(self.service_sync_path, receipt)
+        _publish_service_sync(self.service_sync_path, receipt)
 
     def rearm_flat_session(
         self,
@@ -3970,6 +4066,34 @@ class TwDayTradeSimulationEngine:
         }
 
     def register_signal(
+        self, *, spec: ModeSpec, summary: Mapping[str, Any],
+        signal_rows: Sequence[Mapping[str, Any]], quotes: Mapping[str, Mapping[str, Any]],
+        eligibility: Mapping[str, LiveEligibility], eligibility_coverage: Mapping[str, Any],
+        now: datetime | None = None, counterfactual_open_replay: bool = False,
+    ) -> str:
+        self._register_commit_started = False
+        try:
+            return self._register_signal_impl(spec=spec, summary=summary, signal_rows=signal_rows,
+                quotes=quotes, eligibility=eligibility, eligibility_coverage=eligibility_coverage,
+                now=now, counterfactual_open_replay=counterfactual_open_replay)
+        except Exception:
+            if self._register_commit_started:
+                mode = self.state["modes"][spec.market]
+                mode["engine_status"] = "critical_ledger_state_divergence"
+                mode["ledger_state_divergence"] = {"kind": "signal_registration_interrupted",
+                    "signal_id": summary.get("signal_id")}
+                # Keep the original exception if the disk failure also blocks
+                # quarantine persistence. The fsynced start event is sufficient
+                # for the normal restart audit to fail closed.
+                try:
+                    self._persist(_now_taipei(now))
+                except Exception:
+                    pass
+            raise
+        finally:
+            self._register_commit_started = False
+
+    def _register_signal_impl(
         self,
         *,
         spec: ModeSpec,
@@ -3982,6 +4106,7 @@ class TwDayTradeSimulationEngine:
         counterfactual_open_replay: bool = False,
     ) -> str:
         observed = _now_taipei(now)
+        timestamp_precision = "microseconds" if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE else "seconds"
         mode = self._mode(spec)
         signal_id = str(summary.get("signal_id") or "").strip()
         if not signal_id:
@@ -3993,6 +4118,14 @@ class TwDayTradeSimulationEngine:
             return "blocked_ledger_state_divergence"
         if signal_id in set(mode.get("processed_signal_ids") or ()):
             return "already_processed"
+        from stockagent.live.opening_signal_revision import revision_admission
+        progressive_revision, revision_error = revision_admission(
+            policy=spec.signal_update_policy, summary=summary, mode=mode,
+            session_date=observed.date().isoformat())
+        if revision_error:
+            return self._block_signal(mode, signal_id, revision_error, observed)
+        if progressive_revision and (counterfactual_open_replay or mode.get("simulation_replay")):
+            return self._block_signal(mode, signal_id, "live_revision_cannot_rewrite_replay", observed)
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
             return self._block_signal(mode, signal_id, "not_tw_day_trade", observed)
         source_signal_at = _parse_timestamp(
@@ -4061,6 +4194,8 @@ class TwDayTradeSimulationEngine:
                 return self._block_signal(
                     mode, signal_id, "invalid_signal_ready_timestamp", observed
                 )
+            if signal_at > observed:
+                return self._block_signal(mode, signal_id, "signal_ready_after_observation", observed)
         entry_gate = (
             ENTRY_GATE
             if counterfactual_open_replay
@@ -4083,6 +4218,25 @@ class TwDayTradeSimulationEngine:
                 or resolved != int(summary.get("opening_price_active_count") or 0) + int(summary.get("opening_no_print_active_count") or 0)
                 or not 0 <= resolved <= active
             )
+        provisional_reference = summary.get("opening_coverage_gate_basis") == "observed_or_known_prior_trade_model_only"
+        if provisional_reference:
+            policy = summary.get("day_trade_opening_reference_policy")
+            counts = [summary.get(key) for key in ("opening_price_active_count",
+                "opening_no_print_active_count", "opening_provisional_reference_active_count")]
+            active = summary.get("opening_price_active_symbol_count")
+            invalid_coverage = (
+                policy != OPENING_PROVISIONAL_REFERENCE_POLICY
+                or spec.opening_reference_policy != policy
+                or summary.get("day_trade_opening_reference_policy_fingerprint") != hashlib.sha256(policy.encode()).hexdigest()
+                or type(active) is not int or active <= 0
+                or any(type(count) is not int or count < 0 for count in counts)
+                or any(type(summary.get(key)) is not int for key in (
+                    "opening_input_resolved_count", "opening_input_required_count"))
+                or sum(counts) != active
+                or summary.get("opening_input_resolved_count") != active
+                or summary.get("opening_input_required_count") != active
+                or summary.get("live_session_open_reference_applied") is not True
+            )
         if invalid_coverage or inputs_ready is False or (inputs_ready is None and summary.get("opening_source_complete") is False):
             # Recoverable acquisition wait, not a model-selected cash day.
             # Do not consume the signal or create orders from incomplete input.
@@ -4092,18 +4246,18 @@ class TwDayTradeSimulationEngine:
             self._persist(observed)
             return "waiting_source"
         mode.pop("opening_missing_symbols", None)
-        if not bool(summary.get("live_session_open_feature_applied")):
+        if not bool(summary.get("live_session_open_feature_applied")) and not provisional_reference:
             return self._block_signal(
                 mode, signal_id, "open_feature_not_observed", observed
             )
         if str(
             mode.get("session_date") or ""
-        ) == observed.date().isoformat() and mode.get("entry_completed_at"):
+        ) == observed.date().isoformat() and mode.get("entry_completed_at") and not progressive_revision:
             return self._block_signal(
                 mode, signal_id, "daily_signal_already_consumed", observed
             )
         carrying_positions = [p for p in (mode.get("positions") or {}).values() if int(p.get("signed_shares") or 0)]
-        if spec.strict_intraday and carrying_positions:
+        if spec.strict_intraday and carrying_positions and not progressive_revision:
             # A prior-day failure is a liquidation obligation, not today's
             # target inventory. Preserve its ledger and close it before any
             # new risk, even if today's model requests the same direction.
@@ -4120,7 +4274,7 @@ class TwDayTradeSimulationEngine:
             carrying_positions = []
         margin_rebalance = bool(carrying_positions and spec.residual_margin_conversion
             and all(p.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT for p in carrying_positions))
-        if not margin_rebalance and any(
+        if not (margin_rebalance or progressive_revision) and any(
             int(position.get("signed_shares") or 0) != 0
             for position in (mode.get("positions") or {}).values()
         ):
@@ -4315,6 +4469,13 @@ class TwDayTradeSimulationEngine:
         if prior_session_date and prior_session_date != observed.date().isoformat():
             self._archive_mode_positions(mode, archived_at=observed)
 
+        if progressive_revision:
+            # Reconciliation mutates actual FIFO inventory before building the
+            # append batches. Crash/exception evidence must PRECEDE that work.
+            self._register_commit_started = True
+            self._event("signal_commit_started", recorded_at=observed,
+                market=spec.market, session_date=observed.date().isoformat(), signal_id=signal_id)
+
         mode["session_date"] = observed.date().isoformat()
         mode.pop("entry_sweep_completed_at", None)
         mode["entry_post_0901_minute_price_fill_count"] = 0
@@ -4323,8 +4484,10 @@ class TwDayTradeSimulationEngine:
         mode.pop("non_session_invalidation_reason", None)
         mode["blocked_reason"] = None
         mode["signal_id"] = signal_id
-        mode["signal_at"] = signal_at.isoformat(timespec="seconds")
-        mode["source_signal_at"] = source_signal_at.isoformat(timespec="seconds")
+        mode["signal_at"] = signal_at.isoformat(timespec=timestamp_precision)
+        mode["day_trade_signal_update_policy"] = spec.signal_update_policy
+        mode["opening_signal_revision"] = dict(summary.get("opening_signal_revision") or {})
+        mode["source_signal_at"] = source_signal_at.isoformat(timespec=timestamp_precision)
         mode["counterfactual_open_replay"] = bool(counterfactual_open_replay)
         # A replay has two different clocks: the immutable model decision time
         # and the paper ledger time at which the already-observed session open
@@ -4381,6 +4544,9 @@ class TwDayTradeSimulationEngine:
         mode["entry_fill_policy"] = spec.entry_fill_policy
         # Session semantics are frozen at registration, not relabelled by a
         # later config read/restart. Individual later fills also carry this ABI.
+        mode["opening_reference_policy"] = summary.get("day_trade_opening_reference_policy", OPENING_OBSERVED_REFERENCE_POLICY)
+        mode["opening_reference_policy_fingerprint"] = summary.get("day_trade_opening_reference_policy_fingerprint")
+        mode["opening_provisional_reference_active_count"] = summary.get("opening_provisional_reference_active_count", 0)
         mode["entry_price_guard_contract"] = ENTRY_PRICE_GUARD_CONTRACT
         mode["entry_price_guard_rejection_counts"] = {}
         mode["execution_realism_contract"] = EXECUTION_REALISM_CONTRACT if spec.uses_realistic_execution else None
@@ -4415,7 +4581,15 @@ class TwDayTradeSimulationEngine:
         mode["counterfactual_open_price_fill"] = bool(deterministic_official_open_fill)
         mode["entry_fill_has_synthetic_fallback"] = False
         mode.pop("execution_projection", None)
-        mode["positions"] = {p["position_id"]: p for p in carrying_positions} if margin_rebalance else {}
+        # Same-session revisions retain CLOSED cohorts too: realized P&L and
+        # lifecycle rows must not disappear when a new target arrives.
+        mode["positions"] = (dict(mode.get("positions") or {}) if progressive_revision else
+                             {p["position_id"]: p for p in carrying_positions} if margin_rebalance else {})
+        superseded_orders = [dict(order) for order in (mode.get("pending_entry_orders") or {}).values()
+                             if progressive_revision and order.get("status") in {"working", "waiting_source"}]
+        superseded_reductions = [dict(order, symbol=symbol)
+            for symbol, order in (mode.get("pending_reduction_orders") or {}).items()
+            if progressive_revision and order.get("status") == "working"]
         mode["pending_entry_orders"] = {}
         # Historical minute replay freezes one signed inventory target at
         # 09:00.  Reductions are orders too: if the 09:01 bar cannot absorb
@@ -4442,6 +4616,20 @@ class TwDayTradeSimulationEngine:
         signal_records: list[dict[str, Any]] = []
         order_records: list[dict[str, Any]] = []
         fill_records: list[dict[str, Any]] = []
+        for order in superseded_orders:
+            template = order.get("position") or {}
+            order_records.append({"recorded_at": observed.isoformat(),
+                "session_date": observed.date().isoformat(), "market": spec.market,
+                "symbol": template.get("symbol"), "position_id": template.get("position_id"),
+                "signal_id": signal_id, "purpose": "superseded_signal_revision",
+                "status": "cancelled_signal_revision", "quantity": order.get("remaining_shares"),
+                "simulation_only": True})
+        for order in superseded_reductions:
+            order_records.append({"recorded_at": observed.isoformat(),
+                "session_date": observed.date().isoformat(), "market": spec.market,
+                "symbol": order["symbol"], "signal_id": signal_id,
+                "purpose": "superseded_reduction_revision", "status": "cancelled_signal_revision",
+                "quantity": order.get("remaining_shares"), "simulation_only": True})
 
         plans = [
             _prepare_entry_plan(
@@ -4457,11 +4645,12 @@ class TwDayTradeSimulationEngine:
             for row in signal_rows
             if str(row.get("symbol") or "")
         ]
-        if margin_rebalance:
+        if margin_rebalance or progressive_revision:
             plans = self._reconcile_margin_targets(
                 mode, plans, quotes=quotes, spec=spec, signal_at=signal_at,
                 observed=observed, allow_quote_at_signal=counterfactual_open_replay,
                 order_records=order_records, fill_records=fill_records,
+                preserve_brackets=progressive_revision,
             )
         if spec.uses_realistic_execution and plans:
             # Reserve full notional for BOTH directions: short-sale proceeds
@@ -4475,11 +4664,11 @@ class TwDayTradeSimulationEngine:
             ])
             funded = _scale_lot_buys_to_budget_with_fixed_fees(
                 desired, prices, np.asarray([p.get("quantity_step_shares", spec.lot_size) for p in plans]), rates,
-                budget=max(0.0, sizing_nav - sum(
-                    abs(int(p.get("signed_shares") or 0)) * (_finite(quotes[p["symbol"]].get("open")) or float(p["last_mark_price"]))
+                budget=(_progressive_funding_headroom(mode) if progressive_revision else max(0.0, sizing_nav - sum(
+                    abs(int(p.get("signed_shares") or 0)) * (_finite((quotes.get(p["symbol"]) or {}).get("open")) or float(p["last_mark_price"]))
                     for p in carrying_positions
                 ) - sum(float(r.get("fee_and_tax_twd") or 0) for r in fill_records)
-                    - float(mode.get("corporate_action_receivable_twd") or 0.0)),
+                    - float(mode.get("corporate_action_receivable_twd") or 0.0))),
                 minimum_commission=0.0, commission_rounding="none",
             )
             for plan, quantity in zip(plans, funded):
@@ -4495,6 +4684,10 @@ class TwDayTradeSimulationEngine:
                             "counterfactual_0901_price_fill", "counterfactual_open_price_fill",
                             "prior_paper_fill_reused"):
                     plan[key] = False
+        mode["signal_inventory_targets"] = ({p["symbol"]:
+            p.get("target_signed_shares", int(p["requested_shares"]) * (1 if p["side"] == "long" else -1))
+            for p in plans} if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE else {})
+        for plan in plans:
             row = plan["row"]
             symbol = plan["symbol"]
             target_weight = float(plan["target_weight"])
@@ -4516,7 +4709,7 @@ class TwDayTradeSimulationEngine:
             effective_entry_at = (
                 str(prior_paper_fill_at)
                 if plan.get("prior_paper_fill_reused")
-                else observed.isoformat(timespec="seconds")
+                else observed.isoformat(timespec=timestamp_precision)
             )
             offset_ticks = int(spec.price_limit_offset_ticks)
             filled_weight = (
@@ -4528,15 +4721,22 @@ class TwDayTradeSimulationEngine:
                 else 0.0
             )
             signal_record = {
-                "recorded_at": observed.isoformat(timespec="seconds"),
+                "recorded_at": observed.isoformat(timespec=timestamp_precision),
                 "session_date": observed.date().isoformat(),
                 "market": spec.market,
                 "signal_source_path": summary.get("summary_path"),
                 "signal_market": spec.signal_market or spec.market,
                 "price_limit_offset_ticks": offset_ticks,
                 "signal_id": signal_id,
-                "signal_at": signal_at.isoformat(timespec="seconds"),
-                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
+                "day_trade_signal_update_policy": spec.signal_update_policy,
+                "opening_signal_revision": dict(summary.get("opening_signal_revision") or {}),
+                "opening_reference_policy": summary.get("day_trade_opening_reference_policy", OPENING_OBSERVED_REFERENCE_POLICY),
+                "opening_reference_policy_fingerprint": summary.get("day_trade_opening_reference_policy_fingerprint"),
+                "model_input_price_basis": row.get("model_input_price_basis"),
+                "model_input_price_source_date": row.get("model_input_price_source_date"),
+                "model_input_price_is_provisional": bool(row.get("model_input_price_is_provisional")),
+                "signal_at": signal_at.isoformat(timespec=timestamp_precision),
+                "source_signal_at": source_signal_at.isoformat(timespec=timestamp_precision),
                 "open_reconstructed_at": (
                     signal_at.isoformat(timespec="seconds")
                     if counterfactual_open_replay
@@ -4622,6 +4822,7 @@ class TwDayTradeSimulationEngine:
                     "quote_after_local_observation",
                     "account_nav_budget_exhausted",
                     "waiting_non_trial_quote",
+                    "waiting_opposite_inventory_reduction",
                 }
             )
             historical_minute_retryable = (
@@ -4675,6 +4876,10 @@ class TwDayTradeSimulationEngine:
             entry_rebate = filled_shares * entry_price * rebate_rate if filled_shares else 0.0
             entry_fee = entry_gross_fee - entry_rebate
             position_id = f"{spec.market}:{observed.date().isoformat()}:{symbol}"
+            if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE:
+                # One acquisition cohort per immutable decision. A later
+                # addition/reversal must never overwrite earlier realized P&L.
+                position_id += f":{signal_id}"
             entry_order_id = f"{position_id}:entry"
             position = {
                 "position_id": position_id,
@@ -4682,8 +4887,8 @@ class TwDayTradeSimulationEngine:
                 "signal_market": spec.signal_market or spec.market,
                 "session_date": observed.date().isoformat(),
                 "signal_id": signal_id,
-                "signal_at": signal_at.isoformat(timespec="seconds"),
-                "source_signal_at": source_signal_at.isoformat(timespec="seconds"),
+                "signal_at": signal_at.isoformat(timespec=timestamp_precision),
+                "source_signal_at": source_signal_at.isoformat(timespec=timestamp_precision),
                 "open_reconstructed_at": (
                     signal_at.isoformat(timespec="seconds")
                     if counterfactual_open_replay
@@ -4924,6 +5129,11 @@ class TwDayTradeSimulationEngine:
         entry_unfilled_shares = max(0, entry_requested_shares - entry_filled_shares)
         entry_fill_count = sum(r.get("purpose") == "entry" for r in fill_records)
         mode["rebalance_reduction_fill_count"] = sum(r.get("purpose") == "next_signal_inventory_delta" for r in fill_records)
+        if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE:
+            mode["signal_reductions"] = {p["symbol"]: {
+                "requested_shares": int(p.get("reduction_requested_shares") or 0),
+                "filled_shares": int(p.get("reduction_filled_shares") or 0)}
+                for p in plans if p.get("reduction_requested_shares")}
         entry_best_quote_fill_count = sum(
             int(plan.get("filled_shares") or 0) > 0
             and not bool(plan.get("synthetic_fill"))
@@ -5028,13 +5238,12 @@ class TwDayTradeSimulationEngine:
         # One signal is one logical append transaction per ledger.  The compact
         # start marker is fsynced first so an interrupted transaction can never
         # be mistaken for a never-seen signal and executed twice after restart.
-        self._event(
-            "signal_commit_started",
-            recorded_at=observed,
-            market=spec.market,
-            session_date=observed.date().isoformat(),
-            signal_id=signal_id,
-        )
+        if not progressive_revision:
+            self._register_commit_started = True
+            self._event(
+                "signal_commit_started", recorded_at=observed, market=spec.market,
+                session_date=observed.date().isoformat(), signal_id=signal_id,
+            )
         try:
             _append_jsonl_many(self.signals_path, signal_records)
             _append_jsonl_many(self.orders_path, order_records)
@@ -5640,6 +5849,105 @@ class TwDayTradeSimulationEngine:
                 timespec="seconds"
             )
 
+    def _retry_revision_reduction_orders(self, mode, quotes, now):
+        """Continue causal FIFO reductions, sharing ordinary exit capacity.
+
+        One durable intent/batch protects against replay after a crash. An
+        interrupted reduction is quarantined by the existing recovery gate,
+        never guessed into an addition or repeated at yesterday's price.
+        """
+        if (mode.get("day_trade_signal_update_policy") != SIGNAL_UPDATE_PROGRESSIVE
+                or mode.get("session_date") != now.date().isoformat()):
+            return
+        orders = mode.get("pending_reduction_orders") or {}
+        if now.time() >= EXIT_LIMIT_TIME:
+            cancelled = []
+            for order in orders.values():
+                if order.get("status") == "working":
+                    order["status"] = "cancelled_exit_priority"
+                    cancelled.append({"kind": "reduction", "shares": order.get("remaining_shares")})
+            for symbol, order in (mode.get("pending_entry_orders") or {}).items():
+                if order.get("status") in {"working", "waiting_source"}:
+                    order["status"] = "cancelled_exit_priority"
+                    cancelled.append({"kind": "entry", "symbol": symbol, "shares": order.get("remaining_shares")})
+            if cancelled:
+                self._event("signal_revision_exit_priority", recorded_at=now,
+                    market=mode["market"], signal_id=mode.get("signal_id"), cancelled=cancelled)
+            mode["pending_reduction_shares"] = 0
+            mode["pending_entry_shares"] = 0
+            mode["pending_entry_source_count"] = 0
+            return
+        signal_at = _parse_timestamp(mode.get("signal_at"))
+        if signal_at is None:
+            return
+        candidates = []
+        for symbol, order in orders.items():
+            if order.get("status") != "working":
+                continue
+            lots = sorted([p for p in mode["positions"].values()
+                           if p["symbol"] == symbol and int(p.get("signed_shares") or 0)],
+                          key=lambda p: str(p["entry_at"]))
+            held = sum(int(p["signed_shares"]) for p in lots)
+            target = int(order["target_signed_shares"])
+            remaining = (max(0, abs(held) - abs(target)) if held * target > 0 else abs(held))
+            order["remaining_shares"] = remaining
+            if not remaining:
+                order["status"] = "filled"
+                continue
+            quote = dict(quotes.get(symbol) or {})
+            price = _finite(quote.get("bid" if held > 0 else "ask"))
+            if (price is None or not self._fresh_regular_quote(quote, now)
+                    or not _quote_after_signal(quote, signal_at)):
+                order["last_wait_reason"] = "waiting_causal_reduction_quote"
+                continue
+            if any(not float(p["lower_limit"]) <= price <= float(p["upper_limit"]) for p in lots):
+                order["last_wait_reason"] = "reduction_price_outside_limits"
+                continue
+            if not bool(price_on_tick_grid_numpy(np.array([price]), np.array([now.date()]),
+                    security_types=lots[0].get("security_type") or "stock")[0]):
+                continue
+            sequence = int(order.get("sequence") or 0) + 1
+            candidates.append((symbol, order, lots, remaining, quote, price, sequence))
+        if not candidates:
+            mode["pending_reduction_shares"] = sum(int(o.get("remaining_shares") or 0)
+                for o in orders.values() if o.get("status") == "working")
+            return
+        mode["entry_retry_pending_commit"] = {
+            "contract": "progressive_fifo_reduction_batch_v1", "signal_id": mode["signal_id"],
+            "order_ids": [f"{p['position_id']}:{mode['signal_id']}:reduction:{seq}"
+                          for _, _, lots, _, _, _, seq in candidates for p in lots]}
+        self._persist(now)
+        order_rows, fill_rows = [], []
+        try:
+            for symbol, order, lots, remaining, quote, price, sequence in candidates:
+                before_remaining = remaining
+                for position in lots:
+                    if not remaining:
+                        break
+                    before = abs(int(position["signed_shares"]))
+                    self._close_position(position, mode, price=price, quote=quote, now=now,
+                        reason="next_signal_inventory_delta", order_type="MKT", quantity=remaining,
+                        ledger_order_id=f"{position['position_id']}:{mode['signal_id']}:reduction:{sequence}",
+                        ledger_rows=(order_rows, fill_rows))
+                    remaining -= before - abs(int(position["signed_shares"]))
+                order.update(remaining_shares=remaining, sequence=sequence,
+                             status="working" if remaining else "filled")
+                progress = mode.setdefault("signal_reductions", {}).setdefault(symbol,
+                    {"requested_shares": int(order["requested_shares"]), "filled_shares": 0})
+                progress["filled_shares"] += before_remaining - remaining
+            _append_jsonl_many(self.orders_path, order_rows)
+            _append_jsonl_many(self.fills_path, fill_rows)
+            mode["rebalance_reduction_fill_count"] = int(mode.get("rebalance_reduction_fill_count") or 0) + len(fill_rows)
+            mode.pop("entry_retry_pending_commit", None)
+            mode["pending_reduction_shares"] = sum(int(o["remaining_shares"])
+                for o in orders.values() if o.get("status") == "working")
+            self._persist(now)
+        except Exception:
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            mode["ledger_state_divergence"] = {"kind": "progressive_reduction_commit_failed",
+                "signal_id": mode["signal_id"]}
+            raise
+
     def _size_pending_opening_orders(self, mode, quotes, now):
         """Resolve only unsized names, retaining the published weights and NAV.
 
@@ -5665,14 +5973,15 @@ class TwDayTradeSimulationEngine:
                 continue
             template = order["position"]
             side = template["side"]
-            if (side == "long" and opening == upper) or (side == "short" and opening == lower):
+            progressive = mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+            if not progressive and ((side == "long" and opening == upper) or (side == "short" and opening == lower)):
                 order["last_wait_reason"] = "opening_direction_at_daily_limit"
                 continue
             quantity = whole_lot_target_shares(
                 float(template["target_weight"]), float(mode["session_sizing_nav_twd"]),
                 opening, int(template["lot_size"]),
             )
-            if quantity <= 0:
+            if quantity <= 0 and not progressive:
                 order.update(status="skipped_below_one_board_lot", sizing_pending=False)
                 continue
             security = template.get("security_type") or "stock"
@@ -5696,8 +6005,27 @@ class TwDayTradeSimulationEngine:
                 take_profit_price=take_profit, stop_trigger_price=stop_trigger,
                 entry_price=opening, last_mark_price=opening,
             )
+            if progressive:
+                held = sum(int(p.get("signed_shares") or 0) for p in mode["positions"].values()
+                           if p.get("symbol") == symbol)
+                target = quantity * (1 if side == "long" else -1)
+                reduce = max(0, abs(held) - abs(target)) if held * target > 0 else abs(held)
+                if reduce:
+                    mode.setdefault("pending_reduction_orders", {})[symbol] = {
+                        "remaining_shares": reduce, "requested_shares": reduce,
+                        "target_signed_shares": target, "status": "working", "sequence": 0,
+                        "signal_at": signal_at.isoformat(timespec="microseconds")}
+                    mode.setdefault("signal_reductions", {})[symbol] = {
+                        "requested_shares": reduce, "filled_shares": 0}
+                quantity = (max(0, abs(target) - abs(held)) if target * held >= 0 else abs(target))
+                mode.setdefault("signal_inventory_targets", {})[symbol] = target
+                template.update(requested_shares=quantity, target_unsubmitted_shares=quantity)
+                mode["pending_reduction_shares"] = sum(int(o.get("remaining_shares") or 0)
+                    for o in (mode.get("pending_reduction_orders") or {}).values() if o.get("status") == "working")
             order.update(status="working", sizing_pending=False, remaining_shares=quantity,
                          sized_at=now.isoformat(), sizing_quote_at=quote.get("quote_at"))
+            if not quantity:
+                order["status"] = "inventory_target_retained"
             mode["entry_requested_shares"] = int(mode.get("entry_requested_shares") or 0) + quantity
             mode["entry_unfilled_shares"] = int(mode.get("entry_unfilled_shares") or 0) + quantity
         mode["pending_entry_source_count"] = sum(o.get("status") == "waiting_source" for o in orders.values())
@@ -5876,6 +6204,20 @@ class TwDayTradeSimulationEngine:
                 continue
             template = order["position"]
             existing = mode["positions"].get(template["position_id"])
+            if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE and any(
+                    p.get("symbol") == symbol and p.get("stop_triggered_at")
+                    and (int(p.get("signed_shares") or 0) != 0
+                         or (_parse_timestamp(p.get("last_exit_at")) or signal_at) >= signal_at)
+                    for p in mode["positions"].values()):
+                order["status"] = "cancelled_exit_priority"
+                order["last_wait_reason"] = "existing_stop_exit_priority"
+                continue
+            if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE and any(
+                    p.get("symbol") == symbol and int(p.get("signed_shares") or 0)
+                    * (1 if template["side"] == "long" else -1) < 0
+                    for p in mode["positions"].values()):
+                order["last_wait_reason"] = "waiting_opposite_inventory_reduction"
+                continue
             if existing and (existing.get("last_exit_at") or existing.get("stop_triggered_at")):
                 order["status"] = "cancelled_exit_priority"
                 continue
@@ -5949,6 +6291,11 @@ class TwDayTradeSimulationEngine:
             + float(position.get("entry_fee_twd") or 0)
             for position in mode["positions"].values()
         )
+        if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE:
+            # The headroom already withholds unpaid receivables; the common
+            # per-order budget below subtracts that amount once, not twice.
+            reserved = (float(mode["session_sizing_nav_twd"]) - _progressive_funding_headroom(mode)
+                        - float(mode.get("corporate_action_receivable_twd") or 0))
         for symbol, order, quote, price in candidates:
             template = order["position"]
             side = str(template["side"])
@@ -6237,6 +6584,7 @@ class TwDayTradeSimulationEngine:
                 self._submit_closing_auction_limits(market, mode, observed)
                 self._settle_closing_auction(market, mode, quotes, observed)
                 self._convert_residual_to_carry(market, mode, quotes, observed)
+            self._retry_revision_reduction_orders(mode, quotes, observed)
             self._retry_entry_orders(mode, quotes, observed)
             self._mark_mode(
                 market,
@@ -6279,7 +6627,9 @@ class TwDayTradeSimulationEngine:
             # triggers the stop. Once triggered, recovery cannot disarm it.
             adverse_prices = [p for p in (last, bid if side == "long" else ask) if p is not None]
             if any(p <= stop if side == "long" else p >= stop for p in adverse_prices):
-                position.setdefault("stop_triggered_at", now.isoformat(timespec="seconds"))
+                position.setdefault("stop_triggered_at", now.isoformat(timespec=(
+                    "microseconds" if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+                    else "seconds")))
                 position["stop_order_status"] = "triggered_waiting_liquidity"
         tp_hit = (side == "long" and bid is not None and bid >= take_profit) or (
             side == "short" and ask is not None and ask <= take_profit
@@ -6321,7 +6671,9 @@ class TwDayTradeSimulationEngine:
         ):
             return
         position["stop_order_status"] = "triggered_waiting_liquidity"
-        position.setdefault("stop_triggered_at", now.isoformat(timespec="seconds"))
+        position.setdefault("stop_triggered_at", now.isoformat(timespec=(
+            "microseconds" if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+            else "seconds")))
         executable = bid if side == "long" else ask
         capacity_fn = _top_book_capacity_shares if strict and now.time() < FIRST_MINUTE_EXECUTION_TIME else _executable_capacity_shares
         capacity = capacity_fn(
@@ -7167,6 +7519,7 @@ class TwDayTradeSimulationEngine:
         quotes: Mapping[str, Mapping[str, Any]], spec: ModeSpec,
         signal_at: datetime, observed: datetime, allow_quote_at_signal: bool,
         order_records: list[dict[str, Any]], fill_records: list[dict[str, Any]],
+        preserve_brackets: bool = False,
     ) -> list[dict[str, Any]]:
         """FIFO reductions before additions, one capacity budget per symbol.
 
@@ -7188,6 +7541,12 @@ class TwDayTradeSimulationEngine:
                     spec=spec, sizing_nav_twd=nav, allow_quote_at_signal=allow_quote_at_signal)
                 plans.append(plan)
             held = sum(int(p["signed_shares"]) for p in lots)
+            if preserve_brackets and plan["target_weight"] and plan["sizing_price"] is None:
+                # An unknown target quantity is not a zero target. Keep the
+                # existing inventory and retry after a real sizing open arrives.
+                plan.update(previous_signed_shares=held, target_signed_shares=None,
+                            requested_shares=0, filled_shares=0)
+                continue
             if held % spec.lot_size and spec.odd_lot_execution_policy == "assumed_odd_lot_at_regular_board_price_v1":
                 plan["quantity_step_shares"] = 1
             if any(int(p["signed_shares"]) * held <= 0 for p in lots):
@@ -7206,7 +7565,8 @@ class TwDayTradeSimulationEngine:
                      if key != "historical_prior_paper_fill"}
                     if spec.historical_full_fill_at_0901 else quote
                 )
-                reducing = _prepare_entry_plan({"symbol": symbol, "target_weight": -1.0 if held > 0 else 1.0},
+                reducing = _prepare_entry_plan({"symbol": symbol, "target_weight": -1.0 if held > 0 else 1.0,
+                    "open_price": lots[0].get("sizing_open_price")},
                     quote=reduction_quote, evidence=None, signal_at=signal_at, observation_at=observed,
                     spec=spec, sizing_nav_twd=nav, allow_quote_at_signal=allow_quote_at_signal,
                     requested_shares_override=reduce, reduce_only=True)
@@ -7230,7 +7590,7 @@ class TwDayTradeSimulationEngine:
                             now=observed, reason="next_signal_inventory_delta",
                             order_type="PAPER_0901_MINUTE_PRICE" if allow_quote_at_signal else "MKT",
                             quantity=take, ledger_session_date=observed.date().isoformat(),
-                            ledger_order_id=f"{p['position_id']}:{observed.date()}:target_delta",
+                            ledger_order_id=f"{p['position_id']}:{mode['signal_id'] if preserve_brackets else observed.date()}:target_delta",
                             ledger_rows=(order_records, fill_records))
                         actual = before - abs(int(p["signed_shares"]))
                         reduction_filled += actual
@@ -7240,11 +7600,10 @@ class TwDayTradeSimulationEngine:
             reduction_remaining = max(0, reduce - reduction_filled)
             if (
                 reduction_remaining
-                and allow_quote_at_signal
-                and mode.get("simulation_replay") is True
-                and spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
-                and mode.get("entry_fill_contract")
-                == REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
+                and (preserve_brackets or (allow_quote_at_signal
+                    and mode.get("simulation_replay") is True
+                    and spec.entry_fill_policy == ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                    and mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE))
             ):
                 mode["pending_reduction_orders"][symbol] = {
                     "remaining_shares": reduction_remaining,
@@ -7254,6 +7613,7 @@ class TwDayTradeSimulationEngine:
                     "sequence": 0,
                     "minute": observed.strftime("%Y-%m-%dT%H:%M"),
                     "minute_used_shares": reduction_filled,
+                    "signal_at": signal_at.isoformat(timespec="microseconds"),
                 }
             addition = max(0, abs(target) - abs(remaining)) if target * remaining >= 0 else 0
             # A failed reduction may not be bypassed by opening the other side.
@@ -7276,15 +7636,27 @@ class TwDayTradeSimulationEngine:
             if plan["status"] not in {"ready", "partial_depth"}:
                 capacity = 0
             capacity = max(0, capacity - reduction_filled)
+            if preserve_brackets and remaining and target * remaining < 0:
+                capacity = 0  # Never hold both directions while reduction waits.
+            if preserve_brackets and addition and any(p.get("stop_triggered_at")
+                    and int(p.get("signed_shares") or 0) for p in lots):
+                capacity = 0
+                plan.update(status="skipped", reason="existing_stop_exit_priority")
             plan["filled_shares"] = min(addition, capacity)
             if not plan["filled_shares"]:
-                if addition and plan["reason"] in ENTRY_PRICE_GUARD_REASONS:
+                if addition and (plan["reason"] in ENTRY_PRICE_GUARD_REASONS
+                                 or plan["reason"] == "existing_stop_exit_priority"):
                     # An inventory reduction must not erase a rejected new
                     # entry or turn it into a retryable capacity shortage.
                     plan["status"] = "skipped"
                 elif reduction_remaining and addition:
                     plan["status"] = "blocked"
-                    plan["reason"] = "observed_09_01_minute_capacity_exhausted"
+                    plan["reason"] = ("waiting_opposite_inventory_reduction" if preserve_brackets
+                                      else "observed_09_01_minute_capacity_exhausted")
+                elif addition and preserve_brackets:
+                    # A stale/missing quote for an addition remains retryable;
+                    # retaining older inventory does not mean the target is met.
+                    pass
                 else:
                     plan["status"] = "hold" if reduction_filled == reduce else "blocked"
                     plan["reason"] = "inventory_target_retained" if reduction_filled == reduce else "inventory_reduction_incomplete"
@@ -7294,6 +7666,11 @@ class TwDayTradeSimulationEngine:
                 if not int(p.get("signed_shares") or 0):
                     continue
                 p["current_target_signal_id"] = mode["signal_id"]
+                if preserve_brackets:
+                    # A new target is not permission to re-arm a triggered stop
+                    # or move an acquisition cohort's original weight/bracket.
+                    p["current_target_weight"] = plan["target_weight"]
+                    continue
                 p["target_weight"] = plan["target_weight"]
                 p["status"] = "margin_inventory_active"
                 p["take_profit_order_status"] = "working"
@@ -7537,7 +7914,9 @@ class TwDayTradeSimulationEngine:
             {
                 "signed_shares": direction * remaining_after,
                 "status": "closed" if fully_closed else "partially_closed",
-                "last_exit_at": now.isoformat(timespec="seconds"),
+                "last_exit_at": now.isoformat(timespec=(
+                    "microseconds" if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+                    else "seconds")),
                 "last_exit_quote_at": quote.get("quote_at"),
                 "last_exit_price": float(price),
                 "last_exit_quantity": fill_quantity,
@@ -7881,11 +8260,31 @@ class TwDayTradeSimulationEngine:
         persist_started = perf_counter()
         self.last_persist_metrics = None
         writes: list[dict[str, Any]] = []
+        journal_generations = paper_journal_generations(self.state_dir)
+        group_sync_ms = 0.0
 
         def publish(path: Path, payload: Mapping[str, Any]) -> None:
+            nonlocal group_sync_ms
             timing: dict[str, Any] = {}
-            _atomic_json(path, payload, timings=timing)
-            writes.append(timing)
+            commit = path == self.service_sync_path
+            if path.parent != self.state_dir:
+                raise ValueError("paper commit group must share its authoritative directory")
+            if commit:
+                if paper_journal_generations(self.state_dir) != journal_generations:
+                    raise OSError("paper journals changed during commit publication")
+                group_started = perf_counter()
+                # All prior payloads are individually file-fsynced. One
+                # namespace barrier makes them durable BEFORE publishing the
+                # commit marker; the marker keeps its own directory barrier.
+                _fsync_directory(self.state_dir)
+                group_sync_ms = (perf_counter() - group_started) * 1000.0
+            if commit:
+                ack_timing: dict[str, Any] = {}
+                _publish_service_sync(path, payload, timings=timing, ack_timings=ack_timing)
+                writes.extend((timing, ack_timing))
+            else:
+                _atomic_json(path, payload, timings=timing, sync_directory=False)
+                writes.append(timing)
 
         # A live process can replay a 09:01 financial event at 11:00. Its
         # liveness/commit publication time is not that historical event time.
@@ -7901,12 +8300,26 @@ class TwDayTradeSimulationEngine:
                 else sorted((self.state.get("modes") or {}).keys())
             )
         ]
+        from stockagent.live.opening_execution_latency import inventory_rebalance_quantities
+        for market in active_markets:
+            mode = self.state.get("modes", {}).get(market) or {}
+            if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE:
+                mode["inventory_rebalance"] = inventory_rebalance_quantities(mode)
         material_projection = {
+            "contract": "dashboard_material_without_private_order_templates_v2",
             "enabled_markets": active_markets,
             "configuration_errors": self.state.get("configuration_errors") or {},
             "modes": {
                 market: {
-                    key: value
+                    # Pending acquisition templates are private future
+                    # position payloads, not rendered material. Like actual
+                    # positions below, they remain COMPLETE in state.json;
+                    # keep every order status/quantity/reason/clock in this
+                    # invalidation key without rehashing thousands of nested
+                    # immutable templates on every mode/heartbeat commit.
+                    key: ({symbol: {field: item for field, item in order.items() if field != "position"}
+                           for symbol, order in value.items()}
+                          if key == "pending_entry_orders" and isinstance(value, Mapping) else value)
                     for key, value in (
                         self.state.get("modes", {}).get(market) or {}
                     ).items()
@@ -7916,15 +8329,7 @@ class TwDayTradeSimulationEngine:
             },
             "benchmarks": self.state.get("benchmarks") or {},
         }
-        material_fingerprint = hashlib.sha256(
-            json.dumps(
-                material_projection,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode("utf-8")
-        ).hexdigest()
+        material_fingerprint = _dashboard_material_fingerprint(material_projection)
         fingerprint_completed = perf_counter()
         content_revision = int(self.state.get("dashboard_content_revision") or 0)
         if material_fingerprint != self.state.get("dashboard_content_fingerprint"):
@@ -8108,6 +8513,11 @@ class TwDayTradeSimulationEngine:
                             "exchange_fill_guaranteed",
                             "entry_fill_policy",
                             "configured_entry_fill_policy",
+                            "day_trade_signal_update_policy",
+                            "configured_signal_update_policy",
+                            "opening_signal_revision",
+                            "inventory_rebalance",
+                            "simulation_replay",
                             "entry_price_guard_contract",
                             "configured_entry_price_guard_contract",
                             "entry_price_guard_rejection_counts",
@@ -8198,6 +8608,8 @@ class TwDayTradeSimulationEngine:
                 "configuration_errors": self.state.get("configuration_errors") or {},
                 "enabled_markets": enabled_markets,
                 "mode_count": len(mode_rows),
+                "journal_generations": journal_generations,
+                "projection_generations": paper_projection_generations(self.state_dir),
                 "modes": {
                     str(item.get("market")): {
                         key: item.get(key)
@@ -8209,6 +8621,11 @@ class TwDayTradeSimulationEngine:
                             "entry_completed_at",
                             "entry_fill_policy",
                             "configured_entry_fill_policy",
+                            "day_trade_signal_update_policy",
+                            "configured_signal_update_policy",
+                            "opening_signal_revision",
+                            "inventory_rebalance",
+                            "simulation_replay",
                             "entry_price_offset_ticks",
                             "engine_status",
                             "checkpoint_ready",
@@ -8240,6 +8657,8 @@ class TwDayTradeSimulationEngine:
             "state_revision": revision,
             "total_ms": round((perf_counter() - persist_started) * 1000.0, 3),
             "projection_fingerprint_ms": round((fingerprint_completed - persist_started) * 1000.0, 3),
+            "group_directory_fsync_ms": round(group_sync_ms, 3),
+            "durability_contract": "file_fsync_group_directory_then_commit_marker_and_ack_v2",
             "files": writes,
         }
         # This observer follows the committed state, not the economic event's

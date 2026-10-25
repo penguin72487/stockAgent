@@ -425,30 +425,34 @@ def discovery_links(payload: bytes, kind: str, source, *, page_url: str | None =
         if not links:
             raise NewsError("publisher_index_no_matching_links")
         return list(dict.fromkeys(links))
-    soup = BeautifulSoup(payload, "xml")
-    if soup.find("parsererror"):
-        raise NewsError("invalid_discovery_xml")
-    links = []
-    if kind == "feed":
-        if not soup.find(["rss", "feed", "RDF"]):
-            raise NewsError("invalid_feed")
-        for item in soup.find_all(["item", "entry"]):
-            link = item.find("link", attrs={"rel": "alternate"}) or item.find("link")
-            if link:
-                url = link.get("href") or link.get_text(strip=True)
-                title = item.find("title")
-                date = item.find(["pubDate", "published", "updated"])
-                links.append((url, title.get_text() if title else "", date.get_text() if date else ""))
-    elif soup.find("sitemapindex"):
-        links = [(node.get_text(strip=True), "sitemap", "") for node in soup.select("sitemap > loc")]
-    elif soup.find("urlset"):
-        for item in soup.find_all("url"):
-            location = item.find("loc")
-            modified = item.find("lastmod")
-            if location:
-                links.append((location.get_text(strip=True), "", modified.get_text() if modified else ""))
+    if kind == 'sitemap' and payload.startswith(b'\x1f\x8b'):
+        from downloader.news_fulltext_sitemaps import gzip_sitemap_links
+        links = gzip_sitemap_links(payload)
     else:
-        raise NewsError("invalid_sitemap")
+        soup = BeautifulSoup(payload, "xml")
+        if soup.find("parsererror"):
+            raise NewsError("invalid_discovery_xml")
+        links = []
+        if kind == "feed":
+            if not soup.find(["rss", "feed", "RDF"]):
+                raise NewsError("invalid_feed")
+            for item in soup.find_all(["item", "entry"]):
+                link = item.find("link", attrs={"rel": "alternate"}) or item.find("link")
+                if link:
+                    url = link.get("href") or link.get_text(strip=True)
+                    title = item.find("title")
+                    date = item.find(["pubDate", "published", "updated"])
+                    links.append((url, title.get_text() if title else "", date.get_text() if date else ""))
+        elif soup.find("sitemapindex"):
+            links = [(node.get_text(strip=True), "sitemap", "") for node in soup.select("sitemap > loc")]
+        elif soup.find("urlset"):
+            for item in soup.find_all("url"):
+                location = item.find("loc")
+                modified = item.find("lastmod")
+                if location:
+                    links.append((location.get_text(strip=True), "", modified.get_text() if modified else ""))
+        else:
+            raise NewsError("invalid_sitemap")
     accepted = []
     for url, title, date in links:
         try:
@@ -468,6 +472,11 @@ def discovery_links(payload: bytes, kind: str, source, *, page_url: str | None =
 
 
 def seed_discovery(queue: NewsQueue):
+    with queue.metrics.measure('discovery_seed_maintenance'):
+        _seed_discovery(queue)
+
+
+def _seed_discovery(queue: NewsQueue):
     queue.sync_finite_cohorts()
     with queue.db:
         for source in queue.registry.sources.values():
@@ -597,10 +606,24 @@ def seed_discovery(queue: NewsQueue):
                     queue._cnyes_seed_signatures = seeds
 
 
-def discovery_fingerprint(source):
+def discovery_fingerprint(source, *, kind=None):
     fingerprint = (cnyes_bulk_fingerprint(source) if source.cnyes_apis
                    else source.fulltext_feed_data_fingerprint or source.data_fingerprint)
-    return _discovery_fingerprint(source, fingerprint)
+    result = _discovery_fingerprint(source, fingerprint)
+    if kind == 'sitemap':
+        from downloader.news_fulltext_sitemaps import GZIP_SITEMAP_CONTRACT_VERSION
+        result = hashlib.sha256((result + ':gzip-sitemap-v' + str(GZIP_SITEMAP_CONTRACT_VERSION)).encode()).hexdigest()
+    return result
+
+
+def sitemap_discovery_fingerprints(source):
+    """Keep successful plain-XML validators and original schedules usable.
+
+    The old parser could not accept gzip; its successful receipts therefore
+    describe supported plain XML. Adding gzip does not require replaying them.
+    Body/feed/index fingerprints and their deadlines are unchanged.
+    """
+    return discovery_fingerprint(source, kind='sitemap'), discovery_fingerprint(source)
 
 
 def _discovery_fingerprint(source, fingerprint):
@@ -645,7 +668,7 @@ def fetch_discovery(http: NewsHTTP, task: dict):
         raise NewsError("unregistered_bulk_api")  # reject before a network request
     headers = {}
     fingerprint = (source.metadata_feed_fingerprint if metadata else
-                   source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source))
+                   source.cnyes_index_data_fingerprint if index_task else discovery_fingerprint(source, kind=task['kind']))
     compatible = task.get("parser_fingerprint") == fingerprint
     if metadata:
         from downloader.news_fulltext_metadata_feeds import compatible_fingerprints as metadata_fingerprints
@@ -655,6 +678,8 @@ def fetch_discovery(http: NewsHTTP, task: dict):
         compatible = task.get('parser_fingerprint') in compatible_fingerprints(source)
     if task['kind'] == 'rss_fulltext':
         compatible = task.get('parser_fingerprint') in fulltext_feed_discovery_fingerprints(source)
+    if task['kind'] == 'sitemap':
+        compatible = task.get('parser_fingerprint') in sitemap_discovery_fingerprints(source)
     if task["etag"] and compatible:
         headers["If-None-Match"] = task["etag"]
     if task["last_modified"] and compatible:
@@ -916,7 +941,7 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                          (time.time() + delay,
                           response.headers.get("etag"), response.headers.get("last-modified"),
                           hashlib.sha256(response.body).hexdigest() if response.status == 200 else None,
-                          discovery_fingerprint(source) if response.status == 200 else None,
+                          discovery_fingerprint(source, kind=task['kind']) if response.status == 200 else None,
                           utc_now(), "bulk_response_contains_restricted_text" if restricted_page else
                           XML_BODY_METADATA_FALLBACK if rss_metadata_only else None, task["url"]))
         if (cnyes_page_info and not restricted_page and not records and errors
@@ -982,6 +1007,17 @@ def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
         retain_index_failure_response(queue, task, error)
 
 
+def refresh_disk_admission(queue, config):
+    """Publish the original admission sample; status reads never repeat statvfs."""
+    free = shutil.disk_usage(queue.root).free
+    required = math.ceil(config['min_free_disk_bytes'])  # Integer free bytes must meet the original threshold.
+    queue.disk_admission = {'contract_version': 1, 'checked_at_utc': utc_now(),
+        'free_bytes': free, 'required_free_bytes': required,
+        'shortfall_bytes': max(0, required-free), 'fetch_allowed': free >= required,
+        'automatic_recheck_seconds': math.ceil(max(10, config.get('service_idle_max_seconds', 60)))}
+    return not queue.disk_admission['fetch_allowed']
+
+
 def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: int, max_discovery_requests: int = 64,
               executor=None, max_run_seconds: float | None = None, provider_ids: set[str] | None = None,
               continuous_budgets: bool = False, refresh_metadata=None):
@@ -1023,6 +1059,9 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
             now = time.monotonic()
             if http.capacity_controller:
                 http.capacity_controller.tick()
+            # One O(providers) readiness snapshot per round. Long shared/client
+            # pacing waits belong in the scheduler, before any work is leased.
+            provider_deadlines = http.cooldown_snapshot()
             # Work limits are diagnostic bounds, not source quotas. A resident
             # owner renews its scheduling quantum without waiting for unrelated
             # publishers' slow responses. One queue writer and HTTP pacing stay
@@ -1049,7 +1088,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
             if not continuous_budgets and max_discovery_requests > 0 and discovery_budget_used >= max_discovery_requests:
                 for provider in provider_order:
                     source = queue.registry.sources[provider]
-                    if not (source.wordpress_apis or source.cnyes_apis or source.fulltext_feeds) or http.provider_not_before.get(provider, 0) > time.time():
+                    if not (source.wordpress_apis or source.cnyes_apis or source.fulltext_feeds) or provider_deadlines.get(provider, 0) > time.time():
                         continue
                     if not queue.bulk_allowed(source):
                         continue
@@ -1062,12 +1101,14 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
             draining = (http.stop.is_set() or max_run_seconds is not None and now - started >= max_run_seconds
                         or not continuous_budgets and max_articles > 0 and article_budget_used >= max_articles or bulk_rollover)
             if now - last_disk_check >= 10:
-                low_disk = shutil.disk_usage(queue.root).free < config["min_free_disk_bytes"]
+                low_disk = refresh_disk_admission(queue, config)
                 last_disk_check = now
             if (continuous_budgets and not draining and not low_disk and provider_ids is None
                     and now - last_reviewed_repair >= PUMP_INTERVAL_SECONDS):
                 from downloader.news_fulltext_repairs import consume_repairs
                 with queue.metrics.measure('reviewed_repair_admission'):
+                    from downloader.news_fulltext_url_metadata import consume_urls
+                    consume_urls(queue, stop=http.stop)
                     consume_repairs(queue, stop=http.stop)
                     from downloader.news_fulltext_candidate_diagnostics import pump_candidates
                     pump_candidates(queue, stop=http.stop)
@@ -1119,7 +1160,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 source = queue.registry.sources[provider]
                 if low_disk or len(futures) >= config["workers"] or active[provider] >= http.parallelism[provider]:
                     continue
-                if http.provider_not_before.get(provider, 0) > time.time():
+                if provider_deadlines.get(provider, 0) > time.time():
                     continue
                 excluded_origins = tuple(http.blocked_robots_origins(provider))
                 task = None
@@ -1202,7 +1243,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 from downloader.news_fulltext_candidate_diagnostics import claim_candidate, fetch_candidate
                 for provider in provider_order:
                     if (len(futures) >= config['workers'] or active[provider] >= http.parallelism[provider]
-                            or http.provider_not_before.get(provider, 0) > time.time()):
+                            or provider_deadlines.get(provider, 0) > time.time()):
                         continue
                     job = claim_candidate(queue, http, config, provider)
                     if job:
@@ -1271,7 +1312,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 with queue.metrics.measure("status_write"):
                     queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                                  run_seconds=now - started, accepted_this_run=accepted, activity="draining" if draining else "running",
-                                 provider_cooldowns=http.provider_not_before)
+                                 provider_cooldowns=http.cooldown_snapshot())
                 last_status = now
             if metadata_only:
                 # A local metadata backlog is work even with every publisher
@@ -1284,7 +1325,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     result = queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                           run_seconds=time.monotonic() - started, accepted_this_run=accepted,
                           activity="waiting_disk" if low_disk else "stopped" if http.stop.is_set() else "cycle_complete",
-                          provider_cooldowns=http.provider_not_before)
+                          provider_cooldowns=http.cooldown_snapshot())
     result["cycle"] = {"wall_seconds": time.monotonic() - started, "article_attempts_started": claimed,
                        "durably_accepted_versions": accepted, "discovery_attempts_started": discovery_claimed,
                        "http_requests": {p: count - requests_at_start.get(p, 0) for p, count in http.requests_by_provider.items()},
@@ -1294,6 +1335,37 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     result["http_counters_basis"] = "since current owner started; cycle contains separate deltas"
     atomic_write_json(queue.root / "status.json", result, durable=False, compact=True)
     return result
+
+
+def _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata):
+    """Keep local inventory moving without rebuilding a blocked HTTP cycle.
+
+    Disk admission keeps its configured wake; pending metadata keeps its
+    registered slice interval. Heartbeats retain the fifteen second cadence.
+    Neither local work nor a durable mailbox can bypass disk admission.
+    """
+    from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
+    until = time.monotonic() + delay
+    next_status = time.monotonic() + 15
+    next_metadata = time.monotonic() + METADATA_SLICE_INTERVAL_SECONDS
+    with queue.metrics.measure('idle_wait'):
+        while not http.stop.is_set() and time.monotonic() < until:
+            now = time.monotonic()
+            if (refresh_metadata and getattr(queue, 'metadata_inventory_pending', False)
+                    and now >= next_metadata):
+                refresh_metadata()
+                next_metadata = time.monotonic() + METADATA_SLICE_INTERVAL_SECONDS
+                if http.stop.is_set():
+                    break
+                now = time.monotonic()
+            if now >= next_status:
+                queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
+                             activity='waiting_disk', provider_cooldowns=http.cooldown_snapshot())
+                next_status = time.monotonic() + 15
+            deadline = min(until, next_status)
+            if refresh_metadata and getattr(queue, 'metadata_inventory_pending', False):
+                deadline = min(deadline, next_metadata)
+            mailbox.wait(max(0, deadline - time.monotonic()), enabled=False)
 
 
 def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: int, max_discovery_requests: int,
@@ -1330,16 +1402,19 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
             if http.stop.is_set():
                 break
             delay = (config.get("service_idle_max_seconds", 60) if result["activity"] == "waiting_disk"
-                     else queue.next_wake_delay(http.provider_not_before, config.get("service_idle_max_seconds", 60),
+                     else queue.next_wake_delay(http.cooldown_snapshot(), config.get("service_idle_max_seconds", 60),
                                                request_scope_cooldowns=http.request_scope_cooldown_snapshot()))
             # Even diagnostic work limits of zero must not spin continuously.
             if max_articles == 0 and max_discovery_requests == 0:
                 delay = max(1, delay)
-            if getattr(queue, 'metadata_inventory_pending', False):
+            if result['activity'] != 'waiting_disk' and getattr(queue, 'metadata_inventory_pending', False):
                 from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
                 delay = min(delay, METADATA_SLICE_INTERVAL_SECONDS)
             if remaining is not None:
                 delay = min(delay, max(0, duration_seconds - (time.monotonic() - started)))
+            if delay and result['activity'] == 'waiting_disk':
+                _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata)
+                continue
             if delay:
                 idle_until = time.monotonic() + delay
                 with queue.metrics.measure("idle_wait"):
@@ -1348,10 +1423,10 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
                             break
                         queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                                      activity="waiting_disk" if result["activity"] == "waiting_disk" else "waiting_next_due",
-                                     provider_cooldowns=http.provider_not_before)
+                                     provider_cooldowns=http.cooldown_snapshot())
                         if mailbox.wait(min(15, max(0, idle_until - time.monotonic())),
                                 enabled=result['activity'] != 'waiting_disk'):
                             break
     return queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                         activity="stopped" if http.stop.is_set() else "service_duration_complete",
-                        provider_cooldowns=http.provider_not_before)
+                        provider_cooldowns=http.cooldown_snapshot())

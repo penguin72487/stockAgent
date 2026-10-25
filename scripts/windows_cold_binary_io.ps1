@@ -2,8 +2,12 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:STOCKAGENT_BINARY_IO_CONFIG)) | ConvertFrom-Json
 $path = [IO.Path]::GetFullPath([string]$config.path)
+$completedStageRead = $config.mode -eq 'read' -and (
+    $path.StartsWith('D:\stockagent-completed-benchmark-scratch\', [StringComparison]::OrdinalIgnoreCase) -or
+    $path.StartsWith('D:\stockagent-completed-offline-scratch\', [StringComparison]::OrdinalIgnoreCase))
 if ((!$path.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -and
-     !$path.StartsWith('D:\stockagent-backup-ingress-lab203\', [StringComparison]::OrdinalIgnoreCase)) -or $path -ne [string]$config.path) {
+     !$path.StartsWith('D:\stockagent-backup-ingress-lab203\', [StringComparison]::OrdinalIgnoreCase) -and
+     !$completedStageRead) -or $path -ne [string]$config.path) {
     throw 'Fixed D cold namespace required'
 }
 $stream = $null

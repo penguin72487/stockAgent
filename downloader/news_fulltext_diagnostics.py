@@ -8,7 +8,9 @@ three independently scoped raw-capable providers may reserve one supplemental
 sample per fixed bucket/UTC hour, never per URL or parser fingerprint. Storage
 errors consume reservations, and restarts/upgrades cannot reset them. Independently
 identified free Cnyes HTML or article-licensed Global Voices HTML may retain
-raw bytes; other failures keep metadata. No extra network request is made.
+raw bytes. Checked Contentplatform native originals share the existing daily
+budget; scope rejection, storage failure and internal failure stay distinct.
+Other failures keep metadata. No extra network request is made.
 An explicitly configured finite missing-response cohort has its own persistent
 byte/write budget, not another hourly allowance. It retains each eligible
 source response once and reconciles interrupted writes without a second fetch.
@@ -57,7 +59,10 @@ CNYES_RAW_SCOPE_REASONS = frozenset({
 DAILY_PROVIDER_ATTEMPTS = 2
 HOURLY_BUCKET_ATTEMPTS = 1
 HOURLY_EVIDENCE_PROVIDERS = frozenset({'cnyes', 'globalvoices', 'taiwanhot'})
-IDENTITY_METADATA_CONTRACT_VERSION = 1
+IDENTITY_METADATA_CONTRACT_VERSION = 2
+# Version 2 adds failure context; the exact-request canonical witness fields
+# remain readable in both versions. Future formats require an explicit review.
+IDENTITY_METADATA_READ_VERSIONS = frozenset({1, 2})
 VALIDATION_METADATA_CODES = frozenset({
     'invalid_bulk_publication_clock', 'article_attribution_not_verified',
     'article_rights_or_scope_excluded', 'article_license_not_verified',
@@ -177,6 +182,7 @@ def retain_identity_metadata(queue, row, error, context):
                 return
             queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (key, str(attempts + 1)))
         from bs4 import BeautifulSoup
+        from downloader.news_fulltext_candidates import extraction_failure_location
         soup = BeautifulSoup(context.response.body, source.html_parser)
         def declarations(selector, attribute):
             nodes = soup.select(selector)
@@ -193,12 +199,16 @@ def retain_identity_metadata(queue, row, error, context):
                                'original_value_sha256': hashlib.sha256(value.encode()).hexdigest()})
             return {'node_count': len(nodes), 'values': values, 'truncated': len(nodes) > 16}
         titles = soup.select('h1,h2.news_title')
-        facts = {'canonical': declarations('link[rel~="canonical"][href]', 'href'),
+        facts = {'failure_location': extraction_failure_location(error),
+                 'canonical': declarations('link[rel~="canonical"][href]', 'href'),
                  'og_url': declarations('meta[name="og:url"][content],meta[property="og:url"][content]', 'content'),
                  'title_nodes': len(titles),
                  'title_sha256': [hashlib.sha256(n.get_text(' ', strip=True).encode()).hexdigest() for n in titles[:16]],
                  'configured_containers': [{'selector': selector, 'nodes': len(soup.select(selector))}
                                            for selector in source.selectors[:16]]}
+        if provider == 'gvm':
+            from downloader.news_fulltext_gvm import gvm_failure_context
+            facts['gvm_received_failure_context'] = gvm_failure_context(error)
         if error.code == 'article_license_not_verified':
             facts['native_article_license_validation'] = article_license_validation_metadata(soup, source)
         if source.embedded_article_layout in INEWS_LAYOUT_VERSIONS:
@@ -209,14 +219,12 @@ def retain_identity_metadata(queue, row, error, context):
             facts['inews_native_validation_context'] = inews_validation_context(soup,page_url=context.response.url)
         if provider == 'upmedia':
             from downloader.news_fulltext_upmedia import UPMEDIA_LAYOUT_VERSIONS, upmedia_boundary_metadata
-            from downloader.news_fulltext_candidates import extraction_failure_location
             version = UPMEDIA_LAYOUT_VERSIONS.get(source.embedded_article_layout)
             if version:
                 # Diagnose this exact received failure; do not run the accepting
                 # adapter a second time, refill a budget or make another GET.
                 facts['upmedia_native_boundary'] = upmedia_boundary_metadata(soup,
                     adapter_contract_version=version, raw_payload=context.response.body)
-                facts['failure_location'] = extraction_failure_location(error)
         if provider == 'maxfinanciallife':
             # Reuse this already-received envelope and the existing budget.
             # Native clock drift should not require another publisher fetch;
@@ -816,11 +824,115 @@ def retain_index_failure_response(queue, task, error):
         queue.metrics.count(task['provider'], 'public_index_failure_diagnostic_write_errors')
 
 
+def retain_contentplatform_failure_original(queue, row, error, context):
+    """Two existing-budget samples, no repeated GET or article admission.
+
+    Metadata and raw witnesses have separate existing reservations. Spending
+    the metadata budget cannot reset either budget or hide a parser failure.
+    Only the sole queue owner writes this checked native public original.
+    """
+    provider = row['provider']
+    stage, budget, attempt = 'preflight', None, None
+    outcome, reason = 'internal_error', 'unexpected_exception'
+    try:
+        source = queue.registry.require(row['url'])
+        if (source.provider != provider or context.provider != provider
+                or context.source_fingerprint != source.data_fingerprint
+                or context.requested_url != row['url'] or context.response.url != row['url']
+                or context.response.status != 200 or len(context.response.body) > 8 << 20):
+            return
+        clock = datetime.fromisoformat(context.received_at_utc)
+        if clock.tzinfo is None:
+            return
+        stage = 'reservation'
+        budget = _reserve_evidence(queue, provider, clock, None)
+        if budget is None:
+            return
+        day = clock.astimezone(timezone.utc).strftime('%Y%m%d')
+        key = f'failure_diagnostic_attempts:v1:{provider}:{day}'
+        attempt = int(queue.db.execute('SELECT value FROM queue_settings WHERE key=?', (key,)).fetchone()[0])
+        stage = 'scope'
+        from downloader.news_fulltext_contentplatform import contentplatform_private_failure_permit
+        permit = contentplatform_private_failure_permit(context.response, source)
+        raw = context.response.body
+        stage = 'directory'
+        folder = queue.root/'failure_responses'/day/provider
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if folder.is_symlink() or folder.stat().st_mode & 0o077:
+            raise ValueError('private diagnostic directory required')
+        target = folder/(clock.strftime('%H%M%S%f')+'-'+uuid.uuid4().hex[:8]+'.parquet')
+        value = {'contract_version': 1, 'scope_kind': 'contentplatform_native_failure_original_v1',
+            'provider': provider, 'owner_id': queue.owner, 'request_url': row['url'],
+            'final_url': context.response.url, 'response_sha256': hashlib.sha256(raw).hexdigest(),
+            'response_bytes': len(raw), 'captured_at_utc': context.received_at_utc,
+            'error_code': error.code, 'data_fingerprint': source.data_fingerprint,
+            'authorization_json': json.dumps(source.authorization, ensure_ascii=False, sort_keys=True),
+            'headers_json': json.dumps({k: v[:2048] for k, v in context.response.headers.items()
+                if k in {'content-type', 'content-length', 'content-encoding', 'server'}}),
+            'budget_contract_version': FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION, **budget,
+            'native_private_permit': permit, 'diagnostic_only': True, 'accepted_as_article': False,
+            'raw_response_retained': True, 'publish': False, 'remote_training_export': False}
+        stage = 'payload'
+        atomic_write_parquet(target, table_from_records([{**value, 'raw_response_body': raw}]),
+            compression='zstd', compression_level=9, durable=True)
+        target.chmod(0o600)
+        stage = 'receipt'
+        receipt = target.with_suffix('.receipt.json')
+        atomic_write_json(receipt, {**value, 'path': str(target.relative_to(queue.root)),
+            'sha256': sha256_file(target)}, durable=True)
+        receipt.chmod(0o600)
+        outcome, reason = 'saved', 'checked_native_original_retained'
+        queue.metrics.count(provider, 'failure_contentplatform_originals_saved')
+    except NewsError as failure:
+        if stage == 'scope':
+            outcome = 'scope_rejected'
+            reason = failure.code if failure.code in {
+                'article_identity_not_verified', 'article_attribution_not_verified',
+                'article_title_not_verified', 'article_rights_or_scope_excluded',
+                'invalid_bulk_publication_clock', 'paywall_or_login',
+                'private_contentplatform_original_scope_not_verified',
+            } else 'unverified_public_scope'
+            queue.metrics.count(provider, 'failure_contentplatform_original_scope_rejections')
+        else:
+            queue.metrics.count(provider, 'failure_contentplatform_original_internal_errors')
+    except (OSError, ValueError) as failure:
+        if stage in {'directory', 'payload', 'receipt'}:
+            outcome = 'storage_error'
+            reason = 'io_error' if isinstance(failure, OSError) else 'private_storage_validation_failed'
+            queue.metrics.count(provider, 'failure_contentplatform_original_write_errors')
+        else:
+            queue.metrics.count(provider, 'failure_contentplatform_original_internal_errors')
+    except Exception:
+        queue.metrics.count(provider, 'failure_contentplatform_original_internal_errors')
+    finally:
+        # Keep one bounded, immutable outcome for each existing reservation.
+        # No source text/exception message, new allowance, GET or head mutation.
+        # Old unclassified attempts stay unknown rather than being rewritten.
+        if budget is not None and attempt in {1, 2}:
+            facts = {'contract_version': 1, 'provider': provider,
+                'owner_id': queue.owner, 'observed_at_utc': context.received_at_utc,
+                'request_url_sha256': hashlib.sha256(row['url'].encode()).hexdigest(),
+                'response_sha256': hashlib.sha256(context.response.body).hexdigest(),
+                'data_fingerprint': source.data_fingerprint,
+                'outcome': outcome, 'stage': stage, 'reason': reason,
+                'budget_attempt': attempt, **budget, 'accepted_as_article': False,
+                'publish': False, 'remote_training_export': False}
+            try:
+                with queue.db:
+                    queue.db.execute('INSERT OR IGNORE INTO queue_settings VALUES (?,?)', (
+                        f'failure_contentplatform_original_outcome:v1:{day}:{attempt}',
+                        json.dumps(facts, ensure_ascii=False, sort_keys=True)))
+            except Exception:
+                queue.metrics.count(provider, 'failure_contentplatform_original_outcome_errors')
+
+
 def retain_failure_response(queue, row, error):
     """Best-effort diagnostics; the original failure is persisted first."""
     context = getattr(error, 'failure_response', None)
     if error.code in {'article_identity_not_verified', *VALIDATION_METADATA_CODES} and isinstance(context, FailureResponse):
         retain_identity_metadata(queue, row, error, context)
+        if row['provider'] == 'contentplatform' and error.code == 'article_identity_not_verified':
+            retain_contentplatform_failure_original(queue, row, error, context)
         return
     if error.code != 'body_not_found' or not isinstance(context, FailureResponse):
         return

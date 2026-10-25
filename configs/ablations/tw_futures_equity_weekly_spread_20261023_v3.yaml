@@ -1,0 +1,47 @@
+# Complete the expanded half after the admitted stock controls in v2.
+base_config: configs/markets/tw_futures_equity_weekly_spread_2020_20261023_v3.yaml
+output_root: artifacts/markets/tw_futures_equity_weekly_spread_20261023_v3
+fold_selection: last
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 8
+  torch_compile_threads: 8
+  capacity_retry:
+    max_retries: 2
+    minimum_train_batch: 32
+postprocess_plots:
+  - split: val
+    prefix: val
+    comparison_mode: absolute
+    scope_label: Common 2020 equity-universe study with independently verified spread legs
+  - split: test
+    prefix: test
+    comparison_mode: absolute
+    scope_label: Previously inspected research period; not an untouched holdout
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+  fixed_overrides:
+    training:
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      early_stopping_min_delta: 0.0001
+      pretrained_initialization_root: null
+      warm_start_from_previous_fold: false
+    runner:
+      resume: false
+      require_cuda: true
+  dimensions:
+    - name: twd_equity
+      enabled: true
+      variants:
+        - name: '0845'
+          description: 擴大股票類期貨／Expanded equity futures；08:45；核對週月價差腿。
+          overrides: {}
+        - name: '0900'
+          description: 擴大股票類期貨／Expanded equity futures；09:00；核對週月價差腿。
+          overrides:
+            trading:
+              tw_futures_portfolio_decision_time: '09:00'
+              tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0900/entries.parquet
+              tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0900/opening_reference.parquet

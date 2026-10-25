@@ -2,7 +2,7 @@
 """Apply the local source policy at the existing publication-owner boundary."""
 import argparse
 import asyncio
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -85,6 +85,50 @@ async def workflows(c):
     return result
 
 
+@contextmanager
+def publication_boundary(locks, deadline):
+    """Acquire the complete boundary without parking unrelated owners.
+
+    If a later lock is busy, release all earlier locks before waiting on that
+    one inode. Retry the complete set after its kernel wait finishes. Never
+    retain the source/version owners throughout a long catalog export.
+    """
+    while True:
+        blocked = None
+        try:
+            with ExitStack() as stack:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('publication owner has not reached its handoff boundary')
+                for lock in locks:
+                    if lock.is_symlink() or lock.parent.resolve() != lock.parent:
+                        raise ValueError('storage owner lock is redirected')
+                    handle = stack.enter_context(lock.open('a'))
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        blocked = lock
+                        raise
+                yield
+                return
+        except BlockingIOError:
+            if blocked is None:
+                raise  # A body error must not repeat a service-control action.
+        # ExitStack has now released every partial acquisition. Wait only for
+        # the busy lock, then close that descriptor before retrying all locks.
+        if blocked.is_symlink() or blocked.parent.resolve() != blocked.parent:
+            raise ValueError('storage owner lock is redirected')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('publication owner has not reached its handoff boundary')
+        with blocked.open('a') as handle:
+            result = subprocess.run(['flock', '--exclusive', '--wait', str(remaining), str(handle.fileno())],
+                                    pass_fds=(handle.fileno(),), capture_output=True, timeout=remaining + 5)
+            if result.returncode == 1:
+                raise TimeoutError('publication owner has not reached its handoff boundary')
+            if result.returncode:
+                raise RuntimeError('canonical owner acquisition failed')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
@@ -137,60 +181,39 @@ def main(argv=None):
             subprocess.run(['systemctl','stop',OWNER],check=True,timeout=110)
             if pid(OWNER) != '0':
                 raise ValueError('original worker did not stop; retain all owners and journals')
-        while True:
-            try:
-                with ExitStack() as stack:
-                    # Stop the optional version activity at its own durable
-                    # source boundary BEFORE reserving NAS/catalog controls.
-                    # Default: never stop a worker writing a private head.
-                    # Authorized restart: acquire these same inode locks only
-                    # AFTER the previous worker has fully stopped.
-                    version_owner = Path(c['state_root'])/'dataset-versions'
-                    locks = ([version_owner/'owner.lock'] if version_owner.exists() else [])
-                    locks += [Path(c['state_root'])/name for name in
-                              ('source-replication-owner.lock','catalog-owner.lock')]
-                    for lock in locks:
-                        if lock.is_symlink() or lock.parent.resolve() != lock.parent:
-                            raise ValueError('storage owner lock is redirected')
-                        f=stack.enter_context(lock.open('a'))
-                        remaining=max(1,int(deadline-time.monotonic()))
-                        acquired=subprocess.run(['flock','--exclusive','--wait',str(remaining),str(f.fileno())],
-                                                pass_fds=(f.fileno(),),capture_output=True,timeout=remaining+5)
-                        if acquired.returncode==1:
-                            raise TimeoutError('publication owner has not reached its handoff boundary')
-                        if acquired.returncode:
-                            raise RuntimeError('canonical owner acquisition failed')
-                    if worker_code_identity()!=candidate_identity:
-                        raise ValueError('worker candidate changed while waiting for the owner boundary')
-                    if not stopped:
-                        stopped=True
-                        subprocess.run(['systemctl','stop',OWNER],check=True,timeout=110)
-                    if worker_code_identity()!=candidate_identity:
-                        raise ValueError('worker candidate changed while stopping the old owner')
-                    verify_migration_checkpoint(checkpoint)
-                    if private.read_bytes() != original:
-                        raise ValueError('private policy changed during the owner handoff')
-                    rollback=Path(c['state_root'])/'policy-rollbacks'
-                    rollback.mkdir(mode=0o700,exist_ok=True)
-                    if rollback.is_symlink() or rollback.stat().st_mode & 0o077:
-                        raise ValueError('policy rollback directory is not private')
-                    digest=hashlib.sha256(original).hexdigest()
-                    backup=rollback/(digest+'.json')
-                    if not backup.exists():
-                        fd=os.open(backup,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
-                        with os.fdopen(fd,'wb') as stream:
-                            stream.write(original);stream.flush();os.fsync(stream.fileno())
-                    elif backup.read_bytes()!=original:
-                        raise ValueError('private rollback identity conflicts')
-                    if not args.reload_code_only:
-                        updated=json.loads(original);updated['source_replication']=policy
-                        atomic_write_json(private,updated,durable=True)
-                        os.chmod(private,0o600)
-                break
-            except BlockingIOError:
-                if time.monotonic()>=deadline:
-                    raise TimeoutError('publication owner has not reached its handoff boundary')
-                time.sleep(5)
+        version_owner = Path(c['state_root'])/'dataset-versions'
+        locks = ([version_owner/'owner.lock'] if version_owner.exists() else [])
+        locks += [Path(c['state_root'])/name for name in
+                  ('source-replication-owner.lock','catalog-owner.lock')]
+        with publication_boundary(locks, deadline):
+            # Acquire every original boundary before stopping the worker.
+            # A busy catalog cannot reserve the other owners while we wait.
+            if worker_code_identity()!=candidate_identity:
+                raise ValueError('worker candidate changed while waiting for the owner boundary')
+            if not stopped:
+                stopped=True
+                subprocess.run(['systemctl','stop',OWNER],check=True,timeout=110)
+            if worker_code_identity()!=candidate_identity:
+                raise ValueError('worker candidate changed while stopping the old owner')
+            verify_migration_checkpoint(checkpoint)
+            if private.read_bytes() != original:
+                raise ValueError('private policy changed during the owner handoff')
+            rollback=Path(c['state_root'])/'policy-rollbacks'
+            rollback.mkdir(mode=0o700,exist_ok=True)
+            if rollback.is_symlink() or rollback.stat().st_mode & 0o077:
+                raise ValueError('policy rollback directory is not private')
+            digest=hashlib.sha256(original).hexdigest()
+            backup=rollback/(digest+'.json')
+            if not backup.exists():
+                fd=os.open(backup,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+                with os.fdopen(fd,'wb') as stream:
+                    stream.write(original);stream.flush();os.fsync(stream.fileno())
+            elif backup.read_bytes()!=original:
+                raise ValueError('private rollback identity conflicts')
+            if not args.reload_code_only:
+                updated=json.loads(original);updated['source_replication']=policy
+                atomic_write_json(private,updated,durable=True)
+                os.chmod(private,0o600)
         subprocess.run(['systemctl','start',OWNER],check=True,timeout=30)
         started=time.monotonic()
         while True:

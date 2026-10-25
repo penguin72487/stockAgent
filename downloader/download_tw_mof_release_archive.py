@@ -29,11 +29,13 @@ try:
     from downloader.download_tw_mof_trade_release_values import _fetch
     from downloader.release_archive_io import write_release_rows_if_changed
     from downloader.tw_public_source_lock import source_update_lock
+    from downloader.release_archive_timing import timed_release_archive
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter
     from download_tw_mof_trade_release_values import _fetch
     from release_archive_io import write_release_rows_if_changed
     from tw_public_source_lock import source_update_lock
+    from release_archive_timing import timed_release_archive
 
 
 NAME = "mof_original_release_archive"
@@ -228,6 +230,7 @@ def _period_gaps(periods: list[str]) -> list[str]:
             if f"{(ordinal - 1) // 12:04d}-{(ordinal - 1) % 12 + 1:02d}" not in observed]
 
 
+@timed_release_archive(NAME)
 def collect(root: Path, *, request_interval: float = 0.5,
             recent_periods: int = 3, full_recheck: bool = False) -> dict[str, object]:
     if request_interval <= 0 or recent_periods < 0:

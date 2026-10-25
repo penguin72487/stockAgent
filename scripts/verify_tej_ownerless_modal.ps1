@@ -10,10 +10,23 @@ $ErrorActionPreference='Stop'
 if(Test-Path -LiteralPath $Output){throw 'Do not overwrite modal acceptance'}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName Accessibility
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
 $source=[IO.File]::ReadAllText($BridgeScript)
 $tokens=$null;$parseErrors=$null
-[void][Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$parseErrors)
+$bridgeAst=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$tokens,[ref]$parseErrors)
 if($parseErrors.Count -ne 0){throw 'Canonical bridge PowerShell parse failed'}
+$runtimeBlocks=@($bridgeAst.FindAll({param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+    $node.Extent.Text.StartsWith("if(`$requestDoc.action -eq 'ack_source_memory_error')")
+},$true))
+if($runtimeBlocks.Count -ne 1){throw 'One canonical runtime acknowledgement branch required'}
+# Reuse the actual native guards/action, excluding only the CLI exit so the
+# fixture can independently read back its own window and continue testing.
+$runtimeStatements=@($runtimeBlocks[0].Clauses[0].Item2.Statements|Where-Object {
+    $_ -isnot [Management.Automation.Language.ExitStatementAst]
+})
+$runtimeAcknowledgement=[ScriptBlock]::Create(($runtimeStatements.Extent.Text -join "`n"))
 $match=[regex]::Match($source,"(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
 if(-not $match.Success){throw 'Canonical native helpers missing'}
 Add-Type -TypeDefinition $match.Groups[1].Value -ReferencedAssemblies @([Accessibility.IAccessible].Assembly.Location)
@@ -71,6 +84,12 @@ function Await-Closed([long]$handle) {
 function Acknowledge-Modal([long]$handle,[long]$button) {
     [TejBridgeNative]::AcknowledgeNormalEmptyDialog($rootHandle,$handle,$button)
 }
+function Acknowledge-Runtime([long]$handle,[string]$code,[string]$path,[int]$expectedPid) {
+    $ExpectedWindow=$rootHandle;$TejProcessId=$expectedPid;$Output=$path
+    $requestDoc=@{action='ack_source_memory_error';error_window=$handle;error_code=$code;
+        task_id='owned-runtime-fixture';type='fixture';smart_id='fixture';table='fixture'}
+    & $runtimeAcknowledgement | Out-Null
+}
 try {
     [TejModalFixture]::Start();$rootHandle=[TejModalFixture]::Root.Handle.ToInt64()
     [TejModalFixture]::Modal('ERROR1:No data !!(fixture)',$false);$modal=Await-Modal
@@ -101,6 +120,40 @@ try {
     Check 'direct_owned_dialog_still_recognized' ($modal -in [TejBridgeNative]::Dialogs($rootHandle))
     $button=@([TejBridgeNative]::Children($modal,'Button'))[0]
     Acknowledge-Modal $modal $button;Await-Closed $modal;$modal=0
+    $dns="MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'"
+    $cases=@(
+        @{name='reviewed_dns';message=$dns;code='vendor_source_dns_resolution_failed';accept=$true},
+        @{name='reviewed_allocation';message='MySql:malloc';code='vendor_mysql_allocation_failed';accept=$true},
+        @{name='reviewed_table';message='Cannot find table 0.';code='vendor_source_table_unresolved';accept=$true},
+        @{name='dns_other_host';message=$dns.Replace('pro-119.tej.com.tw','other.example');code='vendor_source_dns_resolution_failed';accept=$false},
+        @{name='dns_host_suffix';message=$dns.Replace('pro-119.tej.com.tw','pro-119.tej.com.tw.evil.example');code='vendor_source_dns_resolution_failed';accept=$false},
+        @{name='dns_extra_text';message=($dns+' Quota exhausted');code='vendor_source_dns_resolution_failed';accept=$false},
+        @{name='dns_wrong_pid';message=$dns;code='vendor_source_dns_resolution_failed';accept=$false;wrong_pid=$true},
+        @{name='quota';message='Quota exhausted';code='vendor_source_dns_resolution_failed';accept=$false},
+        @{name='login';message='Please login';code='vendor_source_dns_resolution_failed';accept=$false}
+    )
+    foreach($case in $cases) {
+        [TejModalFixture]::Modal($case.message,$true);$modal=Await-Modal
+        if($prior -ne 0 -and [TejBridgeNative]::IsWindow([IntPtr]$prior)){[TejBridgeNative]::Activate($prior)}
+        $beforeAck=[TejBridgeNative]::GetForegroundWindow()
+        $caseOutput=$Output+'.'+$case.name+'.json';$rejected=$false
+        $expectedPid=if($case.wrong_pid){$PID+1000000}else{$PID}
+        try {Acknowledge-Runtime $modal $case.code $caseOutput $expectedPid}catch{
+            $rejected=$true
+            if($case.accept){throw ('Canonical runtime acknowledgement failed: '+$_.Exception.ToString())}
+        }
+        if($case.accept) {
+            Check ($case.name+'_canonical_ack_closed') (-not $rejected -and -not [TejBridgeNative]::IsWindow([IntPtr]$modal))
+            Check ($case.name+'_background_foreground_preserved') ([TejBridgeNative]::GetForegroundWindow() -eq $beforeAck)
+            $ack=[IO.File]::ReadAllText($caseOutput)|ConvertFrom-Json
+            Check ($case.name+'_no_query_or_credentials') ($ack.error_code -ceq $case.code -and $ack.data_query_repeated -eq $false -and $ack.credentials_read -eq $false)
+        }else {
+            Check ($case.name+'_canonical_ack_rejected') ($rejected -and [TejBridgeNative]::IsWindow([IntPtr]$modal) -and -not (Test-Path -LiteralPath $caseOutput))
+            [void][TejBridgeNative]::PostMessageW([IntPtr]$modal,0x10,[IntPtr]::Zero,[IntPtr]::Zero)
+            Await-Closed $modal
+        }
+        $modal=0
+    }
 }finally {
     if($modal -ne 0 -and [TejBridgeNative]::IsWindow([IntPtr]$modal)) {
         # Cleanup ONLY the exact modal created by this owned fixture.

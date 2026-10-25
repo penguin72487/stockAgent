@@ -16,6 +16,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -300,7 +301,10 @@ def profile_inventory(root, repeats, reference=None):
         spec = importlib.util.spec_from_file_location("_inventory_benchmark_reference", reference)
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
+        # Reference releases are immutable. A SourceFileLoader would otherwise
+        # create __pycache__ beside this private source when run as root, making
+        # the qualified release fail its extra-member cold-start gate.
+        exec(compile(reference.read_bytes(), str(reference), "exec"), vars(module))
         modules["reference"] = module
     samples = {name: [] for name in modules}
     digests = {name: [] for name in modules}
@@ -429,6 +433,226 @@ def capture_measurement(builder):
     except Exception as exc:
         # Persist failed optional phases as failures, never as zero latency.
         return {"error": type(exc).__name__}
+
+
+def profile_tw_status_projection(payload, repeats, reference=None):
+    """ABBA on one full receipt: projection -> JSON -> gzip -> full readback.
+
+    The visible-value oracle ignores ONLY the unrendered per-attempt history.
+    No source/fill/failure count, latest reason or minute point is discarded
+    from that oracle. This is not an HTTP, browser or opening SLA measurement.
+    """
+    import gzip
+    from scripts.serve_public_dashboards import _prepared
+    from stockagent.live import public_dashboards as current
+    modules = {"current": current}
+    if reference is not None:
+        spec = importlib.util.spec_from_file_location("_tw_status_projection_reference", reference)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        # Never add bytecode files to an immutable qualified reference release.
+        exec(compile(reference.read_bytes(), str(reference), "exec"), vars(module))
+        modules = {"reference": module, **modules}
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                         separators=(",", ":")).encode()).hexdigest()
+    before = digest(payload)
+    samples, visible_digests = [], set()
+    for repeat in range(repeats):
+        order = list(modules) if repeat % 2 == 0 else list(reversed(modules))
+        for variant in order:
+            started = time.perf_counter()
+            projected = modules[variant].sanitize_tw_status(payload)
+            projection_done = time.perf_counter()
+            body = (json.dumps(projected, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+            json_done = time.perf_counter()
+            prepared = _prepared(body, content_type="application/json; charset=utf-8", cache_control="no-store")
+            gzip_done = time.perf_counter()
+            decoded = json.loads(gzip.decompress(prepared.gzip_body)
+                                 if prepared.gzip_body is not prepared.body else prepared.body)
+            readback_done = time.perf_counter()
+            if decoded != projected:
+                raise ValueError("status wire readback changed values")
+            visible = dict(decoded)
+            if isinstance(visible.get("opening_signal_latency"), dict):
+                visible["opening_signal_latency"] = dict(visible["opening_signal_latency"])
+                visible["opening_signal_latency"].pop("failures", None)
+            visible_digests.add(digest(visible))
+            if len(visible_digests) != 1:
+                raise ValueError("status projection changed retained display values")
+            samples.append({"variant": variant, "repeat": repeat,
+                "projection_ms": (projection_done - started) * 1000,
+                "json_encode_ms": (json_done - projection_done) * 1000,
+                "gzip_etag_ms": (gzip_done - json_done) * 1000,
+                "full_readback_ms": (readback_done - gzip_done) * 1000,
+                "complete_ms": (readback_done - started) * 1000,
+                "decoded_bytes": len(body), "wire_bytes": len(prepared.gzip_body),
+                "visible_contract_sha256": next(iter(visible_digests))})
+    if digest(payload) != before:
+        raise ValueError("status projection mutated source receipt")
+    return {"scope": "fixed_full_receipt_public_projection_wire_readback_not_opening_sla",
+        "input_sha256": before, "input_failure_count": len((payload.get("opening_signal_latency") or {}).get("failures") or []),
+        "retained_display_values_equal": True, "source_receipt_unchanged": True,
+        "source_build_network_browser_and_executor_excluded": True,
+        "samples": samples, "variants": {name: summarize([row["complete_ms"] for row in samples
+                                                            if row["variant"] == name]) for name in modules}}
+
+
+def profile_opening_attempt_tail(state_dir, repeats):
+    """Cold process-tail-cache ABBA; full rows, failures and summary parity.
+
+    The original append-only JSONL is never rewritten. File/OS caches are not
+    flushed, and this local reader is not a quote/executor/browser SLA probe.
+    """
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+
+    source = Path(state_dir) / "opening_signal_latency.jsonl"
+    state = json.loads((Path(state_dir) / "state.json").read_bytes())
+    markets = sorted((state.get("modes") or {}).keys())
+    session_date = datetime.now(dashboard.TAIPEI).date().isoformat()
+
+    def signature():
+        stat = source.stat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+    def source_digest():
+        digest = hashlib.sha256()
+        with source.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    observed = signature()
+    original_digest = source_digest()
+    samples, expected_digest = [], None
+    for repeat in range(repeats):
+        for variant in ("stdlib", "native", "native", "stdlib"):
+            if signature() != observed:
+                raise ValueError("opening tail source changed during comparison")
+            # Only this benchmark's private process cache is replaced. All
+            # native service owners and their caches remain untouched.
+            with patch.object(dashboard, "_TAIL_CACHE", {}):
+                started, cpu = time.perf_counter(), time.thread_time()
+                kwargs = ({"row_decoder": dashboard._decode_opening_latency_row}
+                          if variant == "native" else
+                          {"row_projection": dashboard._opening_latency_row_projection})
+                rows = dashboard._tail(source, 10_000, **kwargs)
+                tail_done = time.perf_counter()
+                summary = dashboard._opening_signal_latency_summary(
+                    rows, expected_markets=markets, session_date=session_date,
+                )
+                encoded = json.dumps(summary, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+                # Compare the complete JSON contract, including any preserved
+                # nonfinite source extensions, without Python NaN != NaN noise.
+                readback = json.dumps(json.loads(encoded), sort_keys=True,
+                                      ensure_ascii=True, separators=(",", ":"))
+                digest = hashlib.sha256(readback.encode()).hexdigest()
+                if encoded != readback:
+                    raise ValueError("opening summary wire readback changed values")
+                if expected_digest is None:
+                    expected_digest = digest
+                if digest != expected_digest:
+                    raise ValueError("opening tail decoder changed the complete summary")
+                samples.append({"repeat": repeat, "variant": variant,
+                    "tail_read_decode_project_ms": (tail_done - started) * 1000,
+                    "complete_ms": (time.perf_counter() - started) * 1000,
+                    "owner_thread_cpu_ms": (time.thread_time() - cpu) * 1000,
+                    "row_count": len(rows), "summary_failure_count": summary["failure_count"],
+                    "complete_summary_sha256": digest})
+    if signature() != observed or source_digest() != original_digest:
+        raise ValueError("opening tail source mutated during comparison")
+    return {"scope": "fixed_source_full_tail_summary_readback_not_opening_sla",
+        "source": str(source), "source_signature": observed, "source_sha256": original_digest,
+        "native_decoder_available": dashboard._OPENING_FAILURE_DECODER is not None,
+        "source_unchanged": True, "complete_summary_parity": True,
+        "tail_cache_cleared_each_sample": True, "os_cache_flushed": False,
+        "broker_orders": False, "ledger_writes": False,
+        "samples": samples, "variants": {name: summarize([row["complete_ms"] for row in samples
+            if row["variant"] == name]) for name in ("stdlib", "native")}}
+
+
+def profile_opening_attempt_append(state_dir, repeats):
+    """Full native-decode refresh versus prefix-verified incremental refresh.
+
+    Use one private byte-for-byte source copy and append its last physical row
+    verbatim as a labeled engineering fixture. Neither variant changes history,
+    drops failed attempts, touches provider owners, or pretends to be 09:00.
+    Cache seeding and file copying are retained outside the refresh interval.
+    """
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    source = Path(state_dir) / "opening_signal_latency.jsonl"
+    state = json.loads((Path(state_dir) / "state.json").read_bytes())
+    markets = sorted((state.get("modes") or {}).keys())
+    session_date = datetime.now(dashboard.TAIPEI).date().isoformat()
+    signature = lambda: dashboard._tail_file_signature(source.stat())
+    def file_digest(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while chunk := handle.read(1 << 20):
+                digest.update(chunk)
+        return digest.hexdigest()
+    observed, original_digest = signature(), file_digest(source)
+    with source.open("rb") as handle:
+        handle.seek(dashboard._jsonl_tail_start(handle, observed[2], 1))
+        last_line = handle.read()
+    if not last_line.strip():
+        raise ValueError("opening append fixture needs a nonblank final physical row")
+    # Validate the captured physical record; never append a partial JSON row.
+    json.loads(last_line)
+    appended = (b"" if last_line.endswith(b"\n") else b"\n") + last_line.rstrip(b"\r\n") + b"\n"
+    samples, expected_digest = [], None
+    with tempfile.TemporaryDirectory(prefix="stockagent-opening-append-") as directory:
+        fixture = Path(directory) / "opening_signal_latency.jsonl"
+        copy_started = time.perf_counter()
+        shutil.copyfile(source, fixture)
+        if signature() != observed or file_digest(fixture) != original_digest:
+            raise ValueError("opening append source changed during private snapshot")
+        copy_ms = (time.perf_counter() - copy_started) * 1000
+        for repeat in range(repeats):
+            for variant in ("full_native", "verified_append", "verified_append", "full_native"):
+                if signature() != observed:
+                    raise ValueError("opening append source changed during comparison")
+                with fixture.open("r+b") as handle:
+                    handle.truncate(observed[2])
+                with patch.object(dashboard, "_TAIL_CACHE", {}):
+                    kwargs = {"row_decoder": dashboard._decode_opening_latency_row,
+                              "verified_append": variant == "verified_append"}
+                    warm_started = time.perf_counter()
+                    dashboard._tail(fixture, 10_000, **kwargs)
+                    initial_cache_seed_ms = (time.perf_counter() - warm_started) * 1000
+                    with fixture.open("ab") as handle:
+                        handle.write(appended)
+                    started, cpu = time.perf_counter(), time.thread_time()
+                    rows = dashboard._tail(fixture, 10_000, **kwargs)
+                    decoded = time.perf_counter()
+                    summary = dashboard._opening_signal_latency_summary(
+                        rows, expected_markets=markets, session_date=session_date)
+                    encoded = json.dumps(summary, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+                    readback = json.dumps(json.loads(encoded), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+                    digest = hashlib.sha256(readback.encode()).hexdigest()
+                    if encoded != readback or (expected_digest is not None and expected_digest != digest):
+                        raise ValueError("verified append changed the complete opening summary")
+                    expected_digest = digest
+                    samples.append({"repeat": repeat, "variant": variant,
+                        "initial_cache_seed_ms_outside_refresh": initial_cache_seed_ms,
+                        "tail_refresh_ms": (decoded - started) * 1000,
+                        "complete_ms": (time.perf_counter() - started) * 1000,
+                        "owner_thread_cpu_ms": (time.thread_time() - cpu) * 1000,
+                        "row_count": len(rows), "summary_failure_count": summary["failure_count"],
+                        "complete_summary_sha256": digest})
+    if signature() != observed or file_digest(source) != original_digest:
+        raise ValueError("opening append source changed during comparison")
+    return {"scope": "private_verbatim_row_append_full_summary_readback_not_native_opening_sla",
+        "source": str(source), "source_signature": observed, "source_sha256": original_digest,
+        "source_unchanged": True, "private_source_copy_and_validation_ms": copy_ms,
+        "append_fixture_origin": "verbatim_final_physical_source_row_not_new_observation",
+        "append_fixture_bytes": len(appended), "append_fixture_sha256": hashlib.sha256(appended).hexdigest(),
+        "complete_summary_parity": True, "prefix_policy": "sha256_all_previously_observed_source_bytes_before_decoded_row_reuse",
+        "remaining_complexity": "O(source_bytes)_integrity_scan_plus_delta_decode_not_O(delta)_IO",
+        "native_decoder_available": dashboard._OPENING_FAILURE_DECODER is not None,
+        "broker_orders": False, "ledger_writes": False, "samples": samples,
+        "variants": {name: summarize([row["complete_ms"] for row in samples if row["variant"] == name])
+                     for name in ("full_native", "verified_append")}}
 
 
 def code_fingerprints():
@@ -704,14 +928,28 @@ def main():
     parser.add_argument("--profile-inventory", action="store_true", help="Benchmark all footer fields on one frozen local input")
     parser.add_argument("--profile-inventory-reference", type=Path, help="Optional pre-change inventory module for exact paired replay")
     parser.add_argument("--profile-shioaji-monitor", action="store_true", help="Compare sequential/parallel local monitor I/O (no broker API calls)")
+    parser.add_argument("--profile-tw-status-projection", action="store_true",
+                        help="ABBA projection/JSON/gzip/full-readback on one captured public TW status")
+    parser.add_argument("--profile-tw-status-projection-reference", type=Path)
+    parser.add_argument("--profile-tw-status-input", type=Path,
+                        help="Replay a prior full status capture instead of reading the local/public status API")
+    parser.add_argument("--profile-opening-tail", type=Path,
+                        help="State directory: fixed-source complete opening telemetry tail/summary decoder ABBA, without provider requests")
+    parser.add_argument("--profile-opening-append", type=Path,
+                        help="State directory: private copy + verbatim row append, full native versus prefix-verified refresh ABBA")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.output and args.output.exists():
         parser.error("output receipt must be new")
     if (args.profile_history_reference or args.profile_history_wire) and not args.profile_history:
         parser.error("history reference/wire requires --profile-history")
-    if args.local_only and not (args.profile_history or args.profile_inventory or args.profile_shioaji_monitor):
+    if args.local_only and not (args.profile_history or args.profile_inventory or args.profile_shioaji_monitor
+                               or args.profile_tw_status_projection or args.profile_opening_tail or args.profile_opening_append):
         parser.error("--local-only requires a local profile")
+    if (args.profile_tw_status_projection_reference or args.profile_tw_status_input) and not args.profile_tw_status_projection:
+        parser.error("status projection reference/input requires --profile-tw-status-projection")
+    if args.profile_tw_status_projection and not args.profile_tw_status_input and not args.output:
+        parser.error("live status capture requires an explicit new --output receipt")
     if args.profile_inventory_reference and not args.profile_inventory:
         parser.error("--profile-inventory-reference requires --profile-inventory")
     if args.profile_history_source_rebuild and not args.profile_history:
@@ -761,6 +999,35 @@ def main():
         result["local_shioaji_monitor"] = capture_measurement(
             lambda: profile_shioaji_monitor(REPO_ROOT, min(args.repeats, 10))
         )
+    if args.profile_tw_status_projection:
+        def status_projection():
+            from downloader.artifact_io import atomic_write_json
+            if args.profile_tw_status_input:
+                input_path = args.profile_tw_status_input
+                payload = json.loads(input_path.read_bytes())
+            else:
+                import requests
+                input_path = args.output.with_name(args.output.stem + ".status-input.json")
+                if input_path.exists() or input_path.is_symlink():
+                    raise FileExistsError("status input receipt must be new")
+                response = requests.get(args.base_url.rstrip("/") + "/tw-day-trade/api/status", timeout=args.timeout)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("status capture must be a complete JSON object")
+                atomic_write_json(input_path, payload)
+            report = profile_tw_status_projection(payload, min(args.repeats, 10), args.profile_tw_status_projection_reference)
+            report["input_receipt"] = str(input_path)
+            report["input_receipt_sha256"] = hashlib.sha256(input_path.read_bytes()).hexdigest()
+            return report
+        result["local_tw_status_projection"] = capture_measurement(status_projection)
+    if args.profile_opening_tail:
+        result["local_opening_tail"] = capture_measurement(
+            lambda: profile_opening_attempt_tail(args.profile_opening_tail, min(args.repeats, 3))
+        )
+    if args.profile_opening_append:
+        result["local_opening_append"] = capture_measurement(
+            lambda: profile_opening_attempt_append(args.profile_opening_append, min(args.repeats, 3)))
     if args.profile_services:
         result["services_before"] = capture_measurement(service_snapshot)
     result["http"] = [] if args.local_only else measure_http(
@@ -785,7 +1052,7 @@ def main():
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     print(f"receipt={output}", flush=True)
     return int(any(row["errors"] for row in result["http"]) or any(
-        (result.get(phase) or {}).get("error") for phase in ("notification", "local_history", "local_inventory", "local_shioaji_monitor", "services")))
+        (result.get(phase) or {}).get("error") for phase in ("notification", "local_history", "local_inventory", "local_shioaji_monitor", "local_tw_status_projection", "local_opening_tail", "local_opening_append", "services")))
 
 
 if __name__ == "__main__":

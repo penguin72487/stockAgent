@@ -203,6 +203,18 @@ def _decode_discovery(stdout: str) -> list[RemoteCandidate]:
     return result
 
 
+def _remote_ancestor_reference_override() -> str:
+    from stockagent.data_sync.artifact_maintenance import _ancestor_process_references
+
+    # The shared scanner needs the maintenance module's globals, including its
+    # /proc readers and fail-closed error handling. Defining it in the SSH
+    # script's namespace loses those dependencies even after assigning it back.
+    return (
+        "import stockagent.data_sync.artifact_maintenance as maintenance\n"
+        f"exec({inspect.getsource(_ancestor_process_references)!r}, maintenance.__dict__)\n"
+    )
+
+
 def discover_remote_artifacts(
     *,
     ssh_target: str,
@@ -222,15 +234,13 @@ def discover_remote_artifacts(
     selected = ""
     if relative_root is not None:
         selected = " " + shlex.quote(_safe_relative_path(relative_root, "selected remote artifact").as_posix())
-    from stockagent.data_sync.artifact_maintenance import discover_completed_runs, _ancestor_process_references
+    from stockagent.data_sync.artifact_maintenance import discover_completed_runs
     # Run the reviewed shared discovery implementation over SSH without
     # mutating the remote working tree (which may have an unfinished merge).
     program = _REMOTE_DISCOVERY_PROGRAM.replace(
         "artifact_root = Path(sys.argv[1]).resolve()",
         inspect.getsource(discover_completed_runs) + "\n" +
-        "import stockagent.data_sync.artifact_maintenance as maintenance\n" +
-        inspect.getsource(_ancestor_process_references) + "\n" +
-        "maintenance._ancestor_process_references = _ancestor_process_references\n" +
+        _remote_ancestor_reference_override() +
         "artifact_root = Path(sys.argv[1]).resolve()",
     )
     remote_command = shlex.join(
@@ -401,10 +411,7 @@ def remote_retirement(args, ack: dict, policy: dict, *, apply: bool) -> dict:
     program = program.replace("from stockagent.data_sync.materialized_cache import process_references_many",
                               "from stockagent.data_sync.materialized_cache import _path_is_under\n" +
                               "from typing import Iterable\n" + inspect.getsource(process_references_many))
-    from stockagent.data_sync.artifact_maintenance import _ancestor_process_references
-    program += "\nimport stockagent.data_sync.artifact_maintenance as maintenance\n"
-    program += inspect.getsource(_ancestor_process_references) + "\n"
-    program += "maintenance._ancestor_process_references = _ancestor_process_references\n"
+    program += "\n" + _remote_ancestor_reference_override()
     program += "\nrequest = json.loads(" + repr(json.dumps(payload)) + ")\n"
     program += '''
 artifact = Path(request['artifact_root'])

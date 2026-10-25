@@ -59,6 +59,7 @@ COMPRESSION_PROFILES = {DEFAULT_COMPRESSION_PROFILE, ADAPTIVE_COMPRESSION_PROFIL
 CODEC_SUFFIXES = {"raw": "raw", "gzip": "gz", "zstd": "zst"}
 C_TEMP_STAGE_ROOT = Path("/var/lib/stockagent-legacy-archive-stage")
 D_BENCHMARK_STAGE_ROOT = Path("/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch")
+D_OFFLINE_STAGE_ROOT = Path("/srv/stockagent-d-volume/stockagent-completed-offline-scratch")
 MANUAL_WSL_CAPTURE_CONTRACT = "manual-wsl-artifact-preservation-v1"
 MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations", "benchmarks"}
 MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
@@ -76,9 +77,17 @@ OFFLINE_SIMULATION_PREFIXES = ("official-close-settlement-", "account-addition-"
 
 def reviewed_wsl_artifact_root(relative: str) -> bool:
     """An explicit case, never an entire benchmark suite or namespace."""
+    from stockagent.data_sync.benchmark_fixtures import standalone_benchmark_contract
     path = _safe_relative_path(relative, "reviewed WSL artifact root")
     return (len(path.parts) >= 2 and path.parts[0] in MANUAL_WSL_SCOPES
-            and (path.parts[0] != "benchmarks" or len(path.parts) == 3))
+            and (path.parts[0] != "benchmarks" or len(path.parts) == 3
+                 or (len(path.parts) == 2
+                     and standalone_benchmark_contract(path.parts[1]) is not None)))
+
+
+def reviewed_offline_scratch_root(relative: str) -> bool:
+    """One explicitly selected operations case, never the namespace or raw data."""
+    return relative.startswith("operations/") and reviewed_wsl_artifact_root(relative)
 
 
 def reviewed_offline_simulation_root(relative: str) -> bool:
@@ -204,7 +213,8 @@ def _source_signature(info: os.stat_result) -> dict[str, int]:
 
 
 def source_plan(
-    source: Path, spec: LegacyArchiveSpec, *, manual_capture: bool = False
+    source: Path, spec: LegacyArchiveSpec, *, manual_capture: bool = False,
+    original_source: Path | None = None,
 ) -> list[dict[str, Any]]:
     if type(manual_capture) is not bool:
         raise SnapshotError("manual capture must be an explicit boolean")
@@ -236,8 +246,16 @@ def source_plan(
         raise SnapshotError(f"legacy source file missing or root is not a real directory: {source}")
     if (spec.capture_contract == MANUAL_WSL_CAPTURE_CONTRACT
             and spec.relative_root.split("/", 1)[0] == "benchmarks"):
-        from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
-        completed_benchmark_evidence(source)
+        from stockagent.data_sync.benchmark_fixtures import (
+            external_benchmark_contract, completed_benchmark_evidence, standalone_benchmark_contract,
+        )
+        parts = PurePosixPath(spec.relative_root).parts
+        required = standalone_benchmark_contract(parts[1]) if len(parts) == 2 else None
+        if original_source is not None:
+            required = external_benchmark_contract(original_source)
+            if required is None:
+                raise SnapshotError('renamed benchmark has no exact original producer binding')
+        completed_benchmark_evidence(source, required_contract=required, original_source=original_source)
     stability_hours = (
         spec.manual_capture_min_stable_hours if manual_capture
         else spec.minimum_stable_days * 24
@@ -264,13 +282,13 @@ def source_plan(
 
 
 def _paths(spec: LegacyArchiveSpec, artifact_root: Path) -> tuple[Path, Path, Path]:
-    if spec.stage_root == D_BENCHMARK_STAGE_ROOT and not _prunable_stage(spec):
+    if spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT) and not _prunable_stage(spec):
         raise SnapshotError('guarded D benchmark scratch requires its explicit completed-case scope')
     source = artifact_root / spec.relative_root
     stage = spec.stage_root / spec.dataset
     archive = stage / "archive"
     if (spec.stage_root.is_relative_to(Path("/srv/stockagent-d-volume"))
-        or spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT)):
+        or spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)):
         from stockagent.data_sync.cold_primary import _check_d_primary_mount
 
         _check_d_primary_mount(Path("/srv/stockagent-packed"))
@@ -363,6 +381,28 @@ class _HashingReader:
         return block
 
 
+NATIVE_ENCODED_READ_MIN_BYTES = 64 * 1024**2
+NATIVE_ENCODED_READ_MAX_BYTES = 8 * 1024**3
+
+
+@contextmanager
+def _encoded_input(path: Path, fd: int, opened):
+    """Read large reviewed D encodings natively, retaining the Linux FD fence.
+
+    Only byte transport changes. The caller hashes every encoded/decoded byte
+    and checks the still-open Linux descriptor and current path afterwards.
+    Small members and all other paths retain the original local reader.
+    """
+    if (NATIVE_ENCODED_READ_MIN_BYTES <= opened.st_size <= NATIVE_ENCODED_READ_MAX_BYTES
+            and any(path.is_relative_to(root) for root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT))):
+        from stockagent.data_sync.windows_cold_io import binary_reader
+        with binary_reader(path, expected_bytes=opened.st_size) as source:
+            yield source
+    else:
+        with os.fdopen(fd, "rb", closefd=False) as source:
+            yield source
+
+
 def _encoded_original_hashes(path: Path, codec: str) -> tuple[str, int, str, int]:
     """Hash the complete encoding and decoded original in one input pass.
 
@@ -380,7 +420,7 @@ def _encoded_original_hashes(path: Path, codec: str) -> tuple[str, int, str, int
         if not stat.S_ISREG(opened.st_mode):
             raise SnapshotError("legacy encoded payload is not a regular file")
         signature = _source_signature(opened)
-        with os.fdopen(fd, "rb", closefd=False) as source:
+        with _encoded_input(path, fd, opened) as source:
             encoded = _HashingReader(source)
             original = hashlib.sha256()
             size = 0
@@ -436,12 +476,15 @@ def _encoded_original_hashes(path: Path, codec: str) -> tuple[str, int, str, int
             # also prevents an early-returning adapter from omitting the tail.
             while encoded.read():
                 pass
-            after = path.lstat()
-            if (_source_signature(os.fstat(fd)) != signature
-                    or not stat.S_ISREG(after.st_mode)
-                    or _source_signature(after) != signature):
-                raise SnapshotError("legacy encoded payload changed during verification")
-            return encoded.digest.hexdigest(), encoded.size, decoded_digest, size
+            result = encoded.digest.hexdigest(), encoded.size, decoded_digest, size
+        # Native exit/EOF validation is part of the input context. Check both
+        # identities after it too, including failures or changes at pipe close.
+        after = path.lstat()
+        if (_source_signature(os.fstat(fd)) != signature
+                or not stat.S_ISREG(after.st_mode)
+                or _source_signature(after) != signature):
+            raise SnapshotError("legacy encoded payload changed during verification")
+        return result
     except (EOFError, gzip.BadGzipFile, zlib.error) as error:
         raise SnapshotError("legacy encoded payload decode failed") from error
     finally:
@@ -540,11 +583,11 @@ def prepare_archive(
     if not spec.durable_staging and not manual_capture:
         raise SnapshotError('rebuildable staging requires explicit manual capture; cold publication remains durable')
     source, stage, archive = _paths(spec, artifact_root)
-    if spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT):
+    if spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
         available = shutil.disk_usage(spec.stage_root.parent).free
         planned_bytes = sum(row["source"]["size"] for row in source_plan(source, spec, manual_capture=manual_capture))
         if available < planned_bytes + 32 * 1024**3:
-            volume = "C" if spec.stage_root == C_TEMP_STAGE_ROOT else "guarded D benchmark"
+            volume = "C" if spec.stage_root == C_TEMP_STAGE_ROOT else "guarded D temporary"
             raise SnapshotError(f"{volume} archive scratch lacks source-size budget plus 32 GiB reserve")
         # WSL's virtual ext4 free space is not the Windows backing volume's
         # free space. Budget both before a new scratch wave can grow its VHDX.
@@ -654,6 +697,13 @@ def prepare_archive(
         raise SnapshotError("legacy directories changed during staging; stage retained for audit")
     if manual_capture:
         _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
+    manifest = _capture_manifest(spec, planned, directories, result_rows, manual_capture=manual_capture)
+    atomic_write_json(archive / "legacy_archive_manifest.json", manifest)
+    return manifest
+
+
+def _capture_manifest(spec, planned, directories, result_rows, *, manual_capture):
+    """The same preservation descriptor for new and resumed complete captures."""
     manifest = {
         "schema_version": ARCHIVE_SCHEMA,
         "dataset": spec.dataset,
@@ -673,7 +723,116 @@ def prepare_archive(
             "minimum_stable_hours": spec.manual_capture_min_stable_hours,
             "source_plan_sha256": hashlib.sha256(json.dumps(planned, sort_keys=True).encode()).hexdigest(),
         }
-    atomic_write_json(archive / "legacy_archive_manifest.json", manifest)
+    return manifest
+
+
+def recover_complete_archive_manifest(
+    spec: LegacyArchiveSpec, artifact_root: Path, *, manual_capture: bool = False,
+    repo_root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Finish only a complete interrupted encoding, with no payload writes.
+
+    The existing capture owner must serialize this call. Missing receipts or
+    payloads return None for ordinary preparation; corrupt/unknown members and
+    source drift fail closed. Old real observations remain unchanged, including
+    a uniform device renumber after reboot. This creates no cold/READY proof.
+    """
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+
+    artifact_root = artifact_root.resolve()
+    if spec.compression_profile not in COMPRESSION_PROFILES:
+        raise SnapshotError('unknown legacy compression profile')
+    if not spec.durable_staging and not manual_capture:
+        raise SnapshotError('rebuildable staging requires explicit manual capture')
+    source, stage, archive = _paths(spec, artifact_root)
+    destination = archive / 'legacy_archive_manifest.json'
+    if destination.exists() or destination.is_symlink():
+        raise SnapshotError('complete capture manifest already exists; use ordinary verification')
+    plan_path = stage / 'source_plan.json'
+    if not plan_path.exists():
+        return None
+    if (plan_path.is_symlink() or not plan_path.is_file()
+            or plan_path.stat().st_size > 64 * 1024**2):
+        raise SnapshotError('interrupted source-plan control is invalid')
+    planned = json.loads(plan_path.read_text())
+    current = source_plan(source, spec, manual_capture=manual_capture)
+    if not isinstance(planned, list) or not planned or len(planned) != len(current):
+        raise SnapshotError('interrupted source plan differs from current source')
+    mappings, changed = set(), 0
+    for old, now in zip(planned, current, strict=True):
+        if (not isinstance(old, dict) or set(old) != {'path', 'source'}
+                or old['path'] != now['path'] or not isinstance(old['source'], dict)
+                or set(old['source']) != set(now['source'])):
+            raise SnapshotError('interrupted source observation schema differs')
+        before, after = old['source']['device'], now['source']['device']
+        if type(before) is not int or type(after) is not int or min(before, after) < 0:
+            raise SnapshotError('interrupted device observation is invalid')
+        normalized = {**old['source'], 'device': after}
+        if json.dumps(normalized, sort_keys=True) != json.dumps(now['source'], sort_keys=True):
+            raise SnapshotError('source changed since the interrupted capture')
+        if before != after:
+            mappings.add((before, after))
+            changed += 1
+    if mappings and (len(mappings) != 1 or changed != len(planned)):
+        raise SnapshotError('interrupted capture has a partial or mixed device renumber')
+    directories = _archive_directories(source)
+    rows, expected = [], {'source_plan.json'}
+    for item in planned:
+        key = hashlib.sha256(item['path'].encode('utf-8')).hexdigest()
+        receipt_name = 'receipts/' + key + '.json'
+        receipt = stage / receipt_name
+        if not receipt.exists():
+            return None
+        if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 64 * 1024:
+            raise SnapshotError('interrupted per-file encoding control is invalid')
+        row = json.loads(receipt.read_text())
+        if (not isinstance(row, dict) or set(row) != {'path', 'source', 'codec', 'encoded_path',
+                'encoded_sha256', 'encoded_size', 'original_sha256'}
+                or row['path'] != item['path']
+                or json.dumps(row['source'], sort_keys=True) != json.dumps(item['source'], sort_keys=True)
+                or not isinstance(row['codec'], str) or row['codec'] not in CODEC_SUFFIXES
+                or row['encoded_path'] != f"payload/{key[:2]}/{key}.{CODEC_SUFFIXES[row['codec']]}"
+                or type(row['encoded_size']) is not int or row['encoded_size'] < 0
+                or any(not isinstance(row[k], str) or re.fullmatch('[0-9a-f]{64}', row[k]) is None
+                       for k in ('original_sha256', 'encoded_sha256'))):
+            raise SnapshotError('interrupted encoding receipt differs from its original plan')
+        encoded = archive / row['encoded_path']
+        if not encoded.exists():
+            return None
+        expected.update((receipt_name, 'archive/' + row['encoded_path']))
+        rows.append(row)
+    # A complete stage is metadata-only recovery, not another source-sized wave.
+    before_stage = metadata_tree(stage)
+    if ({r['path'] for r in before_stage['rows'] if r['kind'] == 'file'} != expected
+            or any(r['kind'] not in {'file', 'directory'} or r['cross_filesystem']
+                   or (r['kind'] == 'file' and r['signature'][6] != 1)
+                   for r in before_stage['rows'])):
+        raise SnapshotError('interrupted encoding contains unknown, linked or nonregular members')
+    manifest = _capture_manifest(spec, planned, directories, rows, manual_capture=manual_capture)
+    metadata_bytes = len(json.dumps(manifest, ensure_ascii=True).encode())
+    if shutil.disk_usage(stage).free < 256 * 1024**2 + 2 * metadata_bytes:
+        raise SnapshotError('complete capture metadata recovery lacks its bounded write budget')
+    if artifact_process_references(stage, legacy_process_scope(spec, artifact_root)):
+        raise SnapshotError('interrupted encoding has current process references')
+    if manual_capture:
+        _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
+    for row in rows:
+        encoded = archive / row['encoded_path']
+        proof = _encoded_original_hashes(encoded, row['codec'])
+        if proof != (row['encoded_sha256'], row['encoded_size'], row['original_sha256'], row['source']['size']):
+            raise SnapshotError('interrupted encoding or decoded original bytes differ')
+        if sha256_file(source / row['path']) != row['original_sha256']:
+            raise SnapshotError('current source bytes differ from the interrupted original')
+    if (source_plan(source, spec, manual_capture=manual_capture) != current
+            or _archive_directories(source) != directories
+            or metadata_tree(stage)['fingerprint'] != before_stage['fingerprint']
+            or artifact_process_references(stage, legacy_process_scope(spec, artifact_root))):
+        raise SnapshotError('source or encoding changed during complete manifest recovery')
+    if manual_capture:
+        _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
+    if destination.exists() or destination.is_symlink():
+        raise SnapshotError('capture manifest appeared during recovery; preserve the original')
+    atomic_write_json(destination, manifest)
     return manifest
 
 
@@ -712,7 +871,14 @@ def verify_archive_directory(
     source_spec = spec or LegacyArchiveSpec(
         manifest["dataset"], manifest["relative_root"], 7, archive.parent
     )
-    before_source = source_plan(source, source_spec, manual_capture=manual_capture) if source is not None else None
+    original_source = None
+    if source is not None and artifact_root is not None and manual_capture:
+        from stockagent.data_sync.benchmark_fixtures import external_benchmark_contract
+        expected_source = artifact_root.resolve() / source_spec.relative_root
+        if source != expected_source and external_benchmark_contract(expected_source) is not None:
+            original_source = expected_source
+    before_source = source_plan(source, source_spec, manual_capture=manual_capture,
+        original_source=original_source) if source is not None else None
     directories = manifest.get("directories")
     if directories is not None:
         if not isinstance(directories, list):
@@ -794,7 +960,8 @@ def verify_archive_directory(
     if observed != expected_encoded:
         raise SnapshotError("legacy encoded tree has extra or missing files")
     if source is not None:
-        after_source = source_plan(source, source_spec, manual_capture=manual_capture)
+        after_source = source_plan(source, source_spec, manual_capture=manual_capture,
+                                  original_source=original_source)
         observed_source = {row["path"] for row in after_source}
         if observed_source != expected_original:
             raise SnapshotError("legacy source has extra or missing files")
@@ -826,7 +993,7 @@ def publish_archive(
         raise SnapshotError('unknown legacy compression profile')
     if not spec.durable_staging and not manual_capture:
         raise SnapshotError('rebuildable staging requires explicit manual capture; cold publication remains durable')
-    if (spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT)
+    if (spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)
             and sync_root.resolve() != Path("/srv/stockagent-packed")):
         raise SnapshotError("temporary scratch may publish only into the guarded D canonical cold store")
     source, _stage, archive = _paths(spec, artifact_root.resolve())
@@ -1000,10 +1167,13 @@ def _stage_cold_generation(sync_root: Path, spec: LegacyArchiveSpec) -> dict[str
 def _prunable_stage(spec: LegacyArchiveSpec) -> bool:
     if spec.stage_root == C_TEMP_STAGE_ROOT:
         return True
-    return (spec.stage_root == D_BENCHMARK_STAGE_ROOT
+    reviewed = ((spec.stage_root == D_BENCHMARK_STAGE_ROOT
+                 and spec.relative_root.startswith("benchmarks/")
+                 and reviewed_wsl_artifact_root(spec.relative_root))
+                or (spec.stage_root == D_OFFLINE_STAGE_ROOT
+                    and reviewed_offline_scratch_root(spec.relative_root)))
+    return (reviewed
             and spec.capture_contract == MANUAL_WSL_CAPTURE_CONTRACT
-            and spec.relative_root.startswith("benchmarks/")
-            and reviewed_wsl_artifact_root(spec.relative_root)
             and spec.manual_capture_min_stable_hours is not None
             and spec.manual_capture_min_stable_hours >= 12)
 

@@ -17,6 +17,8 @@ OPENING_AUDIT_SERVICE_NAME="stockagent-tw-opening-audit.service"
 OPENING_AUDIT_TIMER_NAME="stockagent-tw-opening-audit.timer"
 QUOTE_PHASE_SERVICE_NAME="stockagent-tw-quote-phase-benchmark.service"
 QUOTE_PHASE_TIMER_NAME="stockagent-tw-quote-phase-benchmark.timer"
+OPENING_BROWSER_SERVICE_NAME="stockagent-tw-opening-browser.service"
+OPENING_BROWSER_TIMER_NAME="stockagent-tw-opening-browser.timer"
 
 for option in "$@"; do
   case "$option" in
@@ -34,14 +36,14 @@ if [[ "$OPENING_AUDIT_ONLY" == true && "$RETRY_ONLY" == true ]]; then
   echo "[discord-service] select one scoped installer" >&2
   exit 2
 fi
-unit_names=("$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME" "$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME")
+unit_names=("$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME" "$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_SERVICE_NAME" "$OPENING_BROWSER_TIMER_NAME")
 if [[ "$RETRY_ONLY" == true ]]; then
   # Scoped maintenance deployment must not rewrite/restart Gateway, market,
   # full-history or source owners, nor hide a failed inotify path.
   unit_names=("$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME")
 fi
 if [[ "$OPENING_AUDIT_ONLY" == true ]]; then
-  unit_names=("$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME")
+  unit_names=("$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_SERVICE_NAME" "$OPENING_BROWSER_TIMER_NAME")
 fi
 for unit_name in "${unit_names[@]}"; do
   if [[ ! -f "$REPO_ROOT/deploy/systemd/$unit_name.in" ]]; then
@@ -89,10 +91,11 @@ for unit_name in "${unit_names[@]}"; do
 done
 if [[ "$OPENING_AUDIT_ONLY" == true ]]; then
   systemctl daemon-reload
-  systemctl enable "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_TIMER_NAME"
+  systemctl enable "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_TIMER_NAME"
   if [[ "$START_NOW" == true ]]; then
     systemctl start "$OPENING_AUDIT_TIMER_NAME"
     systemctl start "$QUOTE_PHASE_TIMER_NAME"
+    systemctl start "$OPENING_BROWSER_TIMER_NAME"
   fi
   echo "[discord-service] scoped_opening_audit_install=true gateway_restarted=false engine_restarted=false"
   exit 0
@@ -112,13 +115,14 @@ chmod 0755 \
   "$REPO_ROOT/scripts/run_discord_artifact_maintenance.sh" \
   "$REPO_ROOT/scripts/run_discord_artifact_maintenance.py"
 systemctl daemon-reload
-systemctl enable "$SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_TIMER_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_TIMER_NAME"
+systemctl enable "$SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_TIMER_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_TIMER_NAME"
 if [[ "$START_NOW" == true ]]; then
   systemctl restart "$SERVICE_NAME"
   systemctl start "$MAINTENANCE_TIMER_NAME"
   systemctl start "$RETRY_TIMER_NAME"
   systemctl start "$OPENING_AUDIT_TIMER_NAME"
   systemctl start "$QUOTE_PHASE_TIMER_NAME"
+  systemctl start "$OPENING_BROWSER_TIMER_NAME"
   systemctl restart "$MAINTENANCE_PATH_NAME"
 fi
 echo "[discord-service] installed=/etc/systemd/system/$SERVICE_NAME enabled=$(systemctl is-enabled "$SERVICE_NAME")"

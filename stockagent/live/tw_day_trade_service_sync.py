@@ -8,6 +8,7 @@ committed revision without repeatedly parsing multi-megabyte ledgers.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -16,8 +17,81 @@ from typing import Any, Final, Mapping
 
 
 SERVICE_SYNC_FILENAME: Final[str] = "service_sync.json"
+SERVICE_SYNC_DURABLE_ACK_FILENAME: Final[str] = "service_sync_durable_ack.json"
+SERVICE_SYNC_DURABLE_ACK_CONTRACT: Final[str] = "post_commit_directory_fsync_v1"
 DISCORD_SERVICE_STATUS_FILENAME: Final[str] = "service_status.json"
 SERVICE_SYNC_SCHEMA_VERSION: Final[int] = 1
+PAPER_JOURNAL_FILENAMES: Final[tuple[str, ...]] = (
+    "signals.jsonl", "orders.jsonl", "fills.jsonl", "events.jsonl",
+    "marks.jsonl", "benchmark_marks.jsonl",
+)
+
+
+def paper_journal_generations(root: Path) -> dict[str, list[int] | None]:
+    """Bind the commit to exact local journal metadata, not size alone.
+
+    This is a read-consistency fence, NOT a prefix-integrity proof. It cannot
+    authorize skipping the canonical reader's rewrite detection or hashing.
+    Missing files are explicit, and permission/I/O errors remain errors.
+    """
+    return _paper_file_generations(root, PAPER_JOURNAL_FILENAMES)
+
+
+def paper_projection_generations(root: Path) -> dict[str, list[int] | None]:
+    return _paper_file_generations(root, ("state.json", "positions.json", "status.json"))
+
+
+def _paper_file_generations(root: Path, names) -> dict[str, list[int] | None]:
+    result = {}
+    for name in names:
+        try:
+            stat = (Path(root) / name).stat()
+        except FileNotFoundError:
+            result[name] = None
+        else:
+            result[name] = [stat.st_dev, stat.st_ino, stat.st_size,
+                            stat.st_mtime_ns, stat.st_ctime_ns]
+    return result
+
+
+class PaperReadChanged(OSError):
+    """The requested projection is not one stable committed paper view."""
+
+
+@contextmanager
+def committed_paper_read_guard(root: Path):
+    """Bracket financial readers without locking or parsing large state.
+
+    New receipts bind BOTH journals and replaced projections. A matching
+    journal size alone cannot validate a state rename before the commit marker.
+    Legacy receipts retain their prior diagnostic semantics, not this proof.
+    """
+    receipt = load_service_sync(root)
+    if receipt is None and (Path(root) / SERVICE_SYNC_FILENAME).exists():
+        # An absent historical marker is legacy diagnostic input; a present
+        # corrupt/unsupported marker is not. Never downgrade known commit
+        # corruption into permission to publish an unfenced financial view.
+        raise PaperReadChanged("paper commit marker is invalid or unreadable")
+    if not isinstance(receipt, Mapping) or "projection_generations" not in receipt:
+        yield
+        return
+    identity = tuple(receipt.get(key) for key in ("engine_run_id", "state_revision", "content_revision"))
+    if (not isinstance(identity[0], str) or not identity[0]
+            or type(identity[1]) is not int or identity[1] <= 0
+            or type(identity[2]) is not int or identity[2] < 0):
+        raise PaperReadChanged("invalid committed paper identity")
+
+    def matches():
+        return (paper_projection_generations(root) == receipt.get("projection_generations")
+                and paper_journal_generations(root) == receipt.get("journal_generations"))
+
+    if not matches():
+        raise PaperReadChanged("paper files are ahead of their commit marker")
+    yield
+    after = load_service_sync(root) or {}
+    if (tuple(after.get(key) for key in ("engine_run_id", "state_revision", "content_revision"))
+            != identity or not matches()):
+        raise PaperReadChanged("paper commit changed during view construction")
 
 
 def read_json_object(path: Path) -> dict[str, Any]:
@@ -40,7 +114,15 @@ def read_service_ack_pair(engine_path: Path, discord_path: Path, *,
     """
     if not 0 < poll_seconds <= timeout_seconds <= 10:
         raise ValueError("ACK observation requires 0 < poll <= timeout <= 10 seconds")
-    read = reader or read_json_object
+    def committed_read(path):
+        if Path(path).name == SERVICE_SYNC_FILENAME:
+            receipt = load_service_sync(Path(path).parent)
+            if receipt is None:
+                raise ValueError("engine receipt is not durably acknowledged")
+            return receipt
+        return read_json_object(path)
+
+    read = reader or committed_read
     started = time.monotonic()
     deadline = started + timeout_seconds
     attempts = 0
@@ -76,8 +158,34 @@ def load_service_sync(state_dir: Path) -> dict[str, Any] | None:
         payload = read_json_object(path)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    if int(payload.get("schema_version") or 0) != SERVICE_SYNC_SCHEMA_VERSION:
+    try:
+        supported = int(payload.get("schema_version") or 0) == SERVICE_SYNC_SCHEMA_VERSION
+    except (TypeError, ValueError, OverflowError):
         return None
+    if not supported:
+        return None
+    if "durability_ack" in payload:
+        # A marker rename may be visible before its directory fsync returns.
+        # Only the canonical writer, AFTER that barrier succeeds, may publish
+        # this separate admission hint. It is not another financial ledger.
+        # A missing/lost hint after a crash fails closed until the engine's
+        # ordinary next commit; legacy receipts retain diagnostic semantics.
+        expected = payload["durability_ack"]
+        if (not isinstance(expected, dict)
+                or expected.get("contract") != SERVICE_SYNC_DURABLE_ACK_CONTRACT
+                or not isinstance(expected.get("commit_id"), str)
+                or not expected["commit_id"]):
+            return None
+        try:
+            ack = read_json_object(Path(state_dir) / SERVICE_SYNC_DURABLE_ACK_FILENAME)
+            generation = _paper_file_generations(state_dir, (SERVICE_SYNC_FILENAME,))
+        except (OSError, TypeError, ValueError):
+            return None
+        if (ack.get("schema_version") != 1 or ack.get("durability_ack") != expected
+                or ack.get("marker_generation") != generation[SERVICE_SYNC_FILENAME]
+                or any(ack.get(key) != payload.get(key) for key in
+                       ("engine_run_id", "state_revision", "content_revision"))):
+            return None
     return payload
 
 
@@ -117,9 +225,15 @@ def age_seconds(value: object, *, now: datetime | None = None) -> float | None:
 __all__ = [
     "DISCORD_SERVICE_STATUS_FILENAME",
     "SERVICE_SYNC_FILENAME",
+    "SERVICE_SYNC_DURABLE_ACK_FILENAME",
+    "SERVICE_SYNC_DURABLE_ACK_CONTRACT",
     "SERVICE_SYNC_SCHEMA_VERSION",
     "age_seconds",
     "load_service_sync",
+    "PaperReadChanged",
+    "committed_paper_read_guard",
+    "paper_journal_generations",
+    "paper_projection_generations",
     "mode_from_service_sync",
     "parse_timestamp",
     "read_json_object",

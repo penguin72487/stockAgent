@@ -17,7 +17,9 @@ import io
 import json
 import os
 from pathlib import Path
+import threading
 from typing import Any
+import weakref
 
 import numpy as np
 import torch
@@ -25,6 +27,7 @@ import torch
 CONTRACT = "tw_factorized_nullable_panel_lag1_v1"
 VALUE_ONLY_CONTRACT = "tw_factorized_nullable_panel_values_lag1_v2"
 SUPPORTED_CONTRACTS = {CONTRACT, VALUE_ONLY_CONTRACT}
+_LIVE_PACKET_INIT_LOCK = threading.Lock()
 
 
 def file_sha256(path: Path) -> str:
@@ -105,9 +108,101 @@ class _BlockCache:
     budget_bytes: int
 
     def __post_init__(self):
-        self.cache: OrderedDict[int, np.ndarray | _ColumnBlock] = OrderedDict()
+        self.cache: OrderedDict[Any, Any] = OrderedDict()
         self.bytes = 0
         self.hits = self.misses = self.bytes_read = 0
+        self.prepared_hits = self.prepared_misses = self.prepared_admissions = 0
+        # Same immutable packet owner as the host LRU. Only raw, lossless
+        # inference payloads may survive a request, never model activations.
+        self._live_device_packets = OrderedDict()
+        self._live_device_bytes = 0
+        # Training sources remain pickleable; a device lock exists only once
+        # an admitted private inference owner actually uses this path.
+        self._live_device_lock = None
+        self._live_device_retired = False
+
+    def retire_live_device_packets(self):
+        if self._live_device_lock is None:
+            self._live_device_retired = True
+            return False
+        with self._live_device_lock:
+            retained = bool(self._live_device_packets)
+            self._live_device_retired = True
+            self._live_device_packets.clear()
+            self._live_device_bytes = 0
+            return retained
+
+    def live_device_packet(self, host, device, *, non_blocking):
+        """Own bounded immutable CUDA bytes; order producer/consumer streams.
+
+        A weak host identity also fences source/window/coordinate changes and
+        does not pin evicted host packets outside their existing byte budget.
+        Each cache owns at most min(host budget, 1 GiB) across ALL devices.
+        Capacity rejection is the ordinary transport, not a changed input.
+        """
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        device = torch.device("cuda", index)
+        stream = torch.cuda.current_stream(device)
+        key = (index, id(host))
+        if self._live_device_lock is None:
+            with _LIVE_PACKET_INIT_LOCK:
+                if self._live_device_lock is None:
+                    self._live_device_lock = threading.Lock()
+        with self._live_device_lock:
+            # An evicted host object can never validate a later reused id.
+            for old_key, (reference, packet, _ready) in list(self._live_device_packets.items()):
+                if reference() is None:
+                    self._live_device_packets.pop(old_key)
+                    self._live_device_bytes -= packet.numel() * packet.element_size()
+            budget = min(self.budget_bytes, 1024**3)
+            while self._live_device_packets and self._live_device_bytes > budget:
+                _, (_, old, _ready) = self._live_device_packets.popitem(last=False)
+                self._live_device_bytes -= old.numel() * old.element_size()
+            entry = self._live_device_packets.get(key)
+            if not self._live_device_retired and entry is not None and entry[0]() is host:
+                self._live_device_packets.move_to_end(key)
+                stream.wait_event(entry[2])
+                entry[1].record_stream(stream)
+                return entry[1], True
+            size = host.packet.numel() * host.packet.element_size()
+            free, _ = torch.cuda.mem_get_info(device)
+            admit = (not self._live_device_retired and size <= budget
+                     and free >= size + 1024**3)
+            if admit:
+                while self._live_device_packets and self._live_device_bytes + size > budget:
+                    _, (_, old, _ready) = self._live_device_packets.popitem(last=False)
+                    self._live_device_bytes -= old.numel() * old.element_size()
+            packet = host.packet.to(device=device, non_blocking=non_blocking)
+            if admit:
+                ready = torch.cuda.Event()
+                ready.record(stream)
+                self._live_device_packets[key] = (weakref.ref(host), packet, ready)
+                self._live_device_bytes += size
+            return packet, False
+
+    def _admit(self, key, value):
+        if value.nbytes > self.budget_bytes:
+            return False  # An uncacheable packet must not evict useful blocks.
+        previous = self.cache.pop(key, None)
+        if previous is not None:
+            self.bytes -= previous.nbytes
+        while self.cache and self.bytes + value.nbytes > self.budget_bytes:
+            _, old = self.cache.popitem(last=False)
+            self.bytes -= old.nbytes
+        if value.nbytes <= self.budget_bytes:
+            self.cache[key] = value
+            self.bytes += value.nbytes
+            return True
+        return False
+
+    def prepared(self, key):
+        value = self.cache.get(key)
+        if value is None:
+            self.prepared_misses += 1
+        else:
+            self.prepared_hits += 1
+            self.cache.move_to_end(key)
+        return value
 
     def get(self, index: int) -> np.ndarray | _ColumnBlock:
         import pyarrow as pa
@@ -148,12 +243,7 @@ class _BlockCache:
         values.setflags(write=False)
         self.misses += 1
         self.bytes_read += len(compressed)
-        while self.cache and self.bytes + value.nbytes > self.budget_bytes:
-            _, old = self.cache.popitem(last=False)
-            self.bytes -= old.nbytes
-        if value.nbytes <= self.budget_bytes:
-            self.cache[index] = value
-            self.bytes += value.nbytes
+        self._admit(index, value)
         return value
 
 
@@ -504,13 +594,35 @@ def _reconstruct_transfer_packet(result, packet, layout, queued, base_width, com
                 views[indices][None, None, :]), views[payload])
 
 
+@dataclass(frozen=True)
+class _PreparedHostPacket:
+    packet: torch.Tensor
+    layout: list
+    queued: list
+
+    @property
+    def nbytes(self):
+        # Coordinate metadata remains on CPU alongside the packed value bytes.
+        return self.packet.numel() + sum(value.nbytes for op in self.queued
+                                         for value in op if isinstance(value, np.ndarray))
+
+
+def _live_host_packets_reusable(source):
+    # Only the live attachment owns this private immutable base. Training or
+    # externally mutable sources must always rebuild their exact current bytes.
+    return (torch.is_inference_mode_enabled()
+            and getattr(source, "_live_prepared_packet_owner", False)
+            and not source.base.flags.writeable and not source.common.flags.writeable)
+
+
 class FactorizedPanelSlab:
     """Lazy slab passed at the eager I/O boundary, never inside compiled math."""
     _stockagent_factorized_slab=True
     dtype=torch.float32
-    def __init__(self,source,rows,*,pin_slabs=False,device=None):
+    def __init__(self,source,rows,*,pin_slabs=False,device=None,prepared_host_packets=False):
         self.source,self.rows,self.pin_slabs=source,np.asarray(rows,dtype=np.int64),pin_slabs
         self.device=torch.device("cpu") if device is None else torch.device(device)
+        self.prepared_host_packets = prepared_host_packets
         # One forward/checkpoint lifetime only: no stale observations across
         # batches, devices, optimizer updates or folds. Store compact bytes,
         # not the much larger dense input or learned activations.
@@ -537,10 +649,44 @@ class FactorizedPanelSlab:
     def size(self,dim=None):return self.shape if dim is None else self.shape[dim]
     def dim(self):return 3
     def to(self,device=None,**kwargs):
-        return FactorizedPanelSlab(self.source,self.rows,pin_slabs=self.pin_slabs,device=device or self.device)
+        return FactorizedPanelSlab(self.source,self.rows,pin_slabs=self.pin_slabs,device=device or self.device,
+                                   prepared_host_packets=self.prepared_host_packets)
     def pad_end(self,count):
         return FactorizedPanelSlab(self.source,np.concatenate([self.rows,np.repeat(self.rows[-1],count)]),
-                                  pin_slabs=self.pin_slabs,device=self.device)
+                                  pin_slabs=self.pin_slabs,device=self.device,
+                                  prepared_host_packets=self.prepared_host_packets)
+    def _full_host_packet(self, subset, start, end):
+        # Only attach_factorized_live_features owns the private read-only base.
+        # Training/public mutable sources never enter this inference cache.
+        cache = self.source._cache
+        reusable = self.prepared_host_packets and _live_host_packets_reusable(self.source)
+        key = (("live-host-packet-v1", self.source.root_identity, tuple(self.rows.tolist()),
+                tuple(self.source.symbol_indices[start:end].tolist()), bool(self.pin_slabs))
+               if reusable else None)
+        if key is not None:
+            cached = cache.prepared(key)
+            if cached is not None:
+                return cached
+        values, queued = [], []
+        def queue(value):
+            values.append(value)
+            return len(values)-1
+        if subset.base.shape[-1]:
+            queued.append(("base", queue(subset.base[self.rows[:, None], subset.symbol_indices[None, :]])))
+        if subset.common.shape[-1]:
+            queued.append(("common", queue(subset.common[self.rows])))
+        for rows, stocks, columns, value in subset.compact_transfer_rectangles(self.rows):
+            payload, indices = queue(value), queue(columns)
+            if np.all(np.diff(rows) == 1) and np.all(np.diff(stocks) == 1):
+                queued.append(("rectangle", rows, stocks, payload, indices))
+            else:
+                queued.append(("indexed", queue(rows), queue(stocks), payload, indices))
+        packet, layout = _pack_transfer_payloads(values, pin_memory=self.pin_slabs,
+                                                budget_bytes=self.source.max_slab_bytes)
+        result = _PreparedHostPacket(packet, layout, queued)
+        if key is not None and cache._admit(key, result):
+            cache.prepared_admissions += 1
+        return result
     def _compact_column_packet(self,start,end):
         """Pack immutable rectangle views, not a large NumPy column scatter.
 
@@ -652,7 +798,23 @@ class FactorizedPanelSlab:
         self.source.transfer_stats["chunks"] += 1
         self.source.transfer_stats["logical_dense_bytes"] += len(self.rows)*(end-start)*self.size(2)*4
         return values, columns
-    def stock_chunk(self,start,end):
+    def stock_chunk(self,start,end,*,destination=None):
+        if destination is not None:
+            # Only the live inference owner supplies this fresh output view.
+            # Training/checkpoint callers retain their privately allocated slab.
+            if not torch.is_inference_mode_enabled():
+                raise RuntimeError("factorized destination requires inference mode")
+            expected_device = (torch.device("cuda", torch.cuda.current_device())
+                if self.device.type == "cuda" and self.device.index is None else self.device)
+            if (self.device.type != "cuda" or destination.device != expected_device
+                    or self.source.transfer_mode not in {"compact_cuda", "compact_cuda_packed", "compact_cuda_cached"}
+                    or destination.dtype != torch.float32 or destination.requires_grad
+                    or not 0 <= start < end <= self.size(1)
+                    or tuple(destination.shape) != (len(self.rows), end-start, self.size(2))
+                    or destination.stride(-1) != 1
+                    or destination.stride(-2) != self.size(2)
+                    or destination.stride(-3) < (end-start)*self.size(2)):
+                raise ValueError("factorized destination must be a nonoverlapping full-width CUDA FP32 view")
         subset=self.source.subset_symbols(np.arange(start,end))
         logical_bytes=len(self.rows)*(end-start)*self.source.shape[2]*4
         if logical_bytes>self.source.max_slab_bytes:
@@ -662,8 +824,8 @@ class FactorizedPanelSlab:
             # selected from validation/test or a small-but-nonzero value.
             # Transfer this lossless representation, then reconstruct the same
             # contiguous full-width Float32 tensor before compiled model math.
-            result=torch.zeros((len(self.rows),end-start,self.source.shape[2]),
-                dtype=torch.float32,device=self.device)
+            result=(torch.zeros((len(self.rows),end-start,self.source.shape[2]),
+                dtype=torch.float32,device=self.device) if destination is None else destination.zero_())
             payload_bytes=0
             packed=self.source.transfer_mode in {"compact_cuda_packed", "compact_cuda_cached"}
             queued=[]
@@ -679,25 +841,18 @@ class FactorizedPanelSlab:
                     self.source.transfer_stats["logical_dense_bytes"] += logical_bytes
                     self.source.transfer_stats["payload_cache_hits"] += 1
                     return result
-                values=[]
-                def queue(value):
-                    values.append(value)
-                    return len(values)-1
-                if base_width:
-                    queued.append(("base",queue(subset.base[
-                        self.rows[:,None],subset.symbol_indices[None,:]])))
-                if subset.common.shape[-1]:
-                    queued.append(("common",queue(subset.common[self.rows])))
-                for rows,stocks,columns,value in subset.compact_transfer_rectangles(self.rows):
-                    payload,indices=queue(value),queue(columns)
-                    if np.all(np.diff(rows)==1) and np.all(np.diff(stocks)==1):
-                        queued.append(("rectangle",rows,stocks,payload,indices))
-                    else:
-                        queued.append(("indexed",queue(rows),queue(stocks),payload,indices))
-                packet,layout=_pack_transfer_payloads(values,pin_memory=self.pin_slabs,
-                    budget_bytes=self.source.max_slab_bytes)
+                host = self._full_host_packet(subset, start, end)
+                packet, layout, queued = host.packet, host.layout, host.queued
                 payload_bytes=packet.numel()
-                packet=packet.to(device=self.device,non_blocking=self.pin_slabs)
+                if self.prepared_host_packets and _live_host_packets_reusable(self.source):
+                    packet, hit = self.source._cache.live_device_packet(
+                        host, self.device, non_blocking=self.pin_slabs)
+                    self.source.transfer_stats["live_device_packet_hits"] = (
+                        self.source.transfer_stats.get("live_device_packet_hits", 0) + int(hit))
+                    if hit:
+                        payload_bytes = 0
+                else:
+                    packet=packet.to(device=self.device,non_blocking=self.pin_slabs)
                 if (self.source.transfer_mode == "compact_cuda_cached"
                         and self._retain_gpu_packets and torch.is_grad_enabled()):
                     self._remember_gpu_packet(key, packet, layout, queued)
@@ -968,7 +1123,7 @@ class FactorizedLiveWindow:
             value[:, self.overlay[0]] = self.overlay[1]
         return value
 
-    def stock_chunks(self, device, *, chunk_stocks=128):
+    def stock_chunks(self, device, *, chunk_stocks=128, destination=None, prepared_host_packets=False):
         if isinstance(self.features, FactorizedDateView):
             source = self.features.source
             rows = self.features.rows[self.start:self.stop]
@@ -976,17 +1131,20 @@ class FactorizedLiveWindow:
             source = self.features
             rows = np.arange(self.start, self.stop)
         # Share the immutable verified block cache without modifying its
-        # transport policy for other callers. No transformed GPU cache lives
-        # across requests, devices, folds, or model-state changes.
+        # transport policy for other callers. Only bounded immutable raw
+        # packets may survive requests; no model-dependent GPU value does.
         from copy import copy
         source = copy(source)
         source.transfer_stats = dict(source.transfer_stats)
-        source.transfer_stats.update(logical_dense_bytes=0, host_payload_bytes=0)
+        source.transfer_stats.update(logical_dense_bytes=0, host_payload_bytes=0,
+                                     live_device_packet_hits=0)
         source.transfer_mode = "compact_cuda_packed" if device.type == "cuda" else "dense_cpu"
-        slab = FactorizedPanelSlab(source, rows, pin_slabs=device.type == "cuda", device=device)
+        slab = FactorizedPanelSlab(source, rows, pin_slabs=device.type == "cuda", device=device,
+                                   prepared_host_packets=prepared_host_packets)
         for begin in range(0, self.shape[1], chunk_stocks):
             end = min(self.shape[1], begin+chunk_stocks)
-            raw = slab.stock_chunk(begin, end)
+            raw = slab.stock_chunk(begin, end, **({} if destination is None else
+                {"destination": destination[:, begin:end]}))
             # Same nan/inf sentinel and FP32 storage as the canonical host
             # normalizer. The freshly reconstructed tensor is privately owned.
             raw.nan_to_num_(nan=0., posinf=0., neginf=0.)
@@ -995,26 +1153,48 @@ class FactorizedLiveWindow:
                 raw[-1, :, column].copy_(torch.from_numpy(values[begin:end].copy()).to(device))
             yield raw.unsqueeze(0)
         self.transport_stats.update({"logical_dense_bytes": source.transfer_stats["logical_dense_bytes"],
-                                     "host_payload_bytes": source.transfer_stats["host_payload_bytes"]})
+                                     "host_payload_bytes": source.transfer_stats["host_payload_bytes"],
+                                     "live_device_packet_hits": source.transfer_stats["live_device_packet_hits"]})
 
-    def materialize(self, device):
-        """Reconstruct the full original tensor shape, not chunked model math."""
+    def materialize(self, device, *, direct_destination=False, prepared_host_packets=True):
+        """Reuse bounded immutable live packets, preserving full-shape FP32 math."""
         import time
+        if direct_destination and not (device.type == "cuda" and torch.is_inference_mode_enabled()):
+            raise RuntimeError("direct live destination requires CUDA inference mode")
         started = time.perf_counter()
-        cache = (self.features.source if isinstance(self.features, FactorizedDateView)
-                 else self.features)._cache
+        source = self.features.source if isinstance(self.features, FactorizedDateView) else self.features
+        cache = source._cache
+        prepared = bool(prepared_host_packets and device.type == "cuda"
+                        and _live_host_packets_reusable(source))
         self.transport_stats = {"layout": "lossless_packed_full_shape_owned_fp32_v1",
             "source_cache_misses_before": cache.misses,
             "source_cache_hits_before": cache.hits,
             "source_cache_budget_bytes": cache.budget_bytes}
+        self.transport_stats.update(host_packet_cache_hits_before=cache.prepared_hits,
+            host_packet_cache_misses_before=cache.prepared_misses,
+            prepared_host_packets_requested=bool(prepared_host_packets),
+            prepared_host_packets_active=prepared)
         result = torch.empty((1, *self.shape), dtype=torch.float32, device=device)
+        # Direct destination assembly regressed in complete ABBA runs. Retain
+        # private chunks unless explicitly comparing that experimental axis.
+        direct = direct_destination
+        self.transport_stats.update(destination_policy=("owned_full_window_slices_v1" if direct
+            else "private_chunk_then_copy_v1"), avoided_dense_copy_bytes=(result.numel()*result.element_size()
+            if direct else 0))
         begin = 0
-        for raw in self.stock_chunks(device):
+        for raw in self.stock_chunks(device, prepared_host_packets=prepared,
+                                     **({"destination": result[0]} if direct else {})):
             end = begin+raw.size(2)
-            result[:, :, begin:end].copy_(raw)
+            if not direct:
+                result[:, :, begin:end].copy_(raw)
             begin = end
         self.transport_stats.update(source_cache_misses_after=cache.misses,
             source_cache_hits_after=cache.hits, source_cache_resident_bytes=cache.bytes)
+        self.transport_stats.update(host_packet_cache_hits_after=cache.prepared_hits,
+            host_packet_cache_misses_after=cache.prepared_misses,
+            host_packet_cache_payload_bytes=sum(value.nbytes for value in cache.cache.values()
+                                               if isinstance(value, _PreparedHostPacket)))
+        self.transport_stats["live_device_packet_resident_bytes"] = cache._live_device_bytes
         self.transport_stats["input_reconstruct_enqueue_ms"] = round((time.perf_counter()-started)*1000, 3)
         return result
 
@@ -1058,6 +1238,10 @@ def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_ca
     source_panel.features = base
     source_panel = attach_factorized_features(source_panel, path, host_cache_bytes=host_cache_bytes,
         progress_callback=progress_callback)
+    # This base was allocated above and has no external mutable owner. Keeping
+    # it read-only permits preopen exact packet reuse; quote overlays are private.
+    source_panel.features.base.setflags(write=False)
+    source_panel.features._live_prepared_packet_owner = True
     result = copy(panel)
     result.features = FactorizedDateView(source_panel.features, rows)
     result.feature_names = source_panel.feature_names

@@ -22,6 +22,125 @@ def write_json(path, value):
     atomic_write_json(path, value, durable=True)
 
 
+def registered_approval(tmp_path, monkeypatch):
+    from downloader.news_fulltext import load_config
+    from downloader import news_fulltext_contentplatform as native
+    from downloader.news_fulltext_retained_native import _article_digest
+    from test_news_contentplatform import URL as original_url, entry, page as original_page
+    config, _, _ = load_config(Path('configs/news_fulltext.json'))
+    config.pop('provider_catalog', None)
+    config['providers'] = [entry()]
+    source = PolicyRegistry(config, base=tmp_path).sources['contentplatform']
+    original_auth = deepcopy(source.authorization)
+    original_auth['scope'] = 'One synthetic diagnostic original; no publication, aliases or export.'
+    old_provider = 'policy_contentplatform_review'
+    queue, registry, path, manifest = approved(tmp_path, config, urls=(original_url,),
+        provider='contentplatform', raw_factory=lambda **_: original_page(),
+        raw_override={'provider': old_provider}, original_auth=original_auth)
+    report_path = path.parent/manifest['observation_report']
+    report = json.loads(report_path.read_bytes())
+    report['probes'][0]['provider'] = old_provider
+    write_json(report_path, report)
+    manifest.update(contract_version=4, scope_kind='reviewed_native_source_registration_v4',
+        diagnostic_source_registration_reviewed=True, observation_report_sha256=sha256_file(report_path))
+    article = extract_article(original_page(), source, page_url=original_url)
+    item = manifest['entries'][0]
+    item.update(original_provider=old_provider, article_keys=sorted(article),
+        article_fields_sha256=_article_digest(article))
+    identity = (original_url, item['response_sha256'], old_provider, _article_digest(original_auth))
+    monkeypatch.setattr(native, 'CONTENTPLATFORM_RETAINED_REGISTRATIONS', (identity,))
+    directory = path.parent/'private-source-diagnostics'
+    directory.chmod(0o700)
+    for file in directory.iterdir():
+        file.chmod(0o600)
+    write_json(path, manifest)
+    return queue, registry, path, manifest, original_url
+
+
+def test_registered_original_keeps_both_provider_identities_without_another_get(tmp_path, monkeypatch):
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__',
+        lambda *a, **k: pytest.fail('registration reuses the original; no HTTP'))
+    queue, registry, path, manifest, url = registered_approval(tmp_path, monkeypatch)
+    try:
+        original = path.parent/manifest['entries'][0]['diagnostic_path']
+        before = original.read_bytes()
+        result = replay(queue, path, (url,))
+        assert result['materialized_bodies']==1 and result['publisher_requests_this_command']==0
+        row = pq.ParquetFile(queue.root/head(queue, url)['parquet_path']).read().to_pylist()[0]
+        assert row['provider']=='contentplatform'
+        assert row['original_diagnostic_provider']=='policy_contentplatform_review'
+        assert row['captured_at_utc']==row['source_observed_at_utc']==manifest['entries'][0]['captured_at_utc']
+        assert json.loads(row['original_diagnostic_authorization_json'])==manifest['entries'][0]['original_authorization']
+        assert not row['historical_point_in_time'] and original.read_bytes()==before
+        assert replay(queue, path, (url,))['materialized_bodies']==0
+        root=queue.root
+    finally:
+        queue.close()
+    queue=NewsQueue(root,registry)
+    try:
+        assert head(queue,url)['state']=='complete'
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('change', ['old_abi','provider','unreviewed','field_digest','widened_source',
+    'unsigned_original','public_original','changed_pin'])
+def test_source_registration_is_not_a_general_original_import(tmp_path, monkeypatch, change):
+    from downloader import news_fulltext_contentplatform as native
+    queue, registry, path, manifest, url=registered_approval(tmp_path,monkeypatch)
+    try:
+        before=head(queue,url)
+        if change=='old_abi':
+            manifest.update(contract_version=1,scope_kind='reviewed_native_diagnostic_materialization_v1')
+        elif change=='provider':
+            manifest['entries'][0]['original_provider']='unreviewed-provider'
+        elif change=='unreviewed':
+            manifest['diagnostic_source_registration_reviewed']=False
+        elif change=='field_digest':
+            manifest['entries'][0]['article_fields_sha256']='0'*64
+        elif change=='widened_source':
+            registry.sources['contentplatform']=replace(registry.sources['contentplatform'],known_url_only=False)
+        elif change=='unsigned_original':
+            manifest['entries'][0]['original_authorization']['kind']='unreviewed'
+        elif change=='public_original':
+            (path.parent/manifest['entries'][0]['diagnostic_path']).chmod(0o644)
+        else:
+            monkeypatch.setattr(native,'CONTENTPLATFORM_RETAINED_REGISTRATIONS',())
+        write_json(path,manifest)
+        with pytest.raises(ValueError):
+            replay(queue,path,(url,))
+        assert head(queue,url)==before
+        assert not queue.db.execute('SELECT 1 FROM accepted_batches').fetchone()
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('newer_refusal', [False, True])
+def test_source_registration_receipt_recovery_preserves_newer_refusal(tmp_path, monkeypatch, newer_refusal):
+    queue, registry, path, manifest, url=registered_approval(tmp_path,monkeypatch)
+    root=queue.root
+    monkeypatch.setattr(queue, '_accept_records',
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('crash after durable receipt')))
+    try:
+        with pytest.raises(RuntimeError,match='crash after durable receipt'):
+            replay(queue,path,(url,))
+        assert len(list((root/'receipts').glob('*.json')))==1
+        if newer_refusal:
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='http_403',error_code='http_403',lease_owner=NULL,lease_until=NULL WHERE url=?",(url,))
+    finally:
+        queue.close()
+    queue=NewsQueue(root,registry)
+    try:
+        saved=head(queue,url)
+        if newer_refusal:
+            assert saved['state']==saved['error_code']=='http_403' and saved['body_sha256'] is None
+        else:
+            assert saved['state']=='complete' and saved['body_sha256']==manifest['entries'][0]['body_sha256']
+    finally:
+        queue.close()
+
+
 def approved(tmp_path, settings, *, urls=(URL,), raw_override=None, original_auth=None,
              provider='mitrade', raw_factory=None):
     # A standalone synthetic provider is not the deployed Cnyes focus cohort.
@@ -91,6 +210,102 @@ def cmnews_approval(tmp_path):
     config['providers'] = [entry for entry in config['providers'] if entry['id'] == 'cmnews']
     return approved(tmp_path, config, urls=(ANNOUNCEMENT_URL,), provider='cmnews',
         raw_factory=lambda **kwargs: short_announcement_page())
+
+
+def moneyweekly_config():
+    from downloader.news_fulltext import load_config
+    config, _, _ = load_config(Path('configs/news_fulltext.json'))
+    config.pop('provider_catalog', None)
+    config['providers'] = [entry for entry in config['providers'] if entry['id'] == 'moneyweekly']
+    return config
+
+
+def moneyweekly_approval(tmp_path):
+    from test_news_reviewed_author_scope import short_page
+    url = 'https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394'
+    return approved(tmp_path, moneyweekly_config(), urls=(url,), provider='moneyweekly',
+        raw_factory=lambda **kwargs: short_page())
+
+
+def test_moneyweekly_short_original_uses_explicit_repair_and_canonical_zero_http_acceptance(tmp_path, monkeypatch):
+    from downloader.news_fulltext_repairs import submit_repairs, consume_repairs
+    from test_news_reviewed_author_scope import SHORT_PROSE
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__',
+        lambda *args, **kwargs: pytest.fail('retained repair cannot construct HTTP'))
+    queue, registry, path, manifest = moneyweekly_approval(tmp_path)
+    url = manifest['entries'][0]['url']
+    with queue.db:
+        queue.db.execute("UPDATE articles SET state='body_not_found',error_code='body_not_found',"
+            "attempts=2,last_checked_at_utc=? WHERE url=?",
+            ((datetime.now(UTC)-timedelta(seconds=30)).isoformat(), url))
+    before = head(queue, url)
+    try:
+        assert replay(queue, path, (url,))['materialized_bodies'] == 0
+        assert head(queue, url) == before  # A local original is not a retry grant.
+        request = submit_repairs(queue.root, registry, [url], reason='Review complete native short prose')
+        assert request['submitted_targets'] == 1
+        assert consume_repairs(queue, max_seconds=0.1)['outcomes'] == {'enqueued': 1}
+        admitted = head(queue, url)
+        assert admitted['state'] == 'retry'
+        assert {k: admitted[k] for k in before if k != 'state'} == {k: before[k] for k in before if k != 'state'}
+        result = replay(queue, path, (url,))
+        assert result['materialized_bodies'] == 1 and result['publisher_requests_this_command'] == 0
+        current = head(queue, url)
+        assert current['state'] == 'complete' and current['attempts'] == 3
+        saved, = pq.ParquetFile(queue.root/current['parquet_path']).read().to_pylist()
+        assert saved['body'] == SHORT_PROSE
+        assert saved['published_at_raw'] == '2026/10/8'
+        assert saved['extraction_method'] == 'moneyweekly_visible_short_prose_v1'
+        assert saved['source_observed_at_utc'] == manifest['entries'][0]['captured_at_utc']
+        assert saved['http_duration_seconds'] is None and not saved['historical_point_in_time']
+        assert replay(queue, path, (url,))['materialized_bodies'] == 0 and head(queue, url) == current
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('change', [
+    {'domains': ('other.invalid',)}, {'selectors': ('body',)}, {'known_url_only': False},
+    {'embedded_article_layout': 'other'},
+    {'title_selector': 'h2'}, {'author_selectors': ('.related-author',)},
+    {'publication_selectors': ('footer time',)}, {'permitted_author_names': ()},
+    {'require_author_attribution': False}, {'require_configured_container': False},
+])
+def test_moneyweekly_native_replay_requires_the_reviewed_current_editor_and_header(tmp_path, change):
+    queue, registry, path, manifest = moneyweekly_approval(tmp_path)
+    url = manifest['entries'][0]['url']
+    before = head(queue, url)
+    try:
+        registry.sources['moneyweekly'] = replace(registry.sources['moneyweekly'], **change)
+        with pytest.raises((NewsError, ValueError), match='scope|unapproved'):
+            replay(queue, path, (url,))
+        assert head(queue, url) == before
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+    finally:
+        queue.close()
+
+
+def test_moneyweekly_parser_upgrade_keeps_missing_heads_attempts_deadlines_and_observations(tmp_path):
+    config = moneyweekly_config()
+    old, new = PolicyRegistry(config, base=tmp_path), PolicyRegistry(config, base=tmp_path)
+    old.sources['moneyweekly'] = replace(old.sources['moneyweekly'], data_fingerprint='a'*64,
+        parser_repair_capture_fingerprint='a'*64, parser_repair_fingerprint='b'*64)
+    urls = ['https://www.moneyweekly.com.tw/ArticleData/Info/Article/'+str(i) for i in (254394, 254340, 254341, 254342)]
+    queue = NewsQueue(tmp_path/'news', old)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': url} for url in urls])
+            for url, state, due in zip(urls, ('body_not_found', 'article_attribution_not_verified',
+                    'redirect_not_article', 'unsupported_article_path'), (0, 10**12, 0, 10**12)):
+                queue.db.execute('UPDATE articles SET state=?,error_code=?,attempts=7,due=?,last_checked_at_utc=? WHERE url=?',
+                    (state, state, due, (datetime.now(UTC)-timedelta(days=2)).isoformat(), url))
+        before = [head(queue, url) for url in urls]
+    finally:
+        queue.close()
+    queue = NewsQueue(tmp_path/'news', new)
+    try:
+        assert [head(queue, url) for url in urls] == before
+    finally:
+        queue.close()
 
 
 def test_discoverable_cmnews_native_original_reuses_same_private_approval_without_http(tmp_path, monkeypatch):

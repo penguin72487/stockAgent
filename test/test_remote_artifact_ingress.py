@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -212,6 +213,47 @@ def test_exact_remote_recheck_rejects_a_different_scope(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.argv", ["discovery", str(tmp_path), "markets", "ablations/run"])
     with pytest.raises(SnapshotError, match="outside its real scope"):
         exec(ingress._REMOTE_DISCOVERY_PROGRAM, {})
+
+
+def test_ssh_discovery_preserves_ancestor_consumer_guard(tmp_path, monkeypatch, capsys):
+    import stockagent.data_sync.artifact_maintenance as maintenance
+
+    artifact = tmp_path / "artifacts"
+    source = artifact / "markets/suite/selected"
+    lifecycle = TrainingRunLifecycle(source, execution_mode="naive", run_mode="train",
+                                     strategy="none", model_name="transformer_base_portfolio")
+    lifecycle.start(fold_ids=[1], dataset_fingerprint="source", configuration_fingerprint="config")
+    lifecycle.start_group(group_name="train_2020-2021", group_index=1, group_total=1, fold_ids=[1], epoch_total=1)
+    lifecycle.finish_fold(1)
+    _write_minimal_completed_artifacts(lifecycle.layout, group_name="train_2020-2021", fold_id=1, execution_mode="naive")
+    lifecycle.complete(fold_ids=[1])
+
+    process = tmp_path / "proc/99999999"
+    process.mkdir(parents=True)
+    (process / "cmdline").write_bytes(b"python\0--output-root\0" + bytes(source.parent) + b"\0")
+    (process / "cwd").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(maintenance, "_process_directories", lambda: [process])
+    monkeypatch.setattr(maintenance, "process_references", lambda *_: [])
+    # Restore the module function after the transmitted override is evaluated.
+    monkeypatch.setattr(maintenance, "_ancestor_process_references", maintenance._ancestor_process_references)
+    monkeypatch.setattr(ingress, "_ssh_base", lambda *_: ["ssh"])
+
+    def run_remote(command, **kwargs):
+        shell = shlex.split(command[-1])[2]
+        python_command = shlex.split(shell.split('exec "$python_bin" ', 1)[1])
+        assert python_command[0] == "-c"
+        monkeypatch.setattr("sys.argv", ["remote-discovery", *python_command[2:]])
+        exec(python_command[1], {})
+        return SimpleNamespace(stdout=capsys.readouterr().out)
+
+    monkeypatch.setattr(ingress.subprocess, "run", run_remote)
+    candidates = ingress.discover_remote_artifacts(
+        ssh_target="root@trusted", ssh_port=22, identity_file=tmp_path / "key",
+        remote_repo_root="/root/stockAgent", remote_artifact_root=str(artifact), scope="markets",
+    )
+    assert len(candidates) == 1
+    assert candidates[0].relative_root == "markets/suite/selected"
+    assert candidates[0].process_references == (f"pid=99999999:cmdline:{source.parent}",)
 
 
 def test_remote_control_failure_preserves_private_diagnostics_without_publishing_contents(tmp_path, monkeypatch):

@@ -60,7 +60,7 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
     first = {symbol: {} for symbol in symbols}
     first_rows = {}
     latest = {cutoff: {} for cutoff in cutoffs}
-    starts, failures, malformed, line_count, legacy_absence = {}, [], [], 0, 0
+    starts, failures, malformed, invalid_events, line_count, legacy_absence = {}, [], [], [], 0, 0
     started = time.perf_counter()
 
     def observe(provider, job, elapsed, symbol, state, proof=None, details=None):
@@ -102,8 +102,10 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
             read_bytes += len(raw)
             digest.update(raw)
             line_count += 1
+            rejection_reason, rejection_metrics = "invalid_event", {}
             try:
                 if not raw.endswith(b"\n"):
+                    rejection_reason = "partial_journal_line"
                     raise ValueError("partial journal line")
                 if project_headers:
                     header = projected_object_values(raw,
@@ -161,14 +163,29 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
                             "received_timestamp_ms": received, "open_price": price, "simtrade": simtrade}
                         observe(provider, job, elapsed, symbol, state, proof, details)
                 elif row.get("event") == "provider_snapshot":
+                    rejection_reason = "invalid_full_market_coverage"
                     coverage = row["coverage"]
                     if coverage.get("contract") != "finmind_unfiltered_market_snapshot_coverage_v1":
                         raise ValueError("unknown full-market coverage")
                     received = datetime.fromisoformat(coverage["received_at_taipei"])
                     validated = datetime.fromisoformat(coverage["validated_at_taipei"])
-                    if (received.tzinfo is None or validated.tzinfo is None
-                            or not gate <= received <= validated <= at):
-                        raise ValueError("invalid full-market coverage clocks")
+                    if received.tzinfo is None or validated.tzinfo is None:
+                        rejection_reason = "naive_full_market_clock"
+                        raise ValueError("naive full-market coverage clock")
+                    if received < gate:
+                        rejection_reason = "preopen_full_market_receipt"
+                        raise ValueError("full-market receipt precedes opening")
+                    if received > validated:
+                        rejection_reason = "full_market_receive_after_validation"
+                        rejection_metrics = {"clock_order_gap_ms": round((received - validated).total_seconds() * 1000, 3)}
+                        raise ValueError("full-market receipt follows validation")
+                    if validated > at:
+                        # Retain the original clocks and reject the event. An
+                        # apparent backwards jump does not establish whether
+                        # host clock adjustment or mutable metadata caused it.
+                        rejection_reason = "full_market_validation_after_event"
+                        rejection_metrics = {"clock_order_gap_ms": round((validated - at).total_seconds() * 1000, 3)}
+                        raise ValueError("full-market validation follows event")
                     positive, rejected = coverage["valid_open_symbols"], coverage["rejected_symbols"]
                     if not isinstance(rejected, dict) or any(not isinstance(reason, str) or not reason for reason in rejected):
                         raise ValueError("invalid full-market rejection reasons")
@@ -196,6 +213,7 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
                     failures.append(failure)
             except (KeyError, TypeError, ValueError, AttributeError):
                 malformed.append(line_count)
+                invalid_events.append({"line": line_count, "reason": rejection_reason, **rejection_metrics})
     after = path.stat()
     stable_prefix = ((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
         and read_bytes == before.st_size and after.st_size >= before.st_size)
@@ -238,13 +256,15 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
             "official_status": record.get("trading_status", "not_in_verified_current_registry"),
             "first_valid_open_after_open_ms": first_ms, "first_valid_by_provider_ms": provider_first,
             "deadlines": deadlines})
-    return {"contract": "official_axis_opening_symbol_deadlines_v2", "session_date": payload["session_date"],
+    return {"contract": "official_axis_opening_symbol_deadlines_v3", "session_date": payload["session_date"],
         "requested_count": len(symbols), "official_fingerprint": universe["fingerprint"],
         "official_observed_at": universe["observed_at_taipei"],
         "scope_basis": "receipt_official_axis_not_backdated_membership",
         "state": "observed" if stable_prefix and not malformed else "degraded",
         "journal_prefix": {"path": str(path), "bytes": read_bytes, "sha256": digest.hexdigest(),
-            "same_inode_after_read": stable_prefix, "line_count": line_count, "malformed_lines": malformed},
+            "same_inode_after_read": stable_prefix, "line_count": line_count, "malformed_lines": malformed,
+            "invalid_event_diagnostics": invalid_events,
+            "invalid_event_boundary": "JSON, schema and clock rejection are not proof of byte corruption; original events remain unchanged"},
         "milestones": [{"after_open_ms": cutoff, "counts": dict(counts[cutoff]),
             "input_reference_candidate_count": counts[cutoff]["valid_open"] + counts[cutoff]["observed_no_first_print"],
             "job_failure_reason_counts": failure_counts[cutoff]} for cutoff in cutoffs],
@@ -399,6 +419,8 @@ def main() -> int:
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--compare-receipt", type=Path)
     parser.add_argument("--refresh-unknown-mis", action="store_true")
+    parser.add_argument("--markets-dir", type=Path, default=ROOT / "services/discord_bot/markets",
+                        help="Current configured calendars for applicability only; not historical owner proof")
     parser.add_argument("--journal", type=Path, help="Read-only complete official-axis deadline and recovery analysis")
     parser.add_argument("--deadlines-ms", default="1000,5000,10000,11000,20000,30000,32000,59000,60000,120000,300000")
     parser.add_argument("--project-at-ms", type=int, help="Also save a private diagnostic source projection at this original clock")
@@ -430,6 +452,12 @@ def main() -> int:
     raw_comparison = args.compare_receipt.read_bytes() if args.compare_receipt else None
     comparison = json.loads(raw_comparison) if raw_comparison is not None else None
     report = classify_symbols(payload, universe, comparison=comparison)
+    from scripts.audit_tw_opening_latency import opening_session_context
+    from stockagent.live.market_config import load_market_configs
+    configured_modes = [cfg for cfg in load_market_configs(args.markets_dir).values()
+        if cfg.enabled and cfg.day_trade_simulation_enabled]
+    report["session_applicability"] = opening_session_context(configured_modes, payload["session_date"])
+    report["session_applicability"]["mode_scope_basis"] = "current_enabled_yaml_modes_not_runtime_overrides"
     if args.journal:
         if args.project_at_ms is not None:
             cutoffs = (*cutoffs, args.project_at_ms)
@@ -444,16 +472,21 @@ def main() -> int:
         if args.journal_decoder_abba_blocks:
             report["journal_decoder_benchmark"] = benchmark_journal_decoders(args.journal, payload, universe,
                 blocks=args.journal_decoder_abba_blocks)
+    refresh_enabled = bool(args.refresh_unknown_mis
+        and report["session_applicability"]["native_opening_latency_sample_eligible"] is not False)
     report.update(observed_at_taipei=datetime.now(TAIPEI).isoformat(),
         source_sha256=hashlib.sha256(raw_source).hexdigest(),
-        provider_requests_enabled=args.refresh_unknown_mis, broker_orders=0,
+        provider_requests_requested=args.refresh_unknown_mis,
+        provider_requests_enabled=refresh_enabled, broker_orders=0,
         production_ledger_modified=False, extra_shioaji_login=False)
+    if args.refresh_unknown_mis and not refresh_enabled:
+        report["fresh_mis"] = {"state": "skipped_verified_calendar_closed", "provider_requests": 0}
     if raw_comparison is not None:
         report["comparison_sha256"] = hashlib.sha256(raw_comparison).hexdigest()
         report["comparison_captured_at"] = comparison["captured_at_taipei"]
     # Preserve the classification even if every new request fails.
     atomic_write_json(args.output, report)
-    if args.refresh_unknown_mis:
+    if refresh_enabled:
         symbols = [row["symbol"] for row in report["unknown_symbols"] if not row["exclusion_allowed"]]
         if symbols:
             started = time.perf_counter()

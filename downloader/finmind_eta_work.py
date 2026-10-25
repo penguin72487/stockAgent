@@ -22,6 +22,7 @@ from typing import Any
 from downloader.finmind_batching import RANGE_CONTRACTS, coalesce_pending_tasks
 from downloader.finmind_scheduling import TAIPEI
 from downloader.finmind_runtime import idle_heartbeat
+from downloader.finmind_queue_indexes import eta_work_index
 
 
 EXCLUDED_STATES = frozenset({"non_session", "not_observation_date", "deprecated_query_shape",
@@ -109,6 +110,35 @@ def _work_class(state: str, priority: int, due: bool) -> str:
     return "blocked"
 
 
+def _indexed_work_rows(conn: sqlite3.Connection, now: datetime, hint: str):
+    """Count disjoint time ranges and seek extrema within each indexed cohort.
+
+    Counts still include every task. Only the small distinct cohort keys cross
+    into grouping; their time bounds use the final covering-index column.
+    This avoids comparing the same tuple and updating MIN/MAX for every row.
+    """
+    prefix = ' AND '.join(f't.{column} IS c.{column}' for column in ('dataset', 'kind', 'priority', 'state'))
+    def scalar(aggregate, predicate):
+        return f'(SELECT {aggregate} FROM tasks AS t{hint} WHERE {prefix} AND {predicate})'
+    columns = [scalar('count(*)', 't.next_attempt_at_utc IS NULL')]
+    for operator in ('<=', '>'):
+        predicate = f't.next_attempt_at_utc{operator}:now'
+        columns.extend(scalar(aggregate, predicate) for aggregate in
+                       ('count(*)', 'min(t.next_attempt_at_utc)', 'max(t.next_attempt_at_utc)'))
+    query = (f'WITH cohorts AS (SELECT DISTINCT dataset,kind,priority,state FROM tasks{hint}) '
+             f"SELECT c.dataset,c.kind,c.priority,c.state,{','.join(columns)} FROM cohorts AS c "
+             'ORDER BY c.dataset,c.kind,c.priority,c.state')
+    for row in conn.execute(query, {'now': now.isoformat()}):
+        dataset, kind, priority, state, nulls, past, past_first, past_last, future, future_first, future_last = row
+        prefix_values = (dataset, kind, priority, state)
+        cooling = future + (nulls if state != 'pending' else 0)
+        due = past + (nulls if state == 'pending' else 0)
+        if cooling:
+            yield (*prefix_values, 0, cooling, future_first, future_last, future)
+        if due:
+            yield (*prefix_values, 1, due, past_first, past_last, past)
+
+
 def _queue(path: Path, owner: str, now: datetime, *,
            queue_snapshots: dict[str, QueueAggregateSnapshot] | None = None
            ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
@@ -127,13 +157,19 @@ def _queue(path: Path, owner: str, now: datetime, *,
                 raise ValueError("queue_schema_missing_columns")
             # SQL groups the large day/ID queues; only the small range subset is
             # materialized below. One snapshot keeps aggregates and grouping aligned.
-            query = """SELECT dataset,kind,priority,state,
+            hint = eta_work_index(conn)
+            if hint:
+                grouped = _indexed_work_rows(conn, now, hint)
+            else:
+                query = """SELECT dataset,kind,priority,state,
                 CASE WHEN (state='pending' AND next_attempt_at_utc IS NULL)
                     OR next_attempt_at_utc<=? THEN 1 ELSE 0 END,
                 count(*),min(next_attempt_at_utc),max(next_attempt_at_utc),
                 count(next_attempt_at_utc)
                 FROM tasks GROUP BY dataset,kind,priority,state,5"""
-            for dataset, kind, priority, state, due, count, first, last, renewal_count in conn.execute(query, (now.isoformat(),)):
+                parameters = (now.isoformat(),)
+                grouped = conn.execute(query, parameters)
+            for dataset, kind, priority, state, due, count, first, last, renewal_count in grouped:
                 if any(value is not None and _stamp(value) is None for value in (first, last)):
                     raise ValueError("invalid_queue_retry_timestamp")
                 item = aggregate.setdefault(dataset, {"classes": Counter(), "range_classes": Counter(),

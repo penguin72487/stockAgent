@@ -124,6 +124,7 @@
       groups: [
         group("progress", "進度與執行排程", "台股現貨日曆、協作守門與 FinLab 詳情", [".calendar-banner", ".acquisition", ".finlab-monitor"]),
         group("catalog", "所有來源與資料清冊", "全 provider、按市場分類及每個端點", ["#provider-directory", "section[aria-labelledby='category-title']", "#source-list", ".kpis"]),
+        group("ticks", "逐筆成交與五檔清冊", "按來源、商品分列筆數、實際天數與起訖", ["#tick-inventory"]),
         group("features", "所有特徵明細", "每個特徵獨立列出；依原清冊搜尋與分頁", ["#feature-list"]),
         group("storage", "儲存與證據", "實體群組、首末資料與可用性界線", ["section[aria-labelledby='groups-title']", ".boundary-note"]),
       ],
@@ -140,6 +141,7 @@
       groups: [
         group("quota", "配額與來源機制", "可驗證用量、市場範圍及專用面板", [".provider-context"]),
         group("catalog", "完整資料清冊", "所有端點、狀態、實存首末資料與更新時間", ["#provider-sources", ".provider-kpis"]),
+        group("ticks", "本來源逐筆成交與五檔清冊", "筆數、實際天數、起訖及逐合約搜尋", ["#tick-inventory"]),
         group("method", "統計口徑與限制", "取得、歷史完整性與可訓練性分開", [".boundary-note"]),
       ],
     },

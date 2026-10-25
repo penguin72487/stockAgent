@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_queue import NewsQueue, summarize_bulk_coverage, summarize_discovery_status, utc_now
-from downloader.news_fulltext_status import bulk_item_error_count
+from downloader.news_fulltext_status import bulk_item_error_count, copy_status_value
 
 
 def legacy_discovery_status(db, now):
@@ -55,7 +55,7 @@ def scan_discovery_status(db, now):
 
 def profile_current_status(root, registry, repetitions=5, *, compare_discovery_summary=False,
                            compare_bulk_error_summary=False, compare_discovery_transactional=False,
-                           compare_scope_cache=False, verify_body_states=False):
+                           compare_scope_cache=False, compare_capacity_copy=False, verify_body_states=False):
     """Replay the canonical whole heartbeat without an owner or source writes.
 
     The only publisher is replaced with exact JSON serialization in this
@@ -66,7 +66,7 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
     if not 3 <= repetitions <= 15:
         raise ValueError('bounded_repetition_count_required')
     if sum((compare_discovery_summary, compare_bulk_error_summary, compare_discovery_transactional,
-            compare_scope_cache)) > 1:
+            compare_scope_cache, compare_capacity_copy)) > 1:
         raise ValueError('one_projection_comparison_per_snapshot_required')
     payload = (root / 'status.json').read_bytes()
     published = json.loads(payload)
@@ -83,7 +83,7 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
             view.acceptance_receipt_io = deepcopy(published['acceptance_receipt_io'])
         view.metrics = SimpleNamespace(snapshot=lambda: deepcopy(published['performance']),
                                        measure=lambda *args, **kwargs: nullcontext())
-        view.http_capacity_snapshot = lambda: deepcopy(published['http_capacity'])
+        view.http_capacity_snapshot = lambda: copy_status_value(published['http_capacity'])
         view._original_url_started = time.monotonic() - 120
         view._original_url_start_count = 0
         serialized = []
@@ -178,7 +178,7 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                       if compare_bulk_error_summary else
                       {'legacy': (summarize_discovery_status, bulk_item_error_count),
                        'summary': (summarize_discovery_status, bulk_item_error_count)}
-                      if compare_scope_cache else
+                      if compare_scope_cache or compare_capacity_copy else
                       {'current': (summarize_discovery_status, bulk_item_error_count)})
         measurements, identities = {name: [] for name in projectors}, {name: set() for name in projectors}
         sizes = {}
@@ -189,6 +189,9 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                 order = list(projectors) if number % 2 == 0 else list(reversed(projectors))
                 for name in order:
                     discovery_projector, error_projector = projectors[name]
+                    if compare_capacity_copy:
+                        copy_value = deepcopy if name == 'legacy' else copy_status_value
+                        view.http_capacity_snapshot = lambda: copy_value(published['http_capacity'])
                     cache_before = history._cached_scope_key.cache_info()._asdict() if compare_scope_cache else None
                     with (patch('downloader.news_fulltext_queue.summarize_discovery_status', discovery_projector),
                           patch('downloader.news_fulltext_queue.bulk_item_error_count', error_projector),
@@ -204,6 +207,10 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                     output = serialized.pop()
                     sizes[name] = len(output)
                     identities[name].add(hashlib.sha256(output).hexdigest())
+            if compare_capacity_copy:
+                # The final ABBA timing arm can be the reference. Profile the
+                # current implementation explicitly, not that arm's closure.
+                view.http_capacity_snapshot = lambda: copy_status_value(published['http_capacity'])
             profiler = cProfile.Profile(timer=time.process_time)
             queries = {}
 
@@ -224,7 +231,7 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
         medians = {name: {unit: statistics.median(m[unit] for m in samples)
                          for unit in ('wall_seconds', 'cpu_seconds')} for name, samples in measurements.items()}
         digests = set().union(*identities.values())
-        return {'contract_version': 6 if verify_body_states else 5, 'accepted': len(digests) == 1,
+        return {'contract_version': 7 if compare_capacity_copy else 6 if verify_body_states else 5, 'accepted': len(digests) == 1,
                 'observed_at_utc': observed, 'owner_id': owner[0],
                 'input_status_sha256': hashlib.sha256(payload).hexdigest(),
                 'serialized_status_bytes': sizes,
@@ -235,7 +242,12 @@ def profile_current_status(root, registry, repetitions=5, *, compare_discovery_s
                 'profiler_time_basis': 'explicit process CPU clock; profiled run excluded from timing medians',
                 'speedups': {unit: medians['legacy'][unit] / medians['summary'][unit]
                              for unit in ('wall_seconds', 'cpu_seconds')}
-                             if compare_discovery_summary or compare_bulk_error_summary or compare_discovery_transactional or compare_scope_cache else None,
+                             if compare_discovery_summary or compare_bulk_error_summary or compare_discovery_transactional or compare_scope_cache or compare_capacity_copy else None,
+                **({'capacity_copy': {'contract_version': 1, 'all_published_values_preserved': len(digests) == 1,
+                    'input': 'fixed published HTTP capacity projection; no controller tick or HTTP locks',
+                    'profiled_implementation': 'summary',
+                    'history_windows_removed': 0, 'source_calibration_mutated': False}}
+                   if compare_capacity_copy else {}),
                 **({'scope_parse_cache': {'maximum_entries': history.SCOPE_KEY_CACHE_SIZE,
                     'maximum_url_chars': history.SCOPE_KEY_CACHE_MAX_URL_CHARS,
                     'first_summary_trial_includes_cold_cache': True,
@@ -333,16 +345,17 @@ def main(argv=None):
     parser.add_argument('--compare-bulk-error-summary', action='store_true')
     parser.add_argument('--compare-discovery-transactional', action='store_true')
     parser.add_argument('--compare-scope-cache', action='store_true')
+    parser.add_argument('--compare-capacity-copy', action='store_true')
     parser.add_argument('--verify-body-states', action='store_true')
     args = parser.parse_args(argv)
     if not 3 <= args.repeat <= 15:
         parser.error("bounded repetition count required")
-    if (args.compare_discovery_summary or args.compare_bulk_error_summary or args.compare_discovery_transactional or args.compare_scope_cache) and not args.profile_current_status:
+    if (args.compare_discovery_summary or args.compare_bulk_error_summary or args.compare_discovery_transactional or args.compare_scope_cache or args.compare_capacity_copy) and not args.profile_current_status:
         parser.error('projection comparison requires --profile-current-status')
     if args.verify_body_states and not args.profile_current_status:
         parser.error('body-state verification requires --profile-current-status')
     if sum((args.compare_discovery_summary,args.compare_bulk_error_summary,args.compare_discovery_transactional,
-            args.compare_scope_cache)) > 1:
+            args.compare_scope_cache, args.compare_capacity_copy)) > 1:
         parser.error('select one projection comparison')
     config, registry, repo = load_config(args.config)
     result = (profile_current_status(repo / config['root'], registry, args.repeat,
@@ -350,6 +363,7 @@ def main(argv=None):
                                     compare_bulk_error_summary=args.compare_bulk_error_summary,
                                     compare_discovery_transactional=args.compare_discovery_transactional,
                                     compare_scope_cache=args.compare_scope_cache,
+                                    compare_capacity_copy=args.compare_capacity_copy,
                                     verify_body_states=args.verify_body_states)
               if args.profile_current_status else benchmark(repo / config["root"], registry, args.repeat))
     result["implementation_sha256"] = {str(path): sha256_file(path) for path in (Path(__file__), Path("downloader/news_fulltext_queue.py"), Path('downloader/news_fulltext_status.py'), Path('downloader/news_fulltext_cnyes_history.py'))}

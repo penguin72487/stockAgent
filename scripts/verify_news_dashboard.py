@@ -119,6 +119,27 @@ def body_state_inventory_check(status):
             **{key: total[key] for key in fields}, 'publisher_requests': 0}
 
 
+def request_scope_progress_check(checked):
+    """Verify the rendered scope split, not source recovery or a source quota."""
+    scope = checked.get('body_request_scope_progress')
+    if not scope or not scope.get('available'):
+        return None  # Old heartbeats or explicit unknowns are not zero work.
+    assert scope['contract_version'] == 1 and scope['source_recovery_verified'] is False
+    total, paused, other = (scope[key] for key in (
+        'active_missing_body_urls', 'source_paused_missing_body_urls', 'other_missing_body_urls'))
+    assert all(type(value) is int and value >= 0 for value in (total, paused, other))
+    assert paused + other == total
+    assert checked['body_work_progress']['active_missing_body_urls'] == total
+    assert checked['displayed_request_scope_counts'] == [paused, other]
+    assert checked['request_scope_note_present']
+    if paused:
+        assert checked['conditional_eta_seconds'] is None and checked['conditional_finish_at_utc'] is None
+        assert checked['conditional_eta_unavailable_reason'] == 'source_request_scope_paused'
+    return {'accepted': True, 'active_missing_body_urls': total,
+            'source_paused_missing_body_urls': paused, 'other_missing_body_urls': other,
+            'source_recovery_verified': False}
+
+
 def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
            required_api_setup_providers: tuple[str, ...] = (), require_original_url_progress: bool = False,
            require_original_routing_progress: bool = False,
@@ -202,6 +223,11 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                     actual_progress: document.querySelector('#download-progress').getAttribute('value'),
                     expected_progress: state.latest.acquisition.progress_ratio,
                     summary: document.querySelector('#acq-overview').textContent,
+                    disk_admission: state.latest.worker.disk_admission ?? null,
+                    disk_text: document.querySelector('#capture-next').textContent,
+                    expected_disk_prefix: state.latest.worker.disk_admission?.available
+                      ? `磁碟可用 ${bytes(state.latest.worker.disk_admission.free_bytes)}／保留線 ${bytes(state.latest.worker.disk_admission.required_free_bytes)}，尚差 ${bytes(state.latest.worker.disk_admission.shortfall_bytes)}；`
+                      : null,
                     document_width: document.documentElement.scrollWidth
                 })""")
                 assert int(facts["stored_label"].replace(",", "")) == facts["stored"]
@@ -209,6 +235,11 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                 assert int(facts["remaining_label"].replace(",", "")) == facts["remaining"]
                 assert abs(float(facts["actual_progress"]) - facts["expected_progress"]) < 1e-12
                 assert facts["document_width"] <= width
+                if facts['health'] == 'waiting_disk' and facts['disk_admission']:
+                    assert not facts['disk_admission']['fetch_allowed']
+                    assert facts['disk_text'].startswith(facts['expected_disk_prefix'])
+                    expect(page.locator('#eligible-eta-basis')).to_contain_text('新增抓取暫停')
+                    expect(page.locator('#eligible-eta')).to_contain_text('暫無有效估時')
                 original = page.evaluate("state.latest.original_url_resolution")
                 if require_original_url_progress:
                     assert original and original['snapshot_consistent'] is True
@@ -363,9 +394,14 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             displayed_queued_retained: card.querySelector('[data-news-queued-retained]')?.textContent,
                             displayed_retained_noncomplete: card.querySelector('[data-news-retained-noncomplete]')?.textContent,
                             robots_origin_policy_pause: source.robots_origin_policy_pause,
+                            body_request_scope_progress: source.body_request_scope_progress,
+                            displayed_request_scope_counts: ['[data-news-scope-paused]', '[data-news-scope-other]']
+                                .map(selector => Number(card.querySelector(selector)?.textContent.replaceAll(',', ''))),
+                            request_scope_note_present: !!card.querySelector('[data-news-request-scope]'),
                             completion_forecast: source.completion_forecast,
                             conditional_eta_seconds: source.conditional_eta_seconds ?? null,
                             conditional_finish_at_utc: source.conditional_finish_at_utc ?? null,
+                            conditional_eta_unavailable_reason: source.conditional_eta_unavailable_reason ?? null,
                             conditional_eta_scope: source.conditional_eta_scope ?? null,
                             displayed_conditional_eta: [...card.querySelectorAll('.news-provider-note')]
                                 .find(node => node.textContent.startsWith('剩餘 '))?.textContent
@@ -441,6 +477,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             expect(card).to_contain_text('到期不代表恢復存取')
                             assert checked['partial_origin_pause_label_visible'] and checked['origin_probe_clock_visible'], checked
                     if provider == 'cnyes':
+                        checked['request_scope_acceptance'] = request_scope_progress_check(checked)
                         work = checked['body_work_progress']
                         assert work and work['contract_version'] == 1
                         assert not work['candidate_views_accepted_by_hint'] and not work['candidate_body_equivalence_verified']
@@ -691,6 +728,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
         finally:
             browser.close()
     return {"schema_version": 1, "nontext_outcome_observation_contract_version": 1,
+            "disk_admission_observation_contract_version": 1,
             "original_routing_progress_observation_contract_version": 1,
             "state": "accepted", "generated_at_utc": datetime.now(UTC).isoformat(),
             "page": url, "browser_profile": "cpu-2d", "gpu_webgl_verified": False,

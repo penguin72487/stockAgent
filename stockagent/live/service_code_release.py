@@ -56,15 +56,37 @@ def namespace_contract(root: Path) -> dict:
             "mutable_data_and_configs_preserved": True}
 
 
-def freeze_source(root: Path, output: Path) -> Path:
+def freeze_source(root: Path, output: Path, *, base_receipt: Path | None = None,
+                  include_sources: tuple[str, ...] = ()) -> Path:
     """Freeze one stable tree using the existing source-release verifier."""
     root, output = root.resolve(), output.resolve()
     allowed = root / "artifacts/operations/service_code_releases"
     if output != allowed:
         raise ValueError("service code releases belong in the private canonical release root")
-    names = source_members(root)
-    before = {name: stable_source_sha256(root, name) for name in names}
-    if sum((root / name).stat().st_size for name in names) > 128 * 1024**2:
+    lineage = None
+    if base_receipt is None:
+        if include_sources:
+            raise ValueError("explicit source overlay requires a verified base release")
+        names = source_members(root)
+        source_roots = dict.fromkeys(names, root)
+    else:
+        proof = verify_frozen_source(base_receipt, root)
+        base_receipt = Path(proof["receipt"])
+        base = json.loads(base_receipt.read_bytes())
+        selected = tuple(include_sources)
+        if (not selected or len(set(selected)) != len(selected)
+                or not set(selected).issubset(source_members(root))):
+            raise ValueError("overlay requires unique explicit canonical source members")
+        source_roots = dict.fromkeys(base["code"]["files"], base_receipt.parent / "source")
+        source_roots.update(dict.fromkeys(selected, root))
+        names = sorted(source_roots)
+        lineage = {"contract": "verified_base_explicit_source_overlay_v1",
+                   "base_receipt": str(base_receipt),
+                   "base_source_sha256": base["code"]["source_sha256"],
+                   "included_sources": sorted(selected),
+                   "unselected_workspace_changes_promoted": False}
+    before = {name: stable_source_sha256(source_roots[name], name) for name in names}
+    if sum((source_roots[name] / name).stat().st_size for name in names) > 128 * 1024**2:
         raise ValueError("code release exceeds bounded source size")
     release = output / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:12])
     source = release / "source"
@@ -84,7 +106,8 @@ def freeze_source(root: Path, output: Path) -> Path:
         else:
             target.mkdir(mode=0o555)
     for name in names:
-        body = (root / name).read_bytes()
+        original = source_roots[name] / name
+        body = original.read_bytes()
         if hashlib.sha256(body).hexdigest() != before[name]:
             raise RuntimeError(f"source changed during freeze: {name}")
         target = source / name
@@ -94,9 +117,14 @@ def freeze_source(root: Path, output: Path) -> Path:
             stream.write(body)
             stream.flush()
             os.fsync(stream.fileno())
-        target.chmod(0o555 if (root / name).stat().st_mode & 0o111 else 0o444)
-    if names != source_members(root) or before != {name: stable_source_sha256(root, name) for name in names}:
+        target.chmod(0o555 if original.stat().st_mode & 0o111 else 0o444)
+    if (before != {name: stable_source_sha256(source_roots[name], name) for name in names}
+            or (base_receipt is None and names != source_members(root))):
         raise RuntimeError("source membership/content changed during freeze; unpublished release retained")
+    if base_receipt is not None:
+        verify_frozen_source(base_receipt, root)
+        if not set(include_sources).issubset(source_members(root)):
+            raise RuntimeError("selected source membership changed during freeze")
     bundle = release / "source.zip"
     with zipfile.ZipFile(bundle, "x", compression=zipfile.ZIP_DEFLATED) as archive:
         for name in names:
@@ -114,7 +142,8 @@ def freeze_source(root: Path, output: Path) -> Path:
         "code": {"git_head": head, "files": files, "source_sha256": identity_sha256(files)},
         "source_bundle": {"file": bundle.name, "files": files,
                           "sha256": hashlib.sha256(bundle.read_bytes()).hexdigest()},
-        "service_namespace": namespace_contract(root)})
+        "service_namespace": namespace_contract(root),
+        **({"source_overlay": lineage} if lineage is not None else {})})
     receipt.chmod(0o444)
     bundle.chmod(0o444)
     release.chmod(0o555)

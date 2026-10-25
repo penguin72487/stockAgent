@@ -6,6 +6,8 @@ their existing authority and recovery contracts.
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 
 STATUS_PROJECTION_CONTRACT_VERSION = 3
 STATUS_QUERY_TIMING_CONTRACT_VERSION = 1
@@ -14,6 +16,37 @@ DISCOVERY_SUMMARY_CONTRACT_VERSION = 1
 ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION = 1
 CAPACITY_STATUS_HISTORY_LIMIT = 64
 BULK_GAP_STATUS_SAMPLE_LIMIT = 64
+STATUS_VALUE_COPY_CONTRACT_VERSION = 1
+
+_JSON_SCALARS = frozenset((type(None), bool, int, float, str))
+_NOT_COPIED = object()
+
+
+def copy_status_value(value, memo=None):
+    """Detach JSON containers without dispatching deepcopy for every scalar.
+
+    Preserve values, aliasing and cycles. Non-JSON values and subclasses use
+    ordinary deepcopy with the same memo; this never serializes/coerces a
+    number, cuts history or returns a controller-owned mutable container.
+    """
+    kind = type(value)
+    if kind in _JSON_SCALARS:
+        return value
+    if kind not in (dict, list):
+        return deepcopy(value, memo)
+    if memo is None:
+        memo = {}
+    prior = memo.get(id(value), _NOT_COPIED)
+    if prior is not _NOT_COPIED:
+        return prior
+    result = {} if kind is dict else []
+    memo[id(value)] = result
+    if kind is dict:
+        for key, item in value.items():
+            result[key if type(key) is str else deepcopy(key, memo)] = copy_status_value(item, memo)
+    else:
+        result.extend(copy_status_value(item, memo) for item in value)
+    return result
 
 
 def initialize_article_body_states(db):

@@ -174,6 +174,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-refresh-inventory", action="store_true")
     parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--summary-only", action="store_true",
+                        help="Rebuild receipt-backed metadata under the original writer lock; no login or API calls.")
     parser.add_argument('--refresh-empty', action='store_true')
     parser.add_argument('--official-activity', type=Path, default=DEFAULT_FUTURES_ACTIVITY)
     parser.add_argument('--prioritize-futures', action='store_true')
@@ -834,6 +836,8 @@ def _write_summary(
     activity: FuturesActivity | None = None,
 ) -> dict[str, Any]:
     collection_rows: dict[str, dict[str, Any]] = {}
+    tick_days: dict[str, set[date]] = {}
+    tick_symbols: dict[str, set[str]] = {}
     totals = {
         "contracts": 0,
         "kbar_chunks": 0,
@@ -916,6 +920,9 @@ def _write_summary(
                 resolved_ticks += 1
                 bucket["tick_rows"] += int(receipt.get("rows") or 0)
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
+                if receipt.get('status') == 'complete' and int(receipt.get('rows') or 0) > 0:
+                    tick_days.setdefault(row.collection, set()).add(trading_date)
+                    tick_symbols.setdefault(row.collection, set()).add(row.code)
                 if receipt['status'] == 'source_empty':
                     source_empty_queries += 1
                     positive_empty_queries += 1
@@ -930,6 +937,15 @@ def _write_summary(
         for key in totals:
             if key in bucket:
                 totals[key] += int(bucket[key])
+    # tick_dates is an additive contract-day target count. These separate
+    # statistics describe the union of actual nonempty, verified Tick dates.
+    for collection, bucket in collection_rows.items():
+        actual = tick_days.get(collection, set())
+        bucket.update(tick_data_days=len(actual) if not kbars_only else None,
+                      tick_first_data_date=min(actual).isoformat() if actual else None,
+                      tick_last_data_date=max(actual).isoformat() if actual else None,
+                      tick_symbols_with_data=len(tick_symbols.get(collection, set())) if not kbars_only else None)
+    all_tick_days = set().union(*tick_days.values()) if tick_days else set()
     unresolved = totals['kbar_chunks'] - totals['resolved_kbar_chunks'] + totals['tick_dates'] - totals['resolved_tick_dates']
     final_state = state if pending_queries else ('waiting_source' if unresolved or positive_empty_queries or missing_kbar_dates or failed_contracts else 'complete')
     payload = {
@@ -949,6 +965,9 @@ def _write_summary(
         'completed_session': max((row.end_date for row in rows), default=date.today()).isoformat(),
         'official_activity': (activity or FuturesActivity()).provenance,
         **totals,
+        "tick_data_days": len(all_tick_days) if not kbars_only else None,
+        "tick_first_data_date": min(all_tick_days).isoformat() if all_tick_days else None,
+        "tick_last_data_date": max(all_tick_days).isoformat() if all_tick_days else None,
         "complete_contracts": completed_contracts,
         "pending_queries": pending_queries,
         "tick_target_universe_finalized": bool(
@@ -1243,6 +1262,25 @@ def main() -> int:
         return load_futures_activity(args.official_activity,
                                      start=min(row.begin_date for row in rows),
                                      end=max(row.end_date for row in rows))
+
+    if args.summary_only:
+        if selected_codes or collections != set(COLLECTION_PRIORITY) or args.kbars_only or args.dry_run:
+            raise ValueError('--summary-only requires the full existing inventory and Tick scope')
+        with (args.output_dir / 'download.lock').open('a+b') as summary_lock:
+            fcntl.flock(summary_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            previous = _read_receipt(args.output_dir / 'summary.json') or {}
+            used, limit = previous.get('traffic_used_bytes'), previous.get('traffic_limit_bytes')
+            rows = selected_rows()
+            if not rows:
+                raise ValueError('--summary-only requires a nonempty existing inventory')
+            summary = _write_summary(args.output_dir, rows, chunk_days=args.chunk_days,
+                                     state=previous.get('state', 'observed'),
+                                     usage=(used, limit) if used is not None and limit is not None else None,
+                                     progress_path=args.output_dir / 'progress.json',
+                                     refresh_empty=args.refresh_empty, activity=official_activity(rows))
+        print(json.dumps({key: summary[key] for key in ('state', 'tick_rows', 'tick_data_days',
+                                                       'tick_first_data_date', 'tick_last_data_date')}))
+        return 0
 
     if args.dry_run:
         rows = selected_rows()

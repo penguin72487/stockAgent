@@ -7,6 +7,7 @@ import pytest
 from stockagent.data_sync.node_roles import EXPECTED, training_only_node
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from scripts.audit_node_storage_roles import inventory
+from scripts import audit_node_storage_roles as audit
 
 
 @pytest.fixture
@@ -83,3 +84,55 @@ def test_partial_inventory_is_explicitly_incomplete(tmp_path):
     (tmp_path / "one").write_bytes(b"one")
     (tmp_path / "two").write_bytes(b"two")
     assert not inventory(tmp_path, max_files=1)["complete"]
+
+
+def test_filesystem_probe_does_not_walk_or_sum_shared_capacity(tmp_path, monkeypatch):
+    paths = [tmp_path, tmp_path / "other"]
+    paths[1].mkdir()
+    monkeypatch.setattr(audit.os, "walk", lambda *_a, **_k: pytest.fail("walked payload tree"))
+    calls = []
+
+    def mount(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["timeout"] == 10 and kwargs["check"] is True
+        return SimpleNamespace(stdout=json.dumps({"filesystems": [{"target": "/", "fstype": "ext4"}]}))
+
+    result = audit.filesystem_inventory([*paths, paths[0]], run=mount)
+    assert result["inventory_complete"] and len(result["filesystems"]) == 2
+    assert len(calls) == 2 and all(row[-1] == "TARGET,FSTYPE" for row in calls)
+    assert result["source_payload_reads"] == result["source_payload_writes"] == 0
+    assert result["deletion_authorized"] is False and "total_bytes" not in result
+    assert all(row["available_bytes"] > 0 for row in result["filesystems"])
+
+
+@pytest.mark.parametrize("failure", ["malformed", "missing_filesystem", "timeout",
+                                     "null_mount", "nonlist_mounts", "empty_mounts"])
+def test_incomplete_mount_observation_cannot_be_reported_complete(tmp_path, failure):
+    def mount(*_args, **_kwargs):
+        if failure == "timeout":
+            raise audit.subprocess.TimeoutExpired("findmnt", 10)
+        values = {"malformed": "invalid", "missing_filesystem": '{"filesystems": [{}]}',
+                  "null_mount": '{"filesystems": [null]}', "nonlist_mounts": '{"filesystems": null}',
+                  "empty_mounts": '{"filesystems": []}'}
+        return SimpleNamespace(stdout=values[failure])
+
+    result = audit.filesystem_inventory([tmp_path], run=mount)
+    assert not result["inventory_complete"] and not result["filesystems"][0]["complete"]
+
+
+def test_filesystems_only_cli_never_invokes_full_census(tmp_path, monkeypatch):
+    import sys
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"schema_version": 1, "authority_node_id": "penguin",
+                                  "nodes": {"penguin": {"cold_root": str(tmp_path)}}}))
+    output = tmp_path / "observation.json"
+    monkeypatch.setattr(audit, "resolve_node_id", lambda *_: "penguin")
+    monkeypatch.setattr(audit.os, "umask", lambda *_: 0o022)
+    monkeypatch.setattr(audit, "audit", lambda *_: pytest.fail("performed full project census"))
+    seen = []
+    monkeypatch.setattr(audit, "filesystem_inventory", lambda paths: (
+        seen.extend(paths) or {"node_id": "penguin", "inventory_complete": True}))
+    monkeypatch.setattr(sys, "argv", ["audit", "--policy", str(policy), "--output", str(output),
+                                      "--filesystems-only", "--filesystem-path", str(tmp_path)])
+    assert audit.main() == 0 and seen == [tmp_path]
+    assert json.loads(output.read_bytes())["inventory_complete"]

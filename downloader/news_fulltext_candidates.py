@@ -91,6 +91,25 @@ def _exact_candidate(config, registry, repo, source, layout):
 
 
 def native_candidate_source(config, registry, repo, layout):
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_LAYOUTS, contentplatform_original_source
+    if layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS:
+        source = registry.sources.get('contentplatform')
+        if source is None or source.embedded_article_layout != layout or not contentplatform_original_source(source):
+            raise ValueError('reviewed_current_contentplatform_source_required')
+        return source
+    from downloader.news_fulltext_gvm import (
+        GVM_KNOWN_URL_LAYOUT, GVM_MEDIA_LAYOUT, GVM_TABLE_LAYOUT, GVM_WRITTEN_FORMAT_LAYOUT, GVM_STATIC_EDITOR_LAYOUT, GVM_PRESENTATION_LAYOUT,
+        gvm_known_url_source, gvm_media_source, gvm_table_source, gvm_original_source, gvm_static_editor_source, gvm_presentation_source,
+    )
+    if layout in {GVM_KNOWN_URL_LAYOUT, GVM_MEDIA_LAYOUT, GVM_TABLE_LAYOUT, GVM_WRITTEN_FORMAT_LAYOUT, GVM_STATIC_EDITOR_LAYOUT, GVM_PRESENTATION_LAYOUT}:
+        source = registry.sources.get('gvm')
+        predicate = {GVM_KNOWN_URL_LAYOUT: gvm_known_url_source,
+            GVM_MEDIA_LAYOUT: gvm_media_source, GVM_TABLE_LAYOUT: gvm_table_source,
+            GVM_WRITTEN_FORMAT_LAYOUT: gvm_original_source, GVM_STATIC_EDITOR_LAYOUT: gvm_static_editor_source,
+            GVM_PRESENTATION_LAYOUT:gvm_presentation_source}[layout]
+        if source is None or not predicate(source):
+            raise ValueError('reviewed_current_gvm_source_required')
+        return source
     from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS, INEWS_PROVIDER, inews_boundary_source
     if layout in INEWS_LAYOUT_VERSIONS:
         source = registry.sources.get(INEWS_PROVIDER)
@@ -176,12 +195,24 @@ def candidate_evidence_allowed(source, candidate, version):
     """Fixed provider/question pairs; timestamps/reasons cannot choose scope."""
     if type(version) is not int:
         return False
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
+    if version in CONTENTPLATFORM_EVIDENCE_VERSIONS or source.provider == 'contentplatform' or candidate.provider == 'contentplatform':
+        from downloader.news_fulltext_contentplatform import contentplatform_original_source
+        return bool(version in CONTENTPLATFORM_EVIDENCE_VERSIONS and source == candidate and contentplatform_original_source(source))
+    if version in {34, 35, 36, 37, 40, 41, 42} or source.provider == 'gvm' or candidate.provider == 'gvm':
+        from downloader.news_fulltext_gvm import gvm_known_url_source, gvm_media_source, gvm_table_source, gvm_original_source, gvm_static_editor_source, gvm_presentation_source
+        return bool(source == candidate and (version in {34, 35} and gvm_known_url_source(source)
+            or version == 36 and gvm_media_source(source) or version == 37 and gvm_table_source(source)
+            or version == 40 and gvm_original_source(source) or version == 41 and gvm_static_editor_source(source)
+            or version == 42 and gvm_presentation_source(source)))
     if version in {27, 28, 29, 30, 31, 32, 33} or source == candidate and source.provider == 'ettoday':
         from downloader.news_fulltext_ettoday import ettoday_resident_source
         return bool(version in {27, 28, 29, 30, 31, 32, 33} and source == candidate and ettoday_resident_source(source))
     from downloader.news_fulltext_setn import INEWS_PROVIDER, inews_boundary_source
-    if source.provider == INEWS_PROVIDER or candidate.provider == INEWS_PROVIDER or version in {24, 25, 26}:
-        return bool(version in {24, 25, 26} and source == candidate and inews_boundary_source(source))
+    if source.provider == INEWS_PROVIDER or candidate.provider == INEWS_PROVIDER or version in {24, 25, 26, 38, 39}:
+        return bool(source == candidate and inews_boundary_source(source) and (
+            version in {24, 25, 26}
+            or version in {38, 39} and source.embedded_article_layout == 'setn_inews_native_article_v8'))
     if source.provider == 'upmedia' or candidate.provider == 'upmedia' or version in {20, 21, 22, 23}:
         from downloader.news_fulltext_upmedia import upmedia_evidence_source
         layout = source.embedded_article_layout
@@ -282,6 +313,110 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
     from downloader.news_fulltext import _require_article_response
     if not candidate_evidence_allowed(source, candidate, evidence_contract_version):
         raise ValueError('reviewed_candidate_evidence_contract_required')
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
+    if evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS:
+        from downloader.news_fulltext_candidate_originals import (
+            private_contentplatform_original_permit, private_contentplatform_root_original_permit,
+            private_contentplatform_image_original_permit)
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_QUESTIONS
+        question = CONTENTPLATFORM_EVIDENCE_QUESTIONS[evidence_contract_version]
+        verify = {43: private_contentplatform_original_permit, 44: private_contentplatform_root_original_permit,
+            45: private_contentplatform_image_original_permit}[evidence_contract_version]
+        _require_article_response(response, source)
+        facts = {'contract_version': 1, 'evidence_contract_version': evidence_contract_version,
+            'provider': source.provider, 'question': question,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'status': response.status, 'requested_url': requested_url, 'final_url': response.url,
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'raw_or_names_or_body_retained': False, 'body_completeness_verified': False,
+            'identity_or_alias_accepted': False}
+        try:
+            permit = verify(response, source, requested_url)
+        except NewsError as failure:
+            facts['private_original_scope_error'] = failure.code
+            facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
+            context = getattr(failure, 'private_scope_facts', {})
+            for key in ('native_root_shape', 'native_image_credit_shape', 'native_header_failure_context'):
+                if key in context:
+                    facts[key] = context[key]
+        else:
+            facts['private_original_permit'] = permit
+            shape_key = {44: 'native_root_shape', 45: 'native_image_credit_shape'}.get(evidence_contract_version)
+            if shape_key:
+                facts[shape_key] = {k: v for k, v in permit['native_permit'].items()
+                    if k != 'signed_reporter_and_explicit_clocks_verified'}
+        return facts
+    if evidence_contract_version in {40, 41, 42}:
+        from downloader.news_fulltext_candidate_originals import GVM_ORIGINAL_QUESTION, private_gvm_original_permit, private_gvm_header_original_permit, private_gvm_multiple_credit_original_permit
+        from downloader.news_fulltext_gvm import GVM_HEADER_QUESTION, GVM_MULTIPLE_CREDIT_QUESTION
+        question,verify={40:(GVM_ORIGINAL_QUESTION,private_gvm_original_permit),
+            41:(GVM_HEADER_QUESTION,private_gvm_header_original_permit),
+            42:(GVM_MULTIPLE_CREDIT_QUESTION,private_gvm_multiple_credit_original_permit)}[evidence_contract_version]
+        _require_article_response(response, source)
+        try:
+            permit, context = verify(response, source, requested_url, include_context=True)
+        except NewsError as failure:
+            if not hasattr(failure, 'private_scope_facts'):
+                raise
+            permit = None
+            context = {**failure.private_scope_facts, 'private_original_scope_error':failure.code}
+        facts = {'contract_version':1, 'evidence_contract_version':evidence_contract_version, 'provider':source.provider,
+            'question':question, 'response_bytes':len(response.body),
+            'response_sha256':hashlib.sha256(response.body).hexdigest(), 'status':response.status,
+            'requested_url':requested_url, 'final_url':response.url, 'redirect_count':0,
+            'current_source_not_candidate':True, 'current_parser_replayed':True,
+            'accepted_as_article':False, 'raw_or_names_or_body_retained':False,
+            'body_completeness_verified':False, 'identity_or_alias_accepted':False, **context}
+        if permit is not None:
+            facts['private_original_permit'] = permit
+        return facts
+    if evidence_contract_version in {34, 35, 36, 37}:
+        from downloader.news_fulltext_policy import public_article_document
+        from downloader.news_fulltext_gvm import (
+            GVM_PATH_PATTERN, GVM_BOUNDARY_QUESTION, GVM_EDITOR_QUESTION, GVM_REMAINING_QUESTION,
+            GVM_V4_FAILURE_QUESTION, gvm_boundary_metadata, gvm_editor_grammar_metadata,
+            gvm_public_native_article, gvm_failure_context,
+        )
+        from urllib.parse import urlsplit
+        _require_article_response(response, source)
+        parts = urlsplit(requested_url or '')
+        if (parts.scheme != 'https' or parts.netloc != 'www.gvm.com.tw'
+                or parts.query or parts.fragment or not re.fullmatch(GVM_PATH_PATTERN, parts.path)
+                or response.url != requested_url or response.redirects or not 0 < len(response.body) <= 2 << 20):
+            raise NewsError('candidate_literal_response_not_verified')
+        document = public_article_document(response.body, source, page_url=response.url)
+        if evidence_contract_version == 37:
+            try:
+                gvm_public_native_article(document, page_url=response.url, version=4)
+            except NewsError as error:
+                context = gvm_failure_context(error)
+                location = extraction_failure_location(error)
+            else:
+                context = {'contract_version': 1, 'current_native_error': None,
+                    'accepted_as_article': False, 'raw_or_names_or_body_retained': False}
+                location = None
+            return {'contract_version': 1, 'evidence_contract_version': 37, 'provider': source.provider,
+                'question': GVM_V4_FAILURE_QUESTION, 'response_bytes': len(response.body),
+                'response_sha256': hashlib.sha256(response.body).hexdigest(), 'status': response.status,
+                'requested_url': requested_url, 'final_url': response.url, 'redirect_count': 0,
+                'current_source_not_candidate': True, 'current_parser_replayed': True,
+                'accepted_as_article': False, 'raw_or_names_or_body_retained': False,
+                'body_completeness_verified': False, 'identity_or_alias_accepted': False,
+                'failure_location': location, 'gvm_received_failure_context': context}
+        boundary = evidence_contract_version == 34
+        remaining = evidence_contract_version == 36
+        return {'contract_version': 1, 'evidence_contract_version': evidence_contract_version, 'provider': source.provider,
+            'question': GVM_REMAINING_QUESTION if remaining else GVM_BOUNDARY_QUESTION if boundary else GVM_EDITOR_QUESTION,
+            'response_bytes': len(response.body),
+            'response_sha256': hashlib.sha256(response.body).hexdigest(), 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url, 'redirect_count': 0,
+            'accepted_as_article': False, 'raw_or_names_or_body_retained': False,
+            'current_source_not_candidate': True, 'current_parser_replayed': True,
+            'body_completeness_verified': False, 'identity_or_alias_accepted': False,
+            **({'gvm_native_boundary':gvm_boundary_metadata(document,page_url=response.url,version=3),
+                'gvm_editor_grammar':gvm_editor_grammar_metadata(document,page_url=response.url,version=3)} if remaining
+                else {'gvm_native_boundary':gvm_boundary_metadata(document,page_url=response.url)} if boundary
+                else {'gvm_editor_grammar':gvm_editor_grammar_metadata(document,page_url=response.url)})}
     if evidence_contract_version in {27, 28, 29, 30, 31, 32, 33}:
         from downloader.news_fulltext_policy import public_article_document
         from downloader.news_fulltext_ettoday import (
@@ -343,7 +478,7 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
             'body_completeness_verified':False, 'identity_or_alias_accepted':False,
             'ettoday_native_boundary':ettoday_resident_boundary_metadata(document, page_url=response.url,
                 allow_house='house.ettoday.net' in source.reviewed_article_subsites)}
-    if evidence_contract_version in {24, 25, 26}:
+    if evidence_contract_version in {24, 25, 26, 38, 39}:
         from downloader.news_fulltext_policy import public_article_document
         from downloader.news_fulltext_setn import (
             INEWS_BOUNDARY_QUESTION, inews_literal_article_url, inews_resident_boundary_metadata)
@@ -352,11 +487,21 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
                 or response.redirects or not 0 < len(response.body) <= 2 << 20):
             raise NewsError('candidate_literal_response_not_verified')
         permit = None
-        if evidence_contract_version in {25, 26}:
+        if evidence_contract_version in {25, 26, 38, 39}:
             from downloader.news_fulltext_candidate_originals import (
-                private_inews_original_permit, private_inews_header_original_permit)
-            verify = private_inews_original_permit if evidence_contract_version == 25 else private_inews_header_original_permit
-            permit, document = verify(response, source, requested_url, include_document=True)
+                private_inews_original_permit, private_inews_header_original_permit,
+                private_inews_body_original_permit, private_inews_short_credit_original_permit)
+            verify = {25: private_inews_original_permit, 26: private_inews_header_original_permit,
+                38: private_inews_body_original_permit, 39: private_inews_short_credit_original_permit}[evidence_contract_version]
+            try:
+                permit, document = verify(response, source, requested_url, include_document=True)
+            except NewsError as error:
+                if evidence_contract_version not in {38, 39}:
+                    raise
+                # A negative scope observation remains metadata only. Do not
+                # discard the short/empty geometry or automatically retry it.
+                document = public_article_document(response.body, source, page_url=response.url)
+                scope_error = error.code
         else:
             document = public_article_document(response.body, source, page_url=response.url)
         facts = {'contract_version': 1, 'evidence_contract_version': evidence_contract_version, 'provider': source.provider,
@@ -370,6 +515,12 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
             'inews_native_boundary': inews_resident_boundary_metadata(document, page_url=response.url)}
         if permit is not None:
             facts['private_original_permit'] = permit
+        if evidence_contract_version in {38, 39}:
+            from downloader.news_fulltext_candidate_originals import INEWS_BODY_ORIGINAL_QUESTION, INEWS_SHORT_CREDIT_ORIGINAL_QUESTION
+            facts['question'] = INEWS_BODY_ORIGINAL_QUESTION if evidence_contract_version == 38 else INEWS_SHORT_CREDIT_ORIGINAL_QUESTION
+            facts['native_short_body_scope_verified'] = permit is not None
+            if permit is None:
+                facts['private_original_scope_error'] = scope_error
         return facts
     if evidence_contract_version in {20, 21, 22, 23}:
         from urllib.parse import urlsplit

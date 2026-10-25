@@ -26,6 +26,7 @@ from typing import Any, Callable, Final, Mapping
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import ProxyHandler, build_opener
 from weakref import WeakValueDictionary
+import zlib
 from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +90,7 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     project_data_monitor_summary,
 )
 from stockagent.live.data_monitor_providers import project_provider_detail  # noqa: E402
+from stockagent.live.tick_inventory import KINDS as TICK_KINDS, MARKETS as TICK_MARKETS, tick_page  # noqa: E402
 from stockagent.live.data_monitor_api_contract import FeaturePageQuery  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
     trusted_feature_preview,
@@ -103,6 +105,7 @@ from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     DashboardSessionUnavailable,
+    DashboardSnapshotChanged,
     DEFAULT_MAX_SOURCE_AGE_SECONDS,
     DEFAULT_OPENING_GATE_PATH,
     build_dashboard_event_page,
@@ -116,7 +119,9 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     warm_dashboard_session_indexes,
 )
 from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
+    SERVICE_SYNC_DURABLE_ACK_FILENAME,
     age_seconds,
+    committed_paper_read_guard,
     load_service_sync,
 )
 
@@ -166,6 +171,10 @@ _CACHE_OUTCOMES: Final[frozenset[str]] = frozenset(
         "build",
         "coalesced_hit",
         "fresh_hit",
+        "revision_build",
+        "revision_coalesced",
+        "revision_log_failed",
+        "revision_refresh_failed",
         "revision_stale_hit",
         "stale_hit",
         "static_build",
@@ -215,6 +224,7 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/data-monitor/api/summary",
         "/data-monitor/api/details",
         "/data-monitor/api/provider",
+        "/data-monitor/api/ticks",
         "/data-monitor/api/features",
         "/data-monitor/api/features/page",
         "/traffic/api/status",
@@ -249,6 +259,7 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/events",
         "/openbb/api/history",
         "/data-monitor/api/provider",
+        "/data-monitor/api/ticks",
         "/data-monitor/api/features/page",
         "/tej/api/features",
         "/tw-overnight/api/status",
@@ -294,6 +305,17 @@ class CacheEntry:
     stale_until: float
     response: PreparedResponse
     last_accessed_at: float
+    published_at: float
+
+
+@dataclass
+class RevisionBuildJob:
+    cache_key: str
+    revision_token: str
+    builder: Callable[[], PreparedResponse]
+    first_requested_at: float
+    latest_requested_at: float
+    superseded_pending_requests: int = 0
 
 
 @dataclass
@@ -1690,6 +1712,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
             WeakValueDictionary()
         )
         self._refreshing: set[str] = set()
+        # Revision keys change while the *query* stays the same. Keep a single
+        # consumer and one latest pending request per exact query/date, rather
+        # than starting a history/snapshot scan for every intermediate key.
+        self._revision_active: dict[str, str] = {}
+        self._revision_pending: dict[str, RevisionBuildJob] = {}
+        self._revision_scope_locks: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
         self._feature_page_lock = threading.Lock()
@@ -1703,6 +1731,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             {
                 topic: (
                     self.repo_root / f"artifacts/live/{directory}/service_sync.json",
+                    self.repo_root / "artifacts/live" / directory / SERVICE_SYNC_DURABLE_ACK_FILENAME,
                     self.repo_root / f"artifacts/live/{directory}/status.json",
                     benchmark_projection_head_path(
                         self.repo_root / f"artifacts/live/{directory}"
@@ -1878,6 +1907,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 stale_until=observed + float(ttl_seconds) + stale_grace,
                 response=response,
                 last_accessed_at=observed,
+                published_at=observed,
             )
             self._cache_bytes += response.resident_bytes
             removable = sorted(
@@ -1956,6 +1986,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         ttl_seconds: float,
         builder: Callable[[], PreparedResponse],
         stale_grace_seconds: float | None = None,
+        refresh_in_background: bool = True,
     ) -> PreparedResponse:
         """Per-key single-flight cache with stale-while-refresh behavior."""
 
@@ -1969,7 +2000,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     self._cache_observation("fresh_hit")
                     return cached.response
                 key_lock = self._cache_key_locks.setdefault(cache_key, threading.Lock())
-                if cached.stale_until > observed:
+                if refresh_in_background and cached.stale_until > observed:
                     if cache_key not in self._refreshing:
                         self._refreshing.add(cache_key)
                         start_background = True
@@ -2027,6 +2058,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_control: str,
         builder: Callable[[], Mapping[str, Any]],
         stale_grace_seconds: float | None = None,
+        refresh_in_background: bool = True,
     ) -> PreparedResponse:
         """Build and cache a local allowlisted status payload."""
 
@@ -2058,7 +2090,42 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ttl_seconds=ttl_seconds,
             stale_grace_seconds=stale_grace_seconds,
             builder=build,
+            refresh_in_background=refresh_in_background,
         )
+
+    def cached_paper_json(
+        self, topic: str, *, source_token: str, builder: Callable[[], Mapping[str, Any]],
+        history_only: bool = False, **cache_options,
+    ) -> PreparedResponse:
+        """One source/commit fence for every paper detail and history DTO."""
+        directory = {"tw": "tw_day_trade_simulation", "overnight": "tw_overnight_simulation"}[topic]
+        original_key = cache_options["cache_key"]
+        if not source_token or not original_key.endswith(source_token):
+            raise ValueError("paper cache key must end with its exact source token")
+        prefix = original_key[:-len(source_token)]
+
+        for attempt in range(2):
+            # A queued read may already be obsolete. Bind the cache key to
+            # admission, not to the source from before waiting for its scope.
+            observed_token = self.content_token(topic, history_only=history_only)
+
+            def checked(expected=observed_token):
+                with committed_paper_read_guard(self.repo_root / "artifacts/live" / directory):
+                    if self.content_token(topic, history_only=history_only) != expected:
+                        raise DashboardSnapshotChanged("paper query was superseded before admission")
+                    payload = builder()
+                    if self.content_token(topic, history_only=history_only) != expected:
+                        raise DashboardSnapshotChanged("paper query source changed during construction")
+                    return payload
+
+            try:
+                return self.cached_local_json(builder=checked,
+                    **(cache_options | {"cache_key": prefix + observed_token}))
+            except OSError:
+                if attempt:
+                    raise
+                self._cache_observation("paper_view_commit_retry")
+        raise AssertionError("bounded paper view retry exhausted")
 
     def cached_json(
         self,
@@ -2115,7 +2182,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         revision_token: str,
         builder: Callable[[], PreparedResponse],
     ) -> PreparedResponse:
-        """Serve the last verified revision while one replacement is built.
+        """Serve a verified view while one query-scoped consumer catches up.
 
         Revision-bearing keys preserve immediate source invalidation, but a
         large immutable projection should not turn that invalidation into a
@@ -2124,46 +2191,165 @@ class PublicDashboardServer(ThreadingHTTPServer):
         """
 
         start_refresh = False
+        coalesced = False
+        first_job: RevisionBuildJob | None = None
         fallback: PreparedResponse | None = None
         with self._cache_lock:
-            if cache_key not in self._cache:
-                observed = time.monotonic()
-                candidates = [
-                    entry
-                    for key, entry in self._cache.items()
-                    if key.startswith(cache_prefix) and entry.stale_until > observed
-                ]
-                if candidates:
-                    latest = max(candidates, key=lambda entry: entry.last_accessed_at)
-                    latest.last_accessed_at = observed
-                    fallback = latest.response
-                    if cache_key not in self._refreshing:
-                        self._refreshing.add(cache_key)
-                        start_refresh = True
+            observed = time.monotonic()
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached.expires_at > observed:
+                cached.last_accessed_at = observed
+                self._cache_observation("fresh_hit")
+                return cached.response
+            scope_lock = self._revision_scope_locks.setdefault(cache_prefix, threading.Lock())
+            candidates = [
+                entry
+                for key, entry in self._cache.items()
+                if key.startswith(cache_prefix) and entry.stale_until > observed
+            ]
+            if candidates:
+                # Accessing an older key must not make it the preferred view.
+                # Publication order, rather than access order, controls age.
+                latest = max(candidates, key=lambda entry: entry.published_at)
+                latest.last_accessed_at = observed
+                fallback = latest.response
+                if cache_prefix not in self._revision_active:
+                    self._revision_active[cache_prefix] = cache_key
+                    first_job = RevisionBuildJob(cache_key, revision_token, builder, observed, observed)
+                    start_refresh = True
+                elif self._revision_active[cache_prefix] != cache_key:
+                    pending = self._revision_pending.get(cache_prefix)
+                    if pending is None or pending.cache_key != cache_key:
+                        self._revision_pending[cache_prefix] = RevisionBuildJob(
+                            cache_key, revision_token, builder,
+                            pending.first_requested_at if pending else observed, observed,
+                            pending.superseded_pending_requests + 1 if pending else 0)
+                    coalesced = True
         if fallback is None:
-            return builder()
+            # Cold/expired views may not use a stale body. They still share
+            # the same query lock with the background consumer; different
+            # dates/routes remain independent (no global concurrency limit).
+            with scope_lock:
+                return builder()
 
         self._cache_observation("revision_stale_hit")
+        if coalesced:
+            self._cache_observation("revision_coalesced")
         if start_refresh:
+            assert first_job is not None
 
             def refresh_revision() -> None:
-                try:
-                    builder()
-                except Exception as error:
-                    sys.stderr.write(
-                        "public-dashboard revision_refresh_failed "
-                        f"key={cache_key} error={type(error).__name__}\n"
-                    )
-                finally:
+                job = first_job
+                while True:
+                    admitted_at = time.monotonic()
+                    build_started = admitted_at
+                    error_detail = None
+                    try:
+                        with scope_lock:
+                            build_started = time.monotonic()
+                            self._cache_observation("revision_build")
+                            job.builder()
+                    except Exception as error:
+                        self._cache_observation("revision_refresh_failed")
+                        # Private diagnostic only, never a public response.
+                        # Keep OSError's actual reason to distinguish a source
+                        # generation race from disk/permission failures.
+                        detail = (" detail=" + json.dumps({"errno": error.errno,
+                            "reason": str(error)[:400]}, ensure_ascii=True)
+                            if isinstance(error, OSError) else "")
+                        error_detail = (f"public-dashboard revision_refresh_failed key={job.cache_key} "
+                                        f"error={type(error).__name__}{detail}\n")
+                    completed_at = time.monotonic()
+                    # The existing private service journal owns these bounded
+                    # spans. HTTP cache hits are not background-build latency,
+                    # nor are gateway request clocks acquisition/fill clocks.
+                    timing = {"event": "dashboard_revision_build", "query": cache_prefix,
+                        "revision_token": job.revision_token, "ready": error_detail is None,
+                        "queue_ms": round((admitted_at - job.first_requested_at) * 1000, 3),
+                        "scope_wait_ms": round((build_started - admitted_at) * 1000, 3),
+                        "build_ms": round((completed_at - build_started) * 1000, 3),
+                        "oldest_request_to_ready_ms": round((completed_at - job.first_requested_at) * 1000, 3),
+                        "latest_request_to_ready_ms": round((completed_at - job.latest_requested_at) * 1000, 3),
+                        "superseded_pending_requests": job.superseded_pending_requests,
+                        "clock_basis": "gateway_monotonic_not_acquisition_or_paper_fill"}
+                    try:
+                        if error_detail is not None:
+                            sys.stderr.write(error_detail)
+                        sys.stderr.write("public-dashboard revision_timing " + json.dumps(timing) + "\n")
+                    except (OSError, ValueError):
+                        # A broken log sink must not leave this query pinned
+                        # forever or prevent a later verified view publishing.
+                        self._cache_observation("revision_log_failed")
                     with self._cache_lock:
-                        self._refreshing.discard(cache_key)
+                        pending = self._revision_pending.pop(cache_prefix, None)
+                        if pending is None:
+                            self._revision_active.pop(cache_prefix, None)
+                            return
+                        self._revision_active[cache_prefix] = pending.cache_key
+                        job = pending
 
-            threading.Thread(
+            thread = threading.Thread(
                 target=refresh_revision,
                 name=f"public-revision-{revision_token[:32]}",
                 daemon=True,
-            ).start()
+            )
+            try:
+                thread.start()
+            except Exception:
+                with self._cache_lock:
+                    self._revision_active.pop(cache_prefix, None)
+                    self._revision_pending.pop(cache_prefix, None)
+                raise
         return fallback
+
+    def _committed_status_response(
+        self, *, revision_reader: Callable[[], PreparedResponse],
+        cache_key: Callable[[Mapping[str, Any]], str],
+        builder: Callable[[], Mapping[str, Any]],
+        display_session: str | None = None,
+    ) -> PreparedResponse:
+        """Bind the body and cache key to the revision observed at admission.
+
+        A queued job may already have been superseded. Refresh its tiny receipt
+        BEFORE the expensive projection, then verify again before publication.
+        At most one retry absorbs a commit race; sustained source churn retains
+        the query's prior bounded verified view rather than busy-retrying or
+        blessing a mixed generation. The executor is never blocked by readers.
+        """
+        for attempt in range(2):
+            revision = _response_json(revision_reader())
+            if display_session is not None and (
+                (revision.get("session_clock") or {}).get("display_session_date") != display_session
+            ):
+                raise DashboardSnapshotChanged("dashboard session changed before status admission")
+
+            def build_verified() -> Mapping[str, Any]:
+                payload = dict(builder())
+                sync = dict(payload.get("service_sync") or {})
+                expected_engine = revision.get("engine_revision_token")
+                if expected_engine is not None and sync.get("revision_token") != expected_engine:
+                    raise DashboardSnapshotChanged("dashboard commit differs from requested revision")
+                for field in ("engine_generation", "content_revision"):
+                    if field in revision and sync.get(field) != revision[field]:
+                        raise DashboardSnapshotChanged("dashboard commit identity changed before publication")
+                after = _response_json(revision_reader())
+                if after.get("revision_token") != revision.get("revision_token"):
+                    raise DashboardSnapshotChanged("dashboard source revision changed during status build")
+                sync["revision_token"] = revision.get("revision_token")
+                sync["history_revision"] = revision.get("history_revision")
+                payload["service_sync"] = sync
+                return payload
+
+            try:
+                return self.cached_local_json(
+                    cache_key=cache_key(revision), ttl_seconds=55.0,
+                    cache_control="no-store", stale_grace_seconds=120.0,
+                    builder=build_verified, refresh_in_background=False)
+            except DashboardSnapshotChanged:
+                if attempt:
+                    raise
+                self._cache_observation("revision_commit_retry")
+        raise AssertionError("bounded snapshot retry exhausted")  # pragma: no cover
 
     def tw_status(self, session_date: str | None = None) -> PreparedResponse:
         normalized_date = str(session_date or "").strip()
@@ -2211,21 +2397,17 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     # Completed-session position snapshots and immutable
                     # benchmark history already enumerate the public selector.
                     include_ledger_session_dates=False,
+                    require_committed_revision=True,
                 ), quote_source=self.public_quote_source, private_prices=self.is_owner,
             )
-            service_sync = dict(payload.get("service_sync") or {})
-            service_sync["revision_token"] = revision_token
-            service_sync["history_revision"] = revision.get("history_revision")
-            payload["service_sync"] = service_sync
             return payload
 
         def build_response() -> PreparedResponse:
-            return self.cached_local_json(
-                cache_key=cache_key,
-                ttl_seconds=55.0,
-                cache_control="no-store",
-                stale_grace_seconds=120.0,
+            return self._committed_status_response(
+                revision_reader=self.tw_revision,
+                cache_key=lambda current: f"{cache_prefix}{current.get('revision_token') or current.get('state_revision') or 'missing'}:registry:{registry_token}",
                 builder=build_status,
+                display_session=display_session if not normalized_date else None,
             )
 
         # An atomic history promotion can change the content revision and the
@@ -2269,6 +2451,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 repr(signature[5:]).encode("utf-8")
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
+            payload["engine_revision_token"] = payload.get("revision_token") or "missing"
             payload["revision_token"] = (
                 f"{payload.get('revision_token') or 'missing'}:{history_revision}:{quote_revision}"
             )
@@ -2300,7 +2483,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_key = f"{cache_prefix}{revision_token}"
 
         def build_response() -> PreparedResponse:
-            return self.cached_local_json(
+            return self.cached_paper_json("tw", source_token=revision_token, history_only=True,
                 cache_key=cache_key,
                 ttl_seconds=55.0,
                 cache_control="no-cache",
@@ -2350,6 +2533,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 repr(signature[5:]).encode("utf-8")
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
+            payload["engine_revision_token"] = payload.get("revision_token") or "missing"
             payload["revision_token"] = (
                 f"{payload.get('revision_token') or 'missing'}:{history_revision}:{quote_revision}"
             )
@@ -2386,6 +2570,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     include_ledger_session_dates=False,
                     discord_markets_field="overnight_markets",
                     discord_engine_revision_field="overnight_engine_state_revision",
+                    require_committed_revision=True,
                 ), quote_source=self.public_quote_source, private_prices=self.is_owner,
             )
             payload["product"] = "tw_overnight"
@@ -2420,10 +2605,6 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "blocked_close_signal_count",
                 )
             }
-            service_sync = dict(payload.get("service_sync") or {})
-            service_sync["revision_token"] = revision_token
-            service_sync["history_revision"] = revision.get("history_revision")
-            payload["service_sync"] = service_sync
             payload["source_contract"] = {
                 "switch": "the dashboard and executor roll to the current verified session at 13:00 Asia/Taipei, then wait",
                 "signal": "calculation starts at 13:20 using the current quote and temporary day-trade model weights",
@@ -2444,15 +2625,17 @@ class PublicDashboardServer(ThreadingHTTPServer):
             }
             return payload
 
-        return self.cached_local_json(
-            cache_key=(
-                f"overnight-status:{normalized_date or 'latest'}:{revision_token}"
-            ),
-            ttl_seconds=55.0,
-            cache_control="no-store",
-            stale_grace_seconds=120.0,
-            builder=build,
-        )
+        cache_prefix = f"overnight-status:{normalized_date or 'latest'}:"
+
+        def build_response() -> PreparedResponse:
+            return self._committed_status_response(
+                revision_reader=self.overnight_revision,
+                cache_key=lambda current: f"{cache_prefix}{current.get('revision_token') or current.get('state_revision') or 'missing'}",
+                builder=build)
+
+        return self._revision_stale_or_build(
+            cache_prefix=cache_prefix, cache_key=f"{cache_prefix}{revision_token}",
+            revision_token=revision_token, builder=build_response)
 
     def overnight_history(
         self,
@@ -2466,8 +2649,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         date_key = (
             f"{start_date or ''}:{end_date or ''}:{resolution}:{history_encoding}"
         )
-        return self.cached_local_json(
-            cache_key=f"overnight-history:{range_key}:{date_key}:{self.content_token('overnight', history_only=True)}",
+        revision_token = self.content_token("overnight", history_only=True)
+        return self.cached_paper_json("overnight", source_token=revision_token, history_only=True,
+            cache_key=f"overnight-history:{range_key}:{date_key}:{revision_token}",
             ttl_seconds=55.0,
             cache_control="no-cache",
             stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
@@ -2642,6 +2826,21 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cache_control="no-store",
             stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS,
             builder=build,
+        )
+
+    def data_monitor_ticks(self, *, provider: str = "all", market: str = "all", kind: str = "all",
+                           search: str = "", detail: bool = False, offset: int = 0, limit: int = 30) -> PreparedResponse:
+        """Project producer-owned Tick metadata; never query a source or its database."""
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            return tick_page(payload.get("tick_inventory") or {}, provider=provider, market=market,
+                             kind=kind, search=search, detail=detail, offset=offset, limit=limit)
+
+        request_key = json.dumps([provider, market, kind, search, detail, offset, limit], ensure_ascii=False)
+        digest = hashlib.sha256(request_key.encode()).hexdigest()
+        return self.cached_local_json(
+            cache_key=f"data-monitor-ticks:{digest}", ttl_seconds=8.0, cache_control="no-store",
+            stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS, builder=build,
         )
 
     def data_monitor_features(self) -> PreparedResponse:
@@ -3393,7 +3592,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else "public, max-age=60",
                 )
-            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix == "provider.js") or (
+            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix in {"provider.js", "ticks.js"}) or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
                 and suffix
                 in {
@@ -3407,7 +3606,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/javascript; charset=utf-8",
                     "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
-            elif suffix == "styles.css" or (
+            elif suffix == "styles.css" or (prefix == "/data-monitor/" and suffix == "ticks.css") or (
                 prefix == "/traffic/" and suffix == "performance.css"
             ):
                 routes[path] = (
@@ -3493,6 +3692,30 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise InvalidPublicRequest("invalid provider filters")
         return {"provider": provider, "offset": offset, "limit": limit,
                 "search": search, "operation": operation, "market": market}
+
+    @staticmethod
+    def _tick_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=7)
+            allowed = {"provider", "market", "kind", "q", "detail", "offset", "limit"}
+            if set(query) - allowed or any(len(values) != 1 for values in query.values()):
+                raise ValueError("unsupported or repeated field")
+            provider = query.get("provider", ["all"])[0]
+            market = query.get("market", ["all"])[0]
+            kind = query.get("kind", ["all"])[0]
+            search = query.get("q", [""])[0].strip()
+            detail = query.get("detail", ["0"])[0]
+            offset = int(query.get("offset", ["0"])[0])
+            limit = int(query.get("limit", ["30"])[0])
+            if (not 0 < len(provider) <= 200 or len(search) > 120 or
+                    any(ord(c) < 32 for c in provider + search) or market not in {"all", *TICK_MARKETS} or
+                    kind not in {"all", *TICK_KINDS} or detail not in {"0", "1"} or
+                    not 0 <= offset <= 1_000_000 or not 1 <= limit <= 100):
+                raise ValueError("invalid filters")
+            return {"provider": provider, "market": market, "kind": kind, "search": search,
+                    "detail": detail == "1", "offset": offset, "limit": limit}
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid Tick inventory query") from error
 
     @staticmethod
     def _feature_page_query(raw_query: str) -> "FeaturePageQuery":
@@ -3833,8 +4056,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-day-trade/api/signals":
             normalized = self._signal_query(raw_query, allow_hide_zero_targets=True)
             query = parse_qs(normalized, keep_blank_values=True)
-            return self.server.cached_local_json(
-                cache_key=f"tw-signals:{normalized}:{self.server.content_token()}",
+            token = self.server.content_token()
+            return self.server.cached_paper_json("tw", source_token=token,
+                cache_key=f"tw-signals:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -3857,8 +4081,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-day-trade/api/positions":
             normalized = self._signal_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
-            return self.server.cached_local_json(
-                cache_key=f"tw-positions:{normalized}:{self.server.content_token()}",
+            token = self.server.content_token()
+            return self.server.cached_paper_json("tw", source_token=token,
+                cache_key=f"tw-positions:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -3887,8 +4112,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             symbol = str(query.get("symbol", [""])[0])
             offset = int(query.get("offset", ["0"])[0])
             limit = int(query.get("limit", [str(PUBLIC_EVENT_LIMIT)])[0])
-            return self.server.cached_local_json(
-                cache_key=f"tw-events:{normalized}:{self.server.content_token()}",
+            token = self.server.content_token()
+            return self.server.cached_paper_json("tw", source_token=token,
+                cache_key=f"tw-events:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -3941,8 +4167,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-overnight/api/signals":
             normalized = self._signal_query(raw_query, allow_hide_zero_targets=True)
             query = parse_qs(normalized, keep_blank_values=True)
-            return self.server.cached_local_json(
-                cache_key=f"overnight-signals:{normalized}:{self.server.content_token('overnight')}",
+            token = self.server.content_token("overnight")
+            return self.server.cached_paper_json("overnight", source_token=token,
+                cache_key=f"overnight-signals:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -3965,8 +4192,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-overnight/api/positions":
             normalized = self._signal_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
-            return self.server.cached_local_json(
-                cache_key=f"overnight-positions:{normalized}:{self.server.content_token('overnight')}",
+            token = self.server.content_token("overnight")
+            return self.server.cached_paper_json("overnight", source_token=token,
+                cache_key=f"overnight-positions:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -3988,8 +4216,9 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
         if path == "/tw-overnight/api/events":
             normalized = self._event_query(raw_query)
             query = parse_qs(normalized, keep_blank_values=True)
-            return self.server.cached_local_json(
-                cache_key=f"overnight-events:{normalized}:{self.server.content_token('overnight')}",
+            token = self.server.content_token("overnight")
+            return self.server.cached_paper_json("overnight", source_token=token,
+                cache_key=f"overnight-events:{normalized}:{token}",
                 ttl_seconds=2.0,
                 cache_control="no-store",
                 stale_grace_seconds=0.0,
@@ -4067,6 +4296,8 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_details()
         if path == "/data-monitor/api/provider":
             return self.server.data_monitor_provider(**self._provider_query(raw_query))
+        if path == "/data-monitor/api/ticks":
+            return self.server.data_monitor_ticks(**self._tick_query(raw_query))
         if path == "/data-monitor/api/features":
             return self.server.data_monitor_features()
         if path == "/data-monitor/api/features/page":
@@ -4126,15 +4357,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
         raise PublicRouteNotFound(path)
 
-    def _stream_updates(self, topic: str, *, head_only: bool) -> None:
-        # SSE uses identity with immediate flush, not a buffered gzip response.
-        if (
-            _preferred_encoding(
-                ",".join(self.headers.get_all("Accept-Encoding", [])),
-                gzip_available=False,
-            )
-            is None
-        ):
+    def _stream_updates(self, topic: str, *, head_only: bool, include_status: bool = False) -> None:
+        # Legacy small notifications retain identity. Opt-in full-status
+        # streams can negotiate gzip, but EVERY event must be sync-flushed;
+        # ordinary buffered whole-response compression would strand the UI.
+        encoding = _preferred_encoding(
+            ",".join(self.headers.get_all("Accept-Encoding", [])),
+            gzip_available=include_status,
+        )
+        if encoding is None:
             self._send_json(
                 HTTPStatus.NOT_ACCEPTABLE,
                 {"error": "no_acceptable_content_encoding"},
@@ -4150,18 +4381,33 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             )
             return
         self.close_connection = True
+        compressor = None
         try:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store, no-transform")
             self.send_header("X-Accel-Buffering", "no")
             self.send_header("Vary", "Accept-Encoding")
+            if encoding == "gzip":
+                self.send_header("Content-Encoding", "gzip")
             self._security_headers()
             self.end_headers()
             if head_only:
                 return
             self.connection.settimeout(5.0)  # slow consumers cannot pin writers
+            if encoding == "gzip":
+                compressor = zlib.compressobj(level=1, wbits=16 + zlib.MAX_WBITS)
+
+            def send_event(frame):
+                wire = (compressor.compress(frame) + compressor.flush(zlib.Z_SYNC_FLUSH)
+                        if compressor is not None else frame)
+                self.wfile.write(wire)
+                self.wfile.flush()
+                self._response_body_bytes += len(wire)
+
             version = -1
+            last_status_body = None
+            last_status_identity = None
             while not hub.closed:
                 current = hub.wait(topic, version)
                 if hub.closed:
@@ -4174,6 +4420,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     )
                     payload = _response_json(revision)
                     payload["view_generation"] = current
+                    payload["status_stream_contract"] = "verified_compact_status_v1"
                     frame = (
                         b"event: revision\ndata: "
                         + json.dumps(
@@ -4184,18 +4431,58 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     version = current
                 else:
                     frame = b": heartbeat\n\n"
-                self.wfile.write(frame)
-                self.wfile.flush()
+                send_event(frame)
                 if not hasattr(self, "_stream_first_frame_ms"):
                     self._stream_first_frame_ms = (
                         time.perf_counter_ns() - self._request_started_ns
                     ) / 1_000_000
-                self._response_body_bytes += len(frame)
+                status_identity = (tuple(payload.get(key) for key in
+                    ("revision_token", "engine_generation", "content_revision"))
+                    if not frame.startswith(b":") else None)
+                if (include_status and current == version and status_identity is not None
+                        and status_identity != last_status_identity):
+                    # Reuse the SAME public/owner-scoped, sanitized status
+                    # builder and its coalesced cache. The hint is flushed
+                    # first; a cold build never holds a writer or hub lock.
+                    try:
+                        status = (self.server.tw_status() if topic == "tw"
+                                  else self.server.overnight_status())
+                    except (OSError, ValueError):
+                        # A normal append-before-commit race must not tear
+                        # down the established stream and add a reconnect RTT.
+                        # No status is claimed; the next source/ready event
+                        # retries, with ordinary polling still independent.
+                        self.server._cache_observation("sse_status_unavailable")
+                        continue
+                    status_sync = _response_json(status).get("service_sync") or {}
+                    latest = _response_json(self.server.tw_revision() if topic == "tw"
+                                            else self.server.overnight_revision())
+                    if status.body != last_status_body and all(status_sync.get(key) == payload.get(key) == latest.get(key)
+                           for key in ("revision_token", "engine_generation", "content_revision")):
+                        # EventSource joins data lines with LF. Prepared JSON
+                        # bytes retain the ordinary API's exact wire values.
+                        status_frame = b"event: status\ndata: " + status.body.replace(b"\n", b"\ndata: ") + b"\n\n"
+                        send_event(status_frame)
+                        last_status_body = status.body
+                        # Engine/Discord heartbeat changes are already in the
+                        # compact revision hint. Do not rebuild and transmit a
+                        # large status merely because its age/heartbeat differs.
+                        # Only a successfully verified push acknowledges this
+                        # identity; a failed/stale build must retry on readiness.
+                        last_status_identity = status_identity
         except (OSError, ValueError):
             # Disconnects/timeouts and transient invalid source receipts close
             # the stream; the browser reconnects and keeps its polling fallback.
             pass
         finally:
+            if compressor is not None:
+                try:
+                    trailer = compressor.flush(zlib.Z_FINISH)
+                    self.wfile.write(trailer)
+                    self.wfile.flush()
+                    self._response_body_bytes += len(trailer)
+                except (OSError, ValueError):
+                    pass  # a disconnected stream still releases admission
             if not head_only:
                 hub.release()
 
@@ -4267,7 +4554,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
 
         is_api = "/api/" in path
         if path in {"/tw-day-trade/api/updates", "/tw-overnight/api/updates"}:
-            if parsed.query:
+            if parsed.query not in {"", "status=1"}:
                 self._send_json(
                     HTTPStatus.BAD_REQUEST,
                     {"error": "invalid_request"},
@@ -4277,6 +4564,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 self._stream_updates(
                     "tw" if path.startswith("/tw-day-trade/") else "overnight",
                     head_only=head_only,
+                    include_status=parsed.query == "status=1",
                 )
             return
         if is_api:

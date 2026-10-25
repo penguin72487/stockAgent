@@ -8,9 +8,172 @@ import sqlite3
 import pytest
 
 from scripts.profile_workflow_speeds import (
-    Evidence, Ledger, bind_source_stages, capture_benchmark, collect_benchmark, collect_finlab, collect_finmind, collect_http, collect_services, collect_training, discover,
+    Evidence, Ledger, bind_source_stages, capture_benchmark, collect_benchmark, collect_finlab, collect_finmind, collect_http, collect_services, collect_tej, collect_training, discover,
     finite_seconds, inspect_benchmarks, reported_metrics, select_benchmark_paths, storage_activity_timings, verify_collection, visible_code, write_csv,
 )
+
+
+def operation_row(provider="census", dataset="marts"):
+    from downloader.operation_timing import CONTRACT
+    return {"provider": provider, "dataset": dataset, "status": "current_cached",
+            "operation_timing": {"contract": CONTRACT, "clock": "perf_counter_ns", "invalid_clock": False,
+                                 "scope": "verified_receipt_readonly", "seconds": 2.0,
+                                 "stages": [{"stage": "existing_receipt_verification", "seconds": 1.5, "outcome": "returned"}]}}
+
+
+def _seal_readback_fixture(output, store, ledger):
+    from collections import Counter
+    from scripts.profile_workflow_speeds import CONTRACT
+    (output / "speed_samples.jsonl").write_text("".join(json.dumps(row) + "\n" for row in ledger.samples))
+    write_csv(output / "speed_summary.csv", ledger.summaries())
+    (output / "inventory.json").write_text(json.dumps({"contract": CONTRACT, "rows": ledger.inventory}))
+    (output / "evidence_manifest.json").write_text(json.dumps({"files": list(store.sources.values())}))
+    report = {"speed_samples": len(ledger.samples), "summary_groups": len(ledger.summaries()),
+              "sample_counts": dict(Counter(row["origin"] for row in ledger.samples)),
+              "inventory_counts": dict(Counter(row["kind"] for row in ledger.inventory))}
+    report["outputs"] = {p.name: {"bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                         for p in output.iterdir() if p.is_file() and p.name != "collection.json"}
+    (output / "collection.json").write_text(json.dumps(report))
+
+
+def test_known_source_inventory_retains_scope_without_old_clocks_or_current_health(tmp_path):
+    from scripts.profile_workflow_speeds import CONTRACT, collect_known_source_inventory
+    output = tmp_path / "observation"
+    output.mkdir()
+    store = Evidence(output, max_file_bytes=1 << 20, max_total_bytes=1 << 20)
+    ledger = Ledger()
+    current = {"kind": "source_endpoint", "id": "economic:census:marts", "provider": "current",
+               "active_scope": False, "service_keys": ["current"], "snapshot_at_utc": "new"}
+    ledger.inventory.append(current)
+    identifier = "tej:" + "a" * 24
+    known = tmp_path / "known.json"
+    known.write_text(json.dumps({"contract": CONTRACT, "rows": [
+        {**current, "provider": "old", "active_scope": True, "snapshot_at_utc": "old"},
+        {"kind": "source_endpoint", "id": identifier, "provider": "TEJ", "active_scope": True,
+         "service_keys": ["old-service"], "snapshot_at_utc": "old", "timed_stages": ["fake"],
+         "coverage": "recorded_stage_timing_only", "speed_sample_count": 999}],
+        "samples": [{"seconds": 999}]}))
+    assert collect_known_source_inventory(ledger, store, known) == 1
+    assert current == {"kind": "source_endpoint", "id": "economic:census:marts", "provider": "current",
+                       "active_scope": False, "service_keys": ["current"], "snapshot_at_utc": "new"}
+    historical = next(row for row in ledger.inventory if row.get("id") == identifier)
+    assert historical["active_scope"] is None and historical["service_keys"] == []
+    assert historical["historical_active_scope"] is True and historical["historical_service_keys"] == ["old-service"]
+    assert historical["snapshot_at_utc"] == "old" and historical["current_visibility_verified"] is False
+    assert historical["live_readiness_verified"] is False and "timed_stages" not in historical
+    assert ledger.samples == [] and bind_source_stages(ledger) == 0
+    assert collect_known_source_inventory(ledger, store, known) == 0
+    assert sum(row["kind"] == "source_endpoint" for row in ledger.inventory) == 2
+    # Only a separately captured, directly timed source task can add coverage.
+    sha = store.sources[str(known)]["sha256"]
+    ledger.add(workflow="tej:task", stage="complete", seconds=1.5, source=sha, locator="fresh",
+               origin="recorded_tej_task", context={"table_id": "a" * 24, "task_id": "fresh",
+                                                   "timing_basis": "fresh_end_to_end"})
+    assert bind_source_stages(ledger) == 1
+    assert ledger.samples[0]["source_endpoint_id"] == identifier
+    assert historical["timed_stages"] == ["complete"]
+    assert gzip.decompress((output / store.sources[str(known)]["snapshot"]).read_bytes()) == known.read_bytes()
+
+
+@pytest.mark.parametrize("payload", [{"contract": "unknown", "rows": []},
+    {"contract": "stockagent_workflow_speed_evidence_v1", "rows": []},
+    {"contract": "stockagent_workflow_speed_evidence_v1", "rows": [
+        {"kind": "source_endpoint", "id": "same"}, {"kind": "source_endpoint", "id": "same"}]}])
+def test_known_source_inventory_rejects_unusable_or_ambiguous_scope(tmp_path, payload):
+    from scripts.profile_workflow_speeds import collect_known_source_inventory
+    store = Evidence(tmp_path, max_file_bytes=4096, max_total_bytes=4096)
+    path = tmp_path / "known.json"
+    path.write_text(json.dumps(payload))
+    ledger = Ledger()
+    with pytest.raises(ValueError):
+        collect_known_source_inventory(ledger, store, path)
+    assert ledger.inventory == [] and ledger.samples == []
+    with pytest.raises(ValueError, match="unavailable"):
+        collect_known_source_inventory(ledger, store, tmp_path / "missing.json")
+
+
+def test_known_source_readback_rejects_lost_scope_and_historical_health_promotion(tmp_path):
+    from scripts.profile_workflow_speeds import CONTRACT, collect_known_source_inventory
+    output = tmp_path / "observation"
+    output.mkdir()
+    store = Evidence(output, max_file_bytes=4096, max_total_bytes=8192)
+    ledger = Ledger()
+    known = tmp_path / "known.json"
+    original = {"kind": "source_endpoint", "id": "tej:known", "provider": "TEJ", "snapshot_at_utc": "old",
+                "active_scope": None, "service_keys": [], "historical_active_scope": True,
+                "historical_service_keys": ["old-service"]}
+    known.write_text(json.dumps({"contract": CONTRACT, "rows": [original]}))
+    collect_known_source_inventory(ledger, store, known)
+    historical = ledger.inventory[0]
+    assert historical["historical_active_scope"] is True and historical["historical_service_keys"] == ["old-service"]
+    _seal_readback_fixture(output, store, ledger)
+    assert verify_collection(output)["known_source_identity_links_verified"] == 1
+    historical["live_readiness_verified"] = True
+    _seal_readback_fixture(output, store, ledger)
+    with pytest.raises(ValueError, match="visibility boundary"):
+        verify_collection(output)
+    historical["live_readiness_verified"] = False
+    ledger.inventory.remove(historical)
+    _seal_readback_fixture(output, store, ledger)
+    with pytest.raises(ValueError, match="registry scope"):
+        verify_collection(output)
+
+
+@pytest.mark.parametrize("change", [{"seconds": None}, {"seconds": -1}, {"seconds": True},
+                                    {"seconds": float("nan")}, {"scope": "unknown"}, {"invalid_clock": True},
+                                    {"clock": "utc"}, {"contract": "unknown"}])
+def test_source_operation_rejects_unknown_or_invalid_clock(change):
+    from scripts.profile_workflow_speeds import collect_source_operation
+    row = operation_row()
+    row["operation_timing"].update(change)
+    ledger = Ledger()
+    collect_source_operation(ledger, row, "sha", locator="receipt", owner="economic")
+    assert ledger.samples == []
+
+
+def test_source_operation_exact_binding_and_shared_fallback_total():
+    from scripts.profile_workflow_speeds import collect_source_operation
+    ledger = Ledger()
+    ids = ["economic:census:marts", "openbb:fred", "openbb:sec", "economic:census:marts_other"]
+    ledger.inventory = [{"kind": "source_endpoint", "id": name} for name in ids]
+    collect_source_operation(ledger, operation_row(), "sha", locator="receipt", owner="economic")
+    row = operation_row("fred", None)
+    row.update(declared_providers=["sec", "fred"], endpoint="economy.probe", task_id="task", status="success")
+    row["operation_timing"]["stages"] = [{"stage": "provider_adapter_inclusive", "provider": p,
+                                        "seconds": .5, "outcome": "raised" if p == "sec" else "returned"}
+                                       for p in ("sec", "fred")]
+    collect_source_operation(ledger, row, "sha", locator="task", owner="openbb")
+    assert bind_source_stages(ledger) == 3
+    shared_total = [sample for sample in ledger.samples if sample["workflow_id"].startswith("openbb:")
+                    and sample["stage"] == "producer_call_total"][0]
+    assert "source_endpoint_id" not in shared_total
+    assert {sample.get("source_endpoint_id") for sample in ledger.samples} == {None, *ids[:3]}
+
+
+def test_openbb_timing_snapshot_is_readonly_and_scheduler_survives_missing_worker_clock(tmp_path):
+    from downloader.operation_timing import OPENBB_META_PREFIX
+    from scripts.profile_workflow_speeds import collect_openbb_operations
+    root = tmp_path / "native"
+    (root / "_state").mkdir(parents=True)
+    path = root / "_state/openbb_archive.sqlite3"
+    row = {"provider": "fred", "endpoint": "economy.probe", "declared_providers": ["fred"],
+           "status": "failed", "task_id": "task", "scheduler_timing": {
+               "contract": "openbb_scheduler_monotonic_v1", "clock": "monotonic", "submit_to_reap_seconds": 5.0}}
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE archive_meta(key TEXT PRIMARY KEY,value TEXT,updated_at TEXT)")
+        connection.execute("INSERT INTO archive_meta VALUES (?,?,?)", (OPENBB_META_PREFIX + "sample", json.dumps(row), "stamp"))
+    before = path.read_bytes()
+    output = tmp_path / "snapshot"
+    output.mkdir()
+    ledger = Ledger()
+    evidence = Evidence(output, max_file_bytes=1 << 20, max_total_bytes=1 << 20)
+    collect_openbb_operations(ledger, evidence, root)
+    assert path.read_bytes() == before
+    assert evidence.issues == []
+    assert [(sample["stage"], sample["seconds"]) for sample in ledger.samples] == [("submit_to_reap_seconds", 5.0)]
+    snapshot = json.loads((output / "openbb_operation_observation.json").read_bytes())
+    assert snapshot["rows"][0]["value"] == json.dumps(row)
+    assert snapshot["selection_truncated"] is False
 
 
 def test_evidence_manifest_preserves_bytes_and_atomic_durable_owner(tmp_path, monkeypatch):
@@ -247,6 +410,47 @@ def test_prefetch_rechecks_generation_before_capture(tmp_path, mutation):
         assert store.read(path) == (new, sha)
     finally:
         reads.close()
+
+
+@pytest.mark.parametrize("chunk_size", [1, 5, 17])
+def test_prefetch_completes_short_raw_reads_within_the_original_byte_bound(tmp_path, monkeypatch, chunk_size):
+    path = tmp_path / "source.json"
+    raw = b'{"wall_seconds":1.25}'
+    path.write_bytes(raw)
+    output = tmp_path / "output"
+    output.mkdir()
+    store = Evidence(output, max_file_bytes=1024, max_total_bytes=4096)
+    original_open = Path.open
+    requests = []
+
+    class ShortReads:
+        def __init__(self, handle):
+            self.handle, self.total = handle, 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def read(self, limit):
+            requests.append(limit)
+            assert 0 < limit <= len(raw) + 1 - self.total
+            value = self.handle.read(min(limit, chunk_size))
+            self.total += len(value)
+            return value
+
+    def short_open(selected, mode="r", *args, **kwargs):
+        handle = original_open(selected, mode, *args, **kwargs)
+        return ShortReads(handle) if selected == path and mode == "rb" else handle
+
+    monkeypatch.setattr(Path, "open", short_open)
+    prepared = store._prepare_reads([path], frozenset(), 1024)[0][1]
+    assert prepared is not None and prepared[2] == raw
+    assert len(requests) > 1
+    body, sha = store.read(path, prepared=prepared)
+    assert body == raw and sha == hashlib.sha256(raw).hexdigest()
+    assert store.read_stats["prefetched_reads"] == 1 and not store.issues
 
 
 def test_prefetch_bounds_growing_reads_and_keeps_changed_read_failure(tmp_path, monkeypatch):
@@ -833,6 +1037,40 @@ def test_benchmark_selection_keeps_original_order_and_file_link_exclusions(tmp_p
     assert select_benchmark_paths(inputs, output) == expected
 
 
+def test_spawn_static_inventory_preserves_source_hashes_order_errors_and_never_executes(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for index in range(65):
+        (scripts / f"script_{index:02d}.py").write_text(
+            '\ufeff"""原始說明"""\nimport time\n'
+            'if __name__ == "__main__":\n'
+            '    raise RuntimeError("STATIC DISCOVERY MUST NOT EXECUTE")\n'
+            '    parser.add_argument("--original")\n    time.monotonic()\n')
+    (scripts / "broken.py").write_bytes(b"if (\n")
+    (scripts / "library.py").write_text("raise RuntimeError('MUST NOT IMPORT')\n")
+    (scripts / "command.ps1").write_text("Write-Error 'MUST NOT EXECUTE'\n")
+    (scripts / "config.json").write_text('{"raw":1}')
+    before = visible_code(tmp_path)
+    observations = {}
+    after = visible_code(tmp_path, workers=2, observations=observations)
+    assert after == before
+    inventory, code = after
+    assert len(inventory) == 67 and len(code) == 69
+    assert next(row for row in inventory if row["id"].endswith("broken.py"))["discovery_error"]
+    assert all(row["argument_flags"] == ["--original"] for row in inventory if "/script_" in row["id"])
+    assert observations["start_method"] == "spawn" and observations["workers"] == 2
+    assert observations["child_user_cpu_seconds"] > 0
+
+
+@pytest.mark.parametrize("workers", [-1, 3, True])
+def test_static_inventory_rejects_invalid_worker_count_before_dispatch(tmp_path, workers):
+    with pytest.raises(ValueError, match="inventory workers"):
+        visible_code(tmp_path, workers=workers)
+
+
 def test_benchmark_selection_invalidates_retargeted_parent(tmp_path):
     included = tmp_path / "included"
     output = tmp_path / "observation"
@@ -938,6 +1176,118 @@ def test_finmind_reads_existing_tables_without_schema_changes_and_deduplicates_c
     assert snapshot["provider_calls"] == 0 and snapshot["query_only"] is True
 
 
+def test_finmind_retains_recent_window_and_older_latest_dataset_with_direct_batch_clock(tmp_path):
+    root = tmp_path / "data_finmind"
+    owner = root / "complement"
+    owner.mkdir(parents=True)
+    database = owner / "queue.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE finmind_json_pipeline_samples (id INTEGER PRIMARY KEY, dataset TEXT, "
+                           "seconds REAL, rows INTEGER, requests INTEGER, fetch_validate_publish_seconds REAL, "
+                           "cycle_wall_verified INTEGER, cycle_id TEXT, cycle_wall_seconds REAL)")
+        connection.executemany("INSERT INTO finmind_json_pipeline_samples VALUES (?,?,?,?,?,?,?,?,?)", [
+            (index, "old" if index == 1 else "busy", 10., 40, 2, 3., 1, "cycle", 1300.)
+            for index in range(1, 131)])
+    before = database.read_bytes()
+    output = tmp_path / "output"
+    output.mkdir()
+    ledger = Ledger()
+    ledger.inventory = [{"kind": "source_endpoint", "id": "finmind:" + name} for name in ("old", "busy")]
+    evidence = Evidence(output, max_file_bytes=1 << 20, max_total_bytes=1 << 20)
+    collect_finmind(ledger, evidence, root)
+    assert database.read_bytes() == before and evidence.issues == []
+    payload = json.loads((output / "finmind_telemetry_snapshot.json").read_bytes())
+    observation = payload["observations"][0]
+    assert [row["id"] for row in observation["rows"]] == [*range(130, 2, -1), 1]
+    assert observation["selection"]["latest_per_dataset_selected"] == 2
+    allocated = [row for row in ledger.samples if row["metric"] == "allocated_cycle_wall_seconds"]
+    direct = [row for row in ledger.samples if row["stage"] == "json_fetch_validate_publish"]
+    assert len(allocated) == len(direct) == 129
+    assert {row["seconds"] for row in allocated} == {10}
+    assert {row["seconds"] for row in direct} == {3}
+    assert direct[0]["work"] == {"units": 40, "unit": "rows", "requests": 2, "nonempty_requests": None}
+    assert direct[0]["locator"].endswith("/fetch_validate_publish_seconds")
+    assert len([row for row in ledger.samples if row["stage"] == "verified_complete_cycle_wall"]) == 1
+    assert bind_source_stages(ledger) == 2
+    assert all("source_endpoint_id" not in row for row in allocated)
+    assert all("source_endpoint_id" in row for row in direct)
+
+
+def test_finmind_dataset_selection_reports_bound_without_discarding_recent_samples():
+    from scripts.profile_workflow_speeds import _finmind_sample_rows
+    with sqlite3.connect(":memory:") as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE samples (id INTEGER PRIMARY KEY, dataset TEXT, seconds REAL)")
+        connection.executemany("INSERT INTO samples VALUES (?,?,?)", [(i + 1, f"dataset_{i:03d}", 1.) for i in range(300)])
+        rows, selection, queries = _finmind_sample_rows(connection, "samples", ["id", "dataset", "seconds"])
+    assert len(rows) == 300  # All 128 recent rows plus 256 lexical dataset winners overlap.
+    assert selection["dataset_selection_truncated"] is True
+    assert selection["dataset_groups_observed"] == 257
+    assert len(queries) == 3
+
+
+@pytest.mark.parametrize("owner_name", ["free", "sponsor"])
+@pytest.mark.parametrize("invalid", [None, "missing_time", "regressing_clock", "inconsistent_seconds", "wrong_request_id", "naive_clock", "monotonic_with_regressing_UTC"])
+def test_finmind_observation_clocks_preserve_identity_units_and_reject_unknown_elapsed(tmp_path, invalid, owner_name):
+    root = tmp_path / "data_finmind"
+    owner = root if owner_name == "free" else root / owner_name
+    owner.mkdir(parents=True)
+    database = owner / "update_observations.sqlite3"
+    payload = {"request_id": "request", "request_started_at_utc": "2026-10-23T00:00:00+00:00",
+               "checked_at_utc": "2026-10-23T00:00:02+00:00", "network_seconds": 2., "response_rows": 123, "rows": 7}
+    if invalid == "missing_time":
+        payload.pop("request_started_at_utc")
+    elif invalid == "regressing_clock":
+        payload["request_started_at_utc"] = "2026-10-23T00:00:03+00:00"
+        payload["network_seconds"] = 0.
+    elif invalid == "inconsistent_seconds":
+        payload["network_seconds"] = 1.
+    elif invalid == "wrong_request_id":
+        payload["request_id"] = "other"
+    elif invalid == "naive_clock":
+        payload["request_started_at_utc"] = "2026-10-23T00:00:00"
+    elif invalid == "monotonic_with_regressing_UTC":
+        from downloader.finmind_updates import TRANSPORT_TIMING_CONTRACT
+        payload["request_started_at_utc"] = "2026-10-23T00:00:03+00:00"
+        payload["network_seconds"] = 0.
+        payload["transport_timing"] = {"contract": TRANSPORT_TIMING_CONTRACT, "seconds": 2.5}
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE dataset_heads (dataset TEXT PRIMARY KEY, metadata_json TEXT)")
+        connection.execute("CREATE TABLE checks (id INTEGER PRIMARY KEY, request_id TEXT, dataset TEXT, data_id TEXT, "
+                           "partition TEXT, checked_at_utc TEXT, kind TEXT, metadata_json TEXT)")
+        connection.execute("INSERT INTO dataset_heads VALUES ('dataset', '{}')")
+        connection.execute("INSERT INTO checks VALUES (1, 'request', 'dataset', '2330', '2026-10-23', ?, 'unchanged', ?)",
+                           (payload["checked_at_utc"], json.dumps(payload)))
+        connection.execute("INSERT INTO checks VALUES (2, 'failed_request', 'dataset', '2330', '2026-10-23', "
+                           "'2026-10-23T00:00:04+00:00', 'failed', '{}')")
+    before = database.read_bytes()
+    output = tmp_path / "output"
+    output.mkdir()
+    ledger = Ledger()
+    evidence = Evidence(output, max_file_bytes=65536, max_total_bytes=65536)
+    collect_finmind(ledger, evidence, root)
+    assert database.read_bytes() == before
+    snapshot = json.loads((output / "finmind_telemetry_snapshot.json").read_bytes())
+    assert snapshot["observations"][0]["rows"][0]["id"] == 1
+    assert snapshot["observations"][0]["database_relative_path"] == str(database.relative_to(root))
+    if invalid == "monotonic_with_regressing_UTC":
+        assert evidence.issues == [] and len(ledger.samples) == 1
+        sample = ledger.samples[0]
+        assert sample["seconds"] == 2.5 and sample["metric"] == "wall_seconds"
+        assert sample["stage"] == "request_to_parsed_response_monotonic"
+        assert sample["locator"].endswith("/transport_timing/seconds")
+    elif invalid is not None:
+        assert ledger.samples == [] and len(evidence.issues) == 1
+    else:
+        assert evidence.issues == [] and len(ledger.samples) == 1
+        sample = ledger.samples[0]
+        assert sample["seconds"] == 2 and sample["metric"] == "wall_clock_delta_seconds"
+        assert sample["work"] == {"units": 123, "unit": "provider_response_rows", "stored_task_rows": 7}
+        assert sample["units_per_second"] == 61.5
+        assert sample["context"]["data_id"] == "2330"
+        assert sample["context"]["clock_basis"] == "recorded_UTC_difference_not_monotonic"
+
+
 def test_selected_benchmark_converts_ms_and_keeps_variants_separate():
     ledger = Ledger()
     payload = {"scope": "isolated_publication", "samples": [
@@ -997,6 +1347,39 @@ def test_source_stage_binding_requires_exact_registry_id_and_excludes_shared_cyc
     assert "source_endpoint_id" not in ledger.samples[2]
     assert ledger.inventory[0]["speed_sample_count"] == 1
     assert ledger.inventory[0]["coverage"] == "recorded_stage_timing_only"
+
+
+def test_tej_exact_table_identity_binds_nested_timings_without_claiming_full_history():
+    ledger = Ledger()
+    ledger.inventory = [{"kind": "source_endpoint", "id": "tej:" + "a" * 24}]
+    collect_tej(ledger, {"contract": "profile", "timing_basis": "fresh_end_to_end",
+        "source_scope_contract": "scope", "samples": [{"task_id": "task", "table_id": "a" * 24,
+        "table": "same display name", "seconds": 30, "actual_rows": 0,
+        "windows_flow": {"prebridge_timing": {"script_staging_seconds": .1}},
+        "transport_timing": {"admitted_execution_seconds": 25}}]}, "sha")
+    assert bind_source_stages(ledger) == 1
+    assert {row["stage"]: row["seconds"] for row in ledger.samples} == {
+        "complete_download_task": 30, "prebridge/script_staging_seconds": .1,
+        "transport/admitted_execution_seconds": 25}
+    assert all(row["source_endpoint_id"] == "tej:" + "a" * 24 for row in ledger.samples)
+    assert all(row["context"]["result_kind"] == "empty" for row in ledger.samples)
+    assert [row["locator"] for row in ledger.samples[1:]] == [
+        "samples/0/windows_flow/prebridge_timing/script_staging_seconds",
+        "samples/0/transport_timing/admitted_execution_seconds"]
+    assert ledger.inventory[0]["coverage"] == "recorded_stage_timing_only"
+
+
+@pytest.mark.parametrize("identity", [{}, {"table_id": "b" * 24},
+    {"table_id": "a" * 24, "task_id": None},
+    {"table_id": "a" * 24, "task_id": True},
+    {"table_id": "a" * 24, "task_id": "task", "basis": "legacy_bridge_only"}])
+def test_tej_binding_rejects_display_name_missing_task_and_legacy_basis(identity):
+    ledger = Ledger()
+    ledger.inventory = [{"kind": "source_endpoint", "id": "tej:" + "a" * 24}]
+    collect_tej(ledger, {"timing_basis": identity.get("basis", "fresh_end_to_end"),
+        "samples": [{"table": "a" * 24, "task_id": "task", "seconds": 1, **identity}]}, "sha")
+    assert bind_source_stages(ledger) == 0
+    assert "source_endpoint_id" not in ledger.samples[0]
 
 
 def test_storage_pairs_same_scheduled_start_and_terminal_without_timing_running_work():
@@ -1233,3 +1616,159 @@ def test_read_batch_budget_changes_transport_only(tmp_path):
     assert results[0] == results[1]
     assert reads[0]["synchronous_reads"] == 1 and not reads[0]["prefetched_reads"]
     assert reads[1]["prefetched_reads"] == 1 and not reads[1]["synchronous_reads"]
+
+
+"""Native transport boundaries; canonical consumer and output oracles stay shared."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import threading
+
+import pytest
+
+from scripts import profile_workflow_speeds as profile
+
+@pytest.fixture(scope="module")
+def native_batch_compiled(tmp_path_factory):
+    import shutil
+    if sys.platform != "linux" or not (shutil.which("g++") or shutil.which("c++")):
+        pytest.skip("optional Linux C++ batch backend unavailable")
+    from stockagent.workflow_metric_tree import load_backend
+    module, info = load_backend(tmp_path_factory.mktemp("batch-native"), "cpp")
+    assert info["bounded_read_batch_available"] and hasattr(module, "read_batch")
+    return module
+
+
+@pytest.fixture
+def native_batch_selected(monkeypatch, native_batch_compiled):
+    monkeypatch.setattr(profile, "_METRIC_TREE", native_batch_compiled)
+    monkeypatch.setattr(profile, "_METRIC_DESCRIPTOR", native_batch_compiled.cache_descriptor(profile._metric_descriptor))
+    yield
+
+
+@pytest.mark.parametrize('chunk', [0, 1, 5, 17])
+def test_native_short_reads_and_stat_ns(tmp_path, chunk, native_batch_compiled):
+    native = native_batch_compiled
+    path = tmp_path / '讀取.json'
+    raw = b'{"wall_seconds":1.25}'
+    path.write_bytes(raw)
+    os.utime(path, ns=(1740000000000000123, 1740000000000000456))
+    before, after, body = native.read_batch([os.fsencode(path)], 1024, 1024, chunk)[0]
+    assert body == raw
+    assert before == after == profile.Evidence._signature(path.stat())
+
+
+def test_native_bounds_skip_missing_fifo_and_unrepresentable_filename(tmp_path, native_batch_compiled):
+    native = native_batch_compiled
+    regular = tmp_path / 'file'
+    regular.write_bytes(b'abcd')
+    fifo = tmp_path / 'fifo'
+    os.mkfifo(fifo)
+    invalid = os.fsencode(tmp_path) + b'/bad-\xff'
+    fd = os.open(invalid, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(fd, b'xyz')
+    os.close(fd)
+    values = native.read_batch([None, os.fsencode(tmp_path/'missing'), os.fsencode(fifo),
+                               invalid, os.fsencode(regular), os.fsencode(regular)], 7, 4)
+    assert values[:3] == [None, None, None]
+    assert values[3][2] == b'xyz' and values[4][2] == b'abcd' and values[5] is None
+    assert native.read_batch([os.fsencode(regular)], 100, 3) == [None]
+    with pytest.raises(ValueError, match='null'):
+        native.read_batch([b'a\0b'], 10, 10)
+
+
+@pytest.mark.parametrize('workers', [1, 2, 4])
+def test_complete_consumer_output_parity(tmp_path, workers, native_batch_selected):
+    # Reuse the maintained independent oracle, including budgets/duplicates/UTF16.
+    test_prefetch_preserves_complete_order_budget_failures_and_originals(tmp_path, workers)
+
+
+@pytest.mark.parametrize('mutation', ['write', 'replace', 'symlink'])
+def test_consumer_generation_retry(tmp_path, mutation, native_batch_selected):
+    test_prefetch_rechecks_generation_before_capture(tmp_path, mutation)
+
+
+def test_missing_speculation_retries_on_consumption(tmp_path, native_batch_selected):
+    output = tmp_path/'output'
+    output.mkdir()
+    source = tmp_path/'later.json'
+    store = profile.Evidence(output, max_file_bytes=1024, max_total_bytes=4096)
+    prepared = store._prepare_reads([source], frozenset(), 1024)[0][1]
+    assert prepared is None
+    raw = b'{"wall_seconds":2}'
+    source.write_bytes(raw)
+    assert store.read(source, prepared=prepared) == (raw, hashlib.sha256(raw).hexdigest())
+    assert store.read_stats['synchronous_reads'] == 1
+
+
+def test_shutdown_and_allocation_bound(tmp_path, native_batch_selected):
+    test_prefetch_is_bounded_and_closes_workers_when_consumer_stops(tmp_path)
+
+
+def test_explicit_budget_precedes_io(tmp_path, monkeypatch, native_batch_selected):
+    test_prefetch_does_not_read_explicit_payload_after_budget_failure(tmp_path, monkeypatch)
+
+
+def test_shutdown_on_consumer_failure(tmp_path, monkeypatch, native_batch_selected):
+    test_inspection_closes_prefetch_after_consumer_failure(tmp_path, monkeypatch)
+
+
+def test_changed_native_generation_is_rejected(tmp_path, native_batch_selected):
+    output = tmp_path/'output'
+    output.mkdir()
+    source = tmp_path/'source.json'
+    source.write_bytes(b'abc')
+    store = profile.Evidence(output, max_file_bytes=1024, max_total_bytes=4096)
+    before, after, raw, sha = store._prepare_reads([source], frozenset(), 1024)[0][1]
+    # A native result reporting a changed generation must fail before capture.
+    after = after._replace(st_ctime_ns=after.st_ctime_ns + 1)
+    assert store.read(source, prepared=(before, after, raw, sha)) is None
+    assert store.sources[str(source)]['state'] == 'changed_during_read'
+    assert not list((output/'evidence').iterdir())
+
+
+def test_native_unrepresentable_ns_retries_through_python(tmp_path, native_batch_compiled, native_batch_selected):
+    source = tmp_path / "future.json"
+    raw = b'{"seconds":1}'
+    source.write_bytes(raw)
+    timestamp = 9223372036000000000
+    os.utime(source, ns=(timestamp, timestamp))
+    assert source.stat().st_mtime_ns == timestamp
+    assert native_batch_compiled.read_batch([os.fsencode(source)], 1024, 1024) == [None]
+    output = tmp_path / "output"
+    output.mkdir()
+    store = profile.Evidence(output, max_file_bytes=1024, max_total_bytes=4096)
+    prepared = store._prepare_reads([source], frozenset(), 1024)[0][1]
+    assert prepared is None
+    assert store.read(source, prepared=prepared) == (raw, hashlib.sha256(raw).hexdigest())
+
+
+def test_native_huge_python_limit_keeps_original_fallback(tmp_path, native_batch_selected):
+    source = tmp_path / "source.json"
+    source.write_bytes(b'{"seconds":1}')
+    output = tmp_path / "output"
+    output.mkdir()
+    store = profile.Evidence(output, max_file_bytes=10**30, max_total_bytes=4096)
+    prepared = store._prepare_reads([source], frozenset(), 1024)[0][1]
+    assert prepared[2] == source.read_bytes()
+    assert store.read_stats["native_prefetch_batches"] == 0
+
+
+@pytest.mark.parametrize("threads", [0, 1, 2, 4])
+def test_training_discovery_keeps_native_epoch_plot_clocks_and_depth(tmp_path, threads):
+    from scripts import profile_workflow_speeds as profile
+    valid = [tmp_path / "epoch_curve_plot_timing_every1.json", tmp_path / "epoch_curve_plot_timing_every20.json"]
+    invalid = ["epoch_curve_plot_timing_every0.json", "epoch_curve_plot_timing_every01.json",
+               "epoch_curve_plot_timing_every2x.json", "epoch_curve_plot_timing_every-1.json"]
+    for path in [*valid, *[tmp_path / name for name in invalid]]:
+        path.write_text('{"total_s":1}')
+    nested = tmp_path / "a/b"
+    nested.mkdir(parents=True)
+    (nested / "epoch_curve_plot_timing_every2.json").write_text('{"total_s":1}')
+    observations = []
+    paths, gaps = profile.discover_training(tmp_path, depth=1, threads=threads, observations=observations)
+    assert paths == sorted(valid)
+    assert gaps == [{"path":str(tmp_path), "reason":"training_depth_budget", "files_beyond_depth":1}]
+    assert observations[0]["exit_code"] == 0 and observations[0]["wall_seconds"] >= 0

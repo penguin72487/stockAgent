@@ -48,6 +48,23 @@ def _now():
     return datetime.now(UTC).isoformat()
 
 
+def _require_capture_headroom(directory: Path, payload_bytes: int) -> None:
+    """Admit new preparation writes against the existing free-space policy.
+
+    Per-file size bounds do not bound the total of thousands of frozen tables.
+    Existing complete captures remain readable; this never evicts any bytes.
+    Other writers still need their own admission, so this is not a disk quota.
+    """
+    from stockagent.data_sync.cache_capacity import load_capacity_policy
+    minimum = max(5 * 1024**3, load_capacity_policy()['minimum_free_bytes'])
+    growth = (payload_bytes * 6 + 4) // 5 + 1024**2
+    available = shutil.disk_usage(directory).free
+    if available < minimum + growth:
+        raise SnapshotError(
+            f'migration capture scratch headroom insufficient: available={available}, '
+            f'required_growth={growth}, minimum_free={minimum}; retain preparation and retry')
+
+
 def migration_process_identity(pid=None):
     """Fence reused PIDs and rebooted workers without a time-based liveness guess."""
     pid = os.getpid() if pid is None else pid
@@ -316,8 +333,7 @@ def _snapshot_sqlite(database: Path, staging: Path, logical_path: str) -> dict:
         staging.mkdir(mode=0o700)
         atomic_write_json(staging / "backup-intent.json", marker)
     target = staging / "snapshot.sqlite3"
-    if shutil.disk_usage(staging.parent).free < database.stat().st_size * 1.2 + 5 * 1024**3:
-        raise SnapshotError("insufficient native snapshot scratch space; retain source and retry")
+    _require_capture_headroom(staging.parent, database.stat().st_size)
     if any(path.is_symlink() for path in staging.iterdir()):
         raise SnapshotError("native SQLite scratch is redirected")
     from stockagent.data_sync.materialized_cache import process_references_many
@@ -566,8 +582,7 @@ def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
                 before = os.fstat(source.fileno())
                 if not stat.S_ISREG(before.st_mode):
                     raise SnapshotError(f'published mutable source is not regular: {logical}')
-                if shutil.disk_usage(target.parent).free < before.st_size * 1.2 + 5 * 1024**3:
-                    raise SnapshotError('published mutable capture would cross its 5 GiB scratch reserve')
+                _require_capture_headroom(target.parent, before.st_size)
                 if original.name == 'openbb_l1.duckdb' and original.with_suffix('.duckdb.wal').exists():
                     raise SnapshotError('OpenBB published catalog has a WAL; native owner recovery required')
                 digest, copied, oversized = hashlib.sha256(), 0, False
@@ -788,6 +803,7 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                         break
                     if attempt == 2:
                         raise SnapshotError(f"control file changed during bounded freeze: {logical}")
+                _require_capture_headroom(target.parent, len(raw))
                 atomic_write_bytes(target, raw, mode=0o600, durable=True)
             frozen[logical] = {"path": str(target), "sha256": hashlib.sha256(raw).hexdigest(),
                                "bytes": len(raw)}

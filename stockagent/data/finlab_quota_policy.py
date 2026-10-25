@@ -88,7 +88,7 @@ def load_policy(path: Path = DEFAULT_CONFIG) -> QuotaPolicy:
             "minute_authorization_slots": (1, 32),
             "tick_workers": (1, 8), "tick_range_calendar_days": (1, 31), "tick_queue_depth": (1, 4),
             "tick_authorization_slots": (1, 8),
-            "general_batch_size": (1, 16),
+            "general_batch_size": (1, 64),
             "pre_reset_publication_recheck_minutes": (1, 120),
             "processing_threads": (1, 8),
         }

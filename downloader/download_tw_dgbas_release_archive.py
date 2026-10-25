@@ -33,9 +33,11 @@ from pypdf import PdfReader
 try:
     from downloader.common import SharedRateLimiter, retry_delay_seconds
     from downloader.release_archive_io import write_release_rows_if_changed
+    from downloader.release_archive_timing import timed_release_archive
 except ImportError:  # direct execution from downloader/
     from common import SharedRateLimiter, retry_delay_seconds
     from release_archive_io import write_release_rows_if_changed
+    from release_archive_timing import timed_release_archive
 
 try:
     import fcntl
@@ -571,6 +573,7 @@ def _write_state(root: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, state)
 
 
+@timed_release_archive(OUTPUT_NAME)
 def collect(root: Path, *, sources: tuple[str, ...], attachments: str,
             workers: int, request_interval: float, refresh_recent: int,
             offline_cache_only: bool = False) -> dict[str, object]:

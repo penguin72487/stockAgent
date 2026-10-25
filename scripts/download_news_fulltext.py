@@ -68,6 +68,10 @@ def main(argv=None):
     parser.add_argument("--reason", help="Bounded review reason for a missing-body repair request; repair only, no HTTP or owner restart")
     parser.add_argument('--reviewed-empty-responses', type=Path,
                         help='Repair only: private JSON mapping selected saved URLs to exact canonical zero-byte receipt references; no HTTP/body/freshness acceptance')
+    parser.add_argument('--address-recheck', action='store_true',
+                        help='Repair only: one reviewed missing-only non-public-address recheck per URL; all DNS, redirect and robots checks remain required')
+    parser.add_argument('--publication-clock-recheck', action='store_true',
+                        help='Repair only: reviewed missing-only publication-clock retry through the existing owner; no timestamp rewrite')
     parser.add_argument("--reviewed-supplement", type=Path, help="Retained public-source diagnostic report for an explicit finite supplement; requires source opt-in, at most16 direct --url arguments; original cohort unchanged")
     parser.add_argument('--reviewed-native-diagnostics', type=Path,
                         help='Explicit approved native diagnostic manifest; fetch only, 1-16 direct URLs, no HTTP or scope/retry reset')
@@ -83,6 +87,11 @@ def main(argv=None):
         parser.error('repair requires --reason; --reason belongs to repair')
     if args.reviewed_empty_responses and args.command != 'repair':
         parser.error('reviewed empty responses belong to repair only')
+    if args.address_recheck and (args.command != 'repair' or args.reviewed_empty_responses):
+        parser.error('address recheck belongs to repair only and cannot be combined with empty-response rechecks')
+    if args.publication_clock_recheck and (args.command != 'repair' or args.address_recheck
+                                          or args.reviewed_empty_responses):
+        parser.error('publication-clock recheck belongs to repair only and cannot combine other recheck modes')
     if args.reviewed_url_references and (args.command != 'enqueue' or args.url_file is not None
             or not 1 <= len(args.url) <= 16 or args.refresh or args.reviewed_supplement
             or args.reviewed_native_diagnostics or args.reviewed_source_outcomes
@@ -130,7 +139,8 @@ def main(argv=None):
                 raise ValueError('empty_response_manifest_too_large')
             witnesses = json.loads(raw, object_pairs_hook=_unique)
         result = submit_repairs(root, registry, selected_urls(args), reason=args.reason,
-                                empty_response_witnesses=witnesses)
+                                empty_response_witnesses=witnesses, address_recheck=args.address_recheck,
+                                publication_clock_recheck=args.publication_clock_recheck)
         if args.output:
             atomic_write_bytes(args.output, json.dumps(result, ensure_ascii=False, indent=2).encode(), durable=True, mode=0o600)
         print_status(result)
@@ -144,6 +154,15 @@ def main(argv=None):
             atomic_write_json(args.output, result)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0 if result["accepted"] else 1
+    if (args.command == 'enqueue' and not args.refresh and not args.reviewed_supplement
+            and not args.reviewed_source_outcomes and not args.reviewed_url_references):
+        from downloader.news_fulltext_url_metadata import has_live_owner, submit_urls
+        if has_live_owner(root):
+            result = submit_urls(root, registry, selected_urls(args))
+            if args.output:
+                atomic_write_json(args.output,result)
+            print(json.dumps(result,ensure_ascii=False,indent=2))
+            return 0
     metrics = NewsMetrics()
     from stockagent.data.news_worker_lifecycle import NewsWorkerLifecycle
     lifecycle = NewsWorkerLifecycle(root)

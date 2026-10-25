@@ -31,6 +31,7 @@ from stockagent.data.tw_futures_margin_preparation import (
     bind_equity_margin_families, bind_equity_position_families,
     bind_physical_position_inputs, bind_adjusted_terminal_values, equity_contract_families,
     stock_futures_preparation_scope,
+    futures_preparation_universe, FUTURES_UNIVERSE_SCOPE_CONTRACT,
 )
 from stockagent.data.tw_futures_margin_release import (
     read_bound_output, materialize_margin_market_rows, margin_execution_dependency_rows,
@@ -966,10 +967,14 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
           previous_sources: Path | None = None, omit_empty_account_prefixes: bool = False,
           empty_prefix_max_volume_participation: float | None = None,
           replay_accounting: Path | None = None, rule_delta: Path | None = None,
-          valuation_research_policy: Path | None = None, stock_futures_only: bool = False) -> dict:
+          valuation_research_policy: Path | None = None, stock_futures_only: bool = False,
+          universe_scope: str | None = None) -> dict:
     begun = time.monotonic()
     if type(stock_futures_only) is not bool:
         raise ValueError('stock-futures scope must be an explicit boolean')
+    if universe_scope is not None and (stock_futures_only or replay_accounting is not None
+            or previous_sources is not None or diagnostic_products):
+        raise ValueError('explicit universe scope requires its own ordinary/integrated-source build')
     if output.exists() and not reuse_accounting and not (
             replay_accounting is not None and (output/'research_accounting_composition.json').is_file()):
         raise FileExistsError("build output exists; use --reuse-accounting for its exact compiled checkpoint")
@@ -995,9 +1000,13 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
 
     universe = pl.read_csv(source / "universe/products.csv", infer_schema=False)
     deferred = pl.read_csv(source / "deferred_54_products.csv", infer_schema=False)
-    universe = universe.filter(~pl.col("product").is_in(deferred["product"].to_list()))
-    if universe.height != 711 or not universe["settlement_currency"].eq("TWD").all():
-        raise ValueError("the explicitly retained 711-product TWD universe changed")
+    if universe_scope is None:
+        universe = universe.filter(~pl.col("product").is_in(deferred["product"].to_list()))
+        if universe.height != 711 or not universe["settlement_currency"].eq("TWD").all():
+            raise ValueError("the explicitly retained 711-product TWD universe changed")
+    else:
+        universe = futures_preparation_universe(universe, scope=universe_scope)
+        universe.write_csv(output / 'requested_universe.csv')
     parent_products = universe['product'].to_list()
     if stock_futures_only:
         universe = stock_futures_preparation_scope(universe)
@@ -1026,6 +1035,11 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         end=str(end), slots=slots, products=products, calculation=_calculation_identity())
     if stock_futures_only:
         inputs['asset_class_scope'] = 'stock_future'
+    if universe_scope is not None:
+        inputs['product_universe'] = dict(contract=FUTURES_UNIVERSE_SCOPE_CONTRACT,
+            scope=universe_scope, source_catalog_sha256=sha256_file(source / 'universe/products.csv'),
+            legacy_deferred_sha256=sha256_file(source / 'deferred_54_products.csv'),
+            legacy_deferrals_applied=False)
     accounting_source, information_reviews, valuation_policy = source, [], None
     if rule_delta is not None and replay_proof is None:
         accounting_source, information_reviews, valuation_policy, replay_policies, integration = _integrated_rule_inputs(
@@ -1266,6 +1280,11 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         initial_capital_twd=100000000, runtime_training_verified=False)
     if stock_futures_only:
         summary['asset_class_scope'] = 'stock_future'
+    if universe_scope is not None:
+        summary['product_universe'] = dict(inputs['product_universe'],
+            requested_products=len(products), admitted_products=len(chosen_products),
+            all_requested_product_codes_admitted=set(products) == set(chosen_products),
+            complete_dated_history_verified=False)
     atomic_write_json(output / "build_acceptance.json", summary)
     log("release_validated", products=len(chosen_products), rows=chosen.height, excluded_products=review["excluded_products"])
     return summary
@@ -1280,6 +1299,8 @@ if __name__ == "__main__":
     parser.add_argument("--slots", type=int, default=2816)
     parser.add_argument('--stock-futures-only', action='store_true',
                         help='Compile only source-declared stock futures, retaining adjusted contract families')
+    parser.add_argument('--universe-scope', choices=['all_twd', 'domestic_equity'],
+                        help='New source-declared scope; retain legacy-deferred products for dated admission')
     parser.add_argument("--previous-sources", type=Path, help="Verified previous source for a margin-only incremental repair")
     parser.add_argument("--reuse-accounting", action="store_true")
     parser.add_argument("--repair-release-metadata", action="store_true")
@@ -1305,6 +1326,9 @@ if __name__ == "__main__":
     parser.add_argument('--empty-prefix-max-volume-participation', type=float,
                         help='Whole-contract prefix ABI; reject runtime participation above this explicit bound')
     args = parser.parse_args()
+    if args.universe_scope and (args.stock_futures_only or args.rule_delta or args.publish_replay
+            or args.repair_release_metadata or args.diagnostic_product or args.previous_sources):
+        parser.error('explicit universe scope requires a fresh ordinary or integrated-source build')
     if args.stock_futures_only and (args.rule_delta or args.publish_replay or args.repair_release_metadata
                                    or args.diagnostic_product or args.previous_sources):
         parser.error('stock-futures scope requires a fresh ordinary or integrated-source build')
@@ -1325,7 +1349,7 @@ if __name__ == "__main__":
             reuse_accounting=args.reuse_accounting,omit_empty_account_prefixes=True,
             empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
             rule_delta=args.integrate_rule_delta,valuation_research_policy=args.valuation_research_policy,
-            stock_futures_only=args.stock_futures_only)
+            stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope)
     elif args.publish_replay:
         if (not args.rule_delta or not args.valuation_research_policy or not args.omit_empty_account_prefixes
                 or args.reuse_accounting or args.previous_sources or args.repair_release_metadata
@@ -1356,4 +1380,4 @@ if __name__ == "__main__":
               diagnostic_products=args.diagnostic_product, reuse_accounting=args.reuse_accounting,
               previous_sources=args.previous_sources, omit_empty_account_prefixes=args.omit_empty_account_prefixes,
               empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
-              stock_futures_only=args.stock_futures_only)
+              stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope)

@@ -198,7 +198,136 @@ static PyObject *rows(PyObject *, PyObject *args) {
     return output.release();
 }
 
+
+#ifdef __linux__
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+#include <new>
+#include <string>
+#include <vector>
+
+struct Row {
+    std::string path, raw;
+    struct stat before{}, after{};
+    bool skip = false, ready = false;
+};
+
+static PyObject *signature(const struct stat &s) {
+    return Py_BuildValue("(KKLLL)", (unsigned long long)s.st_dev,
+        (unsigned long long)s.st_ino, (long long)s.st_size,
+        (long long)s.st_mtim.tv_sec * 1000000000LL + s.st_mtim.tv_nsec,
+        (long long)s.st_ctim.tv_sec * 1000000000LL + s.st_ctim.tv_nsec);
+}
+
+static bool batch_times_fit(const struct stat &s) {
+    constexpr long long limit = 9223372035LL;
+    return s.st_mtim.tv_sec >= -limit && s.st_mtim.tv_sec <= limit
+        && s.st_ctim.tv_sec >= -limit && s.st_ctim.tv_sec <= limit;
+}
+
+static void prepare(Row &row, Py_ssize_t &remaining, Py_ssize_t maximum,
+                    Py_ssize_t chunk) {
+    if (row.skip || stat(row.path.c_str(), &row.before) != 0) return;
+    const auto size = row.before.st_size;
+    if (!S_ISREG(row.before.st_mode) || size < 0 || size > remaining || size > maximum
+        || !batch_times_fit(row.before)) return;
+    int fd;
+    do { fd = open(row.path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK); }
+    while (fd < 0 && errno == EINTR);
+    if (fd < 0) return;
+    // A path may change between stat and open; never read a replaced FIFO/device.
+    struct stat opened{};
+    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode)) { close(fd); return; }
+    try { row.raw.resize((size_t)size + 1); }
+    catch (...) { close(fd); throw; }
+    size_t total = 0;
+    bool failed = false;
+    do {
+        size_t requested = (size_t)size + 1 - total;
+        if (chunk && requested > (size_t)chunk) requested = (size_t)chunk;
+        ssize_t count;
+        do { count = read(fd, row.raw.data() + total, requested); }
+        while (count < 0 && errno == EINTR);
+        if (count < 0) { failed = true; break; }
+        total += (size_t)count;
+        if (!count || total >= (size_t)size) break;
+    } while (total < (size_t)size);
+    // Do not retry close(EINTR): Linux has already released the descriptor.
+    close(fd);
+    if (failed || stat(row.path.c_str(), &row.after) != 0 || !batch_times_fit(row.after)) {
+        std::string().swap(row.raw);
+        return;
+    }
+    row.raw.resize(total);
+    remaining -= (Py_ssize_t)total;
+    row.ready = true;
+}
+
+static PyObject *read_batch(PyObject *, PyObject *args) {
+    PyObject *paths;
+    Py_ssize_t budget, maximum, chunk = 0;
+    if (!PyArg_ParseTuple(args, "Onn|n:read_batch", &paths, &budget, &maximum, &chunk)) return nullptr;
+    if (!PyList_CheckExact(paths) || PyList_GET_SIZE(paths) > 1024 || budget < 0
+        || budget > (256 << 20) || maximum < 0 || chunk < 0) {
+        PyErr_SetString(PyExc_ValueError, "private batch bounds exceeded"); return nullptr;
+    }
+    std::vector<Row> rows;
+    try {
+        rows.resize((size_t)PyList_GET_SIZE(paths));
+        for (size_t i = 0; i < rows.size(); ++i) {
+            PyObject *path = PyList_GET_ITEM(paths, (Py_ssize_t)i);
+            if (path == Py_None) { rows[i].skip = true; continue; }
+            if (!PyBytes_CheckExact(path)) {
+                PyErr_SetString(PyExc_TypeError, "paths must be exact bytes or None"); return nullptr;
+            }
+            const char *data = PyBytes_AS_STRING(path);
+            const auto length = PyBytes_GET_SIZE(path);
+            if (memchr(data, 0, (size_t)length)) {
+                PyErr_SetString(PyExc_ValueError, "embedded null byte"); return nullptr;
+            }
+            rows[i].path.assign(data, (size_t)length);
+        }
+    } catch (const std::bad_alloc &) { return PyErr_NoMemory(); }
+    bool exhausted = false, unexpected = false;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        for (auto &row : rows) prepare(row, budget, maximum, chunk);
+    } catch (const std::bad_alloc &) { exhausted = true; }
+      catch (...) { unexpected = true; }
+    Py_END_ALLOW_THREADS
+    if (exhausted) return PyErr_NoMemory();
+    if (unexpected) { PyErr_SetString(PyExc_RuntimeError, "native batch failure"); return nullptr; }
+    PyObject *output = PyList_New((Py_ssize_t)rows.size());
+    if (!output) return nullptr;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        auto &row = rows[i];
+        PyObject *value = Py_NewRef(Py_None);
+        if (row.ready) {
+            Py_DECREF(value);
+            PyObject *before = signature(row.before), *after = signature(row.after);
+            PyObject *raw = PyBytes_FromStringAndSize(row.raw.data(), (Py_ssize_t)row.raw.size());
+            if (!before || !after || !raw) {
+                Py_XDECREF(before); Py_XDECREF(after); Py_XDECREF(raw); Py_DECREF(output); return nullptr;
+            }
+            value = PyTuple_Pack(3, before, after, raw);
+            Py_DECREF(before); Py_DECREF(after); Py_DECREF(raw);
+            if (!value) { Py_DECREF(output); return nullptr; }
+            std::string().swap(row.raw);
+        }
+        PyList_SET_ITEM(output, (Py_ssize_t)i, value);
+    }
+    return output;
+}
+
+#endif
+
 static PyMethodDef methods[] = {
+#ifdef __linux__
+    {"read_batch", read_batch, METH_VARARGS, "Ordered bounded stat/read/stat; consumer owns verification."},
+#endif
     {"rows", rows, METH_VARARGS, "Walk decoded plain JSON without converting numeric values."},
     {"cache_descriptor", cache_descriptor, METH_O,
      "Bind one pure key classifier to a bounded native semantics cache."},

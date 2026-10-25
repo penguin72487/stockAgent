@@ -11,6 +11,8 @@ summary_time: '14:00'
 data_ready_time: '13:40'
 freshness_max_lag_days: 3
 freshness_scan_limit: 0
+# Announced emergency closure; evidence: docs/gpu_idle_load_2026-10-23.md.
+holidays: ["2026-10-23"]
 initial_capital: 10000000.0
 day_trade_simulation_enabled: true
 day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation

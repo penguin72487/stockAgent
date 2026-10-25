@@ -58,6 +58,25 @@ ACCESS_DIAGNOSTIC_HEADERS = frozenset({
 })
 
 
+class _RequestSlotCancellation:
+    """Cancel a queued slot without confusing client waiting with an HTTP error."""
+
+    def __init__(self, http, provider, url):
+        self.http, self.provider, self.url = http, provider, url
+        self.deadline = time.monotonic() + http.config['response_deadline_seconds']
+        self.error = None
+
+    def is_set(self):
+        # SharedRateLimiter removes a cancelled ticket itself. Never raise from
+        # this predicate: doing so would strand the ticket in its FIFO queue.
+        try:
+            self.http._check_request_gates(self.provider, self.url)
+        except NewsError as error:
+            self.error = error
+            return True
+        return time.monotonic() >= self.deadline
+
+
 class NewsHTTP:
     def __init__(self, registry: PolicyRegistry, config: dict, root: Path, *,
                  session_factory: Callable = OriginConnectionSession,
@@ -94,6 +113,9 @@ class NewsHTTP:
         self.robots_policy_pauses: dict[str, dict[str, float]] = {}
         self.last_calls: dict[str, float] = {}
         self.provider_not_before: dict[str, float] = {}
+        # Actual shared-slot deadlines are separate from source refusals. The
+        # capacity controller must not mistake our own pacing for a new 403/429.
+        self.pacing_not_before: dict[str, float] = {}  # Monotonic; epoch only at the display boundary.
         self.transport_failures: dict[str, int] = {}
         self.rate_refusal_intervals: dict[str, float] = {}
         self.articles_since_sitemap: dict[str, int] = {}
@@ -119,11 +141,7 @@ class NewsHTTP:
                     self.limiters[provider].interval_seconds = max(self.limiters[provider].interval_seconds, learned)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
-            readiness = getattr(self.limiters[provider], "remaining_delay_seconds", None)
-            if readiness:
-                delay = readiness()
-                if delay > max(config["response_deadline_seconds"], registry.sources[provider].interval_seconds):
-                    self.provider_not_before[provider] = max(self.provider_not_before.get(provider, 0), time.time() + delay)
+            self._refresh_pacing_deadline(provider)
         self.requests_by_provider: dict[str, int] = {}
         self.response_bytes = 0
         self._sessions: list = []
@@ -152,7 +170,7 @@ class NewsHTTP:
             return "rss_fulltext"
         if base in source.feeds:
             return "feed"
-        if base in source.sitemaps or parts.path.endswith(".xml"):
+        if base in source.sitemaps or parts.path.endswith((".xml", ".xml.gz")):
             return "xml_discovery"
         if source.index_path_pattern and re.search(source.index_path_pattern, parts.path):
             return "index"
@@ -167,11 +185,59 @@ class NewsHTTP:
         with self.lock:
             self.client_intervals[provider] = float(interval)
             self.parallelism[provider] = slots
-            self.limiters[provider].interval_seconds = self.effective_interval(provider)
+            effective = self.effective_interval(provider)
+            interval_changed = self.limiters[provider].interval_seconds != effective
+            self.limiters[provider].interval_seconds = effective
+        if interval_changed and effective > self.config['response_deadline_seconds']:
+            # Calibration restores learned capacity after construction. Re-read
+            # with that interval's restart/stale-state interpretation as well.
+            self._refresh_pacing_deadline(provider)
 
     def cooldown_snapshot(self):
+        """Scheduler readiness, including long client waits; no slot is claimed."""
         with self.lock:
-            return dict(self.provider_not_before)
+            deadlines = dict(self.provider_not_before)
+            for provider in self.limiters:
+                deadline = self._pacing_schedule_deadline(provider)
+                if deadline:
+                    deadlines[provider] = max(deadlines.get(provider, 0), deadline)
+            return deadlines
+
+    def _refresh_pacing_deadline(self, provider):
+        # Read at startup, source deferral, slow grants or cancelled waits, not
+        # on every scheduler round/request for normally paced publishers.
+        readiness = getattr(self.limiters[provider], 'remaining_delay_seconds', None)
+        delay = readiness() if readiness else 0
+        if delay > self.config['response_deadline_seconds']:
+            with self.lock:
+                self.pacing_not_before[provider] = max(
+                    self.pacing_not_before.get(provider, 0), time.monotonic() + delay)
+
+    def _local_pacing_remaining(self, provider):
+        last = self.last_calls.get(provider)
+        return max(0, last + self.effective_interval(provider) - time.monotonic()) if last is not None else 0
+
+    def _pacing_schedule_deadline(self, provider):
+        delay = max(0, self.pacing_not_before.get(provider, 0) - time.monotonic())
+        if self.effective_interval(provider) > self.config['response_deadline_seconds']:
+            delay = max(delay, self._local_pacing_remaining(provider))
+        return time.time() + delay if delay > 0 else 0
+
+    def _check_pacing(self, provider, *, shared=True):
+        with self.lock:
+            delay = self._local_pacing_remaining(provider)
+            if shared:
+                delay = max(delay, self.pacing_not_before.get(provider, 0) - time.monotonic())
+            if delay > self.config['response_deadline_seconds']:
+                raise NewsError('provider_pacing_cooldown', retry=True, delay=delay, request_deferred=True)
+
+    def _check_request_gates(self, provider, url, *, shared_pacing=True):
+        if self.stop.is_set():
+            raise NewsError('stopping', retry=True, delay=1, request_deferred=True)
+        self._check_cooldown(provider)
+        self._check_host_cooldown(provider, url)
+        self._check_robots_origin_cooldown(provider, url)
+        self._check_pacing(provider, shared=shared_pacing)
 
     def capacity_snapshot(self):
         with self.lock:
@@ -179,12 +245,14 @@ class NewsHTTP:
                             "effective_interval_seconds": self.effective_interval(p),
                             "parallelism": self.parallelism[p], "maximum_parallelism": self.maximum_parallelism[p],
                             "hard_interval_floor_seconds": self.hard_interval_floor(p),
+                            "request_pacing_not_before_epoch": self._pacing_schedule_deadline(p) or None,
                             "minimum_permitted_interval_this_owner": self.minimum_permitted_intervals.get(p)}
                         for p in self.limiters}
             for provider, control in controls.items():
                 control['temporarily_paused_gateway_hosts'] = self.host_circuits.blocked(provider)
                 control['temporarily_paused_robots_origins'] = self.blocked_robots_origins(provider)
-        return {"providers": controls,
+        return {"providers": controls, "request_pacing_wait_contract_version": 1,
+                "finite_robots_redirect_contract_version": 1,
                 "calibration": self.capacity_controller.snapshot(for_status=True) if self.capacity_controller else None}
 
     def _session(self):
@@ -238,6 +306,7 @@ class NewsHTTP:
                 "provider": provider, "not_before_epoch": self.provider_not_before[provider],
                 "rate_refusal_interval_seconds": self.rate_refusal_intervals.get(provider, 0),
             })
+        self._refresh_pacing_deadline(provider)
 
     def _check_cooldown(self, provider):
         with self.lock:
@@ -286,44 +355,88 @@ class NewsHTTP:
         from downloader.news_fulltext_metadata_feeds import require_request
         return require_request(self.registry, url, metadata_feed)
 
-    def _reserve_request(self, source, url, *, endpoint=None, metadata_feed=None):
+    def _require_robots_request(self, url, origin, metadata_feed=None):
+        """Validate the policy role without granting another article URL.
+
+        The REP loop supplies only the original /robots.txt and actual Location
+        hops. Finite articles may need a same-authority localized policy path;
+        ordinary get(), metadata-feed capabilities and other authorities keep
+        their existing exact scopes. Each hop still checks authorization, DNS,
+        pacing, status and the final policy representation at the initial origin.
+        """
+        if policy_origin(origin + '/') != origin:
+            raise NewsError('robots_origin_context_invalid')
+        initial = self._require(origin + '/robots.txt', metadata_feed)
+        if metadata_feed is None and initial.finite_article_urls:
+            if policy_origin(url) != origin:
+                raise NewsError('robots_redirect_refused', retry=True, delay=300)
+            source = self.registry.require(url)
+        else:
+            source = self._require(url, metadata_feed)
+        if source.provider != initial.provider:
+            raise NewsError('robots_redirect_refused', retry=True, delay=300)
+        return source
+
+    def _reserve_request(self, source, url, *, endpoint=None, metadata_feed=None, robots_origin=None):
         # Lock only the send reservation, never the network response. Concurrent
         # responses may overlap, but dispatch commitments remain evenly paced.
-        with self.metrics.measure("request_slot_wait", source.provider), self.send_locks[source.provider]:
-            self._check_cooldown(source.provider)
-            self._check_host_cooldown(source.provider, url)
-            self._check_robots_origin_cooldown(source.provider, url)
+        provider = source.provider
+        cancellation = _RequestSlotCancellation(self, provider, url)
+        send_lock = self.send_locks[provider]
+        with self.metrics.measure("request_slot_wait", provider):
+            while not send_lock.acquire(timeout=0.05):
+                if cancellation.is_set():
+                    self._raise_slot_cancellation(cancellation)
             try:
-                self.limiters[source.provider].wait(cancel_event=self.stop)
-            except RateLimitWaitCancelled:
-                raise NewsError("stopping", retry=True, delay=1, request_deferred=True) from None
-            while True:
-                with self.lock:
-                    self._check_cooldown(source.provider)
-                    self._check_host_cooldown(source.provider, url)
-                    self._check_robots_origin_cooldown(source.provider, url)
-                    delay = self.effective_interval(source.provider)
-                    remaining = self.last_calls.get(source.provider, 0) + delay - time.monotonic()
-                    if remaining <= 0:
-                        if self.stop.is_set():
-                            raise NewsError("stopping", retry=True, delay=1, request_deferred=True)
-                        if metadata_feed is not None or source.authorization.get("valid_until"):
-                            self._require(url, metadata_feed)  # Permission may expire during the pacing wait.
-                        # One clock event, after telemetry-lock waiting, owns
-                        # both the next deadline and measured dispatch gap.
-                        # Refusal/floor checks and this commitment share the
-                        # HTTP lock, so another response cannot change policy
-                        # between the final check and this reservation.
-                        self.last_calls[source.provider] = self.metrics.request_started(
-                            source.provider, endpoint or self.endpoint_kind(source, url))
-                        self.requests_by_provider[source.provider] = self.requests_by_provider.get(source.provider, 0) + 1
-                        self.minimum_permitted_intervals[source.provider] = min(
-                            self.minimum_permitted_intervals.get(source.provider, math.inf), delay)
-                        return
-                if self.stop.is_set() or remaining > 0 and self.stop.wait(remaining):
-                    raise NewsError("stopping", retry=True, delay=1, request_deferred=True)
-                # Re-read pacing after sleep: another response/robots parse can
-                # impose a stricter publisher floor while this slot is waiting.
+                self._check_request_gates(provider, url)
+                try:
+                    self.limiters[provider].wait(cancel_event=cancellation)
+                except RateLimitWaitCancelled:
+                    self._raise_slot_cancellation(cancellation)
+                # A granted slot's future deadline is for subsequent requests,
+                # not grounds for cancelling the current legitimate request.
+                if self.effective_interval(provider) > self.config['response_deadline_seconds']:
+                    self._refresh_pacing_deadline(provider)
+                while True:
+                    with self.lock:
+                        self._check_request_gates(provider, url, shared_pacing=False)
+                        delay = self.effective_interval(provider)
+                        remaining = self._local_pacing_remaining(provider)
+                        if remaining <= 0:
+                            if metadata_feed is not None or source.authorization.get("valid_until"):
+                                # Permission may expire during the pacing wait;
+                                # a redirected policy retains its policy role.
+                                if robots_origin is not None:
+                                    self._require_robots_request(url, robots_origin, metadata_feed)
+                                else:
+                                    self._require(url, metadata_feed)
+                            # One clock event, after telemetry-lock waiting,
+                            # owns both the pacing deadline and dispatch gap.
+                            self.last_calls[provider] = self.metrics.request_started(
+                                provider, endpoint or self.endpoint_kind(source, url))
+                            self.requests_by_provider[provider] = self.requests_by_provider.get(provider, 0) + 1
+                            self.minimum_permitted_intervals[provider] = min(
+                                self.minimum_permitted_intervals.get(provider, math.inf), delay)
+                            return
+                    if time.monotonic() >= cancellation.deadline:
+                        self._raise_slot_cancellation(cancellation)
+                    # A new source refusal/floor or stop must interrupt even a
+                    # previously permitted short local wait.
+                    self.stop.wait(min(0.05, remaining))
+            finally:
+                send_lock.release()
+
+    def _raise_slot_cancellation(self, cancellation):
+        if self.stop.is_set():
+            raise NewsError('stopping', retry=True, delay=1, request_deferred=True)
+        if cancellation.error is not None:
+            raise cancellation.error
+        self._refresh_pacing_deadline(cancellation.provider)
+        self._check_request_gates(cancellation.provider, cancellation.url)
+        with self.lock:
+            remaining = max(self._local_pacing_remaining(cancellation.provider),
+                self.pacing_not_before.get(cancellation.provider, 0) - time.monotonic(), 1)
+        raise NewsError('provider_pacing_cooldown', retry=True, delay=remaining, request_deferred=True)
 
     def _response_status(self, provider: str, status: int, headers: dict, *, host=None, robots_origin=None):
         """Honor source signals before reading a possibly stalled error body.
@@ -416,14 +529,16 @@ class NewsHTTP:
             raise error
 
     def _record_access_problem(self, response: Response, code: str, *, body_read: bool,
-                               recovery_observation=None, robots_origin=None, robots_pressure=None, metadata_feed=None):
+                               recovery_observation=None, robots_origin=None, robots_pressure=None, metadata_feed=None,
+                               request_robots_origin=None):
         """Preserve the refusal layer, not just a retry timestamp.
 
         Only failed access/policy requests take this path. Ordinary successful
         articles incur no new hash, parse or file write. These are private
         diagnostic events, not accepted-body receipts or public status fields.
         """
-        provider = self._require(response.url, metadata_feed).provider
+        provider = (self._require_robots_request(response.url, request_robots_origin, metadata_feed)
+                    if request_robots_origin is not None else self._require(response.url, metadata_feed)).provider
         observation = {
             "contract_version": 2, "owner_id": self.metrics.owner_id,
             "provider": provider, "requested_url": response.url,
@@ -497,26 +612,24 @@ class NewsHTTP:
         self._persist_problem('transport', source.provider, observation, day=now.strftime('%Y%m%d'))
 
     def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None, metadata_feed=None) -> Response:
-        source = self._require(url, metadata_feed)
-        if robots_origin is not None and (policy_origin(robots_origin + '/') != robots_origin
-                # Validate the initial REP authority with its policy URL, not
-                # an unrelated home page outside an exact finite article scope.
-                # This does not fetch the home page or widen redirect access.
-                or self._require(robots_origin + '/robots.txt', metadata_feed).provider != source.provider):
-            raise NewsError('robots_origin_context_invalid')
-        if self.stop.is_set():
-            raise NewsError("stopping", retry=True, delay=1, request_deferred=True)
-        self._check_cooldown(source.provider)
-        self._check_host_cooldown(source.provider, url)
-        self._check_robots_origin_cooldown(source.provider, url)
+        source = (self._require_robots_request(url, robots_origin, metadata_feed)
+                  if robots_origin is not None else self._require(url, metadata_feed))
+        self._check_request_gates(source.provider, url)
         try:
             with self.metrics.measure("address_validation", source.provider):
                 self.address_check(url)
         except NewsError as error:
+            if error.code == 'non_public_address' and robots_origin is not None:
+                # No request was sent. Revalidate this authority's REP later,
+                # instead of permanently failing every article behind it.
+                # The same all-address/redirect checks still run on retry.
+                self.metrics.count(source.provider, 'robots_pretransport_address_rejections')
+                raise NewsError('robots_non_public_address', retry=True, delay=30) from error
             if error.code == "dns_error":
                 self.defer(source.provider, max(30, error.delay))
             raise
-        self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None, metadata_feed=metadata_feed)
+        self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None,
+                              metadata_feed=metadata_feed, robots_origin=robots_origin)
         started = time.monotonic()
         started_cpu = time.thread_time()
         endpoint = 'robots' if robots_origin is not None else self.endpoint_kind(source, url)
@@ -560,7 +673,8 @@ class NewsHTTP:
                     self._record_access_problem(Response(url, response.status_code, response_headers, b""), error.code,
                         body_read=False, recovery_observation=getattr(error, 'gateway_recovery_observation', None),
                         robots_origin=robots_origin if getattr(error, 'robots_origin_isolation', False) else None,
-                        robots_pressure=getattr(error, 'robots_pressure_corroboration', None), metadata_feed=metadata_feed)
+                        robots_pressure=getattr(error, 'robots_pressure_corroboration', None), metadata_feed=metadata_feed,
+                        request_robots_origin=robots_origin)
                     raise
                 maximum = max(self.config["max_response_bytes"], source.pdf_max_response_bytes) if registered_pdf else self.config["max_response_bytes"]
                 try:
@@ -755,8 +869,7 @@ class NewsHTTP:
                             raise NewsError('robots_redirect_missing_location', retry=True, delay=300)
                         target = normalize_url(urljoin(target, location))
                         # Redirect rules still belong to the initial authority.
-                        if self._require(target, metadata_feed).provider != source.provider:
-                            raise NewsError("robots_redirect_refused")
+                        self._require_robots_request(target, origin, metadata_feed)
                         headers = {}
                     else:
                         raise NewsError("robots_redirect_loop")
@@ -770,7 +883,8 @@ class NewsHTTP:
                             try:
                                 cache.update(robots_representation(result, source, origin))
                             except NewsError as error:
-                                self._record_access_problem(result, error.code, body_read=True, metadata_feed=metadata_feed)
+                                self._record_access_problem(result, error.code, body_read=True, metadata_feed=metadata_feed,
+                                                            request_robots_origin=origin)
                                 raise
                             if cache["representation_kind"] != "plain_utf8":
                                 self.metrics.count(source.provider, "robots_" + cache["representation_kind"])

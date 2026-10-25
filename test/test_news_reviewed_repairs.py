@@ -1,4 +1,5 @@
 """Missing-only repairs must not become another downloader or retry reset."""
+from contextlib import closing
 from copy import deepcopy
 import hashlib
 import json
@@ -87,6 +88,225 @@ def test_admission_changes_only_state_and_retains_durable_input(queue):
     assert receipt["outcomes"][0]["outcome"] == "enqueued"
     assert dict(queue.db.execute("SELECT key,value FROM counters"))["reviewed_repair_targets_admitted"] == 1
     assert repair.consume_repairs(queue)["processed"] == 0
+
+
+def address_failure(queue, **changes):
+    return failure(queue, state='non_public_address', error_code='non_public_address', **changes)
+
+
+def clock_failure(queue, **changes):
+    values = dict(state='invalid_bulk_publication_clock', error_code='invalid_bulk_publication_clock')
+    values.update(changes)
+    return failure(queue, **values)
+
+
+def clock_submit(queue):
+    return repair.submit_repairs(queue.root, queue.registry, [URL], reason='Reviewed original publication declarations',
+                                 publication_clock_recheck=True)
+
+
+def test_publication_clock_recheck_is_explicit_readonly_and_preserves_raw_head(queue, monkeypatch):
+    before = clock_failure(queue)
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__', lambda *a, **k: pytest.fail('no HTTP'))
+    assert not submit(queue)['submitted']
+    result = clock_submit(queue)
+    assert result['contract_version'] == 7 and result['publisher_requests'] == 0
+    assert not result['queue_mutations'] and head(queue) == before
+    assert repair._load(Path(result['request_path']))['kind'] == repair.PUBLICATION_CLOCK_RECHECK_KIND
+    assert repair.consume_repairs(queue)['outcomes'] == {repair.PUBLICATION_CLOCK_RECHECK_OUTCOME: 1}
+    assert head(queue) == dict(before, state='retry')
+    receipt = json.loads((queue.root / 'reviewed_repairs/processed' / (result['request_id'] + '.outcome.json')).read_bytes())
+    assert receipt['contract_version'] == 7 and receipt['admitted_targets'] == 1
+    assert not receipt['publication_clocks_rewritten'] and not receipt['accepted_as_bodies']
+    assert receipt['full_body_still_requires_normal_capture']
+    assert dict(queue.db.execute('SELECT key,value FROM counters'))['reviewed_publication_clock_rechecks_admitted'] == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'body_sha256': 'a' * 64}, {'body_bytes': 1}, {'parquet_path': 'retained.parquet'},
+    {'captured_at_utc': '2026-01-01T00:00:00+00:00'}, {'lease_owner': 'live'}, {'lease_until': 1},
+    {'due': lambda: time.time() + 86400}, {'last_checked_at_utc': '2099-01-01T00:00:00+00:00'},
+    {'attempts': -1}, {'error_code': 'http_403'},
+])
+def test_publication_clock_recheck_protects_bodies_leases_and_failure_clocks(queue, changes):
+    before = clock_failure(queue, **{k: v() if callable(v) else v for k, v in changes.items()})
+    assert not clock_submit(queue)['submitted'] and head(queue) == before
+
+
+@pytest.mark.parametrize('state', [*sorted(repair.REPAIRABLE), 'article_rights_or_scope_excluded',
+    'non_public_address', 'robots_disallowed', 'http_403', 'http_429', 'paywall_or_login', 'retry'])
+def test_publication_clock_recheck_cannot_admit_other_failure_or_active_state(queue, state):
+    before = failure(queue, state=state, error_code=state)
+    assert not clock_submit(queue)['submitted'] and head(queue) == before
+
+
+@pytest.mark.parametrize('changes', [{'attempts': 8}, {'lease_owner': 'live'}, {'body_sha256': 'b' * 64}])
+def test_publication_clock_recheck_owner_revalidates_exact_current_head(queue, changes):
+    clock_failure(queue)
+    clock_submit(queue)
+    with queue.db:
+        queue.db.execute('UPDATE articles SET ' + ','.join(k + '=?' for k in changes) + ' WHERE url=?',
+                         (*changes.values(), URL))
+    protected = head(queue)
+    assert repair.PUBLICATION_CLOCK_RECHECK_OUTCOME not in repair.consume_repairs(queue)['outcomes']
+    assert head(queue) == protected
+
+
+@pytest.mark.parametrize('version', [1, 2])
+def test_legacy_missing_body_request_cannot_gain_publication_clock_scope(queue, version):
+    clock_failure(queue)
+    result = clock_submit(queue)
+    path = Path(result['request_path'])
+    request = json.loads(path.read_bytes())
+    request.update(contract_version=version, kind='reviewed_missing_body_repair')
+    rewrite(path, request)
+    protected = head(queue)
+    assert repair.consume_repairs(queue)['outcomes'] == {'invalid_request': 1}
+    assert head(queue) == protected
+
+
+@pytest.mark.parametrize('mode', ['address_recheck', 'retained_originals', 'empty_response_witnesses',
+                                  'native_success_witnesses'])
+def test_publication_clock_recheck_cannot_combine_other_modes(queue, mode):
+    clock_failure(queue)
+    with pytest.raises(ValueError, match='invalid_.*recheck_mode'):
+        repair.submit_repairs(queue.root, queue.registry, [URL], reason='One explicit mode only',
+                              publication_clock_recheck=True, **{mode: True if mode == 'address_recheck' else {}})
+
+
+def test_publication_clock_recheck_crash_archive_resumes_without_minting_attempt(queue, monkeypatch):
+    clock_failure(queue)
+    result = clock_submit(queue)
+    archive = repair._archive
+    def unavailable(*args, **kwargs):
+        raise OSError('simulated receipt-volume failure')
+    monkeypatch.setattr(repair, '_archive', unavailable)
+    assert repair.consume_repairs(queue)['outcomes'] == {repair.PUBLICATION_CLOCK_RECHECK_OUTCOME: 1}
+    assert Path(result['request_path']).exists()
+    before = clock_failure(queue, attempts=8)
+    assert not clock_submit(queue)['submitted']  # Same parser and URL cannot mint another attempt.
+    monkeypatch.setattr(repair, '_archive', archive)
+    assert repair.consume_repairs(queue)['processed'] == 0
+    assert head(queue) == before and not Path(result['request_path']).exists()
+    assert queue.db.execute('SELECT count(*) FROM reviewed_repair_items').fetchone()[0] == 1
+
+
+def address_submit(queue, reason='Recheck the exact legacy address rejection with every normal safety check'):
+    return repair.submit_repairs(queue.root, queue.registry, [URL], reason=reason, address_recheck=True)
+
+
+def test_address_recheck_is_readonly_until_owner_admission_and_changes_only_state(queue, monkeypatch):
+    before = address_failure(queue)
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__', lambda *a, **k: pytest.fail('no HTTP'))
+    total = queue.db.total_changes
+    assert not submit(queue)['submitted']  # A parser review cannot re-arm a security failure.
+    result = address_submit(queue)
+    assert result['contract_version'] == 6 and result['publisher_requests'] == 0
+    assert queue.db.total_changes == total and head(queue) == before
+    assert repair._load(Path(result['request_path']))['kind'] == repair.ADDRESS_RECHECK_KIND
+    assert repair.consume_repairs(queue)['outcomes'] == {repair.ADDRESS_RECHECK_OUTCOME: 1}
+    assert head(queue) == dict(before, state='retry')
+    receipt = json.loads((queue.root / 'reviewed_repairs/processed' / (result['request_id'] + '.outcome.json')).read_bytes())
+    assert receipt['contract_version'] == 6 and receipt['admitted_targets'] == 1
+    assert receipt['address_and_robots_checks_still_required'] and not receipt['permission_granted']
+    assert receipt['full_body_still_requires_normal_capture'] and not receipt['accepted_as_bodies']
+    assert dict(queue.db.execute('SELECT key,value FROM counters'))['reviewed_address_validation_rechecks_admitted'] == 1
+
+
+@pytest.mark.parametrize('changes', [
+    {'body_sha256': 'a' * 64}, {'parquet_path': 'retained.parquet'}, {'body_bytes': 1},
+    {'captured_at_utc': '2026-01-01T00:00:00+00:00'}, {'lease_owner': 'live'}, {'lease_until': 1},
+    {'due': lambda: time.time() + 86400}, {'attempts': -1},
+    {'last_checked_at_utc': '2099-01-01T00:00:00+00:00'},
+])
+def test_address_recheck_preserves_saved_heads_leases_deadlines_and_clocks(queue, changes):
+    before = address_failure(queue, **{k: v() if callable(v) else v for k, v in changes.items()})
+    assert not address_submit(queue)['submitted'] and head(queue) == before
+
+
+@pytest.mark.parametrize('state', ['http_403', 'http_429', 'robots_disallowed', 'paywall_or_login',
+    'article_rights_or_scope_excluded', 'article_identity_not_verified', 'retry', 'robots_non_public_address'])
+def test_address_recheck_cannot_retry_any_other_refusal_or_active_state(queue, state):
+    before = failure(queue, state=state, error_code=state)
+    assert not address_submit(queue)['submitted'] and head(queue) == before
+
+
+@pytest.mark.parametrize('changes', [{'attempts': 8}, {'lease_owner': 'live'}, {'body_sha256': 'b' * 64}])
+def test_address_recheck_owner_rechecks_exact_head_after_submission(queue, changes):
+    address_failure(queue)
+    address_submit(queue)
+    with queue.db:
+        queue.db.execute('UPDATE articles SET ' + ','.join(k + '=?' for k in changes) + ' WHERE url=?',
+                         (*changes.values(), URL))
+    protected = head(queue)
+    result = repair.consume_repairs(queue)
+    assert result['processed'] == 1 and repair.ADDRESS_RECHECK_OUTCOME not in result['outcomes']
+    assert head(queue) == protected
+
+
+@pytest.mark.parametrize('field,value', [('article_selectors', ['.changed']), ('enabled', False),
+                                      ('article_path_pattern', '^/different$')])
+def test_address_recheck_never_overrides_current_source_contract(config, queue, field, value):
+    protected = address_failure(queue)
+    address_submit(queue)
+    changed = deepcopy(config)
+    changed['providers'][0][field] = value
+    queue.registry = PolicyRegistry(changed, base=queue.root)
+    result = repair.consume_repairs(queue)
+    assert repair.ADDRESS_RECHECK_OUTCOME not in result['outcomes'] and head(queue) == protected
+
+
+def test_address_recheck_once_per_url_even_after_new_parser_reason_and_restart(config, queue):
+    address_failure(queue)
+    address_submit(queue)
+    assert repair.consume_repairs(queue)['outcomes'] == {repair.ADDRESS_RECHECK_OUTCOME: 1}
+    address_failure(queue, attempts=8)
+    changed = deepcopy(config)
+    changed['providers'][0]['article_selectors'] = ['.changed-parser']
+    prior = queue.registry.sources['publisher'].parser_repair_fingerprint
+    queue.close()
+    with closing(NewsQueue(queue.root, PolicyRegistry(changed, base=queue.root))) as owner:
+        assert owner.registry.sources['publisher'].parser_repair_fingerprint != prior
+        protected = head(owner)
+        result = address_submit(owner, reason='New reason does not grant another security recheck')
+        assert not result['submitted'] and result['excluded'][0]['reason'] == 'already_admitted_for_address_validation'
+        assert head(owner) == protected
+
+
+def test_address_recheck_archive_restart_preserves_committed_once_marker(queue, monkeypatch):
+    address_failure(queue)
+    result = address_submit(queue)
+    archive = repair._archive
+    def unavailable(*args, **kwargs):
+        raise OSError('simulated receipt-volume failure')
+    monkeypatch.setattr(repair, '_archive', unavailable)
+    assert repair.consume_repairs(queue)['outcomes'] == {repair.ADDRESS_RECHECK_OUTCOME: 1}
+    assert Path(result['request_path']).exists()
+    protected = address_failure(queue, attempts=8)
+    monkeypatch.setattr(repair, '_archive', archive)
+    assert repair.consume_repairs(queue)['processed'] == 0
+    assert head(queue) == protected and not Path(result['request_path']).exists()
+    assert queue.db.execute('SELECT count(*) FROM reviewed_repair_items').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('mode', ['retained_originals', 'empty_response_witnesses', 'native_success_witnesses'])
+def test_address_recheck_cannot_combine_other_repair_modes(queue, mode):
+    address_failure(queue)
+    with pytest.raises(ValueError, match='invalid_address_recheck_mode'):
+        repair.submit_repairs(queue.root, queue.registry, [URL], reason='Explicit address review',
+                              address_recheck=True, **{mode: {}})
+
+
+def test_address_recheck_abi_cannot_be_rewritten_to_admit_parser_failure(queue):
+    address_failure(queue)
+    result = address_submit(queue)
+    path = Path(result['request_path'])
+    request = json.loads(path.read_bytes())
+    request['targets'][0].update(state='article_identity_not_verified', error_code='article_identity_not_verified')
+    rewrite(path, request)
+    protected = head(queue)
+    assert repair.consume_repairs(queue)['outcomes'] == {'invalid_request': 1}
+    assert head(queue) == protected
 
 
 @pytest.mark.parametrize("changes,expected", [
@@ -573,7 +793,8 @@ def test_explicit_submission_is_bounded(queue, urls, reason):
         submit(queue, urls, reason=reason)
 
 
-def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_path):
+@pytest.mark.parametrize('clock', [False, True])
+def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_path, clock):
     healthy = "https://publisher.test/story/2"
     http, session = http_fixture(config, tmp_path, {
         "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
@@ -581,10 +802,10 @@ def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_pa
     })
     queue = NewsQueue(tmp_path, http.registry)
     try:
-        before = failure(queue)
+        before = clock_failure(queue) if clock else failure(queue)
         with queue.db:
             queue.add_articles([{"url": healthy}])
-        submit(queue)
+        clock_submit(queue) if clock else submit(queue)
         owner = queue.owner
         result = run_service(queue, http, config, max_articles=1, max_discovery_requests=0, duration_seconds=0.2)
         assert queue.owner == owner and result["states"] == {"complete": 2}
@@ -594,6 +815,8 @@ def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_pa
         assert head(queue)["attempts"] == before["attempts"] + 1
         assert verify_bodies(tmp_path)["accepted"]
         assert result["counters"]["reviewed_repair_targets_admitted"] == 1
+        if clock:
+            assert result['counters']['reviewed_publication_clock_rechecks_admitted'] == 1
         assert result["performance"]["stages"]["reviewed_repair_admission"]["count"] >= 1
     finally:
         http.close()
@@ -637,10 +860,11 @@ def test_service_does_not_admit_while_draining_or_low_disk(config, tmp_path, mon
         queue.close()
 
 
-def test_cli_submission_while_owner_held_does_not_construct_lifecycle_or_http(config, queue, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize('mode', ['missing', 'address', 'clock'])
+def test_cli_submission_while_owner_held_does_not_construct_lifecycle_or_http(config, queue, tmp_path, monkeypatch, capsys, mode):
     from scripts import download_news_fulltext as cli
 
-    before = failure(queue)
+    before = address_failure(queue) if mode == 'address' else clock_failure(queue) if mode == 'clock' else failure(queue)
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps(config))
     monkeypatch.setattr(cli, "NewsQueue", lambda *a, **k: pytest.fail("no second owner"))
@@ -648,7 +872,9 @@ def test_cli_submission_while_owner_held_does_not_construct_lifecycle_or_http(co
     monkeypatch.setattr("stockagent.data.news_worker_lifecycle.NewsWorkerLifecycle", lambda *a: pytest.fail("no lifecycle"))
     output = tmp_path / "private-submission.json"
     assert cli.main(["repair", "--config", str(cfg), "--root", str(queue.root), "--url", URL,
-                     "--reason", "Reviewed explicit missing original", "--output", str(output)]) == 0
+                     "--reason", "Reviewed explicit missing original", "--output", str(output)]
+                    + (['--address-recheck'] if mode == 'address'
+                       else ['--publication-clock-recheck'] if mode == 'clock' else [])) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["submitted_targets"] == 1 and result["publisher_requests"] == 0
     assert head(queue) == before and output.stat().st_mode & 0o777 == 0o600
@@ -660,6 +886,11 @@ def test_cli_submission_while_owner_held_does_not_construct_lifecycle_or_http(co
     ["repair", "--reason", "review", "--url", URL, "--skip-local-ingest"],
     ["repair", "--reason", "review", "--url", URL, "--continuous"],
     ["fetch", "--url", URL, "--reason", "review"],
+    ["fetch", "--url", URL, "--address-recheck"],
+    ["repair", "--url", URL, "--reason", "review", "--address-recheck", "--reviewed-empty-responses", "private.json"],
+    ['fetch', '--url', URL, '--publication-clock-recheck'],
+    ['repair', '--url', URL, '--reason', 'review', '--publication-clock-recheck', '--address-recheck'],
+    ['repair', '--url', URL, '--reason', 'review', '--publication-clock-recheck', '--reviewed-empty-responses', 'private.json'],
 ])
 def test_cli_rejects_scope_changing_combinations(args):
     from scripts.download_news_fulltext import main

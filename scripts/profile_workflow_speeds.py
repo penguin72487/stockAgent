@@ -10,17 +10,19 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
-from collections import Counter, OrderedDict, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter, OrderedDict, defaultdict, deque, namedtuple
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import closing
 import csv
 from datetime import UTC, datetime, timedelta
 import gzip
 import hashlib
+import io
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 import json
 import math
+import multiprocessing
 import os
 from pathlib import Path
 import re
@@ -31,6 +33,7 @@ import statistics
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -40,6 +43,8 @@ from downloader.artifact_io import atomic_write_bytes, atomic_write_json
 from stockagent import private_json
 from stockagent.remote_build import observe_node
 from stockagent.workflow_metric_tree import load_backend
+from stockagent.workflow_snapshot_pack import (SnapshotPackStore, SnapshotStreams as PinnedSnapshotStreams,
+                          snapshot_json, validate_manifest_storage)
 
 CONTRACT = "stockagent_workflow_speed_evidence_v1"
 TRAINING_NAMES = {
@@ -47,6 +52,7 @@ TRAINING_NAMES = {
     "epoch_curve.jsonl", "epoch_workflow_timing.jsonl", "save_timing.json",
     "plot_timing.json", "explainability_timing.json",
 }
+EPOCH_PLOT_TIMING = re.compile(r"epoch_curve_plot_timing_every[1-9][0-9]*\.json")
 # Full component/per-batch rows remain byte-for-byte in evidence/*.gz. Keep
 # normalized epoch observations at lifecycle grain to avoid multiplying every
 # epoch into hundreds of overlapping component pseudo-workflows.
@@ -92,7 +98,7 @@ def category(name: str) -> str:
 
 def write_csv(path: Path, rows: list[dict]) -> None:
     fields = sorted({key for row in rows for key in row})
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+    with path.open("w", encoding="utf-8-sig", newline="", buffering=1 << 20) as handle:
         if all(type(row) is dict for row in rows):
             # A direct ordered row avoids DictWriter's per-row dictionary,
             # key-set difference and wrapper calls. Missing cells and nested
@@ -114,7 +120,7 @@ def write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def json_lines(path: Path, rows) -> None:
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open("w", encoding="utf-8", buffering=1 << 20) as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
 
@@ -122,11 +128,17 @@ def json_lines(path: Path, rows) -> None:
 def write_evidence_manifest(path: Path, evidence: Evidence, traversal_gaps: list[dict]) -> None:
     payload = {"files": list(evidence.sources.values()), "issues": evidence.issues,
                "traversal_gaps": traversal_gaps}
+    if evidence.snapshot_store is not None:
+        payload["snapshot_storage"] = evidence.snapshot_store.seal(payload["files"])
     atomic_write_bytes(path, private_json.pretty_metadata_bytes(payload) + b"\n", durable=True)
 
 
+_PreparedFileStat = namedtuple("_PreparedFileStat", "st_dev st_ino st_size st_mtime_ns st_ctime_ns")
+
+
 class Evidence:
-    def __init__(self, output: Path, *, max_file_bytes: int, max_total_bytes: int):
+    def __init__(self, output: Path, *, max_file_bytes: int, max_total_bytes: int,
+                 snapshot_storage: str = "individual_gzip"):
         self.output = output
         self.max_file_bytes, self.max_total_bytes = max_file_bytes, max_total_bytes
         self.total_bytes = 0
@@ -138,14 +150,64 @@ class Evidence:
         self.benchmark_negatives: OrderedDict[str, tuple[str, bool, str]] = OrderedDict()
         self.read_stats = Counter()
         self.inspection_timings = None
+        if snapshot_storage not in ("individual_gzip", "packed_gzip_v1"):
+            raise ValueError("unknown evidence storage layout")
+        self.snapshot_store = None
         (output / "evidence").mkdir()
+        if snapshot_storage == "packed_gzip_v1":
+            self.snapshot_store = SnapshotPackStore(output, max_file_bytes=max_file_bytes)
+
+    def _snapshot_destination(self, name, *, raw_bytes):
+        if self.snapshot_store is not None:
+            return self.snapshot_store.destination(name, raw_bytes)
+        return self.output / name
+
+    def close_snapshot_store(self):
+        if self.snapshot_store is not None:
+            self.snapshot_store.abort()
 
     @staticmethod
     def _signature(info):
         return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
+    @staticmethod
+    def _bounded_regular_read(handle, expected_size):
+        """Read a stat-admitted regular file without buffering or an EOF probe.
+
+        A short raw read can occur before EOF. Complete it within the same
+        size-plus-one allocation bound; the caller still validates both stat
+        generations and the exact final length before consuming these bytes.
+        """
+        raw = handle.read(expected_size + 1)
+        if len(raw) >= expected_size or not raw:
+            return raw
+        chunks, size = [raw], len(raw)
+        while raw and size < expected_size:
+            raw = handle.read(expected_size + 1 - size)
+            chunks.append(raw)
+            size += len(raw)
+        return b"".join(chunks)
+
     def _prepare_reads(self, batch, skip, byte_limit):
         """Read bytes only. The consuming thread owns all evidence decisions."""
+        native = getattr(_METRIC_TREE, "read_batch", None)
+        if (callable(native) and type(batch) in (list, tuple) and len(batch) <= 1024
+                and type(byte_limit) is int and 0 <= byte_limit <= 256 << 20
+                and type(self.max_file_bytes) is int and 0 <= self.max_file_bytes <= sys.maxsize
+                and all(type(path) is type(Path()) for path in batch)):
+            paths = [None if path in skip else os.fsencode(path) for path in batch]
+            timing = self.inspection_timings
+            values = (timing.call("native_batch_stat_read_stat", native, paths, byte_limit, self.max_file_bytes)
+                      if timing else native(paths, byte_limit, self.max_file_bytes))
+            self.read_stats["native_prefetch_batches"] += 1
+            prepared = []
+            for path, value in zip(batch, values, strict=True):
+                if value is not None:
+                    before, after, raw = value
+                    sha = (timing.call("sha256", hashlib.sha256, raw) if timing else hashlib.sha256(raw)).hexdigest()
+                    value = _PreparedFileStat(*before), _PreparedFileStat(*after), raw, sha
+                prepared.append((path, value))
+            return prepared
         prepared, remaining = [], byte_limit
         timing = self.inspection_timings
         for path in batch:
@@ -155,10 +217,11 @@ class Evidence:
                     before = timing.call("stat", path.stat) if timing else path.stat()
                     if S_ISREG(before.st_mode) and before.st_size <= min(remaining, self.max_file_bytes):
                         # Bound allocations even when a producer grows a file.
-                        handle = timing.call("file_open", path.open, "rb") if timing else path.open("rb")
+                        handle = (timing.call("file_open", path.open, "rb", buffering=0)
+                                  if timing else path.open("rb", buffering=0))
                         with handle:
-                            raw = (timing.call("bounded_read", handle.read, before.st_size + 1)
-                                   if timing else handle.read(before.st_size + 1))
+                            raw = (timing.call("bounded_read", self._bounded_regular_read, handle, before.st_size)
+                                   if timing else self._bounded_regular_read(handle, before.st_size))
                         after = timing.call("stat", path.stat) if timing else path.stat()
                         remaining -= len(raw)
                         sha = (timing.call("sha256", hashlib.sha256, raw) if timing else hashlib.sha256(raw)).hexdigest()
@@ -174,7 +237,9 @@ class Evidence:
         """Bounded read-ahead, original consumption order and synchronous fallback.
 
         At most `workers` batches are pending plus one being consumed. Raw
-        payloads occupy at most (workers + 1) * (batch_bytes + 1) bytes. Large,
+        payloads occupy at most (workers + 1) * (batch_bytes + 1) bytes in
+        Python mode. Native conversion can briefly add one batch per worker,
+        bounding native raw copies by (2 * workers + 1) * (batch_bytes + 1). Large,
         explicit and non-regular inputs use the original synchronous path.
         """
         if workers == 0:
@@ -220,7 +285,7 @@ class Evidence:
             row = self.sources[key]
             if row["state"] != "captured":
                 return None
-            snapshot = self.output / row["snapshot"]
+            snapshot = self._snapshot_destination(row["snapshot"], raw_bytes=row["bytes"])
             body = timing.call("snapshot_read", snapshot.read_bytes) if timing else snapshot.read_bytes()
             return (timing.call("gzip_decompress", gzip.decompress, body) if timing else gzip.decompress(body)), row["sha256"]
         row = {"path": key, "state": "unavailable"}
@@ -265,7 +330,7 @@ class Evidence:
                 self.issues.append({"path": key, "reason": row["state"]})
                 return None
             snapshot = f"evidence/{sha}.gz"
-            destination = self.output / snapshot
+            destination = self._snapshot_destination(snapshot, raw_bytes=len(raw))
             exists = timing.call("snapshot_exists", destination.exists) if timing else destination.exists()
             if not exists:
                 compressed = (timing.call("gzip_compress", gzip.compress, raw, compresslevel=3, mtime=0)
@@ -295,58 +360,111 @@ class Evidence:
             return None
 
 
-def visible_code(root: Path) -> tuple[list[dict], list[dict]]:
-    """Static discovery, never import arbitrary executable scripts."""
-    result = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-                            cwd=root, check=True, capture_output=True)
+def _entrypoint_inventory(item):
+    """Inspect fixed source bytes without importing the inspected program."""
+    name, suffix, raw, sha = item
+    text = raw.decode("utf-8-sig", errors="replace")
+    flags, timing_lines, error, description = [], [], None, ""
+    entrypoint = suffix != ".py" and name.startswith("scripts/")
+    if suffix == ".py":
+        try:
+            tree = ast.parse(text)
+            description = (ast.get_docstring(tree) or "").split("\n")[0][:240]
+            entrypoint = any(isinstance(node, ast.If)
+                             and any(isinstance(n, ast.Name) and n.id == "__name__" for n in ast.walk(node.test))
+                             and any(isinstance(n, ast.Constant) and n.value == "__main__" for n in ast.walk(node.test))
+                             for node in ast.walk(tree))
+            if not entrypoint:
+                return None
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name_tail = getattr(node.func, "attr", getattr(node.func, "id", ""))
+                if name_tail == "add_argument":
+                    flags.extend(a.value for a in node.args if isinstance(a, ast.Constant)
+                                 and isinstance(a.value, str) and a.value.startswith("--"))
+                if name_tail in {"perf_counter", "monotonic", "perf_counter_ns", "monotonic_ns", "process_time"}:
+                    timing_lines.append(node.lineno)
+        except SyntaxError as exc:
+            error = str(exc)
+            entrypoint = name.startswith("scripts/")
+    if not entrypoint:
+        return None
+    return {"kind": "entrypoint", "id": name, "category": category(name),
+            "sha256": sha, "description": description,
+            "argument_flags": sorted(set(flags)), "timing_call_lines": sorted(set(timing_lines)),
+            "discovery_error": error, "coverage": "entrypoint_discovered_operation_not_measured",
+            "next_measurement": "use canonical owner with exact config/input/output and retain its acceptance"}
+
+
+def _visible_source_inventory_batch(root: Path, names):
     inventory, code = [], []
-    for name in sorted(set(os.fsdecode(v) for v in result.stdout.split(b"\0") if v)):
+    for name in names:
         path = root / name
-        if path.suffix not in {".py", ".sh", ".ps1", ".mjs", ".js", ".in", ".yaml", ".json"}:
-            continue
-        if not (name.startswith(("scripts/", "downloader/", "stockagent/", "deploy/", "configs/", "services/")) or name == "train.py"):
-            continue
         if not path.is_file():
             continue
         raw = path.read_bytes()
         sha = hashlib.sha256(raw).hexdigest()
         code.append({"path": name, "sha256": sha, "bytes": len(raw)})
-        if path.suffix not in {".py", ".sh", ".ps1", ".mjs"}:
-            continue
-        text = raw.decode("utf-8-sig", errors="replace")
-        flags, timing_lines, error, description = [], [], None, ""
-        entrypoint = path.suffix != ".py" and name.startswith("scripts/")
-        if path.suffix == ".py":
-            try:
-                tree = ast.parse(text)
-                description = (ast.get_docstring(tree) or "").split("\n")[0][:240]
-                entrypoint = any(isinstance(node, ast.If)
-                                 and any(isinstance(n, ast.Name) and n.id == "__name__" for n in ast.walk(node.test))
-                                 and any(isinstance(n, ast.Constant) and n.value == "__main__" for n in ast.walk(node.test))
-                                 for node in ast.walk(tree))
-                if not entrypoint:
-                    # These calls cannot produce inventory rows. Their raw
-                    # source identity is already retained in the code list.
-                    continue
-                for node in ast.walk(tree):
-                    if not isinstance(node, ast.Call):
-                        continue
-                    name_tail = getattr(node.func, "attr", getattr(node.func, "id", ""))
-                    if name_tail == "add_argument":
-                        flags.extend(a.value for a in node.args if isinstance(a, ast.Constant)
-                                     and isinstance(a.value, str) and a.value.startswith("--"))
-                    if name_tail in {"perf_counter", "monotonic", "perf_counter_ns", "monotonic_ns", "process_time"}:
-                        timing_lines.append(node.lineno)
-            except SyntaxError as exc:
-                error = str(exc)
-                entrypoint = name.startswith("scripts/")
-        if not entrypoint:
-            continue
-        inventory.append({"kind": "entrypoint", "id": name, "category": category(name),
-                          "sha256": sha, "description": description,
-                          "argument_flags": sorted(set(flags)), "timing_call_lines": sorted(set(timing_lines)),
-                          "discovery_error": error, "coverage": "entrypoint_discovered_operation_not_measured",
-                          "next_measurement": "use canonical owner with exact config/input/output and retain its acceptance"})
+        if path.suffix in {".py", ".sh", ".ps1", ".mjs"}:
+            row = _entrypoint_inventory((name, path.suffix, raw, sha))
+            if row is not None:
+                inventory.append(row)
+    return inventory, code
+
+
+def visible_code(root: Path, *, workers: int = 0, observations=None) -> tuple[list[dict], list[dict]]:
+    """Static discovery; queue paths, keeping source read/hash/parse together."""
+    if type(workers) is not int or workers not in (0, 1, 2, 4):
+        raise ValueError("code inventory workers must be 0, 1, 2 or 4")
+    result = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                            cwd=root, check=True, capture_output=True)
+    inventory, code = [], []
+
+    def names():
+        for name in sorted(set(os.fsdecode(v) for v in result.stdout.split(b"\0") if v)):
+            path = root / name
+            if path.suffix not in {".py", ".sh", ".ps1", ".mjs", ".js", ".in", ".yaml", ".json"}:
+                continue
+            if not (name.startswith(("scripts/", "downloader/", "stockagent/", "deploy/", "configs/", "services/")) or name == "train.py"):
+                continue
+            yield name
+
+    if not workers:
+        inventory, code = _visible_source_inventory_batch(root, names())
+    else:
+        import resource
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        pending, batch = deque(), []
+
+        def consume(future):
+            rows, sources = future.result()
+            inventory.extend(rows)
+            code.extend(sources)
+
+        # Explicit spawn never inherits a caller's threads, native pools or CUDA.
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+            for name in names():
+                if len(batch) >= 32:
+                    pending.append(pool.submit(_visible_source_inventory_batch, root, batch))
+                    batch = []
+                    if len(pending) >= workers * 2:
+                        consume(pending.popleft())
+                batch.append(name)
+            if batch:
+                pending.append(pool.submit(_visible_source_inventory_batch, root, batch))
+            for future in pending:
+                consume(future)
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        if observations is not None:
+            observations.update(workers=workers, start_method="spawn", batch_max_files=32,
+                maximum_pending_batches=workers * 2,
+                source_byte_policy="one complete source per active worker; pending queues contain paths only",
+                child_user_cpu_seconds=after.ru_utime-before.ru_utime,
+                child_system_cpu_seconds=after.ru_stime-before.ru_stime,
+                child_peak_rss_bytes=after.ru_maxrss * 1024,
+                cpu_scope="waited parser children; phase cpu_seconds is parent-only",
+                rss_scope="maximum individual waited-child peak, may include earlier children; not simultaneous process-tree RSS")
     return inventory, code
 
 
@@ -460,7 +578,7 @@ def discover_training(root: Path, *, depth: int, threads: int = 0, observations=
     command = ["rg", "--files", "--hidden", "--no-ignore", "-0"]
     if threads:
         command.extend(["--threads", str(threads)])
-    for name in sorted(TRAINING_NAMES):
+    for name in sorted([*TRAINING_NAMES, "epoch_curve_plot_timing_every[0-9]*.json"]):
         command.extend(["-g", name])
     for name in sorted(SKIP_DIRS):
         command.extend(["-g", f"!**/{name}/**"])
@@ -480,6 +598,7 @@ def discover_training(root: Path, *, depth: int, threads: int = 0, observations=
         if result.returncode not in (0, 1):
             return [], [{"path": str(root), "reason": "timing_discovery_failed", "exit_code": result.returncode}]
         paths = [Path(os.fsdecode(value)) for value in result.stdout.split(b"\0") if value]
+        paths = [path for path in paths if path.name in TRAINING_NAMES or EPOCH_PLOT_TIMING.fullmatch(path.name)]
         deep = {path for path in paths if len(path.relative_to(root).parts) > depth + 1}
         return sorted(path for path in paths if path not in deep), ([
             {"path": str(root), "reason": "training_depth_budget", "files_beyond_depth": len(deep)}] if deep else [])
@@ -579,9 +698,14 @@ def collect_http(ledger: Ledger, payload: dict, sha: str) -> None:
 
 def collect_tej(ledger: Ledger, payload: dict, sha: str) -> None:
     for index, row in enumerate(payload.get("samples", [])):
-        context = {"table": row.get("table"), "fields": row.get("fields"), "companies": row.get("companies"),
+        context = {"table": row.get("table"), "table_id": row.get("table_id"), "task_id": row.get("task_id"),
+                   "active_attempt_id": row.get("active_attempt_id"), "prepared_sha256": row.get("prepared_sha256"),
+                   "completed_at_utc": row.get("completed_at_utc"), "profile_contract": payload.get("contract"),
+                   "source_scope_contract": payload.get("source_scope_contract"),
+                   "fields": row.get("fields"), "companies": row.get("companies"),
                    "dates": row.get("dates"), "result_kind": "nonempty" if row.get("actual_rows") else "empty",
-                   "timing_basis": payload.get("timing_basis"), "machine": "windows_bridge_producer"}
+                   "timing_basis": payload.get("timing_basis"), "machine": "windows_bridge_producer",
+                   "scope": "one_completed_task; nested phases overlap and must not be summed; not full source history"}
         ledger.add(workflow="acquisition:tej", stage="complete_download_task", seconds=row.get("seconds"), source=sha,
                    locator=f"samples/{index}", origin="recorded_tej_task", outcome="completed", context=context,
                    work={"unit": "exported_rows", "units": row.get("actual_rows")})
@@ -596,6 +720,12 @@ def collect_tej(ledger: Ledger, payload: dict, sha: str) -> None:
             ledger.add(workflow="acquisition:tej", stage="native_helper_cache/" + phase, seconds=seconds, source=sha,
                        locator=f"samples/{index}/windows_flow/native_helper_cache/timings/{phase}",
                        origin="recorded_tej_task", context={**context, "native_cache_state": cache.get("state")})
+        for prefix, timings, pointer in (
+                ("prebridge", (row.get("windows_flow") or {}).get("prebridge_timing") or {}, "windows_flow/prebridge_timing"),
+                ("transport", row.get("transport_timing") or {}, "transport_timing")):
+            for phase, seconds in timings.items():
+                ledger.add(workflow="acquisition:tej", stage=prefix + "/" + phase, seconds=seconds, source=sha,
+                           locator=f"samples/{index}/{pointer}/{phase}", origin="recorded_tej_task", context=context)
 
 
 def collect_finlab(ledger: Ledger, evidence: Evidence, root: Path) -> None:
@@ -832,8 +962,56 @@ def collect_registered_steps(ledger: Ledger, evidence: Evidence, root: Path, *, 
                                      "category": "acquisition", "coverage": "recorded_steps_not_entire_run"})
 
 
+def _finmind_sample_rows(connection, table, columns):
+    """Keep the recent window and one latest row for every bounded dataset.
+
+    The global recent window alone hides infrequently dispatched datasets. All
+    identifiers come from the fixed table specification, never source metadata.
+    The owning read-only transaction supplies the time and consistency bound.
+    """
+    recent_query = f"SELECT {','.join(columns)} FROM {table} ORDER BY id DESC LIMIT 128"
+    recent = [dict(row) for row in connection.execute(recent_query)]
+    selection = {"mode": "recent_plus_latest_per_dataset_v1", "recent_limit": 128,
+                 "dataset_limit": 256, "recent_rows": len(recent),
+                 "dataset_selection_truncated": False}
+    queries = [recent_query]
+    if "dataset" not in columns:
+        selection["latest_per_dataset_selected"] = 0
+        return recent, selection, queries
+    latest_query = (f"SELECT MAX(id) AS id FROM {table} WHERE dataset IS NOT NULL "
+                    "GROUP BY dataset ORDER BY dataset LIMIT 257")
+    latest = [row[0] for row in connection.execute(latest_query)]
+    queries.append(latest_query)
+    selection.update(dataset_groups_observed=len(latest),
+                     dataset_selection_truncated=len(latest) > 256,
+                     latest_per_dataset_selected=min(len(latest), 256))
+    missing = sorted(set(latest[:256]) - {row["id"] for row in recent})
+    if missing:
+        query = f"SELECT {','.join(columns)} FROM {table} WHERE id IN ({','.join('?' for _ in missing)})"
+        recent.extend(dict(row) for row in connection.execute(query, missing))
+        queries.append({"sql": query, "parameters": missing})
+    return sorted(recent, key=lambda row: row["id"], reverse=True), selection, queries
+
+
+def _finmind_update_rows(connection):
+    """Use exact successful checks, not a head that may include a later failure."""
+    heads = [row[0] for row in connection.execute("SELECT dataset FROM dataset_heads ORDER BY dataset LIMIT 257")]
+    rows = []
+    for dataset in heads[:256]:
+        row = connection.execute(
+            "SELECT id,request_id,dataset,data_id,partition,checked_at_utc,kind,metadata_json "
+            "FROM checks WHERE dataset=? AND kind!='failed' ORDER BY checked_at_utc DESC,id DESC LIMIT 1",
+            (dataset,)).fetchone()
+        if row:
+            rows.append(dict(row))
+    return rows, {"mode": "latest_success_per_dataset_v1", "dataset_limit": 256,
+                  "dataset_groups_observed": len(heads), "dataset_selection_truncated": len(heads) > 256,
+                  "selected_rows": len(rows), "older_successes_searched": False}
+
+
 def collect_finmind(ledger: Ledger, evidence: Evidence, root: Path) -> None:
     """Read existing producer telemetry in bounded query-only transactions."""
+    from downloader.finmind_updates import TRANSPORT_TIMING_CONTRACT
     tables = {
         "finmind_object_transfer_samples": ("object_transfer", "id,dataset,partition,seconds,bytes,rows,observed_at_utc"),
         "finmind_object_derivation_samples": ("object_derivation", "id,dataset,partition,seconds,observed_at_utc,engine"),
@@ -841,8 +1019,10 @@ def collect_finmind(ledger: Ledger, evidence: Evidence, root: Path) -> None:
         "finmind_json_pipeline_samples": ("json_pipeline_calibration", "id,dataset,requests,seconds,rows,nonempty_requests,configuration_sha256,observed_at_utc,fetch_validate_publish_seconds,cycle_wall_verified,cycle_id,cycle_wall_seconds,excluded_work_seconds,cycle_started_at_utc,cycle_finished_at_utc"),
     }
     observations = []
-    for owner in ("sponsor", "complement"):
-        path = root / owner / "queue.sqlite3"
+    for owner, database in ((owner, database) for owner in ("free", "sponsor", "complement")
+                            for database in ("queue.sqlite3", "update_observations.sqlite3")):
+        owner_root = root if owner == "free" else root / owner
+        path = owner_root / database
         if not path.is_file():
             continue
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.5)
@@ -853,22 +1033,31 @@ def collect_finmind(ledger: Ledger, evidence: Evidence, root: Path) -> None:
             connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             connection.execute("BEGIN")
             existing = {r[0] for r in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            for table, (stage, columns) in tables.items():
+            for table, (stage, columns) in tables.items() if database == "queue.sqlite3" else ():
                 if table not in existing:
                     continue
                 actual = {r[1] for r in connection.execute(f"PRAGMA table_info({table})")}
                 selected = [column for column in columns.split(",") if column in actual]
-                query = f"SELECT {','.join(selected)} FROM {table} ORDER BY id DESC LIMIT 128"
-                observations.append({"owner": owner, "table": table, "stage": stage, "query": query,
+                rows, selection, queries = _finmind_sample_rows(connection, table, selected)
+                observations.append({"owner": owner, "table": table, "stage": stage, "query": queries[0],
+                                     "database": database, "database_relative_path": str(path.relative_to(root)),
                                      "snapshot_at_utc": datetime.now(UTC).isoformat(),
-                                     "rows": [dict(row) for row in connection.execute(query)]})
+                                     "rows": rows, "selection": selection, "queries": queries})
+            if database == "update_observations.sqlite3" and {"dataset_heads", "checks"} <= existing:
+                rows, selection = _finmind_update_rows(connection)
+                observations.append({"owner": owner, "table": "checks", "database": database,
+                                     "database_relative_path": str(path.relative_to(root)),
+                                     "stage": "request_to_parsed_response_wall_clock",
+                                     "snapshot_at_utc": datetime.now(UTC).isoformat(),
+                                     "rows": rows, "selection": selection})
             connection.rollback()
         except sqlite3.Error as exc:
             evidence.issues.append({"path": str(path), "reason": f"finmind_read_only_snapshot:{type(exc).__name__}"})
         finally:
             connection.close()
     snapshot = evidence.output / "finmind_telemetry_snapshot.json"
-    atomic_write_json(snapshot, {"provider_calls": 0, "query_only": True, "observations": observations})
+    atomic_write_json(snapshot, {"contract": "finmind_existing_timing_snapshot_v2",
+                                "provider_calls": 0, "query_only": True, "observations": observations})
     captured = evidence.object(snapshot)
     if not captured:
         return
@@ -876,16 +1065,68 @@ def collect_finmind(ledger: Ledger, evidence: Evidence, root: Path) -> None:
     cycles = set()
     for observation in observations:
         for row in observation["rows"]:
+            if observation["table"] == "checks":
+                try:
+                    payload = json.loads(row["metadata_json"])
+                    started = datetime.fromisoformat(payload["request_started_at_utc"])
+                    finished = datetime.fromisoformat(payload["checked_at_utc"])
+                    elapsed = (finished - started).total_seconds()
+                    timing = payload.get("transport_timing")
+                    monotonic = (isinstance(timing, dict) and timing.get("contract") == TRANSPORT_TIMING_CONTRACT
+                                 and finite_seconds(timing.get("seconds")))
+                    valid = (started.utcoffset() is not None and finished.utcoffset() is not None
+                             and row["request_id"] == payload.get("request_id")
+                             and row["checked_at_utc"] == payload["checked_at_utc"]
+                             and (monotonic or (elapsed >= 0 and finite_seconds(payload.get("network_seconds"))
+                                  and math.isclose(elapsed, payload["network_seconds"], rel_tol=1e-9, abs_tol=1e-6))))
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    valid = False
+                if not valid:
+                    evidence.issues.append({"path": str(root / observation["database_relative_path"]),
+                                            "reason": "finmind_latest_success_without_consistent_transport_clock",
+                                            "row_id": row["id"], "dataset": row.get("dataset")})
+                    continue
+                context = {"owner": observation["owner"], "dataset": row["dataset"],
+                           "partition": row["partition"], "data_id": row["data_id"],
+                           "request_id": row["request_id"], "event": row["kind"],
+                           "request_started_at_utc": payload["request_started_at_utc"],
+                           "response_received_at_utc": payload["checked_at_utc"],
+                           "clock_basis": TRANSPORT_TIMING_CONTRACT if monotonic else "recorded_UTC_difference_not_monotonic",
+                           "input_identity": "producer_request",
+                           "scope": "request_start_through_basic_response_validation_excludes_rate_limit_product_validation_and_publication; batch response may fan out"}
+                ledger.add(workflow=f"acquisition:finmind:{observation['owner']}:{row['dataset']}",
+                           stage="request_to_parsed_response_monotonic" if monotonic else observation["stage"],
+                           seconds=timing["seconds"] if monotonic else payload["network_seconds"], source=sha,
+                           locator=f"{observation['owner']}/checks/{row['id']}/metadata_json/" + (
+                               "transport_timing/seconds" if monotonic else "network_seconds"),
+                           origin="recorded_finmind_telemetry", metric="wall_seconds" if monotonic else "wall_clock_delta_seconds", context=context,
+                           work={"units": payload.get("response_rows"), "unit": "provider_response_rows",
+                                 "stored_task_rows": payload.get("rows")})
+                continue
             context = {"owner": observation["owner"], "dataset": row.get("dataset"),
                        "configuration_sha256": row.get("configuration_sha256"), "engine": row.get("engine"),
                        "partition": row.get("partition"), "requests": row.get("requests"),
                        "nonempty_requests": row.get("nonempty_requests"),
                        "scope": "producer_calibration_not_full_history_or_entire_service"}
             locator = f"{observation['owner']}/{observation['table']}/{row['id']}"
+            allocated = observation["table"] == "finmind_json_pipeline_samples" and row.get("cycle_wall_verified") == 1
+            if observation["table"] == "finmind_json_pipeline_samples":
+                context.update(timing_basis="proportional_cycle_allocation" if allocated else "recorded_batch_wall",
+                               cycle_id=row.get("cycle_id"), observed_at_utc=row.get("observed_at_utc"))
             ledger.add(workflow=f"acquisition:finmind:{observation['owner']}:{row.get('dataset')}",
                        stage=observation["stage"], seconds=row.get("seconds"), source=sha, locator=locator,
                        origin="recorded_finmind_telemetry", context=context,
+                       metric="allocated_cycle_wall_seconds" if allocated else "wall_seconds",
                        work={"units": row.get("rows"), "unit": "rows", "bytes": row.get("bytes")})
+            if observation["table"] == "finmind_json_pipeline_samples":
+                direct_context = {**context, "timing_basis": "direct_monotonic_batch_wall",
+                                  "scope": "overlapping fetch_validate_publish_batch; excludes shared cycle preparation/status/pool shutdown"}
+                ledger.add(workflow=f"acquisition:finmind:{observation['owner']}:{row.get('dataset')}",
+                           stage="json_fetch_validate_publish", seconds=row.get("fetch_validate_publish_seconds"),
+                           source=sha, locator=locator + "/fetch_validate_publish_seconds",
+                           origin="recorded_finmind_telemetry", context=direct_context,
+                           work={"units": row.get("rows"), "unit": "rows", "requests": row.get("requests"),
+                                 "nonempty_requests": row.get("nonempty_requests")})
             cycle = (observation["owner"], row.get("cycle_id"))
             if row.get("cycle_wall_verified") == 1 and cycle[1] and cycle not in cycles:
                 cycles.add(cycle)
@@ -943,15 +1184,866 @@ def collect_engineering_runs(ledger: Ledger, evidence: Evidence, root: Path, *, 
                             "workflow_code_sha256": row.get("workflow_code_sha256"), "input_identity": "not_in_timing_projection"})
 
 
+def _crypto_feature_rows(raw, provider):
+    """Validate complete native worker clocks before emitting any samples."""
+    from downloader.binance_historical_features import FEATURE_STAGE_IDS as BINANCE_STAGES
+    from downloader.okx_historical_features import FEATURE_STAGE_IDS as OKX_STAGES
+    stages = {"binance": set(BINANCE_STAGES), "okx": set(OKX_STAGES)}
+    if provider not in stages:
+        raise ValueError("unsupported crypto feature provider")
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""))
+    required = {"code", provider + "_symbol", "status", "rows", "output_path", "changed",
+                "stage_status_json", "coverage_json", "errors_json",
+                "stage_elapsed_seconds_json", "total_elapsed_seconds"}
+    fields = reader.fieldnames or []
+    if not required <= set(fields) or len(fields) != len(set(fields)):
+        raise ValueError("crypto feature CSV headers differ")
+    rows, codes = [], set()
+    local = {"read_existing", "derive", "compare", "write", "coverage"}
+    for row in reader:
+        if len(rows) >= 10_000 or None in row or any(value is None for value in row.values()):
+            raise ValueError("crypto feature CSV row shape or budget differs")
+        if not row["code"] or row["code"] in codes or not row[provider + "_symbol"] or not row["status"]:
+            raise ValueError("crypto feature worker identity differs")
+        codes.add(row["code"])
+        elapsed = json.loads(row["stage_elapsed_seconds_json"])
+        status = json.loads(row["stage_status_json"])
+        total = float(row["total_elapsed_seconds"])
+        if (not isinstance(elapsed, dict) or not isinstance(status, dict)
+                or not elapsed.keys() <= stages[provider] | local
+                or not status.keys() <= stages[provider]
+                or not all(isinstance(value, str) for value in status.values())
+                or not all(finite_seconds(value) for value in elapsed.values())
+                or not finite_seconds(total) or int(row["rows"]) < 0):
+            raise ValueError("crypto feature native clock or stage differs")
+        if elapsed and ("read_existing" not in elapsed
+                        or any(value > total + .000001 for value in elapsed.values())):
+            raise ValueError("crypto feature stage exceeds rounded worker total")
+        row.update(_elapsed=elapsed, _stage_status=status, _total=total)
+        rows.append(row)
+    if not rows:
+        raise ValueError("crypto feature report has no workers")
+    return rows
+
+
+def collect_crypto_feature_samples(ledger, provider, report_path, report_raw, report_sha,
+                                   summary_raw, summary_sha):
+    """Reuse native CEX clocks; stage sums and stored rows are not work units."""
+    from downloader.feature_stage_timing import stage_latency_summary
+    rows = _crypto_feature_rows(report_raw, provider)
+    summary = json.loads(summary_raw)
+    if (not isinstance(summary, dict) or summary.get("interval") != "1m"
+            or summary.get("historical_features_enabled") is not True
+            or summary.get("historical_feature_report_is_current_run") is not True
+            or summary.get("asset_class") != "crypto_" + provider + "_" + ("usdm_perp" if provider == "binance" else "perp")
+            or not isinstance(summary.get("historical_feature_report"), str)
+            or not isinstance(summary.get("started_at_utc"), str)
+            or not isinstance(summary.get("ended_at_utc"), str)):
+        raise ValueError("crypto feature summary scope differs")
+    if (ROOT / summary["historical_feature_report"]).resolve() != Path(report_path).resolve():
+        raise ValueError("crypto feature summary belongs to a different report path")
+    for field in ("work_elapsed_seconds", "lock_wait_seconds", "elapsed_seconds"):
+        value = summary.get(field)
+        if type(value) in (int, float) and not math.isfinite(value):
+            raise ValueError("crypto feature summary contains a nonfinite clock")
+    reconstructed = stage_latency_summary(SimpleNamespace(
+        stage_elapsed_seconds_json=row["stage_elapsed_seconds_json"]) for row in rows)
+    if reconstructed != summary.get("historical_feature_stage_latency"):
+        raise ValueError("crypto feature CSV and summary stage clocks differ")
+    empty, emitted = [], 0
+    for index, row in enumerate(rows, 1):
+        if not row["_elapsed"]:
+            empty.append(dict(record=index, code=row["code"], status=row["status"],
+                reason="empty_stage_clock_default_is_not_a_measured_worker",
+                reported_total=row["total_elapsed_seconds"]))
+            continue
+        base = dict(provider=provider, instrument_code=row["code"],
+            instrument_symbol=row[provider + "_symbol"], report_path=str(report_path),
+            report_record=index, report_status=row["status"], summary_sha256=summary_sha,
+            producer_started_at_utc=summary["started_at_utc"], producer_ended_at_utc=summary["ended_at_utc"],
+            grain="1m", clock_basis="producer_reported_perf_counter_rounded_6_observed_source_not_loaded_identity_proof",
+            scope="per_instrument_worker_stages_may_include_limiter_retries_fetch_parse_and_merge",
+            existing_output_rows_not_work_denominator=int(row["rows"]), source_binding_eligible=False,
+            whole_loaded_source_identity_verified=False, acquisition_completeness_verified=False,
+            live_readiness_verified=False, full_source_end_to_end_verified=False,
+            cross_file_atomic_snapshot_verified=False)
+        for stage, seconds in row["_elapsed"].items():
+            ledger.add(workflow="crypto-features:" + provider + ":" + row["code"], stage=stage,
+                seconds=seconds, source=report_sha,
+                locator=f"csv/records/{index}/stage_elapsed_seconds_json/{stage}",
+                origin="recorded_crypto_feature_worker",
+                outcome=row["_stage_status"].get(stage, "returned_result:" + row["status"]),
+                context=dict(base, native_stage_status=row["_stage_status"].get(stage)))
+            emitted += 1
+        ledger.add(workflow="crypto-features:" + provider + ":" + row["code"], stage="worker_return_total",
+            seconds=row["_total"], source=report_sha, locator=f"csv/records/{index}/total_elapsed_seconds",
+            origin="recorded_crypto_feature_worker", outcome=row["status"], context=base)
+        emitted += 1
+    run_clock = summary.get("work_elapsed_seconds")
+    if finite_seconds(run_clock):
+        ledger.add(workflow="crypto-features:" + provider, stage="run_work_before_summary_publication",
+            seconds=run_clock, source=summary_sha, locator="/work_elapsed_seconds",
+            origin="recorded_crypto_feature_run", outcome="producer_returned_summary_not_acquisition_acceptance",
+            context=dict(provider=provider, grain="1m", clock_basis="producer_monotonic_observed_source",
+                scope="main_work_excludes_lock_wait_and_later_summary_receipt_publication",
+                source_binding_eligible=False, whole_loaded_source_identity_verified=False,
+                acquisition_completeness_verified=False, cross_file_atomic_snapshot_verified=False))
+    return dict(provider=provider, report_rows=len(rows), workers_with_stage_clocks=len(rows) - len(empty),
+        worker_stage_and_total_samples=emitted, empty_stage_clock_gaps=empty,
+        source_report_sha256=report_sha, source_summary_sha256=summary_sha,
+        stage_summary_exactly_reconstructed=True, per_stage=reconstructed,
+        recorded_run_work_seconds=run_clock, recorded_lock_wait_seconds=summary.get("lock_wait_seconds"),
+        utc_duration_estimate_not_monotonic=summary.get("elapsed_seconds"),
+        aggregate_worker_seconds_is_not_run_wall=True, full_source_or_loaded_identity_verified=False)
+
+
+def collect_crypto_feature_operations(ledger, evidence, reports):
+    """Freeze explicit native CSV/summary pairs without launching source work."""
+    seen, count = set(), 0
+    for provider, report, summary in reports:
+        report, summary = Path(report).absolute(), Path(summary).absolute()
+        captured, captured_summary = evidence.read(report), evidence.read(summary)
+        if captured is None or captured_summary is None:
+            evidence.issues.append({"path": str(report), "summary": str(summary),
+                                    "reason": "crypto_feature_clock_pair_unavailable"})
+            continue
+        identity = provider, str(report.resolve()), captured[1], captured_summary[1]
+        if identity in seen:
+            continue
+        pending = Ledger()
+        try:
+            result = collect_crypto_feature_samples(pending, provider, report, *captured,
+                                                     *captured_summary)
+        except (KeyError, TypeError, ValueError, UnicodeError, csv.Error, OverflowError) as exc:
+            evidence.issues.append({"path": str(report), "summary": str(summary),
+                                    "reason": "invalid_crypto_feature_clock_pair", "error_type": type(exc).__name__})
+            continue
+        seen.add(identity)
+        ledger.samples.extend(pending.samples)
+        ledger.inventory.append(dict(kind="crypto_feature_report", id=provider + ":" + str(report),
+            contract="native_crypto_feature_csv_summary_v1", summary_path=str(summary),
+            coverage="captured_native_worker_and_run_clocks_only", **result))
+        count += len(pending.samples)
+    return count
+
+
+CRYPTO_ISSUER_PARSER_SCOPE = (
+    "captured_raw_read_SHA_gzip_decompressed_SHA_and_native_parse_excludes_imports_capture_and_output_write"
+)
+CRYPTO_ISSUER_STREAMS = {
+    "daily_metrics": ("issuer_daily_fund_metrics.parquet", ("source_id", "ticker", "event_date", "metric")),
+    "holdings": ("issuer_holdings_snapshots.parquet", ("source_id", "ticker", "as_of_date", "holding_ticker")),
+    "reserves": ("issuer_reserve_snapshots.parquet", ("source_id", "ticker", "snapshot_at_utc")),
+}
+
+
+def _crypto_issuer_parser_samples(ledger, evidence, captured):
+    """Read the retained-parser ABI; these clocks exclude external acquisition."""
+    import polars as pl
+
+    (timing, timing_sha), (protocol, protocol_sha), (outputs, outputs_sha), (readback, readback_sha) = captured
+
+    def require(condition, reason):
+        if not condition:
+            raise ValueError(reason)
+
+    def nonnegative_int(value):
+        return type(value) is int and value >= 0 and finite_seconds(value / 1e9)
+
+    require(all(isinstance(value, dict) for value in (timing, protocol, readback)) and isinstance(outputs, list),
+            "issuer parser bundle shape differs")
+    require(timing.get("state") == "measured_all_seven_retained_native_issuer_parsers"
+            and timing.get("scope") == CRYPTO_ISSUER_PARSER_SCOPE
+            and timing.get("profiler_enabled") is False and timing.get("source_modified") is False
+            and timing.get("full_acquisition_measured") is False and type(timing.get("new_provider_calls")) is int
+            and timing["new_provider_calls"] == 0
+            and timing.get("parser_loaded_from_exact_archived_source") is True
+            and timing.get("native_result_request_counts_are_preserved_metadata_not_new_HTTP") is True,
+            "issuer parser clock scope differs")
+    require(all(protocol.get(key) is True for key in (
+                "native_parser_only", "no_new_provider_or_GPU_jobs", "all_seven_issuer_sources_required",
+                "complete_original_normalized_row_oracle_required"))
+            and all(protocol.get(key) is False for key in (
+                "source_or_receipts_modified", "source_bindings_globally_recomputed", "full_acquisition_measured")),
+            "issuer parser protocol scope differs")
+    require(readback.get("state") == "verified_all_seven_native_outputs_against_original_normalized_rows"
+            and readback.get("output_sha256") == outputs_sha
+            and readback.get("original_observation_clocks_and_raw_SHA_preserved") is True
+            and readback.get("source_stage_bindings_globally_recomputed") is False
+            and readback.get("acquisition_completeness_verified") is False,
+            "issuer parser output oracle differs")
+    require(isinstance(protocol.get("inputs"), list) and 0 < len(protocol["inputs"]) <= 256
+            and isinstance(protocol.get("code"), list) and 0 < len(protocol["code"]) <= 64,
+            "issuer parser evidence budget differs")
+    inputs, code, original_bytes = {}, {}, 0
+    for collection, destination in ((protocol["inputs"], inputs), (protocol["code"], code)):
+        for row in collection:
+            require(isinstance(row, dict) and isinstance(row.get("path"), str)
+                    and isinstance(row.get("archive"), str) and row["path"] not in destination,
+                    "issuer parser evidence identity differs")
+            body = evidence.read(Path(row["archive"]))
+            require(body is not None and body[1] == row.get("sha256"), "issuer parser archived SHA differs")
+            if destination is inputs:
+                require(row.get("stable") is True and type(row.get("bytes")) is int
+                        and row["bytes"] == len(body[0]), "issuer parser archived size differs")
+                original_bytes += row["bytes"]
+            destination[row["path"]] = row
+    require(type(protocol.get("original_bytes")) is int and original_bytes == protocol["original_bytes"],
+            "issuer parser original byte denominator differs")
+
+    def original(path):
+        row = inputs[str(path)]
+        body = evidence.read(Path(row["archive"]))
+        require(body is not None and body[1] == row["sha256"], "issuer parser original unavailable")
+        return body[0]
+
+    config = json.loads(original(ROOT / "configs/crypto_etf_sources.json"))
+    specs, issuers, clocks = config["issuer_sources"], protocol.get("issuers"), timing.get("per_issuer")
+    require(isinstance(specs, list) and isinstance(issuers, list) and isinstance(clocks, list)
+            and 0 < len(specs) == len(issuers) == len(clocks) == len(outputs) <= 128,
+            "issuer parser complete source set differs")
+    owner = code[str(ROOT / "downloader/download_crypto_etf_history.py")]
+    adapters = {"ishares_gross_proceeds_xls": "_parse_ishares_xls",
+                "ishares_holdings_csv": "_parse_ishares_holdings", "bitwise_next_data": "_parse_bitwise"}
+    ids, work, raw_bytes, wall_sum, cpu_sum = set(), 0, 0, 0, 0
+    verified = []
+    for spec, item, clock, parsed in zip(specs, issuers, clocks, outputs):
+        require(all(isinstance(value, dict) for value in (spec, item, clock, parsed))
+                and isinstance(spec.get("id"), str) and spec["id"] and spec["id"] not in ids
+                and spec.get("adapter") in adapters and item.get("spec") == spec,
+                "issuer parser source definition differs")
+        identifier = spec["id"]
+        ids.add(identifier)
+        require(clock.get("source_endpoint_id") == "crypto-etf:issuer:" + identifier
+                and isinstance(item.get("raw_path"), str), "issuer parser source clock differs")
+        receipt = json.loads(original(ROOT / "data_crypto_etf/receipts/issuers" / (identifier + ".json")))
+        require(isinstance(receipt, dict)
+                and all(receipt.get(key) == item.get(key) for key in ("raw_path", "raw_sha256", "observed_at_utc"))
+                and isinstance(item.get("observed_at_utc"), str) and item["observed_at_utc"],
+                "issuer parser native receipt differs")
+        raw = original(item["raw_path"])
+        if Path(item["raw_path"]).suffix == ".gz":
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+                raw = stream.read(evidence.max_file_bytes + 1)
+        require(len(raw) <= evidence.max_file_bytes and hashlib.sha256(raw).hexdigest() == item.get("raw_sha256")
+                and clock.get("raw_sha256") == item["raw_sha256"], "issuer parser decompressed SHA differs")
+        result = parsed.get("result")
+        require(isinstance(result, dict) and result.get("source_id") == identifier
+                and result.get("provider") == spec["provider"] and result.get("status") == "complete"
+                and all(isinstance(parsed.get(key), list) for key in CRYPTO_ISSUER_STREAMS),
+                "issuer parser native result differs")
+        rows = sum(len(parsed[key]) for key in CRYPTO_ISSUER_STREAMS)
+        require(type(result.get("rows")) is int and result["rows"] == rows
+                and type(clock.get("output_rows")) is int and clock["output_rows"] == rows
+                and type(clock.get("input_bytes")) is int and clock["input_bytes"] == len(raw)
+                and all(nonnegative_int(clock.get(key)) for key in ("wall_ns", "process_cpu_ns")),
+                "issuer parser clock or work denominator differs")
+        for key in CRYPTO_ISSUER_STREAMS:
+            for row in parsed[key]:
+                require(isinstance(row, dict) and row.get("source_id") == identifier
+                        and row.get("raw_sha256") == item["raw_sha256"]
+                        and row.get("observed_at_utc") == row.get("available_at_utc") == item["observed_at_utc"],
+                        "issuer parser returned provenance differs")
+        verified.append((spec, item, clock, result))
+        wall_sum += clock["wall_ns"]
+        cpu_sum += clock["process_cpu_ns"]
+        work += rows
+        raw_bytes += len(raw)
+    require(raw_bytes <= evidence.max_total_bytes
+            and nonnegative_int(timing.get("native_workflow_wall_ns"))
+            and nonnegative_int(timing.get("native_workflow_process_cpu_ns"))
+            and timing["native_workflow_wall_ns"] >= wall_sum
+            and timing["native_workflow_process_cpu_ns"] >= cpu_sum,
+            "issuer parser sequential workflow clock differs")
+    streams = []
+    for stream, (filename, keys) in CRYPTO_ISSUER_STREAMS.items():
+        original_rows = pl.read_parquet(io.BytesIO(original(ROOT / "data_crypto_etf/normalized" / filename))).to_dicts()
+        count = 0
+        for item, parsed in zip(issuers, outputs):
+            expected = {tuple(row[key] for key in keys): row for row in parsed[stream]}
+            matched = [row for row in original_rows if row["source_id"] == item["spec"]["id"]
+                       and row["raw_sha256"] == item["raw_sha256"]]
+            actual = {tuple(row[key] for key in keys): row for row in matched}
+            require(len(actual) == len(matched) and expected.keys() == actual.keys(),
+                    "issuer parser complete normalized keys differ")
+            for key, row in expected.items():
+                require(digest(row) == digest({field: actual[key][field] for field in row}),
+                        "issuer parser complete normalized values differ")
+            count += len(expected)
+        streams.append(dict(stream=stream, complete_current_raw_rows_verified=count,
+                            native_ordered_rows_compared_between_both_full_calls=True))
+    require(streams == readback.get("streams"), "issuer parser normalized row counts differ")
+    base = dict(contract="observed_retained_crypto_issuer_parser_v1", scope=CRYPTO_ISSUER_PARSER_SCOPE,
+        input_protocol_sha256=protocol_sha, native_outputs_sha256=outputs_sha, native_readback_sha256=readback_sha,
+        parser_source_sha256=owner["sha256"], input_identity="retained_native_issuer_raw",
+        source_capsule_capture_excluded=True, returned_row_capture_included_in_workflow_total=True,
+        imports_and_output_write_excluded=True, source_cache="previous_capture_may_be_warm",
+        clock_is_source_publication_time=False, new_provider_calls=0,
+        native_request_counts_are_preserved_metadata=True, producer_reported_exact_archived_parser=True,
+        whole_loaded_source_identity_verified=False, acquisition_completeness_verified=False,
+        live_readiness_verified=False, stage_totals_overlap=True,
+        pandas_version=timing.get("pandas_version"), polars_version=timing.get("polars_version"))
+    for index, (spec, item, clock, result) in enumerate(verified):
+        context = dict(base, dataset=spec["id"], source_binding_eligible=True,
+            parser_function=adapters[spec["adapter"]], raw_sha256=item["raw_sha256"],
+            native_observed_at_utc=item["observed_at_utc"], native_result_requests=result.get("requests"))
+        for field, metric in (("wall_ns", "wall_seconds"), ("process_cpu_ns", "process_cpu_seconds")):
+            ledger.add(workflow="preparation:crypto_etf_issuer", stage="retained_raw_verify_decode_parse",
+                seconds=clock[field] / 1e9, source=timing_sha, locator=f"per_issuer/{index}/{field}",
+                origin="observed_crypto_issuer_parser", outcome="verified_retained_native_output", metric=metric,
+                context=dict(context, native_nanoseconds=clock[field]),
+                work={"unit": "parsed_output_rows", "units": clock["output_rows"], "input_bytes": clock["input_bytes"]})
+    for field, metric in (("native_workflow_wall_ns", "wall_seconds"),
+                          ("native_workflow_process_cpu_ns", "process_cpu_seconds")):
+        ledger.add(workflow="preparation:crypto_etf_issuer", stage="all_retained_issuers_with_result_capture",
+            seconds=timing[field] / 1e9, source=timing_sha, locator=field,
+            origin="observed_crypto_issuer_parser", outcome="verified_retained_native_output", metric=metric,
+            context=dict(base, source_binding_eligible=False, native_nanoseconds=timing[field]),
+            work={"unit": "parsed_output_rows", "units": work, "input_bytes": raw_bytes})
+    return dict(issuers=len(issuers), native_rows=work, complete_normalized_streams=streams,
+                protocol_sha256=protocol_sha, outputs_sha256=outputs_sha, readback_sha256=readback_sha,
+                frozen_originals_verified=len(inputs), full_acquisition_verified=False)
+
+
+def collect_crypto_issuer_parser_operations(ledger, evidence, reports):
+    """Keep complete report bundles and visible failures; never launch a parser."""
+    if not reports:
+        return 0
+    from polars.exceptions import PolarsError
+    from zlib import error as ZlibError
+
+    seen, emitted = set(), 0
+    for report in reports:
+        paths = [Path(path).absolute() for path in report]
+        captured = [evidence.object(path) for path in paths]
+        if len(captured) != 4 or any(item is None for item in captured):
+            evidence.issues.append(dict(paths=[str(path) for path in paths], reason="crypto_issuer_parser_bundle_unavailable"))
+            continue
+        identity = tuple(item[1] for item in captured)
+        if identity in seen:
+            continue
+        pending = Ledger()
+        try:
+            result = _crypto_issuer_parser_samples(pending, evidence, captured)
+        except (KeyError, TypeError, ValueError, UnicodeError, OverflowError, OSError, EOFError,
+                PolarsError, ZlibError) as exc:
+            evidence.issues.append(dict(paths=[str(path) for path in paths],
+                reason="invalid_crypto_issuer_parser_bundle", error_type=type(exc).__name__))
+            continue
+        seen.add(identity)
+        ledger.samples.extend(pending.samples)
+        ledger.inventory.append(dict(kind="crypto_issuer_parser_report", id=str(paths[0]),
+            contract="observed_retained_crypto_issuer_parser_v1", source_report_sha256=captured[0][1],
+            coverage="observed_retained_parser_stage_only", **result))
+        emitted += len(pending.samples)
+    return emitted
+
+
+RETAINED_DUNE_PARTITION_SCOPE = (
+    "retained_page_read_SHA_gzip_JSON_native_partition_transform_and_atomic_outputs_with_receipt_supplied_status_and_clock_excludes_HTTP_capture_imports_and_verification"
+)
+
+
+class RetainedReplayContractError(ValueError):
+    """A static replay-contract reason safe to retain with rejected evidence."""
+
+
+def _replay_require(condition, reason):
+    if not condition:
+        raise RetainedReplayContractError(reason)
+
+
+def _replay_nonnegative_int(value):
+    return type(value) is int and value >= 0
+
+
+def _retained_replay_inputs(evidence, protocol):
+    """Retain every declared original and code archive before consuming a replay."""
+    require = _replay_require
+    require(isinstance(protocol.get("inputs"), list) and 0 < len(protocol["inputs"]) <= 8192
+            and isinstance(protocol.get("code"), list) and 0 < len(protocol["code"]) <= 64,
+            "retained replay evidence budget differs")
+    inputs, code, total = {}, {}, 0
+    for collection, destination in ((protocol["inputs"], inputs), (protocol["code"], code)):
+        for row in collection:
+            require(isinstance(row, dict) and isinstance(row.get("path"), str)
+                    and isinstance(row.get("archive"), str) and row["path"] not in destination,
+                    "retained replay evidence identity differs")
+            body = evidence.read(Path(row["archive"]))
+            require(body is not None and body[1] == row.get("sha256"), "retained replay archive SHA differs")
+            if destination is inputs:
+                require(row.get("stable") is True and _replay_nonnegative_int(row.get("bytes"))
+                        and row["bytes"] == len(body[0]), "retained replay archive size differs")
+                total += row["bytes"]
+            destination[row["path"]] = row
+    require(_replay_nonnegative_int(protocol.get("original_bytes")) and protocol["original_bytes"] == total,
+            "retained replay original byte denominator differs")
+
+    def original(path):
+        row = inputs[str(path)]
+        body = evidence.read(Path(row["archive"]))
+        require(body is not None and body[1] == row["sha256"], "retained replay original unavailable")
+        return body[0]
+
+    def output(path):
+        body = evidence.read(Path(path))
+        require(body is not None, "retained replay native output unavailable")
+        return body
+
+    return inputs, code, original, output
+
+
+def _replay_gzip(raw, limit):
+    with gzip.GzipFile(fileobj=io.BytesIO(raw)) as stream:
+        result = stream.read(limit + 1)
+    _replay_require(len(result) <= limit, "retained replay expanded page exceeds budget")
+    return result
+
+
+def _replay_frame_equal(actual, original):
+    """Keep null masks and signed floating bits in addition to ordered values."""
+    import numpy as np
+    import polars as pl
+
+    require = _replay_require
+    require(dict(actual.schema) == dict(original.schema) and actual.shape == original.shape,
+            "retained replay normalized schema or shape differs")
+    require(actual.select(original.columns).equals(original, null_equal=True), "retained replay ordered values differ")
+    for name, dtype in original.schema.items():
+        if dtype in (pl.Float32, pl.Float64):
+            a, b = actual[name], original[name]
+            require(a.is_null().equals(b.is_null()), "retained replay null masks differ")
+            bits = np.uint32 if dtype == pl.Float32 else np.uint64
+            require(np.array_equal(a.fill_null(0).to_numpy().view(bits), b.fill_null(0).to_numpy().view(bits)),
+                    "retained replay floating bits differ")
+
+
+def _retained_dune_partition_samples(ledger, evidence, captured):
+    import polars as pl
+
+    require = _replay_require
+    (timing, timing_sha), (protocol, protocol_sha), (readback, readback_sha) = captured
+    require(all(isinstance(value, dict) for value in (timing, protocol, readback)), "Dune replay bundle shape differs")
+    require(timing.get("state") == "measured_all_complete_retained_Dune_partitions"
+            and timing.get("scope") == RETAINED_DUNE_PARTITION_SCOPE and timing.get("profiler_enabled") is False
+            and type(timing.get("new_provider_calls")) is int and timing["new_provider_calls"] == 0
+            and type(timing.get("new_provider_executions")) is int and timing["new_provider_executions"] == 0
+            and timing.get("status_and_retrieval_clock_supplied_from_retained_receipts") is True
+            and timing.get("native_source_loaded_from_exact_archive") is True
+            and timing.get("full_external_acquisition_verified") is False
+            and timing.get("global_source_bindings_recomputed") is False, "Dune replay clock scope differs")
+    require(protocol.get("state") == "prepared_all_complete_retained_Dune_partition_replays"
+            and all(protocol.get(key) is True for key in ("no_source_modification",
+                "original_observation_clocks_supplied_from_receipts", "complete_ordered_row_and_raw_page_oracle_required",
+                "numerical_values_null_masks_and_floating_bits_required"))
+            and protocol.get("full_external_acquisition_measured") is False
+            and protocol.get("source_bindings_globally_recomputed") is False
+            and all(type(protocol.get(key)) is int and protocol[key] == 0
+                    for key in ("new_provider_calls", "new_provider_executions")),
+            "Dune replay protocol scope differs")
+    require(readback.get("state") == "verified_both_full_retained_Dune_replays_against_every_original_row_and_page"
+            and readback.get("native_timing_sha256") == timing_sha
+            and readback.get("source_or_receipts_modified") is False
+            and readback.get("no_new_provider_calls") is True
+            and readback.get("full_external_acquisition_verified") is False
+            and readback.get("global_source_bindings_recomputed") is False
+            and readback.get("whole_production_loaded_identity_verified") is False,
+            "Dune replay readback scope differs")
+    inputs, code, original, output = _retained_replay_inputs(evidence, protocol)
+    owner = code[str(ROOT / "downloader/download_dune_crypto_history.py")]
+    root = ROOT / "data_dune_crypto"
+    config = json.loads(original(ROOT / "configs/dune_crypto_queries.json"))
+    require(isinstance(config, dict) and isinstance(config.get("queries"), list)
+            and all(isinstance(row, dict) for row in config["queries"]), "Dune query config shape differs")
+    definitions = {row["id"]: row for row in config["queries"]}
+    require(len(definitions) == len(config["queries"]), "Dune duplicate query definitions")
+    items, clocks, checks = protocol.get("partitions"), timing.get("partitions"), readback.get("partitions")
+    require(all(isinstance(rows, list) for rows in (items, clocks, checks))
+            and 0 < len(items) == len(clocks) == len(checks) <= 8192, "Dune replay complete partition set differs")
+    receipt_paths = {name for name in inputs if Path(name).is_relative_to(root / "receipts")}
+    supplied, pages, verified, rows_total, compressed_total = set(), set(), [], 0, 0
+    wall_sum, cpu_sum = 0, 0
+    for index, (item, clock, check) in enumerate(zip(items, clocks, checks)):
+        require(all(isinstance(row, dict) for row in (item, clock, check)), "Dune replay partition shape differs")
+        receipt_path = item["receipt_path"]
+        receipt = json.loads(original(receipt_path))
+        require(isinstance(receipt, dict) and receipt == item.get("receipt") and receipt.get("status") == "complete"
+                and receipt_path not in supplied
+                and all(_replay_nonnegative_int(receipt.get(key)) for key in ("rows", "pages")),
+                "Dune replay original receipt differs")
+        supplied.add(receipt_path)
+        spec = item["spec"]
+        require(spec == definitions[receipt["query_id"]] and spec["id"] == receipt["query_id"]
+                and spec["expected_columns"] == receipt["expected_columns"]
+                and spec["primary_key"] == receipt["primary_key"]
+                and hashlib.sha256(original(item["sql_path"])).hexdigest() == receipt["sql_sha256"],
+                "Dune replay query definition differs")
+        require(clock.get("source_endpoint_id") == "dune-query:" + spec["id"]
+                and clock.get("partition_id") == receipt["partition_id"]
+                and clock.get("original_receipt_path") == receipt_path
+                and all(_replay_nonnegative_int(clock.get(key)) for key in ("wall_ns", "process_cpu_ns", "rows", "pages"))
+                and clock["rows"] == receipt["rows"] and clock["pages"] == receipt["pages"],
+                "Dune replay source clock or work differs")
+        require(check.get("query_id") == spec["id"] and check.get("partition_id") == receipt["partition_id"]
+                and check.get("rows") == receipt["rows"]
+                and check.get("original_receipt_sha256") == inputs[receipt_path]["sha256"]
+                and all(check.get(key) is True for key in ("all_ordered_values_schema_null_masks_and_floating_bits_equal",
+                    "all_native_receipt_fields_except_verified_output_roots_equal",
+                    "historical_metadata_column_order_retained_in_original_and_compared_by_name",
+                    "both_full_replays_raw_uncompressed_page_bytes_equal")), "Dune replay partition oracle differs")
+        original_frame = pl.read_parquet(io.BytesIO(original(receipt["parquet_path"])))
+        actual_bytes, parquet_sha = output(clock["parquet_path"])
+        actual = pl.read_parquet(io.BytesIO(actual_bytes))
+        require(original_frame.height == receipt["rows"] and
+                [name for name in actual.columns if name != "_dune_contract_id"] ==
+                [name for name in original_frame.columns if name != "_dune_contract_id"], "Dune replay column order differs")
+        _replay_frame_equal(actual, original_frame)
+        relative = Path(receipt["parquet_path"]).relative_to(root)
+        output_root = Path(clock["parquet_path"]).parents[len(relative.parts) - 1]
+        require(output_root / relative == Path(clock["parquet_path"])
+                and output_root / Path(receipt_path).relative_to(root) == Path(clock["receipt_path"]),
+                "Dune replay output roots differ")
+        receipt_bytes, receipt_sha = output(clock["receipt_path"])
+        native_receipt = json.loads(receipt_bytes)
+        migration = {key: receipt[key] for key in ("lineage_upgraded_at_utc", "migrated_from_partition_id") if key in receipt}
+        raw_components = (spec["id"], receipt["partition_id"], receipt["execution_id"])
+        require(all(isinstance(value, str) and value not in {"", ".", ".."}
+                    and Path(value).name == value for value in raw_components),
+                "Dune replay native raw path component differs")
+        # Historical lineage migration preserves its old raw partition folder.
+        # The canonical writer uses the current query/partition/execution tuple.
+        native_raw_root = output_root.joinpath("raw", *raw_components)
+        require(check.get("original_migration_metadata_retained") == migration
+                and set(native_receipt) == set(receipt) - migration.keys()
+                and {k:v for k,v in native_receipt.items() if k not in {"parquet_path", "raw_root"}} ==
+                    {k:v for k,v in receipt.items() if k not in {"parquet_path", "raw_root"} | migration.keys()}
+                and native_receipt["parquet_path"] == clock["parquet_path"]
+                and Path(native_receipt["raw_root"]) == native_raw_root,
+                "Dune replay native receipt fields differ")
+        partition_pages = item["pages"]
+        require(isinstance(partition_pages, list) and len(partition_pages) == len(set(partition_pages)) == receipt["pages"]
+                and receipt["pages"] > 0 and not pages.intersection(partition_pages), "Dune replay page set differs")
+        page_rows, compressed = 0, 0
+        for path in partition_pages:
+            require(Path(path).parent == Path(receipt["raw_root"]), "Dune replay original page root differs")
+            body = original(path)
+            plain = _replay_gzip(body, evidence.max_file_bytes)
+            actual_page, _ = output(Path(native_receipt["raw_root"]) / Path(path).name)
+            require(plain == _replay_gzip(actual_page, evidence.max_file_bytes), "Dune replay raw page bytes differ")
+            payload = json.loads(plain)
+            require(isinstance(payload, dict), "Dune replay raw page shape differs")
+            result = payload.get("result") or {}
+            require(isinstance(result, dict), "Dune replay raw result shape differs")
+            values = result.get("rows") or []
+            require(isinstance(values, list), "Dune replay raw row shape differs")
+            page_rows += sum(isinstance(row, dict) for row in values)
+            compressed += len(body)
+        require(page_rows == receipt["rows"], "Dune replay raw row denominator differs")
+        pages.update(partition_pages)
+        rows_total += receipt["rows"]
+        compressed_total += compressed
+        wall_sum += clock["wall_ns"]
+        cpu_sum += clock["process_cpu_ns"]
+        verified.append((clock, dict(dataset=spec["id"], partition_id=receipt["partition_id"],
+            original_receipt_sha256=inputs[receipt_path]["sha256"], native_receipt_sha256=receipt_sha,
+            original_parquet_sha256=inputs[receipt["parquet_path"]]["sha256"], native_parquet_sha256=parquet_sha,
+            pages=clock["pages"], compressed_original_page_bytes=compressed,
+            original_available_at_utc=receipt["available_at_utc"], original_retrieved_at_utc=receipt["completed_at_utc"])))
+    retained_pages = {name for name in inputs if Path(name).is_relative_to(root / "raw") and name.endswith(".json.gz")}
+    require(supplied == receipt_paths and pages <= retained_pages
+            and _replay_nonnegative_int(protocol.get("original_raw_pages"))
+            and len(retained_pages) == protocol["original_raw_pages"]
+            and protocol.get("completed_partition_raw_pages") == len(pages)
+            and sorted(retained_pages - pages) == protocol.get("unreferenced_pages")
+            and protocol.get("unreferenced_pages_are_not_completed_partition_evidence") is True
+            and rows_total == protocol.get("original_rows") == readback.get("total_rows")
+            and compressed_total == readback.get("raw_compressed_bytes"), "Dune replay complete coverage differs")
+    require(all(_replay_nonnegative_int(timing.get(key)) for key in
+                ("native_workflow_wall_ns", "native_workflow_process_cpu_ns"))
+            and timing["native_workflow_wall_ns"] >= wall_sum
+            and timing["native_workflow_process_cpu_ns"] >= cpu_sum, "Dune replay workflow clocks differ")
+    base = dict(contract="observed_retained_dune_partition_v1", scope=RETAINED_DUNE_PARTITION_SCOPE,
+        input_protocol_sha256=protocol_sha, native_readback_sha256=readback_sha,
+        parser_source_sha256=owner["sha256"], input_identity="retained_Dune_pages_and_original_receipts",
+        new_provider_calls=0, new_provider_executions=0, supplied_provider_status_and_clocks=True,
+        imports_capture_and_verification_excluded=True, native_atomic_outputs_included=True,
+        whole_loaded_source_identity_verified=False, acquisition_completeness_verified=False,
+        live_readiness_verified=False, stage_totals_overlap=True, source_cache="capture_warmed_existing_pages")
+    for index, (clock, context) in enumerate(verified):
+        for field, metric in (("wall_ns", "wall_seconds"), ("process_cpu_ns", "process_cpu_seconds")):
+            ledger.add(workflow="preparation:retained_dune", stage="retained_page_transform_and_atomic_outputs",
+                seconds=clock[field] / 1e9, source=timing_sha, locator=f"partitions/{index}/{field}",
+                origin="observed_retained_dune_partition", outcome="verified_retained_native_output", metric=metric,
+                context=dict(base, **context, source_binding_eligible=True, native_nanoseconds=clock[field]),
+                work={"unit": "normalized_output_rows", "units": clock["rows"], "pages": clock["pages"]})
+    for field, metric in (("native_workflow_wall_ns", "wall_seconds"), ("native_workflow_process_cpu_ns", "process_cpu_seconds")):
+        ledger.add(workflow="preparation:retained_dune", stage="all_complete_retained_partitions",
+            seconds=timing[field] / 1e9, source=timing_sha, locator=field,
+            origin="observed_retained_dune_partition", outcome="verified_retained_native_output", metric=metric,
+            context=dict(base, source_binding_eligible=False, native_nanoseconds=timing[field]),
+            work={"unit": "normalized_output_rows", "units": rows_total, "pages": len(pages)})
+    return dict(partitions=len(items), native_rows=rows_total, completed_pages=len(pages),
+        retained_other_execution_pages=len(retained_pages - pages), frozen_originals_verified=len(inputs),
+        protocol_sha256=protocol_sha, readback_sha256=readback_sha, full_acquisition_verified=False)
+
+
+RETAINED_SEC_NATIVE_SCOPE = (
+    "retained_response_read_SHA_gzip_native_mapping_and_40_serial_cached_entity_workflows_with_atomic_outputs_excludes_HTTP_capture_imports_cache_staging_and_verification"
+)
+
+
+def _retained_sec_native_samples(ledger, evidence, captured):
+    import polars as pl
+
+    require = _replay_require
+    (timing, timing_sha), (protocol, protocol_sha), (results, results_sha), (readback, readback_sha) = captured
+    require(all(isinstance(row, dict) for row in (timing, protocol, readback)) and isinstance(results, list),
+            "SEC replay bundle shape differs")
+    require(timing.get("state") == "measured_all_retained_native_SEC_mapping_and_entities"
+            and timing.get("scope") == RETAINED_SEC_NATIVE_SCOPE and timing.get("profiler_enabled") is False
+            and type(timing.get("new_provider_calls")) is int and timing["new_provider_calls"] == 0
+            and all(timing.get(key) is True for key in ("native_result_requests_are_replayed_metadata",
+                "retrieval_and_manifest_clocks_supplied_from_retained_originals",
+                "missing_companyfacts_branch_is_receipt_supplied_not_observed_HTTP_status",
+                "native_source_loaded_from_exact_archive"))
+            and timing.get("full_external_acquisition_verified") is False
+            and timing.get("global_source_bindings_recomputed") is False, "SEC replay clock scope differs")
+    require(protocol.get("state") == "prepared_complete_retained_SEC_mapping_and_40_entity_replays"
+            and all(protocol.get(key) is True for key in ("native_cached_document_state_preserved",
+                "complete_original_rows_manifests_and_documents_required", "numerical_values_null_masks_and_floating_bits_required",
+                "status_and_clocks_replayed_from_retained_originals",
+                "mapping_rows_are_entity_definitions_not_filing_or_companyfact_observations"))
+            and all(protocol.get(key) is False for key in ("full_external_acquisition_measured",
+                "production_worker_concurrency_reproduced", "source_bindings_globally_recomputed"))
+            and all(type(protocol.get(key)) is int and protocol[key] == 0 for key in ("new_provider_calls", "new_gpu_jobs")),
+            "SEC replay protocol scope differs")
+    require(readback.get("state") == "verified_both_complete_SEC_replays_against_all_original_rows_manifests_and_documents"
+            and readback.get("native_timing_sha256") == timing_sha
+            and all(readback.get(key) is False for key in ("full_external_acquisition_verified",
+                "production_concurrency_reproduced", "global_source_bindings_recomputed", "whole_loaded_production_identity_verified")),
+            "SEC replay readback scope differs")
+    inputs, code, original, output = _retained_replay_inputs(evidence, protocol)
+    owner = code[str(ROOT / "downloader/download_crypto_etf_history.py")]
+    root = ROOT / "data_crypto_etf"
+    config = json.loads(original(ROOT / "configs/crypto_etf_sources.json"))
+    require(config == protocol.get("config"), "SEC replay frozen config differs")
+    mapping = json.loads(original(root / "receipts/sec/company_tickers.json"))
+    require(isinstance(mapping, dict) and mapping == protocol.get("mapping_receipt") and mapping.get("missing_tickers") == [],
+            "SEC replay original mapping receipt differs")
+    mapping_raw = _replay_gzip(original(mapping["raw_path"]), evidence.max_file_bytes)
+    require(hashlib.sha256(mapping_raw).hexdigest() == mapping["raw_sha256"], "SEC replay original mapping bytes differ")
+    items, clocks, checks = protocol.get("entities"), timing.get("per_stage"), readback.get("entities")
+    require(all(isinstance(rows, list) for rows in (items, clocks, checks))
+            and len(items) == len(results) == len(checks) == 40 and len(clocks) == 41,
+            "SEC replay complete entity set differs")
+    require(all(isinstance(row, dict) for row in clocks)
+            and all(_replay_nonnegative_int(row.get(key)) for row in clocks for key in ("wall_ns", "process_cpu_ns", "native_result_requests")),
+            "SEC replay stage clocks differ")
+    require(clocks[0].get("stage") == "resolve_mapping" and type(clocks[0].get("entities")) is int
+            and clocks[0]["entities"] == mapping.get("resolved_entities") == 40,
+            "SEC replay mapping definition count differs")
+    summary = json.loads(original(root / "download_summary.json"))
+    require(isinstance(summary, dict) and isinstance(summary.get("results"), list)
+            and all(isinstance(row, dict) for row in summary["results"]), "SEC replay summary shape differs")
+    sec_results = [row for row in summary["results"] if row.get("provider") == "SEC EDGAR"]
+    original_results = {row["source_id"]: row for row in sec_results}
+    require(len(original_results) == len(sec_results) == 41
+            and original_results["sec_company_tickers"]["status"] == "complete"
+            and original_results["sec_company_tickers"]["rows"] == 40,
+            "SEC replay summary source set differs")
+    supplied, identifiers, verified, rows_total, documents, output_root = set(), set(), [], 0, 0, None
+    for item, clock, check, result in zip(items, clocks[1:], checks, results):
+        require(all(isinstance(row, dict) for row in (item, check, result)), "SEC replay entity shape differs")
+        manifest_path = item["manifest_path"]
+        manifest = json.loads(original(manifest_path))
+        require(isinstance(manifest, dict) and manifest == item.get("manifest") and manifest_path not in supplied
+                and all(_replay_nonnegative_int(manifest.get(key)) for key in ("filing_rows", "companyfact_rows")),
+                "SEC replay original manifest differs")
+        supplied.add(manifest_path)
+        cik = manifest["cik"]
+        identifier = "sec_cik_" + cik
+        identifiers.add(identifier)
+        rows = manifest["filing_rows"] + manifest["companyfact_rows"]
+        require(clock.get("stage") == "native_cached_entity" and clock.get("source_endpoint_id") == "crypto-etf:sec-edgar"
+                and clock.get("source_entity_id") == identifier and clock.get("original_manifest_path") == manifest_path
+                and type(clock.get("rows")) is int and clock["rows"] == rows
+                and type(clock.get("cached_documents")) is int and clock["cached_documents"] == len(manifest["primary_documents"])
+                and result.get("source_id") == identifier and result.get("status") == "complete"
+                and result.get("provider") == "SEC EDGAR" and type(result.get("rows")) is int and result["rows"] == rows
+                and type(result.get("requests")) is int and result["requests"] == clock["native_result_requests"]
+                and original_results[identifier]["rows"] == rows and original_results[identifier]["status"] == "complete",
+                "SEC replay native source clock or result differs")
+        paths = result["output_paths"]
+        require(isinstance(paths, list) and all(isinstance(path, str) for path in paths), "SEC replay native paths differ")
+        filing_path, = [Path(path) for path in paths if Path(path).name == "filings.parquet"]
+        entity_root = filing_path.parents[3]
+        require(filing_path == entity_root / "normalized/sec" / cik / "filings.parquet"
+                and (output_root is None or output_root == entity_root), "SEC replay output root differs")
+        output_root = entity_root
+        expected_paths = [str(entity_root / Path(item["submissions_path"]).relative_to(root)), str(filing_path)]
+        if item["companyfacts_path"] is not None:
+            expected_paths.append(str(entity_root / Path(item["companyfacts_path"]).relative_to(root)))
+        expected_paths.extend(str(entity_root / "normalized/sec" / cik / name)
+                              for name in ("companyfacts.parquet", "manifest.json"))
+        require(paths == expected_paths, "SEC replay complete native output path list differs")
+        observed = set()
+        for filename, field in (("filings.parquet", "filing_rows"), ("companyfacts.parquet", "companyfact_rows")):
+            original_frame = pl.read_parquet(io.BytesIO(original(Path(manifest_path).parent / filename)))
+            body, _ = output(entity_root / "normalized/sec" / cik / filename)
+            actual = pl.read_parquet(io.BytesIO(body))
+            require(actual.columns == original_frame.columns and original_frame.height == manifest[field],
+                    "SEC replay ordered column or row counts differ")
+            _replay_frame_equal(actual, original_frame)
+            if original_frame.height:
+                observed.update(original_frame["retrieved_at_utc"].unique().to_list())
+        require(observed == {item["retrieved_at_utc"]}, "SEC replay original retrieval clock differs")
+        for key, hash_key in (("submissions_path", "submissions_raw_sha256"), ("companyfacts_path", "companyfacts_raw_sha256")):
+            path = item[key]
+            if path is None:
+                require(manifest[hash_key] is None and key == "companyfacts_path", "SEC replay missing response differs")
+                continue
+            raw = _replay_gzip(original(path), evidence.max_file_bytes)
+            body, _ = output(entity_root / Path(path).relative_to(root))
+            require(hashlib.sha256(raw).hexdigest() == manifest[hash_key]
+                    and raw == _replay_gzip(body, evidence.max_file_bytes), "SEC replay retained response bytes differ")
+        native_manifest_bytes, manifest_sha = output(entity_root / "normalized/sec" / cik / "manifest.json")
+        native_manifest = json.loads(native_manifest_bytes)
+        require(isinstance(native_manifest, dict), "SEC replay native manifest shape differs")
+        for document in native_manifest["primary_documents"]:
+            actual_path = Path(document["raw_path"])
+            original_path = root / actual_path.relative_to(entity_root)
+            raw = original(original_path)
+            actual, _ = output(actual_path)
+            plain = _replay_gzip(raw, evidence.max_file_bytes)
+            require(_replay_nonnegative_int(document.get("raw_bytes"))
+                    and raw == actual and hashlib.sha256(plain).hexdigest() == document["raw_sha256"]
+                    and len(plain) == document["raw_bytes"], "SEC replay cached document bytes differ")
+            document["raw_path"] = str(original_path)
+        require(native_manifest == manifest and check.get("cik") == cik and check.get("complete_rows") == rows
+                and check.get("all_ordered_values_schema_null_masks_and_float_bits_equal") is True
+                and check.get("complete_native_manifest_and_original_document_bytes_equal_after_verified_output_root_mapping") is True,
+                "SEC replay complete manifest or original oracle differs")
+        rows_total += rows
+        documents += len(manifest["primary_documents"])
+        verified.append((clock, dict(cik=cik, original_manifest_sha256=inputs[manifest_path]["sha256"],
+            native_manifest_sha256=manifest_sha, cached_documents=clock["cached_documents"],
+            original_retrieved_at_utc=item["retrieved_at_utc"], original_completed_at_utc=manifest["completed_at_utc"])))
+    expected_manifests = {path for path in inputs if Path(path).is_relative_to(root / "normalized/sec") and Path(path).name == "manifest.json"}
+    require(supplied == expected_manifests and identifiers == set(original_results) - {"sec_company_tickers"}
+            and rows_total == protocol.get("entity_data_rows") == readback.get("complete_rows")
+            and protocol.get("mapping_entity_definitions") == 40
+            and protocol.get("original_summary_SEC_rows") == rows_total + 40 == sum(r["rows"] for r in sec_results)
+            and documents == readback.get("cached_documents"), "SEC replay complete coverage differs")
+    require(type(timing.get("replay_client_calls")) is int and timing["replay_client_calls"] == 1 + 2 * len(items),
+            "SEC replay retained metadata request count differs")
+    native_mapping_bytes, _ = output(output_root / "receipts/sec/company_tickers.json")
+    native_mapping = json.loads(native_mapping_bytes)
+    expected_raw = output_root / Path(mapping["raw_path"]).relative_to(root)
+    require(native_mapping == dict(mapping, raw_path=str(expected_raw)), "SEC replay native mapping receipt differs")
+    raw, _ = output(expected_raw)
+    require(_replay_gzip(raw, evidence.max_file_bytes) == mapping_raw, "SEC replay native mapping bytes differ")
+    require(all(_replay_nonnegative_int(timing.get(key)) for key in ("native_workflow_wall_ns", "native_workflow_process_cpu_ns"))
+            and timing["native_workflow_wall_ns"] >= sum(row["wall_ns"] for row in clocks)
+            and timing["native_workflow_process_cpu_ns"] >= sum(row["process_cpu_ns"] for row in clocks),
+            "SEC replay sequential total clocks differ")
+    base = dict(contract="observed_retained_sec_native_v1", scope=RETAINED_SEC_NATIVE_SCOPE,
+        input_protocol_sha256=protocol_sha, native_results_sha256=results_sha, native_readback_sha256=readback_sha,
+        parser_source_sha256=owner["sha256"], input_identity="retained_SEC_responses_and_cached_documents",
+        new_provider_calls=0, native_result_requests_are_replayed_metadata=True, supplied_receipt_clocks=True,
+        imports_capture_cache_staging_and_verification_excluded=True, native_atomic_outputs_included=True,
+        source_cache="complete_original_document_cache_staged_before_native_clock",
+        whole_loaded_source_identity_verified=False, acquisition_completeness_verified=False,
+        production_concurrency_reproduced=False, live_readiness_verified=False, stage_totals_overlap=True)
+    for index, (clock, context) in enumerate([(clocks[0], {}), *verified]):
+        for field, metric in (("wall_ns", "wall_seconds"), ("process_cpu_ns", "process_cpu_seconds")):
+            ledger.add(workflow="preparation:retained_sec", stage=clock["stage"], seconds=clock[field] / 1e9,
+                source=timing_sha, locator=f"per_stage/{index}/{field}", origin="observed_retained_sec_native",
+                outcome="verified_retained_native_output", metric=metric,
+                context=dict(base, **context, dataset="sec-edgar", source_binding_eligible=True,
+                    native_nanoseconds=clock[field], native_result_requests=clock["native_result_requests"]),
+                work={"unit": "mapped_entity_definitions" if index == 0 else "financial_data_rows",
+                      "units": 40 if index == 0 else clock["rows"]})
+    for field, metric in (("native_workflow_wall_ns", "wall_seconds"), ("native_workflow_process_cpu_ns", "process_cpu_seconds")):
+        ledger.add(workflow="preparation:retained_sec", stage="all_retained_mapping_and_cached_entities",
+            seconds=timing[field] / 1e9, source=timing_sha, locator=field, origin="observed_retained_sec_native",
+            outcome="verified_retained_native_output", metric=metric,
+            context=dict(base, source_binding_eligible=False, native_nanoseconds=timing[field]),
+            work={"unit": "financial_data_rows", "units": rows_total, "mapping_entity_definitions": 40})
+    return dict(entities=len(items), native_rows=rows_total, mapping_entity_definitions=40,
+        cached_documents=documents, frozen_originals_verified=len(inputs), protocol_sha256=protocol_sha,
+        results_sha256=results_sha, readback_sha256=readback_sha, full_acquisition_verified=False)
+
+
+def _collect_retained_native_operations(ledger, evidence, reports, *, size, accept, kind, contract, scope_name):
+    """Explicit offline clocks require fresh independent original/output comparisons."""
+    if not reports:
+        return 0
+    from polars.exceptions import PolarsError
+    from zlib import error as ZlibError
+
+    seen, emitted = set(), 0
+    for report in reports:
+        paths = [Path(path).absolute() for path in report]
+        captured = [evidence.object(path) for path in paths]
+        if len(captured) != size or any(item is None for item in captured):
+            evidence.issues.append(dict(paths=[str(path) for path in paths], reason=scope_name + "_bundle_unavailable"))
+            continue
+        identity = tuple(item[1] for item in captured)
+        if identity in seen:
+            continue
+        pending = Ledger()
+        try:
+            result = accept(pending, evidence, captured)
+        except (KeyError, TypeError, ValueError, UnicodeError, OverflowError, OSError, EOFError,
+                PolarsError, ZlibError) as exc:
+            issue = dict(paths=[str(path) for path in paths],
+                         reason="invalid_" + scope_name + "_bundle", error_type=type(exc).__name__)
+            if isinstance(exc, RetainedReplayContractError):
+                issue["contract_violation"] = str(exc)
+            evidence.issues.append(issue)
+            continue
+        seen.add(identity)
+        ledger.samples.extend(pending.samples)
+        ledger.inventory.append(dict(kind=kind, id=str(paths[0]), contract=contract,
+            source_report_sha256=captured[0][1], coverage="observed_retained_native_stage_only", **result))
+        emitted += len(pending.samples)
+    return emitted
+
+
+def collect_retained_dune_operations(ledger, evidence, reports):
+    return _collect_retained_native_operations(ledger, evidence, reports, size=3,
+        accept=_retained_dune_partition_samples, kind="retained_dune_partition_report",
+        contract="observed_retained_dune_partition_v1", scope_name="retained_dune")
+
+
+def collect_retained_sec_operations(ledger, evidence, reports):
+    return _collect_retained_native_operations(ledger, evidence, reports, size=4,
+        accept=_retained_sec_native_samples, kind="retained_sec_native_report",
+        contract="observed_retained_sec_native_v1", scope_name="retained_sec")
+
+
 def bind_source_stages(ledger: Ledger) -> int:
     """Bind exact registered IDs; shared cycle wall is not per-source."""
     sources = {row["id"]: row for row in ledger.inventory if row["kind"] == "source_endpoint"}
     bound = defaultdict(list)
     for sample in ledger.samples:
-        prefix = {"recorded_finmind_telemetry": "finmind:", "recorded_finlab_receipt": "finlab:"}.get(sample["origin"])
-        if prefix is None or sample["context"].get("input_identity") == "producer_cycle":
+        prefix = {"recorded_finmind_telemetry": "finmind:", "recorded_finlab_receipt": "finlab:",
+                  "recorded_tej_task": "tej:", "recorded_economic_receipt": "economic:",
+                  "observed_economic_receipt_validation": "economic:",
+                  "recorded_openbb_task": "openbb:",
+                  "observed_crypto_issuer_parser": "crypto-etf:issuer:",
+                  "observed_retained_dune_partition": "dune-query:",
+                  "observed_retained_sec_native": "crypto-etf:",
+                  "recorded_tw_public_operation": "tw-public:"}.get(sample["origin"])
+        if (prefix is None or sample["context"].get("input_identity") == "producer_cycle"
+                or sample["context"].get("source_binding_eligible") is False
+                or sample["context"].get("timing_basis") == "proportional_cycle_allocation"):
             continue
-        dataset = sample["context"].get("dataset")
+        if prefix == "tej:" and (sample["context"].get("timing_basis") != "fresh_end_to_end"
+                                 or not isinstance(sample["context"].get("task_id"), str)
+                                 or not sample["context"]["task_id"]):
+            continue
+        dataset = sample["context"].get("table_id" if prefix == "tej:" else "dataset")
         identifier = prefix + dataset if isinstance(dataset, str) else None
         if identifier in sources:
             sample["source_endpoint_id"] = identifier
@@ -965,10 +2057,441 @@ def bind_source_stages(ledger: Ledger) -> int:
     return len(bound)
 
 
+def collect_known_source_inventory(ledger: Ledger, evidence: Evidence, path: Path) -> int:
+    """Retain declared historical identities; never import their old timings."""
+    captured = evidence.object(path)
+    if captured is None:
+        raise ValueError("requested known-source inventory is unavailable")
+    payload, sha = captured
+    if (not isinstance(payload, dict) or payload.get("contract") != CONTRACT
+            or not isinstance(payload.get("rows"), list)):
+        raise ValueError("unknown known-source inventory contract")
+    known = {}
+    for row in payload["rows"]:
+        if not isinstance(row, dict) or row.get("kind") != "source_endpoint":
+            continue
+        identifier = row.get("id")
+        if not isinstance(identifier, str) or not identifier or identifier in known:
+            raise ValueError("invalid or duplicate known-source identity")
+        known[identifier] = row
+    if not known:
+        raise ValueError("known-source inventory has no source identities")
+    inventory_path = str(path.absolute())
+    existing = next((row for row in ledger.inventory
+                     if row["kind"] == "known_source_inventory" and row["id"] == inventory_path), None)
+    if existing is not None:
+        if existing.get("source_sha256") != sha:
+            raise ValueError("known-source inventory identity changed within collection")
+        return 0
+    present = {row["id"] for row in ledger.inventory if row["kind"] == "source_endpoint"}
+    missing = sorted(known.keys() - present)
+    for identifier in missing:
+        row = known[identifier]
+        ledger.inventory.append({
+            "kind": "source_endpoint", "id": identifier, "category": "acquisition",
+            "provider": row.get("provider"), "active_scope": None, "service_keys": [],
+            "snapshot_at_utc": row.get("snapshot_at_utc"),
+            "historical_active_scope": row.get("historical_active_scope", row.get("active_scope")),
+            "historical_service_keys": row.get("historical_service_keys", row.get("service_keys")),
+            "registry_presence": "historical_identity_missing_from_current_snapshot",
+            "current_visibility_verified": False, "live_readiness_verified": False,
+            "known_inventory_path": inventory_path, "known_inventory_sha256": sha,
+            "coverage": "historical_source_identity_operation_timing_not_bound",
+            "next_measurement": "retain known identity; verify current visibility and measure remaining source workflow; historical service state is not current health",
+        })
+    ledger.inventory.append({
+        "kind": "known_source_inventory", "id": inventory_path, "category": "operations",
+        "contract": "known_source_identity_scope_v1", "source_sha256": sha,
+        "declared_identities": len(known), "already_present_identities": len(known) - len(missing),
+        "historical_identities_added": len(missing), "old_timings_imported": 0,
+        "current_snapshot_retained": True,
+    })
+    return len(missing)
+
+
+def collect_source_operation(ledger, row, sha, *, locator, owner, origin=None):
+    """Consume only the named direct-clock ABI, with exact source identity."""
+    from downloader.operation_timing import CONTRACT
+    if not isinstance(row, dict):
+        return
+    timing = row.get("operation_timing") or {}
+    scheduler = row.get("scheduler_timing") or {}
+    scheduler_valid = (isinstance(scheduler, dict) and scheduler.get("contract") == "openbb_scheduler_monotonic_v1"
+                       and scheduler.get("clock") == "monotonic")
+    scopes = {"acquire_return_including_receipt_publication", "payloads_verified_before_receipt_publication",
+              "failure_before_attempt_publication", "worker_return_before_discovery_and_manifest_commit",
+              "verified_receipt_readonly"}
+    if owner == "tw-public":
+        scopes = {"native_dataset_dispatch_excludes_executor_queue_timing_log_parent_reports_and_later_audits"}
+        from downloader.release_archive_timing import SCOPE as release_scope
+        scopes.add(release_scope)
+    valid = (isinstance(timing, dict) and timing.get("contract") == CONTRACT
+             and timing.get("clock") == "perf_counter_ns" and timing.get("invalid_clock") is False
+             and timing.get("scope") in scopes and finite_seconds(timing.get("seconds")))
+    if not valid and not scheduler_valid:
+        return
+    if not valid:
+        timing = {}
+    provider, dataset = row.get("provider"), row.get("dataset")
+    if not isinstance(provider, str) or not provider or (owner == "economic" and not isinstance(dataset, str)):
+        return
+    origin = origin or ("recorded_economic_receipt" if owner == "economic" else "recorded_openbb_task")
+    stages = timing.get("stages", [])
+    if not isinstance(stages, list):
+        return
+    context = {"dataset": f"{provider}:{dataset}" if owner == "economic" else provider,
+               "provider": provider, "endpoint": row.get("endpoint"), "task_id": row.get("task_id"),
+               "query_fingerprint": row.get("query_fingerprint"), "observed_at_utc": row.get("observed_at_utc"),
+               "clock_basis": "producer_monotonic", "timing_scope": timing.get("scope", "scheduler_only"),
+               "input_identity": "source_receipt" if owner == "economic" else "manifest_task",
+               "source_binding_eligible": (row.get("source_binding_eligible", True) if owner == "economic"
+                                           else row.get("declared_providers") == [provider]),
+               "transport_scope": "adapter/fetch may include limiter, retries, local cache and parsing; not pure HTTP latency"}
+    if owner == "tw-public":
+        context.update(row.get("native_context", {}))
+        release_collect = timing.get("scope") == release_scope
+        context.update(dataset=dataset, input_identity=("native_release_archive_collect" if release_collect
+                                                       else "native_dataset_dispatch"),
+                       source_binding_eligible=row.get("source_binding_eligible") is True)
+        workflow = f"tw-public:{dataset}"
+    else:
+        workflow = f"{owner}:{provider}:{dataset or row.get('endpoint')}"
+    if valid:
+        stage = "producer_collect_total" if owner == "tw-public" and release_collect else "producer_call_total"
+        ledger.add(workflow=workflow, stage=stage, seconds=timing["seconds"], source=sha,
+                   locator=locator + "/operation_timing/seconds", origin=origin, outcome=str(row.get("status")), context=context)
+    for index, stage in enumerate(stages):
+        if (not isinstance(stage, dict) or not isinstance(stage.get("stage"), str)
+                or not finite_seconds(stage.get("seconds")) or stage["seconds"] > timing["seconds"]):
+            continue
+        stage_context = dict(context)
+        if owner == "openbb":
+            stage_provider = stage.get("provider")
+            if not isinstance(stage_provider, str) or stage_provider not in row.get("declared_providers", []):
+                continue
+            stage_context.update(dataset=stage_provider, provider=stage_provider, source_binding_eligible=True)
+        stage_context["stage_outcome"] = stage.get("outcome")
+        ledger.add(workflow=workflow, stage=stage["stage"], seconds=stage["seconds"], source=sha,
+                   locator=f"{locator}/operation_timing/stages/{index}", origin=origin,
+                   outcome=str(row.get("status")), context=stage_context)
+    if scheduler_valid:
+        for field in ("executor_queue_seconds", "worker_and_discovery_seconds", "discovery_seconds", "submit_to_reap_seconds"):
+            ledger.add(workflow=workflow, stage=field, seconds=scheduler.get(field), source=sha,
+                       locator=locator + "/scheduler_timing/" + field, origin=origin,
+                       outcome=str(row.get("status")), context={**context, "clock_basis": "producer_monotonic_scheduler"})
+
+
+def _tw_public_journal_operation(entry, registry):
+    from dataclasses import asdict
+
+    if not isinstance(entry, dict):
+        raise ValueError("invalid_journal_entry")
+    message = entry.get("MESSAGE", "")
+    if isinstance(message, list):
+        if not all(type(value) is int and 0 <= value <= 255 for value in message):
+            raise ValueError("invalid_journal_message_bytes")
+        message = bytes(message).decode("utf-8")
+    if not isinstance(message, str):
+        raise ValueError("invalid_journal_message")
+    prefix = "[tw-public:operation-timing] "
+    if prefix not in message:
+        return None
+    offset = message.index(prefix) + len(prefix)
+    event, consumed = json.JSONDecoder().raw_decode(message[offset:])
+    if message[offset + consumed:].strip() or not isinstance(event, dict):
+        raise ValueError("invalid_native_timing_json")
+    if event.get("contract") != "tw_public_dataset_operation_timing_v1":
+        raise ValueError("unknown_native_timing_contract")
+    timing = event.get("operation_timing")
+    scope = "native_dataset_dispatch_excludes_executor_queue_timing_log_parent_reports_and_later_audits"
+    if (not isinstance(timing, dict) or timing.get("contract") != "source_operation_monotonic_v1"
+            or timing.get("clock") != "perf_counter_ns" or timing.get("invalid_clock") is not False
+            or timing.get("scope") != scope or not finite_seconds(timing.get("seconds"))
+            or timing.get("stages") != [] or type(timing.get("started_monotonic_ns")) is not int
+            or timing["started_monotonic_ns"] < 0):
+        raise ValueError("invalid_native_operation_clock")
+    dataset = event.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise ValueError("invalid_native_dataset")
+    for field in ("dataset_spec_sha256", "request_policy_sha256"):
+        if not isinstance(event.get(field), str) or re.fullmatch(r"[0-9a-f]{64}", event[field]) is None:
+            raise ValueError("invalid_native_configuration_identity")
+    for field in ("producer_pid", "producer_thread_id"):
+        if type(event.get(field)) is not int or event[field] <= 0:
+            raise ValueError("invalid_native_producer_identity")
+    if str(event["producer_pid"]) != entry.get("_PID"):
+        raise ValueError("journal_producer_pid_differs")
+    unit = entry.get("_SYSTEMD_UNIT")
+    if not isinstance(unit, str) or re.fullmatch(r"stockagent-[A-Za-z0-9_.@:-]+\.service", unit) is None:
+        raise ValueError("unknown_native_journal_owner")
+    for field in ("_BOOT_ID", "_SYSTEMD_INVOCATION_ID"):
+        if not isinstance(entry.get(field), str) or re.fullmatch(r"[0-9a-f]{32}", entry[field]) is None:
+            raise ValueError("invalid_journal_invocation_identity")
+    if "work_units_denominator" not in event or event["work_units_denominator"] is not None:
+        raise ValueError("native_work_denominator_contract_differs")
+    for field in ("clock_is_source_publication_time", "configuration_is_resolved_request_range",
+                  "acquisition_completeness_verified", "live_readiness_verified"):
+        if event.get(field) is not False:
+            raise ValueError("native_observation_boundary_differs")
+    spec = registry.get(dataset)
+    known = spec is not None and digest(asdict(spec)) == event["dataset_spec_sha256"]
+    eligible = (known and event.get("dataset_kind") == spec.kind
+                and spec.kind in {"historical_json_table", "delisted_history", "snapshot_url",
+                                  "data_gov", "gcis_catalog", "fsc_catalog"}
+                and event.get("source_binding_eligible") is True
+                and event.get("source_endpoint_id") == "tw-public:" + dataset
+                and event.get("returned_dataset") == dataset
+                and event.get("result_dataset_matches_request") is True
+                and event.get("outcome") == "returned"
+                and isinstance(event.get("status"), str) and event["status"] != "unsupported")
+    identity = (entry["_BOOT_ID"], entry["_SYSTEMD_INVOCATION_ID"], event["producer_pid"],
+                event["producer_thread_id"], timing["started_monotonic_ns"], dataset)
+    context = {"producer_pid": event["producer_pid"], "producer_thread_id": event["producer_thread_id"],
+        "producer_started_monotonic_ns": timing["started_monotonic_ns"],
+        "dataset_spec_sha256": event["dataset_spec_sha256"],
+        "request_policy_sha256": event["request_policy_sha256"],
+        "journal_unit": unit, "journal_boot_id": entry["_BOOT_ID"],
+        "journal_invocation_id": entry["_SYSTEMD_INVOCATION_ID"],
+        "native_outcome": event.get("outcome"), "native_event_sha256": digest(event),
+        "configuration_is_resolved_request_range": False,
+        "whole_loaded_source_identity_verified": False,
+        "acquisition_completeness_verified": False, "live_readiness_verified": False,
+        "work_units_denominator": None}
+    return {"identity": identity, "event_sha256": context["native_event_sha256"],
+        "row": {"provider": "tw_public", "dataset": dataset, "status": event.get("status"),
+                "observed_at_utc": event.get("observed_at_utc"), "operation_timing": timing,
+                "source_binding_eligible": eligible, "native_context": context}}
+
+
+def _tw_public_release_journal_operation(entry):
+    """Decode the distinct collect clock; the shared journal owner handles evidence and deduplication."""
+    from downloader.release_archive_timing import CONTRACT as release_contract, PREFIX, SCOPE, SOURCES
+
+    if not isinstance(entry, dict):
+        raise ValueError("invalid_journal_entry")
+    message = entry.get("MESSAGE", "")
+    if isinstance(message, list):
+        if not all(type(value) is int and 0 <= value <= 255 for value in message):
+            raise ValueError("invalid_journal_message_bytes")
+        message = bytes(message).decode("utf-8")
+    if not isinstance(message, str):
+        raise ValueError("invalid_journal_message")
+    if PREFIX not in message:
+        return None
+    offset = message.index(PREFIX) + len(PREFIX)
+    event, consumed = json.JSONDecoder().raw_decode(message[offset:])
+    if message[offset + consumed:].strip() or not isinstance(event, dict):
+        raise ValueError("invalid_release_timing_json")
+    if event.get("contract") != release_contract:
+        raise ValueError("unknown_release_timing_contract")
+    timing = event.get("operation_timing")
+    if (not isinstance(timing, dict) or timing.get("contract") != "source_operation_monotonic_v1"
+            or timing.get("clock") != "perf_counter_ns" or timing.get("invalid_clock") is not False
+            or timing.get("scope") != SCOPE or not finite_seconds(timing.get("seconds"))
+            or timing.get("stages") != [] or type(timing.get("started_monotonic_ns")) is not int
+            or timing["started_monotonic_ns"] < 0):
+        raise ValueError("invalid_release_operation_clock")
+    dataset = event.get("dataset")
+    if not isinstance(dataset, str) or not dataset:
+        raise ValueError("invalid_release_dataset")
+    if (not isinstance(event.get("definition_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", event["definition_sha256"]) is None):
+        raise ValueError("invalid_release_definition_identity")
+    for field in ("producer_pid", "producer_thread_id"):
+        if type(event.get(field)) is not int or event[field] <= 0:
+            raise ValueError("invalid_release_producer_identity")
+    if str(event["producer_pid"]) != entry.get("_PID"):
+        raise ValueError("journal_producer_pid_differs")
+    unit = entry.get("_SYSTEMD_UNIT")
+    if not isinstance(unit, str) or re.fullmatch(r"stockagent-[A-Za-z0-9_.@:-]+\.service", unit) is None:
+        raise ValueError("unknown_release_journal_owner")
+    for field in ("_BOOT_ID", "_SYSTEMD_INVOCATION_ID"):
+        if not isinstance(entry.get(field), str) or re.fullmatch(r"[0-9a-f]{32}", entry[field]) is None:
+            raise ValueError("invalid_journal_invocation_identity")
+    if "work_units_denominator" not in event or event["work_units_denominator"] is not None:
+        raise ValueError("release_work_denominator_contract_differs")
+    for field in ("clock_is_source_publication_time", "configuration_is_resolved_request_range",
+                  "whole_loaded_source_identity_verified", "acquisition_completeness_verified",
+                  "live_readiness_verified"):
+        if event.get(field) is not False:
+            raise ValueError("release_observation_boundary_differs")
+    definition = {"dataset": dataset, "producer_file": SOURCES.get(dataset),
+                  "producer_function": "collect", "timing_scope": SCOPE}
+    definition_sha = hashlib.sha256(json.dumps(definition, sort_keys=True).encode()).hexdigest()
+    eligible = (dataset in SOURCES and event["definition_sha256"] == definition_sha
+                and event.get("producer_file") == SOURCES[dataset]
+                and event.get("producer_function") == "collect"
+                and event.get("source_binding_eligible") is True
+                and event.get("source_endpoint_id") == "tw-public:" + dataset
+                and event.get("returned_dataset") == dataset
+                and event.get("result_dataset_matches_request") is True
+                and event.get("outcome") == "returned"
+                and isinstance(event.get("status"), str) and event["status"] != "unsupported")
+    identity = (release_contract, entry["_BOOT_ID"], entry["_SYSTEMD_INVOCATION_ID"],
+                event["producer_pid"], event["producer_thread_id"], timing["started_monotonic_ns"], dataset)
+    context = {"producer_pid": event["producer_pid"], "producer_thread_id": event["producer_thread_id"],
+        "producer_started_monotonic_ns": timing["started_monotonic_ns"],
+        "native_timing_contract": release_contract, "definition_sha256": event["definition_sha256"],
+        "producer_file": event.get("producer_file"), "producer_function": event.get("producer_function"),
+        "journal_unit": unit, "journal_boot_id": entry["_BOOT_ID"],
+        "journal_invocation_id": entry["_SYSTEMD_INVOCATION_ID"],
+        "native_outcome": event.get("outcome"), "native_event_sha256": digest(event),
+        "configuration_is_resolved_request_range": False,
+        "whole_loaded_source_identity_verified": False,
+        "acquisition_completeness_verified": False, "live_readiness_verified": False,
+        "work_units_denominator": None,
+        "transport_scope": "collect includes final state write; excludes CLI admission, outer locks and logging; not pure HTTP latency"}
+    return {"identity": identity, "event_sha256": context["native_event_sha256"],
+        "row": {"provider": "tw_public", "dataset": dataset, "status": event.get("status"),
+                "observed_at_utc": event.get("observed_at_utc"), "operation_timing": timing,
+                "source_binding_eligible": eligible, "native_context": context}}
+
+
+def collect_tw_public_operations(ledger, evidence, paths, *, registry=None):
+    """Freeze supplied journals; bind exact native dispatch and release collect clocks.
+
+    Overlapping journal exports do not multiply a call. Conflicting observations
+    retain their distinct durations but cannot establish source-stage coverage.
+    No journal/provider process is started here.
+    """
+    if not paths:
+        return 0
+    if registry is None:
+        from downloader.download_tw_public_data import EXTENDED_DATASETS
+        registry = EXTENDED_DATASETS
+    groups, observations, statistics_by_path = defaultdict(dict), [], {}
+    for path in paths:
+        path = Path(path)
+        key = str(path.absolute())
+        if key in statistics_by_path:
+            continue
+        captured = evidence.read(path)
+        if captured is None:
+            continue
+        raw, sha = captured
+        counts = {"kind": "source_clock_journal", "id": key, "source_sha256": sha,
+            "contract": "tw_public_operation_journal_ingestion_v1",
+            "native_events": 0, "unique_events_emitted": 0, "duplicate_events": 0,
+            "conflicting_events": 0, "invalid_entries": 0,
+            "scope": "frozen journal native dispatch observations; not acquisition E2E or verified loaded code"}
+        statistics_by_path[key] = counts
+        for index, line in enumerate(raw.splitlines()):
+            try:
+                entry = json.loads(line)
+                value = _tw_public_journal_operation(entry, registry)
+                if value is None:
+                    value = _tw_public_release_journal_operation(entry)
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                counts["invalid_entries"] += 1
+                evidence.issues.append({"path": key, "line": index + 1,
+                                        "reason": "invalid_tw_public_journal_operation"})
+                continue
+            if value is None:
+                continue
+            if value["row"]["native_context"].get("native_timing_contract") == "tw_public_release_archive_operation_timing_v1":
+                counts["contract"] = "tw_public_operation_journal_ingestion_v2"
+                counts["scope"] = "frozen journal native dispatch and release collect observations; not acquisition E2E or verified loaded code"
+            counts["native_events"] += 1
+            family = groups[value["identity"]]
+            if value["event_sha256"] in family:
+                counts["duplicate_events"] += 1
+                continue
+            value.update(source_sha256=sha, locator=f"journal/lines/{index + 1}", counts=counts)
+            family[value["event_sha256"]] = value
+            observations.append(value)
+    for value in observations:
+        conflict = len(groups[value["identity"]]) > 1
+        row = value["row"]
+        row["native_context"]["native_operation_conflict"] = conflict
+        if conflict:
+            row["source_binding_eligible"] = False
+            value["counts"]["conflicting_events"] += 1
+            evidence.issues.append({"path": value["counts"]["id"], "locator": value["locator"],
+                                    "reason": "conflicting_tw_public_native_operation"})
+        collect_source_operation(ledger, row, value["source_sha256"], locator=value["locator"],
+                                 owner="tw-public", origin="recorded_tw_public_operation")
+        value["counts"]["unique_events_emitted"] += 1
+    ledger.inventory.extend(statistics_by_path.values())
+    return len(observations)
+
+
+def collect_economic_operations(ledger, evidence, root):
+    for kind, pattern in (("status", "*.json"), ("receipts", "*/*.json"), ("attempts", "*/*.json")):
+        for path in sorted((root / kind).glob(pattern)):
+            captured = evidence.object(path)
+            if not captured or not isinstance(captured[0], dict):
+                continue
+            payload, sha = captured
+            rows = payload.get("datasets", []) if kind == "status" else [payload]
+            for index, row in enumerate(rows):
+                if isinstance(row, dict):
+                    collect_source_operation(ledger, row, sha, locator=f"{kind}/{index}", owner="economic")
+    summary = root / "download_summary.json"
+    if summary.is_file():
+        captured = evidence.object(summary)
+        if captured and isinstance(captured[0], dict):
+            for index, row in enumerate(captured[0].get("datasets", [])):
+                collect_source_operation(ledger, row, captured[1], locator=f"download_summary/datasets/{index}", owner="economic")
+
+
+def collect_openbb_operations(ledger, evidence, root):
+    """Bounded query-only snapshot of native committed latest task clocks."""
+    from downloader.operation_timing import OPENBB_META_PREFIX
+    state_path = root / "_state/provider_scheduler.json"
+    if state_path.is_file():
+        captured = evidence.object(state_path)
+        if captured and isinstance(captured[0], dict):
+            batch = captured[0].get("last_completion_timing") or {}
+            from downloader.operation_timing import CONTRACT
+            if (isinstance(batch, dict) and batch.get("contract") == CONTRACT and batch.get("invalid_clock") is False
+                    and batch.get("scope") == "manifest_completion_batch_including_commit_and_terminal_quarantine"):
+                ledger.add(workflow="openbb:completion_batch", stage="manifest_commit_and_quarantine",
+                           seconds=batch.get("seconds"), source=captured[1], locator="last_completion_timing/seconds",
+                           origin="recorded_openbb_completion_batch", context={"input_identity": "producer_batch",
+                           "task_ids": batch.get("task_ids"), "allocation": "whole batch; never per source"},
+                           work={"units": batch.get("task_count"), "unit": "completed_tasks"})
+    path = root / "_state/openbb_archive.sqlite3"
+    if not path.is_file():
+        return
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=.5)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        deadline = time.monotonic() + 3
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        connection.execute("BEGIN")
+        query = "SELECT key,value,updated_at FROM archive_meta WHERE key>=? AND key<? ORDER BY key LIMIT 4097"
+        rows = [dict(zip(("key", "value", "updated_at"), row)) for row in connection.execute(
+            query, (OPENBB_META_PREFIX, "operation_timing_v1;"))]
+    except sqlite3.Error as exc:
+        evidence.issues.append({"path": str(path), "reason": type(exc).__name__})
+        return
+    finally:
+        connection.rollback()
+        connection.close()
+    snapshot = evidence.output / "openbb_operation_observation.json"
+    atomic_write_json(snapshot, {"database": str(path), "query": query, "rows": rows[:4096],
+                                "selection_limit": 4096, "selection_truncated": len(rows) > 4096,
+                                "scope": "latest native committed sample per provider/endpoint/outcome; not complete task history"})
+    captured = evidence.object(snapshot)
+    if captured:
+        for index, row in enumerate(rows[:4096]):
+            try:
+                payload = json.loads(row["value"])
+            except (TypeError, ValueError):
+                evidence.issues.append({"path": str(path), "reason": "invalid_operation_timing_json", "key": row["key"]})
+                continue
+            if isinstance(payload, dict):
+                collect_source_operation(ledger, payload, captured[1], locator=f"rows/{index}", owner="openbb")
+
+
 def collect_benchmark(ledger: Ledger, payload, sha: str, path: Path) -> None:
     """Explicitly selected producer samples; full receipt retains acceptance."""
     if not isinstance(payload, dict):
         return
+    if payload.get("contract") == "economic_receipt_validation_v1":
+        for index, row in enumerate(payload.get("sources", [])):
+            collect_source_operation(ledger, row, sha, locator=f"sources/{index}", owner="economic",
+                                     origin="observed_economic_receipt_validation")
     workflow = f"benchmark:{path.parent.name}/{path.stem}"
     history = payload.get("local_history")
     if isinstance(history, dict) and isinstance(history.get("samples"), list):
@@ -1221,107 +2744,148 @@ def verify_collection(output: Path) -> dict:
         require(path.stat().st_size == expected["bytes"] and actual.hexdigest() == expected["sha256"],
                 f"final output differs: {name}")
     manifest = json.loads((output / "evidence_manifest.json").read_bytes())
-    snapshots, source_shas = {}, set()
-    sources_by_path = {row["path"]: row for row in manifest["files"]}
-    negative_rows = [row for row in manifest["files"] if row["state"] == "not_timing_evidence"]
-    reused_inspections = 0
-    for row in negative_rows:
-        require(row.get("classification") in {"no_possible_timing_tokens", "parsed_no_reported_timing_fields"},
-                "unknown non-timing classification")
-        require(re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", "")) is not None
-                and isinstance(row.get("bytes"), int) and row["bytes"] >= 0,
-                "invalid non-timing content identity")
-        reused = row.get("classification_reused_from_sha256")
-        if reused:
-            source = sources_by_path.get(row.get("classification_source_path"), {})
-            require(reused == row["sha256"] and source.get("path") != row["path"]
-                    and source.get("state") == "not_timing_evidence"
-                    and all(source.get(key) == row[key] for key in ("sha256", "bytes", "classification"))
-                    and not source.get("classification_reused_from_sha256")
-                    and row.get("json_parsed") is False,
-                    "non-timing classification reuse identity differs")
-            reused_inspections += 1
-    if "non_timing_inspections_reused" in report:
-        require(reused_inspections == report["non_timing_inspections_reused"], "inspection reuse count differs")
-    for row in manifest["files"]:
-        if row["state"] != "captured":
-            continue
-        source_shas.add(row["sha256"])
-        if row["snapshot"] not in snapshots:
-            with gzip.open(local(row["snapshot"]), "rb") as handle:
-                actual, size = hashlib.sha256(), 0
-                while block := handle.read(1 << 20):
-                    actual.update(block)
-                    size += len(block)
-            snapshots[row["snapshot"]] = (actual.hexdigest(), size)
-        require(snapshots[row["snapshot"]] == (row["sha256"], row["bytes"]),
-                "frozen producer SHA or byte count differs")
-    native_backend_verified = 0
-    backend = report.get("metric_backend", {})
-    if backend.get("selected") == "cpp":
-        for path_key, sha_key in (("source_path", "source_sha256"), ("module_path", "module_sha256"),
-                                  ("build_receipt", "build_receipt_sha256")):
-            source = sources_by_path.get(backend.get(path_key), {})
-            require(source.get("state") == "captured" and source.get("sha256") == backend.get(sha_key),
-                    "native backend has no matching frozen identity")
-        build_source = sources_by_path[backend["build_receipt"]]
-        build = json.loads(gzip.decompress(local(build_source["snapshot"]).read_bytes()))
-        require(build.get("contract") == "source_bound_metric_tree_cpp_build_v1"
-                and build.get("identity", {}).get("source_sha256") == backend["source_sha256"]
-                and build.get("module_sha256") == backend["module_sha256"],
-                "native backend build identity differs")
-        environment = json.loads((output / "environment.json").read_bytes())
-        require(build["identity"].get("python") == environment.get("python"),
-                "native backend build runtime differs")
-        native_backend_verified = 1
-    groups, origins = defaultdict(list), Counter()
-    with (output / "speed_samples.jsonl").open(encoding="utf-8") as handle:
-        for line in handle:
-            row = json.loads(line)
-            require(finite_seconds(row["seconds"]), "invalid speed sample")
-            require(row["source_sha256"] in source_shas, "sample has no frozen producer")
-            require(row["context_id"] == digest(row["context"]), "sample context identity differs")
-            units = row["work"].get("units")
-            rate = units / row["seconds"] if finite_seconds(units) and row["seconds"] > 0 else None
-            require(row["units_per_second"] == rate, "throughput denominator differs")
-            key = tuple(row[k] for k in ("workflow_id", "stage", "metric", "origin", "outcome", "context_id"))
-            groups[key].append(row["seconds"])
-            origins[row["origin"]] += 1
-    require(sum(origins.values()) == report["speed_samples"] and dict(origins) == report["sample_counts"],
-            "sample count differs")
-    seen = set()
-    with (output / "speed_summary.csv").open(encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            key = tuple(row[k] for k in ("workflow_id", "stage", "metric", "origin", "outcome", "context_id"))
-            require(key in groups and key not in seen, "missing or duplicate summary group")
-            values = groups[key]
-            require(int(row["samples"]) == len(values), "summary count differs")
-            for field, expected in (("median_seconds", statistics.median(values)),
-                                    ("min_seconds", min(values)), ("max_seconds", max(values))):
-                require(float(row[field]) == expected, f"summary {field} differs")
-            seen.add(key)
-    require(len(seen) == len(groups) == report["summary_groups"], "summary coverage differs")
-    inventory = json.loads((output / "inventory.json").read_bytes())["rows"]
-    require(dict(Counter(row["kind"] for row in inventory)) == report["inventory_counts"], "inventory count differs")
-    phases = report.get("phase_timings", {})
-    if "phase_timings" in report:
-        require(isinstance(phases, dict) and bool(phases), "invalid collector phase timings")
-        for row in phases.values():
-            require(isinstance(row, dict) and all(finite_seconds(row.get(key)) for key in ("wall_seconds", "cpu_seconds")),
-                    "invalid collector phase duration")
-        require(finite_seconds(report.get("pre_manifest_wall_seconds"))
-                and math.isclose(sum(row["wall_seconds"] for row in phases.values()),
-                                 report["pre_manifest_wall_seconds"], rel_tol=1e-9, abs_tol=1e-7),
-                "collector phase total differs")
-    return {"contract": "workflow_speed_evidence_readback_v1", "state": "verified",
-            "observed_at_utc": datetime.now(UTC).isoformat(), "collection": str(output),
-            "collection_sha256": hashlib.sha256(report_raw).hexdigest(),
-            "outputs_verified": len(report["outputs"]), "unique_originals_verified": len(snapshots),
-            "speed_samples_verified": sum(origins.values()), "summary_groups_verified": len(groups),
-            "collector_phases_verified": len(phases),
-            "native_metric_backend_verified": native_backend_verified,
-            "non_timing_identities_recorded": len(negative_rows), "classification_reuse_links_verified": reused_inspections,
-            "scope": "frozen-byte integrity, duration domain, source links, throughput, independent CSV regrouping and non-timing classification identity links; non-timing payloads are not frozen/read back; coverage gaps and producer acceptance remain explicit"}
+    validate_manifest_storage(manifest)
+    with PinnedSnapshotStreams(output, local, storage=manifest.get("snapshot_storage")) as snapshot_streams:
+        snapshots, source_shas = {}, set()
+        sources_by_path = {row["path"]: row for row in manifest["files"]}
+        negative_rows = [row for row in manifest["files"] if row["state"] == "not_timing_evidence"]
+        reused_inspections = 0
+        for row in negative_rows:
+            require(row.get("classification") in {"no_possible_timing_tokens", "parsed_no_reported_timing_fields"},
+                    "unknown non-timing classification")
+            require(re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", "")) is not None
+                    and isinstance(row.get("bytes"), int) and row["bytes"] >= 0,
+                    "invalid non-timing content identity")
+            reused = row.get("classification_reused_from_sha256")
+            if reused:
+                source = sources_by_path.get(row.get("classification_source_path"), {})
+                require(reused == row["sha256"] and source.get("path") != row["path"]
+                        and source.get("state") == "not_timing_evidence"
+                        and all(source.get(key) == row[key] for key in ("sha256", "bytes", "classification"))
+                        and not source.get("classification_reused_from_sha256")
+                        and row.get("json_parsed") is False,
+                        "non-timing classification reuse identity differs")
+                reused_inspections += 1
+        if "non_timing_inspections_reused" in report:
+            require(reused_inspections == report["non_timing_inspections_reused"], "inspection reuse count differs")
+        for row in manifest["files"]:
+            if row["state"] != "captured":
+                continue
+            source_shas.add(row["sha256"])
+            if row["snapshot"] not in snapshots:
+                with snapshot_streams.open(row["snapshot"]) as handle:
+                    actual, size = hashlib.sha256(), 0
+                    while block := handle.read(1 << 20):
+                        actual.update(block)
+                        size += len(block)
+                snapshots[row["snapshot"]] = (actual.hexdigest(), size)
+            require(snapshots[row["snapshot"]] == (row["sha256"], row["bytes"]),
+                    "frozen producer SHA or byte count differs")
+        native_backend_verified = 0
+        backend = report.get("metric_backend", {})
+        if backend.get("selected") == "cpp":
+            for path_key, sha_key in (("source_path", "source_sha256"), ("module_path", "module_sha256"),
+                                      ("build_receipt", "build_receipt_sha256")):
+                source = sources_by_path.get(backend.get(path_key), {})
+                require(source.get("state") == "captured" and source.get("sha256") == backend.get(sha_key),
+                        "native backend has no matching frozen identity")
+            build_source = sources_by_path[backend["build_receipt"]]
+            build = snapshot_json(snapshot_streams, build_source["snapshot"])
+            require(build.get("contract") == "source_bound_metric_tree_cpp_build_v1"
+                    and build.get("identity", {}).get("source_sha256") == backend["source_sha256"]
+                    and build.get("module_sha256") == backend["module_sha256"],
+                    "native backend build identity differs")
+            environment = json.loads((output / "environment.json").read_bytes())
+            require(build["identity"].get("python") == environment.get("python"),
+                    "native backend build runtime differs")
+            native_backend_verified = 1
+        groups, origins = defaultdict(list), Counter()
+        with (output / "speed_samples.jsonl").open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                require(finite_seconds(row["seconds"]), "invalid speed sample")
+                require(row["source_sha256"] in source_shas, "sample has no frozen producer")
+                require(row["context_id"] == digest(row["context"]), "sample context identity differs")
+                units = row["work"].get("units")
+                rate = units / row["seconds"] if finite_seconds(units) and row["seconds"] > 0 else None
+                require(row["units_per_second"] == rate, "throughput denominator differs")
+                key = tuple(row[k] for k in ("workflow_id", "stage", "metric", "origin", "outcome", "context_id"))
+                groups[key].append(row["seconds"])
+                origins[row["origin"]] += 1
+        require(sum(origins.values()) == report["speed_samples"] and dict(origins) == report["sample_counts"],
+                "sample count differs")
+        seen = set()
+        with (output / "speed_summary.csv").open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                key = tuple(row[k] for k in ("workflow_id", "stage", "metric", "origin", "outcome", "context_id"))
+                require(key in groups and key not in seen, "missing or duplicate summary group")
+                values = groups[key]
+                require(int(row["samples"]) == len(values), "summary count differs")
+                for field, expected in (("median_seconds", statistics.median(values)),
+                                        ("min_seconds", min(values)), ("max_seconds", max(values))):
+                    require(float(row[field]) == expected, f"summary {field} differs")
+                seen.add(key)
+        require(len(seen) == len(groups) == report["summary_groups"], "summary coverage differs")
+        inventory = json.loads((output / "inventory.json").read_bytes())["rows"]
+        require(dict(Counter(row["kind"] for row in inventory)) == report["inventory_counts"], "inventory count differs")
+        known_inventories, known_links = {}, 0
+        source_ids = {row["id"] for row in inventory if row["kind"] == "source_endpoint"}
+        for scope in (row for row in inventory if row["kind"] == "known_source_inventory"):
+            source = sources_by_path.get(scope["id"], {})
+            require(source.get("state") == "captured" and source.get("sha256") == scope.get("source_sha256"),
+                    "known-source inventory has no frozen identity")
+            original = snapshot_json(snapshot_streams, source["snapshot"])
+            require(original.get("contract") == CONTRACT and isinstance(original.get("rows"), list),
+                    "known-source inventory contract differs")
+            rows = [r for r in original["rows"] if isinstance(r, dict) and r.get("kind") == "source_endpoint"]
+            known_inventories[scope["id"]] = {r["id"]: r for r in rows}
+            declared = known_inventories[scope["id"]]
+            added = sum(r.get("known_inventory_path") == scope["id"] for r in inventory)
+            require(bool(declared) and len(rows) == len(declared) == scope.get("declared_identities")
+                    and declared.keys() <= source_ids and added == scope.get("historical_identities_added")
+                    and scope.get("already_present_identities") == len(declared) - added
+                    and scope.get("old_timings_imported") == 0 and scope.get("current_snapshot_retained") is True,
+                    "known-source registry scope differs")
+        for row in inventory:
+            if row.get("registry_presence") == "historical_identity_missing_from_current_snapshot":
+                require(bool(row.get("known_inventory_path")), "historical identity has no inventory provenance")
+            if not row.get("known_inventory_path"):
+                continue
+            path = row["known_inventory_path"]
+            source = sources_by_path.get(path, {})
+            require(source.get("state") == "captured" and source.get("sha256") == row.get("known_inventory_sha256"),
+                    "known-source inventory has no frozen identity")
+            require(path in known_inventories, "known-source inventory has no declared scope")
+            original = known_inventories[path].get(row["id"], {})
+            require(original.get("id") == row["id"] and original.get("provider") == row.get("provider")
+                    and original.get("snapshot_at_utc") == row.get("snapshot_at_utc")
+                    and original.get("historical_active_scope", original.get("active_scope")) == row.get("historical_active_scope")
+                    and original.get("historical_service_keys", original.get("service_keys")) == row.get("historical_service_keys")
+                    and row.get("active_scope") is None and row.get("service_keys") == []
+                    and row.get("registry_presence") == "historical_identity_missing_from_current_snapshot"
+                    and row.get("current_visibility_verified") is False and row.get("live_readiness_verified") is False,
+                    "known-source identity or visibility boundary differs")
+            known_links += 1
+        phases = report.get("phase_timings", {})
+        if "phase_timings" in report:
+            require(isinstance(phases, dict) and bool(phases), "invalid collector phase timings")
+            for row in phases.values():
+                require(isinstance(row, dict) and all(finite_seconds(row.get(key)) for key in ("wall_seconds", "cpu_seconds")),
+                        "invalid collector phase duration")
+            require(finite_seconds(report.get("pre_manifest_wall_seconds"))
+                    and math.isclose(sum(row["wall_seconds"] for row in phases.values()),
+                                     report["pre_manifest_wall_seconds"], rel_tol=1e-9, abs_tol=1e-7),
+                    "collector phase total differs")
+        return {"contract": "workflow_speed_evidence_readback_v1", "state": "verified",
+                "observed_at_utc": datetime.now(UTC).isoformat(), "collection": str(output),
+                "collection_sha256": hashlib.sha256(report_raw).hexdigest(),
+                "outputs_verified": len(report["outputs"]), "unique_originals_verified": len(snapshots),
+                "speed_samples_verified": sum(origins.values()), "summary_groups_verified": len(groups),
+                "collector_phases_verified": len(phases),
+                "native_metric_backend_verified": native_backend_verified,
+                "known_source_identity_links_verified": known_links,
+                "non_timing_identities_recorded": len(negative_rows), "classification_reuse_links_verified": reused_inspections,
+                "scope": "frozen-byte integrity, duration domain, source links, throughput, independent CSV regrouping and non-timing classification identity links; non-timing payloads are not frozen/read back; coverage gaps and producer acceptance remain explicit"}
 
 
 def inspect_benchmarks(evidence: Evidence, ledger: Ledger, benchmark_paths, *, explicit_receipts=(), read_workers=0,
@@ -1439,209 +3003,270 @@ def collect(args) -> dict:
 
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    evidence = Evidence(output, max_file_bytes=args.max_file_mib << 20, max_total_bytes=args.max_total_mib << 20)
-    ledger = Ledger()
-    metric_backend = configure_metric_backend(getattr(args, "metric_backend", "auto"))
-    entries, code = visible_code(ROOT)
-    ledger.inventory.extend(entries)
-    print(json.dumps({"phase": "entrypoint_inventory", "entrypoints": len(entries)}), flush=True)
-    code_identity = digest(code)
-    atomic_write_json(output / "code_manifest.json", {"sha256": code_identity, "files": code})
-    # Retain the measurement implementation itself. Other working-tree hashes
-    # identify observed source only, not code loaded by a long-lived service or
-    # by a historical training producer.
-    measurement_sources = []
-    for name in ("scripts/profile_workflow_speeds.py", "scripts/agent_workflow.py", "scripts/runtime_env.sh",
-                 "scripts/audit_service_latency_coverage.py", "scripts/benchmark_dashboard_latency.py",
-                 "scripts/benchmark_live_inference.py", "scripts/benchmark_day_trade_persistence.py",
-                 "scripts/benchmark_dataset_version_pipeline.py", "scripts/benchmark_downloader_http.py",
-                 "scripts/benchmark_dashboard_browser.mjs", "stockagent/private_json.py",
-                 "stockagent/workflow_metric_tree.py", "stockagent/workflow_metric_tree.cpp",
-                 "stockagent/live/market_status.py", "stockagent/live/signal_engine.py",
-                 "stockagent/live/tw_day_trade_dashboard.py", "stockagent/live/completed_inference_cache.py",
-                 "stockagent/live/service_code_release.py"):
-        captured = evidence.read(ROOT / name)
-        if captured:
-            measurement_sources.append({"path": name, "sha256": captured[1]})
-    if metric_backend["selected"] == "cpp":
-        for name in ("module_path", "build_receipt"):
-            path = Path(metric_backend[name])
-            captured = evidence.read(path)
+    evidence = Evidence(output, max_file_bytes=args.max_file_mib << 20, max_total_bytes=args.max_total_mib << 20,
+                        snapshot_storage=getattr(args, "evidence_storage_layout", "individual_gzip"))
+    try:
+        ledger = Ledger()
+        metric_backend = configure_metric_backend(getattr(args, "metric_backend", "auto"))
+        code_inventory_resources = {}
+        entries, code = visible_code(ROOT, workers=getattr(args, "code_inventory_workers", 0),
+                                     observations=code_inventory_resources)
+        ledger.inventory.extend(entries)
+        print(json.dumps({"phase": "entrypoint_inventory", "entrypoints": len(entries)}), flush=True)
+        code_identity = digest(code)
+        atomic_write_json(output / "code_manifest.json", {"sha256": code_identity, "files": code})
+        # Retain the measurement implementation itself. Other working-tree hashes
+        # identify observed source only, not code loaded by a long-lived service or
+        # by a historical training producer.
+        measurement_sources = []
+        for name in ("scripts/profile_workflow_speeds.py", "scripts/agent_workflow.py", "scripts/runtime_env.sh",
+                     "scripts/audit_service_latency_coverage.py", "scripts/benchmark_dashboard_latency.py",
+                     "scripts/benchmark_live_inference.py", "scripts/benchmark_day_trade_persistence.py",
+                     "scripts/benchmark_dataset_version_pipeline.py", "scripts/benchmark_downloader_http.py",
+                     "scripts/benchmark_dashboard_browser.mjs", "stockagent/private_json.py",
+                     "stockagent/workflow_metric_tree.py", "stockagent/workflow_metric_tree.cpp",
+                     "stockagent/workflow_snapshot_streams.py",
+                 "stockagent/workflow_snapshot_pack.py",
+                 "stockagent/data_sync/packed_snapshots.py",
+                 "stockagent/data_sync/packed_metadata.py",
+                 "stockagent/data_sync/desync_snapshots.py",
+                     "stockagent/live/market_status.py", "stockagent/live/signal_engine.py",
+                     "stockagent/live/tw_day_trade_dashboard.py", "stockagent/live/completed_inference_cache.py",
+                     "stockagent/live/service_code_release.py", "downloader/operation_timing.py",
+                     "downloader/feature_stage_timing.py", "downloader/binance_historical_features.py",
+                     "downloader/okx_historical_features.py",
+                     "downloader/download_public_economic_history.py", "downloader/public_economic_sources.py",
+                     "downloader/frankfurter_official_history.py", "downloader/download_openbb_archive.py",
+                     "downloader/openbb_archive_types.py", "downloader/download_tw_public_data.py",
+                     "downloader/release_archive_timing.py", "downloader/download_tw_cbc_overnight_pages.py",
+                     "downloader/download_tw_cbc_fx_annual_pages.py", "downloader/download_tw_mof_macro_release_dates.py",
+                     "downloader/download_tw_mof_trade_release_values.py", "downloader/download_tw_mof_release_archive.py",
+                     "downloader/download_tw_dgbas_release_archive.py",
+                     "scripts/benchmark_public_economic_receipts.py"):
+            captured = evidence.read(ROOT / name)
             if captured:
-                measurement_sources.append({"path": str(path.relative_to(ROOT)), "sha256": captured[1]})
-    atomic_write_json(output / "measurement_sources.json", {
-        "scope": "observed collector/benchmark source; not proof of loaded service or historical producer code",
-        "files": measurement_sources})
-    finish_phase("code_inventory_and_source_capture")
-    environment = observe_node(ROOT, output)
-    environment["runtime_versions"] = {}
-    for package in ("numpy", "numba", "pyarrow", "polars", "torch", "pandas", "msgspec"):
-        try:
-            environment["runtime_versions"][package] = version(package)
-        except PackageNotFoundError:
-            environment["runtime_versions"][package] = None
-    environment["python"] = sys.version
-    environment["host"] = socket.gethostname()
-    environment["thread_environment"] = {key: os.environ.get(key) for key in
-        ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS", "POLARS_MAX_THREADS")}
-    atomic_write_json(output / "environment.json", environment)
-    finish_phase("environment_observation")
-    for path in args.architecture:
-        captured = evidence.object(path)
-        if captured is None:
-            continue
-        payload, _ = captured
-        for key, kind, identity in (("training_modes", "training_mode", "execution_mode"),
-                                     ("dataset_catalog", "dataset", "dataset"),
-                                     ("market_configs", "market_config", "path"),
-                                     ("deployment_configs", "deployment_config", "path"),
-                                     ("systemd_templates", "service_template", "unit")):
-            for row in payload.get(key, []):
-                ledger.inventory.append({"kind": kind, "id": row[identity], "category": category(str(row)),
-                                         "coverage": "registered_scope_operation_timing_not_bound", "owner": row})
-        for key in ("market_config_errors", "deployment_config_errors"):
-            for row in payload.get(key, []):
-                ledger.inventory.append({"kind": "config_error", "id": row["path"], "category": "training", "coverage": "configuration_unresolved", "error": row["error"]})
-    captured = evidence.object(args.monitor_snapshot)
-    if captured:
-        payload, _ = captured
-        for row in payload.get("sources", []):
-            ledger.inventory.append({"kind": "source_endpoint", "id": row["id"], "category": "acquisition",
-                                     "provider": row.get("provider"), "active_scope": row.get("in_active_scope"),
-                                     "service_keys": (row.get("automation") or {}).get("service_keys", []),
-                                     "snapshot_at_utc": payload.get("generated_at_utc"),
-                                     "coverage": "source_specific_operation_timing_not_bound",
-                                     "next_measurement": "match source/task identity, completed units and elapsed time; shared service time is not per-source time"})
-    captured = evidence.object(ROOT / "configs/data_sync/node_storage_roles.json")
-    if captured:
-        for name, row in captured[0].get("nodes", {}).items():
-            ledger.inventory.append({"kind": "node", "id": name, "category": "operations", "owner": row,
-                                     "coverage": "local_observation" if name == socket.gethostname() else "remote_live_speed_not_observed"})
-    finish_phase("scope_inventory")
-    for paths, adapter in ((args.services, collect_services), (args.http, collect_http), (args.tej, collect_tej), (args.storage, collect_storage)):
-        for path in paths:
+                measurement_sources.append({"path": name, "sha256": captured[1]})
+        if getattr(args, "crypto_issuer_parser_report", []) or getattr(args, "retained_sec_report", []):
+            name = "downloader/download_crypto_etf_history.py"
+            captured = evidence.read(ROOT / name)
+            if captured:
+                measurement_sources.append({"path": name, "sha256": captured[1]})
+        if getattr(args, "retained_dune_report", []):
+            name = "downloader/download_dune_crypto_history.py"
+            captured = evidence.read(ROOT / name)
+            if captured:
+                measurement_sources.append({"path": name, "sha256": captured[1]})
+        if metric_backend["selected"] == "cpp":
+            for name in ("module_path", "build_receipt"):
+                path = Path(metric_backend[name])
+                captured = evidence.read(path)
+                if captured:
+                    measurement_sources.append({"path": str(path.relative_to(ROOT)), "sha256": captured[1]})
+        atomic_write_json(output / "measurement_sources.json", {
+            "scope": "observed collector/benchmark source; not proof of loaded service or historical producer code",
+            "files": measurement_sources})
+        finish_phase("code_inventory_and_source_capture")
+        environment = observe_node(ROOT, output)
+        environment["runtime_versions"] = {}
+        for package in ("numpy", "numba", "pyarrow", "polars", "torch", "pandas", "msgspec"):
+            try:
+                environment["runtime_versions"][package] = version(package)
+            except PackageNotFoundError:
+                environment["runtime_versions"][package] = None
+        environment["python"] = sys.version
+        environment["host"] = socket.gethostname()
+        environment["thread_environment"] = {key: os.environ.get(key) for key in
+            ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS", "POLARS_MAX_THREADS")}
+        atomic_write_json(output / "environment.json", environment)
+        finish_phase("environment_observation")
+        for path in args.architecture:
             captured = evidence.object(path)
-            if captured:
-                if adapter is collect_storage:
-                    # A storage profile refers to complete pinned histories;
-                    # retain those originals too and independently check them.
-                    for workflow in captured[0].get("workflows", []):
-                        history = evidence.read(Path(workflow["history_path"]))
-                        if history:
-                            raw = gzip.decompress(history[0])
-                            if hashlib.sha256(raw).hexdigest() != workflow["history_sha256"]:
-                                raise ValueError("storage history SHA does not match its profile")
-                adapter(ledger, *captured)
-    finish_phase("service_http_tej_storage_receipts")
-    collect_registered_steps(ledger, evidence, ROOT / "artifacts/daily_downloader", runs=args.registered_runs)
-    collect_finmind(ledger, evidence, ROOT / "data_finmind")
-    collect_finlab(ledger, evidence, ROOT / "data_finlab")
-    finish_phase("acquisition_receipts")
-    collect_engineering_runs(ledger, evidence, ROOT / "artifacts/operations/agent-workflow/runs", limit=args.agent_runs)
-    finish_phase("engineering_command_receipts")
-    print(json.dumps({"phase": "current_receipts", "samples": len(ledger.samples)}), flush=True)
-    traversal_gaps = []
-    training_paths = []
-    training_discovery_resources = []
-    for root in args.training_root:
-        paths, gaps = discover_training(root, depth=args.training_depth,
-            threads=getattr(args, "training_discovery_threads", 0), observations=training_discovery_resources)
-        training_paths.extend(paths)
-        traversal_gaps.extend(gaps)
-    finish_phase("training_timing_discovery")
-    for path in sorted(set(training_paths)):
-        captured = evidence.read(path)
-        ledger.inventory.append({"kind": "training_timing_file", "id": str(path), "category": "training",
-                                 "coverage": "captured_producer_timing" if captured else "timing_evidence_unavailable"})
+            if captured is None:
+                continue
+            payload, _ = captured
+            for key, kind, identity in (("training_modes", "training_mode", "execution_mode"),
+                                         ("dataset_catalog", "dataset", "dataset"),
+                                         ("market_configs", "market_config", "path"),
+                                         ("deployment_configs", "deployment_config", "path"),
+                                         ("systemd_templates", "service_template", "unit")):
+                for row in payload.get(key, []):
+                    ledger.inventory.append({"kind": kind, "id": row[identity], "category": category(str(row)),
+                                             "coverage": "registered_scope_operation_timing_not_bound", "owner": row})
+            for key in ("market_config_errors", "deployment_config_errors"):
+                for row in payload.get(key, []):
+                    ledger.inventory.append({"kind": "config_error", "id": row["path"], "category": "training", "coverage": "configuration_unresolved", "error": row["error"]})
+        captured = evidence.object(args.monitor_snapshot)
         if captured:
-            collect_training(ledger, path, *captured, evidence.issues)
-    finish_phase("training_timing_ingestion")
-    print(json.dumps({"phase": "training_timings", "files": len(set(training_paths)), "samples": len(ledger.samples)}), flush=True)
-    benchmark_root = ROOT / "artifacts/benchmarks"
-    # These collector generations are consumed only through explicit receipt
-    # arguments below. Prune them before walking their retained input payloads.
-    excluded_benchmarks = [output, *(path for path in benchmark_root.iterdir()
-                                   if path.is_dir() and path.name.startswith("workflow_speed_"))] if benchmark_root.is_dir() else [output]
-    benchmark_paths, gaps = discover(benchmark_root, depth=args.benchmark_depth,
-                                    exclude_roots=excluded_benchmarks,
-                                    directory_budget=args.benchmark_directory_budget)
-    traversal_gaps.extend(gaps)
-    finish_phase("benchmark_discovery")
-    benchmark_paths = select_benchmark_paths(benchmark_paths, output)
-    explicit_receipts = set(args.benchmark_receipt)
-    benchmark_paths = list(dict.fromkeys([*sorted(explicit_receipts), *sorted(set(benchmark_paths))]))
-    finish_phase("benchmark_path_selection")
-    metrics, receipt_catalog = inspect_benchmarks(evidence, ledger, benchmark_paths,
-                                                explicit_receipts=explicit_receipts,
-                                                read_workers=getattr(args, "evidence_read_workers", 0),
-                                                read_batch_bytes=getattr(args, "evidence_read_batch_mib", 2) << 20,
-                                                profile_output=(output / "inspection_profile.json")
-                                                if getattr(args, "profile_benchmark_inspection", False) else None)
-    finish_phase("benchmark_evidence_inspection")
-    print(json.dumps({"phase": "benchmark_index", "receipts": len(receipt_catalog), "reported_metrics": len(metrics)}), flush=True)
-    # Deduplicate inventory rows across repeated snapshots without hiding an
-    # earlier outcome: per-snapshot data remain in frozen evidence and samples.
-    inventory = {(row["kind"], row["id"]): row for row in ledger.inventory}
-    ledger.inventory = list(inventory.values())
-    source_stage_count = bind_source_stages(ledger)
-    json_lines(output / "speed_samples.jsonl", ledger.samples)
-    summaries = ledger.summaries()
-    write_csv(output / "speed_summary.csv", summaries)
-    write_csv(output / "coverage.csv", ledger.inventory)
-    write_csv(output / "reported_metrics.csv", metrics)
-    write_csv(output / "benchmark_receipts.csv", receipt_catalog)
-    atomic_write_json(output / "inventory.json", {"contract": CONTRACT, "rows": ledger.inventory})
-    write_evidence_manifest(output / "evidence_manifest.json", evidence, traversal_gaps)
-    finish_phase("aggregation_and_output_serialization")
-    report = {
-        "contract": CONTRACT, "state": "collected_with_explicit_coverage_gaps",
-        "metric_backend": metric_backend,
-        "observed_at_utc": datetime.now(UTC).isoformat(), "code_manifest_sha256": code_identity,
-        "inventory_counts": dict(Counter(row["kind"] for row in ledger.inventory)),
-        "sample_counts": dict(Counter(row["origin"] for row in ledger.samples)),
-        "speed_samples": len(ledger.samples), "summary_groups": len(summaries),
-        "benchmark_receipts": len(receipt_catalog), "unreviewed_reported_metrics": len(metrics),
-        "benchmark_receipt_states": dict(Counter(row["state"] for row in receipt_catalog)),
-        "non_timing_inspections_reused": sum(bool(row.get("classification_reused_from_sha256")) for row in receipt_catalog),
-        "evidence_sources": len(evidence.sources), "evidence_bytes": evidence.total_bytes,
-        "evidence_read_stats": dict(evidence.read_stats),
-        "training_discovery_resources": training_discovery_resources,
-        "issues": len(evidence.issues), "traversal_gaps": len(traversal_gaps),
-        "source_endpoints_individually_timed": 0,
-        "source_endpoints_with_stage_timing": source_stage_count,
-        "input_paths": {**{key: [str(path) for path in getattr(args, key)] for key in
-                              ("architecture", "services", "http", "tej", "storage", "benchmark_receipt", "training_root")},
-                        "monitor_snapshot": str(args.monitor_snapshot)},
-        "limits": {"training_depth": args.training_depth, "benchmark_depth": args.benchmark_depth,
-                   "benchmark_directory_budget": args.benchmark_directory_budget,
-                   "excluded_directory_names": sorted(SKIP_DIRS), "max_file_mib": args.max_file_mib,
-                   "max_total_mib": args.max_total_mib, "registered_runs": args.registered_runs,
-                   "agent_runs": args.agent_runs,
-                   "evidence_read_workers": getattr(args, "evidence_read_workers", 0),
-                   "evidence_read_batch_mib": getattr(args, "evidence_read_batch_mib", 2),
-                   "training_discovery_threads": getattr(args, "training_discovery_threads", 0)},
-        "interpretation": [
-            "Inventories have different grains; never combine their denominators into one completion percentage.",
-            "Source/service/config discovery is not an individually timed operation.",
-            "Historical producer timings retain their own identity; collector hardware is not their hardware.",
-            "No source data, fee, mask, checkpoint, validation, plotting or durability work was omitted to claim acceleration.",
-            "A daemon resource sample is not operation latency; failed attempts and empty results remain separate.",
-            "Nested/parallel component timings overlap; never sum them as total workflow wall time.",
-            "reported_metrics.csv is a discovery index, not validated comparable benchmark samples.",
-            "Non-timing benchmark candidates retain identity/classification only; explicit and timing-bearing receipts retain complete bytes, subject to visible evidence limits.",
-            "collection_wall_seconds ends before final file hashing/manifest write; the canonical command receipt measures through child wait.",
-        ],
-        "collection_wall_seconds": time.perf_counter() - started,
-        "phase_timings": phase_timings,
-        "phase_timing_scope": "serial monotonic intervals through final output hashing; excludes final collection.json write; CPU is collector process time, excluding subprocess CPU",
-    }
-    # Bind every final output and every retained original snapshot independently.
-    report["outputs"] = {str(path.relative_to(output)): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
-                         for path in sorted(output.iterdir()) if path.is_file()}
-    finish_phase("final_output_hashes")
-    report["pre_manifest_wall_seconds"] = phase_started - started
-    atomic_write_json(output / "collection.json", report)
-    return report
+            payload, _ = captured
+            for row in payload.get("sources", []):
+                ledger.inventory.append({"kind": "source_endpoint", "id": row["id"], "category": "acquisition",
+                                         "provider": row.get("provider"), "active_scope": row.get("in_active_scope"),
+                                         "service_keys": (row.get("automation") or {}).get("service_keys", []),
+                                         "snapshot_at_utc": payload.get("generated_at_utc"),
+                                         "registry_presence": "current_snapshot", "current_visibility_verified": True,
+                                         "live_readiness_verified": False,
+                                         "coverage": "source_specific_operation_timing_not_bound",
+                                         "next_measurement": "match source/task identity, completed units and elapsed time; shared service time is not per-source time"})
+        for path in getattr(args, "known_source_inventory", []):
+            collect_known_source_inventory(ledger, evidence, path)
+        captured = evidence.object(ROOT / "configs/data_sync/node_storage_roles.json")
+        if captured:
+            for name, row in captured[0].get("nodes", {}).items():
+                ledger.inventory.append({"kind": "node", "id": name, "category": "operations", "owner": row,
+                                         "coverage": "local_observation" if name == socket.gethostname() else "remote_live_speed_not_observed"})
+        finish_phase("scope_inventory")
+        for paths, adapter in ((args.services, collect_services), (args.http, collect_http), (args.tej, collect_tej), (args.storage, collect_storage)):
+            for path in paths:
+                captured = evidence.object(path)
+                if captured:
+                    if adapter is collect_storage:
+                        # A storage profile refers to complete pinned histories;
+                        # retain those originals too and independently check them.
+                        for workflow in captured[0].get("workflows", []):
+                            history = evidence.read(Path(workflow["history_path"]))
+                            if history:
+                                raw = gzip.decompress(history[0])
+                                if hashlib.sha256(raw).hexdigest() != workflow["history_sha256"]:
+                                    raise ValueError("storage history SHA does not match its profile")
+                    adapter(ledger, *captured)
+        finish_phase("service_http_tej_storage_receipts")
+        collect_registered_steps(ledger, evidence, ROOT / "artifacts/daily_downloader", runs=args.registered_runs)
+        collect_finmind(ledger, evidence, ROOT / "data_finmind")
+        collect_finlab(ledger, evidence, ROOT / "data_finlab")
+        collect_economic_operations(ledger, evidence, ROOT / "data_public_economic")
+        collect_economic_operations(ledger, evidence, ROOT / "data_forex_frankfurter/official_v2")
+        collect_openbb_operations(ledger, evidence, ROOT / "data_openBB")
+        collect_tw_public_operations(ledger, evidence, getattr(args, "tw_public_operation_journal", []))
+        collect_crypto_feature_operations(ledger, evidence, getattr(args, "crypto_feature_report", []) or [])
+        collect_crypto_issuer_parser_operations(ledger, evidence, getattr(args, "crypto_issuer_parser_report", []))
+        collect_retained_dune_operations(ledger, evidence, getattr(args, "retained_dune_report", []))
+        collect_retained_sec_operations(ledger, evidence, getattr(args, "retained_sec_report", []))
+        finish_phase("acquisition_receipts")
+        collect_engineering_runs(ledger, evidence, ROOT / "artifacts/operations/agent-workflow/runs", limit=args.agent_runs)
+        finish_phase("engineering_command_receipts")
+        print(json.dumps({"phase": "current_receipts", "samples": len(ledger.samples)}), flush=True)
+        traversal_gaps = []
+        training_paths = []
+        training_discovery_resources = []
+        for root in args.training_root:
+            paths, gaps = discover_training(root, depth=args.training_depth,
+                threads=getattr(args, "training_discovery_threads", 0), observations=training_discovery_resources)
+            training_paths.extend(paths)
+            traversal_gaps.extend(gaps)
+        finish_phase("training_timing_discovery")
+        for path in sorted(set(training_paths)):
+            captured = evidence.read(path)
+            ledger.inventory.append({"kind": "training_timing_file", "id": str(path), "category": "training",
+                                     "coverage": "captured_producer_timing" if captured else "timing_evidence_unavailable"})
+            if captured:
+                collect_training(ledger, path, *captured, evidence.issues)
+        finish_phase("training_timing_ingestion")
+        print(json.dumps({"phase": "training_timings", "files": len(set(training_paths)), "samples": len(ledger.samples)}), flush=True)
+        benchmark_root = ROOT / "artifacts/benchmarks"
+        # These collector generations are consumed only through explicit receipt
+        # arguments below. Prune them before walking their retained input payloads.
+        excluded_benchmarks = [output, *(path for path in benchmark_root.iterdir()
+                                       if path.is_dir() and path.name.startswith("workflow_speed_"))] if benchmark_root.is_dir() else [output]
+        benchmark_paths, gaps = discover(benchmark_root, depth=args.benchmark_depth,
+                                        exclude_roots=excluded_benchmarks,
+                                        directory_budget=args.benchmark_directory_budget)
+        traversal_gaps.extend(gaps)
+        finish_phase("benchmark_discovery")
+        benchmark_paths = select_benchmark_paths(benchmark_paths, output)
+        explicit_receipts = set(args.benchmark_receipt)
+        benchmark_paths = list(dict.fromkeys([*sorted(explicit_receipts), *sorted(set(benchmark_paths))]))
+        finish_phase("benchmark_path_selection")
+        metrics, receipt_catalog = inspect_benchmarks(evidence, ledger, benchmark_paths,
+                                                    explicit_receipts=explicit_receipts,
+                                                    read_workers=getattr(args, "evidence_read_workers", 0),
+                                                    read_batch_bytes=getattr(args, "evidence_read_batch_mib", 2) << 20,
+                                                    profile_output=(output / "inspection_profile.json")
+                                                    if getattr(args, "profile_benchmark_inspection", False) else None)
+        finish_phase("benchmark_evidence_inspection")
+        print(json.dumps({"phase": "benchmark_index", "receipts": len(receipt_catalog), "reported_metrics": len(metrics)}), flush=True)
+        # Deduplicate inventory rows across repeated snapshots without hiding an
+        # earlier outcome: per-snapshot data remain in frozen evidence and samples.
+        inventory = {(row["kind"], row["id"]): row for row in ledger.inventory}
+        ledger.inventory = list(inventory.values())
+        source_stage_count = bind_source_stages(ledger)
+        json_lines(output / "speed_samples.jsonl", ledger.samples)
+        summaries = ledger.summaries()
+        write_csv(output / "speed_summary.csv", summaries)
+        write_csv(output / "coverage.csv", ledger.inventory)
+        write_csv(output / "reported_metrics.csv", metrics)
+        write_csv(output / "benchmark_receipts.csv", receipt_catalog)
+        atomic_write_json(output / "inventory.json", {"contract": CONTRACT, "rows": ledger.inventory})
+        write_evidence_manifest(output / "evidence_manifest.json", evidence, traversal_gaps)
+        finish_phase("aggregation_and_output_serialization")
+        report = {
+            "contract": CONTRACT, "state": "collected_with_explicit_coverage_gaps",
+            "metric_backend": metric_backend,
+            "observed_at_utc": datetime.now(UTC).isoformat(), "code_manifest_sha256": code_identity,
+            "inventory_counts": dict(Counter(row["kind"] for row in ledger.inventory)),
+            "sample_counts": dict(Counter(row["origin"] for row in ledger.samples)),
+            "speed_samples": len(ledger.samples), "summary_groups": len(summaries),
+            "benchmark_receipts": len(receipt_catalog), "unreviewed_reported_metrics": len(metrics),
+            "benchmark_receipt_states": dict(Counter(row["state"] for row in receipt_catalog)),
+            "non_timing_inspections_reused": sum(bool(row.get("classification_reused_from_sha256")) for row in receipt_catalog),
+            "evidence_sources": len(evidence.sources), "evidence_bytes": evidence.total_bytes,
+            "evidence_read_stats": dict(evidence.read_stats),
+            "training_discovery_resources": training_discovery_resources,
+            "code_inventory_resources": code_inventory_resources,
+            "issues": len(evidence.issues), "traversal_gaps": len(traversal_gaps),
+            "source_endpoints_individually_timed": 0,
+            "source_endpoints_with_stage_timing": source_stage_count,
+            "input_paths": {**{key: [str(path) for path in getattr(args, key)] for key in
+                                  ("architecture", "services", "http", "tej", "storage", "benchmark_receipt", "training_root")},
+                            "tw_public_operation_journal": [str(path) for path in getattr(args, "tw_public_operation_journal", [])],
+                            "monitor_snapshot": str(args.monitor_snapshot)},
+            "tw_public_operation_ingestion_contract": "tw_public_operation_journal_ingestion_v1",
+            "tw_public_release_operation_ingestion_contract": "tw_public_operation_journal_ingestion_v2",
+            "limits": {"training_depth": args.training_depth, "benchmark_depth": args.benchmark_depth,
+                       "benchmark_directory_budget": args.benchmark_directory_budget,
+                       "excluded_directory_names": sorted(SKIP_DIRS), "max_file_mib": args.max_file_mib,
+                       "max_total_mib": args.max_total_mib, "registered_runs": args.registered_runs,
+                       "agent_runs": args.agent_runs,
+                       "evidence_read_workers": getattr(args, "evidence_read_workers", 0),
+                       "evidence_read_batch_mib": getattr(args, "evidence_read_batch_mib", 2),
+                       "code_inventory_workers": getattr(args, "code_inventory_workers", 0),
+                       "training_discovery_threads": getattr(args, "training_discovery_threads", 0)},
+            "interpretation": [
+                "Inventories have different grains; never combine their denominators into one completion percentage.",
+                "Source/service/config discovery is not an individually timed operation.",
+                "Historical producer timings retain their own identity; collector hardware is not their hardware.",
+                "No source data, fee, mask, checkpoint, validation, plotting or durability work was omitted to claim acceleration.",
+                "A daemon resource sample is not operation latency; failed attempts and empty results remain separate.",
+                "Nested/parallel component timings overlap; never sum them as total workflow wall time.",
+                "reported_metrics.csv is a discovery index, not validated comparable benchmark samples.",
+                "Non-timing benchmark candidates retain identity/classification only; explicit and timing-bearing receipts retain complete bytes, subject to visible evidence limits.",
+                "collection_wall_seconds ends before final file hashing/manifest write; the canonical command receipt measures through child wait.",
+            ],
+            "collection_wall_seconds": time.perf_counter() - started,
+            "phase_timings": phase_timings,
+            "phase_timing_scope": "serial monotonic intervals through final output hashing; excludes final collection.json write; CPU is collector process time, excluding subprocess CPU",
+        }
+        if getattr(args, "crypto_issuer_parser_report", []):
+            report["crypto_issuer_parser_ingestion_contract"] = "observed_retained_crypto_issuer_parser_v1"
+            report["input_paths"]["crypto_issuer_parser_report"] = [
+                [str(path) for path in bundle] for bundle in args.crypto_issuer_parser_report]
+        if getattr(args, "retained_dune_report", []):
+            report["retained_dune_ingestion_contract"] = "observed_retained_dune_partition_v1"
+            report["input_paths"]["retained_dune_report"] = [
+                [str(path) for path in bundle] for bundle in args.retained_dune_report]
+        if getattr(args, "retained_sec_report", []):
+            report["retained_sec_ingestion_contract"] = "observed_retained_sec_native_v1"
+            report["input_paths"]["retained_sec_report"] = [
+                [str(path) for path in bundle] for bundle in args.retained_sec_report]
+        # Bind every final output and every retained original snapshot independently.
+        report["outputs"] = {str(path.relative_to(output)): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
+                             for path in sorted(output.iterdir()) if path.is_file()}
+        finish_phase("final_output_hashes")
+        report["pre_manifest_wall_seconds"] = phase_started - started
+        atomic_write_json(output / "collection.json", report)
+        return report
+
+    finally:
+        evidence.close_snapshot_store()
 
 
 def main(argv=None) -> int:
@@ -1649,6 +3274,8 @@ def main(argv=None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True, help="New immutable observation directory")
     parser.add_argument("--architecture", type=Path, action="append", default=[])
     parser.add_argument("--monitor-snapshot", type=Path, default=ROOT / "artifacts/live/data_monitor/public_status.json")
+    parser.add_argument("--known-source-inventory", type=Path, action="append", default=[],
+                        help="Retain known identities from a frozen collector inventory when absent from the current snapshot; import no old timings or current-health claims; current entries win")
     parser.add_argument("--services", type=Path, action="append", default=[])
     parser.add_argument("--http", type=Path, action="append", default=[])
     parser.add_argument("--tej", type=Path, action="append", default=[])
@@ -1656,15 +3283,31 @@ def main(argv=None) -> int:
     parser.add_argument("--storage-history-only", action="store_true", help="Use run_lakehouse_control.sh python in the locked role; read pinned histories only")
     parser.add_argument("--verify-only", action="store_true", help="Read an existing observation; check every frozen SHA and regroup every sample")
     parser.add_argument("--validation-output", type=Path, help="New independent readback receipt, used with --verify-only")
+    parser.add_argument("--tw-public-operation-journal", type=Path, action="append", default=[],
+                        help="Freeze supplied journald JSONL; bind exact registered native TW-public dispatch clocks without launching providers")
+    parser.add_argument("--crypto-feature-report", nargs=3, action="append",
+                        metavar=("PROVIDER", "CSV", "SUMMARY"),
+                        help="Native binance/okx worker CSV and matching feature-run summary; defaults to available canonical data_PROVIDER/1m pairs. No provider calls or source-coverage promotion")
+    parser.add_argument("--crypto-issuer-parser-report", nargs=4, action="append", default=[],
+                        metavar=("TIMING", "PROTOCOL", "OUTPUTS", "READBACK"),
+                        help="Explicit retained issuer-parser bundle; verify all frozen raw/normalized rows, retain offline stage scope, and make no provider calls")
+    parser.add_argument("--retained-dune-report", nargs=3, action="append", default=[],
+                        metavar=("TIMING", "PROTOCOL", "READBACK"),
+                        help="Explicit retained Dune native clocks; independently verify every original/output row, receipt and raw page, with no provider operations")
+    parser.add_argument("--retained-sec-report", nargs=4, action="append", default=[],
+                        metavar=("TIMING", "PROTOCOL", "RESULTS", "READBACK"),
+                        help="Explicit retained SEC native clocks; independently verify every original/output row, mapping, manifest and cached document, with no provider operations")
     parser.add_argument("--benchmark-receipt", type=Path, action="append", default=[])
     parser.add_argument("--metric-backend", choices=("python", "auto", "cpp"), default="auto",
-                        help="Benchmark field walker; auto only uses a source/ABI-verified cache; cpp explicitly builds an absent cache")
+                        help="Benchmark field walker and optional Linux batch reads; auto uses a source/ABI-verified cache; cpp explicitly builds an absent cache")
+    parser.add_argument("--code-inventory-workers", type=int, choices=(0, 1, 2, 4), default=0,
+                        help="Bounded spawn processes for static source parsing; 0 remains synchronous; measure complete workflow CPU/RSS")
     parser.add_argument("--evidence-read-workers", type=int, choices=(0, 1, 2, 4), default=0,
                         help="Ordered benchmark read-ahead; 0 is synchronous, positive counts use bounded read-only workers")
     parser.add_argument("--profile-benchmark-inspection", action="store_true",
                         help="Diagnostic per-thread operation clocks; changes timings, excluded from optimization samples")
     parser.add_argument("--evidence-read-batch-mib", type=int, choices=(1, 2, 8, 16, 256), default=2,
-                        help="Raw bytes per read-ahead batch; total prefetch buffers are at most (workers + 1) times this limit plus one byte per batch")
+                        help="Raw bytes per read-ahead batch; Python raw buffers <= (workers + 1) * (limit + 1); native conversion raw copies <= (2 * workers + 1) * (limit + 1)")
     parser.add_argument("--training-root", type=Path, action="append")
     parser.add_argument("--training-depth", type=int, default=9)
     parser.add_argument("--training-discovery-threads", type=int, choices=(0, 1, 2, 4), default=0,
@@ -1673,6 +3316,8 @@ def main(argv=None) -> int:
     parser.add_argument("--benchmark-directory-budget", type=int, default=50_000)
     parser.add_argument("--registered-runs", type=int, default=3, help="Latest recorded step sets per canonical scope; not whole-run acceptance")
     parser.add_argument("--agent-runs", type=int, default=256, help="Latest terminal local-owner engineering commands")
+    parser.add_argument("--evidence-storage-layout", choices=("individual_gzip", "packed_gzip_v1"),
+                        default="individual_gzip", help="Explicit snapshot artifact storage ABI")
     parser.add_argument("--max-file-mib", type=int, default=64)
     parser.add_argument("--max-total-mib", type=int, default=1024)
     args = parser.parse_args(argv)
@@ -1698,6 +3343,16 @@ def main(argv=None) -> int:
         parser.error("registered runs must be 1..100")
     if not 1 <= args.agent_runs <= 10_000:
         parser.error("agent runs must be 1..10000")
+    if args.crypto_feature_report is None:
+        args.crypto_feature_report = []
+        for provider in ("binance", "okx"):
+            root = ROOT / ("data_" + provider) / "1m"
+            report = root / "historical_feature_report.csv"
+            summary = root / "download_summary.historical_features.json"
+            if report.is_file() or summary.is_file():
+                args.crypto_feature_report.append((provider, str(report), str(summary)))
+    if any(provider not in {"binance", "okx"} for provider, _, _ in args.crypto_feature_report):
+        parser.error("crypto feature provider must be binance or okx")
     args.training_root = args.training_root or [ROOT / f"artifacts/{name}" for name in ("markets", "ablations", "operations")]
     if args.storage_history_only:
         report = asyncio.run(profile_storage_history(args.output_dir))

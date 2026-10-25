@@ -8,8 +8,11 @@ Missing desktop targets are independent, explicitly unverified lookup work.
 """
 from __future__ import annotations
 
+from collections import Counter
+from datetime import UTC, datetime
 import hashlib
 import json
+import math
 import re
 import time
 from urllib.parse import urlsplit
@@ -20,6 +23,8 @@ from downloader.news_fulltext_publishers import cnyes_supported_native_alias_vie
 CONTRACT_VERSION = 4
 LOOKUP_DISCOVERY_VERSION = 1
 PROGRESS_VERSION = 1
+REQUEST_SCOPE_PROGRESS_VERSION = 1
+MAX_REQUEST_SCOPE_URLS = 2048
 STATES = ('pending', 'retry', 'retry_cooldown')
 ACTIVE_STATES = (*STATES, 'inflight')
 CURSOR = 'cnyes_body_candidate_cursor_v1'
@@ -149,6 +154,78 @@ def progress(db):
             'states': rows, 'candidate_views_accepted_by_hint': False,
             'candidate_body_equivalence_verified': False,
             'scope': 'active missing-body URL heads; no-known-primary includes unclassified views, not unique stories'}
+
+
+def request_scope_progress(db, work, control, *, now_epoch):
+    """Join a small missing frontier to the owner's actual HTTP scope gates.
+
+    Never scan retained bodies or change dispatch/permission. Large frontiers,
+    absent controls and inconsistent counters stay unknown rather than treating
+    desktop/API ingestion speed as an AMP recovery rate. The regular constant-
+    size ``progress`` read remains unchanged.
+    """
+    result = {'contract_version': REQUEST_SCOPE_PROGRESS_VERSION, 'available': False,
+        'active_missing_body_urls': None, 'source_paused_missing_body_urls': None,
+        'other_missing_body_urls': None, 'policy_paused_missing_body_urls': None,
+        'gateway_paused_missing_body_urls': None, 'next_source_probe_at_utc': None,
+        'source_recovery_verified': False}
+    total = work.get('active_missing_body_urls')
+    if (type(total) is not int or not 0 <= total <= MAX_REQUEST_SCOPE_URLS
+            or not isinstance(control, dict) or type(now_epoch) not in {int, float}
+            or not math.isfinite(now_epoch)):
+        return result
+    policies = control.get('temporarily_paused_robots_origins')
+    gateways = control.get('temporarily_paused_gateway_hosts')
+    for gates in (policies, gateways):
+        if (not isinstance(gates, dict) or len(gates) > 32
+                or any(not isinstance(key, str) or not 0 < len(key) <= 320
+                    or type(deadline) not in {int, float} or not math.isfinite(deadline)
+                    or not 0 <= deadline <= 253402214400 for key, deadline in gates.items())):
+            return result
+    # These existing partial indexes exclude the millions of retained heads.
+    rows = db.execute("SELECT url,state FROM articles INDEXED BY dispatch_cnyes_body_value "
+        "WHERE provider='cnyes' AND body_sha256 IS NULL "
+        "AND state IN ('pending','retry','retry_cooldown') LIMIT ?", (total + 1,)).fetchall()
+    expected = Counter()
+    for row in work['states']:
+        expected[row['state']] += row['urls']
+    if expected['inflight']:
+        rows.extend(db.execute("SELECT url,state FROM articles INDEXED BY dispatch "
+            "WHERE provider='cnyes' AND state='inflight' AND body_sha256 IS NULL LIMIT ?",
+            (expected['inflight'] + 1,)).fetchall())
+    if len(rows) != total or Counter(row['state'] for row in rows) != expected:
+        return result
+    paused = policy_count = gateway_count = 0
+    deadlines = []
+    for row in rows:
+        # An already in-flight request is not prevented by a later gate.
+        if row['state'] == 'inflight':
+            continue
+        if not isinstance(row['url'], str) or len(row['url']) > 4096:
+            return result
+        try:
+            parts = urlsplit(row['url'])
+            if (parts.scheme not in {'http', 'https'} or not parts.hostname
+                    or parts.username is not None or parts.password is not None
+                    or parts.port is not None and not 1 <= parts.port <= 65535):
+                return result
+        except ValueError:
+            return result
+        # Exact same origin construction as NewsHTTP._robots; paths/queries
+        # never become public status fields or equivalence assertions.
+        policy = policies.get(f'{parts.scheme}://{parts.netloc}', 0)
+        gateway = gateways.get(parts.hostname, 0)
+        policy_count += policy > now_epoch
+        gateway_count += gateway > now_epoch
+        deadline = max(policy, gateway)
+        if deadline > now_epoch:
+            paused += 1
+            deadlines.append(deadline)
+    return {**result, 'available': True, 'active_missing_body_urls': total,
+        'source_paused_missing_body_urls': paused, 'other_missing_body_urls': total - paused,
+        'policy_paused_missing_body_urls': policy_count,
+        'gateway_paused_missing_body_urls': gateway_count,
+        'next_source_probe_at_utc': datetime.fromtimestamp(min(deadlines), UTC).isoformat() if deadlines else None}
 
 
 def admit_native_lookup(queue, row):

@@ -11,6 +11,7 @@ from datetime import date
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import polars as pl
 
@@ -169,7 +170,7 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path,
                 volume = None if unreported else int(volume_text)
                 if '/' in month:
                     legs = month.split('/')
-                    if len(legs) != 2 or any(len(v) != 6 or not v.isdigit() for v in legs):
+                    if len(legs) != 2 or any(not re.fullmatch(r'[0-9]{6}(?:W[1-5])?', v) for v in legs):
                         continue
                     for leg in legs:
                         key = day, f'{product}:{leg}'
@@ -211,6 +212,7 @@ def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path,
     atomic_write_parquet(output/'official_evidence.parquet', frame)
     atomic_write_json(output/'official_evidence_manifest.json', dict(
         source='taifex_complete_daily_and_spread_legs_v1', rows=frame.height,
+        spread_delivery_contract_version=2,
         sha256=sha256_file(output/'official_evidence.parquet'), sources=sources,
         input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
         unreported_volume_policy='preserve_unknown_never_zero' if allow_unreported_volume else 'reject',

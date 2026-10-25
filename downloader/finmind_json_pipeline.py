@@ -2,13 +2,15 @@
 
 Do not turn concurrency into a larger entitlement. Threads use independent,
 reused HTTP sessions and the shared limiter/traffic ledger. Only the owner
-selects, claims, validates, publishes and updates SQLite. Complex overlapping
-history/bulk/derived queries keep their existing canonical handlers.
+selects, claims and updates its SQLite queue. Independent keys may publish
+through a bounded pool; the owner acknowledges only durable receipts.
+Overlapping history/bulk/derived queries keep their canonical handlers.
 """
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
+from decimal import getcontext, setcontext
 import hashlib
 import json
 from pathlib import Path
@@ -24,7 +26,7 @@ from downloader.common import RateLimitWaitCancelled
 from downloader.artifact_io import atomic_write_json
 
 CONFIG = Path(__file__).resolve().parents[1] / 'configs/finmind_json_pipeline.json'
-CONTRACT_VERSION = 12  # Stable WAL lifetime and real HTTP counting require fresh capacity.
+CONTRACT_VERSION = 16  # Bounded independent publication needs new whole-cycle capacity.
 LOCAL_PREFLIGHT_ERRORS = frozenset({'local_traffic_busy', 'local_traffic_unavailable'})
 
 
@@ -32,7 +34,9 @@ def settings(path=CONFIG, *, max_requests_per_cycle=None):
     value = json.loads(path.read_bytes())
     if value.get('schema_version') != 1 or type(value.get('enabled')) is not bool:
         raise ValueError('invalid_json_pipeline_configuration')
+    value.setdefault('publication_workers', 1)
     for key, minimum, maximum in (('download_workers', 1, 32), ('max_batch_requests', 1, 2400),
+                                 ('publication_workers', 1, 4),
                                  ('max_requests_per_cycle', 1, 10000),
                                  ('max_buffered_response_bytes', 64 * 1024**2, 1024**3)):
         if type(value.get(key)) is not int or not minimum <= value[key] <= maximum:
@@ -46,13 +50,31 @@ def settings(path=CONFIG, *, max_requests_per_cycle=None):
     return {**value, 'configuration_sha256': fingerprint}
 
 
+def _publication_context(context):
+    setcontext(context.copy())
+
+
 class Sessions:
-    """One keep-alive session per executor thread; close after executor drain."""
+    """Account-scoped sessions/publication pool; drain before owner release."""
     def __init__(self, *, traffic_root=None):
         self.local = threading.local()
         self.sessions = []
         self.lock = threading.Lock()
         self.traffic_root, self.traffic_anchor = traffic_root, None
+        self.reservation_reads = None
+        self.publication_executor = None
+        self.publication_workers = None
+
+    def publisher(self, workers):
+        """Owner-thread admission only; drain before releasing this account."""
+        if self.publication_executor is None:
+            self.publication_workers = workers
+            self.publication_executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix='finmind-json-publish',
+                initializer=_publication_context, initargs=(getcontext().copy(),))
+        elif workers != self.publication_workers:
+            raise ValueError('publication_configuration_changed_during_cycle')
+        return self.publication_executor
 
     def get(self):
         if not hasattr(self.local, 'session'):
@@ -62,6 +84,10 @@ class Sessions:
         return self.local.session
 
     def __enter__(self):
+        if self.traffic_root is not None:
+            from downloader.finmind_scheduling import ReservationReads
+            self.reservation_reads = ReservationReads(self.traffic_root)
+            self.reservation_reads.__enter__()
         if self.traffic_root is not None:
             path = (self.traffic_root / 'request_traffic.sqlite3').resolve()
             if path.is_file():
@@ -83,12 +109,22 @@ class Sessions:
 
     def __exit__(self, *args):
         try:
-            for session in self.sessions:
-                session.close()
+            if self.publication_executor is not None:
+                self.publication_executor.shutdown(wait=True)
+                self.publication_executor = None
         finally:
-            if self.traffic_anchor is not None:
-                self.traffic_anchor.close()
-                self.traffic_anchor = None
+            try:
+                for session in self.sessions:
+                    session.close()
+            finally:
+                try:
+                    if self.traffic_anchor is not None:
+                        self.traffic_anchor.close()
+                        self.traffic_anchor = None
+                finally:
+                    if self.reservation_reads is not None:
+                        self.reservation_reads.__exit__(*args)
+                        self.reservation_reads = None
 
 
 def recover_claims(connection):
@@ -206,8 +242,11 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
     # A worst-case response is 64 MiB. Bound admitted responses, not just
     # sockets: completed futures may retain their body until the owner stores it.
     workers = min(config['download_workers'], config['max_buffered_response_bytes'] // worker.BULK_MAX_RESPONSE_BYTES)
+    publication_workers = min(workers, config.get('publication_workers', 1))
     started = time.monotonic()
     jobs = {}
+    publishing = set()
+    peak_inflight = peak_publications = 0
     attempts = accepted = nonempty = rows_total = failures = cancelled = preflight_holds = 0
     failure_codes = {}
     stop = threading.Event()
@@ -252,6 +291,7 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                 future = executor.submit(_fetch, sessions, cancellable, root, candidate, token,
                                          stamp.astimezone(worker.TAIPEI).date())
                 jobs[future] = candidate
+                peak_inflight = max(peak_inflight, len(jobs))
                 attempts += 1
                 available -= 1
             except BaseException:
@@ -259,26 +299,45 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                 raise
         if not jobs:
             break
-        done, _ = wait(jobs, timeout=1, return_when=FIRST_COMPLETED)
+        # Publishing retains its original response slot. When the publication
+        # pool is full, wait on it rather than spinning on finished downloads.
+        waiting = publishing if len(publishing) >= publication_workers else jobs
+        done, _ = wait(waiting, timeout=1, return_when=FIRST_COMPLETED)
         for future in done:
             task = jobs.pop(future)
+            publication_done = future in publishing
+            publishing.discard(future)
+            release_task = True
             try:
-                rows, metadata = future.result()
-                metadata.update(json_pipeline_contract_version=CONTRACT_VERSION,
-                                pipeline_configuration_sha256=config['configuration_sha256'])
-                context = correction_context(connection, task)
-                receipt = worker._store(root, task, rows, worker._now(), request_metadata=metadata,
-                                        **({'correction': context} if context else {}))
-                # The result and claim release below commit together. Keep
-                # durable source/receipt publication and recovery unchanged,
-                # without two back-to-back queue fsyncs for one finalization.
-                worker._save_result(connection, task, receipt, worker._now(), commit=False)
-                accepted += 1
-                nonempty += int(receipt['rows'] > 0)
-                rows_total += receipt['rows']
-                last = {'dataset': task.dataset, 'data_id': task.data_id, 'partition': task.partition,
-                        'status': receipt['status'], 'rows': receipt['rows'],
-                        'observed_at_utc': worker._iso(worker._now())}
+                receipt = None
+                if publication_done:
+                    receipt = future.result()
+                else:
+                    rows, metadata = future.result()
+                    metadata.update(json_pipeline_contract_version=CONTRACT_VERSION,
+                                    pipeline_configuration_sha256=config['configuration_sha256'])
+                    context = correction_context(connection, task)
+                    options = {'request_metadata': metadata,
+                               **({'correction': context} if context else {})}
+                    if publication_workers > 1:
+                        published = sessions.publisher(publication_workers).submit(
+                            worker._store, root, task, rows, worker._now(), **options)
+                        jobs[published] = task
+                        publishing.add(published)
+                        peak_publications = max(peak_publications, len(publishing))
+                        release_task = False
+                    else:
+                        receipt = worker._store(root, task, rows, worker._now(), **options)
+                if receipt is not None:
+                    # Queue result and claim release remain one owner-thread
+                    # commit, strictly after the complete durable receipt.
+                    worker._save_result(connection, task, receipt, worker._now(), commit=False)
+                    accepted += 1
+                    nonempty += int(receipt['rows'] > 0)
+                    rows_total += receipt['rows']
+                    last = {'dataset': task.dataset, 'data_id': task.data_id, 'partition': task.partition,
+                            'status': receipt['status'], 'rows': receipt['rows'],
+                            'observed_at_utc': worker._iso(worker._now())}
             except RateLimitWaitCancelled:
                 # No request/ledger write happened. Restore the prior task;
                 # do not manufacture a failure, retry or consumed API call.
@@ -297,7 +356,8 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                     pause = error.code
                     stop.set()
             finally:
-                _release(connection, task)
+                if release_task:
+                    _release(connection, task)
             # Refill one vacated slot before publishing another completed
             # response. A completion burst must not drain every socket behind
             # synchronous publication. Unconsumed futures remain in jobs, so
@@ -314,6 +374,8 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
         'contract_version': CONTRACT_VERSION, 'observed_at_utc': datetime.now(UTC).isoformat(),
         'configuration_sha256': config['configuration_sha256'], 'dataset': current.dataset,
         'download_workers': workers, 'claimed_attempts': attempts, 'cancelled_before_request': cancelled,
+        'publication_workers': publication_workers, 'peak_publications': peak_publications,
+        'peak_inflight_responses': peak_inflight,
         'calls': attempts-cancelled-preflight_holds, 'accepted_requests': accepted, 'nonempty_requests': nonempty,
         'local_preflight_holds': preflight_holds,
         'rows': rows_total, 'failed_tasks': failures, 'state': pause, 'elapsed_seconds': elapsed,
@@ -355,8 +417,11 @@ def measured_rates(connection, dataset, now=None):
             'sampled_requests': calls, 'sampled_wall_seconds': seconds,
             'sampled_rows': sum(r[2] for r in rows), 'nonempty_requests': sum(r[3] for r in rows),
             'download_workers': config['download_workers'], 'derivation_workers': 0,
+            'publication_workers': config.get('publication_workers', 1),
             'arrow_threads': 1, 'configuration_sha256': config['configuration_sha256'],
-            'processing_engine': 'bounded_json_keepalive_single_publication_owner',
+            'processing_engine': ('bounded_json_keepalive_parallel_publication_single_queue_owner'
+                                  if config.get('publication_workers', 1) > 1 else
+                                  'bounded_json_keepalive_single_publication_owner'),
             'full_cycle_wall_verified': True,
             'measured_preemption_time_excluded': True,
             'full_owner_cycles': len({row[4] for row in rows if row[4]}),

@@ -24,12 +24,46 @@ SETN_BODY_SELECTOR = (':scope > .article_content_wrap > #article_content > #news
                       ':scope > .article_content_wrap > #article_content > #newsContent > figure > figcaption')
 SETN_AUTHOR_SELECTOR = '.article_time_wrap .author_wrap > a, #newsContent > p:first-child'
 SETN_REVIEWED_URLS = ('https://www.setn.com/news/1911453', 'https://www.setn.com/news/431945')
+# Keep the witnessed diagnostic source identity and HTTP bucket. The name is
+# internal; adopting this subsite never creates an alias to SETN or iNEWS.
+FUHOUSE_PROVIDER = 'policy_setn_fuhouse'
+FUHOUSE_LAYOUT = 'setn_fuhouse_native_article_v1'
+FUHOUSE_SCOPE_SELECTOR = '.newspage_mainbox.contLeft[itemscope]'
+FUHOUSE_BODY_SELECTOR = ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > p'
+FUHOUSE_V2_LAYOUT = 'setn_fuhouse_native_article_v2'
+FUHOUSE_V2_BODY_SELECTOR = (FUHOUSE_BODY_SELECTOR + ', '
+    ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > figure > figcaption')
+FUHOUSE_AUTHOR_SELECTOR = ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > p:first-child'
+FUHOUSE_TITLE_SELECTOR = ':scope > h1[itemprop=headline]'
+FUHOUSE_V2_AUTHOR_SELECTOR = (FUHOUSE_AUTHOR_SELECTOR + ', '
+    ':scope > .date-box > .article_remark_wrap > .author_wrap > a[itemprop=author]')
+FUHOUSE_V2_VERIFICATION = 'literal_fuhouse_whole_editor_figures_header_reporter_and_printed_desk_name_separate_raw_clocks_v2_20261024'
+FUHOUSE_V3_LAYOUT = 'setn_fuhouse_native_article_v3'
+FUHOUSE_V3_BODY_SELECTOR = (FUHOUSE_V2_BODY_SELECTOR + ', '
+    ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > h3')
+FUHOUSE_V3_VERIFICATION = 'literal_fuhouse_printed_reporter_hybrid_credit_headings_and_matched_native_outline_separate_raw_clocks_v3_20261024'
+FUHOUSE_V4_LAYOUT = 'setn_fuhouse_native_article_v4'
+FUHOUSE_V4_BODY_SELECTOR = (FUHOUSE_V3_BODY_SELECTOR + ', '
+    ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > h2, '
+    ':scope > article > #ckuse.ckuse > [itemprop=articleBody] > ul > li')
+FUHOUSE_V4_VERIFICATION = 'literal_fuhouse_plain_strong_credit_h2_inline_outline_and_written_list_separate_raw_clocks_v4_20261024'
+FUHOUSE_VERIFICATION = 'literal_fuhouse_whole_native_paragraphs_desk_and_separate_meta_visible_clocks_v1_20261024'
+# Filled only by the exact offline-reviewed original -> native transition.
+FUHOUSE_HTTP_BINDING = (
+    'fa5534fc4a12f4b8896cfab91bcbc652cb17fe0dbec9bb4b255457924192a621',
+    '17e9b3dbaa050499a839fbfe8c0d0f1a9289401f1921973ed2fb62bb7cf3e9e7',
+    'd73171175a1ba9473c7b5b2d40447a7c1349f299b0edfc2e473c36032e7669d0',
+    '638e9a555d4849af6b7b77db9b10ca781906e1d4e82a6018cae633711a9291a1',
+)
 INEWS_PROVIDER = 'setn_inews_scope'
 INEWS_LAYOUT = 'setn_inews_native_article_v1'
 INEWS_LAYOUT_VERSIONS = {INEWS_LAYOUT: 1, 'setn_inews_native_article_v2': 2,
                         'setn_inews_native_article_v3': 3, 'setn_inews_native_article_v4': 4,
                         'setn_inews_native_article_v5': 5, 'setn_inews_native_article_v6': 6,
-                        'setn_inews_native_article_v7': 7, 'setn_inews_native_article_v8': 8}
+                        'setn_inews_native_article_v7': 7, 'setn_inews_native_article_v8': 8,
+                        'setn_inews_native_article_v9': 9,
+                        'setn_inews_native_article_v10': 10,
+                        'setn_inews_native_article_v11': 11}
 INEWS_BOUNDARY_QUESTION = 'inews_native_editor_credit_shapes_v1'
 INEWS_ORIGIN = 'https://inews.setn.com'
 INEWS_SCOPE_SELECTOR = '#newsArea.stockNewArea > .leftCon'
@@ -98,6 +132,26 @@ INEWS_V8_HTTP_BINDING = (
     '7d236a885de97188ce100e2b1da4580cabd1bfa4a22c369e5214f491f88a2900',
     'fbd919ae2d6fd1cf932b81f8509dade514194b74e76e461aa2dda9b60f6a49d7',
 )
+# Filled only from the reviewed short-prose transition; no new host allowance.
+INEWS_V9_HTTP_BINDING = (
+    '4cb4ce48083d4b31b2a5efdda3b9dd4e2d568f9fae82e20d469ad8390bd286c0',
+    'd6c298a90faf0139dd28b293631512f1450c163a5f4dfa158452b471c7b01656',
+    '7d236a885de97188ce100e2b1da4580cabd1bfa4a22c369e5214f491f88a2900',
+    'fbd919ae2d6fd1cf932b81f8509dade514194b74e76e461aa2dda9b60f6a49d7',
+)
+# Populated from the reviewed native editor-signature transition only.
+INEWS_V10_HTTP_BINDING = (
+    '75b361cfc4cfe519bf4ea9745f189731a6bd651fa08f901ebcc7286a57cce75e',
+    'd6c298a90faf0139dd28b293631512f1450c163a5f4dfa158452b471c7b01656',
+    '7d236a885de97188ce100e2b1da4580cabd1bfa4a22c369e5214f491f88a2900',
+    'fbd919ae2d6fd1cf932b81f8509dade514194b74e76e461aa2dda9b60f6a49d7',
+)
+INEWS_V11_HTTP_BINDING = (
+    '42411f008f6546ecea439a9d97742ebe430657dc73c4139363dcc2eabcbbdac3',
+    '9fb4c01fdd7453f6d25250698608b541a9a3c633798e2ab5267fa86641347b0c',
+    '7d236a885de97188ce100e2b1da4580cabd1bfa4a22c369e5214f491f88a2900',
+    'fbd919ae2d6fd1cf932b81f8509dade514194b74e76e461aa2dda9b60f6a49d7',
+)
 # One witnessed five-character native outline label. Hashing the exact label
 # prevents an arbitrary short paragraph from silently becoming a navigation
 # exclusion. Links must additionally match unique, ordered local headings.
@@ -112,6 +166,246 @@ SETN_FINITE_HTTP_BINDING = (
 )
 _BYLINES = {'施郁韻', '蔡佩蓉'}
 _INLINE = frozenset({'span', 'strong', 'b', 'em', 'i', 'u', 's', 'a', 'br', 'sub', 'sup', 'img'})
+
+
+def setn_fuhouse_native_article(soup, *, page_url, adapter_contract_version=1):
+    """FuHouse's native paragraphs, literal desk credit and two source clocks.
+
+    This is a separate witnessed representation. No title/ID similarity,
+    publisher meta-author, image alt text or implicit Taiwan timezone supplies
+    a missing identity, person, caption or historical publication instant.
+    """
+    if adapter_contract_version not in {1, 2, 3, 4}:
+        raise NewsError('article_identity_not_verified')
+    parts = urlsplit(page_url or '')
+    if (parts.scheme != 'https' or parts.netloc != 'fuhouse.setn.com'
+            or parts.query or parts.fragment or not re.fullmatch(SETN_PATH_PATTERN, parts.path)):
+        raise NewsError('article_identity_not_verified')
+    if (_one(soup, 'head > link[rel=canonical]').get('href') != page_url
+            or _one(soup, 'head > meta[property="og:url"]').get('content') != page_url
+            or _one(soup, 'head > meta[property="og:type"]').get('content') != 'article'
+            or _one(soup, 'head > meta[property="dable:item_id"]').get('content') != parts.path.rsplit('/', 1)[1]
+            or _one(soup, 'head > meta[name=author]').get('content') != '三立新聞網'
+            or _one(soup, 'head > meta[name=source]').get('content') != '三立新聞網'
+            or soup.select('script[type="application/ld+json"]')):
+        raise NewsError('article_identity_not_verified')
+    scope = _one(soup, FUHOUSE_SCOPE_SELECTOR)
+    if scope.get('itemtype') != 'https://schema.org/NewsArticle':
+        raise NewsError('article_identity_not_verified')
+    _visible(scope)
+    heading = _one(scope, FUHOUSE_TITLE_SELECTOR)
+    _visible(heading)
+    title = heading.get_text(' ', strip=True)
+    full_title = title + ' | FuHouse.SETN富房網'
+    if (not title or _one(soup, 'head > title').get_text(' ', strip=True) != full_title
+            or _one(soup, 'head > meta[name=Title]').get('content') != full_title
+            or _one(soup, 'head > meta[property="og:title"]').get('content') != full_title):
+        raise NewsError('article_identity_not_verified')
+    article = _one(scope, ':scope > article')
+    editor = _one(article, ':scope > #ckuse.ckuse')
+    body = _one(editor, ':scope > [itemprop=articleBody]')
+    if list(_children(article)) != [editor] or soup.select('[itemprop=articleBody]') != [body]:
+        raise NewsError('article_identity_not_verified')
+    # The observed empty, explicitly named ad slot is outside the native body.
+    # Unknown written siblings cannot silently disappear during extraction.
+    for node in _children(editor):
+        if node is body:
+            continue
+        if (node.name != 'div' or node.get('id') != 'gad_div-gpt-ad-artcle_bottom'
+                or node.get('class') != ['ad-area', 'dfpAD'] or node.get_text(strip=True) or node.find_all()):
+            raise NewsError('article_identity_not_verified')
+    paragraphs = list(_children(body))
+    if not paragraphs:
+        raise NewsError('body_not_found')
+    figures, headings, outlines, prose_lists = [], [], [], []
+    for paragraph in paragraphs:
+        if adapter_contract_version >= 2 and paragraph.name == 'figure':
+            figures.append(_native_picture_caption(paragraph, allow_direct_image=False))
+            allowed = _INLINE | {'figure', 'picture', 'source', 'figcaption'}
+        elif paragraph.name == 'p':
+            allowed = _INLINE
+        elif (paragraph.get_text(strip=True) and (adapter_contract_version >= 3 and paragraph.name == 'h3'
+                or adapter_contract_version >= 4 and paragraph.name == 'h2')):
+            headings.append(paragraph)
+            allowed = _INLINE
+        elif adapter_contract_version >= 4 and paragraph.name == 'ul':
+            # Native written list, distinct from the matched outline below.
+            # Keep every li in source order, including prose after a br. No
+            # inferred bullets, nested lists or unselected block text.
+            entries = list(_children(paragraph))
+            if (paragraph.attrs or not 1 <= len(entries) <= 256
+                    or any(n.name != 'li' or n.attrs or not n.get_text(strip=True) for n in entries)):
+                raise NewsError('article_identity_not_verified')
+            prose_lists.append({'source_list_type':'ul','source_entry_count':len(entries),
+                'source_order_preserved':True,'written_values_preserved_once':True,
+                'list_number_labels_invented':False,'navigation_or_related_content_excluded':False})
+            allowed = _INLINE | {'li'}
+        elif adapter_contract_version >= 3 and paragraph.name == 'div' and paragraph.get('id') == 'nav-directory':
+            if outlines:
+                raise NewsError('article_identity_not_verified')
+            outlines.append(_inews_outline(paragraph, body,
+                adapter_contract_version=8 if adapter_contract_version >= 4 else 1))
+            allowed = {'p', 'strong', 'ul', 'li', 'a'}
+        else:
+            raise NewsError('article_identity_not_verified')
+        for node in [paragraph, *paragraph.find_all()]:
+            _visible(node)
+            if (node is not paragraph and node.name not in allowed
+                    or any(k.lower().startswith('on') for k in node.attrs)
+                    or node.name == 'a' and re.match(r'\s*(?:javascript|data):', node.get('href', ''), re.I)
+                    or node.name in {'img', 'br', 'source'} and (node.get_text(strip=True) or node.find_all())
+                    or node.name == 'figure' and node is not paragraph
+                    or node.name == 'li' and paragraph.name == 'ul' and node.parent is not paragraph
+                    or node.name in {'picture', 'figcaption'} and node.parent is not paragraph):
+                raise NewsError('article_identity_not_verified')
+        if re.match(r'^(?:轉載自|轉自|本文轉載|本文由|新聞來源[：:])', paragraph.get_text(' ', strip=True)):
+            raise NewsError('article_rights_or_scope_excluded')
+    if sum(len(p.get_text(' ', strip=True)) for p in paragraphs) < 100:
+        raise NewsError('body_not_found')
+    remark = _one(scope, ':scope > .date-box > .article_remark_wrap')
+    _visible(remark)
+    byline = _one(remark, ':scope > .author_wrap', 'article_attribution_not_verified')
+    _visible(byline)
+    first = paragraphs[0]
+    signature = first.get_text(' ', strip=True)
+    header_credit = byline.get_text(' ', strip=True)
+    # One witnessed whole printed credit wrapped in a plain strong element.
+    # A partial or nested signature cannot hide contradictory adjacent text.
+    first_children = first.find_all(recursive=False)
+    wrapped_credit = bool(adapter_contract_version >= 4 and not header_credit
+        and first.name == 'p' and len(first_children) == 1 and first_children[0].name == 'strong'
+        and not first_children[0].attrs and not first_children[0].find_all()
+        and all(child is first_children[0] or type(child) is NavigableString and not str(child).strip()
+            for child in first.contents))
+    person, profile = None, None
+    printed_reporter = (re.fullmatch(r'記者([\u3400-\u9fff·]{2,20})／([\u3400-\u9fff]{1,20})報導', signature)
+        if adapter_contract_version >= 3 else None)
+    new_credit = False
+    role = 'native_visible_financial_desk_combined_report_signature'
+    desk, printed_credit = '財經中心', True
+    if adapter_contract_version >= 2 and header_credit:
+        link = _one(byline, ':scope > a[itemprop=author]', 'article_attribution_not_verified')
+        _visible(link)
+        person, profile = link.get_text(' ', strip=True), link.get('href', '')
+        header_match = re.fullmatch('記者 ' + re.escape(person) + r' ([\u3400-\u9fff]{1,20})?報導', header_credit)
+        printed_matches = bool(printed_reporter and printed_reporter[1] == person
+            and (not header_match or not header_match[1] or header_match[1] == printed_reporter[2]))
+        empty_first = not signature and not first.find_all()
+        if (byline.find_all(recursive=False) != [link] or link.find_all()
+                or any(k.lower().startswith('on') for n in (byline, link) for k in n.attrs)
+                or not re.fullmatch(r'[\u3400-\u9fff·]{2,20}', person)
+                or not re.fullmatch(r'https://www\.setn\.com/author/[a-z0-9-]+', profile)
+                or not header_match or first.name != 'p' or first.find_all()
+                or not (header_match[1] and empty_first
+                    or adapter_contract_version >= 3 and printed_matches)):
+            raise NewsError('article_attribution_not_verified')
+        new_credit = not empty_first
+        signature, desk, printed_credit = header_credit, None, not empty_first
+        role = 'native_visible_header_named_reporter_and_literal_profile'
+        if new_credit:
+            role = 'native_visible_header_and_matching_printed_reporter_signature'
+    else:
+        if (header_credit or byline.find_all() or first.name != 'p' or first.find_all() and not wrapped_credit):
+            raise NewsError('article_attribution_not_verified')
+        if signature != '財經中心／綜合報導':
+            named = re.fullmatch(r'財經中心／([\u3400-\u9fff·]{2,20})', signature)
+            desk_report = (re.fullmatch(r'財經中心／([\u3400-\u9fff·]{2,20})報導', signature)
+                if adapter_contract_version >= 3 else None)
+            if printed_reporter:
+                person, desk, new_credit = printed_reporter[1], None, True
+                role = 'native_visible_printed_reporter_and_location_signature'
+            elif desk_report:
+                person, new_credit = desk_report[1], True
+                role = 'native_visible_financial_desk_named_report_signature_role_unstated'
+            elif adapter_contract_version < 2 or not named or named[1].endswith('報導'):
+                raise NewsError('article_attribution_not_verified')
+            else:
+                person = named[1]
+                role = 'native_visible_financial_desk_named_signature_role_unstated'
+    clock = _one(remark, ':scope > .page-date', 'invalid_bulk_publication_clock')
+    _visible(clock)
+    visible = clock.get_text(' ', strip=True)
+    published = _one(soup, 'head > meta[property="article:published_time"]',
+                     'invalid_bulk_publication_clock').get('content')
+    try:
+        if (list(_children(remark)) != [byline, clock] or clock.find_all() or clock.has_attr('datetime')
+                or not re.fullmatch(r'[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}', visible)
+                or not isinstance(published, str)
+                or not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z', published)):
+            raise ValueError
+        wall = datetime.strptime(visible, '%Y/%m/%d %H:%M')
+        declared = datetime.fromisoformat(published.replace('Z', '+00:00'))
+        if wall.strftime('%Y-%m-%dT%H:%M') != declared.strftime('%Y-%m-%dT%H:%M'):
+            raise ValueError
+    except ValueError:
+        raise NewsError('invalid_bulk_publication_clock') from None
+    detail = {'contract_version': 1, 'source_visible_signature_raw': signature,
+        'source_credit_role': role,
+        'source_declared_desk': desk, 'source_declared_person_name': person,
+        'source_declared_profile_url': profile, 'source_header_credit_absent': not header_credit,
+        'printed_signature_preserved_in_article_body': printed_credit, 'meta_author_is_publisher_not_person': True,
+        'human_reporter_identity_verified': False, 'original_ownership_verified': False}
+    notices = {'contract_version': 1, 'visible_current_article_clock_raw': visible,
+        'visible_clock_precision': 'minute', 'visible_timezone_declared': False,
+        'visible_clock_release_or_revision_role_labelled': False,
+        'meta_publication_clock_raw': published, 'meta_clock_precision': 'second',
+        'meta_timezone_offset_raw': 'Z', 'same_wall_minute_is_same_instant_proof': False,
+        'publication_offset_resolution': 'unresolved', 'revision_clock_present': False,
+        'historical_first_release_verified': False, 'exact_PIT_eligible': False,
+        'image_alt_used_as_caption': False, 'media_or_scripts_requested_or_executed': False}
+    if person:
+        detail.update(contract_version=2, profile_requested=False,
+            source_declared_person_role='記者' if profile else None)
+    if new_credit:
+        detail.update(contract_version=3, source_visible_printed_signature_raw=first.get_text(' ', strip=True),
+            source_visible_header_signature_raw=header_credit or None,
+            source_declared_person_role='記者' if printed_reporter else None,
+            source_declared_printed_location_raw=printed_reporter[2] if printed_reporter else None,
+            printed_report_word_is_person_role_proof=False)
+    if wrapped_credit:
+        detail.update(contract_version=4, source_printed_signature_markup='single_plain_strong_whole_first_paragraph',
+            source_visible_printed_signature_raw=first.get_text(' ', strip=True))
+    if figures:
+        notices.update(native_written_caption_count=len(figures),
+            native_written_captions_preserved_once=True)
+    if headings:
+        notices.update(native_written_heading_count=len(headings), native_written_headings_preserved_once=True)
+    if outlines:
+        notices['matched_native_in_page_outlines'] = outlines
+    v4_shape = wrapped_credit or prose_lists or any(n.name == 'h2' for n in headings) or any(
+        outline['contract_version'] >= 2 for outline in outlines)
+    if prose_lists:
+        notices['native_written_prose_lists'] = prose_lists
+    if v4_shape:
+        notices['native_editor_representation_contract_version'] = 4
+    return {'headline': title, 'author': ([{'name': person, '@type': 'Person', **({'url':profile} if profile else {})}]
+        if person else [{'name': '財經中心', '@type': 'Organization'}]),
+        'datePublished': published,
+        'published_time_basis': 'source_meta_publication_second_Z_label_retained; visible_current_minute_clock_timezone_and_role_unstated; offset_unresolved_not_exact_PIT',
+        'article_identity_basis': ('literal_known_FuHouse_URL_canonical_OG_dable_ID_headline_and_whole_native_editor_v4'
+            if v4_shape else 'literal_known_FuHouse_URL_canonical_OG_dable_ID_headline_and_whole_native_editor_v3'
+            if new_credit or headings or outlines else 'literal_known_FuHouse_URL_canonical_OG_dable_ID_headline_and_whole_native_editor_v2'
+            if figures or person else 'literal_known_FuHouse_URL_canonical_OG_dable_ID_headline_and_whole_native_editor_v1'),
+        'author_attribution_detail_json': json.dumps(detail, ensure_ascii=False, sort_keys=True),
+        'verified_article_notices_json': json.dumps(notices, ensure_ascii=False, sort_keys=True),
+        'body_completeness': ('whole_native_paragraphs_h2_h3_written_list_entries_and_captions_once_in_source_order; original_credit_and_risk_notices_kept; exact_matched_local_outline_navigation_only_excluded; no_invented_list_markers_image_alt_or_ad_text'
+            if v4_shape else 'whole_native_paragraphs_headings_and_written_captions_once_in_source_order; original_header_and_printed_credit_and_risk_notices_kept; exact_matched_local_outline_navigation_only_excluded; no_image_alt_or_ad_text'
+            if new_credit or headings or outlines else 'whole_native_paragraphs_and_written_captions_once_in_source_order; original_header_or_printed_credit_and_risk_notices_kept; no_image_alt_or_ad_text'
+            if figures or person else 'whole_native_paragraphs_once_in_source_order; printed_desk_credit_written_photo_credit_and_risk_notices_kept; no_image_alt_or_ad_text')}, scope
+
+
+def _native_picture_caption(node, *, allow_direct_image):
+    """Shared witnessed figure shape; written captions never come from alt."""
+    caption = _one(node, ':scope > figcaption')
+    children = list(_children(node))
+    direct_image = (allow_direct_image and len(children) == 2
+        and children[0].name == 'img' and not list(_children(children[0])))
+    picture = children[0] if direct_image else _one(node, ':scope > picture')
+    if (children != [picture, caption] or picture.get_text(strip=True)
+            or not direct_image and (len(picture.select(':scope > img')) != 1
+                or any(child.name not in {'img', 'source'} for child in picture.find_all()))):
+        raise NewsError('article_identity_not_verified')
+    return caption
 
 
 def _children(node):
@@ -375,6 +669,46 @@ def _inews_prose_list(node):
         'list_number_labels_invented':False,'navigation_or_related_content_excluded':False}
 
 
+def _inews_static_threads_placeholder(node):
+    """A witnessed link-only native embed, without fetching or executing it.
+
+    Written post content is deliberately outside this grammar. A changed
+    widget stays unresolved instead of silently dropping text from the story.
+    """
+    children = list(_children(node))
+    if (node.attrs != {'class':['embedFrame']} or len(children) != 2
+            or children[0].name != 'blockquote' or children[1].name != 'script'):
+        raise NewsError('article_identity_not_verified')
+    quote, script = children
+    keys = {'class','data-text-post-permalink','data-text-post-version','id','style'}
+    permalink = quote.get('data-text-post-permalink','')
+    match = re.fullmatch(r'https://www\.threads\.com/@[A-Za-z0-9._]{1,40}/post/([A-Za-z0-9_-]{6,128})',permalink)
+    if (set(quote.attrs) != keys or quote.get('class') != ['text-post-media']
+            or quote.get('data-text-post-version') != '0' or match is None
+            or quote.get('id') != 'ig-tp-'+match[1]
+            or set(script.attrs) != {'async','src'} or script.get('async') != ''
+            or script.get('src') != 'https://www.threads.com/embed.js'
+            or script.find_all() or str(script.string or '').strip()):
+        raise NewsError('article_identity_not_verified')
+    containers = list(_children(quote))
+    if len(containers) != 1 or containers[0].name != 'div' or set(containers[0].attrs) != {'style'}:
+        raise NewsError('article_identity_not_verified')
+    outer = containers[0]
+    children = list(_children(outer))
+    if (len(children) != 2 or any(n.name != 'div' or set(n.attrs) != {'style'} for n in children)
+            or children[0].find_all() or children[0].get_text(strip=True)):
+        raise NewsError('article_identity_not_verified')
+    links = list(_children(children[1]))
+    if (len(links) != 1 or links[0].name != 'a'
+            or set(links[0].attrs) != {'href','style','target'}
+            or links[0].get('href') != permalink or links[0].get('target') != '_blank'
+            or links[0].find_all() or links[0].get_text(' ',strip=True) != '在 Threads 查看'):
+        raise NewsError('article_identity_not_verified')
+    return {'source_permalink':permalink,'native_placeholder_UI_text':'在 Threads 查看',
+        'written_post_content_present':False,'media_or_script_requested_or_executed':False,
+        'placeholder_UI_is_not_story_prose':True,'post_transcript_invented':False}
+
+
 def _inews_whole_editor(scope, *, adapter_contract_version=1):
     """One native editor; linear own-node checks, no DOM copy or media fetch."""
     editor = _one(scope, INEWS_EDITOR_SELECTOR)
@@ -401,20 +735,10 @@ def _inews_whole_editor(scope, *, adapter_contract_version=1):
             raise NewsError('article_identity_not_verified')
     captions, outlines, outline_nodes, empty_heading_nodes = [], [], set(), set()
     prose_lists, prose_list_nodes, written_paragraphs = [], set(), []
+    placeholders, placeholder_nodes = [], set()
     for node in _children(body):
         if node.name == 'figure':
-            caption = _one(node, ':scope > figcaption')
-            children = list(_children(node))
-            direct_image = (adapter_contract_version >= 2 and len(children) == 2
-                and children[0].name == 'img' and not list(_children(children[0])))
-            if direct_image:
-                picture = children[0]
-            else:
-                picture = _one(node, ':scope > picture')
-            if (children != [picture,caption] or picture.get_text(strip=True)
-                    or not direct_image and (len(picture.select(':scope > img')) != 1
-                        or any(child.name not in {'img','source'} for child in picture.find_all()))):
-                raise NewsError('article_identity_not_verified')
+            caption = _native_picture_caption(node, allow_direct_image=adapter_contract_version >= 2)
             captions.append(caption.get_text(' ',strip=True))
         elif adapter_contract_version>=3 and node.name=='div' and node.get('id')=='nav-directory':
             if outlines:
@@ -426,6 +750,9 @@ def _inews_whole_editor(scope, *, adapter_contract_version=1):
             prose_lists.append(description)
             prose_list_nodes.update(id(n) for n in (node,*node.find_all()))
             written_paragraphs.extend(paragraphs)
+        elif adapter_contract_version>=11 and node.name=='div' and node.get('class')==['embedFrame']:
+            placeholders.append(_inews_static_threads_placeholder(node))
+            placeholder_nodes.update(id(n) for n in (node,*node.find_all()))
         elif adapter_contract_version>=7 and node.name=='h1':
             # Witnessed native whitespace-only placeholder after a proven
             # local outline. Never discard a written heading, an attribute,
@@ -447,6 +774,9 @@ def _inews_whole_editor(scope, *, adapter_contract_version=1):
         allowed |= {'font'}
     for node in [body,*body.find_all()]:
         style = re.sub(r'\s+','',str(node.get('style',''))).lower()
+        if id(node) in placeholder_nodes:
+            _visible(node)
+            continue
         if ((node.name not in allowed and not (id(node) in outline_nodes and node.name in {'ul','li'})
                 and id(node) not in empty_heading_nodes and id(node) not in prose_list_nodes)
                 or node.has_attr('hidden') or str(node.get('aria-hidden','')).lower() == 'true'
@@ -464,9 +794,9 @@ def _inews_whole_editor(scope, *, adapter_contract_version=1):
                         or written.name == 'figcaption' and written.parent.name == 'figure'
                         and written.parent.parent is body)):
                 raise NewsError('article_identity_not_verified')
-    if sum(len(n.get_text(' ',strip=True)) for n in written_paragraphs) < 100:
+    if adapter_contract_version < 9 and sum(len(n.get_text(' ',strip=True)) for n in written_paragraphs) < 100:
         raise NewsError('body_not_found')
-    return editor, remark, body, captions, outlines, len(empty_heading_nodes), prose_lists
+    return editor, remark, body, captions, outlines, len(empty_heading_nodes), prose_lists, placeholders
 
 
 def _inews_native_identity(soup, *, page_url):
@@ -505,12 +835,14 @@ def setn_inews_native_article(soup, *, page_url, adapter_contract_version=1):
     if type(adapter_contract_version) is not int or adapter_contract_version not in INEWS_LAYOUT_VERSIONS.values():
         raise NewsError('article_identity_not_verified')
     scope, title, canonical, og_url = _inews_native_identity(soup, page_url=page_url)
-    _, remark, body, captions, outlines, empty_headings, prose_lists = _inews_whole_editor(scope, adapter_contract_version=adapter_contract_version)
+    _, remark, body, captions, outlines, empty_headings, prose_lists, placeholders = _inews_whole_editor(scope, adapter_contract_version=adapter_contract_version)
     byline = _one(remark,':scope > .author_wrap','article_attribution_not_verified')
     _visible(byline)
     signature = byline.get_text(' ',strip=True)
     printed_credit = adapter_contract_version >= 4 and not signature and not byline.find_all()
     printed_location = None
+    printed_collective = False
+    header_role = '記者'
     if printed_credit:
         # Witnessed native first-written paragraph, not a publisher/desk name
         # promoted to a person. Its complete signature remains in the body;
@@ -528,21 +860,25 @@ def setn_inews_native_article(soup, *, page_url, adapter_contract_version=1):
             match = re.fullmatch(r'記者([\u3400-\u9fff·]{2,20})／([\u3400-\u9fff]{1,20})報導',signature)
             if match is not None:
                 printed_location = match[2]
-        if match is None or match[1] in {'綜合','整理','編輯','記者'}:
+        printed_collective = (adapter_contract_version >= 11
+            and signature in {'財經中心／綜合報導','財經中心／綜合報導】'})
+        if not printed_collective and (match is None or match[1] in {'綜合','整理','編輯','記者'}):
             raise NewsError('article_attribution_not_verified')
         if any(re.match(r'^[（(]?(?:轉載自|轉自|本文轉載|本文由|新聞來源[：:])',p.get_text(' ',strip=True))
                 for p in body.find_all('p')):
             raise NewsError('article_rights_or_scope_excluded')
-        name, profile = match[1], None
+        name, profile = ('財經中心' if printed_collective else match[1]), None
     else:
         link = _one(byline,':scope > a[itemprop=author]','article_attribution_not_verified')
         _visible(link)
         name, profile = link.get_text(' ',strip=True), link.get('href','')
         location = r'[\u3400-\u9fff]{1,20}' if adapter_contract_version == 1 else r'(?:[\u3400-\u9fff]{1,20})?'
+        if adapter_contract_version >= 10 and signature.startswith('編輯 '):
+            header_role = '編輯'
         if (byline.find_all(recursive=False) != [link] or link.find_all()
                 or not re.fullmatch(r'[\u3400-\u9fff·]{2,20}',name)
                 or not re.fullmatch(r'https://www\.setn\.com/author/[a-z0-9-]+',profile)
-                or not re.fullmatch('記者 '+re.escape(name)+' '+location+'報導',signature)):
+                or not re.fullmatch(re.escape(header_role)+' '+re.escape(name)+' '+location+'報導',signature)):
             raise NewsError('article_attribution_not_verified')
     clock = _one(remark,':scope > time.pageDate','invalid_bulk_publication_clock')
     if list(_children(remark)) != [byline,clock] or clock.find_all() or clock.has_attr('datetime'):
@@ -555,11 +891,27 @@ def setn_inews_native_article(soup, *, page_url, adapter_contract_version=1):
         datetime.strptime(raw_clock,'%Y/%m/%d %H:%M')
     except ValueError:
         raise NewsError('invalid_bulk_publication_clock') from None
+    short_written_prose = False
+    prose_characters = None
+    if adapter_contract_version >= 9:
+        # Length is not completeness. Require real written prose after the
+        # whole native editor, literal credit and clock have been validated.
+        # Neither a printed byline nor photo captions substitute for a story.
+        paragraphs = body.select(':scope > p, :scope > ul > li > p, :scope > ol > li > p')
+        signature_node = first if printed_credit else None
+        prose_characters = sum(len(p.get_text(' ',strip=True)) for p in paragraphs if p is not signature_node)
+        if not prose_characters:
+            raise NewsError('body_not_found')
+        short_written_prose = prose_characters < 100
     attribution = {'contract_version':1,'source_visible_signature_raw':signature,
-        'source_credit_role':'native_visible_named_reporter_signature',
+        'source_credit_role':('native_visible_named_editor_signature' if header_role=='編輯'
+            else 'native_visible_named_reporter_signature'),
         'source_declared_person_name':name,'source_declared_profile_url':profile,
         'profile_requested':False,'meta_author_is_publisher_not_person':True,
         'human_reporter_identity_verified':False,'original_ownership_verified':False}
+    if header_role == '編輯':
+        attribution.update(contract_version=3,source_declared_credit_role='編輯',
+            human_editor_identity_verified=False)
     if printed_credit:
         attribution.update(contract_version=2,
             source_credit_role='native_visible_printed_financial_desk_named_reporter_signature',
@@ -569,6 +921,11 @@ def setn_inews_native_article(soup, *, page_url, adapter_contract_version=1):
             attribution.pop('source_declared_desk')
             attribution.update(source_credit_role='native_visible_printed_named_reporter_signature',
                 source_declared_report_location=printed_location)
+        if printed_collective:
+            attribution.update(contract_version=4,
+                source_credit_role='native_visible_printed_financial_desk_collective_signature',
+                source_declared_author_type='Organization',source_declared_person_name=None,
+                source_declared_collective_role='綜合報導')
     notices = {'contract_version':1,'canonical_raw':canonical,'og_url_raw':og_url,
         'source_current_article_clock_raw':raw_clock,'source_clock_precision':'minute',
         'source_timezone_declared':False,'source_clock_release_or_revision_role_labelled':False,
@@ -584,7 +941,15 @@ def setn_inews_native_article(soup, *, page_url, adapter_contract_version=1):
             'raw_source_tree_modified':False}
     if prose_lists:
         notices['verified_native_written_prose_lists'] = prose_lists
+    if placeholders:
+        notices['verified_native_static_social_placeholders'] = placeholders
+    if short_written_prose:
+        notices['verified_native_short_written_prose'] = {'characters':prose_characters,
+            'whole_editor_credit_and_clock_verified':True,
+            'printed_signature_or_photo_captions_counted_as_prose':False,
+            'generic_100_character_threshold_is_not_completeness_evidence':True}
     return {'headline':title,'author':[{'name':name}],'datePublished':raw_clock,
+        **({'_inews_native_short_written_prose_verified':True} if short_written_prose else {}),
         'published_time_basis':'source_visible_current_article_header_minute_label; timezone_and_release_or_revision_role_unstated; not_exact_historical_PIT',
         'article_identity_basis':'literal_known_iNEWS_URL_relative_or_absolute_canonical_OG_native_NewsArticle_headline_whole_editor_v'+str(adapter_contract_version),
         'author_attribution_detail_json':json.dumps(attribution,ensure_ascii=False,sort_keys=True),

@@ -68,6 +68,13 @@ def table_from_records(rows: list[dict[str, Any]]) -> Any:
     return pa.Table.from_pylist([dict.fromkeys(names), *rows]).slice(1)
 
 
+def _open_temporary_stream(path: Path, mode: int | None) -> Any:
+    if mode is None:
+        return path.open("wb")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    return os.fdopen(os.open(path, flags, mode), "wb")
+
+
 def atomic_write_bytes(
     path: str | Path,
     payload: bytes,
@@ -86,15 +93,14 @@ def atomic_write_bytes(
     """
 
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     temporary = _temporary_path(target)
     created = False
     try:
-        if mode is None:
-            stream = temporary.open("wb")
-        else:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            stream = os.fdopen(os.open(temporary, flags, mode), "wb")
+        try:
+            stream = _open_temporary_stream(temporary, mode)
+        except FileNotFoundError:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            stream = _open_temporary_stream(temporary, mode)
         created = True
         with stream as handle:
             handle.write(payload)
@@ -102,6 +108,7 @@ def atomic_write_bytes(
                 handle.flush()
                 os.fsync(handle.fileno())
         os.replace(temporary, target)
+        created = False
         if durable:
             _sync_parent(target)
     finally:
@@ -178,6 +185,7 @@ def atomic_write_parquet(
         # Pandas remains necessary in a few official-source parsers.  Keep its
         # index out of the storage ABI just like DataFrame.to_parquet(index=False).
         table = pa.Table.from_pandas(frame, preserve_index=False)
+    published = False
     try:
         pq.write_table(
             table,
@@ -192,10 +200,12 @@ def atomic_write_parquet(
         if before_replace is not None:
             before_replace()
         os.replace(temporary, target)
+        published = True
         if durable:
             _sync_parent(target)
     finally:
-        temporary.unlink(missing_ok=True)
+        if not published:
+            temporary.unlink(missing_ok=True)
 
 
 def sha256_bytes(payload: bytes) -> str:

@@ -356,12 +356,13 @@ def test_finlab_stage_expiry_during_work_retains_old_seal_and_exact_staged_bytes
     assert source.read_bytes() == b"original values: -7, NULL, shares=1000"
 
 
-@pytest.mark.parametrize("build_exit,stage_exit,publish_exit,expected_exit,minute_runs", [
-    (75, 0, 1, 0, True), (0, 75, 1, 0, True), (1, 0, 1, 1, False), (0, 1, 1, 1, False),
-    (0, 0, 75, 0, True), (0, 0, 2, 2, False),
+@pytest.mark.parametrize("minute_cleared", [False, True])
+@pytest.mark.parametrize("build_exit,stage_exit,publish_exit,bootstrap_exit,expected_exit", [
+    (75, 0, 1, 0, 0), (0, 75, 1, 0, 0), (1, 0, 1, 0, 1), (0, 1, 1, 0, 1),
+    (0, 0, 75, 0, 0), (0, 0, 2, 0, 2), (0, 0, 0, 0, 0), (0, 0, 0, 65, 65),
 ])
-def test_real_finlab_wrapper_keeps_independent_minutes_after_expected_deferral(
-    tmp_path, build_exit, stage_exit, publish_exit, expected_exit, minute_runs,
+def test_real_finlab_wrapper_acquires_before_research_and_tick_is_residual(
+    tmp_path, build_exit, stage_exit, publish_exit, bootstrap_exit, expected_exit, minute_cleared,
 ):
     """Exercise actual set -e/function/command-substitution behavior, no API."""
     import subprocess
@@ -381,28 +382,41 @@ run_fintech_python() {{
   case "$1" in
     */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":1,"processing_threads":1,"tick_partitions_per_pass":1}}';;
     */finlab_release_gate.py) return 0;;
-    */build_finlab_research_overlay.py) return {build_exit};;
+    */build_finlab_research_overlay.py) echo research >> work-order; return {build_exit};;
     */stage_tw_public_finlab_research_release.py) return {stage_exit};;
+    */audit_finlab_research_cold.py) echo cold-audit >> work-order; return 0;;
     */check_finlab_refresh_due.py) return 0;;
     */download_finlab_history.py) printf '%s\\n' '{{"minute_residual_allowed":true,"scheduled_reserve_mb":50}}';;
     *) '{sys.executable}' "$@";;
   esac
 }}
 stockagent-data() {{ printf 'publication\\n' >> publication-called; return {publish_exit}; }}
+ensure_enrolled_wsl_identity() {{ echo interop >> work-order; return {bootstrap_exit}; }}
 ''')
-    (scripts / "download_finlab_history.py").write_text("# Fixture sweep: pass_complete already sealed locally.\n")
+    (scripts / "download_finlab_history.py").write_text(
+        "from pathlib import Path\nwith Path('work-order').open('a') as log: log.write('general\\n')\n")
     (scripts / "download_finlab_market_intraday.py").write_text('''
 import json
+import sys
 from pathlib import Path
-Path("minute-called").touch()
-state = Path("data_finlab/intraday/market_status.json")
-state.parent.mkdir(exist_ok=True)
-state.write_text(json.dumps({"state":"waiting_older_publication", "active_kind":"tw_minute",
-                           "minute_priority":{"tick_residual_allowed":False}}))
-''')
+kind = sys.argv[sys.argv.index('--kind') + 1]
+with Path('work-order').open('a') as log: log.write(kind + '\\n')
+if kind == 'tw_minute':
+    Path("minute-called").touch()
+    state = Path("data_finlab/intraday/market_status.json")
+    state.parent.mkdir(exist_ok=True)
+    state.write_text(json.dumps({"state":"waiting_older_publication", "active_kind":"tw_minute",
+                               "minute_priority":{"tick_residual_allowed":MINUTE_CLEARED}}))
+'''.replace('MINUTE_CLEARED', repr(minute_cleared)))
     result = subprocess.run(["bash", str(root / "scripts/run_finlab_refresh.sh")],
                             cwd=tmp_path, env={**os.environ, "FINLAB_REPO_ROOT": str(tmp_path)},
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == expected_exit, result.stdout + result.stderr
-    assert (tmp_path / "minute-called").exists() is minute_runs
+    assert (tmp_path / "minute-called").exists()
     assert (tmp_path / "publication-called").exists() is (build_exit == stage_exit == 0)
+    order = (tmp_path / 'work-order').read_text().splitlines()
+    expected_order = (['general', 'tw_minute', 'tw_tick', 'research'] if minute_cleared
+                      else ['general', 'tw_minute', 'research'])
+    if build_exit == stage_exit == publish_exit == 0:
+        expected_order += ['interop'] + ([] if bootstrap_exit else ['cold-audit'])
+    assert order == expected_order

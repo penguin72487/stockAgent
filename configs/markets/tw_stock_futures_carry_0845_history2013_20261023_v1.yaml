@@ -1,0 +1,18 @@
+# Independent 2013-start research, while the 2011 request awaits a missing print.
+# Keep the complete 2011 stock/financial context and its factorized storage ABI.
+# attach_futures_decision_clock crops the panel AFTER prior/corporate context is
+# built; never relabel the partial 2011 clock manifest as complete.
+base_config: tw_stock_futures_carry_0845_history2011_20261021_v5.yaml
+experiment_name: tw-stock-futures-carry-0845-history2013-20261023-v1
+trading:
+  tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_history2013_20261023_v1/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_history2013_20261023_v1/clocks/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_stock_futures_history2013_20261023_v1/clock__0845
+  resume: false
+  # Only the last fold is selected. Launch its two DDP ranks directly rather
+  # than reconstructing this same panel/account in a third parent process.
+  isolate_train_folds: false
+walk_forward:
+  expected_first_year: 2013
+  split_start_year: 2013

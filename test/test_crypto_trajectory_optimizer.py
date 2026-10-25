@@ -162,7 +162,9 @@ def test_crypto_trajectory_preserves_account_and_valid_date_weighted_truncated_g
     assert timing.gradient_norm_observations == 1
 
 
-def test_crypto_trajectory_ddp_routing_keeps_one_policy_and_tail_mask(monkeypatch):
+@pytest.mark.parametrize("device_guard", [False, True])
+def test_crypto_trajectory_ddp_routing_keeps_one_policy_and_tail_mask(monkeypatch, device_guard):
+    monkeypatch.setenv("STOCKAGENT_TRAJECTORY_DEVICE_FINITE_GUARD", str(int(device_guard)))
     # Exercise the actual DDP executor with synthetic collectives, not GPUs or
     # train.py. Communication/reduction correctness is outside this unit test.
     original = _split()

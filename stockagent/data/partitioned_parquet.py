@@ -1,7 +1,7 @@
 """Reader-first Parquet ABI: an explicit manifest, not a directory/glob alias.
 
 Legacy files retain their byte identity. A manifest pins an ordered set of
-immutable, byte-verified year/month members and the logical Arrow schema.
+immutable, byte-verified period/row members and the logical Arrow schema.
 No directory discovery, deduplication, filling, sorting or clock conversion is
 performed while reading. Old generations and failed writes remain recoverable.
 """
@@ -25,9 +25,24 @@ import pyarrow.parquet as pq
 from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash
 
 CONTRACT = "ordered_partitioned_parquet_v1"
+ROW_PARTS_CONTRACT = "ordered_row_parts_parquet_v1"
 MANIFEST_SUFFIX = ".manifest.json"
 MAX_MANIFEST_BYTES = 16 * 1024**2
 MAX_MEMBERS = 4096
+
+
+def _manifest_location(path: Path):
+    if path.name.endswith(MANIFEST_SUFFIX):
+        return path.parent, path.name + ".parts", None
+    match = re.fullmatch(r"generation_([0-9a-f]{64})\.json", path.name)
+    if match and path.parent.name.endswith(MANIFEST_SUFFIX + ".parts"):
+        return path.parent.parent, path.parent.name, match[1]
+    return None
+
+
+def is_partition_manifest(path: str | Path) -> bool:
+    """Recognize only the explicit live pointer or its sealed generation ABI."""
+    return _manifest_location(Path(path)) is not None
 
 
 def implementation_identity():
@@ -93,9 +108,13 @@ class ParquetSource:
         self.byte_sha256 = None
         self.members = []
         self.signatures = []
-        if not self.path.name.endswith(MANIFEST_SUFFIX):
-            self.schema = pq.read_schema(self.path)
-            self.rows = pq.ParquetFile(self.path).metadata.num_rows
+        self._metadata = []
+        location = _manifest_location(self.path)
+        if location is None:
+            with pq.ParquetFile(self.path) as parquet:
+                self.schema = parquet.schema_arrow
+                self.rows = parquet.metadata.num_rows
+                self._metadata.append(parquet.metadata)
             self.members = [self.path]
             self.signatures = [self.before]
             return
@@ -105,38 +124,50 @@ class ParquetSource:
             raise ValueError("partition manifest byte bound")
         manifest = json.loads(raw)
         self.byte_sha256 = hashlib.sha256(raw).hexdigest()
-        if (not isinstance(manifest, dict) or manifest.get("contract") != CONTRACT
+        if (not isinstance(manifest, dict) or manifest.get("contract") not in {CONTRACT, ROW_PARTS_CONTRACT}
                 or manifest.get("manifest_sha256") != _digest(
                     {k: v for k, v in manifest.items() if k != "manifest_sha256"})):
             raise ValueError("partition manifest contract/checksum mismatch")
         proofs = manifest.get("members")
         if (not isinstance(proofs, list) or len(proofs) > MAX_MEMBERS
                 or type(manifest.get("rows")) is not int or manifest["rows"] < 0
-                or manifest.get("period") not in {"year", "month"}
-                or not isinstance(manifest.get("date_column"), str)):
+                or (manifest.get("contract") == CONTRACT and (manifest.get("period") not in {"year", "month"}
+                    or not isinstance(manifest.get("date_column"), str)))
+                or (manifest.get("contract") == ROW_PARTS_CONTRACT and (manifest.get("period") != "rows"
+                    or manifest.get("date_column") is not None
+                    or type(manifest.get("partition_rows")) is not int
+                    or not 1 <= manifest["partition_rows"] <= 1024**2))):
             raise ValueError("partition manifest inventory/clock mismatch")
+        base, namespace, archived_digest = location
+        if archived_digest is not None and (manifest["manifest_sha256"] != archived_digest
+                                            or self.before["mode"] & 0o222):
+            raise ValueError("immutable generation path/content mismatch")
         self.schema = pa.ipc.read_schema(pa.BufferReader(base64.b64decode(manifest["schema"], validate=True)))
-        date_type = self.schema.field(manifest["date_column"]).type
-        if not pa.types.is_date32(date_type):
+        row_parts = manifest["contract"] == ROW_PARTS_CONTRACT
+        if not row_parts and not pa.types.is_date32(self.schema.field(manifest["date_column"]).type):
             raise ValueError("partition ABI requires an explicit Date32 observation clock")
         previous_key = ""
         total = 0
-        namespace = self.path.name + ".parts"
         for proof in proofs:
             key = proof["key"]
-            pattern = r"[0-9]{4}" if manifest["period"] == "year" else r"[0-9]{4}-(?:0[1-9]|1[0-2])"
+            pattern = (r"[0-9]{20}" if row_parts else r"[0-9]{4}" if manifest["period"] == "year"
+                       else r"[0-9]{4}-(?:0[1-9]|1[0-2])")
             if (not isinstance(key, str) or not re.fullmatch(pattern, key) or key <= previous_key
                     or type(proof.get("rows")) is not int or proof["rows"] <= 0
                     or not re.fullmatch(r"[a-f0-9]{64}", str(proof.get("values_sha256", "")))
-                    or not isinstance(proof.get("min_date"), str) or not isinstance(proof.get("max_date"), str)
-                    or not proof["min_date"].startswith(key) or not proof["max_date"].startswith(key)
-                    or proof["min_date"] > proof["max_date"]):
+                    or (not row_parts and (not isinstance(proof.get("min_date"), str)
+                        or not isinstance(proof.get("max_date"), str)
+                        or not proof["min_date"].startswith(key) or not proof["max_date"].startswith(key)
+                        or proof["min_date"] > proof["max_date"]))
+                    or (row_parts and (key != f"{total:020d}" or proof.get("row_start") != total
+                        or type(proof.get("row_start")) is not int
+                        or proof["rows"] != min(manifest["partition_rows"], manifest["rows"]-total)))):
                 raise ValueError("partition order, rows or date bounds mismatch")
             name = proof["path"]
             if (not isinstance(name, str) or not re.fullmatch(
                     re.escape(namespace) + r"/p_[a-f0-9]{64}_[a-f0-9]{32}\.parquet", name)):
                 raise ValueError("partition member escaped its explicit namespace")
-            member = self.path.parent / name
+            member = base / name
             if member.resolve(strict=True) != member:
                 raise ValueError("redirected partition member")
             before = payload_info(member)
@@ -144,10 +175,11 @@ class ParquetSource:
                     or before["size"] != proof["bytes"]
                     or stable_payload_hash(member, before) != proof["sha256"]):
                 raise ValueError("partition member content proof mismatch")
-            parquet = pq.ParquetFile(member)
-            if (parquet.metadata.num_rows != proof["rows"]
-                    or not parquet.schema_arrow.remove_metadata().equals(self.schema.remove_metadata())):
-                raise ValueError("partition member schema/row mismatch")
+            with pq.ParquetFile(member) as parquet:
+                if (parquet.metadata.num_rows != proof["rows"]
+                        or not parquet.schema_arrow.remove_metadata().equals(self.schema.remove_metadata())):
+                    raise ValueError("partition member schema/row mismatch")
+                self._metadata.append(parquet.metadata)
             self.members.append(member)
             self.signatures.append(before)
             total += proof["rows"]
@@ -176,23 +208,31 @@ class ParquetSource:
         self.verify()
         selected_schema = self.schema if columns is None else pa.schema(
             [self.schema.field(name) for name in columns], metadata=self.schema.metadata)
-        paths = self.members
+        members = list(zip(self.members, self._metadata, strict=True))
         if tail_rows is not None:
             if type(tail_rows) is not int or tail_rows <= 0 or filters:
                 raise ValueError("bounded partition tail requires positive rows and no filters")
             if self.manifest is not None:
-                count, begin = 0, len(paths)
+                count, begin = 0, len(members)
                 for proof in reversed(self.manifest["members"]):
                     begin -= 1
                     count += proof["rows"]
                     if count >= tail_rows:
                         break
-                paths = paths[begin:]
+                members = members[begin:]
         # The Dataset factory is useful for predicate pushdown, but adds a
         # scanner/thread-pool per tiny BASE member when no filter is needed.
-        tables = [(pq.read_table(path, columns=columns, filters=filters, memory_map=True)
-                   if filters or self.manifest is None else pq.ParquetFile(path, memory_map=True).read(
-                       columns=columns, use_threads=False)) for path in paths]
+        tables = []
+        for path, metadata in members:
+            if filters or self.manifest is None:
+                # Preserve Dataset predicate/legacy partition discovery semantics.
+                tables.append(pq.read_table(path, columns=columns, filters=filters, memory_map=True))
+            else:
+                # This snapshot already verified the complete member SHA and
+                # footer. Reuse only its parsed metadata, never an open handle
+                # or a proof from another snapshot. Both stat fences remain.
+                with pq.ParquetFile(path, memory_map=True, metadata=metadata) as parquet:
+                    tables.append(parquet.read(columns=columns, use_threads=False))
         result = (pa.concat_tables(tables).replace_schema_metadata(selected_schema.metadata)
                   if tables else pa.Table.from_batches([], schema=selected_schema))
         if tail_rows is not None and result.num_rows > tail_rows:
@@ -249,7 +289,8 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
                             date_column="date", source_identity: dict,
                             replace_from: date | None = None, write_budget=None,
                             previous_source: ParquetSource | None = None,
-                            sync_directory: bool = True):
+                            sync_directory: bool = True, partition_rows: int | None = None,
+                            parquet_options: dict | None = None):
     """Publish only changed partitions under a single writer lease.
 
     ``replace_from`` is a producer-certified boundary, not a heuristic: the
@@ -257,6 +298,9 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
     overlapping month/year is decoded and joined to the replacement suffix.
     Corrections without such a proof supply the complete canonical table.
     Each new member is independently typed-roundtrip checked before commit.
+    ``period="rows"`` partitions the supplied order without interpreting an
+    observation clock. It requires a fixed ``partition_rows``, no date column
+    and a complete canonical table; insertions/corrections are never inferred.
     """
     from contextlib import ExitStack
     import pyarrow.compute as pc
@@ -274,14 +318,30 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
     legacy = path.with_name(path.name.removesuffix(MANIFEST_SUFFIX))
     if legacy.exists() or path.parent.resolve() != path.parent:
         raise ValueError("partition writer requires a separate, unambiguous non-redirected output root")
-    if period not in {"year", "month"} or not pa.types.is_date32(table.schema.field(date_column).type):
-        raise ValueError("partition writer requires a Date32 year/month clock")
+    row_parts = period == "rows"
+    if (period not in {"year", "month", "rows"}
+            or (row_parts and (date_column is not None or type(partition_rows) is not int
+                or not 1 <= partition_rows <= 1024**2 or replace_from is not None))
+            or (not row_parts and (partition_rows is not None
+                or not pa.types.is_date32(table.schema.field(date_column).type)))):
+        raise ValueError("partition writer requires a Date32 year/month clock or explicit ordered rows")
+    if not isinstance(parquet_options, (dict, type(None))):
+        raise ValueError("unsupported explicit partition Parquet encoding")
+    options = {"compression": "snappy", "row_group_size": 64_000, **(parquet_options or {})}
+    if (set(options) - {"compression", "row_group_size", "use_dictionary", "use_byte_stream_split"}
+            or options["compression"] not in ("snappy", "zstd", None)
+            or type(options["row_group_size"]) is not int or not 1 <= options["row_group_size"] <= 1024**2
+            or any(type(options[name]) is not bool for name in ("use_dictionary", "use_byte_stream_split") if name in options)):
+        raise ValueError("unsupported explicit partition Parquet encoding")
+    if options.get("use_byte_stream_split"):
+        options["use_byte_stream_split"] = [f.name for f in table.schema if pa.types.is_floating(f.type)]
     if not isinstance(source_identity, dict) or not source_identity:
         raise ValueError("partition writer requires the canonical producer's source identity")
     if replace_from is not None and type(replace_from) is not date:
         raise ValueError("replacement boundary must be an explicit observation date")
-    dates = table[date_column].combine_chunks()
-    if dates.null_count or (len(dates) > 1 and pc.any(pc.less(dates.slice(1), dates.slice(0, len(dates)-1))).as_py()):
+    dates = None if row_parts else table[date_column].combine_chunks()
+    if dates is not None and (dates.null_count or (len(dates) > 1
+            and pc.any(pc.less(dates.slice(1), dates.slice(0, len(dates)-1))).as_py())):
         raise ValueError("partition writer cannot sort, fill or reinterpret source dates")
     if replace_from is not None and len(dates) and pc.min(dates).as_py() < replace_from:
         raise ValueError("replacement suffix precedes its certified boundary")
@@ -304,6 +364,7 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
             previous = ParquetSource(path) if path.is_file() else None
         if previous is not None and (previous.manifest["period"] != period
                 or previous.manifest["date_column"] != date_column
+                or (row_parts and previous.manifest.get("partition_rows") != partition_rows)
                 or not previous.schema.remove_metadata().equals(table.schema.remove_metadata())):
             raise ValueError("partition layout/schema ABI changed; a fresh output root is required")
         old = {proof["key"]: proof for proof in previous.manifest["members"]} if previous else {}
@@ -321,32 +382,92 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
                 prefix = prefix.filter(pc.less(prefix[date_column], pa.scalar(replace_from, type=pa.date32())))
                 table = pa.concat_tables([prefix.replace_schema_metadata(table.schema.metadata), table])
                 dates = table[date_column].combine_chunks()
-        keys = pc.year(dates)
-        if period == "month":
-            keys = pc.add(pc.multiply(keys, 100), pc.month(dates))
-        runs = pc.run_end_encode(keys)
-        # The shared write budget charges each serializer callback's rounded
-        # allocation, not just compressed bytes. Bound column/page overhead too.
-        growth = max(1024**2, table.nbytes * 3 + 2 * MAX_MANIFEST_BYTES
-                     + len(runs.values) * 512 * 1024)
+        if row_parts:
+            run_keys = list(range(0, table.num_rows, partition_rows))
+            run_ends = [min(begin + partition_rows, table.num_rows) for begin in run_keys]
+        else:
+            keys = pc.year(dates)
+            if period == "month":
+                keys = pc.add(pc.multiply(keys, 100), pc.month(dates))
+            runs = pc.run_end_encode(keys)
+            run_keys, run_ends = runs.values.to_pylist(), runs.run_ends.to_pylist()
+        if len(kept) + len(run_keys) > MAX_MEMBERS:
+            raise ValueError("partition inventory bound; no automatic retention")
+        begin = 0
+        phases["prior_proof_and_boundary_read"] = time.perf_counter() - started
+        proofs = list(kept)
+        contract = ROW_PARTS_CONTRACT if row_parts else CONTRACT
+        stats = {"contract": contract, "written_partitions": 0, "reused_partitions": len(kept),
+                 "written_rows": 0, "reused_rows": sum(p["rows"] for p in kept),
+                 "written_payload_bytes": 0, "old_generations_removed": 0,
+                 "manifest_changed": True}
+        planned, changed_bytes, changed_parts = [], 0, 0
+        for raw_key, end in zip(run_keys, run_ends, strict=True):
+            phase_started = time.perf_counter()
+            part = table.slice(begin, end - begin).replace_schema_metadata(None)
+            key = (f"{raw_key:020d}" if row_parts else str(raw_key) if period == "year"
+                   else f"{raw_key//100:04d}-{raw_key%100:02d}")
+            values = table_content_sha256(part)
+            phases["typed_digest"] = phases.get("typed_digest", 0.0) + time.perf_counter() - phase_started
+            prior = old.get(key)
+            if prior is None or prior["values_sha256"] != values:
+                changed_bytes += part.nbytes
+                changed_parts += 1
+            # Retain offsets, not an additional Arrow table per partition.
+            planned.append((raw_key, begin, end, key, values, prior))
+            begin = end
+
+        def make_manifest(members):
+            value = {"contract": contract, "period": period, "date_column": date_column,
+                "schema": base64.b64encode(table.schema.serialize().to_pybytes()).decode(),
+                "rows": sum(proof["rows"] for proof in members), "members": members,
+                "source_identity": source_identity, "writer_implementation_sha256": implementation,
+                **({"partition_rows": partition_rows} if row_parts else {})}
+            value["manifest_sha256"] = _digest(value)
+            if len(json.dumps(value).encode()) > MAX_MANIFEST_BYTES:
+                raise ValueError("partition manifest byte bound; last-good retained")
+            return value
+
+        def finish_stats(manifest, archived):
+            stats["manifest"] = str(path)
+            stats["immutable_manifest"] = str(archived)
+            stats["current_payload_bytes"] = sum(proof["bytes"] for proof in manifest["members"])
+            stats["phase_seconds"] = phases
+            return stats
+
+        # A no-op is a fully verified source read, not a new allocation. Even a
+        # temporary hardlink to the same inode changes ctime/nlink and breaks an
+        # existing reader's source fence. Keep both inode and generation intact.
+        if previous is not None and not changed_parts:
+            candidate = make_manifest([*kept, *(item[5] for item in planned)])
+            if candidate == previous.manifest:
+                phase_started = time.perf_counter()
+                archived = namespace / f"generation_{candidate['manifest_sha256']}.json"
+                if archived.exists() or archived.is_symlink():
+                    before = payload_info(archived)
+                    if (before["mode"] & 0o222 or before["uid"] != os.geteuid()
+                            or before["size"] > MAX_MANIFEST_BYTES
+                            or stable_payload_hash(archived, before) != previous.byte_sha256):
+                        raise ValueError("immutable manifest archive changed; last-good pointer retained")
+                    previous.verify()
+                    if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation:
+                        raise ValueError("partition implementation changed during write")
+                    stats.update(manifest_changed=False,
+                        reused_partitions=len(candidate["members"]), reused_rows=candidate["rows"])
+                    phases["manifest_reuse"] = time.perf_counter() - phase_started
+                    return finish_stats(candidate, archived)
+
+        # Admit only writes that are actually needed, including a metadata-only
+        # generation. New members still have the original bounded serializer,
+        # typed readback and durability gates before the pointer can advance.
+        growth = max(1024**2, changed_bytes * 3 + 2 * MAX_MANIFEST_BYTES
+                     + changed_parts * 512 * 1024)
         if write_budget is None:
             leases.enter_context(reserve_cache_write(namespace,
                 key=implementation, maximum_growth_bytes=growth, family="panel", policy=load_capacity_policy()))
             write_budget = leases.enter_context(GenerationWriteBudget(growth))
-        begin = 0
-        phases["prior_proof_and_boundary_read"] = time.perf_counter() - started
-        proofs = list(kept)
-        stats = {"contract": CONTRACT, "written_partitions": 0, "reused_partitions": len(kept),
-                 "written_rows": 0, "reused_rows": sum(p["rows"] for p in kept),
-                 "written_payload_bytes": 0, "old_generations_removed": 0}
-        for raw_key, end in zip(runs.values.to_pylist(), runs.run_ends.to_pylist(), strict=True):
-            phase_started = time.perf_counter()
+        for raw_key, begin, end, key, values, prior in planned:
             part = table.slice(begin, end - begin).replace_schema_metadata(None)
-            begin = end
-            key = str(raw_key) if period == "year" else f"{raw_key//100:04d}-{raw_key%100:02d}"
-            values = table_content_sha256(part)
-            phases["typed_digest"] = phases.get("typed_digest", 0.0) + time.perf_counter() - phase_started
-            prior = old.get(key)
             if prior is not None and prior["values_sha256"] == values:
                 proof = prior
                 stats["reused_partitions"] += 1
@@ -358,7 +479,7 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
                 # inside the reserved allowance rather than charging a full
                 # filesystem allocation for every serializer callback.
                 with io.BufferedWriter(write_budget.open(target), buffer_size=1024**2) as stream:
-                    pq.write_table(part, stream, compression="snappy", row_group_size=64_000)
+                    pq.write_table(part, stream, **options)
                 phases["serialize"] = phases.get("serialize", 0.0) + time.perf_counter() - phase_started
                 phase_started = time.perf_counter()
                 roundtrip = pq.ParquetFile(target, memory_map=True).read(use_threads=False)
@@ -371,8 +492,9 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
                 proof = {"key": key, "path": str(target.relative_to(path.parent)),
                     "sha256": sha256_file(target), "bytes": target.stat().st_size,
                     "rows": part.num_rows, "values_sha256": values,
-                    "min_date": pc.min(part[date_column]).as_py().isoformat(),
-                    "max_date": pc.max(part[date_column]).as_py().isoformat()}
+                    **({"row_start": raw_key} if row_parts else {
+                        "min_date": pc.min(part[date_column]).as_py().isoformat(),
+                        "max_date": pc.max(part[date_column]).as_py().isoformat()})}
                 stats["written_partitions"] += 1
                 stats["written_rows"] += part.num_rows
                 stats["written_payload_bytes"] += proof["bytes"]
@@ -381,13 +503,7 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
         if len(proofs) > MAX_MEMBERS:
             raise ValueError("partition inventory bound; no automatic retention")
         phase_started = time.perf_counter()
-        manifest = {"contract": CONTRACT, "period": period, "date_column": date_column,
-            "schema": base64.b64encode(table.schema.serialize().to_pybytes()).decode(),
-            "rows": sum(proof["rows"] for proof in proofs), "members": proofs,
-            "source_identity": source_identity, "writer_implementation_sha256": implementation}
-        manifest["manifest_sha256"] = _digest(manifest)
-        if len(json.dumps(manifest).encode()) > MAX_MANIFEST_BYTES:
-            raise ValueError("partition manifest byte bound; last-good retained")
+        manifest = make_manifest(proofs)
         if previous is not None:
             previous.verify()
         if hashlib.sha256(Path(__file__).read_bytes()).hexdigest() != implementation:
@@ -415,7 +531,5 @@ def write_partitioned_table(table: pa.Table, path: str | Path, *, period="year",
             temporary.unlink(missing_ok=True)
         if sync_directory:
             _fsync_directory(path.parent)
-        stats["manifest"] = str(path)
         phases["manifest_commit"] = time.perf_counter() - phase_started
-        stats["phase_seconds"] = phases
-        return stats
+        return finish_stats(manifest, archived)

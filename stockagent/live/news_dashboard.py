@@ -28,6 +28,26 @@ MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024
 # discovered source when the owner crosses the old auxiliary-file limit.
 MAX_STATUS_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_AGE_SECONDS = 180
+
+
+def _disk_admission(value, observed, now):
+    """Fixed public byte/clock fields only; never storage paths or raw extras."""
+    if not isinstance(value, dict) or type(value.get('contract_version')) is not int or value['contract_version'] != 1:
+        return None
+    checked = _stamp(value.get('checked_at_utc'))
+    fields = ('free_bytes', 'required_free_bytes', 'shortfall_bytes', 'automatic_recheck_seconds')
+    if (not checked or not observed or not -5 <= (observed-checked).total_seconds() <= MAX_AGE_SECONDS
+            or not -5 <= (now-checked).total_seconds() <= MAX_AGE_SECONDS
+            or any(type(value.get(key)) is not int or not 0 <= value[key] <= 2**63-1 for key in fields)
+            or value['automatic_recheck_seconds'] < 10
+            or type(value.get('fetch_allowed')) is not bool
+            or value['fetch_allowed'] != (value['free_bytes'] >= value['required_free_bytes'])
+            or value['shortfall_bytes'] != max(0,value['required_free_bytes']-value['free_bytes'])):
+        return None
+    return {'contract_version': 1, 'available': True, 'checked_at_utc': checked.isoformat(),
+        **{key:value[key] for key in fields}, 'fetch_allowed':value['fetch_allowed']}
+
+
 _ID = re.compile(r"^(?:[a-z][a-z0-9_]{0,63}|unregistered:[a-z0-9.-]{1,253})$")
 _STATES = NEWS_OUTCOME_STATES
 _READY_STATES = {"pending", "inflight", "retry", "retry_cooldown"}
@@ -199,6 +219,40 @@ def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
             'stored_body_recheck_urls': ready - counts['active_missing_body_urls'],
             'candidate_views_accepted_by_hint': False, 'candidate_body_equivalence_verified': False,
             'no_known_primary_includes_unclassified': True}
+
+
+def _body_request_scope_progress(value: Any, work: Mapping[str, Any] | None,
+                                 observed: datetime | None, now: datetime) -> dict[str, Any] | None:
+    """Counts only: no private URL/host, gate permission or recovery inference."""
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or type(raw.get('available')) is not bool or work is None
+            or raw.get('source_recovery_verified') is not False):
+        return None
+    keys = ('active_missing_body_urls', 'source_paused_missing_body_urls', 'other_missing_body_urls',
+            'policy_paused_missing_body_urls', 'gateway_paused_missing_body_urls')
+    if not raw['available']:
+        if any(raw.get(key) is not None for key in (*keys, 'next_source_probe_at_utc')):
+            return None
+        return {'contract_version': 1, 'available': False, **dict.fromkeys(keys),
+                'next_source_probe_at_utc': None, 'source_probe_ready': None, 'source_recovery_verified': False}
+    counts = {key: _count(raw.get(key)) for key in keys}
+    if any(value is None for value in counts.values()):
+        return None
+    total, paused, other, policy, gateway = (counts[key] for key in keys)
+    if (total != work['active_missing_body_urls'] or total > 2048 or paused + other != total
+            or not max(policy, gateway) <= paused <= policy + gateway):
+        return None
+    deadline = _stamp(raw.get('next_source_probe_at_utc'))
+    if paused:
+        if observed is None or deadline is None or not -5 <= (deadline - observed).total_seconds() <= 86400:
+            return None
+    elif raw.get('next_source_probe_at_utc') is not None:
+        return None
+    return {'contract_version': 1, 'available': True, **counts,
+            'next_source_probe_at_utc': deadline.isoformat() if deadline else None,
+            'source_probe_ready': deadline <= now if deadline else False,
+            'source_recovery_verified': False}
 
 
 def _cnyes_public_index_progress(value: Any) -> dict[str, Any] | None:
@@ -725,6 +779,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     raw_activity = status.get("activity")
     source_activity = raw_activity if isinstance(raw_activity, str) and raw_activity in _ACTIVITIES else "unavailable"
     activity = _ACTIVITIES.get(source_activity, "unavailable")
+    disk_admission = _disk_admission(status.get('disk_admission'), observed, now)
     valid = type(status.get("contract_version")) is int and status["contract_version"] == 1
     lifecycle = read_news_worker_lifecycle(repo_root / 'data_news_fulltext',
         snapshot_owner_id=status.get('owner_id'), snapshot_at=observed, now=now)
@@ -738,6 +793,11 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             activity = 'initializing' if lifecycle['age_seconds'] <= MAX_AGE_SECONDS else 'initializing_stale'
         elif lifecycle_stopped and activity not in {'stopped', 'waiting_restart'}:
             activity = 'stopped'
+    if not initializing and not lifecycle_stopped and activity in {'running', 'idle', 'waiting', 'inventorying', 'waiting_disk'}:
+        if 'disk_admission' in status and disk_admission is None:
+            activity = 'unavailable'  # A current heartbeat cannot freshen an old admission sample.
+        elif disk_admission and not disk_admission['fetch_allowed']:
+            activity = 'waiting_disk'  # Inventory activity does not remove the write constraint.
     live = valid and fresh and activity in {"running", "idle", "waiting", "inventorying"}
     health = ("unavailable" if not status else "invalid" if not valid else "stale" if not fresh
               else "stopped" if activity == "stopped" else activity)
@@ -846,6 +906,12 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         body_coverage = (_body_state_coverage(raw.get('body_state_counts') if raw else {'missing': {}, 'stored': {}},
             counts, stored_urls, registered=identifier in configured, body_enabled=body_enabled)
             if valid and body_state_supported else None)
+        work_raw = _object(raw.get('body_work_progress')) if identifier == 'cnyes' else {}
+        body_work = _body_work_progress(work_raw, ready) if identifier == 'cnyes' else None
+        request_scope_declared = 'request_scope_progress' in work_raw
+        request_scope = _body_request_scope_progress(work_raw.get('request_scope_progress'), body_work, observed, now)
+        scope_eta_unknown = request_scope_declared and (request_scope is None or not request_scope['available']
+            or request_scope['source_paused_missing_body_urls'] > 0)
         outcome_progress = classify_news_outcomes(dict(counts), registered=identifier in configured,
                                                   body_enabled=body_enabled) if valid else None
         detail = _object(metric_providers.get(identifier))
@@ -865,7 +931,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         cooldown = _stamp(cooldowns.get(identifier))
         cooling = bool(cooldown and cooldown > now)
         eta_remaining = body_coverage['queued_missing_body_urls'] if body_coverage else ready
-        eta = (eta_remaining / eta_rate if body_enabled and eta_remaining and eta_rate and not cooling else
+        eta = (eta_remaining / eta_rate if body_enabled and eta_remaining and eta_rate and not cooling and not scope_eta_unknown else
                0.0 if body_enabled and eta_remaining == 0 and live else None)
         if body_coverage and eta_remaining == 0 and body_coverage['missing_body_urls']:
             eta = None  # Missing but blocked/unreviewed bodies are not completed work.
@@ -940,7 +1006,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                 raw.get('publisher_body_references'), known, stored_urls, body_coverage) if valid else None,
             "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
-            "body_work_progress": _body_work_progress(raw.get('body_work_progress'), ready) if identifier == 'cnyes' else None,
+            "body_work_progress": body_work,
+            "body_request_scope_progress": request_scope,
             "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress')) if identifier == 'cnyes' else None,
             "manifest_phase_progress": _cnyes_manifest_phase_progress(raw.get('public_index_progress'), metrics,
                 now, live and raw.get('automatic_collection_enabled') is True, status.get('owner_id')) if identifier == 'cnyes' else None,
@@ -958,6 +1025,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "completion_forecast_rate_basis": (forecast['basis'] if forecast is not None else
                                                'owner_new_stored_url_heads' if heads is not None else 'legacy_owner_version_proxy'),
             "conditional_eta_seconds": eta, "conditional_finish_at_utc": finish,
+            "conditional_eta_unavailable_reason": ('source_request_scope_unknown' if request_scope is None or not request_scope['available']
+                else 'source_request_scope_paused') if scope_eta_unknown else None,
             "conditional_eta_scope": 'queued_missing_body_urls' if body_coverage else 'legacy_active_url_states',
             "next_attempt_at_utc": cooldown.isoformat() if cooldown and cooling else None,
             "robots_origin_policy_pause": _robots_origin_pause(control, metrics, now, live),
@@ -1087,6 +1156,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "snapshot_reader_contract_version": 3, "snapshot_read_state": snapshot_read_state,
         "snapshot_read_attempts": snapshot_read_attempts,
         "worker_lifecycle_projection_contract_version": 2,
+        "disk_admission_projection_contract_version": 1,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         "outcome_progress": outcome_progress,
         "provider_stored_body_counter_contract_version": 1 if stored_counter_supported else None,
@@ -1105,6 +1175,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "status_age_seconds": max(0.0, age) if age is not None else None,
         "snapshot_consistent": consistency,
         "worker": {"activity": activity, "source_activity": source_activity,
+                   "disk_admission": disk_admission,
                    "fresh": fresh and not initializing and not lifecycle_stopped,
                    "lifecycle": lifecycle,
                    "owner_elapsed_seconds": lifecycle['elapsed_seconds'] if initializing else elapsed,

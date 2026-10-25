@@ -12,6 +12,113 @@ from scripts.benchmark_opening_signal_pipeline import (
 )
 
 
+def test_row_reference_executes_only_frozen_definitions_with_shared_canonical_globals(tmp_path, monkeypatch):
+    import hashlib
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "trusted-release.py"
+    raw = ("raise RuntimeError('module startup must not execute')\n"
+           "def generate_live_signal():\n    return _build_decision_rows()\n"
+           "def _build_decision_rows():\n    return 'frozen-row-path'\n")
+    path.write_text(raw)
+    functions, proof = benchmark._reference_row_functions(path)
+    assert functions["generate_live_signal"].__globals__ is vars(benchmark.signal_engine)
+    monkeypatch.setattr(benchmark.signal_engine, "_build_decision_rows", functions["_build_decision_rows"])
+    assert functions["generate_live_signal"]() == "frozen-row-path"
+    monkeypatch.setattr(benchmark.signal_engine, "_build_decision_rows", lambda: "shared-clock-and-guards")
+    assert functions["generate_live_signal"]() == "shared-clock-and-guards"
+    assert proof["sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert proof["other_benchmark_globals_shared"]
+
+
+def test_transport_reference_executes_only_selected_method_with_shared_globals(tmp_path):
+    import hashlib
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "trusted-transport.py"
+    raw = ("raise RuntimeError('module startup must not execute')\n"
+           "@unsafe\nclass FactorizedLiveWindow(unsafe_base):\n"
+           "    raise RuntimeError('class startup must not execute')\n"
+           "    def materialize(self, device): return torch.device(device)\n")
+    path.write_text(raw)
+    method, proof = benchmark._reference_live_materialize(path)
+    assert method.__globals__ is vars(benchmark.factorized_panel)
+    assert method(None, "cpu") == torch.device("cpu")
+    assert proof["sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert proof["method"] == "FactorizedLiveWindow.materialize"
+
+
+@pytest.mark.parametrize("flags,valid", [
+    (["--compare-full-shape-prefix", "--preopen-panel-warmup", "--candidate-first"], True),
+    (["--compare-full-shape-prefix", "--candidate-first"], False),
+    (["--compare-full-shape-prefix", "--preopen-panel-warmup", "--compare-config-reuse"], False),
+    (["--candidate-first"], False),
+    (["--repeats", "0"], False),
+    (["--preopen-quote-priority"], False),
+    (["--preopen-quote-priority", "--preopen-panel-warmup"], True),
+    (["--preopen-quote-priority", "--preopen-panel-warmup", "--compare-config-reuse"], False),
+])
+def test_full_shape_benchmark_cli_validates_axes_before_source_io(monkeypatch, flags, valid):
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    def preflight(_path):
+        raise RuntimeError("valid_axes_reached_preflight_without_source_io")
+    monkeypatch.setattr(benchmark, "_benchmark_runtime_profile", preflight)
+    monkeypatch.setattr("sys.argv", ["benchmark", "--receipt", "must-not-read.json",
+        "--feature-date", "2026-10-21", "--output", "must-not-write.json", *flags])
+    if valid:
+        with pytest.raises(RuntimeError, match="valid_axes_reached_preflight"):
+            benchmark.main()
+    else:
+        with pytest.raises(SystemExit) as result:
+            benchmark.main()
+        assert result.value.code == 2
+
+
+@pytest.mark.parametrize("axis", ["direct_destination", "prepared_host_packets"])
+def test_direct_transport_candidate_explicitly_selects_experimental_assembly(axis):
+    from scripts.benchmark_opening_signal_pipeline import _experimental_live_materialize
+    calls = []
+    def materialize(window, device, **kwargs):
+        calls.append((window, device, kwargs))
+        return "owned-window"
+    candidate = _experimental_live_materialize(materialize, axis=axis)
+    assert calls == []
+    assert candidate("fixture", "cuda") == "owned-window"
+    assert calls == [("fixture", "cuda", {axis: True})]
+    with pytest.raises(ValueError, match="unknown"):
+        _experimental_live_materialize(materialize, axis="not-a-transport-policy")
+
+
+@pytest.mark.parametrize("raw", (
+    "class FactorizedLiveWindow: pass\n",
+    "class FactorizedLiveWindow:\n    @unsafe\n    def materialize(self, device): pass\n",
+    "class FactorizedLiveWindow:\n    def materialize(self, device): pass\n    def materialize(self, device): pass\n",
+    "class FactorizedLiveWindow:\n    def materialize(self, device): pass\nclass FactorizedLiveWindow: pass\n"))
+def test_transport_reference_rejects_missing_or_ambiguous_methods(tmp_path, raw):
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "invalid-transport.py"
+    path.write_text(raw)
+    with pytest.raises(ValueError, match="canonical materialize"):
+        benchmark._reference_live_materialize(path)
+
+
+@pytest.mark.parametrize("raw", ("def generate_live_signal(): pass\n", "def generate_live_signal(): pass\ndef generate_live_signal(): pass\ndef _build_decision_rows(): pass\n", "@unsafe\ndef generate_live_signal(): pass\ndef _build_decision_rows(): pass\n"))
+def test_row_reference_rejects_ambiguous_or_decorated_definitions(tmp_path, raw):
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "bad-release.py"
+    path.write_text(raw)
+    with pytest.raises(ValueError):
+        benchmark._reference_row_functions(path)
+
+
+def test_explicit_candidate_adds_only_nullable_projection_definition(tmp_path):
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "candidate.py"
+    path.write_text("def generate_live_signal(): pass\ndef _build_decision_rows(): pass\ndef _finite_float_column(values): return values.tolist()\n")
+    functions, proof = benchmark._reference_row_functions(path, nullable_column=True)
+    assert sorted(functions) == ["_build_decision_rows", "_finite_float_column", "generate_live_signal"]
+    assert proof["functions"] == sorted(functions)
+    assert all(function.__globals__ is vars(benchmark.signal_engine) for function in functions.values())
+
+
 def test_preopen_preparation_never_consumes_opening_quotes_or_writes():
     original = {"price_source": "tw", "write": True, "asof_date": "2026-10-22 09:00:32",
                 "panel_date": "2026-10-21", "checkpoint": "same"}
@@ -268,6 +375,49 @@ def test_publication_clock_does_not_invent_a_missing_prefetch_origin():
         _publication_offset_ms(result, batch_started=1., call_started=2., prefetched=None)
 
 
+@pytest.mark.parametrize("damage", [None, "unpersisted_state", "future_financial_field", "fill_fee", "invalid_journal"])
+def test_complete_ledger_oracle_reads_all_generated_values_and_only_normalizes_own_root(tmp_path, damage):
+    from datetime import datetime
+    from scripts.benchmark_opening_signal_pipeline import _paper_ledger_financial_oracle
+    from stockagent.live import tw_day_trade_simulation as simulation
+    from stockagent.live.tw_day_trade_service_sync import PAPER_JOURNAL_FILENAMES
+    now = datetime.fromisoformat("2026-10-22T09:00:00+08:00")
+    engines, proofs = [], []
+    for name in ("one", "two"):
+        root = tmp_path / name
+        engine = simulation.TwDayTradeSimulationEngine(root / "ledger")
+        engine.state["modes"]["fixture"] = {"market": "fixture", "future_financial_field": -0.,
+            "positions": {"p": {"signed_shares": 1000, "entry_price": 40., "entry_fee": 28.5}},
+            "source_path": str(root / "signals/source.json"),
+            "outside_source": str(tmp_path / "same-canonical-source"), "integer_clock": 2**63 + 1}
+        for filename in PAPER_JOURNAL_FILENAMES:
+            simulation._append_jsonl(engine.state_dir / filename, {"symbol": "2330", "shares": 1000,
+                "price": 40., "fee": 28.5, "source": str(root / "signals/source.json")})
+        engine._persist(now)
+        engines.append(engine)
+        proofs.append(_paper_ledger_financial_oracle(engine))
+    assert proofs[0] == proofs[1]
+    assert all(row["records"] == 1 for row in proofs[0]["journals"].values())
+    changed = engines[1]
+    if damage == "unpersisted_state":
+        changed.state["modes"]["fixture"]["positions"]["p"]["entry_fee"] += 1e-12
+        with pytest.raises(RuntimeError, match="financial state differs"):
+            _paper_ledger_financial_oracle(changed)
+    elif damage == "future_financial_field":
+        changed.state["modes"]["fixture"]["future_financial_field"] = 0.
+        changed._persist(now)
+        assert _paper_ledger_financial_oracle(changed)["state_sha256"] != proofs[0]["state_sha256"]
+    elif damage == "fill_fee":
+        simulation._append_jsonl(changed.fills_path, {"fee": 1e-12})
+        changed._persist(now)
+        assert _paper_ledger_financial_oracle(changed)["journals"]["fills.jsonl"] != proofs[0]["journals"]["fills.jsonl"]
+    elif damage == "invalid_journal":
+        changed.events_path.write_text("{broken\n")
+        changed._persist(now)
+        with pytest.raises(ValueError):
+            _paper_ledger_financial_oracle(changed)
+
+
 def _sample(variant, published, complete, **cache_flags):
     stages = dict.fromkeys(("panel_cache_hit", "checkpoint_cache_hit",
                            "model_cache_hit", "alignment_cache_hit"), True)
@@ -340,6 +490,7 @@ def test_benchmark_manifest_binds_full_evidence_without_promoting_entry_rejectio
     evidence = {"session": "2026-10-22", "input_observation_clock": "2026-10-22T13:29:59+08:00",
         "native_opening_to_completion_claim": False, "broker_fill_claim": False,
         "production_writes": False, "contracts": {"mode": "full-financial-output-digest"},
+        "live_transport_reference": {"path": "trusted-source.py", "sha256": "reference-digest"},
         "preopen_preparation": {"panel_only": True, "opening_quotes_used_for_preparation": False,
             "reference_calls": [{"phase": "opening", "elapsed_ms": 2., "same_reference_object_reused": True}],
             "reference_inventories": [{"prepared_during": "preopen", "source_cutoff": "2026-10-21",
@@ -347,7 +498,11 @@ def test_benchmark_manifest_binds_full_evidence_without_promoting_entry_rejectio
                 "source_dates": ["2026-10-20", None, None]}]},
         "samples": [{"variant": "candidate", "sample_phase": "first_opening_after_panel_only_preparation",
             "all_published_ms": 100., "all_artifacts_ms": 120., "markets": [{"market": "mode",
-                "stages": {"model_inference_ms": 2., "source_scope": ["keep-in-full-file"]},
+                "cpu_clock_contract": "same_thread_cpu_or_unknown_v1",
+                "input_preparation_owner_thread_cpu_ms": {"panel_join": None, "quote": 1.5},
+                "stages": {"model_inference_ms": 2., "source_scope": ["keep-in-full-file"],
+                           "factorized_input_transport": {"destination_policy": "owned_full_window_slices_v1",
+                                                          "avoided_dense_copy_bytes": 1000}},
                 "input_reference_evidence": {"carried_reference_active_count": 1, "rows": [{"symbol": "A"}]},
                 "execution_probe": {"status": "blocked", "position_count": 0, "filled_shares": None,
                                     "scope": "isolated_engineering_synthetic_one_lot_books_not_live_fill"}}]}]}
@@ -360,13 +515,18 @@ def test_benchmark_manifest_binds_full_evidence_without_promoting_entry_rejectio
     assert result["source_artifact"] == {"path": str(path.resolve()), "bytes": len(raw),
                                          "sha256": hashlib.sha256(raw).hexdigest()}
     assert result["contracts"] == evidence["contracts"]
+    assert result["live_transport_reference"] == evidence["live_transport_reference"]
     assert result["native_opening_to_completion_claim"] is False
     assert result["preopen_preparation"]["reference_inventories"][0]["valid_reference_count"] == 1
     assert result["preopen_preparation"]["reference_calls"]["opening"]["same_reference_object_reused_count"] == 1
     sample = result["samples"][0]
     assert sample["sample_phase"] == "first_opening_after_panel_only_preparation"
     market = sample["markets"][0]
+    assert market["cpu_clock_contract"] == "same_thread_cpu_or_unknown_v1"
+    assert market["input_preparation_owner_thread_cpu_ms"] == {"panel_join": None, "quote": 1.5}
     assert market["stages"] == {"model_inference_ms": 2.}
+    assert market["factorized_input_transport"] == {"destination_policy": "owned_full_window_slices_v1",
+                                                    "avoided_dense_copy_bytes": 1000}
     assert market["input_reference_evidence"] == {"carried_reference_active_count": 1}
     assert market["execution_probe"]["status"] == "blocked"
     assert market["execution_probe"]["filled_shares"] is None
@@ -419,3 +579,50 @@ def test_benchmark_input_trace_retains_real_phase_spans_even_on_failure(monkeypa
         assert benchmark._prefetch_with_stage_timing(original, stages) == "unchanged-prefetch"
     assert stages == {"panel_fingerprint": 500., "quote_transport": 500.}
     assert original == {"config_path": "same-config", "price_source": "tw"}
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_benchmark_separates_owner_thread_cpu_and_keeps_original_callbacks(monkeypatch, failed):
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    elapsed = iter([1., 2., 2.5, 3.])
+    cpu = iter([0., .1, .3, .4])
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(elapsed))
+    monkeypatch.setattr(benchmark.time, "thread_time", lambda: next(cpu))
+    events = []
+    def original(**kwargs):
+        assert kwargs["input"] == "unchanged"
+        for phase in ("prepare", "forward", "forward"):
+            kwargs["progress_callback"]({"message": phase, "step": 1})
+        if failed:
+            raise ValueError("original failure")
+        return "original result"
+    inputs = {"input": "unchanged", "progress_callback": events.append}
+    wall_stages, cpu_stages = {}, {}
+    if failed:
+        with pytest.raises(ValueError, match="original failure"):
+            benchmark._call_with_stage_timing(original, inputs, wall_stages, cpu_stages)
+    else:
+        assert benchmark._call_with_stage_timing(original, inputs, wall_stages, cpu_stages) == "original result"
+    assert wall_stages == {"prepare": 500., "forward": 500.}
+    assert cpu_stages == pytest.approx({"prepare": 200., "forward": 100.})
+    assert events == [{"message": phase, "step": 1} for phase in ("prepare", "forward", "forward")]
+    assert inputs["input"] == "unchanged" and inputs["progress_callback"] == events.append
+
+
+@pytest.mark.parametrize("candidate", [False, True])
+@pytest.mark.parametrize("comparison", ["config_reuse", "validation", "other"])
+def test_config_and_schema_comparisons_change_only_the_selected_axis(candidate, comparison):
+    from scripts.benchmark_opening_signal_pipeline import _config_variant_loaders
+    cached, full, raw_schema = object(), object(), object()
+    schema = SimpleNamespace(__wrapped__=raw_schema)
+    loader, validator = _config_variant_loaders(cached, full, schema, use_cached=candidate,
+        compare_config_reuse=comparison == "config_reuse", compare_validation=comparison == "validation",
+        legacy_validation_control=False)
+    if comparison == "config_reuse":
+        assert loader is (cached if candidate else full)
+        assert validator is schema  # Never disable the pre-existing schema cache.
+    elif comparison == "validation":
+        assert loader is full  # Both sides must still execute full parsing.
+        assert validator is (schema if candidate else raw_schema)
+    else:
+        assert loader is cached and validator is schema

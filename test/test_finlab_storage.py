@@ -11,6 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from stockagent.data import finlab_storage as storage
+from scripts import deduplicate_artifacts as cli
 
 
 def _payload(root, name, values=(1., -2., None)):
@@ -177,3 +178,63 @@ def test_bounded_wait_uses_original_lock_and_does_not_interrupt_writer(tmp_path)
     assert result["state"] == "deferred" and result["replaced_paths"] == 0
     with pytest.raises(ValueError, match="wait must be finite"):
         _run(root, receipts, apply=True, wait_owner_seconds=float("nan"))
+
+
+def test_cli_audit_then_reviewed_share_keeps_all_receipts_and_raw_values(tmp_path, capsys):
+    root, receipts = tmp_path / "source", tmp_path / "operations"
+    first, _ = _payload(root, "first")
+    second, _ = _payload(root, "second")
+    before = {p: p.read_bytes() for p in (root / "receipts").iterdir()}
+    common = ["--finlab-history-root", str(root), "--report-dir", str(receipts)]
+    assert cli.main(common) == 0
+    audit = json.loads(capsys.readouterr().out)
+    assert audit["duplicate_groups"] == 1 and not os.path.samefile(first, second)
+    assert cli.main([*common, "--apply", "--expected-plan-fingerprint", audit["plan_fingerprint"]]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == "shared" and result["retired_allocated_bytes"] > 0
+    assert os.path.samefile(first, second)
+    assert all(p.read_bytes() == raw for p, raw in before.items())
+    assert pq.read_table(second).to_pydict()["0050"] == [1., -2., None]
+    assert result["logical_paths_removed"] == result["cold_objects_removed"] == 0
+
+
+@pytest.mark.parametrize("options", [[], ["--expected-plan-fingerprint", "bad"],
+                                    ["--expected-plan-fingerprint", "0" * 64,
+                                     "--finlab-wait-owner-seconds", "nan"]])
+def test_cli_rejects_unreviewed_or_invalid_share_before_changing_source(tmp_path, options):
+    root, receipts = tmp_path / "source", tmp_path / "operations"
+    first, _ = _payload(root, "first")
+    second, _ = _payload(root, "second")
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--apply", "--finlab-history-root", str(root), "--report-dir", str(receipts), *options])
+    assert error.value.code == 2 and not os.path.samefile(first, second)
+    assert not receipts.exists()
+
+
+def test_cli_busy_owner_returns_retryable_exit_and_retains_lock_inode(tmp_path, capsys):
+    root, receipts = tmp_path / "source", tmp_path / "operations"
+    first, _ = _payload(root, "first")
+    second, _ = _payload(root, "second")
+    with (root / ".sync.lock").open("w") as owner:
+        inode = (root / ".sync.lock").stat().st_ino
+        fcntl.flock(owner.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert cli.main(["--finlab-history-root", str(root), "--report-dir", str(receipts)]) == 75
+        result = json.loads(capsys.readouterr().out)
+        assert result["reason"] == "native_sync_owner_busy"
+        assert (root / ".sync.lock").stat().st_ino == inode
+    assert not os.path.samefile(first, second)
+
+
+def test_cli_keeps_large_legacy_diagnostics_in_durable_report(tmp_path, capsys):
+    root, receipts = tmp_path / "source", tmp_path / "operations"
+    _payload(root, "first")
+    for number in range(64):
+        (root / "receipts" / f"legacy-unrecognized-source-{number:04d}.json").write_text(
+            json.dumps({"legacy_source": number}))
+    assert cli.main(["--finlab-history-root", str(root), "--report-dir", str(receipts)]) == 0
+    terminal = capsys.readouterr().out
+    summary = json.loads(terminal)
+    assert len(terminal) < 4096 and "skipped_receipts" not in summary
+    full = json.loads(Path(summary["result_path"]).read_text())
+    assert len(full["skipped_receipts"]) == 64
+    assert full["logical_paths_removed"] == full["retired_allocated_bytes"] == 0

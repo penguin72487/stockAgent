@@ -50,6 +50,43 @@ def test_stock_futures_scope_rejects_ambiguous_sources(defect):
         stock_futures_preparation_scope(source)
 
 
+def source_universe_scope_fixture():
+    return pl.DataFrame(dict(product=['CAF', 'CA1', 'NYF', 'TX', 'UNF', 'TGF', 'CPF', 'GDF'],
+        asset_class=['stock_future', 'stock_future', 'etf_future', 'index_future',
+                     'index_future', 'commodity_future', 'interest_rate_future', 'commodity_future'],
+        underlying_symbol=['1303', '1303', '0050', '', '', '', '', ''],
+        region=['domestic'] * 4 + ['foreign', 'domestic', 'domestic', 'foreign'],
+        settlement_currency=['TWD'] * 7 + ['USD'],
+        currency_source_url=['https://www.taifex.com.tw/cht/2/products'] * 8,
+        currency_source_content_sha256=['a' * 64] * 8))
+
+
+def test_explicit_twd_universe_retains_all_classes_adjustments_and_foreign_indices():
+    from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
+    source = source_universe_scope_fixture()
+    all_twd = futures_preparation_universe(source, scope='all_twd')
+    assert all_twd['product'].to_list() == ['CAF', 'CA1', 'NYF', 'TX', 'UNF', 'TGF', 'CPF']
+    domestic = futures_preparation_universe(source, scope='domestic_equity')
+    assert domestic['product'].to_list() == ['CAF', 'CA1', 'NYF', 'TX']
+    assert source.height == 8
+
+
+@pytest.mark.parametrize('defect', ['duplicate', 'currency_proof', 'unknown_class', 'blank_underlying'])
+def test_explicit_twd_universe_rejects_unresolved_identity_and_currency(defect):
+    from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
+    source = source_universe_scope_fixture()
+    if defect == 'duplicate':
+        source = pl.concat([source, source.head(1)])
+    elif defect == 'currency_proof':
+        source = source.with_columns(pl.lit('a' * 63).alias('currency_source_content_sha256'))
+    elif defect == 'unknown_class':
+        source = source.with_columns(pl.lit('future_option').alias('asset_class'))
+    else:
+        source = source.with_columns(pl.lit(' ').alias('underlying_symbol'))
+    with pytest.raises(ValueError):
+        futures_preparation_universe(source, scope='all_twd')
+
+
 def test_margin_requires_product_local_currency_and_order():
     assert margin_pdf_values(PDF, 'TX') == (184000, 141000, 136000, 167000, 128000, 123000)
     for text in [PDF.replace('新臺幣', '美元'), PDF.replace('TX\n', 'MTX\n'),

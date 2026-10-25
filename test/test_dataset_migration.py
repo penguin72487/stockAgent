@@ -20,6 +20,62 @@ from stockagent.data_sync.packed_snapshots import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize('kind', ['json', 'streamed', 'sqlite'])
+def test_new_migration_captures_preserve_configured_free_space(tmp_path, monkeypatch, kind):
+    # The old 5 GiB check accepted 10 GiB free and could exhaust the shared
+    # 25 GiB reserve over thousands of independently bounded table captures.
+    monkeypatch.setattr(migration.shutil, 'disk_usage',
+                        lambda *_: SimpleNamespace(free=10 * 1024**3))
+    source = tmp_path / 'data_openBB'
+    source.mkdir()
+    stage = tmp_path / 'private/captured'
+    if kind == 'json':
+        original = source / 'status.json'
+        original.write_text('{"observed":-7}')
+    else:
+        original = source / 'openbb_l1.duckdb'
+        if kind == 'sqlite':
+            with sqlite3.connect(original) as connection:
+                connection.execute('CREATE TABLE observations(value INTEGER)')
+                connection.execute('INSERT INTO observations VALUES (-7)')
+        else:
+            original.write_bytes(b'closed immutable observed table')
+    before = original.read_bytes()
+    with pytest.raises(SnapshotError, match='scratch headroom insufficient'):
+        if kind == 'sqlite':
+            migration._snapshot_sqlite(original, stage, original.name)
+        else:
+            migration._freeze_controls(source, stage, [])
+    assert original.read_bytes() == before
+    assert not (stage / original.name).exists()
+    assert not (stage / 'snapshot.sqlite3').exists()
+
+
+@pytest.mark.parametrize('name', ['status.json', 'openbb_l1.duckdb'])
+def test_complete_frozen_observations_can_resume_without_new_capacity(tmp_path, monkeypatch, name):
+    source = tmp_path / 'data_openBB'
+    source.mkdir()
+    original = source / name
+    original.write_bytes(b'{"observed":-7}' if name.endswith('.json') else b'closed table')
+    stage = tmp_path / 'private/captured'
+    captured = migration._freeze_controls(source, stage, [])
+    original.write_bytes(b'{"observed":8}' if name.endswith('.json') else b'new current table')
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda *_: SimpleNamespace(free=0))
+    assert migration._freeze_controls(source, stage, []) == captured
+    assert Path(captured[name]['path']).read_bytes() != original.read_bytes()
+
+
+def test_capture_headroom_uses_current_policy_and_payload_bound(tmp_path, monkeypatch):
+    from stockagent.data_sync import cache_capacity
+    monkeypatch.setattr(cache_capacity, 'load_capacity_policy',
+                        lambda: {'minimum_free_bytes': 40 * 1024**3})
+    monkeypatch.setattr(migration.shutil, 'disk_usage',
+                        lambda *_: SimpleNamespace(free=41 * 1024**3))
+    migration._require_capture_headroom(tmp_path, 1)
+    with pytest.raises(SnapshotError, match='minimum_free=42949672960'):
+        migration._require_capture_headroom(tmp_path, 1024**3)
+
+
 def test_private_control_freeze_uses_observed_size_and_complete_original_bytes(tmp_path, monkeypatch):
     import os
     source = tmp_path / 'source'
@@ -2203,7 +2259,47 @@ def test_private_capture_atomic_no_replace_keeps_an_existing_observation(tmp_pat
     assert target.stat().st_nlink == 1
 
 
-def test_mutable_cohort_benchmark_keeps_complete_recovery_and_equal_original_values():
+@pytest.fixture
+def small_benchmark_capture_policy(monkeypatch):
+    # These byte-parity fixtures deliberately live in /var/tmp and hold only
+    # tiny owned inputs. Isolate their admission policy from the host's real
+    # pressure; the tests above exercise the production 25 GiB rejection.
+    from stockagent.data_sync import cache_capacity
+    native = cache_capacity.load_capacity_policy
+    monkeypatch.setattr(cache_capacity, 'load_capacity_policy',
+                        lambda: {**native(), 'minimum_free_bytes': 5 * 1024**3})
+
+
+def test_benchmark_retry_wait_honors_recorded_deadline_after_clock_correction(monkeypatch):
+    from scripts import benchmark_sealed_pack_recovery as benchmark
+    clocks = {'wall': 100., 'monotonic': 0., 'sleeps': 0}
+    def sleep(seconds):
+        clocks['monotonic'] += seconds
+        clocks['wall'] += seconds
+        clocks['sleeps'] += 1
+        if clocks['sleeps'] == 1:
+            clocks['wall'] -= 0.6
+    monkeypatch.setattr(benchmark, 'time', SimpleNamespace(
+        time=lambda: clocks['wall'], monotonic=lambda: clocks['monotonic'], sleep=sleep))
+    benchmark._wait_for_recorded_retry(101.)
+    assert clocks['wall'] >= 101.
+    assert clocks['monotonic'] == pytest.approx(1.6)
+
+
+def test_benchmark_retry_wait_stops_if_wall_clock_cannot_reach_deadline(monkeypatch):
+    from scripts import benchmark_sealed_pack_recovery as benchmark
+    elapsed = [0.]
+    def sleep(seconds):
+        elapsed[0] += seconds
+    monkeypatch.setattr(benchmark, 'time', SimpleNamespace(
+        time=lambda: 100., monotonic=lambda: elapsed[0], sleep=sleep))
+    with pytest.raises(TimeoutError, match='recorded retry deadline'):
+        benchmark._wait_for_recorded_retry(101., timeout_seconds=2.)
+    assert elapsed[0] == 2.
+
+
+def test_mutable_cohort_benchmark_keeps_complete_recovery_and_equal_original_values(
+        small_benchmark_capture_policy):
     from scripts.benchmark_sealed_pack_recovery import mutable_trial
     reference = mutable_trial(32, False)
     fixed = mutable_trial(32, True)
@@ -2214,7 +2310,8 @@ def test_mutable_cohort_benchmark_keeps_complete_recovery_and_equal_original_val
     assert reference['production_source_payloads_deleted'] == fixed['production_source_payloads_deleted'] == 0
 
 
-def test_operational_controls_benchmark_measures_complete_retry_and_equal_originals():
+def test_operational_controls_benchmark_measures_complete_retry_and_equal_originals(
+        small_benchmark_capture_policy):
     from scripts.benchmark_sealed_pack_recovery import mutable_trial
     reference = mutable_trial(32, False, operational_controls=True)
     candidate = mutable_trial(32, True, operational_controls=True)
@@ -2226,7 +2323,8 @@ def test_operational_controls_benchmark_measures_complete_retry_and_equal_origin
         assert row['production_source_payloads_deleted'] == 0
 
 
-def test_announcement_controls_benchmark_avoids_whole_retry_without_skipping_original_recovery():
+def test_announcement_controls_benchmark_avoids_whole_retry_without_skipping_original_recovery(
+        small_benchmark_capture_policy):
     from scripts.benchmark_sealed_pack_recovery import mutable_trial
     reference = mutable_trial(32, False, announcement_controls=True)
     candidate = mutable_trial(32, True, announcement_controls=True)
@@ -2316,7 +2414,7 @@ def test_pack_digest_benchmark_preserves_archive_bytes_crash_and_old_version_rec
     ('openbb', 'data_openBB', '_state/monitor_history.jsonl', b'{"value":-7,"missing":null}\n'),
 ])
 def test_live_operational_readback_verifies_only_isolated_copies(
-        tmp_path, monkeypatch, provider, root_name, logical, payload):
+        tmp_path, monkeypatch, provider, root_name, logical, payload, small_benchmark_capture_policy):
     from scripts import benchmark_sealed_pack_recovery as benchmark
     root = tmp_path / root_name
     path = root / logical

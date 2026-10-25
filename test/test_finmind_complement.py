@@ -566,3 +566,86 @@ def test_client_errors_are_classified_without_automatic_repeat(
     with pytest.raises(complement.SourceError, match=expected):
         complement._request(Session(), limiter, tmp_path, task, "secret", today=date(2026, 9, 25))
     assert limiter.deferred == (1800 if expected == "ip_banned" else None)
+
+
+def _minute_publication_rows():
+    return [{"date": "2026-10-23 13:31:00", "stock_id": "AAPL",
+             "open": 100.123456, "high": 101.23, "low": 99.87, "close": 100.99, "volume": 1789}]
+
+
+def test_final_parquet_fence_precedes_update_observation_and_receipt(tmp_path, monkeypatch):
+    import os
+    import stat
+    from downloader import artifact_io
+
+    task = complement.Task("USStockPriceMinute", "AAPL", "2026-10-23", "id_day", 0, "pending")
+    now = datetime(2026, 10, 24, 15, tzinfo=UTC)
+    events = []
+    sync, observe = os.fsync, complement.record_success
+
+    def fsync(fd):
+        path = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        events.append(("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file", path))
+        return sync(fd)
+
+    def record(root, selected, rows, receipt, stamp, **kwargs):
+        final = root / receipt['parquet_path']
+        assert final.is_file() and complement._sha256(final) == receipt['sha256']
+        assert ("directory", final.parent) in events
+        assert sum(kind == 'file' and path.name == 'latest.parquet' for kind, path in events) == 1
+        events.append(('update_observation', final))
+        return observe(root, selected, rows, receipt, stamp, **kwargs)
+
+    monkeypatch.setattr(artifact_io.os, 'fsync', fsync)
+    monkeypatch.setattr(complement, 'record_success', record)
+    receipt = complement._store(tmp_path, task, _minute_publication_rows(), now)
+    assert receipt['update_observation']['event'] == 'first_nonempty'
+    observation = next(i for i, event in enumerate(events) if event[0] == 'update_observation')
+    receipt_syncs = [i for i, (kind, path) in enumerate(events)
+                    if kind == 'file' and task.partition + '.json.' in path.name]
+    assert receipt_syncs and min(receipt_syncs) > observation
+
+
+def test_same_parquet_hash_reuses_durable_final_without_syncing_preparation(tmp_path, monkeypatch):
+    import os
+    from downloader import artifact_io
+
+    task = complement.Task("USStockPriceMinute", "AAPL", "2026-10-23", "id_day", 0, "pending")
+    now = datetime(2026, 10, 24, 15, tzinfo=UTC)
+    first = complement._store(tmp_path, task, _minute_publication_rows(), now)
+    final = tmp_path / first['parquet_path']
+    inode, content = final.stat().st_ino, final.read_bytes()
+    calls, sync = [], os.fsync
+
+    def fsync(fd):
+        calls.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        return sync(fd)
+
+    monkeypatch.setattr(artifact_io.os, 'fsync', fsync)
+    second = complement._store(tmp_path, task, _minute_publication_rows(), now + timedelta(seconds=1))
+    assert second['sha256'] == first['sha256']
+    assert final.stat().st_ino == inode and final.read_bytes() == content
+    assert not any('latest.parquet' in path.name for path in calls)
+    assert not (final.parent / 'latest.parquet').exists()
+    assert list((tmp_path / 'receipt_history').rglob('*.json'))
+
+
+def test_failed_final_fence_cannot_publish_observation_or_replace_prior_receipt(tmp_path, monkeypatch):
+    task = complement.Task("USStockPriceMinute", "AAPL", "2026-10-23", "id_day", 0, "pending")
+    now = datetime(2026, 10, 24, 15, tzinfo=UTC)
+    first = complement._store(tmp_path, task, _minute_publication_rows(), now)
+    receipt_path, final = tmp_path / first['receipt_path'], tmp_path / first['parquet_path']
+    prior = receipt_path.read_bytes(), final.read_bytes()
+
+    def failed_fence(*_a, **_kw):
+        raise OSError('injected_final_data_fence_failure')
+
+    def unexpected_observation(*_a, **_kw):
+        pytest.fail('source observation published before final data fence')
+
+    monkeypatch.setattr(complement, 'durable_replace', failed_fence)
+    monkeypatch.setattr(complement, 'record_success', unexpected_observation)
+    changed = [{**row, 'volume': 2001} for row in _minute_publication_rows()]
+    with pytest.raises(OSError, match='injected_final_data_fence_failure'):
+        complement._store(tmp_path, task, changed, now + timedelta(seconds=1))
+    assert (receipt_path.read_bytes(), final.read_bytes()) == prior

@@ -566,7 +566,7 @@ def test_chunked_canonical_preservation_decodes_and_restores_originals(tmp_path,
         archive.validate_parts_plan(plan)
     assert payload.read_bytes() == encoded
     parts[0].write_bytes(b'x' * parts[0].stat().st_size)
-    with pytest.raises(SnapshotError, match='changed after independent decode'):
+    with pytest.raises(archive.PreservationProofExpired, match='changed after independent decode'):
         archive.verify_retained_preservation(proof)
 
 

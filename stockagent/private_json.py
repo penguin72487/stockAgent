@@ -1,13 +1,14 @@
 """Optional private-cache decoder with Python's exact integer semantics.
 
-Public wire bytes keep their canonical owners. Untyped msgspec decoding retains
-arbitrary Python integers. General encoding stays with stdlib; the guarded
-metadata path excludes floats, large integers and custom value/key semantics.
+Public wire bytes and canonical hashes keep their existing owners. Untyped
+msgspec decoding retains arbitrary Python integers. Only guarded metadata and
+private ledger encoding use native output; general encoding stays with stdlib.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from functools import lru_cache
 from typing import Any
 
@@ -83,6 +84,62 @@ def projected_object_rows(lines: list[str], fields: tuple[str, ...]):
 
 def dumps(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+
+def _plain_finite_json(value: Any, depth: int = 0) -> bool:
+    """Exclude native conversions, nonfinite-to-null and custom container rules."""
+    # Most ledger fields are scalars. Do not allocate a recursive generator
+    # and call this Python function for every string/bool/float in thousands
+    # of rows; stack only containers while checking scalar leaves inline.
+    # The depth boundary and exact-builtin rule remain the same as before.
+    pending = [(value, depth)]
+    while pending:
+        current, level = pending.pop()
+        kind = type(current)
+        if current is None or kind in (str, bool, int):
+            continue
+        if kind is float:
+            if not math.isfinite(current):
+                return False
+            continue
+        if level >= 64:
+            return False
+        if kind is dict:
+            if not all(type(key) is str for key in current):
+                return False
+            children = current.values()
+        elif kind in (list, tuple):
+            children = current
+        else:
+            return False
+        for item in children:
+            item_kind = type(item)
+            if item_kind is float:
+                if not math.isfinite(item):
+                    return False
+            elif item is not None and item_kind not in (str, bool, int):
+                pending.append((item, level + 1))
+    return True
+
+
+def ledger_bytes(value: Any) -> bytes:
+    """Compact sorted private paper JSON, preserving decoded financial values.
+
+    This is not a public-wire or canonical-hash encoder: finite float spelling
+    may differ from stdlib, but integers, float bits, strings and order survive
+    readback. Only exact builtin trees enter the native encoder. Nonfinite
+    numbers, custom types/keys, cycles and legacy values retain stdlib's
+    ``default=str`` behavior and errors. The caller still owns append/fsync and
+    atomic publication; old ledger prefixes are never re-encoded.
+    """
+    if _native is not None:
+        try:
+            if _plain_finite_json(value):
+                return _native.json.encode(value, order="sorted")
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            pass
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str,
+                      separators=(",", ":")).encode("utf-8")
 
 
 def _plain_metadata(value: Any, depth: int = 0) -> bool:

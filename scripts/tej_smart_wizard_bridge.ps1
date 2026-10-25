@@ -182,6 +182,40 @@ public static class TejBridgeNative {
             throw new Exception("Exact standard single-OK button ID required; no acknowledgement");
         Message(dialog,0x111u,id,button);
     }
+    public static void AcknowledgeReviewedRuntimeDialog(long root,long dialog,long button,string code) {
+        // Independently repeat the exact allowlist and native ownership at
+        // the action boundary. Neither a caller-supplied caption nor an owned
+        // arbitrary error is permission to close a modal.
+        string expected;
+        switch(code) {
+            case "vendor_mysql_allocation_failed":expected="MySql:malloc";break;
+            case "vendor_source_table_unresolved":expected="Cannot find table 0.";break;
+            case "vendor_source_dns_resolution_failed":
+                expected="MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'";break;
+            default:throw new Exception("Unreviewed runtime code; no acknowledgement");
+        }
+        IntPtr r=new IntPtr(root),d=new IntPtr(dialog),b=new IntPtr(button);uint rp,dp,bp;
+        uint rt=GetWindowThreadProcessId(r,out rp),dt=GetWindowThreadProcessId(d,out dp),bt=GetWindowThreadProcessId(b,out bp);
+        if(rp==0||rp!=dp||rp!=bp||rt!=dt||dt!=bt||!IsWindow(r)||!IsWindow(d)||!IsWindow(b)||
+           GetWindow(d,4)!=r||GetParent(b)!=d||!IsChild(d,b)||IsWindowEnabled(r)||
+           !IsWindowEnabled(d)||!IsWindowEnabled(b)||!IsWindowVisible(d)||!IsWindowVisible(b))
+            throw new Exception("Exact owned runtime modal/control required");
+        var name=new StringBuilder(256);GetClassNameW(d,name,256);
+        if(name.ToString()!="#32770")throw new Exception("Unreviewed runtime modal class");
+        int matching=0;
+        foreach(long child in Children(dialog,"Static")) {
+            string caption=Text(child);
+            if(caption.Length==0)continue;
+            if(caption!=expected)throw new Exception("Changed runtime caption; no acknowledgement");
+            matching++;
+        }
+        long[] buttons=Children(dialog,"Button");int id=GetDlgCtrlID(b);
+        if(matching!=1||buttons.Length!=1||buttons[0]!=button||Text(button)!="OK"||(id!=1&&id!=2))
+            throw new Exception("Ambiguous runtime single-OK controls");
+        // One standard BN_CLICKED notification, using the actual control ID.
+        // Do not depend on foreground activation or repeat after a timeout.
+        Message(dialog,0x111u,id,button);
+    }
     public static long[] VisibleProcessWindows(long root) {
         // Broad enumeration remains diagnostic only. The narrowly reviewed
         // ownerless modal predicate above separately proves thread, root
@@ -1485,8 +1519,9 @@ try {
         Write-Output 'Exact Preview column-limit rejection acknowledged; no new query';exit
     }
     if($requestDoc.action -eq 'ack_source_memory_error') {
-        # Explicit operator-only recovery of an independently inspected
-        # runtime allocation failure. Not a quota/auth/permission bypass.
+        # Exact reviewed runtime recovery. The canonical caller must first
+        # prove its original metadata/pre-Preview action finished. Closing a
+        # notice alone never proves non-submission or authorizes a new query.
         $h=[long]$requestDoc.error_window
         if($h -le 0 -or $h -notin [TejBridgeNative]::Dialogs($ExpectedWindow)){throw 'Exact inspected memory-error HWND required'}
         $notice=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)
@@ -1495,21 +1530,25 @@ try {
         $nodes=$notice.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)
         $texts=@($nodes|Where-Object {$_.Current.ClassName -ceq 'Static' -and -not [string]::IsNullOrEmpty($_.Current.Name)})
         $buttons=@($nodes|Where-Object {$_.Current.ClassName -ceq 'Button'})
-        $knownMessage=@{'vendor_mysql_allocation_failed'='MySql:malloc';'vendor_source_table_unresolved'='Cannot find table 0.'}[[string]$requestDoc.error_code]
+        $knownMessage=@{
+            'vendor_mysql_allocation_failed'='MySql:malloc';
+            'vendor_source_table_unresolved'='Cannot find table 0.';
+            'vendor_source_dns_resolution_failed'="MySql:request error : The remote name could not be resolved: 'pro-119.tej.com.tw'"
+        }[[string]$requestDoc.error_code]
         if([string]::IsNullOrEmpty($knownMessage) -or $texts.Count -ne 1 -or $texts[0].Current.Name -cne $knownMessage -or
            $buttons.Count -ne 1 -or $buttons[0].Current.Name -cne 'OK' -or -not $buttons[0].Current.IsEnabled){throw 'Unreviewed memory-error layout; nothing acknowledged'}
         if(-not [TejBridgeNative]::IsChild([IntPtr]$h,[IntPtr]$buttons[0].Current.NativeWindowHandle)){throw 'Wrong memory-error acknowledgement owner'}
-        [TejBridgeNative]::Activate($h)
-        [void][TejBridgeNative]::Message($buttons[0].Current.NativeWindowHandle,0xF5,0,0)
+        [TejBridgeNative]::AcknowledgeReviewedRuntimeDialog($ExpectedWindow,$h,$buttons[0].Current.NativeWindowHandle,[string]$requestDoc.error_code)
         $deadline=[DateTime]::UtcNow.AddSeconds(5)
         while([TejBridgeNative]::IsWindow([IntPtr]$h) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
         if([TejBridgeNative]::IsWindow([IntPtr]$h)){throw 'Exact memory-error notice did not close; no repeat'}
         $payload=@{contract_version=4;provider='tej_smart_wizard';action='ack_source_memory_error';task_id=$requestDoc.task_id;
             type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
             observed_at_utc=[DateTime]::UtcNow.ToString('o');data_query_repeated=$false;
-            error_code=$requestDoc.error_code;source_axes_require_revalidation=$true;credentials_read=$false}
+            error_code=$requestDoc.error_code;source_axes_require_revalidation=$true;credentials_read=$false;
+            acknowledgement_contract='exact_reviewed_runtime_single_ok_no_foreground_v2'}
         [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 3 -Compress))
-        Write-Output 'Exact source allocation error acknowledged; no new data query';exit
+        Write-Output 'Exact reviewed source runtime error acknowledged; no new data query';exit
     }
     if($requestDoc.action -eq 'ack_excel_error') {
         # Explicit operator recovery ONLY. Never called by the download loop.

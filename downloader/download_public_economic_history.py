@@ -25,11 +25,12 @@ import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, sha256_file
 from downloader.common import load_env_file
+from downloader.operation_timing import OperationTiming
 from downloader.download_keyed_public_catalogs import (
     CatalogError, RequestBudget, SafeCatalogTransport, _redact_value,
 )
 from downloader.public_economic_sources import (
-    EconomicJob, core_jobs, moi_season_jobs, parse_economic_json, parse_moi_zip, request_url,
+    EconomicJob, core_jobs, current_moi_job, moi_season_jobs, parse_economic_json, parse_moi_zip, request_url,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,10 +75,11 @@ def verified_receipt(root: Path, job: EconomicJob) -> dict:
             or receipt.get("status") != "acquired" or not receipt.get("files")):
         return {}
     try:
+        resolved_root = root.resolve()
         for item in receipt["files"]:
             rel = Path(item["path"])
             path = root / rel
-            if (rel.is_absolute() or ".." in rel.parts or not path.resolve().is_relative_to(root.resolve())
+            if (rel.is_absolute() or ".." in rel.parts or not path.resolve().is_relative_to(resolved_root)
                     or not path.is_file() or path.stat().st_size != item["bytes"]):
                 return {}
             # Immutable version files were hashed at publication. A changed
@@ -87,6 +89,10 @@ def verified_receipt(root: Path, job: EconomicJob) -> dict:
             if signature != item.get("verified_file_signature"):
                 if sha256_file(path) != item["sha256"] or file_signature(path) != signature:
                     return {}
+        # Invocation-local reuse only. A changed root invalidates the entire
+        # check; every member still resolves and validates independently.
+        if root.resolve() != resolved_root:
+            return {}
     except (OSError, KeyError, TypeError):
         return {}
     return receipt
@@ -134,8 +140,19 @@ def _file_entry(root: Path, path: Path, **extra) -> dict:
 def acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: RequestBudget,
             *, max_bytes: int, min_free_bytes: int, transport_factory=SafeCatalogTransport,
             recheck_credentials: bool = False) -> dict:
+    timing = OperationTiming()
+    row = _acquire(job, root, credentials, budget, max_bytes=max_bytes, min_free_bytes=min_free_bytes,
+                   transport_factory=transport_factory, recheck_credentials=recheck_credentials, timing=timing)
+    # A cached result receives this call's verification clock, never a previous
+    # download's timing. Status publication below retains receipt-write time.
+    return {**row, "operation_timing": timing.snapshot("acquire_return_including_receipt_publication")}
+
+
+def _acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: RequestBudget,
+             *, max_bytes: int, min_free_bytes: int, transport_factory,
+             recheck_credentials: bool, timing: OperationTiming) -> dict:
     stamp = now()
-    previous = verified_receipt(root, job)
+    previous = timing.call("existing_receipt_verification", verified_receipt, root, job)
     row = {"provider": job.provider, "dataset": job.dataset, "status": "pending",
            "rows": previous.get("rows", 0), "history_complete": False,
            "checked_at_utc": stamp.isoformat()}
@@ -174,51 +191,56 @@ def acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: R
                 for item in candidate.get("files", []):
                     path = root / item.get("path", "")
                     if (item.get("kind") == "raw" and path.resolve().is_relative_to(root.resolve())
-                            and path.is_file() and sha256_file(path) == item.get("sha256")):
-                        body = path.read_bytes()
+                            and path.is_file() and timing.call("verify_cached_raw", sha256_file, path) == item.get("sha256")):
+                        body = timing.call("read_cached_raw", path.read_bytes)
                         observed = candidate["observed_at_utc"]
                         break
             if body is not None:
                 break
         if body is None:
-            body = client.fetch(request_url(job, credentials.get(job.credential or "", ""), since=since),
-                                {"User-Agent": "stockAgent-economic-research/1.0", "Accept": "application/json,application/zip"})
+            # Includes canonical limiter, budget claims, retries and response
+            # body reads; it is not a pure network or server-latency clock.
+            body = timing.call("transport_fetch_inclusive", client.fetch,
+                               request_url(job, credentials.get(job.credential or "", ""), since=since),
+                               {"User-Agent": "stockAgent-economic-research/1.0", "Accept": "application/json,application/zip"})
         observed = observed or now().isoformat()
         if job.provider == "moi":
             # Preserve this bounded, credential-free public archive before
             # parsing. Local failures must not consume another network quota.
-            digest = hashlib.sha256(body).hexdigest()
+            digest = timing.call("hash_raw_archive", lambda: hashlib.sha256(body).hexdigest())
             raw_path = root / "objects" / job.provider / f"{digest}.zip"
             if not raw_path.exists():
-                atomic_write_bytes(raw_path, body)
-            elif sha256_file(raw_path) != digest:
+                timing.call("publish_raw_archive", atomic_write_bytes, raw_path, body)
+            elif timing.call("verify_existing_raw_archive", sha256_file, raw_path) != digest:
                 raise CatalogError("existing_object_hash_mismatch")
-            atomic_write_json(raw_receipt_path, {"status": "raw_acquired_unvalidated", "provider": job.provider,
+            timing.call("publish_raw_recovery_receipt", atomic_write_json, raw_receipt_path, {"status": "raw_acquired_unvalidated", "provider": job.provider,
                               "dataset": job.dataset, "query_fingerprint": job_fingerprint(job),
                               "observed_at_utc": observed, "history_complete": False,
-                              "files": [_file_entry(root, raw_path, kind="raw")]})
-            tables, metadata = parse_moi_zip(body)
+                              "files": [timing.call("verify_recoverable_raw_archive", _file_entry, root, raw_path, kind="raw")]})
+            tables, metadata = timing.call("parse_moi_zip", parse_moi_zip, body)
             encoded, suffix = body, "zip"
         else:
-            table, metadata = parse_economic_json(job, body)
+            table, metadata = timing.call("parse_economic_json", parse_economic_json, job, body)
             # BEA's request echo contains UserID. Retain only sanitized JSON.
-            clean = _redact_value(json.loads(body, parse_float=str), tuple(credentials.values()))
-            encoded, suffix = json.dumps(clean, ensure_ascii=False, sort_keys=True).encode(), "json"
+            with timing.measure("sanitize_source_json"):
+                clean = _redact_value(json.loads(body, parse_float=str), tuple(credentials.values()))
+                encoded, suffix = json.dumps(clean, ensure_ascii=False, sort_keys=True).encode(), "json"
             if since and previous:
                 old_files = [f for f in previous["files"] if f.get("kind") == "parquet"]
                 if len(old_files) != 1:
                     raise CatalogError("invalid_payload_schema")
-                table = merge_revision(pq.read_table(root / old_files[0]["path"]), table, metadata["date_column"], since)
+                old_table = timing.call("read_revision_base", pq.read_table, root / old_files[0]["path"])
+                table = timing.call("merge_revision", merge_revision, old_table, table, metadata["date_column"], since)
                 values = table[metadata["date_column"]].to_pylist()
                 metadata.update(first_observation=min(values), last_observation=max(values))
             tables = {"observations": table}
-        digest = hashlib.sha256(encoded).hexdigest()
+        digest = timing.call("hash_encoded_raw", lambda: hashlib.sha256(encoded).hexdigest())
         raw_path = root / "objects" / job.provider / f"{digest}.{suffix}"
         if not raw_path.exists():
-            atomic_write_bytes(raw_path, encoded)
-        elif sha256_file(raw_path) != digest:
+            timing.call("publish_raw", atomic_write_bytes, raw_path, encoded)
+        elif timing.call("verify_existing_raw", sha256_file, raw_path) != digest:
             raise CatalogError("existing_object_hash_mismatch")
-        files = [_file_entry(root, raw_path, kind="raw")]
+        files = [timing.call("verify_published_raw", _file_entry, root, raw_path, kind="raw")]
         # Versioned outputs: publish a receipt only after every member succeeds.
         # Old good data remains reachable if a new response/parse is interrupted.
         generation = now().isoformat().replace(":", "").replace("+", "_")
@@ -227,8 +249,9 @@ def acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: R
             table = table.replace_schema_metadata({b"source": job.provider.encode(),
                      b"dataset": job.dataset.encode(), b"observed_at_utc": observed.encode(),
                      b"historical_point_in_time": b"false", b"raw_sha256": digest.encode()})
-            atomic_write_parquet(path, table)
-            files.append(_file_entry(root, path, kind="quarantine" if name == "rejected_rows" else "parquet", rows=table.num_rows))
+            timing.call("publish_parquet", atomic_write_parquet, path, table)
+            files.append(timing.call("verify_published_parquet", _file_entry, root, path,
+                                     kind="quarantine" if name == "rejected_rows" else "parquet", rows=table.num_rows))
         receipt = {**row, **metadata, "status": "acquired", "contract_version": 3 if job.provider == "moi" else CONTRACT_VERSION,
                    "query_fingerprint": job_fingerprint(job), "source": job.endpoint,
                    "query": job.params, "incremental_since": since, "observed_at_utc": observed,
@@ -239,8 +262,10 @@ def acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: R
                    "requests_this_run": budget.used - before, "history_complete": False,
                    "requested_scope_acquired": True, "historical_point_in_time": False,
                    "publication_time_status": "unknown; source period is not publication time"}
-        atomic_write_json(root / "receipt_history" / job.provider / job.dataset / f"{generation}.json", receipt)
-        atomic_write_json(receipt_path(root, job), receipt)
+        receipt["operation_timing"] = timing.snapshot("payloads_verified_before_receipt_publication")
+        timing.call("publish_receipt_history", atomic_write_json,
+                    root / "receipt_history" / job.provider / job.dataset / f"{generation}.json", receipt)
+        timing.call("publish_receipt_head", atomic_write_json, receipt_path(root, job), receipt)
         return receipt
     except Exception as exc:
         reason = str(exc) if isinstance(exc, CatalogError) else "local_processing_failed"
@@ -254,7 +279,8 @@ def acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: R
                    retry_at_utc=(now() + timedelta(seconds=delay)).isoformat(),
                    previous_good_receipt=bool(previous))
         if reason != "request_budget_exhausted":
-            atomic_write_json(attempt_path, row)
+            row["operation_timing"] = timing.snapshot("failure_before_attempt_publication")
+            timing.call("publish_failed_attempt", atomic_write_json, attempt_path, row)
         return row
 
 
@@ -284,8 +310,7 @@ def run_provider(provider: str, root: Path, credentials: dict[str, str], *, max_
                         return {"provider": provider, "state": "catalog_unavailable", "requests": budget.used}
             jobs = [EconomicJob(**item) for item in catalog["jobs"]]
             # Current release is separate from historical quarterly batches.
-            jobs.insert(0, EconomicJob("moi", "current", "https://plvr.land.moi.gov.tw/Download",
-                                      {"type": "zip", "fileName": "lvr_landcsv.zip"}, kind="published_snapshot"))
+            jobs.insert(0, current_moi_job())
         rows = []
         for job in jobs:
             row = acquire(job, root, credentials, budget, max_bytes=max_bytes, min_free_bytes=min_free_bytes,

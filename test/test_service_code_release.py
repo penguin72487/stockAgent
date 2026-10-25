@@ -56,6 +56,79 @@ def test_workspace_edits_do_not_invalidate_or_mutate_pinned_source(workspace):
                for _, target, _ in bindings)
 
 
+def test_explicit_overlay_preserves_compatible_base_and_excludes_unrelated_research(workspace):
+    base = prepare(workspace)
+    base_proof = release.verify_frozen_source(base, workspace)
+    (workspace / "stockagent/live/example.py").write_text("# reviewed output formatting\n")
+    (workspace / "downloader/example.py").write_text("# unrelated incompatible research\n")
+    (workspace / "stockagent/new_unselected.py").write_text("# must not silently ship\n")
+    (workspace / "stockagent/live/new_selected.py").write_text("# reviewed new helper\n")
+    selected = ("stockagent/live/example.py", "stockagent/live/new_selected.py")
+    derived = release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                                    base_receipt=base, include_sources=selected)
+    release.verify_frozen_source(derived, workspace)
+    assert release.verify_frozen_source(base, workspace) == base_proof
+    source = derived.parent / "source"
+    assert (source / selected[0]).read_text() == "# reviewed output formatting\n"
+    assert (source / selected[1]).read_text() == "# reviewed new helper\n"
+    assert (source / "downloader/example.py").read_text() == "# original source\n"
+    assert not (source / "stockagent/new_unselected.py").exists()
+    proof = json.loads(derived.read_bytes())
+    assert proof["source_overlay"]["included_sources"] == sorted(selected)
+    assert proof["source_overlay"]["base_receipt"] == str(base)
+    assert not proof["source_overlay"]["unselected_workspace_changes_promoted"]
+    base_files = json.loads(base.read_bytes())["code"]["files"]
+    assert all(proof["code"]["files"][name] == digest for name, digest in base_files.items() if name not in selected)
+
+
+@pytest.mark.parametrize("selected", ((), (".env",), ("configs/private.yaml",),
+    ("/stockagent/live/example.py",), ("stockagent/../downloader/example.py",),
+    ("stockagent/live/example.py", "stockagent/live/example.py")))
+def test_overlay_rejects_implicit_private_outside_or_duplicate_members(workspace, selected):
+    base = prepare(workspace)
+    with pytest.raises(ValueError, match="canonical source"):
+        release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                              base_receipt=base, include_sources=selected)
+
+
+def test_overlay_requires_base_and_refuses_changed_base(workspace):
+    with pytest.raises(ValueError, match="verified base"):
+        release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                              include_sources=("stockagent/live/example.py",))
+    base = prepare(workspace)
+    target = base.parent / "source/stockagent/live/example.py"
+    target.chmod(0o644)
+    target.write_text("# corrupted supposedly immutable source\n")
+    target.chmod(0o444)
+    with pytest.raises((ValueError, RuntimeError)):
+        release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                              base_receipt=base, include_sources=("stockagent/live/example.py",))
+
+
+def test_overlay_refuses_selected_symlink(workspace):
+    base = prepare(workspace)
+    target = workspace / "stockagent/live/alias.py"
+    target.symlink_to(workspace / "stockagent/live/example.py")
+    with pytest.raises(ValueError, match="regular"):
+        release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                              base_receipt=base, include_sources=("stockagent/live/alias.py",))
+
+
+def test_overlay_rejects_selected_source_changed_during_copy(workspace, monkeypatch):
+    base = prepare(workspace)
+    target = workspace / "stockagent/live/example.py"
+    original = Path.read_bytes
+    def mutate(path):
+        body = original(path)
+        if path == target:
+            target.write_text("# changed after first byte snapshot\n")
+        return body
+    monkeypatch.setattr(Path, "read_bytes", mutate)
+    with pytest.raises(RuntimeError, match="changed during freeze"):
+        release.freeze_source(workspace, workspace / "artifacts/operations/service_code_releases",
+                              base_receipt=base, include_sources=("stockagent/live/example.py",))
+
+
 def test_namespace_probe_uses_same_verified_absolute_paths_for_relative_inputs(workspace, monkeypatch):
     receipt = prepare(workspace)
     monkeypatch.chdir(workspace.parent)

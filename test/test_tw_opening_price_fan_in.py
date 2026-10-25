@@ -57,6 +57,63 @@ def fetch(owner, tmp_path, symbols, providers, **kwargs):
     return owner.fetch(symbols, fallback, parquet_root=tmp_path, providers=providers, minimum_coverage=kwargs.pop("minimum_coverage", 0.9), cache_reader=lambda: quotes.fetch_tw_mis_opening_snapshot(symbols, fallback, parquet_root=tmp_path, allow_network=False), **kwargs)
 
 
+def test_preopen_priority_applies_to_every_source_before_batching_without_changing_output_axis(owner, tmp_path):
+    from stockagent.live.opening_price_priority import publish_preopen_priority
+    observed = acquisition.datetime.now(TAIPEI)
+    day = observed.date().isoformat()
+    previous = (observed - timedelta(days=1)).date().isoformat()
+    symbols = ["C", "B", "A", "NEW"]
+    publish_preopen_priority(parquet_root=tmp_path, session_date=day, market="test",
+        feature_date=previous, model_identity={"checkpoint": "pinned"}, prepared_at=observed.replace(hour=8),
+        rows=[{"symbol": s, "abs_model_weight": float(s == "A"), "last_trade_date": previous,
+               "mean_volume_shares_20d": 100., "volume_observed_days": 1} for s in symbols[:-1]])
+    received = {}
+    prices = {"A": 101., "B": 102., "C": 103., "NEW": 104.}
+
+    def source(name):
+        def run(names, fallback, progress):
+            received[name] = list(names)
+            np.testing.assert_array_equal(fallback, [99.] * 4)
+            return snapshot([prices[s] for s in names])
+        return run
+
+    result = fetch(owner, tmp_path, symbols, {s: source(s) for s in (
+        "shioaji_shared", "official_mis", "finmind_snapshot")}, minimum_coverage=1.)
+    assert owner.wait_idle(timeout_seconds=3)
+    assert list(received.values()) == [["A", "B", "C", "NEW"]] * 3
+    np.testing.assert_array_equal(result.open_prices, [103., 102., 101., 104.])
+    evidence = result.transport_timing["opening_quote_priority"]
+    assert evidence["candidate_count"] == 1 and evidence["requested_count"] == 4
+    assert set(received) == {"shioaji_shared", "official_mis", "finmind_snapshot"}
+
+
+def test_mis_unsubmitted_tail_gets_next_full_retry_and_cannot_starve(owner, tmp_path):
+    calls = []
+
+    def mis(names, _fallback, _progress):
+        calls.append(list(names))
+        value = snapshot([np.nan] * len(names))
+        value.transport_timing = {"mis_dispatch_stopped": True,
+            "mis_unsubmitted_symbols": names[2:], "mis_deferred_channel_count": max(0, len(names) - 2)}
+        return value
+
+    symbols = [str(i) for i in range(7)]
+    for _round in range(4):
+        result = fetch(owner, tmp_path, symbols, {"official_mis": mis}, timeout_seconds=.1)
+        assert owner.wait_idle(timeout_seconds=3)
+        state = next(iter(owner._sessions.values()))
+        # Advance this unit fixture's backoff eligibility, never real APIs.
+        state.metrics["official_mis"]["retry_after_monotonic"] = 0
+        state.metrics["official_mis"].pop("transport_probe_after_monotonic", None)
+        assert not result.transport_timing["opening_quorum_ready"]
+    assert calls[0] == symbols
+    assert calls[1][:2] == ["2", "3"]
+    assert set(s for names in calls for s in names[:2]) == set(symbols)
+    assert all(sorted(names) == symbols for names in calls), "all first/retry scopes remain complete"
+    assert result.transport_timing["opening_providers"]["official_mis"]["last_completed_job"][
+        "quote_priority"]["fairness_policy"] == "previous_unsubmitted_tail_first_v1"
+
+
 def test_wait_idle_includes_final_durable_source_journal(owner, tmp_path, monkeypatch):
     finishing, release = threading.Event(), threading.Event()
     original = acquisition._record_source_event
@@ -1834,6 +1891,78 @@ def test_finmind_cooldown_cannot_be_bypassed_by_other_consumers_or_force(owner, 
         with pytest.raises(PermissionError):
             acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None, force_network=force)
     assert calls == [1]
+
+
+def test_after_hours_finmind_price_day_does_not_backdate_receive_or_leak_into_live_view(owner, monkeypatch):
+    now = acquisition.datetime.now(TAIPEI)
+    price_day = (now - timedelta(days=1)).date().isoformat()
+    market = (now - timedelta(days=1)).replace(hour=13, minute=30)
+    calls = []
+    def get(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 200,
+            "data": [{"stock_id": "A", "date": market.isoformat(), "open": 100, "total_volume": 1}]})
+    monkeypatch.setenv("FINMIND_TOKEN", "offline-not-a-credential")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=get))
+    past = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None,
+        price_session_date=price_day)
+    current = acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None)
+    assert len(calls) == 2
+    assert past.available_count == 1 and current.available_count == 0
+    assert past.timestamps_ms[0] == int(now.timestamp() * 1000)
+    assert past.exchange_timestamps_ms[0] == int(market.timestamp() * 1000)
+    assert not current.transport_timing["provider_response_reused"]
+    assert past.transport_timing["provider_snapshot_coverage"]["received_at_taipei"].startswith(now.date().isoformat())
+
+
+def test_after_hours_price_day_cannot_bypass_finmind_permission_backoff(owner, monkeypatch):
+    calls = []
+    now = acquisition.datetime.now(TAIPEI)
+    def get(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"status": 403, "data": []})
+    monkeypatch.setenv("FINMIND_TOKEN", "offline-not-a-credential")
+    monkeypatch.setattr(acquisition, "_http_session", lambda: SimpleNamespace(get=get))
+    for day in (None, (now - timedelta(days=1)).date().isoformat(), (now - timedelta(days=2)).date().isoformat()):
+        with pytest.raises(PermissionError):
+            acquisition.fetch_finmind_opening_prices(["A"], np.array([99.]), lambda *a: None,
+                force_network=True, price_session_date=day)
+    assert calls == [1]
+
+
+def test_finmind_equal_timestamps_do_not_reuse_prices_or_skip_row_validation():
+    now = datetime.fromisoformat("2026-10-22T13:35:00+08:00")
+    body = {"status": 200, "data": [{"stock_id": str(i), "date": "2026-10-22 13:30:00",
+        "open": 100. + i, "total_volume": i} for i in range(100)]}
+    body["data"].extend([
+        {"stock_id": "trial", "date": "2026-10-22 13:30:00", "isTrial": True},
+        {"stock_id": "old", "date": "2026-10-21 13:30:00", "open": 10, "total_volume": 1},
+        {"stock_id": "invalid", "date": "malformed", "open": 10, "total_volume": 0}])
+    options = {"received_ms": int(now.timestamp() * 1000), "session_date": "2026-10-22"}
+    first = acquisition._decode_finmind_opening_payload(body, **options)
+    assert first["rows"]["1"][0] == 101. and first["rows"]["99"][0] == 199.
+    assert first["states"]["0"] == "no_positive_volume_rows"
+    assert first["states"]["trial"] == "trial_rows"
+    assert first["states"]["old"] == "other_session_rows"
+    assert first["states"]["invalid"] == "malformed_rows"
+    body["data"][1]["open"] = 999.
+    second = acquisition._decode_finmind_opening_payload(body, **options)
+    assert second["rows"]["1"][0] == 999.
+    assert first["rows"]["1"][0] == 101., "next response must not mutate an earlier source observation"
+
+
+def test_opening_projection_single_bounds_preserves_scalar_timestamp_contract():
+    day = "2026-10-22"
+    midnight, end = quotes._taipei_session_bounds(day)
+    received = midnight + 10 * 60 * 60 * 1000
+    stamps = [0, -1, midnight, midnight + 9 * 60 * 60 * 1000 - 1,
+        midnight + 9 * 60 * 60 * 1000, received + 1000, received + 1001, end]
+    symbols = [str(i) for i in range(len(stamps))]
+    rows = {symbol: (100. + i, stamp) for i, (symbol, stamp) in enumerate(zip(symbols, stamps))}
+    value = acquisition._opening_only_snapshot(symbols, np.full(len(symbols), np.nan), rows,
+        source="fixture:not_market_data", session_date=day, received_ms=received)
+    expected = [quotes._same_taipei_open_timestamp(stamp, day) and stamp <= received + 1000 for stamp in stamps]
+    assert value.available_mask.tolist() == expected
 
 
 def test_full_provider_snapshot_is_journalled_once_but_each_axis_is_projected(owner, tmp_path, monkeypatch):

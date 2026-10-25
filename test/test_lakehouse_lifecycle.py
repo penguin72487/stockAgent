@@ -84,6 +84,74 @@ def test_active_restart_requires_explicit_code_only_scope_before_any_configurati
     assert error.value.code == 2
 
 
+@pytest.mark.parametrize('busy_index', [0, 1, 2])
+def test_handoff_wait_releases_every_partial_owner_and_reacquires_complete_boundary(tmp_path, monkeypatch, busy_index):
+    import fcntl
+    import time
+    from scripts import rollout_lakehouse_source_policy as rollout
+    locks = [tmp_path / name for name in ('version.lock', 'source.lock', 'catalog.lock')]
+    for lock in locks:
+        lock.touch()
+    inodes = [lock.stat().st_ino for lock in locks]
+    held = locks[busy_index].open('a')
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    original = rollout.subprocess.run
+    waits = []
+
+    def wait_only_for_busy_owner(argv, **options):
+        assert argv[0] == 'flock'
+        waits.append(True)
+        # Independent opens prove earlier owners were released before waiting.
+        for index, lock in enumerate(locks):
+            if index != busy_index:
+                with lock.open('a') as other:
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(held, fcntl.LOCK_UN)
+        return original(argv, **options)
+
+    monkeypatch.setattr(rollout.subprocess, 'run', wait_only_for_busy_owner)
+    try:
+        with rollout.publication_boundary(locks, time.monotonic() + 2):
+            for lock in locks:
+                with lock.open('a') as other:
+                    with pytest.raises(BlockingIOError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert waits == [True]
+        for lock in locks:
+            with lock.open('a') as other:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert [lock.stat().st_ino for lock in locks] == inodes
+    finally:
+        held.close()
+
+
+def test_handoff_timeout_releases_partial_owners_without_entering_body(tmp_path):
+    import fcntl
+    import time
+    from scripts import rollout_lakehouse_source_policy as rollout
+    locks = [tmp_path / name for name in ('version.lock', 'source.lock', 'catalog.lock')]
+    with locks[-1].open('a') as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TimeoutError, match='handoff boundary'):
+            with rollout.publication_boundary(locks, time.monotonic() + 0.03):
+                pytest.fail('a busy catalog must not enter service controls')
+        for lock in locks[:-1]:
+            with lock.open('a') as other:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_handoff_body_error_is_never_retried(tmp_path, monkeypatch):
+    import time
+    from scripts import rollout_lakehouse_source_policy as rollout
+    monkeypatch.setattr(rollout.subprocess, 'run', lambda *a, **k: pytest.fail('body error was treated as a lock wait'))
+    entries = []
+    with pytest.raises(BlockingIOError, match='body failed'):
+        with rollout.publication_boundary([tmp_path / 'owner.lock'], time.monotonic() + 2):
+            entries.append(True)
+            raise BlockingIOError('body failed')
+    assert entries == [True]
+
+
 @pytest.mark.parametrize('fault', [None, 'candidate_drift', 'lost_verified_release'])
 def test_authorized_restart_preserves_checkpoint_and_releases_old_owner_before_locks(tmp_path, monkeypatch, fault):
     import fcntl
@@ -658,8 +726,9 @@ def test_source_pipeline_prioritizes_unbacked_bytes_and_keeps_disjoint_pending_w
 
 @pytest.mark.parametrize('has_acceptance', [False, True])
 @pytest.mark.parametrize('redelivery_enabled', [False, True])
+@pytest.mark.parametrize('historical_only', [False, True])
 def test_source_monitoring_skips_restic_priority_without_new_candidates(
-        source_wave, monkeypatch, has_acceptance, redelivery_enabled):
+        source_wave, monkeypatch, has_acceptance, redelivery_enabled, historical_only):
     from stockagent.data_sync import nas_coverage
     c, entries, physical, _, _, source = source_wave
     state = Path(c['state_root'])
@@ -676,7 +745,15 @@ def test_source_monitoring_skips_restic_priority_without_new_candidates(
         delivery['nas_acceptance'] = {'state': 'nas_archive_file_recovery_verified',
                                       'delivery_identity_sha256': identity}
     ledger_path = state / 'source-replication-ledger.json'
-    atomic_write_json(ledger_path, {'deliveries': {identity: delivery}})
+    deliveries = {identity: delivery}
+    if historical_only:
+        old_id = 'b' * 64
+        # Same logical path, a different accepted historical hash: it stays
+        # archived but cannot inflate current-catalog coverage above 100%.
+        deliveries[old_id] = {'file_keys': [entries[0][0] + '@' + 'c' * 64], 'bytes': entries[0][2],
+            'nas_acceptance': {'state': 'nas_archive_file_recovery_verified',
+                               'delivery_identity_sha256': old_id}}
+    atomic_write_json(ledger_path, {'deliveries': deliveries})
     original_ledger, original_source = ledger_path.read_bytes(), source.read_bytes()
 
     class Catalog:
@@ -695,6 +772,9 @@ def test_source_monitoring_skips_restic_priority_without_new_candidates(
     assert result['minimum_next_source_object_bytes'] is None
     assert result['pending_delivery_ids'] == ([] if has_acceptance else [identity])
     assert result['nas_archive_covered_objects'] == int(has_acceptance)
+    assert result['nas_archive_historical_objects'] == int(has_acceptance) + int(historical_only)
+    assert result['nas_archive_covered_objects'] <= result['available_object_count']
+    assert result['nas_archive_covered_bytes'] == (entries[0][2] if has_acceptance else 0)
     assert ledger_path.read_bytes() == original_ledger
     assert source.read_bytes() == original_source
     assert not list(physical.iterdir())

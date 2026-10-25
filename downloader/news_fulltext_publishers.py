@@ -4237,7 +4237,10 @@ def moneyweekly_article_identity(soup, *, page_url):
     if not requested_id or canonical is None or article_id(canonical.get('href')) != requested_id:
         raise NewsError('article_identity_not_verified')
     headline = soup.find('h1')
-    container = soup.select_one('.div_Article_Info[itemprop=articleBody]')
+    containers = soup.select('.div_Article_Info[itemprop=articleBody]')
+    if len(containers) > 1:
+        raise NewsError('article_identity_not_verified')
+    container = containers[0] if containers else None
     # The public member-only response keeps a valid headline/canonical/byline,
     # but the verified current body contains only this publisher mask. Check
     # it before JSON-LD/body fallback; neither a preview nor hidden schema text
@@ -4252,6 +4255,92 @@ def moneyweekly_article_identity(soup, *, page_url):
             and container is not None and not container.get_text(' ', strip=True)
             and container.find(['img', 'video', 'audio', 'iframe']) is None):
         raise NewsError('source_article_empty_template')
+
+
+def moneyweekly_verified_short_prose(soup, source, container, *, page_url):
+    """Verify the whole native short editor; exclude only its named media slots.
+
+    A short text count is not a missing-data test. The current publisher can
+    publish a complete one-paragraph revenue release beside an image, its
+    separately labelled credit and the configured ad widget. Unknown blocks,
+    links, hidden prose and caption-only editors cannot use this path.
+    """
+    from bs4 import Comment, NavigableString
+    from downloader.news_fulltext_policy import _plain_text_node
+    from downloader.news_fulltext_public_originals import _visible
+
+    if (source.provider != 'moneyweekly' or not source.require_configured_container
+            or source.selectors != ('.div_Article_Info[itemprop=articleBody]',)
+            or not source.require_author_attribution or not source.permitted_author_names
+            or source.author_selectors != ('h1 + div > div:nth-child(2)',)
+            or source.publication_selectors != ('h1 + div > div:first-child',)):
+        return None
+    moneyweekly_article_identity(soup, page_url=page_url)
+    headings = soup.select('h1')
+    authors = soup.select(source.author_selectors[0])
+    clocks = soup.select(source.publication_selectors[0])
+    if len(headings) != 1 or len(authors) != 1 or len(clocks) != 1:
+        return None
+    if not headings[0].get_text(' ', strip=True):
+        return None
+    if authors[0].get_text(' ', strip=True) not in source.permitted_author_names:
+        raise NewsError('article_rights_or_scope_excluded')
+    try:
+        datetime.strptime(clocks[0].get_text(' ', strip=True), '%Y/%m/%d')
+    except ValueError:
+        return None  # No clock borrowed from schema, footer or a related story.
+    for node in (container, headings[0], authors[0], clocks[0]):
+        _visible(node)
+    paragraphs = []
+    image_before_credit = False
+    for child in container.children:
+        if isinstance(child, Comment):
+            continue
+        if isinstance(child, NavigableString):
+            if str(child).strip():
+                return None
+            continue
+        if (child.name == 'div' and child.has_attr('data-widget_id')
+                and '[data-widget_id]' in source.exclude_selectors):
+            continue  # The same explicitly configured non-article ad scope.
+        _visible(child)
+        if child.name == 'p':
+            images = child.find_all('img')
+            if images:
+                if (len(images) != 1 or len(child.find_all()) != 1
+                        or child.get_text(' ', strip=True)
+                        or images[0].get('alt') or images[0].get('title')):
+                    return None
+                _visible(images[0])
+                image_before_credit = True
+                continue
+            if any(node.name not in {'br', 'strong', 'em', 'b', 'i'} or node.attrs
+                   for node in child.find_all()):
+                return None
+            if child.attrs:
+                return None
+            text = _plain_text_node(child, parser=source.html_parser)
+            if text:
+                if re.search(r'請先登入|登入會員|閱讀全文|繼續閱讀|會員專屬|會員獨享|本文限|'
+                             r'^(?:圖片出處|圖片來源|資料來源|圖說|來源|圖|攝影)\s*[:：／/]', text):
+                    return None
+                paragraphs.append(text)
+            image_before_credit = False
+        elif child.name == 'div' and set(child.get('class', ())) == {'cols-12', 'd-flex'}:
+            credits = child.find_all(recursive=False)
+            if (not image_before_credit or len(credits) != 1
+                    or credits[0].name != 'div'
+                    or set(credits[0].get('class', ())) != {'col-11', 'py-3', 'div_Article_Info'}
+                    or credits[0].find() is not None
+                    or not re.fullmatch(r'圖片出處\s*[:：]\s*[^\n]{1,100}', credits[0].get_text(' ', strip=True))
+                    or child.get_text(' ', strip=True) != credits[0].get_text(' ', strip=True)):
+                return None
+            _visible(credits[0])
+            image_before_credit = False
+        else:
+            return None
+    body = '\n\n'.join(paragraphs)
+    return body if 0 < len(body) < 100 else None
 
 
 def einfo_metadata(soup, *, page_url):

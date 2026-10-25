@@ -712,6 +712,19 @@ def _date_text(value: Any, *, column: str) -> str | None:
     return None
 
 
+def parquet_footer_count(path: Path) -> int | None:
+    """Exact row count without decoding unused schemas/null/time statistics."""
+    if path.name.endswith(_PARTITION_SUFFIX):
+        stats = parquet_footer_stats(path)
+        return stats["count"] if stats is not None else None
+    try:
+        import pyarrow.parquet as pq
+
+        return pq.read_metadata(path).num_rows
+    except (OSError, ValueError, RuntimeError, ImportError):
+        return None
+
+
 def parquet_footer_stats(path: Path) -> dict[str, Any] | None:
     """One logical table, with every immutable member's complete byte proof."""
     if not path.name.endswith(_PARTITION_SUFFIX):

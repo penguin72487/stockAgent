@@ -1331,3 +1331,114 @@ attempt／prepared SHA 相符、有限且白名單內的耗時可顯示；壞 te
 scope 與故障，不複製下載器。私有輸出、fixture 暫存與實測收據留在既有 artifact
 根目錄，未加入 Git。下一個工程範圍為 Windows 啟動／檔案 I/O 長尾、跨表準備與
 大表 MSAA 讀回；目前只交付已驗證的恢復修正，不把工作標為全體優化完成。
+
+## 2026-10-23：DNS 提示、重試共用與待機喚醒
+
+### 實際停滯原因與證據
+
+這次初查發現 collector 程序仍在，但下載曾停止數小時。原工作
+`5f2a86164e5e60859ce89954` 在 11:55 的原始負面回應證明失敗發生於 Preview
+之前；15:30 的私人 `inspect_notices` 讀回顯示 TEJ 根視窗被停用，以及
+`pro-119.tej.com.tw` 無法解析的 MySql request error。這是需要辨識並恢復的
+網路錯誤，不能因為程序 `active` 就當成有持續取得資料。
+
+Microsoft 將 [NameResolutionFailure](https://learn.microsoft.com/dotnet/api/system.net.webexceptionstatus)
+定義為無法解析主機名稱；本案的送出邊界仍以原工作自己的 finished negative
+proof 為準，不能僅憑這段錯誤文字推定所有查詢都未送出。原 request、negative
+outcome 與提示讀回的 SHA 保存在
+[換載紀錄](../artifacts/data_quality/tej_resilience_2026-10-23/release_deployment.json)，
+沒有清除失敗證據或重寫成成功。
+
+另有獨立的排程問題：`_ready_task` 原本完全略過公司標籤缺席的共用 retry window，
+讓同表較早到期的其他片段反覆進入 UI，沒有共用該表正在等待的重試時間。
+[修正前的工作清點](../artifacts/data_quality/tej_resilience_2026-10-23/starvation_baseline.json)
+包含 180 個這類片段。新測試先重現 11 個失敗，才修改 SQL。
+
+15:33 左右，舊 collector 在尚未載入本次修改前已自行恢復部分下載。
+因此不能把那次恢復歸功於新程式；本次成果只採換載之後才開始的工作與獨立讀回。
+
+### 修正與恢復邊界
+
+| 環節 | 本次變更 |
+| --- | --- |
+| 挑選工作 | 已知缺席片段共用同表的等待時間；同表仍可取得及尚待驗證的公司照常排入，其他資料表可以繼續。 |
+| DNS 提示 | 僅接受本次核對過的完整 TEJ 主機錯誤原文；沿用原 metadata／未送出證據、精確視窗歸屬、重新讀回及有界重試。 |
+| 關閉已知提示 | 原生層再次核對 PID、thread、owner、標準 modal、完整文字、唯一可用 OK 與實際 control ID，然後只送一次標準通知。 |
+| 待機 | 依 `max(片段到期時間, 適用的同表到期時間)` 喚醒；隔離資料表和不擁有一般 retry window 的片段不造成無效輪詢。 |
+
+Windows fixture 首次核對 runtime 分支時，重現舊 `Activate` 因無法取得前景而失敗。
+現在使用實際 OK 控制項的 `WM_COMMAND / BN_CLICKED`，不搶前景或重按。
+[Microsoft 的 BM_CLICK 文件](https://learn.microsoft.com/windows/win32/controls/bm-click)
+也指出未啟用的 dialog 可能無法接受該動作；
+[BN_CLICKED 文件](https://learn.microsoft.com/windows/win32/controls/bn-clicked)
+說明通知中的 control ID 與 button handle。本次沒有把通知泛化到未知錯誤。
+
+Python 與 PowerShell 都保留精確白名單，原生動作邊界再獨立核對一次。
+其他主機、相似網域、附加配額文字、登入、外來 PID 和未知提示不會被自動關閉。
+關閉提示本身不產生 Preview、不採用新 axes，也不能授權重送未知結果。
+既有 60–900 秒重試與 standing replay 的證據／次數邊界不放寬。
+
+`BATCH_SCHEDULER_CONTRACT` 升為 `phase_preserving_interleave_coalesced_company_retry_v2`；
+metadata isolation 記為 `verified_metadata_only_isolation_reviewed_dns_v2`。
+公開 supervisor JSON 協定維持 v1，另記 `retry_wake_contract`，以相容現有面板。
+本輪曾因誤升 supervisor 協定造成網頁拒絕辨識新 publisher，正式驗收有拒絕並
+保留該 run；之後補上 publisher→公開 projection 的直接回歸，不能只看單元測試。
+
+### 固定輸入與 Windows 驗證
+
+[固定 queue ABBA](../artifacts/data_quality/tej_resilience_2026-10-23/ready_selection_abba_shared_wait.json)
+在私人記憶體副本中，對既有窗口注入一次共用等待情境：90 個 live task 的必要欄位、
+29 個 window、每 pass 90 個選取入口。baseline 有 4 個入口錯誤放行同一資料表的
+缺席片段，candidate 為 0；副本前後 SHA 相同，沒有來源查詢或正式 queue 寫入。
+兩版 SQL 每次約 68 微秒，這不是值得宣稱的整體加速率；主要修正是免除無效 UI
+重試佔住工作順序。
+
+當日原始 queue 檔約 5.58 GB。第一次診斷嘗試整庫副本，超過自己設定的 10 秒
+預算即拒絕並保留失敗 log；後續只擷取有上限的 pending／blocked 必要欄位，
+不再複製歷史 request JSON。這是診斷工具的修正，不冒稱原正式下載器會做整庫複製。
+
+[真實 Windows fixture](../artifacts/data_quality/tej_resilience_2026-10-23/runtime_notice_native_v4.json)
+使用 canonical runtime 分支及新建的獨立測試視窗，**34 項通過**；含三類已知提示、
+背景焦點保留及主機／文字／PID／配額／登入的拒絕案例，沒有連接 TEJ／Excel 或
+發出資料查詢。
+[原生快取驗證](../artifacts/data_quality/tej_resilience_2026-10-23/release_native_cache.json)
+另有 **11 項通過**，同一正式 bridge SHA 為
+`b3c9e0e5013dd41192cfa3409e654de5fd0fb113eec98ac04e434f836daddbdd`。
+
+剩餘資料與效能仍分開記錄：原本 5 個 `source_validation_failed_deferred` 的期間
+問題保持隔離。低密度事件表包含大量公司×日期的空 scope；本輪沒有依股票代碼格式、
+推測上市日或舊空回擅自刪除歷史範圍。Windows 準備／I/O 長尾、大表讀回與更有效的
+有證據 scope 合併仍需完整實測，不能稱為所有歷史完成或理論速度極限。
+
+### 最終換載、網站與資料讀回
+
+- [最終回歸](../artifacts/operations/agent-workflow/runs/tej-1023-release-panel-regressio-20261023T080243-ef04d17a/run.log)：
+  **2,185 項 Python 通過，115.44 秒**；
+  [前端測試](../artifacts/operations/agent-workflow/runs/tej-1023-final-browser-20261023T074452-d1470bca/run.log)
+  **59 項通過**。原 RED、Windows foreground 失敗與診斷預算失敗均保留，
+  以對應後續成功 run 追加處置，沒有改寫原結果。
+- Collector 在當日 **16:02:45（08:02:45 UTC）** 正常載入最終程式，PID
+  `4003568`；[換載紀錄](../artifacts/data_quality/tej_resilience_2026-10-23/release_deployment.json)
+  保存 history／scheduler／bridge／config SHA。只重啟 collector，沒有重啟其他
+  正在修改中的公開 dashboard owner，也沒有終止手上的來源查詢或刪鎖。
+- [最終正式驗收](../artifacts/data_quality/tej_resilience_2026-10-23/release_production_acceptance.json)
+  確認 **8 筆換載後才開始的新 download**，原 request／raw／Parquet／receipt
+  一致、原失敗證據 SHA 不變。八筆全是來源明確空回，**新增 0 列／0 個非空格**。
+  [目前 validator 的非空參考重讀](../artifacts/data_quality/tej_resilience_2026-10-23/nonempty_reference.json)
+  另核對既有 5 列、55 個原始格，不把它們計為本輪新下載。
+- 網頁 owner schema 17 通過 live 驗收，排程 alive／continuous、metadata recovery
+  enabled，沒有 paused reason；公開介面仍為唯讀、不暴露原始值。
+  [開機與登入任務讀回](../artifacts/data_quality/tej_resilience_2026-10-23/boot_readback.json)
+  確認 enabled boot service／API timer 與有效 interactive relay。GUI 仍需使用者
+  登入 Windows，**未執行實體重開機**。
+
+[最終八筆完整計時](../artifacts/data_quality/tej_resilience_2026-10-23/release_profile.json)
+共 190.26 秒，中位數 **24.11 秒**、送出前中位數 **20.20 秒**；讀取必要 metadata
+約 0.002 秒。最慢一筆共 42.20 秒，其中 scope 準備 23.53 秒，細分為 context／
+source binding **14.75 秒**、最終 source／Preview guards **4.26 秒**、公司選取
+0.44 秒、日期選取 0.19 秒；來源回應約 3.78 秒。這與前一批 9.50 秒中位數的
+scope／負載不同，不能相除當加速或退化率，也不能用 SQL 微秒數代替整條鏈路。
+
+這次交付的是已驗證的停滯恢復、重試分流、喚醒及面板相容性修正。接下來的效能
+驗收應固定完整 scope，針對 context／source binding 與 guards 做 ABBA，並保留
+查詢、全量讀回、值驗證和落地；5 個期間隔離及低密度 Key=3 的完整歷史仍未解決。

@@ -2,10 +2,100 @@
 
 import json
 import math
+import random
+import struct
 
 import pytest
 
 from stockagent import private_json
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_ledger_encoder_preserves_all_finite_float_bits_and_unbounded_integers(monkeypatch, native):
+    if not native:
+        monkeypatch.setattr(private_json, "_native", None)
+    rng = random.Random(20261024)
+    values = [-0., 0., 5e-324, -5e-324, 1e300, -1e300]
+    for _ in range(4096):
+        value = struct.unpack("!d", rng.getrandbits(64).to_bytes(8, "big"))[0]
+        if math.isfinite(value):
+            values.append(value)
+    data = {"價格": values, "counts": [2**128, -(2**128), 2**53 + 1],
+            "other": (True, None, "\\n\n台灣\""), "ids": ["0001", "01"]}
+    body = private_json.ledger_bytes(data)
+    observed = json.loads(body)
+    assert observed["counts"] == data["counts"]
+    assert all(type(x) is int for x in observed["counts"])
+    assert observed["other"] == list(data["other"])
+    assert observed["ids"] == data["ids"]
+    assert [struct.pack("!d", x) for x in observed["價格"]] == [struct.pack("!d", x) for x in values]
+    assert list(observed) == sorted(data)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_ledger_nonfinite_values_are_never_native_null(monkeypatch, value):
+    def rejected(*args, **kwargs):
+        raise AssertionError("legacy numbers must not enter native encoding")
+    from types import SimpleNamespace
+    monkeypatch.setattr(private_json, "_native", SimpleNamespace(json=SimpleNamespace(encode=rejected)))
+    body = private_json.ledger_bytes({"price": value})
+    assert body == json.dumps({"price": value}, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_ledger_encoder_preserves_legacy_conversions_and_errors():
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from pathlib import Path
+    class CustomDict(dict):
+        pass
+    for data in ({"time": datetime(2026, 10, 24, tzinfo=timezone.utc)},
+                 {"p": Decimal("1.20"), "path": Path("data")},
+                 CustomDict({"x": [1., b"not base64"]}), {1: "numeric key"}):
+        assert private_json.ledger_bytes(data) == json.dumps(
+            data, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()
+    cycle = []
+    cycle.append(cycle)
+    for data, error in ((cycle, ValueError), ({"x": "\ud800"}, UnicodeEncodeError),
+                        ({1: 2, "x": 1}, TypeError)):
+        with pytest.raises(error):
+            private_json.ledger_bytes(data)
+
+
+@pytest.mark.parametrize("containers", [0, 1, 63, 64, 65, 130])
+@pytest.mark.parametrize("leaf", [None, 1.25, float("inf"), {1: "legacy key"}])
+def test_ledger_guard_keeps_original_depth_and_container_rules(containers, leaf):
+    def original(value, depth=0):
+        kind = type(value)
+        if value is None or kind in (str, bool, int):
+            return True
+        if kind is float:
+            return math.isfinite(value)
+        if depth >= 64:
+            return False
+        if kind in (list, tuple):
+            return all(original(item, depth + 1) for item in value)
+        if kind is dict:
+            return all(type(key) is str and original(item, depth + 1)
+                       for key, item in value.items())
+        return False
+
+    value = leaf
+    for level in range(containers):
+        value = {"child": value} if level % 3 == 0 else (value,) if level % 3 == 1 else [value]
+    assert private_json._plain_finite_json(value) == original(value)
+
+
+def test_ledger_guard_keeps_exact_builtin_rule_and_shared_containers():
+    class Number(float):
+        pass
+    class Text(str):
+        pass
+    class Rows(list):
+        pass
+    for value in (Number(1), Text("x"), Rows([1]), {Text("x"): 1}):
+        assert not private_json._plain_finite_json({"nested": [value]})
+    shared = {"price": -0., "count": 2**128}
+    assert private_json._plain_finite_json([shared, shared])
 
 
 @pytest.mark.parametrize("value", [2**53 + 1, 2**64 - 1, 2**64, 2**128,

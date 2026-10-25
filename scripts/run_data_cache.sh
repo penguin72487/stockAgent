@@ -36,6 +36,12 @@ if [ -f "${edge_state}" ]; then
 fi
 
 case "${1:-}" in
+  layout)
+    shift
+    packed_sync_root="${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}"
+    exec "${script_dir}/run_data_release.sh" layout "$@" \
+      --sync-root "${packed_sync_root}"
+    ;;
   publish)
     shift
     packed_sync_root="${STOCKAGENT_PACKED_SYNC_ROOT:-/srv/stockagent-packed}"

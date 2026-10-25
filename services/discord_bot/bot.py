@@ -102,7 +102,7 @@ from stockagent.live.model_deployment import (
     attempt_model_deployment,
     load_deployment,
 )
-from stockagent.config import load_config
+from stockagent.config import load_config, load_config_cached
 from stockagent.live.capital import positive_float_or_none
 from stockagent.live.quote_provider import (
     load_symbol_name_map,
@@ -126,6 +126,7 @@ from stockagent.live.signal_engine import (
     generate_live_signal,
     finalize_live_signal_artifacts,
     prefetch_live_signal_prices,
+    refresh_provisional_opening_prefetch,
     release_idle_live_cuda_cache,
     write_live_weights_history,
 )
@@ -401,6 +402,8 @@ def _opening_signal_latency_record(
         "price_receipt_timing": receipt or None,
         "quote_transport": quote_transport,
         "input_preparation_stages_ms": timing.get("input_preparation_stages_ms"),
+        "input_preparation_owner_thread_cpu_ms": timing.get("input_preparation_owner_thread_cpu_ms"),
+        "input_preparation_cpu_clock_contract": timing.get("input_preparation_cpu_clock_contract"),
         "ensure_previous_signal": timing.get("ensure_previous_signal"),
         "previous_signal_backfill_limit": timing.get(
             "previous_signal_backfill_limit"
@@ -1446,6 +1449,26 @@ def _preopen_market_symbol_count(
     payload = _preopen_readiness_payload() if readiness is None else readiness
     row = (payload.get("markets") or {}).get(str(cfg.market))
     return int(row.get("symbol_count") or 0) if isinstance(row, dict) else 0
+
+
+def _publish_preopen_quote_priority(cfg, result, *, parquet_root) -> dict[str, Any]:
+    """The existing warmup supplies a private hint, never another inference."""
+    observed = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+    if observed.hour >= 9:
+        return {"status": "not_preopen", "measurement_boundary": "acquisition_hint_not_signal_or_fill"}
+    rows = getattr(result, "_opening_priority_rows", None)
+    if not rows:
+        return {"status": "unavailable", "reason": "no_completed_close_preview"}
+    from stockagent.live.opening_price_priority import model_identity_from_summary, publish_preopen_priority
+    summary = result.summary
+    try:
+        return publish_preopen_priority(parquet_root=parquet_root,
+            session_date=observed.date().isoformat(), market=cfg.market,
+            feature_date=str(summary.get("feature_cutoff_date") or summary.get("panel_data_date") or ""),
+            rows=rows, prepared_at=observed, model_identity=model_identity_from_summary(summary))
+    except (OSError, ValueError, TypeError) as exc:
+        # Advisory ordering must not hold up eligibility, warmup or fresh quotes.
+        return {"status": "unavailable", "reason": type(exc).__name__}
 
 
 def _day_trade_opening_quote_symbols(rows: list[dict[str, Any]]) -> list[str]:
@@ -3290,6 +3313,9 @@ class StockAgentBot(discord.Client):
         self._intraday_signal_inflight: dict[str, asyncio.Task[Any]] = {}
         self._opening_source_repair_retry_at: dict[str, float] = {}
         self._opening_source_repair_attempts: dict[str, int] = {}
+        self._opening_revision_jobs: dict[str, asyncio.Task[Any]] = {}
+        self._opening_revision_seen: dict[str, tuple] = {}
+        self._opening_revision_retry: dict[str, float] = {}
 
     async def setup_hook(self) -> None:
         # Market-deadline work starts before Discord REST synchronization.
@@ -3339,6 +3365,7 @@ class StockAgentBot(discord.Client):
         signal_now_job_resumer.start()
         preopen_prepare.start()
         opening_source_repair.start()
+        progressive_opening_signal.start()
         daily_summary.start()
         # Full-history maintenance runs in a separate systemd oneshot/cgroup.
         # Keeping it out of this process protects Gateway heartbeats and
@@ -3636,6 +3663,7 @@ def _write_preopen_readiness(
             "live_latency": (summary or {}).get("live_latency"),
             "warm_contract": (summary or {}).get("warm_contract"),
             "preopen_price_limits": (summary or {}).get("preopen_price_limits"),
+            "opening_quote_priority": (summary or {}).get("opening_quote_priority"),
             "same_session_eligibility": (summary or {}).get(
                 "same_session_eligibility"
             ),
@@ -3712,6 +3740,7 @@ def _write_preopen_final_arm(
             "attempts": max(1, int(attempts)),
             "live_latency": (summary or {}).get("live_latency"),
             "warm_contract": (summary or {}).get("warm_contract"),
+            "opening_quote_priority": (summary or {}).get("opening_quote_priority"),
             "opening_source_prewarm": (summary or {}).get(
                 "opening_source_prewarm"
             ),
@@ -4406,10 +4435,13 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
             write=False,
             ensure_previous_signal=False,
             previous_signal_backfill_limit=0,
+            preopen_quote_priority=observed.hour < 9,
         )
         with _MODEL_INFERENCE_LOCK:
             result = generate_live_signal(**kwargs)
         symbols = _day_trade_opening_quote_symbols(result.weights_rows)
+        result.summary["opening_quote_priority"] = _publish_preopen_quote_priority(
+            cfg, result, parquet_root=experiment.data.parquet_root)
         result.summary["opening_source_prewarm"] = opening_source_prewarm
         # Compatibility alias for readers deployed before MIS became the
         # primary model-observation source.  It carries identical truthful
@@ -4494,6 +4526,7 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
                 write=False,
                 ensure_previous_signal=False,
                 previous_signal_backfill_limit=0,
+                preopen_quote_priority=not overnight and observed.hour < 9,
             )
             with _MODEL_INFERENCE_LOCK:
                 return generate_live_signal(**kwargs)
@@ -4518,6 +4551,8 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
         else:
             result.summary["opening_source_prewarm"] = opening_source_prewarm
             result.summary["tw_mis_fallback_prewarm"] = opening_source_prewarm
+            result.summary["opening_quote_priority"] = _publish_preopen_quote_priority(
+                cfg, result, parquet_root=experiment.data.parquet_root)
         _write_preopen_final_arm(
             cfg,
             status="ready",
@@ -5920,13 +5955,17 @@ def _latest_market_signal(cfg: LiveMarketConfig) -> tuple[Path, dict[str, Any]] 
         if not isinstance(pointer, dict):
             raise ValueError("latest signal pointer is not an object")
         summary_path = _resolve_repo_path(pointer.get("summary_path"))
+        execution_path = _resolve_repo_path(pointer.get("execution_weights_path"))
         if (
-            pointer.get("artifact_complete") is not False
+            (pointer.get("artifact_complete") is not False
+             or (execution_path is not None and execution_path.is_file()))
             and summary_path is not None
             and summary_path.is_file()
         ):
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            if isinstance(summary, dict):
+            if (isinstance(summary, dict)
+                    and (not pointer.get("signal_id") or summary.get("signal_id") == pointer["signal_id"])
+                    and (not summary.get("market") or summary["market"] == cfg.market)):
                 summary_revision = _path_revision(summary_path)
                 if pointer_revision is not None and summary_revision is not None:
                     with _LATEST_SIGNAL_CACHE_LOCK:
@@ -8453,9 +8492,8 @@ def _market_execution_mode(cfg: LiveMarketConfig) -> str:
         return "naive"
 
 
-@lru_cache(maxsize=16)
 def _load_experiment_config_cached(config_path: str):
-    return load_config(Path(config_path))
+    return load_config_cached(Path(config_path))
 
 
 @lru_cache(maxsize=16)
@@ -11899,18 +11937,16 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
     and age after acquiring its existing serialized runtime lock.
     """
     stage = bot._opening_input_stages.get(cfg.market)
-    input_stages = {}
-    input_clock = time.perf_counter()
-    input_phase = None
+    from stockagent.live.opening_execution_latency import OpeningPhaseTimer
+    input_stages, input_cpu_stages = {}, {}
+    input_timer = OpeningPhaseTimer(input_stages, input_cpu_stages)
 
     def progress(event):
-        nonlocal input_clock, input_phase
         phase = str(event.get("message") or "")
-        if phase != input_phase:
-            observed = time.perf_counter()
-            if input_phase is not None:
-                input_stages[input_phase] = input_stages.get(input_phase, 0.0) + (observed - input_clock) * 1000.0
-            input_clock, input_phase = observed, phase
+        if phase == "input_finished":
+            input_timer.finish()
+        else:
+            input_timer.transition(phase)
         # A completed old config/session job cannot keep its replacement alive.
         if stage is not None and bot._opening_input_stages.get(cfg.market) is stage:
             _record_opening_input_progress(stage, event)
@@ -11946,6 +11982,9 @@ async def _prepare_scheduled_inputs(cfg: LiveMarketConfig):
             )
     progress({"message": "input_finished", "step": 1, "total": 1})
     timing["input_preparation_stages_ms"] = {phase: round(ms, 3) for phase, ms in input_stages.items()}
+    timing["input_preparation_owner_thread_cpu_ms"] = {
+        phase: None if ms is None else round(ms, 3) for phase, ms in input_cpu_stages.items()}
+    timing["input_preparation_cpu_clock_contract"] = "same_thread_cpu_or_unknown_v1"
     return prepared, error, prepare_ms, prefetched, timing
 
 
@@ -12087,8 +12126,18 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
     return result
 
 
-def _opening_source_repair_must_defer() -> bool:
-    """Source I/O may overlap source/preparation waits, not model execution."""
+def _opening_source_repair_must_defer(configs=()) -> bool:
+    """Keep the source owner live when inference only reads received facts.
+
+    The strict model path dispatches the shared fan-in itself. Provisional
+    models deliberately do not, so deferring their observer during inference
+    would leave the new-price path dependent on scheduling order at 09:00.
+    Provider single-flight/backoff remains with the existing shared fan-in.
+    """
+    from stockagent.live.market_config import OPENING_PROVISIONAL_REFERENCE_POLICY
+    if any(getattr(cfg, "day_trade_opening_reference_policy", None)
+           == OPENING_PROVISIONAL_REFERENCE_POLICY for cfg in configs):
+        return False
     return bool(
         bot._opening_attempt_started_monotonic is not None
         and bot._opening_attempt_stage not in {"preopen_catch_up", "realtime_prepare"}
@@ -12169,7 +12218,7 @@ async def opening_source_repair() -> None:
     # repair owner for the whole session. Source construction and realtime
     # preparation can also wait minutes: do not let them starve acquisition.
     # The fan-in still deduplicates provider calls and enforces source backoff.
-    if _opening_source_repair_must_defer():
+    if _opening_source_repair_must_defer(configs):
         return
     roots: set[str] = set()
     for cfg in configs:
@@ -12209,6 +12258,119 @@ async def opening_source_repair() -> None:
         except Exception as exc:
             bot._opening_source_repair_retry_at[key] = time.monotonic() + 5.0
             _log_exception("opening_source_repair:receipt", exc)
+
+
+def _refresh_opening_revision_sync(cfg: LiveMarketConfig) -> LiveSignalResult | None:
+    """Latest facts, one model owner, canonical immutable execution pointer.
+
+    The source observer keeps running while this computes. No network polling
+    or alternative inference/ledger is introduced: provisional prefetch reads
+    the accepted opening facts. Recheck the parent after the model lock so a
+    queued obsolete revision cannot overwrite a newer decision.
+    """
+    from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
+    from stockagent.live.opening_signal_revision import opening_input_fingerprint
+
+    if cfg.day_trade_signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE:
+        return None
+    cfg = _effective_market_config(cfg)
+    now = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+    if not ("09:00" <= now.strftime("%H:%M") < "13:20") or not _scheduled_market_session_day(cfg, now)[0]:
+        return None
+    committed = mode_from_service_sync(load_service_sync(_day_trade_state_dir()), cfg.market)
+    if (isinstance(committed, dict) and committed.get("session_date") == now.date().isoformat()
+            and (committed.get("simulation_replay") or committed.get("ledger_state_divergence")
+                 or str(committed.get("engine_status") or "").startswith("critical"))):
+        return None
+    kwargs = cfg.signal_kwargs(price_source="tw_mis", asof_date=now.isoformat(timespec="microseconds"),
+        ensure_previous_signal=False, write=True, publish_latest=True, defer_rich_artifacts=True)
+    # CPU-only preparation/source reads stay outside the serialized model lock.
+    prefetched = prefetch_live_signal_prices(**kwargs)
+    requested = time.perf_counter()
+    with _MODEL_INFERENCE_LOCK:
+        acquired = time.perf_counter()
+        latest = _latest_market_signal(cfg)
+        if latest is None:
+            return None
+        previous = latest[1]
+        if (str(previous.get("asof_date") or "")[:10] != now.date().isoformat()
+                or previous.get("day_trade_signal_update_policy") != SIGNAL_UPDATE_PROGRESSIVE
+                or previous.get("simulation_replay")):
+            return None
+        # Refresh facts after a long model queue, NOT the expensive preparation
+        # already done outside the lock. The consumer revalidates the complete
+        # current config/checkpoint/panel/universe request before using it.
+        if time.perf_counter() - prefetched.quote_finished > .05:
+            prefetched = refresh_provisional_opening_prefetch(prefetched)
+        key = opening_input_fingerprint(prefetched.request_key, prefetched.snapshot,
+                                        session_date=now.date().isoformat())
+        if (previous.get("opening_signal_revision") or {}).get("input_fingerprint") == key:
+            return None
+        # The decision clock is NOW, never the old row's receipt clock.
+        observed = datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei"))
+        if observed.date() != now.date() or observed.strftime("%H:%M") >= "13:20":
+            return None
+        kwargs.update(asof_date=observed.isoformat(timespec="microseconds"),
+            _prefetched_quote=prefetched, _previous_opening_signal=previous)
+        result = generate_live_signal(**kwargs)
+        # Capture this immutable decision and the lock boundary before another
+        # model can run. The existing logger owns its own append lock; filesystem
+        # I/O is not GPU runtime state and must not serialize the next forward.
+        latency_record = {"event": "opening_signal_revision",
+            "market": cfg.market, "session_date": now.date().isoformat(),
+            "signal_id": result.summary["signal_id"],
+            "revision": result.summary.get("opening_signal_revision"),
+            "model_queue_ms": round((acquired - requested) * 1000, 3),
+            "locked_refresh_compute_publish_ms": round((time.perf_counter() - acquired) * 1000, 3),
+            "recorded_at": datetime.now(ZoneInfo(cfg.timezone or "Asia/Taipei")).isoformat(timespec="microseconds")}
+    _record_opening_signal_latency(latency_record)
+    return result
+
+
+@tasks.loop(seconds=0.05)
+async def progressive_opening_signal() -> None:
+    """Single flight per mode; coalesce arrivals instead of queuing 100 models.
+
+    Source receipt stat is only a cheap wake hint. The actual model input key,
+    full official universe, checkpoint/source and execution gates remain with
+    the canonical owners. Initial signals get priority over follow-up work.
+    """
+    from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
+    from stockagent.live.quote_provider import _tw_mis_opening_receipt_path
+
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    if not "09:00" <= now.strftime("%H:%M") < "13:20":
+        return
+    if _intraday_waits_for_opening():
+        return
+    source_signature = _path_revision(_tw_mis_opening_receipt_path(now.date().isoformat()))
+    for market in _scheduled_markets():
+        cfg = _resolve_market(market)
+        if (not cfg.day_trade_simulation_enabled or cfg.day_trade_signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE
+                or not _scheduled_market_session_day(cfg, now)[0]):
+            continue
+        job = bot._opening_revision_jobs.get(market)
+        if job is not None:
+            if not job.done():
+                continue
+            bot._opening_revision_jobs.pop(market, None)
+            try:
+                result = job.result()
+            except Exception as exc:
+                bot._opening_revision_seen.pop(market, None)
+                bot._opening_revision_retry[market] = time.monotonic() + 1.
+                _log_exception(f"opening_signal_revision:{market}", exc)
+            else:
+                if result is not None:
+                    _enqueue_scheduled_results([(cfg, result, f"{now.date()}:{market}:revision")], [])
+        signature = (now.date().isoformat(), repr(cfg), source_signature)
+        if (bot._opening_revision_seen.get(market) == signature
+                or time.monotonic() < bot._opening_revision_retry.get(market, 0.)):
+            continue
+        # At most one uncancellable thread per mode. A newer source generation
+        # is seen on the next poll, including arrivals DURING a running model.
+        bot._opening_revision_seen[market] = signature
+        bot._opening_revision_jobs[market] = asyncio.create_task(asyncio.to_thread(_refresh_opening_revision_sync, cfg))
 
 
 @tasks.loop(seconds=0.1)
@@ -12536,6 +12698,10 @@ async def _deliver_scheduled_results(deliveries, error_messages):
             except Exception as exc:
                 _log_exception("scheduled_signal:error_notification", exc)
     for cfg, result, _key in deliveries:
+        if int((result.summary.get("opening_signal_revision") or {}).get("index") or 0) > 0:
+            # The website/engine consume every revision. Do not spam Discord
+            # REST or let notifications become another market-data dependency.
+            continue
         try:
             result = await asyncio.to_thread(
                 _enrich_signal_performance_for_discord,

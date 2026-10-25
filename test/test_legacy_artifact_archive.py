@@ -514,6 +514,47 @@ def test_benchmark_scratch_cannot_capture_an_arbitrary_legacy_d_source(tmp_path,
     assert not stage.exists() and source.is_dir()
 
 
+def test_offline_d_scratch_retains_full_source_budget_and_32_gib(tmp_path, monkeypatch):
+    import stockagent.data_sync.cold_primary as primary
+    spec, artifacts, original = _fixture(tmp_path)
+    source = artifacts / 'operations/closed-audit'
+    source.parent.mkdir(parents=True)
+    original.rename(source)
+    stage = tmp_path / 'guarded-offline-d-scratch'
+    monkeypatch.setattr(archive_module, 'D_OFFLINE_STAGE_ROOT', stage)
+    spec = replace(spec, relative_root='operations/closed-audit', stage_root=stage,
+                   capture_contract=archive_module.MANUAL_WSL_CAPTURE_CONTRACT,
+                   manual_capture_min_stable_hours=12)
+    guards = []
+    monkeypatch.setattr(primary, '_check_d_primary_mount', lambda root: guards.append(root))
+    monkeypatch.setattr(archive_module.shutil, 'disk_usage', lambda root:
+                        type('Usage', (), {'free': 32 * 1024**3})())
+    with pytest.raises(SnapshotError, match='source-size budget plus 32 GiB reserve'):
+        prepare_archive(spec, artifacts, manual_capture=True)
+    assert guards == [Path('/srv/stockagent-packed')]
+    assert not stage.exists() and source.is_dir()
+
+
+@pytest.mark.parametrize('problem', ['raw-source', 'automatic', 'short-stability'])
+def test_offline_d_scratch_is_manual_reviewed_and_stable_only(tmp_path, monkeypatch, problem):
+    spec, artifacts, original = _fixture(tmp_path)
+    source = artifacts / 'operations/closed-audit'
+    source.parent.mkdir(parents=True)
+    original.rename(source)
+    stage = tmp_path / 'guarded-offline-d-scratch'
+    monkeypatch.setattr(archive_module, 'D_OFFLINE_STAGE_ROOT', stage)
+    spec = replace(spec, relative_root='operations/closed-audit', stage_root=stage,
+                   capture_contract=archive_module.MANUAL_WSL_CAPTURE_CONTRACT,
+                   manual_capture_min_stable_hours=12)
+    if problem == 'raw-source':
+        spec = replace(spec, relative_root='data_finlab/parquet')
+    elif problem == 'short-stability':
+        spec = replace(spec, manual_capture_min_stable_hours=1)
+    with pytest.raises(SnapshotError):
+        prepare_archive(spec, artifacts, manual_capture=problem != 'automatic')
+    assert not stage.exists() and source.is_dir()
+
+
 def test_legacy_exact_recovery_accepts_hardlink_ctime_drift(tmp_path):
     spec, artifact_root, source = _fixture(tmp_path)
     payload = source / "fold_01/checkpoint_best.pt"
@@ -723,3 +764,82 @@ def test_single_pass_zstd_rejects_input_failure_even_after_complete_frame(tmp_pa
     monkeypatch.setattr(archive_module._HashingReader, "read", fail_at_end)
     with pytest.raises(OSError, match="injected encoded input failure"):
         archive_module._encoded_original_hashes(encoding, "zstd")
+
+
+@pytest.mark.parametrize('codec', ['raw', 'gzip', 'zstd'])
+@pytest.mark.parametrize('failure', ['none', 'native-exit', 'input', 'replace-on-close', 'append-on-close'])
+def test_native_completed_encoding_retains_hashes_exit_and_fd_fences(tmp_path, monkeypatch, codec, failure):
+    from contextlib import contextmanager
+    import hashlib
+    import io
+    from stockagent.data_sync import windows_cold_io as native
+    stage = tmp_path/'completed-stage';stage.mkdir()
+    source, encoding = tmp_path/'source', stage/'encoding'
+    payload = b'original values and null bytes\0' * 4097
+    source.write_bytes(payload)
+    archive_module._encode_one(source, encoding, codec)
+    encoded = encoding.read_bytes()
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', stage)
+    monkeypatch.setattr(archive_module, 'NATIVE_ENCODED_READ_MIN_BYTES', 1)
+    calls, streams = [], []
+
+    class Input(io.BytesIO):
+        def read(self, size=-1):
+            value = super().read(size)
+            if not value and failure == 'input':
+                raise OSError('native pipe input failed')
+            return value
+
+    @contextmanager
+    def reader(path, *, expected_bytes):
+        calls.append((path, expected_bytes))
+        stream = Input(encoded);streams.append(stream)
+        try:
+            yield stream
+            if failure == 'native-exit':
+                raise SnapshotError('native process failed after full EOF')
+            if failure == 'replace-on-close':
+                other = stage/'replacement';other.write_bytes(encoded);os.replace(other, encoding)
+            if failure == 'append-on-close':
+                with encoding.open('ab') as output:output.write(b'\0')
+        finally:
+            stream.close()
+
+    monkeypatch.setattr(native, 'binary_reader', reader)
+    if failure == 'none':
+        assert archive_module._encoded_original_hashes(encoding, codec) == (
+            hashlib.sha256(encoded).hexdigest(), len(encoded),
+            hashlib.sha256(payload).hexdigest(), len(payload))
+    else:
+        with pytest.raises((SnapshotError, OSError), match='native|changed during verification'):
+            archive_module._encoded_original_hashes(encoding, codec)
+    assert calls == [(encoding, len(encoded))]
+    assert streams and all(stream.closed for stream in streams)
+
+
+@pytest.mark.parametrize('scope', ['small-stage', 'large-unregistered'])
+def test_native_encoding_does_not_start_for_small_or_unregistered_paths(tmp_path, monkeypatch, scope):
+    from stockagent.data_sync import windows_cold_io as native
+    path = tmp_path/'encoding';payload=b'keep local byte I/O';path.write_bytes(payload)
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', tmp_path if scope=='small-stage' else tmp_path/'other')
+    monkeypatch.setattr(archive_module, 'D_OFFLINE_STAGE_ROOT', tmp_path/'offline')
+    monkeypatch.setattr(archive_module, 'NATIVE_ENCODED_READ_MIN_BYTES', len(payload)+1 if scope=='small-stage' else 1)
+    def forbidden(*args, **kwargs):pytest.fail('this source does not select native stage input')
+    monkeypatch.setattr(native, 'binary_reader', forbidden)
+    assert archive_module._encoded_original_hashes(path, 'raw')[1::2] == (len(payload), len(payload))
+
+
+def test_oversize_stage_encoding_keeps_unbounded_original_local_reader(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from stockagent.data_sync import windows_cold_io as native
+    path=tmp_path/'encoding';payload=b'keep the original streaming reader';path.write_bytes(payload)
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', tmp_path)
+    def forbidden(*args, **kwargs):pytest.fail('native exact-member bound must not reject large legacy members')
+    monkeypatch.setattr(native, 'binary_reader', forbidden)
+    fd=os.open(path, os.O_RDONLY)
+    try:
+        with archive_module._encoded_input(path, fd, SimpleNamespace(st_size=8*1024**3+1)) as stream:
+            assert stream.read()==payload
+        os.fstat(fd)  # The caller still owns its generation-fence descriptor.
+    finally:
+        os.close(fd)

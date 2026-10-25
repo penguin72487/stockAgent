@@ -29,7 +29,8 @@ SOURCE_KEYS = (
 )
 NESTED_KEYS = {
     "record_stats": ("state", "count", "first", "last", "files_total",
-                     "files_inspected", "invalid_files", "verified_partial_count", "basis"),
+                     "files_inspected", "invalid_files", "verified_partial_count", "basis", "days", "symbols", "date_basis",
+                     "earliest_date", "latest_date"),
     "acquisition_progress": ("state", "label", "current", "total", "unit", "ratio",
                              "basis", "preparing_for_date", "evidence_coverage"),
     "eta": ("state", "remaining_seconds", "estimated_complete_at_utc", "basis"),

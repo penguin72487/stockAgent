@@ -49,23 +49,188 @@ def run(runtime, **changes):
             SharedRateLimiter(0, name='test-finmind-json'), 'not-a-token', **options)
 
 
-def test_single_writer_parallel_and_exact_source_values(runtime, monkeypatch):
+def test_parallel_publication_is_bounded_and_acknowledged_after_durable_store(runtime, monkeypatch):
+    root, conn = runtime
+    owner = threading.get_ident()
+    original, save = worker._store, worker._save_result
+    barrier = threading.Barrier(2)
+    active = set()
+    finished = set()
+    lock = threading.Lock()
+    peak = 0
+    def store(root, task, *args, **kwargs):
+        nonlocal peak
+        assert threading.get_ident() != owner
+        with lock:
+            active.add(task.data_id)
+            peak = max(peak, len(active))
+        barrier.wait(timeout=5)
+        result = original(root, task, *args, **kwargs)
+        with lock:
+            active.remove(task.data_id)
+            finished.add(task.data_id)
+        return result
+    def save_result(connection, task, receipt, *args, **kwargs):
+        assert threading.get_ident() == owner and task.data_id in finished
+        assert (root / receipt['receipt_path']).is_file()
+        return save(connection, task, receipt, *args, **kwargs)
+    monkeypatch.setattr(worker, '_store', store)
+    monkeypatch.setattr(worker, '_save_result', save_result)
+    monkeypatch.setattr(pipeline, '_fetch', lambda sessions, limiter, root, task, *args: (rows(task), {}))
+    result = run(runtime, config={**pipeline.settings(), 'download_workers': 4, 'publication_workers': 2})
+    assert result['accepted_requests'] == 4 and peak == 2
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    status = json.loads((root / 'json_pipeline_last.json').read_bytes())
+    assert status['peak_publications'] == 2 and status['peak_inflight_responses'] <= 4
+
+
+def test_publication_backpressure_keeps_download_slots_and_claims(runtime, monkeypatch):
+    root, conn = runtime
+    worker._add_tasks(conn, [(US, 'EXTRA'+str(i), '2024-06-03', 'id_day', 8) for i in range(4)])
+    conn.commit()
+    original = worker._store
+    fetched = []; errors = []; lock = threading.Lock()
+    full = threading.Event(); publishing = threading.Barrier(3); release = threading.Event()
+    def fetch(sessions, limiter, root, task, *args):
+        with lock:
+            fetched.append(task.data_id)
+            if len(fetched) == 4: full.set()
+        return rows(task), {}
+    def store(*args, **kwargs):
+        if not release.is_set():
+            publishing.wait(timeout=5)
+            assert release.wait(5)
+        return original(*args, **kwargs)
+    def inspect():
+        try:
+            publishing.wait(timeout=5)
+            assert full.wait(5)
+            with sqlite3.connect(root / 'queue.sqlite3') as reader:
+                assert reader.execute("SELECT COUNT(*) FROM tasks WHERE state='inflight'").fetchone()[0] == 4
+                assert reader.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 4
+            with lock: assert len(fetched) == 4
+        except BaseException as error: errors.append(error)
+        finally: release.set()
+    controller = threading.Thread(target=inspect)
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    monkeypatch.setattr(worker, '_store', store)
+    controller.start()
+    try:
+        result = run(runtime, max_calls=8, config={**pipeline.settings(), 'download_workers': 8,
+                     'max_buffered_response_bytes': worker.BULK_MAX_RESPONSE_BYTES * 4,
+                     'publication_workers': 2})
+    finally:
+        release.set(); controller.join(timeout=6)
+    assert not controller.is_alive() and not errors
+    assert result['accepted_requests'] == 8
+    status = json.loads((root / 'json_pipeline_last.json').read_bytes())
+    assert status['peak_inflight_responses'] == 4 and status['peak_publications'] == 2
+
+
+def test_parallel_publication_failure_preserves_prior_nonempty_receipt(runtime, monkeypatch):
+    root, conn = runtime
+    monkeypatch.setattr(pipeline, '_fetch', lambda sessions, limiter, root, task, *args: (rows(task), {}))
+    assert run(runtime, config={**pipeline.settings(), 'publication_workers': 1})['accepted_requests'] == 4
+    path = conn.execute("SELECT receipt_path FROM tasks WHERE data_id='AAPL'").fetchone()[0]
+    before = (root / path).read_bytes()
+    receipt = json.loads(before); parquet = root / receipt['parquet_path']; data = parquet.read_bytes()
+    conn.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=NULL")
+    conn.commit(); original = worker._store
+    def store(root, task, *args, **kwargs):
+        if task.data_id == 'AAPL': raise OSError('simulated durable publication failure')
+        return original(root, task, *args, **kwargs)
+    monkeypatch.setattr(worker, '_store', store)
+    result = run(runtime, config={**pipeline.settings(), 'download_workers': 2, 'publication_workers': 2})
+    assert result['failed_tasks'] == 1 and result['accepted_requests'] == 3
+    assert (root / path).read_bytes() == before and parquet.read_bytes() == data
+    assert conn.execute("SELECT state FROM tasks WHERE data_id='AAPL'").fetchone()[0] == 'failed'
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    assert conn.execute('SELECT COUNT(*) FROM finmind_json_pipeline_samples').fetchone()[0] == 1
+
+
+def test_publication_pool_copies_decimal_context_and_drains_before_sessions_close():
+    from decimal import getcontext, localcontext
+    from types import SimpleNamespace
+    barrier = threading.Barrier(2); values = []; events = []
+    def job(precision):
+        assert getcontext().prec == 47
+        getcontext().prec = precision
+        barrier.wait(timeout=5)
+        values.append(getcontext().prec)
+        assert 'session_closed' not in events
+        events.append('publication_finished')
+    with localcontext() as context:
+        context.prec = 47
+        with pytest.raises(RuntimeError, match='owner interrupted'):
+            with pipeline.Sessions() as sessions:
+                sessions.sessions.append(SimpleNamespace(close=lambda: events.append('session_closed')))
+                sessions.publisher(2).submit(job, 51)
+                sessions.publisher(2).submit(job, 63)
+                raise RuntimeError('owner interrupted')
+        assert getcontext().prec == 47
+    assert sorted(values) == [51, 63]
+    assert events == ['publication_finished', 'publication_finished', 'session_closed']
+
+
+def test_parallel_publication_preserves_monitored_observation_streams(runtime, monkeypatch):
+    root, conn = runtime
+    conn.execute('UPDATE tasks SET priority=0'); conn.commit()
+    monkeypatch.setattr(pipeline, '_fetch', lambda sessions, limiter, root, task, *args: (rows(task), {
+        'request_id': 'test-observation-'+task.data_id, 'request_started_at_utc': NOW.isoformat(),
+        'response_received_at_utc': NOW.isoformat()}))
+    result = run(runtime, config={**pipeline.settings(), 'download_workers': 4, 'publication_workers': 2})
+    assert result['accepted_requests'] == 4
+    from downloader.finmind_updates import DB_NAME
+    with sqlite3.connect(root / DB_NAME) as observations:
+        assert observations.execute('SELECT COUNT(*) FROM checks').fetchone()[0] == 4
+        assert observations.execute('SELECT COUNT(*) FROM streams').fetchone()[0] == 4
+
+
+@pytest.mark.parametrize('value', [0, 5, True, 1.5, None])
+def test_publication_policy_rejects_invalid_worker_bounds(tmp_path, value):
+    policy = {key: value for key, value in pipeline.settings().items() if key != 'configuration_sha256'}
+    policy['publication_workers'] = value
+    path = tmp_path / 'publication.json'; path.write_text(json.dumps(policy))
+    with pytest.raises(ValueError, match='invalid_json_pipeline_configuration'):
+        pipeline.settings(path)
+
+
+def test_publication_policy_changes_eta_fingerprint_and_preserves_serial_legacy_default(tmp_path):
+    policy = {key: value for key, value in pipeline.settings().items()
+              if key not in {'configuration_sha256', 'publication_workers'}}
+    path = tmp_path / 'publication.json'; path.write_text(json.dumps(policy))
+    legacy = pipeline.settings(path)
+    assert legacy['publication_workers'] == 1
+    path.write_text(json.dumps({**policy, 'publication_workers': 1}))
+    assert pipeline.settings(path)['configuration_sha256'] == legacy['configuration_sha256']
+    path.write_text(json.dumps({**policy, 'publication_workers': 2}))
+    assert pipeline.settings(path)['configuration_sha256'] != legacy['configuration_sha256']
+
+
+@pytest.mark.parametrize('publication_workers', [1, 2])
+def test_single_queue_writer_parallel_and_exact_source_values(runtime, monkeypatch, publication_workers):
     root, conn = runtime
     barrier = threading.Barrier(2)
     calls = []
     owner = threading.get_ident()
     original = worker._store
     def store(*a, **kw):
-        assert threading.get_ident() == owner
+        assert (threading.get_ident() == owner) is (publication_workers == 1)
         return original(*a, **kw)
+    save = worker._save_result
+    def save_result(*a, **kw):
+        assert threading.get_ident() == owner
+        return save(*a, **kw)
     def fetch(sessions, limiter, root, task, token, today):
         assert threading.get_ident() != owner
         calls.append((task.data_id, task.partition))
         barrier.wait(timeout=5)
         return rows(task), {'request_count': 1}
     monkeypatch.setattr(worker, '_store', store)
+    monkeypatch.setattr(worker, '_save_result', save_result)
     monkeypatch.setattr(pipeline, '_fetch', fetch)
-    result = run(runtime)
+    result = run(runtime, config={**pipeline.settings(), 'download_workers': 2,
+                                  'publication_workers': publication_workers})
     assert result['calls'] == result['accepted_requests'] == result['nonempty_requests'] == 4
     assert len(set(calls)) == 4
     assert conn.execute('SELECT count(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
@@ -162,7 +327,9 @@ def test_completed_response_burst_refills_before_second_publication(runtime, mon
     monkeypatch.setattr(pipeline, '_fetch', fetch)
     monkeypatch.setattr(pipeline, 'wait', complete_wave)
     monkeypatch.setattr(worker, '_store', store)
-    assert run(runtime)['accepted_requests'] == publications == 4
+    # This legacy single-publisher contract refills after each completed store.
+    # The parallel case instead retains every publishing response slot.
+    assert run(runtime, config={**pipeline.settings(), 'publication_workers': 1})['accepted_requests'] == publications == 4
 
 
 def test_queue_result_and_release_share_one_commit_and_cursor_is_claimed(runtime, monkeypatch):
@@ -197,7 +364,10 @@ def test_interrupted_finalization_keeps_claim_recoverable_and_source_receipt(run
     assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='complete'").fetchone()[0] == 0
     assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 2
     receipts = list((root / 'receipts' / US).glob('*/*.json'))
-    assert len(receipts) == 1
+    assert 1 <= len(receipts) <= min(2, pipeline.settings().get('publication_workers', 1))
+    for path in receipts:
+        receipt = json.loads(path.read_bytes())
+        assert pq.ParquetFile(root / receipt['parquet_path']).metadata.num_rows == receipt['rows']
     receipt = json.loads(receipts[0].read_bytes())
     assert pq.read_table(root / receipt['parquet_path']).num_rows == receipt['rows'] == 1
     objects.recover_claims(conn)

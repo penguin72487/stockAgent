@@ -59,6 +59,7 @@ def test_invalid_floor_is_not_a_quota_bypass(bad):
     ("tick_range_calendar_days", 0), ("tick_range_calendar_days", 32), ("tick_range_calendar_days", True),
     ("tick_queue_depth", 0), ("tick_queue_depth", 5),
     ("tick_authorization_slots", 9), ("tick_http_keepalive", "true"),
+    ("general_batch_size", 0), ("general_batch_size", 65), ("general_batch_size", True),
     ("unused_option", 1),
 ])
 def test_configuration_rejects_unbounded_or_ignored_options(tmp_path, field, bad):
@@ -73,6 +74,16 @@ def test_default_and_explicit_configuration_have_identical_fingerprint(tmp_path)
     path = tmp_path / "policy.json"
     path.write_text(json.dumps({"schema_version": 1, **asdict(policy)}))
     assert load_policy(path).fingerprint == policy.fingerprint
+
+
+def test_bounded_general_group_has_an_independent_configuration_fingerprint(tmp_path):
+    path = tmp_path / 'policy.json'
+    for size in (8, 32, 64):
+        path.write_text(json.dumps({'schema_version': 1, 'general_batch_size': size}))
+        policy = load_policy(path)
+        assert policy.general_batch_size == size
+        assert policy.fingerprint == QuotaPolicy(general_batch_size=size).fingerprint
+    assert QuotaPolicy(general_batch_size=32).fingerprint != QuotaPolicy(general_batch_size=8).fingerprint
 
 
 def test_owner_refresh_projection_includes_bounded_tick_quantum(tmp_path, monkeypatch, capsys):

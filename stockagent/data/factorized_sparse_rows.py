@@ -18,7 +18,7 @@ import torch
 from stockagent.data.factorized_panel import _ColumnBlock
 
 
-SPARSE_ROW_CONTRACT = "full_schema_csr_affine_stable_full_rows_gpu_resident_v2"
+SPARSE_ROW_CONTRACT = "full_schema_csr_affine_stable_date_view_gpu_resident_v3"
 
 
 @dataclass
@@ -141,11 +141,20 @@ class FactorizedSparseRowStore:
         from scipy.sparse import csr_matrix
         source = self.source
         block = source.manifest["blocks"][block_id]
-        start = int(block["start"])
-        count = (int(block["shape"][0]) if "shape" in block else
+        physical_start = int(block["start"])
+        physical_count = (int(block["shape"][0]) if "shape" in block else
             (int(source._starts[block_id+1]) if block_id+1 < len(source._starts)
-             else source.shape[0]) - start)
-        stop = start + count
+             else source._row_offset + source.shape[0]) - physical_start)
+        # base/common use the visible calendar; compressed rectangles retain
+        # their original physical dates. Intersect before translating either.
+        offset = source._row_offset
+        first = max(physical_start, offset)
+        last = min(physical_start + physical_count, offset + source.shape[0])
+        start, stop = first - offset, last - offset
+        count = stop - start
+        if count <= 0:
+            raise ValueError("sparse physical block is outside the source date view")
+        block_rows = slice(first - physical_start, last - physical_start)
         symbols, features = source.shape[1:]
         cache_block = dict(id=int(block_id), start=start, stop=stop,
                            shape=[count*symbols, features])
@@ -200,6 +209,7 @@ class FactorizedSparseRowStore:
                 raw, columns = data.values, data.columns
             else:
                 raw, columns = data, np.arange(data.shape[-1])
+            raw = raw[block_rows]
             stocks = source.symbol_indices[selected] - sstart
             # Keep a view when the source universe is contiguous.
             if stocks.size and np.all(np.diff(stocks) == 1):
@@ -339,7 +349,8 @@ class FactorizedSparseRowStore:
         if rows.ndim != 1 or not rows.size or np.any(rows < 0) or np.any(rows >= self.source.shape[0]):
             raise ValueError("sparse input requires valid nonempty source rows")
         # Split at repeated/reordered dates as well as physical date boundaries.
-        blocks = np.searchsorted(self.source._starts, rows, side="right") - 1
+        blocks = np.searchsorted(self.source._starts,
+                                 rows + self.source._row_offset, side="right") - 1
         cuts = [0, *(np.flatnonzero((np.diff(rows) != 1) | (np.diff(blocks) != 0))+1), len(rows)]
         for a, b in zip(cuts[:-1], cuts[1:], strict=True):
             block_id = int(blocks[a])

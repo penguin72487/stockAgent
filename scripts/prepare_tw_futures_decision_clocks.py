@@ -21,14 +21,15 @@ if str(ROOT) not in sys.path:
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from stockagent.data.tw_futures_decision_clock import (
-    CLOCK_DATASET, OPENING_REFERENCE_DATASET, decision_clock_contract,
+    ASSET_SCOPES, OPENING_REFERENCE_DATASET, clock_asset_classes, clock_dataset, decision_clock_contract,
     opening_reference_contract, resolve_opening_references,
 )
 from stockagent.data.tw_stock_futures_history import _reuse_verified_contract
 from stockagent.data.tw_stock_futures_kbars import read_futures_kbar_sources
 
 
-def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, workers=4):
+def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, workers=4,
+                      asset_scope='stock_only'):
     """Read each complete global object once instead of one file per contract.
 
     Full-session quantity/HLC certificates precede the small two-window view.
@@ -37,11 +38,13 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
     from concurrent.futures import ThreadPoolExecutor
     import time
     from stockagent.data.tw_futures_finmind_ticks import (
-        BULK_SOURCE, BULK_PRICE_POLICY, pin_bulk_tick_inventory, read_bulk_stock_tick_day, stock_print_views,
+        BULK_SOURCE, BULK_EQUITY_SOURCE, BULK_PRICE_POLICY, pin_bulk_tick_inventory,
+        read_bulk_stock_tick_day, stock_print_views,
     )
     from stockagent.data.tw_stock_futures_repair import apply_block_evidence
     from stockagent.data.tw_stock_futures_history import _read_verified_tick_partition, normalize_continuous_ticks
-    from stockagent.data.tw_price_rules import TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION
+    from stockagent.data.tw_price_rules import (TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION,
+                                               taifex_futures_day_session_minutes)
     selected = source.filter(pl.col('executable'))
     block_sha = sha256_file(block_manifest)
     facts, block_proof = apply_block_evidence(selected, Path(block_manifest))
@@ -50,7 +53,7 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
     started = time.monotonic()
     minutes, coverage, trades = [], [], []
     def inspect(item):
-        bars, days, events = read_bulk_stock_tick_day(item, by_day[item['date']])
+        bars, days, events = read_bulk_stock_tick_day(item, by_day[item['date']], asset_scope=asset_scope)
         return bars.filter(pl.col('minute').is_in([527, 542])), days, events
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for i, (bars, days, events) in enumerate(pool.map(inspect, sources), 1):
@@ -78,10 +81,12 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
             if (stats['tick_volume'] != row['outright_volume'] or any(
                     abs(stats['tick_'+c]-row[c]) > 1e-6 for c in ('high', 'low', 'close'))):
                 continue
+            session_start, session_end = taifex_futures_day_session_minutes(row['date'],
+                product_code=row['product'], asset_class=row['asset_class'])
             prints = raw.filter(pl.col('event_ts').dt.date() == row['date']).with_columns(
                 (pl.col('event_ts').dt.hour().cast(pl.Int32)*3600 + pl.col('event_ts').dt.minute().cast(pl.Int32)*60
                  + pl.col('event_ts').dt.second().cast(pl.Int32)).alias('_second')).filter(
-                    pl.col('_second').is_between(525*60, 825*60)).with_columns(
+                    pl.col('_second').is_between(session_start*60, session_end*60)).with_columns(
                         pl.lit(row['physical_contract']).alias('physical_contract'), pl.col('close').alias('price'))
             _, _, events = stock_print_views(prints, day=row['date'], source_sha256=proof['data_sha256'])
             minutes = pl.concat([minutes, bars.filter(pl.col('minute').is_in([527,542]))], how='vertical_relaxed')
@@ -97,7 +102,8 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
     if sha256_file(block_manifest) != block_sha:
         raise ValueError('official block inventory changed during preparation')
     verified = coverage.filter(pl.col('verified')).select('date','physical_contract')
-    proof = dict(source=BULK_SOURCE, price_policy=BULK_PRICE_POLICY,
+    proof = dict(source=BULK_SOURCE if asset_scope == 'stock_only' else BULK_EQUITY_SOURCE,
+        price_policy=BULK_PRICE_POLICY,
         product_history_contract_version=TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION,
         quantity='native_even_double_sided_divided_by_two_no_dedup',
         session='dated_product_rules_inclusive_exact_close_no_night_or_spread',
@@ -107,7 +113,7 @@ def load_bulk_minutes(root, block_manifest, tick_roots, source, *, progress, wor
     return minutes, verified, proof, coverage, trades
 
 
-def paired_entries(source, minutes, verified_days):
+def paired_entries(source, minutes, verified_days, *, asset_scope='stock_only'):
     """Pure alignment: execution availability never changes policy eligibility."""
     keys = ["date", "physical_contract"]
     if source.select(keys).is_duplicated().any() or minutes.select(*keys, "minute").is_duplicated().any():
@@ -115,7 +121,7 @@ def paired_entries(source, minutes, verified_days):
     proof = verified_days.select(keys).unique().with_columns(pl.lit(True).alias("_verified"))
     result = {}
     for clock in ("08:45", "09:00"):
-        window = decision_clock_contract(clock)
+        window = decision_clock_contract(clock, asset_scope=asset_scope)
         observed = minutes.filter(pl.col("minute") == window["window_end_minute"]).select(
             *keys, pl.col("vwap").alias("entry_quote"), pl.col("volume").alias("entry_volume"),
             "source_file_sha256")
@@ -257,10 +263,14 @@ def load_verified_history(history_root, tick_roots, source, *, progress=None, in
 def build(args):
     from stockagent.data.tw_futures_margin import validate_margin_rule_source
 
+    scope = getattr(args, 'asset_scope', 'stock_only')
+    allowed = clock_asset_classes(scope)
+    if scope != 'stock_only' and not args.finmind_bulk_root:
+        raise ValueError('expanded equity clocks require receipt-bound whole-market tick admission')
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     def progress(**state):
-        payload = {"contract": CLOCK_DATASET, **state}
+        payload = {"contract": clock_dataset(scope), **state}
         atomic_write_json(output / "progress.json", payload)
         print(json.dumps(payload, ensure_ascii=False), flush=True)
     progress(stage="validating_canonical_daily_and_rules")
@@ -275,8 +285,9 @@ def build(args):
         "date", "product", "contract", "asset_class", "physical_contract", "symbol", "open", "high", "low", "close",
         "volume", "executable", *alias_columns, *reference_columns, *bulk_columns).collect()
     source = all_source.filter(pl.col("date") >= start)
-    if not source.height or source.filter(pl.col("asset_class") != "stock_future").height:
-        raise ValueError("paired clocks require a nonempty stock-only source release")
+    if not source.height or source.filter(pl.col('asset_class').is_null()
+            | ~pl.col('asset_class').is_in(allowed)).height:
+        raise ValueError("paired clocks require a nonempty source within their declared asset scope")
     daily_sha, rules_sha = sha256_file(args.daily), sha256_file(args.rules)
     reference_trades = None
     if args.finmind_bulk_root:
@@ -285,7 +296,7 @@ def build(args):
         progress(stage='bulk_tick_inventory', contract_days=source.height)
         minutes, verified, history_proof, coverage, reference_trades = load_bulk_minutes(
             args.finmind_bulk_root, args.block_manifest, args.tick_root, source,
-            progress=progress, workers=args.source_workers)
+            progress=progress, workers=args.source_workers, asset_scope=scope)
         atomic_write_parquet(output / 'source_coverage.parquet', coverage)
     else:
         progress(stage="historical_minute_validation", contract_days=source.height)
@@ -325,7 +336,7 @@ def build(args):
         verified = pl.concat([verified, days]).unique()
         sources.extend(receipts)
         missing = missing.join(days, on=["date", "physical_contract"], how="anti")
-    clocks = paired_entries(source, minutes, verified)
+    clocks = paired_entries(source, minutes, verified, asset_scope=scope)
     references = {}
     if args.with_opening_reference:
         references = ({clock: resolve_opening_references(source.select('date','physical_contract','symbol'),
@@ -336,7 +347,7 @@ def build(args):
     atomic_write_parquet(output / "coverage_gaps.parquet", gaps)
     identity = {"daily": daily_sha, "rules": rules_sha, "start": str(source["date"].min()),
         "end": str(source["date"].max()), "historical_source": history_proof,
-        "exact_sources": sources, "clocks": [decision_clock_contract(c) for c in clocks]}
+        "exact_sources": sources, "clocks": [decision_clock_contract(c, asset_scope=scope) for c in clocks]}
     if references:
         identity["opening_reference_contracts"] = [opening_reference_contract(c) for c in references]
         identity['reference_observations'] = ('verified_actual_tick_first_and_last_with_minute_completion_bounds'
@@ -348,8 +359,8 @@ def build(args):
         path = directory / "entries.parquet"
         atomic_write_parquet(path, entries)
         atomic_write_json(directory / "manifest.json", {
-            "dataset": CLOCK_DATASET, "status": "complete" if not gaps.height else "partial",
-            "clock": decision_clock_contract(clock), "pair_identity": pair_identity,
+            "dataset": clock_dataset(scope), "status": "complete" if not gaps.height else "partial",
+            "clock": decision_clock_contract(clock, asset_scope=scope), "pair_identity": pair_identity,
             "entries_sha256": sha256_file(path), "rows": entries.height,
             "source_daily_sha256": daily_sha, "source_rules_sha256": rules_sha,
             "start_date": identity["start"], "end_date": identity["end"],
@@ -388,6 +399,8 @@ def main():
                    help='Whole-market tick collector root or pinned portable raw inventory JSON')
     p.add_argument('--block-manifest', type=Path, help='Independent official continuous-book quantity evidence')
     p.add_argument('--source-workers', type=int, choices=range(1,9), default=4)
+    p.add_argument('--asset-scope', choices=tuple(ASSET_SCOPES), default='stock_only',
+                   help='Opt-in v2 dated stock/ETF/index action universe; never infers missing product rules')
     p.add_argument("--with-opening-reference", action="store_true",
                    help="Add causal observed-open/last-real-trade inputs with separate clocks and source hashes")
     args = p.parse_args()

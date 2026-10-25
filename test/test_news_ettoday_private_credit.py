@@ -88,9 +88,17 @@ def http_stub(queue,envelope=None):
 
 def complete_boundary(queue,settings):
     request = submit(queue,settings,27)
-    diagnostic.pump_candidates(queue)
     http = http_stub(queue)
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    # The bounded owner tick may yield after first-time SQLite schema/fsync
+    # work. Drive the same submitted handle across ticks; never resubmit it.
+    deadline = time.monotonic()+2
+    while True:
+        diagnostic.pump_candidates(queue)
+        job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+        if job is not None:
+            break
+        assert time.monotonic()<deadline, 'Submitted boundary was not admitted within bounded owner ticks'
+        time.sleep(0.005)
     diagnostic.finish_candidate(queue,job,result=diagnostic.fetch_candidate(http,job))
     diagnostic.pump_candidates(queue)
     return request

@@ -39,6 +39,42 @@ def test_native_declared_metadata_is_not_a_complete_article_or_profile_request()
     assert 'wp/v2/users' not in encoded
 
 
+def test_native_permalink_and_raw_clocks_support_a_new_representation_question():
+    value = post()
+    value.update(type='post', status='publish', date='2009-01-17T11:12:13',
+        date_gmt='2009-01-17T11:12:13', modified='2026-10-24T13:30:00+08:00')
+    before = deepcopy(value)
+    result = wordpress_public_metadata_shape([value], {})
+    sample = result['sampled_posts'][0]
+    assert result['contract_version'] == 2 and value == before
+    assert sample['public_link'] == value['link']
+    assert sample['source_declared_type'] == 'post' and sample['source_declared_status'] == 'publish'
+    assert sample['source_clocks'] == {key:value.get(key) for key in ('date','date_gmt','modified','modified_gmt')}
+    assert sample['source_clocks']['date_gmt'].endswith('13')  # No invented timezone suffix.
+    assert result['automatic_profile_requests'] == 0 and not result['article_body_accepted']
+
+
+@pytest.mark.parametrize('link', [None, {}, 'file:///secret', 'javascript:SECRET',
+    'https://user:SECRET@publisher.test/a/', 'https://publisher.test/a/?token=SECRET',
+    'https://publisher.test/a/#SECRET', 'https://publisher.test/a/\nSECRET',
+    'https://publisher.test:invalid/a/', 'https://[invalid/a/', 'https://publisher.test/'+('x'*2048)])
+def test_permalink_metadata_excludes_credentials_queries_and_invalid_URLs(link):
+    value = post(); value['link'] = link
+    result = wordpress_public_metadata_shape([value], {})
+    assert result['sampled_posts'][0]['public_link'] is None
+    assert 'SECRET' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('invalid', ['SECRET DATE', '2026-02-30T01:02:03', '2026-10-24T25:00:00',
+    '2026-10-24', '2026-10-24T01:02:03\nSECRET', {}, True, None])
+def test_invalid_source_clocks_are_not_exported_or_coerced(invalid):
+    value = post()
+    for key in ('date','date_gmt','modified','modified_gmt'): value[key] = invalid
+    result = wordpress_public_metadata_shape([value], {})
+    assert set(result['sampled_posts'][0]['source_clocks'].values()) == {None}
+    assert 'SECRET' not in json.dumps(result)
+
+
 @pytest.mark.parametrize('embedded', [None, False, [], 'wrong', {}, {'author': None},
     {'author': 'unknown'}, {'author': [{'code': 'rest_user_cannot_view', 'message': 'PRIVATE MESSAGE'}]}])
 def test_missing_or_rejected_embeds_do_not_make_up_an_author(embedded):

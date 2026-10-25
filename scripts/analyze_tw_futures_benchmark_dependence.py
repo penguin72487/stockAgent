@@ -93,7 +93,8 @@ def product_scope(dates, quantities, table):
         if row['executable']:
             available.add(product)
         if q[day, slot] != 0:
-            facts = held.setdefault(product, {'name': row['product_name'], 'long_dates': set(), 'short_dates': set()})
+            facts = held.setdefault(product, {'name': row.get('product_name') or product,
+                                               'long_dates': set(), 'short_dates': set()})
             facts['long_dates' if q[day, slot] > 0 else 'short_dates'].add(str(dates[day]))
     if np.any((q != 0) & ~observed):
         raise ValueError('held physical contract has no date/slot source')
@@ -107,6 +108,15 @@ def product_scope(dates, quantities, table):
         'days_with_short_positions': int(np.any(q < 0, axis=1).sum()),
         'active_slot_count_over_period': int(np.any(q != 0, axis=0).sum()),
     }
+
+
+def read_product_scope_table(payload):
+    """Product names are optional display metadata in newer physical releases."""
+    source = pq.ParquetFile(io.BytesIO(payload))
+    columns = ['date', 'portfolio_slot', 'product', 'executable']
+    if 'product_name' in source.schema_arrow.names:
+        columns.append('product_name')
+    return source.read(columns=columns)
 
 
 def analyze(root, fold_id, comparisons):
@@ -129,8 +139,7 @@ def analyze(root, fold_id, comparisons):
     cfg = manifest['configuration']
     path = Path(cfg['trading']['tw_futures_portfolio_data_path']).resolve(strict=True)
     physical = _Sources(path.parent)
-    table = pq.read_table(io.BytesIO(physical.read(path.name)),
-                          columns=['date', 'portfolio_slot', 'product', 'product_name', 'executable'])
+    table = read_product_scope_table(physical.read(path.name))
     scope = product_scope(dates, a['futures_contract_quantities_history'], table)
     columns = a['futures_margin_audit_columns'].tolist()
     audit = a['futures_margin_audit'].astype(float)

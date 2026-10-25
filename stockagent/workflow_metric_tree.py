@@ -1,4 +1,4 @@
-"""Optional, source-bound C++ walker for decoded benchmark metric trees.
+"""Optional, source-bound C++ benchmark walker and bounded Linux prefetch.
 
 Numerical values remain borrowed Python objects. The caller owns redaction,
 time-field matching, finite-number validation and the complete Python fallback.
@@ -37,7 +37,7 @@ def load_backend(root: Path, mode: str = "auto"):
     started = time.perf_counter()
     if mode not in {"auto", "python", "cpp"}:
         raise ValueError("unknown metric backend")
-    info = {"requested": mode, "selected": "python", "scope": "decoded benchmark field extraction only"}
+    info = {"requested": mode, "selected": "python", "scope": "decoded benchmark fields and optional bounded Linux file prefetch"}
     if mode == "python":
         info["initialization_seconds"] = time.perf_counter() - started
         return None, info
@@ -122,7 +122,7 @@ def load_backend(root: Path, mode: str = "auto"):
             raise
         info.update(reason="source_bound_module_unloadable", initialization_seconds=time.perf_counter() - started)
         return None, info
-    info.update(selected="cpp", source_path=str(source), source_sha256=source_sha, module_sha256=receipt["module_sha256"],
+    info.update(selected="cpp", bounded_read_batch_available=hasattr(module, "read_batch"), source_path=str(source), source_sha256=source_sha, module_sha256=receipt["module_sha256"],
                 module_path=str(module_path),
                 build_receipt=str(cache / "build_receipt.json"),
                 build_receipt_sha256=_sha(cache / "build_receipt.json"),

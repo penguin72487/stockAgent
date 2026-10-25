@@ -47,6 +47,7 @@ from tqdm import tqdm
 
 try:
     from downloader.common import SharedRateLimiter
+    from downloader.operation_timing import CONTRACT as OPERATION_TIMING_CONTRACT, OPENBB_META_PREFIX, OperationTiming
     from downloader.openbb_archive_types import (
         AssetRecord, DownloadTask, TaskResult, ColumnarTaskPayload, CoverageDecision, PlannerContext,
     )
@@ -66,6 +67,7 @@ try:
     )
 except ModuleNotFoundError:  # Direct execution from downloader/.
     from common import SharedRateLimiter
+    from operation_timing import CONTRACT as OPERATION_TIMING_CONTRACT, OPENBB_META_PREFIX, OperationTiming
     from openbb_archive_types import (
         AssetRecord, DownloadTask, TaskResult, ColumnarTaskPayload, CoverageDecision, PlannerContext,
     )
@@ -6484,6 +6486,21 @@ class Manifest:
                 result.task.task_id,
             ),
         )
+        if result.operation_timing or result.scheduler_timing:
+            # Bounded latest sample per provider/endpoint/outcome, committed in
+            # the SAME original task transaction. No extra fsync, table/schema
+            # migration or timing field in the DownloadTask fingerprint.
+            key = OPENBB_META_PREFIX + _canonical_json([result.provider, result.task.endpoint, result.status])
+            observation = {"task_id": result.task.task_id, "endpoint": result.task.endpoint,
+                           "provider": result.provider, "status": result.status, "rows": result.rows,
+                           "declared_providers": list(result.task.providers),
+                           "attempts": result.attempts, "observed_at_utc": now,
+                           "operation_timing": result.operation_timing, "scheduler_timing": result.scheduler_timing}
+            self.connection.execute(
+                "INSERT INTO archive_meta(key,value,updated_at) VALUES (?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                (key, _canonical_json(observation), now),
+            )
         terminal = result.status in {
             "empty",
             "unavailable",
@@ -16733,6 +16750,12 @@ class OpenBBWorker:
         )
 
     def __call__(self, task: DownloadTask) -> TaskResult:
+        timing = OperationTiming()
+        result = self._execute(task, timing)
+        result.operation_timing = timing.snapshot("worker_return_before_discovery_and_manifest_commit")
+        return result
+
+    def _execute(self, task: DownloadTask, timing: OperationTiming) -> TaskResult:
         errors: list[str] = []
         attempts = 0
         provider_outcomes = {
@@ -16789,7 +16812,7 @@ class OpenBBWorker:
                             if reason:
                                 provider_evidence[provider] = str(reason)[:2000]
                         break
-                    with self.runtime.semaphore_slot(provider):
+                    with timing.enter("provider_slot_wait", self.runtime.semaphore_slot(provider), provider=provider), timing.measure("provider_adapter_inclusive", provider=provider):
                         # Pace actual provider-call starts after acquiring the
                         # concurrency slot. Providers that can fan out are
                         # governed at their real HTTP boundary; direct
@@ -16808,7 +16831,7 @@ class OpenBBWorker:
                         elif provider in HTTP_BOUNDARY_PACED_PROVIDERS:
                             _install_provider_http_limiter(self.runtime)
                         elif not local_bls_bulk:
-                            limiter.wait()
+                            timing.call("outer_provider_pacing", limiter.wait, timing_provider=provider)
                         available, reason = self._availability(
                             provider, task.endpoint, capability_domain
                         )
@@ -17339,11 +17362,12 @@ class OpenBBWorker:
                             func = _resolve_callable(self.obb, task.endpoint)
                             result = func(provider=provider, **provider_kwargs)
                     if isinstance(result, ColumnarTaskPayload):
-                        rows = _atomic_write_arrow_table(
+                        rows = timing.call("publish_arrow_payload", _atomic_write_arrow_table,
                             result.table,
                             effective_task,
                             provider,
                             show_progress=self.show_progress,
+                            timing_provider=provider,
                         )
                         _clear_request_checkpoints(
                             self._request_checkpoint_dir(task, provider)
@@ -17360,26 +17384,28 @@ class OpenBBWorker:
                             provider_evidence=provider_evidence,
                         )
                     records = (
-                        _normalize_bls_search_result(
+                        timing.call("normalize_records", _normalize_bls_search_result,
                             result,
                             metadata_only=self.metadata_only,
                             show_progress=self.show_progress,
+                            timing_provider=provider,
                         )
                         if task.endpoint == "economy.survey.bls_search"
-                        else normalize_records(
+                        else timing.call("normalize_records", normalize_records,
                             result,
                             metadata_only=self.metadata_only,
                             show_progress=self.show_progress,
                             progress_desc=f"normalize:{task.endpoint}",
+                            timing_provider=provider,
                         )
                     )
                     if task.endpoint in {"news.company", "news.world"}:
-                        records = _filter_company_news_to_task_range(
-                            records, task, show_progress=self.show_progress
+                        records = timing.call("filter_task_range", _filter_company_news_to_task_range,
+                            records, task, show_progress=self.show_progress, timing_provider=provider,
                         )
                     else:
-                        records = _filter_records_to_task_range(
-                            records, task, show_progress=self.show_progress
+                        records = timing.call("filter_task_range", _filter_records_to_task_range,
+                            records, task, show_progress=self.show_progress, timing_provider=provider,
                         )
                     if provider == "yfinance":
                         transport_failure = _consume_yfinance_transport_failure()
@@ -17396,11 +17422,12 @@ class OpenBBWorker:
                         provider_outcomes[provider] = "empty"
                         errors.append(f"{provider}: empty")
                         break
-                    rows = _atomic_write_parquet(
+                    rows = timing.call("publish_record_payload", _atomic_write_parquet,
                         records,
                         effective_task,
                         provider,
                         show_progress=self.show_progress,
+                        timing_provider=provider,
                     )
                     _clear_request_checkpoints(
                         self._request_checkpoint_dir(task, provider)
@@ -17570,7 +17597,7 @@ class OpenBBWorker:
                         delay = min(self.max_backoff, self.base_backoff * (2**attempt))
                         delay *= random.uniform(0.8, 1.2)
                         self.runtime.block(provider, delay, message)
-                        time.sleep(delay)
+                        timing.call("retry_backoff", time.sleep, delay, timing_provider=provider)
                 finally:
                     self.runtime.finish_request_observation(request_observation)
         # Retry flags describe attempts, while provider outcomes describe the
@@ -18723,6 +18750,7 @@ def execute_download_tasks(
     provider_endpoint_selection_order = 0
     scheduler_state_path = context.output_dir / "_state" / "provider_scheduler.json"
     last_scheduler_state_monotonic = 0.0
+    last_completion_timing: dict[str, Any] = {}
     # Scarce daily quotas must first establish whether every selected route is
     # usable. Otherwise a provider can spend its entire allowance deepening
     # already-started endpoints while another market remains at zero forever.
@@ -18744,7 +18772,7 @@ def execute_download_tasks(
     provider_seed_route_cursor: dict[str, int] = {}
     last_total_refresh_monotonic = time.monotonic()
 
-    def execute_and_discover(task: DownloadTask) -> TaskResult:
+    def execute_and_discover(task: DownloadTask, admitted_at: float) -> TaskResult:
         """Run provider I/O, then expand its catalog outside provider slots.
 
         Discovery can scan and materialize tens of thousands of follow-up
@@ -18756,13 +18784,24 @@ def execute_download_tasks(
         the CPU-only expansion. The control thread receives compact follow-up
         tasks instead of retaining the source records during SQLite commits.
         """
+        entered_at = time.monotonic()
         result = worker(task)
+        discovery_at = time.monotonic()
         try:
             if not no_discovery:
                 result.followups = discover_followup_tasks(context, result)
             return result
         finally:
             result.records.clear()
+            finished_at = time.monotonic()
+            result.scheduler_timing = {
+                "contract": "openbb_scheduler_monotonic_v1", "clock": "monotonic",
+                "executor_queue_seconds": entered_at - admitted_at,
+                "worker_and_discovery_seconds": finished_at - entered_at,
+                "discovery_seconds": finished_at - discovery_at,
+                "discovery_enabled": not no_discovery,
+                "scope": "executor admission through discovery/record release; excludes manifest persistence",
+            }
 
     def cooldown_providers() -> set[str]:
         method = getattr(runtime, "cooldown_providers", None)
@@ -19126,6 +19165,7 @@ def execute_download_tasks(
                 "completion_persistence_batch_size": int(
                     completion_persistence_batch_size
                 ),
+                "last_completion_timing": last_completion_timing,
                 "completion_backpressure_limit": int(completion_backpressure_limit),
                 "completion_backpressure_active": sum(
                     1 for future in futures if future.done()
@@ -19223,9 +19263,10 @@ def execute_download_tasks(
         # task while monitor timestamps remain faithful to actual execution.
         manifest.mark_executing([task for _, task in ready])
         for provider, task in ready:
-            future = executor.submit(provider, execute_and_discover, task)
+            admitted_at = time.monotonic()
+            future = executor.submit(provider, execute_and_discover, task, admitted_at)
             futures[future] = task
-            submitted_at[future] = time.monotonic()
+            submitted_at[future] = admitted_at
             scheduled_provider[future] = provider
         return len(ready)
 
@@ -19866,7 +19907,8 @@ def execute_download_tasks(
                     discovered_followups: list[DownloadTask] = []
                     for future in completed_batch:
                         task = futures.pop(future)
-                        submitted_at.pop(future, None)
+                        admitted_at = submitted_at.pop(future)
+                        reaped_at = time.monotonic()
                         scheduled_provider.pop(future, None)
                         try:
                             result = future.result()
@@ -19882,6 +19924,11 @@ def execute_download_tasks(
                                 provider_outcomes=dict(task.provider_outcomes),
                                 provider_evidence=dict(task.provider_evidence),
                             )
+                        result.scheduler_timing.update(
+                            contract="openbb_scheduler_monotonic_v1", clock="monotonic",
+                            submit_to_reap_seconds=reaped_at - admitted_at,
+                            reap_scope="includes queue, worker, discovery and completed-result wait; excludes subsequent manifest writes",
+                        )
                         followups = result.followups
                         if followups:
                             discovered_followups.extend(followups)
@@ -19966,9 +20013,16 @@ def execute_download_tasks(
                                 publish_scheduler_state()
                         finally:
                             followup_progress.close()
+                    completion_clock = OperationTiming()
                     with manifest.completion_batch():
                         for _, result in completion_results:
                             manifest.complete(result)
+                    last_completion_timing = {
+                        **completion_clock.snapshot("manifest_completion_batch_including_commit_and_terminal_quarantine"),
+                        "task_ids": [task.task_id for task, _ in completion_results],
+                        "task_count": len(completion_results),
+                        "allocation": "whole batch only; never divide into per-task/source elapsed time",
+                    }
 
                     for task, result in completion_results:
                         bulk_unavailable = 0

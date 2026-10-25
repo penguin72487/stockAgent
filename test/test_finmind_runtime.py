@@ -94,6 +94,41 @@ def test_retry_and_release_deadlines_wake_at_the_actual_boundary(tmp_path):
     assert next_cycle_delay(tmp_path, NOW, 3600) == 10
 
 
+def test_retry_minimum_uses_priority_seeks_and_preserves_terminal_null_and_legacy_rows():
+    from downloader.finmind_runtime import _next_retry_boundary
+    import sqlite3
+
+    with sqlite3.connect(':memory:') as connection:
+        connection.execute('CREATE TABLE tasks(priority INTEGER,state TEXT,next_attempt_at_utc TEXT)')
+        connection.executemany('INSERT INTO tasks VALUES (?,?,?)', [
+            (index % 9, 'complete', (NOW + timedelta(days=1, seconds=index)).isoformat())
+            for index in range(30000)])
+        connection.executemany('INSERT INTO tasks VALUES (?,?,?)', [
+            (None, 'failed', (NOW + timedelta(seconds=7)).isoformat()),
+            (0, 'retry_exhausted', (NOW + timedelta(seconds=1)).isoformat()),
+            (1, 'disabled', (NOW + timedelta(seconds=2)).isoformat()),
+            (2, 'pending', None), (3, 'observed_empty', NOW.isoformat())])
+        query = ("SELECT MIN(next_attempt_at_utc) FROM tasks WHERE "
+                 "state IN ('pending','failed','complete','observed_empty') AND next_attempt_at_utc>?")
+        expected = connection.execute(query, (NOW.isoformat(),)).fetchone()[0]
+        assert _next_retry_boundary(connection, NOW) == expected  # Legacy schema.
+        connection.execute('CREATE INDEX idx_finmind_complement_queue ON tasks(priority, next_attempt_at_utc, state)')
+        connection.execute('ANALYZE')
+        counts = []
+        for optimized in (False, True):
+            steps = []
+            connection.set_progress_handler(lambda: steps.append(1) or 0, 100)
+            result = (_next_retry_boundary(connection, NOW) if optimized else
+                      connection.execute(query, (NOW.isoformat(),)).fetchone()[0])
+            connection.set_progress_handler(None, 0)
+            assert result == expected == (NOW + timedelta(seconds=7)).isoformat()
+            counts.append(len(steps))
+        assert counts[0] > 10 * counts[1]  # Seeks must not enumerate every future task.
+        connection.execute('DROP INDEX idx_finmind_complement_queue')
+        connection.execute('CREATE INDEX idx_finmind_complement_queue ON tasks(state)')
+        assert _next_retry_boundary(connection, NOW) == expected
+
+
 def test_idle_sponsor_does_not_handoff_to_duplicate_symbol_queries(tmp_path):
     root = tmp_path / 'sponsor'
     status = {'state': 'current_queue', 'tier': 'Sponsor',
@@ -108,7 +143,39 @@ def test_idle_sponsor_does_not_handoff_to_duplicate_symbol_queries(tmp_path):
 def test_free_wakes_at_calendar_publication_even_when_hourly_cache_is_fresh(tmp_path):
     (tmp_path / 'calendar.json').write_text(json.dumps({
         'observed_at_utc': (NOW - timedelta(minutes=10)).isoformat(), 'dates': ['2026-09-28']}))
+    for dataset in ('TaiwanStockInfoWithWarrant', 'TaiwanStockStatisticsOfOrderBookAndTrade',
+                    'TaiwanVariousIndicators5Seconds'):
+        folder = tmp_path / 'receipts' / dataset
+        folder.mkdir(parents=True)
+        (folder / '2026-09-28.json').write_text(json.dumps({'status': 'complete'}))
     assert next_cycle_delay(tmp_path, NOW, 3600) == 20
+
+
+@pytest.mark.parametrize('status', ['provider_empty', 'partial', 'failed'])
+def test_free_receipt_retry_wakes_its_owner_before_blocking_all_history(tmp_path, status):
+    from downloader.finmind_scheduling import incremental_reservation
+
+    (tmp_path / 'calendar.json').write_text(json.dumps({
+        'observed_at_utc': (NOW - timedelta(minutes=10)).isoformat(), 'dates': ['2026-09-28']}))
+    datasets = ('TaiwanStockInfoWithWarrant', 'TaiwanStockStatisticsOfOrderBookAndTrade',
+                'TaiwanVariousIndicators5Seconds')
+    for dataset in datasets:
+        folder = tmp_path / 'receipts' / dataset
+        folder.mkdir(parents=True)
+        (folder / '2026-09-28.json').write_text(json.dumps({'status': 'complete'}))
+    path = tmp_path / 'receipts' / datasets[1] / '2026-09-28.json'
+    retry = NOW + timedelta(seconds=5)
+    path.write_text(json.dumps({'status': status, 'retry_at_utc': retry.isoformat()}))
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*.json')}
+
+    assert incremental_reservation(tmp_path, NOW)['ready_requests'] == 0
+    assert next_cycle_delay(tmp_path, NOW, 600) == 5
+    # If planning crossed the boundary, wake promptly rather than waiting for
+    # the calendar or the 600-second retry poll while other owners must yield.
+    assert incremental_reservation(tmp_path, retry)['ready_requests'] == 1
+    assert next_cycle_delay(tmp_path, retry, 600) == 1
+    assert {p: p.read_bytes() for p in tmp_path.rglob('*.json')} == before
+    assert not list(tmp_path.rglob('*.sqlite3'))
 
 
 def test_priority_wait_releases_within_five_seconds_without_an_api_probe(tmp_path, monkeypatch):

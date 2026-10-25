@@ -19,6 +19,11 @@ from stockagent.research.taifex_transaction_tax import futures_transaction_tax_r
 
 CLOCK_VERSION = 1
 CLOCK_DATASET = "tw_stock_futures_carry_decision_clock_v1"
+EQUITY_CLOCK_DATASET = "tw_twd_equity_futures_carry_decision_clock_v2"
+ASSET_SCOPES = {
+    "stock_only": ("stock_future",),
+    "twd_equity": ("stock_future", "etf_future", "index_future"),
+}
 ACCEPTED_STATUSES = {"observed_minute", "verified_no_window_trade", "daily_not_executable"}
 OPENING_REFERENCE_DATASET = "tw_futures_observed_open_or_last_trade_v1"
 OPENING_REFERENCE_FEATURES = (
@@ -29,12 +34,24 @@ OPENING_REFERENCE_FEATURES = (
 )
 
 
-def decision_clock_contract(decision_time: str) -> dict:
+def clock_asset_classes(asset_scope: str) -> tuple[str, ...]:
+    if asset_scope not in ASSET_SCOPES:
+        raise ValueError("unsupported futures decision-clock asset scope")
+    return ASSET_SCOPES[asset_scope]
+
+
+def clock_dataset(asset_scope: str) -> str:
+    clock_asset_classes(asset_scope)
+    return CLOCK_DATASET if asset_scope == "stock_only" else EQUITY_CLOCK_DATASET
+
+
+def decision_clock_contract(decision_time: str, *, asset_scope="stock_only") -> dict:
+    classes = clock_asset_classes(asset_scope)
     if decision_time not in {"08:45", "09:00"}:
         raise ValueError("supported futures decision times are 08:45 and 09:00")
     hour, minute = map(int, decision_time.split(":"))
     decision = hour * 60 + minute
-    return {
+    contract = {
         "version": CLOCK_VERSION,
         "decision_time": decision_time,
         "timezone": "Asia/Taipei",
@@ -49,6 +66,13 @@ def decision_clock_contract(decision_time: str) -> dict:
         "verified_no_entry": "zero_trade_capacity_prior_settlement_valuation_only",
         "holding": "carry_actual_contracts_and_official_settlement_no_daily_flatten",
     }
+    # The original stock-only ABI remains byte-for-byte compatible. An expanded
+    # action universe needs its own source, execution and checkpoint identity.
+    if asset_scope != "stock_only":
+        contract.update(version=2, asset_scope=asset_scope, asset_classes=list(classes),
+            entry_value="dated_linear_quote_times_multiplier_plus_deliverable_cash",
+            entry_tax="dated_asset_class_quote_notional_whole_twd_half_up")
+    return contract
 
 
 def opening_reference_contract(decision_time: str) -> dict:
@@ -184,8 +208,9 @@ def validate_clock_source(path, *, daily_path, rules_path, decision_time):
     path = Path(path)
     manifest_path = path.with_name("manifest.json")
     manifest = json.loads(manifest_path.read_text())
-    expected = decision_clock_contract(decision_time)
-    if (manifest.get("dataset") != CLOCK_DATASET or manifest.get("clock") != expected
+    scope = manifest.get("clock", {}).get("asset_scope", "stock_only")
+    expected = decision_clock_contract(decision_time, asset_scope=scope)
+    if (manifest.get("dataset") != clock_dataset(scope) or manifest.get("clock") != expected
             or manifest.get("status") != "complete"
             or manifest.get("entries_sha256") != sha256_file(path)
             or manifest.get("source_daily_sha256") != sha256_file(daily_path)
@@ -213,13 +238,19 @@ def validate_clock_source(path, *, daily_path, rules_path, decision_time):
     return entries, manifest
 
 
-def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, broker_multiplier):
+def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, broker_multiplier,
+                           asset_scope="stock_only"):
     """Change entry facts only; preserve prior, end, terminal and corporate state.
 
     `source` is aligned to the flattened execution rows. Dated stock-futures
     contract values are quote * shares + deliverable cash; repricing the quote
     must not discard that cash. Unsupported value bases fail rather than guess.
     """
+    classes = clock_asset_classes(asset_scope)
+    if (asset_scope != "stock_only" and "asset_class" not in source.columns
+            or "asset_class" in source.columns and source.filter(
+                pl.col("asset_class").is_null() | ~pl.col("asset_class").is_in(classes)).height):
+        raise ValueError("entry repricing requires supported dated equity asset classes")
     if not 0 <= participation <= 1 or broker_multiplier <= 0:
         raise ValueError("invalid execution participation or broker multiplier")
     ex = np.asarray(execution, dtype=np.float32).copy()
@@ -234,7 +265,7 @@ def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, br
             or np.any(observed & (~np.isfinite(old_quote) | (old_quote <= 0)))
             or np.any(observed & ~(np.isclose(base, old_quote * multiplier, atol=.005, rtol=0)
                                   | np.isclose(base, full, atol=.005, rtol=0)))):
-        raise ValueError("unsupported dated stock-futures entry value/margin base")
+        raise ValueError("unsupported dated linear futures entry value/margin base")
     # For no observed trade, the previous official value is a valuation only.
     # There is no entry capacity and no imputed executable price.
     delta = np.where(observed, (quote - old_quote) * multiplier, 0.)
@@ -242,10 +273,13 @@ def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, br
     margin_base = np.where(observed, base + delta, get("known_margin_value_twd"))
     if np.any(~np.isfinite(value) | (value <= 0) | ~np.isfinite(margin_base) | (margin_base <= 0)):
         raise ValueError("clock valuation requires positive dated prior/entry values")
-    rate = np.asarray([futures_transaction_tax_rate(d, tax_class="stock") for d in source["date"]])
+    tax_classes = {"stock_future": "stock", "etf_future": "etf", "index_future": "stock_index"}
+    assets = source["asset_class"].to_list() if "asset_class" in source.columns else ["stock_future"] * source.height
+    rate = np.asarray([futures_transaction_tax_rate(d, tax_class=tax_classes[a])
+                       for d, a in zip(source["date"], assets)])
     old_tax = np.floor(old_quote * multiplier * rate + .5)
     if np.any(observed & ~np.isclose(get("opening_tax_twd"), old_tax, atol=.005, rtol=0)):
-        raise ValueError("unsupported stock-futures tax base; explicit dated quote tax required")
+        raise ValueError("unsupported futures tax base; explicit dated quote tax required")
     capacity = np.floor(np.nan_to_num(get("entry_volume"), nan=0.) * participation)
     ex[:, 8] = np.minimum(ex[:, 8], np.where(observed, capacity, 0))
     ex[:, 1] *= observed
@@ -280,8 +314,10 @@ def attach_futures_decision_clock(panel, path, *, decision_time, participation=.
                                         date.fromisoformat(manifest["end_date"]))
     source = pl.scan_parquet(daily.source_path).filter(selected).select(
         "date", "physical_contract", "symbol", "open", "contract_multiplier", "asset_class").collect()
-    if source.filter(pl.col("asset_class") != "stock_future").height:
-        raise ValueError("decision-clock v1 is scoped to dated stock futures")
+    scope = manifest["clock"].get("asset_scope", "stock_only")
+    if source.filter(pl.col("asset_class").is_null()
+            | ~pl.col("asset_class").is_in(clock_asset_classes(scope))).height:
+        raise ValueError("decision-clock source contains assets outside its declared scope")
     rules = pl.scan_parquet(daily.margin_rules_path).filter(selected).collect()
     # Both canonical releases own the units; don't let a join silently suffix
     # and substitute a different multiplier.
@@ -300,7 +336,8 @@ def attach_futures_decision_clock(panel, path, *, decision_time, participation=.
         raise ValueError("active carrying contracts have missing clock evidence")
     ex = daily.integer_execution.copy()
     ex[di[active], si[active]] = reprice_margin_entries(ex[di[active], si[active]],
-        source.filter(pl.Series(active)), participation=participation, broker_multiplier=broker_multiplier)
+        source.filter(pl.Series(active)), participation=participation, broker_multiplier=broker_multiplier,
+        asset_scope=scope)
     open_prices = daily.open_prices.copy()
     # No executable quote stays missing in reports, even though the ledger
     # uses a separately labelled official mark for carrying valuation.

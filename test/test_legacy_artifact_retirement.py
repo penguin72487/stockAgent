@@ -64,6 +64,127 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return spec, source, hot_tree, options
 
 
+@pytest.mark.parametrize('interrupted,defect', [
+    (False, None), (True, None), (False, 'state-origin'), (True, 'state-origin'),
+    (False, 'producer-receipt'), (True, 'producer-receipt'),
+    (True, 'producer-receipt-after-audit'),
+])
+def test_adjacent_completion_survives_real_quarantine_and_exact_cold_recovery(
+        tmp_path, monkeypatch, interrupted, defect):
+    """Exercise actual prepare/publish/rename/unlink, not a mocked outer CLI."""
+    import stockagent.data_sync.artifact_retirement as common
+    from stockagent.data_sync.benchmark_fixtures import (
+        FINMIND_GROUP_STATUS_CONTRACT, completed_benchmark_evidence,
+    )
+    from stockagent.data_sync.legacy_artifact_archive import MANUAL_WSL_CAPTURE_CONTRACT
+    from test_benchmark_fixture_reuse import _finmind_group_case
+
+    source, reports, _ = _finmind_group_case(tmp_path)
+    artifact_root = tmp_path / 'artifacts'
+    original = b'exact offline benchmark bytes, with external original completion metadata'
+    (source / 'original.bin').write_bytes(original)
+    old = time.time() - 2 * 86400
+    os.utime(source / 'original.bin', (old, old))
+    spec = LegacyArchiveSpec('legacy-wsl-group', source.relative_to(artifact_root).as_posix(),
+        7, tmp_path / 'stage', manual_capture_min_stable_hours=12,
+        capture_contract=MANUAL_WSL_CAPTURE_CONTRACT)
+    saved = completed_benchmark_evidence(source, destination=tmp_path / 'retained-evidence')
+    raw_reports = {p.name: p.read_bytes() for p in reports}
+    sync_root = tmp_path / 'packed'
+    release = publish_archive(spec, artifact_root, sync_root, repo_root=tmp_path, manual_capture=True)
+    backup = tmp_path / 'backup'
+    shutil.copytree(sync_root, backup)
+    monkeypatch.setattr(cold_primary.BackupConfig, 'load',
+                        lambda _: SimpleNamespace(source=sync_root, destination=backup))
+    monkeypatch.setattr(cold_primary.VolumeGuard, 'check', lambda self: None)
+    options = dict(repo_root=tmp_path, artifact_root=artifact_root, hot_root=tmp_path / 'hot',
+        sync_root=sync_root, materialized_root=tmp_path / 'materialized',
+        state_root=tmp_path / 'state', activation_root=tmp_path / 'activations',
+        backup_config=tmp_path / 'backup-config.json', bridge_inactive=True,
+        manual_immediate=True, manual_capture=True,
+        peer_proof={'ok': True, 'checked_at': datetime.now(timezone.utc).isoformat(), 'peers': []})
+    # The fixture has no external consumers; final-gate rejection remains tested
+    # by the existing process/pin/peer/service regression cases below.
+    monkeypatch.setattr(retirement, 'artifact_process_references', lambda *args: [])
+    monkeypatch.setattr(retirement, 'process_references', lambda *args: [])
+    monkeypatch.setattr(common, 'artifact_process_references', lambda *args: [])
+    monkeypatch.setattr(common, 'process_references', lambda *args: [])
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    state_path = retirement._state_path(options['state_root'], spec.dataset)
+    if interrupted:
+        original_gate = retirement._assert_unlink_gates
+        def fail_after_rename(*args, **kwargs):
+            raise SnapshotError('controlled final-gate interruption')
+        monkeypatch.setattr(retirement, '_assert_unlink_gates', fail_after_rename)
+        with pytest.raises(SnapshotError, match='controlled final-gate'):
+            retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                              owned_verified_plan=plan, **options)
+        monkeypatch.setattr(retirement, '_assert_unlink_gates', original_gate)
+        state = json.loads(state_path.read_bytes())
+        quarantine = Path(state['quarantine'])
+        assert not source.exists() and (quarantine / 'source/original.bin').read_bytes() == original
+        if defect == 'state-origin':
+            state['relative_root'] = state['relative_root'].replace('20261015', '20261016')
+            state_path.write_text(json.dumps(state))
+        elif defect == 'producer-receipt':
+            changed = json.loads(reports[1].read_bytes())
+            changed['exact_output_parity'] = False
+            reports[1].write_text(json.dumps(changed))
+        if defect and defect != 'producer-receipt-after-audit':
+            with pytest.raises(SnapshotError):
+                retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+            assert (quarantine / 'source/original.bin').read_bytes() == original
+            assert json.loads(state_path.read_bytes())['state'] == 'retiring'
+            return
+        plan = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+        if defect == 'producer-receipt-after-audit':
+            changed = json.loads(reports[1].read_bytes())
+            # The completion ABI still passes, but its exact frozen bytes
+            # changed after the full pre-lock audit. Never reuse that proof.
+            changed['later_annotation'] = 'producer metadata changed after full audit'
+            reports[1].write_text(json.dumps(changed))
+            with pytest.raises(SnapshotError, match='generation changed'):
+                retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                                  owned_verified_plan=plan, **options)
+            assert (quarantine / 'source/original.bin').read_bytes() == original
+            return
+    elif defect:
+        # Reject the same bad binding during the actual post-rename audit.
+        original_verify = retirement.verify_archive_directory
+        def verify(archive, current, **kwargs):
+            if current.name == 'source':
+                if defect == 'state-origin':
+                    state = json.loads(state_path.read_bytes())
+                    state['relative_root'] = state['relative_root'].replace('20261015', '20261016')
+                    state_path.write_text(json.dumps(state))
+                else:
+                    changed = json.loads(reports[1].read_bytes())
+                    changed['exact_output_parity'] = False
+                    reports[1].write_text(json.dumps(changed))
+            return original_verify(archive, current, **kwargs)
+        monkeypatch.setattr(retirement, 'verify_archive_directory', verify)
+        with pytest.raises(SnapshotError):
+            retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                              owned_verified_plan=plan, **options)
+        state = json.loads(state_path.read_bytes())
+        assert state['state'] == 'retiring'
+        assert (Path(state['quarantine']) / 'source/original.bin').read_bytes() == original
+        return
+    result = retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                               owned_verified_plan=plan, **options)
+    assert result['deleted'] is True and not source.exists()
+    assert result.get('resumed_quarantine', False) == interrupted
+    assert json.loads(state_path.read_bytes())['state'] == 'cold-only'
+    assert result['snapshot_id'] == release['snapshot_id']
+    assert {p.name: p.read_bytes() for p in reports} == raw_reports
+    assert completed_benchmark_evidence(tmp_path / 'retained-evidence', original_source=source,
+        required_contract=FINMIND_GROUP_STATUS_CONTRACT) == saved
+    destination = tmp_path / 'independent-restored'
+    restore_archive(spec, sync_root, destination, materialized_root=tmp_path / 'recovery')
+    assert (destination / 'original.bin').read_bytes() == original
+    assert {p.name for p in destination.iterdir()} == {'original.bin', '.LEGACY_RESTORED.json'}
+
+
 @pytest.mark.parametrize('late_change', [None, 'process', 'pin', 'stale', 'timeout', 'error', 'incomplete'])
 def test_idle_scan_wait_rechecks_all_unlink_gates_and_never_accepts_failed_health(tmp_path, monkeypatch, late_change):
     import stockagent.data_sync.artifact_retirement as common
@@ -224,6 +345,62 @@ def test_interrupted_quarantine_resume_reaudits_exact_bytes_and_final_gates(tmp_
         restored=tmp_path/'restored-after-interruption'
         restore_archive(spec,options['sync_root'],restored,materialized_root=tmp_path/'restored-cache')
         assert (restored/'checkpoint.pt').read_bytes()==original_bytes
+
+
+@pytest.mark.parametrize('defect', [None, 'old-contract', 'manifest-proof', 'file-count',
+    'boolean-count', 'byte-count', 'boolean-bytes', 'foreign-pid', 'foreign-start',
+    'foreign-boot', 'missing-owner'])
+def test_owned_quarantine_resume_decodes_once_outside_mutation_and_binds_full_inventory(
+        tmp_path, monkeypatch, defect):
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    expected = (source / 'checkpoint.pt').read_bytes()
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    gate = retirement._assert_unlink_gates
+    def interrupted(*args, **kwargs):
+        raise SnapshotError('controlled final-gate interruption')
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', interrupted)
+    with pytest.raises(SnapshotError, match='controlled final-gate'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                          owned_verified_plan=plan, **options)
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', gate)
+    quarantine = Path(json.loads(retirement._state_path(options['state_root'], spec.dataset).read_bytes())['quarantine'])
+    calls = []
+    mutation = False
+    verify = retirement.verify_archive_directory
+    def full_audit(*args, **kwargs):
+        assert not mutation, 'bulk verification must complete before the mutation owner'
+        calls.append(True)
+        return verify(*args, **kwargs)
+    monkeypatch.setattr(retirement, 'verify_archive_directory', full_audit)
+    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+    full = resumed['full_verification']
+    assert calls == [True] and full['contract'] == 'owned-legacy-quarantine-resume-v2'
+    if defect == 'old-contract': full['contract'] = 'owned-legacy-quarantine-resume-v1'
+    elif defect == 'manifest-proof': full['verified_archive_manifest_sha256'] = '0' * 64
+    elif defect == 'file-count': full['original_files'] += 1
+    elif defect == 'boolean-count': full['original_files'] = True
+    elif defect == 'byte-count': full['original_bytes'] += 1
+    elif defect == 'boolean-bytes': full['original_bytes'] = True
+    elif defect == 'foreign-pid': full['owner_process']['pid'] += 1
+    elif defect == 'foreign-start': full['owner_process']['start_ticks'] += 1
+    elif defect == 'foreign-boot': full['owner_process']['boot_id'] = 'different-boot'
+    elif defect == 'missing-owner': full.pop('owner_process')
+    mutation = True
+    apply = lambda: retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                                      owned_verified_plan=resumed, **options)
+    if defect:
+        with pytest.raises(SnapshotError):
+            apply()
+        assert (quarantine / 'source/checkpoint.pt').read_bytes() == expected
+        assert json.loads(retirement._state_path(options['state_root'], spec.dataset).read_bytes())['state'] == 'retiring'
+    else:
+        result = apply()
+        assert result['deleted'] and result['reused_same_owned_quarantine_full_verification']
+        assert not quarantine.exists() and calls == [True]
+        destination = tmp_path / 'restored-owned-proof'
+        restore_archive(spec, options['sync_root'], destination, materialized_root=tmp_path / 'recovery')
+        assert (destination / 'checkpoint.pt').read_bytes() == expected
 
 
 @pytest.mark.parametrize('new_consumer', [False, True])

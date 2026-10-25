@@ -14,7 +14,7 @@ from stockagent.data_sync.legacy_artifact_archive import (
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 
 
-def fixture(tmp_path, monkeypatch, *, benchmark_d=False):
+def fixture(tmp_path, monkeypatch, *, benchmark_d=False, offline_d=False):
     from test_legacy_manual_capture import fixture as source_fixture
     import stockagent.data_sync.materialized_cache as cache
     # This unit fixture owns a private materialization tree. Exercise the real
@@ -34,6 +34,13 @@ def fixture(tmp_path, monkeypatch, *, benchmark_d=False):
         _completed_benchmark(source)
         spec = replace(spec, relative_root='benchmarks/suite/completed-case',
                        capture_contract=module.MANUAL_WSL_CAPTURE_CONTRACT)
+    elif offline_d:
+        target = artifacts / 'operations/closed-audit'
+        target.parent.mkdir(parents=True)
+        source.rename(target)
+        source = target
+        spec = replace(spec, relative_root='operations/closed-audit',
+                       capture_contract=module.MANUAL_WSL_CAPTURE_CONTRACT)
     packed = tmp_path / "packed"
     release = module.publish_archive(spec, artifacts, packed, repo_root=artifacts.parent,
                                      manual_capture=True)
@@ -43,7 +50,9 @@ def fixture(tmp_path, monkeypatch, *, benchmark_d=False):
     state.parent.mkdir(parents=True)
     state.write_text(json.dumps({"state": "cold-only", "dataset": spec.dataset,
                                 "relative_root": spec.relative_root, "snapshot_id": release["snapshot_id"]}))
-    monkeypatch.setattr(module, "D_BENCHMARK_STAGE_ROOT" if benchmark_d else "C_TEMP_STAGE_ROOT", spec.stage_root)
+    stage_constant = ('D_BENCHMARK_STAGE_ROOT' if benchmark_d else
+                      'D_OFFLINE_STAGE_ROOT' if offline_d else 'C_TEMP_STAGE_ROOT')
+    monkeypatch.setattr(module, stage_constant, spec.stage_root)
     import stockagent.data_sync.cold_primary as primary
     monkeypatch.setattr(primary, "_check_d_primary_mount", lambda root: None)
     options = {"artifact_root": artifacts, "state_root": states}
@@ -87,6 +96,17 @@ def test_completed_benchmark_d_scratch_uses_the_same_full_recovery_and_quarantin
     assert not (spec.stage_root / spec.dataset).exists()
     proof = verify_cold_archive(spec, packed)
     assert proof['cold_verified'] and proof['decoded_originals_verified'] and proof['files'] == 4
+
+
+def test_offline_d_scratch_uses_exact_cold_recovery_and_quarantine_before_prune(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, offline_d=True)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                     owned_verified_plan=plan, **options)
+    assert result['pruned'] and result['cold_objects_deleted'] == 0
+    assert not (spec.stage_root / spec.dataset).exists()
+    proof = verify_cold_archive(spec, packed)
+    assert proof['cold_verified'] and proof['decoded_originals_verified'] and proof['files'] == 2
 
 
 @pytest.mark.parametrize('failure', [None, 'different-bytes', 'unknown-receipt', 'payload-temp', 'changed-after-audit'])

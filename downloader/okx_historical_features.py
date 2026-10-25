@@ -37,6 +37,7 @@ RUBIK_PERIOD = "5m"
 CANDLE_INTERVAL_MS = 60 * 1000
 RUBIK_INTERVAL_MS = 5 * 60 * 1000
 FEATURE_SCHEMA_VERSION = 1
+FEATURE_WORKER_REPORT_CONTRACT = "okx_historical_feature_worker_report_v2"
 
 MARK_PRICE_HISTORY_ENDPOINT = "/api/v5/market/history-mark-price-candles"
 INDEX_PRICE_HISTORY_ENDPOINT = "/api/v5/market/history-index-candles"
@@ -463,6 +464,8 @@ class HistoricalFeatureResult:
     stage_elapsed_seconds_json: str = "{}"
     total_elapsed_seconds: float = 0.0
     index_acquisition_json: str = "{}"
+    mark_acquisition_json: str = "{}"
+    report_contract: str = FEATURE_WORKER_REPORT_CONTRACT
 
 
 def feature_acquisition_payload() -> dict[str, Any]:
@@ -478,6 +481,7 @@ def feature_acquisition_payload() -> dict[str, Any]:
 def feature_catalog_payload() -> dict[str, Any]:
     return {
         "schema_version": FEATURE_SCHEMA_VERSION,
+        "worker_report_contract": FEATURE_WORKER_REPORT_CONTRACT,
         "acquisition": feature_acquisition_payload(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "bar": KLINE_BAR,
@@ -1205,6 +1209,7 @@ def enrich_symbol_historical_features(
     stage_status: dict[str, str] = {}
     errors: dict[str, str] = {}
     index_acquisition: dict[str, Any] = {}
+    mark_acquisition: dict[str, Any] = {}
     stage_elapsed_seconds: dict[str, float] = {
         "read_existing": round(time.perf_counter() - started, 6)
     }
@@ -1244,6 +1249,7 @@ def enrich_symbol_historical_features(
             start_ms=feature_start,
             end_ms=closed_end_ms,
             limit=100,
+            request_audit=mark_acquisition,
         )
         fresh = _normalize_price_candles(
             rows,
@@ -1464,6 +1470,7 @@ def enrich_symbol_historical_features(
         stage_elapsed_seconds_json=json.dumps(stage_elapsed_seconds, sort_keys=True),
         total_elapsed_seconds=round(time.perf_counter() - started, 6),
         index_acquisition_json=json.dumps(index_acquisition, sort_keys=True),
+        mark_acquisition_json=json.dumps(mark_acquisition, sort_keys=True),
     )
 
 

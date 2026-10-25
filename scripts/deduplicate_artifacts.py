@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import UTC, datetime
@@ -51,7 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--finlab-wait-owner-seconds", type=float, default=0,
                         help="bounded wait for the native FinLab writer; never terminates a download")
-    parser.add_argument("--expected-plan-fingerprint", help="require the exact service-cache dry-run plan")
+    parser.add_argument("--expected-plan-fingerprint",
+                        help="require the exact dry-run plan; mandatory for FinLab --apply")
     parser.add_argument(
         "--sharing-candidates-only", action="store_true",
         help="service maintenance: full SHA only complete duplicate candidates; not a whole-cache integrity audit",
@@ -68,16 +70,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
     if args.finlab_history_root:
         if args.sharing_candidates_only or args.forward_capacity_bytes is not None:
             raise ValueError("FinLab source history is not a service-cache capacity policy")
-        from stockagent.data.finlab_storage import compact_history
+        from stockagent.data.finlab_storage import HASH, compact_history
+        if args.apply and not args.expected_plan_fingerprint:
+            parser.error("FinLab --apply requires --expected-plan-fingerprint from a completed audit")
+        if args.expected_plan_fingerprint and not HASH.fullmatch(args.expected_plan_fingerprint):
+            parser.error("--expected-plan-fingerprint must be the completed audit's 64-character SHA-256")
+        if not math.isfinite(args.finlab_wait_owner_seconds) or not 0 <= args.finlab_wait_owner_seconds <= 3600:
+            parser.error("--finlab-wait-owner-seconds must be finite and between 0 and 3600")
         result = compact_history(args.finlab_history_root, args.report_dir, apply=args.apply,
                                  expected_fingerprint=args.expected_plan_fingerprint,
                                  wait_owner_seconds=args.finlab_wait_owner_seconds)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        # Preserve complete per-receipt diagnostics in the durable report;
+        # historical catalogs must not produce an unbounded terminal dump.
+        fields = ("contract", "state", "reason", "plan_fingerprint", "plan_path", "result_path",
+                  "receipt_count", "retained_payload_paths", "duplicate_groups",
+                  "candidate_allocated_bytes", "replaced_paths", "retired_allocated_bytes",
+                  "allocated_before", "allocated_after", "logical_paths_removed",
+                  "historical_receipts_modified", "cold_objects_removed", "nas_archive_files_removed")
+        print(json.dumps({key: result[key] for key in fields if key in result}, ensure_ascii=False))
         return 75 if result["state"] == "deferred" else 0
     if args.finlab_wait_owner_seconds != 0:
         raise ValueError("FinLab owner wait requires --finlab-history-root")

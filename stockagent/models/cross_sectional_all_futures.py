@@ -67,6 +67,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_notional_score_coordinates: bool = False,
         futures_margin_amount_context: bool = False,
         futures_causal_account_policy: bool = False,
+        futures_net_notional_cap: float | None = None,
+        futures_beta_notional_cap: float | None = None,
         futures_opening_reference_feature: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
@@ -117,6 +119,19 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self.futures_margin_budget_output = bool(futures_margin_budget_output)
         self.futures_margin_amount_context = bool(futures_margin_amount_context)
         self.futures_causal_account_policy = bool(futures_causal_account_policy)
+        self.futures_net_notional_cap = futures_net_notional_cap
+        self.futures_beta_notional_cap = futures_beta_notional_cap
+        if futures_beta_notional_cap is not None and (
+            isinstance(futures_beta_notional_cap, bool) or not math.isfinite(futures_beta_notional_cap)
+            or futures_beta_notional_cap < 0 or futures_net_notional_cap is not None
+            or not self.futures_causal_account_policy
+        ):
+            raise ValueError('beta notional cap requires a causal account policy and no net cap')
+        if futures_net_notional_cap is not None and (
+            isinstance(futures_net_notional_cap, bool) or not math.isfinite(futures_net_notional_cap)
+            or futures_net_notional_cap < 0 or not self.futures_causal_account_policy
+        ):
+            raise ValueError('prior net notional cap requires a causal account policy and a finite nonnegative cap')
         self.futures_opening_reference_feature = bool(futures_opening_reference_feature)
         if self.futures_opening_reference_feature and not self.futures_causal_account_policy:
             raise ValueError("opening references require the causal margin account policy")
@@ -316,6 +331,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         margin_features = expected_features + 2 + int(self.futures_margin_amount_context)
         if self.futures_causal_account_policy:
             margin_features += len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+        if self.futures_beta_notional_cap is not None:
+            margin_features += 1
         if self.futures_opening_reference_feature:
             margin_features += len(OPENING_REFERENCE_FEATURES)
         if features is None or mask is None:
@@ -742,6 +759,10 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 market_weights, target_logits, coefficients, candidate_mask,
                 known_notional, known_initial, known_maintenance, known_side_cost,
                 candidate_features[..., observation_start], candidate_features[..., observation_start + 1],
+                net_notional_cap=self.futures_net_notional_cap,
+                beta_notional_cap=self.futures_beta_notional_cap,
+                prior_beta=(candidate_features[..., observation_start + 2]
+                            if self.futures_beta_notional_cap is not None else None),
             )
         reported_scores = scores.masked_fill(
             ~candidate_mask,

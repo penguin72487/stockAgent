@@ -225,6 +225,7 @@ def test_repeated_peer_close_stops_sweep_without_erasing_success(monkeypatch, tm
     timing = snapshot.transport_timing
     assert timing["mis_dispatch_stopped"]
     assert timing["mis_deferred_channel_count"] == 25
+    assert timing["mis_unsubmitted_symbols"] == symbols[5:]
     assert timing["mis_retry_rounds"] == 0
     assert timing["mis_error_chain_types"] == ["ConnectionError", "RemoteDisconnected"]
     assert "private text" not in str(timing)

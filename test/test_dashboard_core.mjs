@@ -148,6 +148,70 @@ test("intersection hints cannot override a closed ancestor, and loading DOM wait
   observer.dispose();
 });
 
+test("a stalled animation frame cannot strand revealed data and fallback still rejects hidden content", () => {
+  let closed = true, sequence = 0;
+  const frames = new Map(), timers = new Map();
+  const target = {closest: () => closed ? {} : null, getClientRects: () => [{}],
+    getBoundingClientRect: () => ({top: 20, bottom: 100, left: 0, right: 200})};
+  const {core, document, requests} = loadCore({globals: {innerHeight: 768, innerWidth: 1366,
+    requestAnimationFrame: callback => {const id = ++sequence; frames.set(id, callback); return id;},
+    cancelAnimationFrame: id => frames.delete(id),
+    setTimeout: (callback, ms) => {const id = ++sequence; timers.set(id, {callback, ms}); return id;},
+    clearTimeout: id => timers.delete(id),
+  }});
+  const rendered = [], render = core.createDeferredRenderer(target, value => rendered.push(value));
+  render("old"); render("latest");
+  const fallback = () => {
+    assert.equal(timers.size, 1);
+    const timer = [...timers.values()][0];
+    assert.equal(timer.ms, 100);
+    timer.callback();
+    assert.equal(timers.size, 0);
+    assert.equal(frames.size, 0);
+  };
+  closed = false;
+  document.hidden = true;
+  document.dispatchEvent({type: "toggle"});
+  document.dispatchEvent({type: "acquisition:reveal"});
+  assert.equal(timers.size, 1, "one bounded fallback serves coalesced visibility events");
+  fallback();
+  assert.deepEqual(rendered, [], "the fallback never overrides hidden-document evidence");
+  document.hidden = false;
+  document.dispatchEvent({type: "visibilitychange"});
+  fallback();
+  assert.deepEqual(rendered, ["latest"]);
+  assert.equal(requests.length, 0);
+  render.dispose();
+});
+
+test("a normal visibility frame cancels its fallback and late callbacks cannot consume a newer check", () => {
+  let closed = true, sequence = 0;
+  const frames = new Map(), timers = new Map();
+  const target = {closest: () => closed ? {} : null, getClientRects: () => [{}],
+    getBoundingClientRect: () => ({top: 20, bottom: 100, left: 0, right: 200})};
+  const {core, document} = loadCore({globals: {innerHeight: 768, innerWidth: 1366,
+    requestAnimationFrame: callback => {const id = ++sequence; frames.set(id, callback); return id;},
+    cancelAnimationFrame: id => frames.delete(id),
+    setTimeout: callback => {const id = ++sequence; timers.set(id, callback); return id;},
+    clearTimeout: id => timers.delete(id),
+  }});
+  const changes = [], observer = core.observeVisibility(target, visible => changes.push(visible));
+  closed = false;
+  document.dispatchEvent({type: "toggle"});
+  const oldFallback = [...timers.values()][0], oldFrame = [...frames.values()][0];
+  oldFrame();
+  assert.deepEqual(changes, [false, true]);
+  assert.equal(timers.size, 0);
+  closed = true;
+  document.dispatchEvent({type: "toggle"});
+  oldFallback(); oldFrame();
+  assert.equal(timers.size, 1, "an old completion cannot clear the new generation");
+  [...frames.values()][0]();
+  assert.deepEqual(changes, [false, true, false]);
+  assert.equal(timers.size, 0);
+  observer.dispose();
+});
+
 test("one broken disclosure callback cannot prevent other visibility consumers updating", async () => {
   let closed = true;
   const target = {closest:() => closed ? {} : null, getClientRects:() => [{}],
@@ -347,6 +411,30 @@ test("revision subscription keeps polling when EventSource is unavailable", () =
   const subscription = core.subscribeRevisions("api/updates", () => assert.fail("no stream"), () => { fallbacks++; });
   assert.equal(fallbacks, 1);
   subscription.dispose();
+});
+
+test("status push shares the validated stream and ignores disconnected events", () => {
+  const {core, sandbox} = loadCore();
+  const streams = [], revisions = [], statuses = [];
+  sandbox.EventSource = class {
+    constructor() { streams.push(this); }
+    addEventListener(name, fn) { this[name] = fn; }
+    close() {}
+  };
+  const subscription = core.subscribeRevisions("api/updates",
+    (_payload, meta) => revisions.push(meta), () => {}, {onStatus: (payload) => statuses.push(payload)});
+  streams[0].revision({data: '{"revision_token":"new"}'});
+  assert.equal(revisions[0].statusExpected, false);  // legacy gateway stays usable
+  streams[0].revision({data: '{"revision_token":"new","status_stream_contract":"verified_compact_status_v1"}'});
+  assert.equal(streams.length, 2);
+  streams[1].revision({data: '{"revision_token":"new"}'});
+  assert.equal(revisions[2].statusExpected, true);
+  streams[1].status({data: '{"modes":[],"service_sync":{"revision_token":"new"}}'});
+  streams[1].status({data: "[]"});
+  assert.equal(statuses.length, 1);
+  subscription.dispose();
+  streams[1].status({data: '{"modes":[]}'});
+  assert.equal(statuses.length, 1);
 });
 
 function stalledBodyFetch(_input, {signal}) {

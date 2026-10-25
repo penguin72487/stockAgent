@@ -1,0 +1,12 @@
+[Unit]
+Description=Retain public opening paint evidence each weekday, including explicit missed arms
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 08:58:30 Asia/Taipei
+Persistent=true
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=stockagent-tw-opening-browser.service
+
+[Install]
+WantedBy=timers.target

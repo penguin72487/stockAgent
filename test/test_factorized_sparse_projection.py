@@ -204,6 +204,44 @@ def test_full_affine_every_parameter_adjoint_and_cache_reuse(tmp_path,norm,devic
         project_factorized_sparse_rows(model,slab)
 
 
+@pytest.mark.parametrize('norm', ['layernorm', 'rmsnorm'])
+@pytest.mark.parametrize('bounds', [(0, 7), (1, 8), (1, 6)])
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_sparse_date_views_align_all_fields_and_parameter_adjoints(tmp_path, norm, bounds, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
+    original = source_fixture(tmp_path)
+    a, b = bounds
+    source = original.slice_dates(1, 9).slice_dates(a, b).subset_symbols(np.array([3, 1]))
+    rows = np.array([len(source.base)-1, 0, 1, len(source.base)-2, 1, 1])
+    # Independent physical-calendar oracle, including partial first/last blocks,
+    # nested views, reordered symbols and repeated/reordered visible dates.
+    raw = original[rows + 1 + a][:, [3, 1]]
+    torch.manual_seed(137)
+    candle = CandleEncoder(num_features=28, d_model=8, dropout=0., norm_type=norm,
+        ffn_type='swiglu', sanitize_inputs=True, projection_fp32=True,
+        causal_feature_rms_normalization=True).to(device)
+    candle.set_causal_feature_rms_normalizer(torch.linspace(.5, 2., 28, device=device),
+                                          torch.arange(28, device=device) != 13)
+    with torch.no_grad():
+        candle.input_norm.weight.copy_(torch.randn_like(candle.input_norm.weight))
+        if getattr(candle.input_norm, 'bias', None) is not None:
+            candle.input_norm.bias.copy_(torch.randn_like(candle.input_norm.bias))
+    oracle = deepcopy(candle)
+    model = SimpleNamespace(candle_encoder=candle, factorized_sparse_cache_bytes=1024**2)
+    actual = project_factorized_sparse_rows(model, FactorizedPanelSlab(source, rows, device=device))
+    expected = oracle(torch.from_numpy(raw).to(device))[0]
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+    coefficient = torch.randn_like(actual)
+    (actual * coefficient).sum().backward()
+    (expected * coefficient).sum().backward()
+    for (name, value), (_, reference) in zip(candle.named_parameters(), oracle.named_parameters(), strict=True):
+        assert (value.grad is None) == (reference.grad is None), name
+        if value.grad is not None:
+            torch.testing.assert_close(value.grad, reference.grad, rtol=7e-5, atol=7e-5,
+                                       msg=lambda message: name + ': ' + message)
+
+
 def test_centering_remains_stable_with_nearly_constant_full_rows(tmp_path):
     source=source_fixture(tmp_path,constant=True)
     candle=CandleEncoder(num_features=28,d_model=8,dropout=0.,norm_type='layernorm',
@@ -378,7 +416,7 @@ def test_sparse_contract_does_not_change_disabled_fingerprints():
         'factorized_sparse_cache_bytes':8*1024**3})=={}
     c=_project_temporal_basis_model_config({'factorized_sparse_projection':True,
         'factorized_sparse_cache_bytes':8*1024**3})
-    assert c['factorized_sparse_projection_contract']=='full_schema_csr_fixed_row_fp32_forward_v3'
+    assert c['factorized_sparse_projection_contract']=='full_schema_csr_fixed_row_fp32_date_view_forward_v4'
 
 
 def test_evaluation_built_cache_supports_later_training(tmp_path):

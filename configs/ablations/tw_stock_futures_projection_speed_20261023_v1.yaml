@@ -1,0 +1,62 @@
+# New-hardware A/B/B/A, full four-epoch lifecycle, same inputs and initial seed.
+# B computes the complete affine stem from immutable CSR; no feature selection.
+# FP32 projection changes numerical/gradient trajectories and has a fresh ABI.
+base_spec: tw_stock_futures_history2013_20261023_v1.yaml
+output_root: artifacts/benchmarks/tw_stock_futures_projection_speed_20261023_v1/abba_no_isolate
+postprocess_plots: []
+runtime:
+  capacity_retry:
+    max_retries: 0
+    minimum_train_batch: 128
+matrix:
+  fixed_overrides:
+    training:
+      epochs: 4
+      early_stopping_no_improve_ratio: 1.0
+  dimensions:
+    - name: clock0845
+      enabled: true
+      paths:
+        - training.financial_transformer.candle_projection_fp32
+        - training.financial_transformer.factorized_compact_projection
+        - training.financial_transformer.factorized_sparse_projection
+      values:
+        - name: a1
+          value: [false, false, false]
+          description: '原封包快取／Original compact packet cache，A1。'
+        - name: b1
+          value: [true, true, true]
+          description: '完整特徵 CSR 投影／Full-schema resident CSR projection，B1。'
+        - name: b2
+          value: [true, true, true]
+          description: '完整特徵 CSR 投影／Full-schema resident CSR projection，B2。'
+        - name: a2
+          value: [false, false, false]
+          description: '原封包快取／Original compact packet cache，A2。'
+    - name: clock0900
+      enabled: true
+      paths:
+        - training.financial_transformer.candle_projection_fp32
+        - training.financial_transformer.factorized_compact_projection
+        - training.financial_transformer.factorized_sparse_projection
+      values:
+        - name: a1
+          value: [false, false, false]
+          description: '原封包快取／Original compact packet cache，A1；09:00。'
+          overrides: &clock0900
+            trading:
+              tw_futures_portfolio_decision_time: '09:00'
+              tw_futures_portfolio_entry_clock_path: artifacts/data_preparation/tw_stock_futures_history2013_20261023_v1/clocks/0900/entries.parquet
+              tw_futures_portfolio_opening_reference_path: artifacts/data_preparation/tw_stock_futures_history2013_20261023_v1/clocks/0900/opening_reference.parquet
+        - name: b1
+          value: [true, true, true]
+          description: '完整特徵 CSR 投影／Full-schema resident CSR projection，B1；09:00。'
+          overrides: *clock0900
+        - name: b2
+          value: [true, true, true]
+          description: '完整特徵 CSR 投影／Full-schema resident CSR projection，B2；09:00。'
+          overrides: *clock0900
+        - name: a2
+          value: [false, false, false]
+          description: '原封包快取／Original compact packet cache，A2；09:00。'
+          overrides: *clock0900

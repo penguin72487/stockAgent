@@ -1,0 +1,16 @@
+base_spec: tw_stock_futures_projection_speed_20261023_v1.yaml
+base_config: configs/markets/tw_stock_futures_carry_0845_history2013_20261023_v2.yaml
+output_root: artifacts/benchmarks/tw_stock_futures_projection_speed_20261023_v2/abba
+matrix:
+  experiment_overrides:
+    clock0900__a1:
+      overrides: &clock0900
+        trading:
+          tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2013_20261023_v1/clocks/0900/entries.parquet
+          tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_stock_futures_history2013_20261023_v1/clocks/0900/opening_reference.parquet
+    clock0900__b1:
+      overrides: *clock0900
+    clock0900__b2:
+      overrides: *clock0900
+    clock0900__a2:
+      overrides: *clock0900

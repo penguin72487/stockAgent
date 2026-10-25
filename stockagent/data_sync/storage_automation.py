@@ -220,7 +220,8 @@ def automation_status(
              'complete_workflow_seconds', 'changed'), now=now)
         receipts['immutable_source_archive'] = bounded_receipt(lake_state / 'source-replication-status.json',
             ('state', 'observed_at_utc', 'available_object_count', 'available_object_bytes',
-             'nas_archive_covered_objects', 'nas_archive_covered_bytes', 'pending_delivery_ids',
+             'nas_archive_covered_objects', 'nas_archive_covered_bytes', 'nas_archive_historical_objects',
+             'pending_delivery_ids',
              'transport_cache_reclaimed_bytes', 'source_deletion_enabled', 'pending_bytes',
              'maximum_pending_deliveries', 'maximum_wave_bytes', 'publication_waits_for_nas_ack',
              'retained_transport_bytes', 'redelivery_attempts', 'receipt_errors', 'catalog_refresh_error'), now=now)
@@ -314,6 +315,9 @@ def print_human_status(value: dict[str, Any]) -> None:
               f"{archive.get('available_object_bytes', 0)/1e9:.3f} GB；"
               f"{archive.get('nas_archive_covered_objects', 0)} / {archive.get('available_object_count', 0)} 物件；"
               f"{len(archive.get('pending_delivery_ids', []))} 批待驗收")
+        if archive.get('nas_archive_historical_objects', 0) > archive.get('nas_archive_covered_objects', 0):
+            print(f"  歷史已驗收 {archive['nas_archive_historical_objects']} 個唯一物件版本；"
+                  "目前覆蓋率只計入本輪清冊。")
         if archive.get('publication_waits_for_nas_ack') is False:
             print(f"  來源持續發布，不等 NAS 驗收；保留暫存 {archive.get('retained_transport_bytes', 0)/1e9:.3f} GB；"
                   f"失敗重傳 {archive.get('redelivery_attempts', 0)} 次")

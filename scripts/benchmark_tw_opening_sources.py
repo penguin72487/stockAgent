@@ -14,7 +14,7 @@ import fcntl
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import importlib.util
 import json
@@ -301,7 +301,7 @@ def compare_mis_pipeline(symbols, root, baseline_file, responses_file, *, rounds
 
 
 def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, rounds, baseline_quotes_path=None,
-                            include_source_failures=False, profile_local=False):
+                            include_source_failures=False, profile_local=False, clock_journal=None):
     """Same retained full response, original prices/clocks, real fsyncs.
 
     Zero network latency is explicit. This measures the complete fan-in local
@@ -321,6 +321,30 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     gate = now.replace(hour=9, minute=0, second=0, microsecond=0)
     fixture_at = max(now, gate + timedelta(seconds=12))
+    clock_proof = None
+    if clock_journal is not None:
+        body_hash = hashlib.sha256(body).hexdigest()
+        matches = []
+        with clock_journal.open("rb") as handle:
+            for line in handle:
+                if body_hash.encode() not in line:
+                    continue
+                row = json.loads(line)
+                if row.get("event") == "provider_snapshot" and row.get("transport_timing", {}).get("body_sha256") == body_hash:
+                    coverage = row["coverage"]
+                    received = datetime.fromisoformat(coverage["received_at_taipei"])
+                    validated = datetime.fromisoformat(coverage["validated_at_taipei"])
+                    event_at = datetime.fromisoformat(row["observed_at_taipei"])
+                    if (received.utcoffset() is None or validated.utcoffset() is None or event_at.utcoffset() is None
+                            or validated < received or validated > event_at):
+                        raise ValueError("invalid retained source receipt clock")
+                    matches.append((received, coverage["snapshot_id"]))
+        if not matches:
+            raise ValueError("retained body lacks its original journal clock proof")
+        fixture_at, snapshot_id = min(matches)
+        clock_proof = {"journal": str(clock_journal), "payload_sha256": body_hash,
+            "original_received_at_taipei": fixture_at.isoformat(), "original_snapshot_id": snapshot_id,
+            "boundary": "original_source_receive_clock_frozen_for_offline_local_abba_not_live_replay"}
 
     class Clock(datetime):
         @classmethod
@@ -348,6 +372,7 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
                                                "FINMIND_TOKEN": "offline-fixture-not-a-credential"}), \
                         patch("requests.sessions.Session.request", forbidden), \
                         patch.object(module, "datetime", Clock), patch.object(variant_quotes, "datetime", Clock), \
+                        patch.object(universe, "datetime", Clock), \
                         patch.object(module, "_http_session", lambda: SimpleNamespace(get=response)), \
                         patch.object(variant_quotes, "_TW_MIS_OPENING_CACHE_KEY", None), \
                         patch.object(variant_quotes, "_TW_MIS_OPENING_CACHE", {}), \
@@ -416,6 +441,8 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
                                               "tw_opening_observation_diagnostics", "persist_tw_opening_snapshot_cache"):
                                 measurements.enter_context(measure_stage(variant_quotes, attribute))
                             measurements.enter_context(measure_stage(module, "_record_source_events"))
+                            measurements.enter_context(measure_stage(module, "_decode_finmind_opening_payload"))
+                            measurements.enter_context(measure_stage(module, "_opening_only_snapshot"))
                             try:
                                 result = owner.fetch(symbols, fallback, parquet_root=root,
                                     providers=providers, minimum_coverage=.9, timeout_seconds=4.5,
@@ -470,6 +497,7 @@ def compare_finmind_decoder(symbols, root, baseline_path, payload_path, *, round
             "baseline_quote_owner_sha256": hashlib.sha256(baseline_quotes_path.read_bytes()).hexdigest() if baseline_quotes_path else None,
             "candidate_quote_owner_sha256": hashlib.sha256(Path(quotes.__file__).read_bytes()).hexdigest(),
             "payload_sha256": hashlib.sha256(body).hexdigest(), "payload_bytes": len(body),
+            "source_clock_proof": clock_proof,
             "requested_count": len(symbols), "financial_and_clock_parity": True,
             "durable_rows_parity": True, "observation_journal_parity": True,
             "controlled_parallel_failures": include_source_failures,
@@ -1303,11 +1331,307 @@ def observation_coverage(snapshot, *, session_date, observed_at):
         "boundary": "source_observation_not_execution_or_model_readiness"}
 
 
+def completion_percentages(samples, requested_count, field):
+    """Every integer percent, including explicit nulls for failed/tail rows."""
+    if requested_count <= 0:
+        raise ValueError("completion denominator must be positive")
+    result = {str(p): None for p in range(1, 101)}
+    next_percent = 1
+    previous_ms = -1.
+    for row in samples:
+        elapsed, count = row["elapsed_ms"], row[field]
+        if (not isinstance(count, int) or not 0 <= count <= requested_count
+                or not math.isfinite(elapsed) or elapsed < previous_ms):
+            raise ValueError("invalid completion observation")
+        previous_ms = elapsed
+        while next_percent <= 100 and count >= math.ceil(requested_count * next_percent / 100):
+            result[str(next_percent)] = elapsed
+            next_percent += 1
+    return result
+
+
+def after_hours_context(source, observed_at):
+    """Verified completed price day, without backdating the observation clock."""
+    from stockagent.live.market_status import tw_stock_day_decision
+    if observed_at.utcoffset() is None:
+        raise ValueError("after-hours probe requires an aware clock")
+    now = observed_at.astimezone(ZoneInfo("Asia/Taipei"))
+    root = Path(source["parquet_root"]).parent
+    # Reject live-session work before searching historical dates. This also
+    # avoids needless calendar scans while the opening owner has priority.
+    today = tw_stock_day_decision(now.date(), (), parquet_root=root, observed=now)
+    if today.status == "unknown" or (today.is_session and 8 <= now.hour < 14):
+        raise ValueError("after-hours probe cannot run during a live/protected session")
+    day = now.date() if now.hour >= 14 else now.date() - timedelta(days=1)
+    for _ in range(14):
+        decision = tw_stock_day_decision(day, (), parquet_root=root, observed=now)
+        if decision.status == "unknown":
+            raise ValueError("unverified completed-session calendar")
+        if decision.is_session:
+            break
+        day -= timedelta(days=1)
+    else:
+        raise ValueError("no verified completed session")
+    price_date = day.isoformat()
+    # Do not divert a manual benchmark into the live/protected session, even
+    # when the caller supplied yesterday's perfectly valid official receipt.
+    official = source.get("official_trading_universe", {})
+    symbols = source.get("requested_symbols", [])
+    if (not symbols or len(set(symbols)) != len(symbols)
+            or source.get("session_date") != price_date or official.get("session_date") != price_date
+            or not str(official.get("contract", "")).startswith("tw_official_current_regular_stock_etf_universe_v")
+            or set(official.get("symbols", [])) != set(symbols)
+            or official.get("official_trading_count") != len(symbols)):
+        raise ValueError("after-hours probe requires the latest completed official full-market scope")
+    registry_proof = {"state": "unmanaged_engineering_fixture_not_live_scope"}
+    if universe.official_scope_required(source["parquet_root"]):
+        path = universe.receipt_path(price_date)
+        metadata = path.stat()
+        # Reuse the complete canonical raw-source/hash/type/status verifier.
+        # Unlike the live loader this does not assert that the price day is
+        # today's request day; all actual source and request clocks stay intact.
+        verified = universe._read_receipt(str(path), metadata.st_mtime_ns, metadata.st_size)
+        trading = {row["symbol"] for row in verified["records"] if row["trading_status"] == "listed_for_regular_trading"}
+        observed = datetime.fromisoformat(verified["observed_at_taipei"])
+        if (verified["session_date"] != price_date or observed.utcoffset() is None or observed > now
+                or verified["fingerprint"] != official.get("fingerprint") or trading != set(symbols)):
+            raise ValueError("completed official scope differs from verified original registry")
+        registry_proof = {"state": "canonical_registry_raw_hashes_verified", "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "fingerprint": verified["fingerprint"]}
+    return {"phase": "after_hours", "price_session_date": price_date,
+        "scope_asof_session_date": price_date, "request_observed_at_taipei": now.isoformat(),
+        "calendar_reason": decision.reason, "requested_count": len(symbols),
+        "request_day_is_session": today.is_session, "registry_proof": registry_proof}
+
+
+def after_hours_probe(source, output, *, rounds=1, providers=None, mis_workers=4):
+    """Observe canonical providers in parallel; no input-cache/ledger publication.
+
+    After-hours snapshots are historical observations, NOT fresh executable
+    books or model quorum. The probe's explicit private durable final readback
+    is not the production fan-in, signal publication, paper fill, or browser.
+    """
+    entered = time.perf_counter()
+    context = after_hours_context(source, datetime.now(ZoneInfo("Asia/Taipei")))
+    if output.exists():
+        raise ValueError("after-hours evidence must not be overwritten")
+    if not 1 <= rounds <= 5:
+        raise ValueError("after-hours probe requires 1..5 rounds")
+    worker_plan = list(mis_workers) if isinstance(mis_workers, (tuple, list)) else [mis_workers] * rounds
+    if len(worker_plan) != rounds or any(not isinstance(n, int) or not 1 <= n <= quotes._TW_MIS_HTTP_WORKERS for n in worker_plan):
+        raise ValueError("after-hours MIS workers require 1..16")
+    load_dotenv(ROOT / ".env", override=False)
+    symbols = list(source["requested_symbols"])
+    fallback = np.full(len(symbols), np.nan)
+    if providers is None:
+        providers = acquisition.configured_opening_providers(source["parquet_root"])
+        def mis_probe(names, values, progress):
+            # The same canonical API-only transport proof used by the daytime
+            # diagnostic, on MIS's OWN worker. A failed single-symbol proof
+            # must not fan out into 29 requests or hold up independent FinMind.
+            began = time.perf_counter()
+            try:
+                proof = quotes.warm_tw_mis_quote_client(force=bool(
+                    source_circuits["official_mis"].get("consecutive_source_failures")))
+                if proof.get("ready") is not True:
+                    raise RuntimeError("MIS diagnostic transport proof unavailable")
+            except Exception as exc:
+                exc.opening_transport_timing = {"network_sweep_skipped": "failed_single_symbol_transport_probe",
+                    "probe_ms": round((time.perf_counter() - began) * 1000, 6),
+                    "probe_error_chain_types": quotes._tw_mis_transport_error_types(exc)}
+                raise
+            result = quotes.fetch_tw_mis_last_prices(names, values, parquet_root=source["parquet_root"],
+                empty_chunk_retry_attempts=0, max_parallel_requests=worker_plan[round_id - 1],
+                request_timeout_seconds=4., on_progress=progress)
+            result.transport_timing = {**(result.transport_timing or {}), "diagnostic_connection_prewarm": proof,
+                "diagnostic_prewarm_and_sweep_ms": round((time.perf_counter() - began) * 1000, 6)}
+            return result
+        providers["official_mis"] = mis_probe
+        if "finmind_snapshot" in providers:
+            providers["finmind_snapshot"] = lambda names, values, progress: acquisition.fetch_finmind_opening_prices(
+                names, values, progress, force_network=True, price_session_date=context["price_session_date"])
+    if not providers:
+        raise ValueError("after-hours probe requires a configured source")
+    report = {"schema_version": 1, "contract": "after_hours_full_scope_completion_v1", **context,
+        "providers": list(providers), "rounds": [], "production_ledger_modified": False,
+        "production_input_cache_modified": False, "extra_shioaji_login": False,
+        "broker_order_submitted": False, "signal_published": False, "opening_slo_claim": False,
+        "mis_worker_plan": worker_plan,
+        "scope_sha256": hashlib.sha256("\n".join(sorted(symbols)).encode()).hexdigest(),
+        "boundaries": {"completion": "source_callback_validated_original_price_session_not_trade_or_live_readiness",
+            "durability": "private_probe_final_snapshot_canonical_serialization_and_independent_readback",
+            "browser_paint": "unmeasured", "signal_and_paper_fill": "unmeasured"}}
+    output.parent.mkdir(parents=True, exist_ok=True)
+    positions = {symbol: i for i, symbol in enumerate(symbols)}
+    source_circuits = {name: {} for name in providers}
+    fields = ("raw_response_count", "response_count", "positive_open_count", "historical_no_print_count",
+              "historical_zero_volume_count", "historical_classified_count")
+    for round_id in range(1, rounds + 1):
+        started = time.perf_counter()
+        round_started_at = datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")
+        if round_id == 1:
+            report["preparation_before_first_dispatch_ms"] = round((started - entered) * 1000, 6)
+        lock = threading.Lock()
+        states = {name: {"raw_response": set(), "response": set(), "open": set(), "no_print": set(), "zero_volume": set(), "samples": [],
+                        "progress_calls": 0, "observer_ms": 0.} for name in providers}
+        merged = {"raw_response": set(), "response": set(), "open": set(), "no_print": set(), "zero_volume": set(), "samples": []}
+
+        def observe(name, requested, snapshot):
+            validation_started = time.perf_counter()
+            if len(requested) != len(snapshot.prices) or len(set(requested)) != len(requested) or not set(requested) <= positions.keys():
+                raise ValueError("source callback differs from the official requested axis")
+            available = np.asarray(snapshot.available_mask, dtype=bool)
+            if available.shape != (len(requested),):
+                raise ValueError("source callback availability shape mismatch")
+            opens = quotes.tw_session_open_observed_mask(snapshot, session_date=context["price_session_date"])
+            no_prints = quotes.tw_session_no_open_print_mask(snapshot, session_date=context["price_session_date"])
+            zero_volume = np.zeros(len(requested), dtype=bool)
+            if (str(snapshot.source).startswith("twse_tpex:mis") and snapshot.volumes is not None
+                    and snapshot.exchange_timestamps_ms is not None):
+                # Historical category only: it explains a missing genuine
+                # open without declaring a fresh live no-print proof or using
+                # the vendor's bid/ask midpoint as a most-recent real trade.
+                volume = np.asarray(snapshot.volumes)
+                zero_volume = available & ~opens & np.isfinite(volume) & (volume == 0) & quotes._tw_opening_timestamp_mask(
+                    np.asarray(snapshot.exchange_timestamps_ms), context["price_session_date"])
+                if snapshot.simtrade_flags is not None:
+                    zero_volume &= np.asarray(snapshot.simtrade_flags) != 1
+            with lock:
+                # Count-admission order, not arrival-before-a-contended-lock;
+                # parallel callbacks must never produce a backwards curve.
+                state = states[name]
+                for key, mask in (("response", available), ("open", opens), ("no_print", no_prints), ("zero_volume", zero_volume)):
+                    values = {requested[int(i)] for i in np.flatnonzero(mask)}
+                    state[key].update(values)
+                    merged[key].update(values)
+                raw = (snapshot.transport_timing or {}).get("provider_snapshot_coverage")
+                if raw is not None:
+                    returned = set(raw["valid_open_symbols"]).union(*map(set, raw["rejected_symbols"].values()))
+                    returned.intersection_update(positions)
+                else:
+                    returned = set(state["response"])
+                state["raw_response"].update(returned)
+                merged["raw_response"].update(returned)
+                for target in (state, merged):
+                    target["no_print"].difference_update(target["open"])
+                    target["zero_volume"].difference_update(target["open"])
+                    sample = {
+                        "raw_response_count": len(target["raw_response"]),
+                        "response_count": len(target["response"]), "positive_open_count": len(target["open"]),
+                        "historical_no_print_count": len(target["no_print"]),
+                        "historical_zero_volume_count": len(target["zero_volume"]),
+                        "historical_classified_count": len(target["open"] | target["no_print"] | target["zero_volume"])}
+                    # Freeze the count-ready clock AFTER merging and counting,
+                    # not before the observer's own validation/lock work.
+                    sample["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 6)
+                    target["samples"].append(sample)
+                state["progress_calls"] += 1
+                state["observer_ms"] += (time.perf_counter() - validation_started) * 1000
+
+        def run(name, provider):
+            called = time.perf_counter()
+            row = {"state": "running", "dispatch_ms": round((called - started) * 1000, 6),
+                "provider_invoked_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")}
+            if name == "shioaji_shared" and not context["request_day_is_session"]:
+                # The existing engine intentionally authorizes its quote worker
+                # only for a verified session day. Do not queue a request that
+                # it must reject or open a second broker login to evade the gate.
+                return name, {**row, "state": "skipped_closed_session_owner", "source_and_private_readback_ms": None}
+            circuit = source_circuits[name]
+            if time.monotonic() < circuit.get("retry_after_monotonic", 0.):
+                return name, {**row, "state": "backoff_previous_source_failure", "source_and_private_readback_ms": None,
+                    "retry_reason": circuit.get("retry_reason"), "new_external_request": False}
+            last = [None]
+            def progress(requested, snapshot):
+                observe(name, requested, snapshot)
+                last[0] = snapshot
+            try:
+                snapshot = provider(symbols, fallback.copy(), progress)
+                if last[0] is not snapshot:
+                    progress(symbols, snapshot)
+                row.update(state="observed", transport_timing=snapshot.transport_timing or {})
+                timing = row["transport_timing"]
+                if timing.get("mis_dispatch_stopped") or timing.get("mis_failed_request_count", 0):
+                    row["state"] = "degraded"
+                    statuses = timing.get("mis_http_error_statuses", [])
+                    limited = next((status for status in statuses if status in {401, 402, 403, 429}), None)
+                    acquisition._source_failure_retry(circuit, status=limited,
+                        endpoint_unavailable=bool(timing.get("mis_dispatch_stopped")))
+                # Each provider's original arrays are retained; no invented
+                # close, volume, order, source clock or no-print proof.
+                path = output.with_name(f"{output.stem}.round{round_id}.{name}.snapshot.json")
+                if path.exists():
+                    raise ValueError("private source evidence must not be overwritten")
+                committing = time.perf_counter()
+                write_spans = {}
+                _atomic_json(path, quotes._price_snapshot_payload(snapshot), timings=write_spans)
+                committed = time.perf_counter()
+                readback = path.read_bytes()
+                restored = quotes._price_snapshot_from_payload(json.loads(readback))
+                row.update(durable_snapshot=str(path), durable_sha256=hashlib.sha256(readback).hexdigest(),
+                    private_final_write_ms=round((committed - committing) * 1000, 6),
+                    private_write_stage_spans=write_spans)
+                for field in ("prices", *quotes._PRICE_SNAPSHOT_ARRAY_FIELDS, "available_mask",
+                              "timestamps_ms", "exchange_timestamps_ms", "no_open_print_timestamps_ms", "simtrade_flags"):
+                    before, after = getattr(snapshot, field), getattr(restored, field)
+                    if ((before is None) != (after is None)
+                            or before is not None and (np.asarray(before).dtype != np.asarray(after).dtype
+                                or np.asarray(before).tobytes() != np.asarray(after).tobytes())):
+                        raise ValueError("private snapshot financial/clock readback parity failed")
+                row["financial_and_clock_readback_parity"] = True
+                row["private_final_readback_ms"] = round((time.perf_counter() - committed) * 1000, 6)
+            except Exception as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                acquisition._source_failure_retry(circuit, status=403 if isinstance(exc, PermissionError) else status)
+                row.update(state="failed", error_type=type(exc).__name__,
+                    http_status=status,
+                    failure_timing=getattr(exc, "opening_transport_timing", {}))
+            row["source_and_private_readback_ms"] = round((time.perf_counter() - called) * 1000, 6)
+            return name, row
+
+        with ThreadPoolExecutor(max_workers=max(1, len(providers)), thread_name_prefix="after-hours-observer") as pool:
+            jobs = [pool.submit(run, name, provider) for name, provider in providers.items()]
+            results = dict(job.result() for job in jobs)
+        for name, state in [*states.items(), ("merged", merged)]:
+            row = merged if name == "merged" else results[name]
+            row["completion_ms"] = {field: completion_percentages(state["samples"], len(symbols), field) for field in fields}
+            row["final_counts"] = {"raw_response_count": len(state["raw_response"]),
+                "response_count": len(state["response"]), "positive_open_count": len(state["open"]),
+                "historical_no_print_count": len(state["no_print"]), "historical_zero_volume_count": len(state["zero_volume"]),
+                "historical_classified_count": len(state["open"] | state["no_print"] | state["zero_volume"]),
+                "unknown_count": len(symbols) - len(state["open"] | state["no_print"]),
+                "unclassified_count": len(symbols) - len(state["open"] | state["no_print"] | state["zero_volume"])}
+            row["missing_positive_open_symbols"] = sorted(set(symbols) - state["open"])
+            row["historical_zero_volume_symbols"] = sorted(state["zero_volume"])
+            if name != "merged":
+                row.update(progress_calls=state["progress_calls"], observer_ms=round(state["observer_ms"], 6))
+        record = {"round": round_id, "started_at_taipei": round_started_at, "mis_workers": worker_plan[round_id - 1],
+            "total_ms": round((time.perf_counter() - started) * 1000, 6), "providers": results,
+            "merged": {key: value for key, value in merged.items() if key not in {"raw_response", "response", "open", "no_print", "zero_volume"}}}
+        report["rounds"].append(record)
+        _atomic_json(output, report)
+        print(json.dumps({"event": "after_hours_round", "round": round_id, "total_ms": record["total_ms"],
+            "counts": merged["final_counts"], "providers": {name: row["state"] for name, row in results.items()}}, ensure_ascii=False), flush=True)
+    report["total_entry_ms"] = round((time.perf_counter() - entered) * 1000, 6)
+    report["positive_prices_complete"] = all(r["merged"]["final_counts"]["positive_open_count"] == len(symbols) for r in report["rounds"])
+    report["historical_observations_classified"] = all(r["merged"]["final_counts"]["unclassified_count"] == 0 for r in report["rounds"])
+    report["state"] = "observed" if all(row["state"] in {"observed", "skipped_closed_session_owner"}
+        for r in report["rounds"] for row in r["providers"].values()) else "degraded"
+    writing = time.perf_counter()
+    _atomic_json(output, report)
+    print(json.dumps({"event": "after_hours_report_committed", "report": str(output), "state": report["state"],
+        "final_report_write_ms": round((time.perf_counter() - writing) * 1000, 6),
+        "total_entry_to_final_report_ms": round((time.perf_counter() - entered) * 1000, 6)}, ensure_ascii=False), flush=True)
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path, help="Read universe/root only; never reused as the timed opening cache")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--scheduled", action="store_true", help="Native intraday/postclose non-broker probe; opening uses the existing passive audit")
+    parser.add_argument("--after-hours", action="store_true", help="Read-only actual-network probe of the verified latest completed price session; preserves today's request clocks")
+    parser.add_argument("--after-hours-mis-workers", default="4", help="Diagnostic after-hours MIS concurrency 1..16, or per-round ABBA plan e.g. 4,8,8,4; never changes the opening policy")
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--no-connection-prewarm", action="store_true", help="Also retain cold HTTP connection costs; a prewarm failure never cancels other sources")
     parser.add_argument("--source-drain-timeout", type=float, default=90., help="Diagnostic-only complete provider-job wait, including input fsync/journal; never extends the model quorum wait")
@@ -1317,6 +1641,7 @@ def main() -> int:
     parser.add_argument("--compare-mis-recovery", type=Path, help="OFFLINE: full-axis transport outage recovery against a captured acquisition owner; real retry clocks, no live SLO claim")
     parser.add_argument("--compare-finmind-decoder", type=Path, help="OFFLINE: captured prior owner versus complete retained FinMind response ingestion, validation and persistence")
     parser.add_argument("--finmind-payload", type=Path, help="Private retained original response bytes, required only for --compare-finmind-decoder")
+    parser.add_argument("--finmind-clock-journal", type=Path, help="Bind offline FinMind replay to the original receive clock using its exact retained-body SHA256")
     parser.add_argument("--retained-source-failures", action="store_true", help="OFFLINE retained FinMind comparison only: include parallel permission/connection failures, not live provider timing")
     parser.add_argument("--baseline-quote-owner", type=Path, help="Captured pre-change quote owner for the complete local FinMind ingestion comparison")
     parser.add_argument("--compare-mis-pipeline", type=Path, help="OFFLINE: explicit prior quote owner versus retained complete MIS response parsing, fan-in and durable receipts")
@@ -1342,11 +1667,28 @@ def main() -> int:
     parser.add_argument("--mis-retry-attempts", type=int, default=1, choices=(0, 1, 2))
     args = parser.parse_args()
     schedule_context = None
+    if args.after_hours:
+        allowed = {"after_hours", "receipt", "output", "rounds", "after_hours_mis_workers"}
+        unsupported = [name for name, value in vars(args).items()
+            if name not in allowed and value != parser.get_default(name)]
+        if args.receipt is None or args.output is None or unsupported:
+            parser.error("after-hours probe requires isolated --receipt and --output; no scheduled/offline/provider-only options")
+        source = json.loads(args.receipt.read_bytes())
+        try:
+            plan = [int(value) for value in args.after_hours_mis_workers.split(",")]
+            if len(plan) == 1:
+                plan *= args.rounds
+        except ValueError:
+            parser.error("after-hours MIS workers require comma-separated integers")
+        after_hours_probe(source, args.output, rounds=args.rounds, mis_workers=plan)
+        return 0
+    if args.after_hours_mis_workers != "4":
+        parser.error("after-hours MIS concurrency requires --after-hours")
     if args.scheduled:
         if args.output or args.rounds != 2 or args.source_drain_timeout != 90. or any(value for name, value in vars(args).items()
                 if name.startswith(("compare_", "callback_")) or name in {"mis_only", "finmind_only", "retain_mis_responses", "profile_mis_local", "profile_finmind_local",
                     "baseline_acquisition_owner", "retained_universe_owner", "baseline_quote_owner",
-                    "mis_responses", "finmind_payload", "retained_source_failures", "mis_simulated_http_delay_ms", "mis_simulated_progress_delay_ms"}):
+                    "mis_responses", "finmind_payload", "finmind_clock_journal", "retained_source_failures", "mis_simulated_http_delay_ms", "mis_simulated_progress_delay_ms"}):
             parser.error("scheduled probe owns its providers, one round and append-only output paths")
         args.receipt, args.output, schedule_context = scheduled_probe_context(receipt_path=args.receipt)
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -1399,6 +1741,8 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
         parser.error("retained FinMind comparison requires both baseline owner and original payload")
     if args.baseline_quote_owner and not args.compare_finmind_decoder:
         parser.error("baseline quote owner is only valid for the retained FinMind comparison")
+    if args.finmind_clock_journal and not args.compare_finmind_decoder:
+        parser.error("retained FinMind clock proof requires the offline decoder comparison")
     if args.retained_source_failures and not args.compare_finmind_decoder:
         parser.error("retained source failures require the offline retained FinMind comparison")
     if comparisons > 1:
@@ -1423,7 +1767,8 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                     simulated_progress_delay_ms=args.mis_simulated_progress_delay_ms)
                   if args.compare_mis_pipeline else compare_finmind_decoder(symbols, source["parquet_root"], args.compare_finmind_decoder, args.finmind_payload,
                     rounds=args.rounds, baseline_quotes_path=args.baseline_quote_owner,
-                    include_source_failures=args.retained_source_failures, profile_local=args.profile_finmind_local)
+                    include_source_failures=args.retained_source_failures, profile_local=args.profile_finmind_local,
+                    clock_journal=args.finmind_clock_journal)
                   if args.compare_finmind_decoder else compare_independent_poll(symbols, source["parquet_root"], args.compare_independent_poll, rounds=args.rounds)
                   if args.compare_independent_poll else compare_mis_recovery(symbols, source["parquet_root"], args.compare_mis_recovery, rounds=args.rounds)
                   if args.compare_mis_recovery else compare_finmind_cadence(symbols, source["parquet_root"], rounds=args.rounds)
@@ -1469,7 +1814,7 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
     if schedule_context is not None:
         providers = {name: provider for name, provider in providers.items() if name != "shioaji_shared"}
         args.rounds = 1
-    report = {"schema_version": 1, "scope": "actual_network_empty_receipt_current_time_not_0900_slo", "observed_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(), "universe_receipt_sha256": hashlib.sha256(source_bytes).hexdigest(), "requested_count": len(symbols), "providers": list(providers), "production_ledger_modified": False, "signal_published": False, "broker_order_submitted": False, "extra_shioaji_login": False, "opening_slo_claim": False, "rounds": []}
+    report = {"schema_version": 1, "scope": "actual_network_empty_receipt_current_time_not_0900_slo", "observed_at_taipei": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(), "universe_receipt_sha256": hashlib.sha256(source_bytes).hexdigest(), "requested_count": len(symbols), "providers": list(providers), "production_ledger_modified": False, "signal_published": False, "broker_order_submitted": False, "extra_shioaji_login": False, "opening_slo_claim": False, "rounds": [], "requested_rounds": args.rounds, "rounds_complete": False}
     from scripts.audit_tw_opening_latency import quote_session_phase
     report["phase"] = quote_session_phase(datetime.now(ZoneInfo("Asia/Taipei")))
     if schedule_context:
@@ -1635,6 +1980,17 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                     "partial" if record["final_positive_opens"] + record["final_observed_no_prints"] else "waiting_source")
             _atomic_json(args.output, report)
             print(json.dumps({k: v for k, v in record.items() if k not in {"quorum_timing", "providers"}}, ensure_ascii=False), flush=True)
+            if (args.mis_only and round_id < args.rounds
+                    and provider_states.get("official_mis", {}).get("transport_timing", {})
+                    .get("mis_dispatch_stopped") is True):
+                # Starting a new isolated owner would reset its circuit and
+                # immediately burst again into a just-refused endpoint. Keep
+                # this failed round and its original timings, leave later
+                # rounds explicitly unstarted, and do not affect healthy
+                # providers in the combined acquisition benchmark.
+                report["unstarted_rounds"] = list(range(round_id+1, args.rounds+1))
+                report["network_rounds_stopped"] = "canonical_mis_source_circuit_open"
+                break
         telemetry = quotes._tw_mis_opening_receipt_path(session_date).with_suffix(".acquisition.jsonl")
         if telemetry.exists():
             shutil.copyfile(telemetry, args.output.with_suffix(".acquisition.jsonl"))
@@ -1653,6 +2009,7 @@ def _network_or_comparison(args, parser, schedule_context=None) -> int:
                     "decoded_at_taipei": observed} for channels, status, body, observed in retained_bodies]})
             report["retained_response_manifest"] = str(target)
     report["data_complete"] = bool(report["rounds"]) and all(row["data_complete"] for row in report["rounds"])
+    report["rounds_complete"] = len(report["rounds"]) == args.rounds
     report["resolved_complete"] = bool(report["rounds"]) and all(row["resolved_complete"] for row in report["rounds"])
     report["status"] = ("complete" if report["data_complete"] else
         "awaiting_first_print" if report["resolved_complete"] else

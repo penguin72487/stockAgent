@@ -50,6 +50,36 @@ def test_clock_windows_are_strictly_later_and_equal_latency():
         decision_clock_contract("08:46")
 
 
+def test_reporting_calendar_uses_verified_clock_horizon_and_retains_original_context(tmp_path):
+    from types import SimpleNamespace
+    from scripts.check_tw_scale_cash_ablation_context import calendar_for_config
+
+    daily, rules = tmp_path / 'daily.parquet', tmp_path / 'rules.parquet'
+    daily.write_bytes(b'bound daily'); rules.write_bytes(b'bound rules')
+    path = tmp_path / 'entries.parquet'
+    dates = [date(2026, 1, 2), date(2026, 1, 5)]
+    pl.DataFrame(dict(date=dates, physical_contract=['TX:202601'] * 2, symbol=['slot1'] * 2,
+        entry_quote=[100., 101.], entry_volume=[1., 2.], status=['observed_minute'] * 2)).write_parquet(path)
+    manifest = dict(dataset=CLOCK_DATASET, clock=decision_clock_contract('08:45'),
+        status='complete', entries_sha256=sha256_file(path), rows=2,
+        source_daily_sha256=sha256_file(daily), source_rules_sha256=sha256_file(rules),
+        start_date='2026-01-02', end_date='2026-01-05', pair_identity='same-source-pair')
+    path.with_name('manifest.json').write_text(json.dumps(manifest))
+    config = SimpleNamespace(trading=SimpleNamespace(tw_futures_portfolio_entry_clock_path=str(path),
+        tw_futures_portfolio_data_path=str(daily), tw_futures_portfolio_margin_rules_path=str(rules),
+        tw_futures_portfolio_decision_time='08:45'))
+    context = ['2011-01-03', '2026-01-02', '2026-01-05', '2026-10-02']
+    actual, proof = calendar_for_config(config, context)
+    assert actual.astype(str).tolist() == ['2026-01-02', '2026-01-05']
+    assert proof['source_context_sessions'] == 4 and proof['model_panel_sessions'] == 2
+    assert context[0] == '2011-01-03'
+    with pytest.raises(ValueError, match='does not cover'):
+        calendar_for_config(config, context[:2])
+    daily.write_bytes(b'changed canonical daily')
+    with pytest.raises(ValueError, match='incompatible'):
+        calendar_for_config(config, context)
+
+
 def test_entry_reprice_keeps_corporate_cash_and_independent_terminal_capacity():
     old = execution()
     new = reprice_margin_entries(old, source(), participation=.5, broker_multiplier=1.)
@@ -60,6 +90,68 @@ def test_entry_reprice_keeps_corporate_cash_and_independent_terminal_capacity():
     np.testing.assert_array_equal(new[:, [i for i in range(33) if i not in changed]],
                                   old[:, [i for i in range(33) if i not in changed]])
     assert old[0, 3] == 1010.  # shared source tape must not mutate
+
+
+@pytest.mark.parametrize('asset', ['stock_future', 'etf_future', 'index_future'])
+def test_v2_entry_reprice_uses_dated_equity_tax_and_preserves_fixed_margin(asset):
+    # 50,000 -> 55,000 notional: dated 2e-5 tax rounds 1.0 -> 1.1 to whole TWD.
+    facts = source().with_columns(pl.lit(asset).alias('asset_class'),
+        pl.lit(500.).alias('contract_multiplier'), pl.lit(50010.).alias('opening_contract_value_twd'),
+        pl.lit(50000.).alias('opening_margin_value_twd'), pl.lit(1.).alias('opening_tax_twd'),
+        pl.lit('fixed_twd').alias('margin_kind'), pl.lit(1234.).alias('initial'),
+        pl.lit(987.).alias('maintenance'))
+    new = reprice_margin_entries(execution(), facts, participation=.5,broker_multiplier=1.1,
+                                 asset_scope='twd_equity')
+    assert new[0,3] == 55010. and new[0,6] == 1.
+    assert new[0,11:13].tolist() == [1357., 1086.]
+    if asset != 'stock_future':
+        with pytest.raises(ValueError,match='asset classes'):
+            reprice_margin_entries(execution(),facts,participation=.5,broker_multiplier=1.)
+    invalid = facts.with_columns(pl.lit('commodity_future').alias('asset_class'))
+    with pytest.raises(ValueError,match='asset classes'):
+        reprice_margin_entries(execution(),invalid,participation=.5,broker_multiplier=1.,asset_scope='twd_equity')
+
+
+def test_expanded_clock_has_distinct_manifest_and_rejects_scope_drift(tmp_path):
+    from stockagent.data.tw_futures_decision_clock import EQUITY_CLOCK_DATASET
+    daily, rules = tmp_path/'daily.parquet', tmp_path/'rules.parquet'
+    daily.write_bytes(b'daily'); rules.write_bytes(b'rules')
+    path = tmp_path/'entries.parquet'
+    pl.DataFrame(dict(date=[date(2026,1,2)],physical_contract=['TX:202601'],symbol=['slot1'],
+        entry_quote=[30001.],entry_volume=[3.],status=['observed_minute'])).write_parquet(path)
+    contract = decision_clock_contract('08:45',asset_scope='twd_equity')
+    manifest = dict(dataset=EQUITY_CLOCK_DATASET,clock=contract,status='complete',rows=1,
+        entries_sha256=sha256_file(path),source_daily_sha256=sha256_file(daily),
+        source_rules_sha256=sha256_file(rules),start_date='2026-01-02',end_date='2026-01-02')
+    path.with_name('manifest.json').write_text(json.dumps(manifest))
+    validate_clock_source(path,daily_path=daily,rules_path=rules,decision_time='08:45')
+    assert contract['version'] == 2 and decision_clock_contract('08:45')['version'] == 1
+    manifest['dataset'] = CLOCK_DATASET
+    path.with_name('manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError,match='incompatible'):
+        validate_clock_source(path,daily_path=daily,rules_path=rules,decision_time='08:45')
+
+
+def test_universe_study_keeps_account_model_and_stopping_identical(tmp_path):
+    from pathlib import Path
+    from scripts.run_ablation_experiments import _experiment_rows, _deep_merge
+    spec, rows = _experiment_rows(Path('configs/ablations/tw_futures_equity_universe_20261023_v2.yaml'))
+    raw = _load_raw_config(spec['base_config'])
+    configs = []
+    for row in rows:
+        case = _deep_merge(raw,row['overrides'])
+        path = tmp_path/(row['name']+'.yaml')
+        path.write_text(yaml.safe_dump(case))
+        configs.append(load_config(path))
+    assert [r['name'] for r in rows] == ['stock_only__0845','stock_only__0900','twd_equity__0845','twd_equity__0900']
+    assert all(c.training == configs[0].training and c.walk_forward == configs[0].walk_forward for c in configs)
+    assert {c.trading.tw_futures_portfolio_integer_initial_capital for c in configs} == {100_000_000.}
+    assert configs[0].training.epochs * configs[0].training.early_stopping_no_improve_ratio == 100
+    assert configs[0].training.pretrained_initialization_root is None
+    assert configs[0].training.loss_type == 'log_utility' and configs[0].training.lookback == 32
+    assert configs[2].trading.tw_futures_portfolio_data_path != configs[0].trading.tw_futures_portfolio_data_path
+    assert configs[2].trading.tw_futures_portfolio_decision_time == '08:45'
+    assert configs[3].trading.tw_futures_portfolio_decision_time == '09:00'
 
 
 def test_no_window_quote_is_not_a_fill_or_daily_open_fallback():

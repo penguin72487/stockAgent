@@ -205,3 +205,25 @@ def test_proof_metadata_integrity_failure_is_not_silently_treated_as_zero(tmp_pa
         conn.execute("UPDATE finmind_history_calendar SET metadata_json='{}'")
         with pytest.raises(ValueError, match='history_calendar_metadata_integrity'):
             supplemental.frontier_status(conn, NOW)
+
+
+def test_materialized_history_seeks_both_date_bounds_and_preserves_taiex_floor(tmp_path, monkeypatch):
+    sources(monkeypatch, ('TaiwanStockKBar',))
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        supplemental.seed(conn, {'stocks': ['2330', 'TAIEX']}, NOW)
+        conn.execute('DELETE FROM tasks')  # disposable fixture only
+        conn.execute('UPDATE finmind_source_frontiers SET older_than=?,newer_than=?',
+                     ('2026-09-28', LAST.isoformat()))
+        worker._add_tasks(conn, [('TaiwanStockKBar', identifier, day, 'id_day', 8)
+                                for identifier, day in [('TAIEX', '2005-01-03'), ('2330', '2005-01-03'),
+                                                        ('2330', '2026-09-24'), ('2330', '2026-10-01')]])
+        queries = []
+        conn.set_trace_callback(queries.append)
+        result = supplemental.frontier_status(conn, NOW)['TaiwanStockKBar']
+        conn.set_trace_callback(None)
+        assert result['already_materialized_candidates'] == 2
+        assert result['unseeded_history_candidates'] == 8 + (FIRST-date(2005, 1, 3)).days
+        history = next(query for query in queries if 'SELECT t.partition,COUNT(*)' in query
+                       and 'f.older_than' in query)
+        plan = [row[3] for row in conn.execute('EXPLAIN QUERY PLAN ' + history)]
+        assert any('dataset=? AND data_id=? AND partition>? AND partition<?' in row for row in plan)

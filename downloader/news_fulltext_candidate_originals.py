@@ -19,6 +19,7 @@ from downloader.news_fulltext_pocket import (
     pocket_numeric_transport_verified, pocket_article_transport_verified,
 )
 from downloader.news_fulltext_public_originals import _one
+from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
 
 MAX_ORIGINAL_BYTES = 2 << 20
 QUESTION = 'pocket_private_native_original_boundary_v1'
@@ -30,13 +31,16 @@ GLOBALVOICES_ORIGINAL_QUESTION = 'globalvoices_registered_missing_body_original_
 STOCKFEEL_ORIGINAL_QUESTION = 'stockfeel_private_native_identity_credit_original_v1'
 INEWS_ORIGINAL_QUESTION = 'inews_private_native_printed_credit_editor_original_v1'
 INEWS_HEADER_ORIGINAL_QUESTION = 'inews_private_native_named_header_editor_original_v1'
+INEWS_BODY_ORIGINAL_QUESTION = 'inews_private_native_short_or_empty_editor_original_v1'
+INEWS_SHORT_CREDIT_ORIGINAL_QUESTION = 'inews_private_short_editor_or_printed_credit_original_v1'
 ETTODAY_CREDIT_ORIGINAL_QUESTION = 'ettoday_private_native_leading_reporter_break_original_v1'
 ETTODAY_INLINE_ORIGINAL_QUESTION = 'ettoday_private_native_inline_leading_reporter_break_original_v1'
 ETTODAY_VISIBLE_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_person_clock_original_v1'
 ETTODAY_IMAGE_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_after_image_person_clock_original_v1'
 ETTODAY_NONEMPTY_ORIGINAL_QUESTION = 'ettoday_private_first_nonempty_reporter_person_clock_original_v1'
 ETTODAY_CANONICAL_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_canonical_author_original_v1'
-ORIGINAL_EVIDENCE_VERSIONS = frozenset({4, 5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33})
+GVM_ORIGINAL_QUESTION = 'gvm_private_public_native_header_verified_missing_original_v1'
+ORIGINAL_EVIDENCE_VERSIONS = frozenset({4, 5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS})
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,151 @@ class PendingOriginal:
     response: object
     facts: dict
     permit: dict
+
+
+def private_contentplatform_original_permit(response, source, requested_url):
+    return _private_contentplatform_permit(response, source, requested_url, evidence=43)
+
+
+def private_contentplatform_root_original_permit(response, source, requested_url):
+    return _private_contentplatform_permit(response, source, requested_url, evidence=44)
+
+
+def private_contentplatform_image_original_permit(response, source, requested_url):
+    return _private_contentplatform_permit(response, source, requested_url, evidence=45)
+
+
+def _private_contentplatform_permit(response, source, requested_url, *, evidence):
+    """One exact missing signed original through the resident owner's lane.
+
+    Reuse the existing native identity/access/credit/clock permit. This does
+    not broaden article acceptance, media/hidden scope or the automatic daily
+    diagnostic budget. The once-only question key survives parser changes.
+    """
+    from downloader.news_fulltext_contentplatform import (
+        CONTENTPLATFORM_EVIDENCE_QUESTIONS, contentplatform_article_id,
+        contentplatform_original_source, contentplatform_private_failure_permit, contentplatform_private_root_permit,
+        contentplatform_private_image_permit,
+    )
+    if (not contentplatform_original_source(source) or contentplatform_article_id(requested_url) is None
+            or response.status != 200 or response.redirects or response.url != requested_url
+            or not isinstance(response.body, bytes) or not 0 < len(response.body) <= MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+                not in {'text/html', 'application/xhtml+xml'}):
+        raise NewsError('private_contentplatform_original_scope_not_verified')
+    verify = {43: contentplatform_private_failure_permit, 44: contentplatform_private_root_permit,
+        45: contentplatform_private_image_permit}[evidence]
+    native = verify(response, source)
+    return {'contract_version': 1, 'question': CONTENTPLATFORM_EVIDENCE_QUESTIONS[evidence],
+        'provider': source.provider, 'url': requested_url,
+        'response_sha256': hashlib.sha256(response.body).hexdigest(),
+        'data_fingerprint': source.data_fingerprint,
+        'authorization_fingerprint': source.authorization_fingerprint,
+        'scope': 'known_signed_native_identity_access_clock_verified_private_original_only',
+        'native_permit': native, 'body_completeness_verified': False}
+
+
+def private_gvm_original_permit(response, source, requested_url, *, include_context=False):
+    """Keep one replayable public original, without accepting its body.
+
+    Reuse the actual current parser's successful header/access/credit/clock
+    gates. An editor failure is evidence to retain privately, not a reason to
+    invent missing prose or relax article acceptance. The writer independently
+    repeats this check on the immutable bytes before committing a sidecar.
+    """
+    from downloader.news_fulltext_gvm import (
+        GVM_PATH_PATTERN, gvm_failure_context, gvm_original_source, gvm_public_native_article,
+    )
+    from downloader.news_fulltext_candidates import extraction_failure_location
+    error = 'private_gvm_original_scope_not_verified'
+    parts = urlsplit(requested_url or '')
+    if (not gvm_original_source(source) or parts.scheme != 'https' or parts.netloc != 'www.gvm.com.tw'
+            or parts.query or parts.fragment or not re.fullmatch(GVM_PATH_PATTERN, parts.path)
+            or response.status != 200 or response.redirects or response.url != requested_url
+            or not isinstance(response.body, bytes) or not 0 < len(response.body) <= MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+                not in {'text/html', 'application/xhtml+xml'}):
+        raise NewsError(error)
+    document = public_article_document(response.body, source, page_url=requested_url)
+    try:
+        gvm_public_native_article(document, page_url=requested_url, version=8)
+    except NewsError as failure:
+        context = {'gvm_received_failure_context':gvm_failure_context(failure),
+            'failure_location':extraction_failure_location(failure), 'current_native_error':failure.code}
+        if (failure.code not in {'article_identity_not_verified', 'body_not_found'}
+                or not context['gvm_received_failure_context']['prior_header_identity_access_credit_clocks_passed']):
+            refused = NewsError(error)
+            refused.private_scope_facts = context
+            raise refused from None
+    else:
+        context = {'gvm_received_failure_context':None, 'failure_location':None, 'current_native_error':None}
+    permit = {'contract_version':1, 'question':GVM_ORIGINAL_QUESTION, 'provider':'gvm',
+        'url':requested_url, 'response_sha256':hashlib.sha256(response.body).hexdigest(),
+        'data_fingerprint':source.data_fingerprint, 'authorization_fingerprint':source.authorization_fingerprint,
+        'scope':'known_public_native_header_access_credit_clock_verified_private_original_only',
+        'native_parser_version':8, 'native_header_access_credit_clocks_verified':True,
+        'current_native_error':context['current_native_error'], 'body_completeness_verified':False}
+    return (permit, context) if include_context else permit
+
+
+def private_gvm_header_original_permit(response, source, requested_url, *, include_context=False):
+    """A distinct remaining-header question, not a replay of evidence40.
+
+    Profile/schema/clock agreement can preserve diagnostic bytes without
+    accepting a conflicting title or issue. Missing/unverified attribution,
+    access, literal identity or clocks still produces only finite facts.
+    """
+    from downloader.news_fulltext_gvm import GVM_HEADER_QUESTION, GVM_PATH_PATTERN, gvm_header_relations, gvm_static_editor_source
+    error = 'private_gvm_header_original_scope_not_verified'
+    parts = urlsplit(requested_url or '')
+    if (not gvm_static_editor_source(source) or parts.scheme!='https' or parts.netloc!='www.gvm.com.tw'
+            or parts.query or parts.fragment or not re.fullmatch(GVM_PATH_PATTERN,parts.path)
+            or response.status!=200 or response.redirects or response.url!=requested_url
+            or not isinstance(response.body,bytes) or not 0<len(response.body)<=MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type','').split(';',1)[0].strip().lower() not in {'text/html','application/xhtml+xml'}):
+        raise NewsError(error)
+    soup = public_article_document(response.body,source,page_url=requested_url)
+    relations = gvm_header_relations(soup,page_url=requested_url)
+    context = {'gvm_header_relations':relations,'current_native_error':relations['current_native_error'],
+        'gvm_received_failure_context':relations.get('gvm_received_failure_context'),
+        'failure_location':relations.get('failure_location')}
+    if not relations['private_header_profile_schema_clocks_verified']:
+        failure = NewsError(error); failure.private_scope_facts = context
+        raise failure
+    permit = {'contract_version':1,'question':GVM_HEADER_QUESTION,'provider':'gvm','url':requested_url,
+        'response_sha256':hashlib.sha256(response.body).hexdigest(),'data_fingerprint':source.data_fingerprint,
+        'authorization_fingerprint':source.authorization_fingerprint,'native_parser_version':9,
+        'scope':'private_native_header_relations_original; title_issue_conflict_not_accepted_as_article',
+        'native_header_profile_schema_clocks_verified':True,'body_completeness_verified':False,
+        'article_identity_or_title_or_issue_conflict_accepted':False}
+    return (permit,context) if include_context else permit
+
+
+def private_gvm_multiple_credit_original_permit(response, source, requested_url, *, include_context=False):
+    """Retain two verified visible/schema profiles without accepting a body."""
+    from downloader.news_fulltext_gvm import GVM_MULTIPLE_CREDIT_QUESTION, GVM_PATH_PATTERN, gvm_multiple_credit_relations, gvm_presentation_source
+    error='private_gvm_multiple_credit_original_scope_not_verified'
+    parts=urlsplit(requested_url or '')
+    if (not gvm_presentation_source(source) or parts.scheme!='https' or parts.netloc!='www.gvm.com.tw'
+            or parts.query or parts.fragment or not re.fullmatch(GVM_PATH_PATTERN,parts.path)
+            or response.status!=200 or response.redirects or response.url!=requested_url
+            or not isinstance(response.body,bytes) or not 0<len(response.body)<=MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type','').split(';',1)[0].strip().lower() not in {'text/html','application/xhtml+xml'}):
+        raise NewsError(error)
+    soup=public_article_document(response.body,source,page_url=requested_url)
+    relations=gvm_multiple_credit_relations(soup,page_url=requested_url)
+    base=relations['single_credit_parser_context']
+    context={'gvm_multiple_credit_relations':relations,'current_native_error':base.get('current_native_error'),
+        'failure_location':base.get('failure_location'),'gvm_received_failure_context':base.get('gvm_received_failure_context')}
+    if not relations['ordered_visible_profile_schema_clocks_verified']:
+        failure=NewsError(error);failure.private_scope_facts=context;raise failure
+    permit={'contract_version':1,'question':GVM_MULTIPLE_CREDIT_QUESTION,'provider':'gvm','url':requested_url,
+        'response_sha256':hashlib.sha256(response.body).hexdigest(),'data_fingerprint':source.data_fingerprint,
+        'authorization_fingerprint':source.authorization_fingerprint,'native_parser_version':10,
+        'scope':'private_ordered_two_visible_schema_profiles_original; native_aggregate_attributes_and_body_not_accepted',
+        'ordered_visible_profile_schema_clocks_verified':True,'body_completeness_verified':False,
+        'native_aggregate_author_attributes_accepted':False,'accepted_as_article':False}
+    return (permit,context) if include_context else permit
 
 
 def _ettoday_visible_credit(first, *, allow_replaced_images=False, first_nonempty_line=False):
@@ -279,7 +428,77 @@ def private_inews_header_original_permit(response, source, requested_url, *, inc
         header_credit=True, include_document=include_document)
 
 
-def _private_inews_original_permit(response, source, requested_url, *, header_credit, include_document):
+def private_inews_body_original_permit(response, source, requested_url, *, include_document=False):
+    """Distinguish a native short story from an empty editor, without admission.
+
+    The existing header-original gate independently proves public publisher,
+    literal identity, named credit and valid native clock. The v8 editor must
+    fail ONLY its length check; an unknown subtree cannot buy raw retention.
+    The queue writer repeats both checks on the immutable received bytes.
+    """
+    from downloader.news_fulltext_setn import INEWS_SCOPE_SELECTOR, _inews_whole_editor
+    error = 'private_inews_short_body_scope_not_verified'
+    if source.embedded_article_layout != 'setn_inews_native_article_v8':
+        raise NewsError(error)
+    permit, document = private_inews_header_original_permit(
+        response, source, requested_url, include_document=True)
+    scope = _one(document, INEWS_SCOPE_SELECTOR, error)
+    try:
+        _inews_whole_editor(scope, adapter_contract_version=8)
+    except NewsError as failure:
+        if failure.code != 'body_not_found':
+            raise NewsError(error) from None
+    else:
+        raise NewsError(error)
+    permit = {**permit, 'question': INEWS_BODY_ORIGINAL_QUESTION,
+        'scope': 'known_public_native_named_header_short_or_empty_editor_private_evidence_only',
+        'current_v8_editor_error': 'body_not_found',
+        'native_editor_geometry_verified': True, 'body_completeness_verified': False}
+    return (permit, document) if include_document else permit
+
+
+def private_inews_short_credit_original_permit(response, source, requested_url, *, include_document=False):
+    """The observed short editor/printed-credit shapes, with their actual roles.
+
+    Requires the distinct completed v38 shape question at submission. Private
+    retention still proves the received native identity, clock and explicit
+    credit; the earlier reporter-only refusal is neither reset nor replayed.
+    """
+    from downloader.news_fulltext_setn import INEWS_EDITOR_SELECTOR, INEWS_SCOPE_SELECTOR, _inews_whole_editor
+    error = 'private_inews_short_credit_scope_not_verified'
+    if (source.embedded_article_layout != 'setn_inews_native_article_v8'
+            or response.status != 200 or response.redirects or response.url != requested_url
+            or not isinstance(response.body, bytes) or not 0 < len(response.body) <= MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type','').split(';',1)[0].strip().lower()
+                not in {'text/html','application/xhtml+xml'}):
+        raise NewsError(error)
+    document = public_article_document(response.body, source, page_url=response.url)
+    scope = _one(document, INEWS_SCOPE_SELECTOR, error)
+    byline = _one(scope, INEWS_EDITOR_SELECTOR + ' > .article_remark_wrap > .author_wrap', error)
+    header_credit = bool(byline.get_text(' ', strip=True) or byline.find_all())
+    permit, document = _private_inews_original_permit(response, source, requested_url,
+        header_credit=header_credit, header_role='編輯', include_document=True, document=document)
+    scope = _one(document, INEWS_SCOPE_SELECTOR, error)
+    try:
+        _inews_whole_editor(scope, adapter_contract_version=8)
+    except NewsError as failure:
+        if failure.code != 'body_not_found':
+            raise NewsError(error) from None
+    else:
+        raise NewsError(error)
+    body = _one(scope, INEWS_EDITOR_SELECTOR + ' > div[itemprop=articleBody]', error)
+    if not any(p.get_text(' ', strip=True) for p in body.find_all('p', recursive=False)):
+        raise NewsError(error)
+    permit = {**permit, 'question': INEWS_SHORT_CREDIT_ORIGINAL_QUESTION,
+        'scope': 'known_public_native_short_editor_or_printed_credit_private_evidence_only',
+        'source_credit_location': 'native_header_editor' if header_credit else 'native_first_printed_signature',
+        'current_v8_editor_error': 'body_not_found', 'native_editor_geometry_verified': True,
+        'body_completeness_verified': False}
+    return (permit, document) if include_document else permit
+
+
+def _private_inews_original_permit(response, source, requested_url, *, header_credit, include_document,
+        header_role='記者', document=None):
     """One known public native printed-credit witness, never body admission.
 
     A completed shape-only question must separately precede submission. Here
@@ -299,7 +518,8 @@ def _private_inews_original_permit(response, source, requested_url, *, header_cr
             or response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
                 not in {'text/html', 'application/xhtml+xml'}):
         raise NewsError(error)
-    document = public_article_document(response.body, source, page_url=response.url)
+    if document is None:
+        document = public_article_document(response.body, source, page_url=response.url)
     scope, _, _, _ = _inews_native_identity(document, page_url=requested_url)
     editor = _one(scope, INEWS_EDITOR_SELECTOR, error)
     body = _one(editor, ':scope > div[itemprop=articleBody]', error)
@@ -327,7 +547,8 @@ def _private_inews_original_permit(response, source, requested_url, *, header_cr
                 or not re.fullmatch(r'[\u3400-\u9fff·]{2,20}', name)
                 or name in {'綜合', '整理', '編輯', '記者'}
                 or not re.fullmatch(r'https://www\.setn\.com/author/[a-z0-9-]+', link.get('href', ''))
-                or not re.fullmatch('記者 '+re.escape(name)+r' (?:[\u3400-\u9fff]{1,20})?報導', signature)):
+                or header_role not in {'記者', '編輯'}
+                or not re.fullmatch(re.escape(header_role)+' '+re.escape(name)+r' (?:[\u3400-\u9fff]{1,20})?報導', signature)):
             raise NewsError(error)
     else:
         first = next((n for n in body.find_all('p', recursive=False, limit=17)
@@ -784,6 +1005,35 @@ def retain_original(queue, job, observation):
     elif version == 26:
         expected = private_inews_header_original_permit(response, source, job['url'])
         question = INEWS_HEADER_ORIGINAL_QUESTION
+    elif version == 38:
+        expected = private_inews_body_original_permit(response, source, job['url'])
+        question = INEWS_BODY_ORIGINAL_QUESTION
+    elif version == 39:
+        expected = private_inews_short_credit_original_permit(response, source, job['url'])
+        question = INEWS_SHORT_CREDIT_ORIGINAL_QUESTION
+    elif version == 43:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_QUESTION
+        expected = private_contentplatform_original_permit(response, source, job['url'])
+        question = CONTENTPLATFORM_ORIGINAL_QUESTION
+    elif version == 44:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ROOT_QUESTION
+        expected = private_contentplatform_root_original_permit(response, source, job['url'])
+        question = CONTENTPLATFORM_ROOT_QUESTION
+    elif version == 45:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_IMAGE_QUESTION
+        expected = private_contentplatform_image_original_permit(response, source, job['url'])
+        question = CONTENTPLATFORM_IMAGE_QUESTION
+    elif version == 40:
+        expected = private_gvm_original_permit(response, source, job['url'])
+        question = GVM_ORIGINAL_QUESTION
+    elif version == 41:
+        from downloader.news_fulltext_gvm import GVM_HEADER_QUESTION
+        expected = private_gvm_header_original_permit(response,source,job['url'])
+        question = GVM_HEADER_QUESTION
+    elif version == 42:
+        from downloader.news_fulltext_gvm import GVM_MULTIPLE_CREDIT_QUESTION
+        expected = private_gvm_multiple_credit_original_permit(response,source,job['url'])
+        question = GVM_MULTIPLE_CREDIT_QUESTION
     elif version == 28:
         expected = private_ettoday_credit_original_permit(response, source, job['url'])
         question = ETTODAY_CREDIT_ORIGINAL_QUESTION
@@ -809,7 +1059,7 @@ def retain_original(queue, job, observation):
             'scope':'reviewed_current_public_native_own_organization_private_original_only'}
         question = QUESTION
     bound = source.pdf_max_response_bytes if version == 12 else MAX_ORIGINAL_BYTES
-    expected_provider = ('ettoday' if version in {28, 29, 30, 31, 32, 33} else 'setn_inews_scope' if version in {25, 26} else 'taiwannews' if version in {16, 17, 18} else 'stockfeel' if version == 15 else 'globalvoices' if version == 13 else 'fed_board' if version == 12
+    expected_provider = ('contentplatform' if version in CONTENTPLATFORM_EVIDENCE_VERSIONS else 'gvm' if version in {40, 41, 42} else 'ettoday' if version in {28, 29, 30, 31, 32, 33} else 'setn_inews_scope' if version in {25, 26, 38, 39} else 'taiwannews' if version in {16, 17, 18} else 'stockfeel' if version == 15 else 'globalvoices' if version == 13 else 'fed_board' if version == 12
         else 'bastillepost' if version in {9, 11} else 'pocket')
     if (version not in ORIGINAL_EVIDENCE_VERSIONS
             or source.provider != expected_provider

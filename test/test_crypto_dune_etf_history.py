@@ -5,6 +5,7 @@ from io import BytesIO
 from http.client import RemoteDisconnected
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import polars as pl
@@ -480,3 +481,69 @@ def test_ishares_holdings_and_bitwise_page_adapters_are_source_timestamped() -> 
     }
     assert bitwise.reserves[0]["ripcord"] is False
     assert "not independently" in bitwise.reserves[0]["definition"]
+
+
+@pytest.mark.parametrize("date_kind", ["text", "timestamp"])
+def test_ishares_xls_preserves_row_order_nulls_and_source_clock(monkeypatch, date_kind) -> None:
+    dates = ["2026-01-03", "invalid", "2026-01-01"]
+    if date_kind == "timestamp":
+        dates = [etf.pd.Timestamp(dates[0]), etf.pd.NaT, etf.pd.Timestamp(dates[2])]
+    table = etf.pd.DataFrame([
+        ["header", "date", "units", "sold", "proceeds"],
+        [None] * 5,
+        [1, dates[0], "1.25", None, "3,000"],
+        [2, dates[1], "999", "999", "999"],
+        [3, dates[2], None, "4.5", "-"],
+    ])
+    monkeypatch.setattr(etf.pd, "ExcelFile", lambda *args, **kwargs: SimpleNamespace(sheet_names=["Gross Proceeds 2026"]))
+    monkeypatch.setattr(etf.pd, "read_excel", lambda *args, **kwargs: table)
+    spec = {"id": "tax_fixture", "provider": "iShares", "ticker": "IBIT", "asset": "BTC"}
+    observed, digest = "2026-02-01T01:02:03+00:00", "d" * 64
+    parsed = etf._parse_ishares_xls(spec, b"fixture", observed, digest)
+    rows = parsed.daily_metrics
+    assert [(row["event_date"], row["metric"], row["value"], row["unit"]) for row in rows] == [
+        ("2026-01-03", "asset_units_per_share", 1.25, "BTC/share"),
+        ("2026-01-03", "asset_units_sold_for_expenses_per_share", None, "BTC/share"),
+        ("2026-01-03", "expense_sale_proceeds_per_share", 3000.0, "USD/share"),
+        ("2026-01-01", "asset_units_per_share", None, "BTC/share"),
+        ("2026-01-01", "asset_units_sold_for_expenses_per_share", 4.5, "BTC/share"),
+        ("2026-01-01", "expense_sale_proceeds_per_share", None, "USD/share"),
+    ]
+    for row in rows:
+        assert {key: row[key] for key in ["source_id", "provider", "ticker", "asset"]} == {
+            "source_id": "tax_fixture", "provider": "iShares", "ticker": "IBIT", "asset": "BTC",
+        }
+        assert row["observed_at_utc"] == row["available_at_utc"] == observed
+        assert row["raw_sha256"] == digest
+        assert row["point_in_time_state"] == "historical_first_observed_at_retrieval"
+    assert parsed.result.rows == 6 and parsed.result.status == "complete"
+    assert parsed.holdings == parsed.reserves == []
+
+
+def test_ishares_xls_numeric_cells_keep_common_array_coercion(monkeypatch) -> None:
+    table = etf.pd.DataFrame([
+        [0, 0, 0, 0.0, 0.0], [0, 0, 0, 0.0, 0.0],
+        [1, -1, 2**53 + 1, 0.0, -0.0],
+        [2, 86_400_000_000_000, 7, 8.0, 9.0],
+    ])
+    monkeypatch.setattr(etf.pd, "ExcelFile", lambda *args, **kwargs: SimpleNamespace(sheet_names=["Gross Proceeds"]))
+    monkeypatch.setattr(etf.pd, "read_excel", lambda *args, **kwargs: table)
+    parsed = etf._parse_ishares_xls(
+        {"id": "numeric_fixture", "provider": "iShares", "ticker": "IBIT", "asset": "BTC"},
+        b"fixture", "2026-02-01T00:00:00+00:00", "e" * 64,
+    )
+    assert [row["event_date"] for row in parsed.daily_metrics] == ["1969-12-31"] * 3 + ["1970-01-02"] * 3
+    assert [row["value"] for row in parsed.daily_metrics] == [float(2**53), 0.0, -0.0, 7.0, 8.0, 9.0]
+    assert str(parsed.daily_metrics[2]["value"]) == "-0.0"
+
+
+@pytest.mark.parametrize("missing_sheet", [True, False])
+def test_ishares_xls_rejects_missing_sheet_or_short_schema(monkeypatch, missing_sheet) -> None:
+    names = ["unrelated"] if missing_sheet else ["Gross Proceeds"]
+    monkeypatch.setattr(etf.pd, "ExcelFile", lambda *args, **kwargs: SimpleNamespace(sheet_names=names))
+    monkeypatch.setattr(etf.pd, "read_excel", lambda *args, **kwargs: etf.pd.DataFrame([[1, 2, 3, 4]]))
+    with pytest.raises(RuntimeError, match="Gross Proceeds sheet is missing" if missing_sheet else "unexpected Gross Proceeds schema"):
+        etf._parse_ishares_xls(
+            {"id": "invalid_fixture", "provider": "iShares", "ticker": "IBIT", "asset": "BTC"},
+            b"fixture", "2026-02-01T00:00:00+00:00", "f" * 64,
+        )

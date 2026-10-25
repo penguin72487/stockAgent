@@ -81,6 +81,11 @@ def core_jobs() -> list[EconomicJob]:
     return jobs
 
 
+def current_moi_job() -> EconomicJob:
+    return EconomicJob("moi", "current", "https://plvr.land.moi.gov.tw/Download",
+                       {"type": "zip", "fileName": "lvr_landcsv.zip"}, kind="published_snapshot")
+
+
 def request_url(job: EconomicJob, key: str, *, since: str | None = None) -> str:
     params = dict(job.params)
     if job.provider == "census":

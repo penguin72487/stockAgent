@@ -57,7 +57,7 @@ TW_CURRENT_RULE_ORDINAL = int(np.iinfo(np.int64).max)
 # A bounded historical registry for the selected all-futures intraday archive.
 # This is deliberately not a latest-specification fallback for arbitrary dates.
 # Sources, product identity and limits: docs/tw_futures_price_grid_evidence_2026-09-27.md.
-TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 3
+TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 4
 TAIFEX_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2020-03-23", "D")
 TAIFEX_STOCK_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2011-01-03", "D")
 TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH = np.datetime64("2026-09-27", "D")
@@ -98,6 +98,14 @@ _TAIFEX_FOREIGN_ETF_PRODUCTS = frozenset({
     "SGF", "SIF", "SQF", "UJF", "UKF", "URF", "USF",
 })
 _TAIFEX_ETF_PRODUCTS = _TAIFEX_DOMESTIC_ETF_PRODUCTS | _TAIFEX_FOREIGN_ETF_PRODUCTS
+# TAIFEX 0050 adjustment notice, effective 2025-06-18, deliveries through
+# 202603: https://www.taifex.com.tw/file/taifex/eng/eng11/0050en_20250618.pdf
+# Only the price/session family is inherited. Dated listing, 40,000/4,000
+# beneficial units, taxes, cash and shared position limits remain source-owned.
+_TAIFEX_ADJUSTED_ETF_PRICE_FAMILIES = {
+    "NY1": ("NYF", "2025-06-18", "2026-04-01"),
+    "SR1": ("SRF", "2025-06-18", "2026-04-01"),
+}
 
 
 def trade_date_ordinals(values: Any | None, shape: tuple[int, ...]) -> np.ndarray:
@@ -271,6 +279,12 @@ def _taifex_futures_history_metadata(
     products = np.char.upper(np.char.strip(
         np.broadcast_to(np.asarray(product_codes).astype(str), shape)
     ))
+    for adjusted, (base, start, end) in _TAIFEX_ADJUSTED_ETF_PRICE_FAMILIES.items():
+        selected = products == adjusted
+        if np.any(selected & ((ordinals < int(np.datetime64(start, 'D').astype(np.int64)))
+                | (ordinals >= int(np.datetime64(end, 'D').astype(np.int64))))):
+            raise ValueError(f"{adjusted} date outside verified adjusted ETF window {start}..{end} exclusive")
+        products = np.where(selected, base, products)
     kinds = np.broadcast_to(np.asarray(asset_classes).astype(str), shape)
     if not np.all(np.isin(kinds, ["stock_future", "etf_future", "index_future"])):
         raise ValueError("unsupported TAIFEX futures asset class")

@@ -29,6 +29,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import numpy as np
 import torch
 from stockagent.training.log_growth_risk import log_growth_risk_kwargs, risk_adjusted_log_growth
+from stockagent.training.finite_checks import (
+    TrajectoryFiniteGuard, tensors_finite_flag, trajectory_device_finite_guard_enabled,
+)
 import torch.distributed as dist
 import torch.distributed.nn.functional as dist_nn_f
 try:
@@ -8954,22 +8957,12 @@ def _model_parameters_are_finite(model: nn.Module) -> bool:
 
 
 def _model_gradients_are_finite(model: nn.Module) -> bool:
-    gradients = [
+    flag = tensors_finite_flag(
         param.grad.detach()
         for param in _unwrap_model(model).parameters()
         if param.grad is not None
-    ]
-    if not gradients:
-        return True
-    try:
-        norms = torch._foreach_norm(gradients, float("inf"))
-        return bool(torch.isfinite(torch.stack(norms)).all().item())
-    except (RuntimeError, TypeError):
-        finite_flag: torch.Tensor | None = None
-        for gradient in gradients:
-            current = torch.isfinite(gradient).all()
-            finite_flag = current if finite_flag is None else torch.logical_and(finite_flag, current)
-        return bool(finite_flag.item()) if finite_flag is not None else True
+    )
+    return True if flag is None else bool(flag.item())
 
 
 def _stabilize_model_parameters_after_step(model: nn.Module) -> None:
@@ -9018,6 +9011,22 @@ def _checkpoint_parameters_are_saveable(
 
 def _tensor_is_finite(value: torch.Tensor) -> bool:
     return bool(torch.isfinite(value.detach()).all().item())
+
+
+def _flush_trajectory_progress(
+    label: str,
+    num_batches: int,
+    rows: list[tuple[int, torch.Tensor, float]],
+) -> None:
+    """Read all batch losses once at the opted-in trajectory boundary."""
+    if not rows:
+        return
+    losses = torch.stack([row[1].reshape(()) for row in rows]).cpu().tolist()
+    for (batch, _, enqueue_elapsed), loss in zip(rows, losses, strict=True):
+        _progress(
+            f"{label}: batch {batch}/{num_batches} done loss={float(loss):.8f} "
+            f"enqueue_elapsed={enqueue_elapsed:.1f}s deferred_trajectory_progress=true"
+        )
 
 
 def _load_state_dict(model: nn.Module, state_dict: dict) -> None:
@@ -10566,15 +10575,16 @@ def _save_backtest_artifact(
     add_optional("requested_weights_history", result.requested_weights_history)
     if persist_futures_account_policy and result.futures_account_policy_packet is not None:
         from stockagent.models.futures_account_policy import (
-            FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+            futures_account_policy_version,
         )
         packet = np.asarray(result.futures_account_policy_packet)
         if (mode != "tw_stock_context_futures_portfolio"
-                or packet.shape != (rows, symbol_count, FUTURES_ACCOUNT_PACKET_WIDTH)
+                or packet.ndim != 3 or packet.shape[:2] != (rows, symbol_count)
                 or not np.isfinite(packet).all()):
             raise ValueError("invalid futures account policy packet artifact")
         payload["futures_account_policy_packet"] = packet
-        payload["futures_account_policy_version"] = np.asarray(FUTURES_ACCOUNT_POLICY_VERSION, dtype=np.int64)
+        payload["futures_account_policy_version"] = np.asarray(
+            futures_account_policy_version(packet.shape[-1]), dtype=np.int64)
     add_optional("futures_contract_quantities_history", result.futures_contract_quantities_history)
     add_optional("futures_residual_contract_quantities_history", result.futures_residual_contract_quantities_history)
     add_optional("final_futures_carry_state", result.final_futures_carry_state)
@@ -12920,13 +12930,13 @@ def _load_backtest_artifact(
         dates = copied("dates")
         if result.futures_account_policy_packet is not None:
             from stockagent.models.futures_account_policy import (
-                FUTURES_ACCOUNT_POLICY_VERSION, FUTURES_ACCOUNT_PACKET_WIDTH,
+                futures_account_policy_version,
             )
             packet = result.futures_account_policy_packet
             if ("futures_account_policy_version" not in keys
-                    or int(np.asarray(data["futures_account_policy_version"]).item()) != FUTURES_ACCOUNT_POLICY_VERSION
                     or execution_mode != "tw_stock_context_futures_portfolio"
-                    or packet.shape != (len(dates), result.weights_history.shape[1], FUTURES_ACCOUNT_PACKET_WIDTH)
+                    or packet.ndim != 3 or packet.shape[:2] != (len(dates), result.weights_history.shape[1])
+                    or int(np.asarray(data["futures_account_policy_version"]).item()) != futures_account_policy_version(packet.shape[-1])
                     or not np.isfinite(packet).all()):
                 raise ValueError("invalid futures account policy packet artifact")
 
@@ -19235,10 +19245,13 @@ def _replay_taiwan_stitched_deployment(
                     f"{expected_width}"
                 )
             if causal_account_policy:
-                from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_PACKET_WIDTH
+                from stockagent.models.futures_account_policy import futures_account_policy_width
+                policy_width = futures_account_policy_width(
+                    config.training.financial_transformer.futures_net_notional_cap,
+                    config.training.financial_transformer.futures_beta_notional_cap)
                 packet = fold_backtest.futures_account_policy_packet
                 if (packet is None
-                        or np.asarray(packet).shape != (rows, expected_width, FUTURES_ACCOUNT_PACKET_WIDTH)):
+                        or np.asarray(packet).shape != (rows, expected_width, policy_width)):
                     raise RuntimeError(
                         "closed-loop futures deployment requires its owned policy packet; "
                         "reset-account requests cannot substitute for carried-state decisions"
@@ -21758,6 +21771,12 @@ def _train_epoch_windowed_tensor(
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
+    finite_guard = (
+        TrajectoryFiniteGuard(device)
+        if optimizer_step_per_trajectory and not scaler.is_enabled()
+        and trajectory_device_finite_guard_enabled() else None
+    )
+    deferred_progress: list[tuple[int, torch.Tensor, float]] = []
     if progress_label:
         _progress(
             f"{progress_label}: train epoch start mode=windowed rows={total_rows} "
@@ -22166,7 +22185,9 @@ def _train_epoch_windowed_tensor(
         # every accumulated parameter gradient cannot change control flow.  The
         # trajectory finalizer still performs the authoritative gradient scan,
         # clip and parameter scan immediately before/after the only update.
-        should_check_finite = (
+        if finite_guard is not None:
+            finite_guard.observe_loss(loss, step_idx)
+        should_check_finite = finite_guard is None and (
             False
             if physical_source is not None and optimizer_step_per_trajectory
             else physical_source is not None
@@ -22433,6 +22454,8 @@ def _train_epoch_windowed_tensor(
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
+        if finite_guard is not None:
+            finite_guard.observe_gradients(_unwrap_model(model), step_idx)
 
         total_loss_t.add_(
             loss_for_backward.detach().to(dtype=torch.float32)
@@ -22441,12 +22464,18 @@ def _train_epoch_windowed_tensor(
         )
         steps += 1
         if progress_label:
-            _progress(
-                f"{progress_label}: batch {step_idx}/{num_batches} done "
-                f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
-            )
+            if finite_guard is not None:
+                deferred_progress.append((step_idx, loss.detach().clone(), time.perf_counter() - batch_start))
+            else:
+                _progress(
+                    f"{progress_label}: batch {step_idx}/{num_batches} done "
+                    f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
+                )
 
     if optimizer_step_per_trajectory and steps > 0:
+        if finite_guard is not None:
+            finite_guard.require_finite(optimizer)
+            _flush_trajectory_progress(progress_label, num_batches, deferred_progress)
         _finalize_trajectory_optimizer_step(
             model=model,
             optimizer=optimizer,
@@ -22833,6 +22862,12 @@ def _train_epoch_windowed_tensor_ddp(
     steps = 0
     timing = TimingBreakdown()
     total_start = time.perf_counter()
+    finite_guard = (
+        TrajectoryFiniteGuard(device)
+        if optimizer_step_per_trajectory and not scaler.is_enabled() and not capture_only
+        and trajectory_device_finite_guard_enabled() else None
+    )
+    deferred_progress: list[tuple[int, torch.Tensor, float]] = []
     if progress_label and _distributed_is_rank0():
         _progress(
             f"{progress_label}: train epoch start mode=windowed_ddp rows={total_rows} "
@@ -23244,7 +23279,9 @@ def _train_epoch_windowed_tensor_ddp(
             timing.loss_s += time.perf_counter() - loss_start
             _record_debug_cuda_sync(timing, "after_loss_sync_s", device, debug_timing_sync)
 
-        should_check_finite = (
+        if finite_guard is not None:
+            finite_guard.observe_loss(loss, step_idx)
+        should_check_finite = finite_guard is None and (
             False
             if physical_source is not None and optimizer_step_per_trajectory
             else physical_source is not None
@@ -23515,6 +23552,8 @@ def _train_epoch_windowed_tensor_ddp(
 
         _maybe_sync_cuda(device, profile_timing)
         timing.backward_s += time.perf_counter() - backward_start
+        if finite_guard is not None:
+            finite_guard.observe_gradients(_unwrap_model(model), step_idx)
         if compound_adjoint is not None and global_end in compound_account_ends:
             compound_start = time.perf_counter()
             account_start, account_rows = compound_account_ends[global_end]
@@ -23529,10 +23568,13 @@ def _train_epoch_windowed_tensor_ddp(
         )
         steps += 1
         if progress_label and _distributed_is_rank0():
-            _progress(
-                f"{progress_label}: batch {step_idx}/{num_batches} done "
-                f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
-            )
+            if finite_guard is not None:
+                deferred_progress.append((step_idx, loss.detach().clone(), time.perf_counter() - batch_start))
+            else:
+                _progress(
+                    f"{progress_label}: batch {step_idx}/{num_batches} done "
+                    f"loss={float(loss.detach().cpu()):.8f} elapsed={time.perf_counter() - batch_start:.1f}s"
+                )
 
     from stockagent.backtest.tw_day_trade_graph import finish_ledger_validation
     timing.deferred_validation_checks = finish_ledger_validation()
@@ -23543,6 +23585,9 @@ def _train_epoch_windowed_tensor_ddp(
         # All ranks check the complete replay before any optimizer can step.
         return_tape.finish()
     if optimizer_step_per_trajectory and steps > 0 and not capture_only:
+        if finite_guard is not None:
+            finite_guard.require_finite(optimizer, distributed=True)
+            _flush_trajectory_progress(progress_label, num_batches, deferred_progress)
         if ddp_trajectory_gradient_sync == "trajectory":
             sync_start = time.perf_counter()
             _synchronize_trajectory_gradients(model, allow_partial_presence=episode_spans is not None)

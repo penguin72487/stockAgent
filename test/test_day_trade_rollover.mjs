@@ -18,10 +18,12 @@ function harness({overnight = false, latestOnly = true} = {}) {
     window: {setTimeout: (fn, ms) => { timers.set(++timerId, {fn, ms}); return timerId; }, clearTimeout: (id) => timers.delete(id)},
     setHtml: () => {}, esc: String, strategyLabel: (row) => row.label,
     renderPriceSources: () => {},
+    Dashboard: {},
     Date, Map, Set, AbortController, console,
   });
   function $(id) { return byId(id); }
   vm.runInContext(app.slice(app.indexOf("let snapshot = null;"), app.indexOf("try {\n  const storedHiddenSeries")), context);
+  vm.runInContext(app.slice(app.indexOf("function measureRevisionPaint("), app.indexOf("function renderPositions()")), context);
   vm.runInContext(app.match(/^const DEFAULT_PERFORMANCE_START_DATE = .*;$/m)[0], context);
   if (latestOnly) vm.runInContext("followLatestSession = true; followPerformanceRange = false", context);
   if (latestOnly === false) vm.runInContext("followLatestSession = false; followPerformanceRange = true", context);
@@ -187,6 +189,19 @@ test("a never-finishing history cannot delay core details and events stay deferr
     "signals", "positions", "history",
     "signals", "positions", "events", "history",
   ]);
+});
+
+test("a light status apply rearms visible revision paint without rebuilding unchanged cards", () => {
+  const {context, run} = harness();
+  const calls = [];
+  for (const name of ["renderHeader", "renderOverview", "renderOperations", "renderModes"]) {
+    context[name] = () => calls.push(name);
+  }
+  context.measureRevisionPaint = (action, rows, root) => calls.push([action, rows.length, root]);
+  run("snapshot = {modes: [{market:'one'}]}");
+  run(app.slice(app.indexOf("function render({"), app.indexOf("async function loadSignals({")));
+  run("render({heavy:false})");
+  assert.deepEqual(calls, ["renderHeader", "renderOverview", ["status_revision_paint", 1, "mode-cards"]]);
 });
 
 test("empty compact status cannot erase a loaded position page or suppress its refresh", async () => {

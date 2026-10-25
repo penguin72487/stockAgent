@@ -26,9 +26,9 @@ from scripts.manage_packed_edge import _convergence
 from stockagent.data_sync.bulk_archive import (
     CONTRACT, INCOMING, SYNC_ROOT, canonical_blobs, digest, index_zstd,
     ingress_owner, native_guard, load_policy, publish_preservation, verify_preservation, root_records, signature,
-    atomic_write_json, verify_retained_preservation,
+    atomic_write_json, verify_retained_preservation, PreservationProofExpired,
 )
-from stockagent.data_sync.desync_snapshots import SnapshotError, sha256_file
+from stockagent.data_sync.desync_snapshots import SnapshotError, sha256_file, atomic_write_bytes
 from stockagent.data_sync.windows_cold_io import metadata_path
 from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id
 
@@ -242,10 +242,31 @@ def organize(args, directory, receipt):
         # A busy owner must not strand this coordinator on its first batch.
         proof_path = directory / (scope + ".cold-proof.json")
         if proof_path.exists():
-            proof = json.loads(proof_path.read_text())
+            original_proof_bytes = proof_path.read_bytes()
+            proof = json.loads(original_proof_bytes)
             if not proof.get("cold_verified") or not proof.get("decoded_originals_verified"):
                 raise SnapshotError("a publication receipt cannot authorize source retirement")
-            verify_retained_proof(proof)
+            try:
+                verify_retained_proof(proof)
+            except PreservationProofExpired:
+                # Only stale inode evidence is refreshable. Identity, rights,
+                # hash or original-decode failures remain hard failures. Keep
+                # the exact old proof before a full canonical re-verification;
+                # never advance its clock from stat alone or republish data.
+                prior = directory / (scope + ".cold-proof-" + digest(proof) + ".json")
+                if prior.exists():
+                    if prior.read_bytes() != original_proof_bytes:
+                        raise SnapshotError("retained prior cold proof differs")
+                else:
+                    atomic_write_bytes(metadata_path(prior), original_proof_bytes)
+                state.update(state="independent_canonical_d_original_recovery",
+                             refresh_reason="cold_object_signature_changed",
+                             prior_cold_proof=str(prior))
+                atomic_write_json(status_path, state)
+                refreshed = verify_preservation(proof, index, progress=progress)
+                verify_retained_proof(refreshed)
+                atomic_write_json(proof_path, refreshed)
+                proof = refreshed
         else:
             publication_path = directory / (scope + ".cold-publication.json")
             if publication_path.exists():
@@ -376,8 +397,20 @@ def main():
             code = run_batches(args)
             if args.capture_inactive_caches:
                 from scripts.capture_inactive_training_cache import capture
-                if capture(args, received_batches()):
-                    code = run_batches(args)
+                from scripts.inventory_remote_training_cache import RemoteCacheInventoryUnavailable
+                try:
+                    if capture(args, received_batches()):
+                        code = run_batches(args)
+                except (RemoteCacheInventoryUnavailable, subprocess.TimeoutExpired) as error:
+                    # A disconnected optional origin must not hide the earlier
+                    # cohort result. Keep actual errors failed, otherwise defer
+                    # through the same timer, without inventing an inventory.
+                    atomic_write_json(COORDINATOR_STATUS.parent / "remote-inventory-deferred.json",
+                                      {"state": "remote_cache_inventory_deferred",
+                                       "error_type": type(error).__name__, "cohort_exit_code": code,
+                                       "observed_at_epoch": time.time(), "source_deleted": False})
+                    if code == 0:
+                        code = 75
         except BaseException:
             atomic_write_json(COORDINATOR_STATUS, {"state": "source_preserved_needs_audit", "observed_at_epoch": time.time(),
                                                  "complete_workflow_seconds": time.perf_counter() - started})

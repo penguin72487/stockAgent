@@ -22,10 +22,12 @@ try:
     from downloader.common import SharedRateLimiter
     from downloader.download_tw_cbc_fx_release_archive import _fetch, _save_raw
     from downloader.tw_public_source_lock import source_update_lock
+    from downloader.release_archive_timing import timed_release_archive
 except ImportError:  # direct invocation from downloader/
     from common import SharedRateLimiter
     from download_tw_cbc_fx_release_archive import _fetch, _save_raw
     from tw_public_source_lock import source_update_lock
+    from release_archive_timing import timed_release_archive
 
 
 NAME = "cbc_usdtwd_annual_pages"
@@ -81,6 +83,7 @@ def parse_annual(body: bytes, year: int) -> list[dict]:
     return rows
 
 
+@timed_release_archive(NAME)
 def collect(root: Path, *, request_interval: float = 0.5) -> dict:
     if request_interval <= 0:
         raise ValueError("request interval must be positive")

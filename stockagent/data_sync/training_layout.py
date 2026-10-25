@@ -110,11 +110,22 @@ def validate_moves(moves: list[dict]) -> None:
     for row in moves:
         source, destination = Path(row["source"]), Path(row["destination"])
         role = row["role"]
+        action = row.get("action", "move")
+        prepared_data = (role == "prepared" and action == "move"
+            and source.parts[:2] == ("artifacts", "data_preparation") and len(source.parts) >= 3
+            and len(destination.parts) >= 3 and destination.parts[0].startswith("data_"))
+        benchmark_alias = (role == "benchmark" and action == "remove-alias"
+            and source.parts[:2] == ("artifacts", "benchmarks") and len(source.parts) >= 4
+            and destination.parts[:2] == ("artifacts", "benchmarks"))
+        legacy = (source.parts[:2] == ("artifacts", "markets") and len(source.parts) >= 3
+            and role in ROLE_DIRECTORIES
+            and destination.parts[:2] == tuple(Path(ROLE_DIRECTORIES[role]).parts))
         if (source.is_absolute() or destination.is_absolute() or ".." in source.parts
                 or ".." in destination.parts or role not in ROLE_DIRECTORIES
-                or source.parts[:2] != ("artifacts", "markets") or len(source.parts) < 3
-                or destination.parts[:2] != tuple(Path(ROLE_DIRECTORIES[role]).parts)
-                or role == "training" or row.get("action", "move") not in {"move", "remove-alias"}):
+                or not (legacy or prepared_data or benchmark_alias)
+                or role == "training" or action not in {"move", "remove-alias"}
+                or type(row.get("compatibility_alias", False)) is not bool
+                or (row.get("compatibility_alias", False) and not prepared_data)):
             raise SnapshotError("layout move leaves its exact source/role namespace")
         for existing in sources:
             if source == existing or source in existing.parents or existing in source.parents:
@@ -122,6 +133,17 @@ def validate_moves(moves: list[dict]) -> None:
         if destination in destinations:
             raise SnapshotError("layout destination moves overlap")
         sources.append(source); destinations.append(destination)
+
+
+def _compatibility_alias(move: dict, source: Path, destination: Path) -> None:
+    """Preserve immutable absolute receipt paths without another payload copy."""
+    if not move.get("compatibility_alias", False):
+        return
+    if os.path.lexists(source):
+        if not source.is_symlink() or source.resolve(strict=True) != destination:
+            raise SnapshotError("prepared-data compatibility alias changed")
+        return
+    source.symlink_to(os.path.relpath(destination, source.parent), target_is_directory=True)
 
 
 def plan(root: Path, moves: list[dict]) -> dict:
@@ -229,6 +251,7 @@ def apply_plan(value: dict, state: Path, *, maximum_moves: int = 32, monitor_cac
         rows = []; moved = 0
         for move in value["moves"]:
             if move["source"] in done:
+                _compatibility_alias(move, root / move["source"], root / move["destination"])
                 rows.append(done[move["source"]]); continue
             source, destination = root / move["source"], root / move["destination"]
             real(source.parent); real(destination)
@@ -240,12 +263,15 @@ def apply_plan(value: dict, state: Path, *, maximum_moves: int = 32, monitor_cac
                 row.update(state="waiting-consumer", references=refs[:20]); rows.append(row); continue
             if moved >= maximum_moves:
                 row.update(state="queued"); rows.append(row); continue
-            if not os.path.lexists(source):
+            compatible_intent = (move.get("compatibility_alias", False) and source.is_symlink()
+                                 and source.resolve(strict=True) == destination)
+            if not os.path.lexists(source) or compatible_intent:
                 # Crash after rename, before completion receipt: verify the
                 # fixed destination and resume the same intent, never guess.
                 intent = intents.get(move["source"], move)
                 expected_rows = intent.get("effective_rows", move["rows"])
                 if move.get("action", "move") == "move" and destination.exists() and same_relocated_tree(expected_rows, inventory(destination)["rows"]):
+                    _compatibility_alias(move, source, destination)
                     row["fingerprint"] = intent["fingerprint"]
                     row.update(state="moved", recovered_interrupted_intent=True)
                     done[move["source"]] = row
@@ -290,6 +316,7 @@ def apply_plan(value: dict, state: Path, *, maximum_moves: int = 32, monitor_cac
                 after = inventory(destination)
                 if not same_relocated_tree(current["rows"], after["rows"]):
                     raise SnapshotError("renamed layout lost its inode/content identity")
+                _compatibility_alias(move, source, destination)
                 row.update(state="moved", destination_fingerprint=after["fingerprint"])
             for parent in (source.parent, destination.parent):
                 fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)

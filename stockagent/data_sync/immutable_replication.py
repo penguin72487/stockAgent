@@ -163,7 +163,12 @@ def read_manifest(root: Path, *, require_ready: bool = True) -> dict:
     return value
 
 
-def verify(root: Path, *, require_ready: bool = True) -> dict:
+def _verified_inventory(root: Path, *, require_ready: bool = True) -> tuple[dict, dict]:
+    """Return the manifest and the exact full-SHA observation that verified it.
+
+    This observation belongs to this verification only. Callers must still
+    verify the source again after copying; it is not a persistent hash cache.
+    """
     value = _read_manifest(root)
     actual = inventory(root)
     expected = {**value["files"], "manifest.json": actual.get("manifest.json")}
@@ -173,20 +178,26 @@ def verify(root: Path, *, require_ready: bool = True) -> dict:
         expected["READY"] = actual.get("READY")
     if actual != expected:
         raise ValueError("immutable delivery exact set or full SHA-256 differs")
-    return value
+    return value, actual
+
+
+def verify(root: Path, *, require_ready: bool = True) -> dict:
+    return _verified_inventory(root, require_ready=require_ready)[0]
 
 
 def replicate(source: Path, destination: Path, rclone: Path, *, workers: int = 2) -> dict:
     started = time.perf_counter()
     if type(workers) is not int or not 1 <= workers <= 8:
         raise ValueError("replication worker count is outside its resource budget")
-    manifest = verify(source)
+    manifest, expected = _verified_inventory(source)
     safe(destination, "manifest.json")
     if source == destination or source in destination.parents or destination in source.parents:
         raise ValueError("replication roots overlap")
     # --checksum can be size-only for a backend with no shared hash. Refuse all
     # conflicting existing members before asking rclone to perform any write.
-    expected = inventory(source)
+    # Reuse this operation's already verified exact set, including manifest
+    # and READY descriptors, instead of immediately reading every source byte
+    # twice. The final independent source/destination verification stays below.
     if destination.exists():
         actual = inventory(destination)
         if any(expected.get(k) != row for k, row in actual.items()):

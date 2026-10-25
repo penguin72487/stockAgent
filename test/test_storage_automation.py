@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,34 @@ import pytest
 from scripts import data_cache
 from stockagent.data_sync import storage_automation as automation
 from stockagent.data_sync.desync_snapshots import SnapshotError
+
+
+@pytest.mark.parametrize('status', [0, 75])
+@pytest.mark.parametrize('custom_root', [False, True])
+def test_data_layout_routes_to_readonly_release_owner_with_argv_and_exit_code(
+    tmp_path, status, custom_root,
+):
+    scripts = tmp_path / 'repo/scripts'
+    scripts.mkdir(parents=True)
+    wrapper = scripts / 'run_data_cache.sh'
+    wrapper.write_bytes((Path(__file__).resolve().parents[1] / 'scripts/run_data_cache.sh').read_bytes())
+    target = scripts / 'run_data_release.sh'
+    target.write_text('#!/usr/bin/env bash\nprintf "%s\\0" "$@" > "$TEST_ARGS"\nexit "$TEST_EXIT"\n')
+    target.chmod(0o700)
+    # Any fall-through to mutable cache/publication setup is a test failure.
+    (scripts / 'runtime_env.sh').write_text('exit 93\n')
+    args_file, output = tmp_path / 'arguments', tmp_path / 'report with spaces.json'
+    env = {**os.environ, 'STOCKAGENT_PACKED_EDGE_STATE': str(tmp_path / 'absent-edge'),
+        'TEST_ARGS': str(args_file), 'TEST_EXIT': str(status)}
+    env.pop('STOCKAGENT_PACKED_SYNC_ROOT', None)
+    cold = str(tmp_path / 'custom cold') if custom_root else '/srv/stockagent-packed'
+    if custom_root:
+        env['STOCKAGENT_PACKED_SYNC_ROOT'] = cold
+    result = subprocess.run(['bash', str(wrapper), 'layout', '--layout-output', str(output)],
+        env=env, capture_output=True, timeout=10)
+    assert result.returncode == status, result.stderr
+    assert args_file.read_bytes().split(b'\0') == [
+        b'layout', b'--layout-output', str(output).encode(), b'--sync-root', cold.encode(), b'']
 
 
 @pytest.fixture

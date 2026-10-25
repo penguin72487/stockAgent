@@ -212,7 +212,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scratch_plan = subparsers.add_parser('metadata-scratch-plan', help='audit one failed disposable metadata index')
     scratch_plan.add_argument('scratch', type=Path)
-    scratch_plan.add_argument('--failed-attempt', required=True, type=Path)
+    scratch_origin = scratch_plan.add_mutually_exclusive_group(required=True)
+    scratch_origin.add_argument('--failed-attempt', type=Path)
+    scratch_origin.add_argument('--empty-index', action='store_true',
+                                help='require an intact empty initial producer index; never a populated index')
     scratch_plan.add_argument('--output', required=True, type=Path)
     scratch_apply = subparsers.add_parser('metadata-scratch-apply', help='retire exactly the audited disposable index')
     scratch_apply.add_argument('plan', type=Path)
@@ -227,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             from stockagent.data_sync.packed_metadata import plan_failed_metadata_scratch
             if args.output.exists() or args.output.is_symlink():
                 raise ValueError('preserve the original scratch plan')
-            result = plan_failed_metadata_scratch(args.scratch, args.failed_attempt)
+            result = plan_failed_metadata_scratch(args.scratch, args.failed_attempt, empty_index=args.empty_index)
             atomic_write_json(args.output, result)
             _print(result)
             return 0

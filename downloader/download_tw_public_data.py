@@ -45,6 +45,7 @@ try:
         resolve_request_interval,
         run_parallel_tasks,
     )
+    from downloader.operation_timing import OperationTiming
     from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 except ImportError:  # pragma: no cover - direct script execution from downloader/
     from common import (
@@ -55,6 +56,7 @@ except ImportError:  # pragma: no cover - direct script execution from downloade
         resolve_request_interval,
         run_parallel_tasks,
     )
+    from operation_timing import OperationTiming
     from tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 
 
@@ -82,6 +84,9 @@ _HTTP_LOCAL = threading.local()
 _RATE_LIMITER: SharedRateLimiter | None = None
 _RATE_LIMITER_LOCK = threading.Lock()
 _JOURNAL_LOCK = threading.Lock()
+_OPERATION_LOG_LOCK = threading.Lock()
+OPERATION_TIMING_CONTRACT = "tw_public_dataset_operation_timing_v1"
+OPERATION_TIMING_PREFIX = "[tw-public:operation-timing] "
 _TPEX_SESSION_CACHE_LOCK = threading.Lock()
 _TPEX_SESSION_CACHE: dict[
     tuple[str, int, int, int, int],
@@ -7052,7 +7057,7 @@ def _download_fsc_catalog(
     )
 
 
-def download_dataset(
+def _download_dataset_dispatch(
     spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
 ) -> DownloadResult:
     try:
@@ -7073,6 +7078,92 @@ def download_dataset(
         )
     except Exception as exc:
         return DownloadResult(spec.name, "failed", 0, None, message=str(exc))
+
+
+def _emit_dataset_operation_timing(spec, args, result, timing) -> None:
+    """Report a native call without changing data/result identities or work units."""
+    registered = EXTENDED_DATASETS.get(spec.name) == spec
+    supported = spec.kind in {
+        "historical_json_table", "delisted_history", "snapshot_url",
+        "data_gov", "gcis_catalog", "fsc_catalog",
+    }
+    policy = {key: getattr(args, key, None) for key in (
+        "mode", "start_date", "end_date", "include_weekends", "max_dates",
+        "refresh", "empty_recheck_days", "daily_overlap_days", "date_workers",
+        "workers", "timeout", "verify_ssl", "retries", "retry_backoff",
+        "skip_raw", "sleep", "resume", "require_taiex_session_calendar",
+        "same_session_rule_date", "flush_every_dates", "request_interval",
+    )}
+    policy_bytes = json.dumps(policy, sort_keys=True, ensure_ascii=False,
+                             allow_nan=False, default=str).encode()
+    spec_bytes = json.dumps(asdict(spec), sort_keys=True, ensure_ascii=False,
+                           allow_nan=False).encode()
+    completed = isinstance(result, DownloadResult)
+    status = result.status if completed else None
+    result_matches_request = completed and result.dataset == spec.name
+    counts = {key: getattr(result, key, None) for key in (
+        "rows", "requested_dates", "fetched_dates", "skipped_dates",
+        "empty_dates", "failed_dates", "missing_dates_before", "missing_dates_after",
+        "source_unavailable_dates",
+    )}
+    record = {
+        "contract": OPERATION_TIMING_CONTRACT, "observed_at_utc": _now_utc(),
+        "dataset": spec.name, "dataset_kind": spec.kind,
+        "dataset_spec_sha256": hashlib.sha256(spec_bytes).hexdigest(),
+        "request_policy_sha256": hashlib.sha256(policy_bytes).hexdigest(),
+        "request_policy_fields": sorted(policy),
+        "configuration_is_resolved_request_range": False,
+        "source_endpoint_id": f"tw-public:{spec.name}" if registered else None,
+        "source_binding_eligible": (registered and supported and result_matches_request
+                                    and status != "unsupported" and timing.get("invalid_clock") is False),
+        "producer_pid": os.getpid(), "producer_thread_id": threading.get_ident(),
+        "status": status, "outcome": "returned" if completed else "raised",
+        "returned_dataset": result.dataset if completed else None,
+        "result_dataset_matches_request": result_matches_request,
+        "operation_timing": timing,
+        # Existing total rows can include cache hits and retained history. They
+        # are observations, never an invented completed-work denominator.
+        "reported_work": {key: value if type(value) is int and value >= 0 else None
+                          for key, value in counts.items()},
+        "invalid_reported_work_fields": sorted(key for key, value in counts.items()
+                                              if value is not None and (type(value) is not int or value < 0)),
+        "work_units_denominator": None,
+        "clock_is_source_publication_time": False,
+        "acquisition_completeness_verified": False, "live_readiness_verified": False,
+    }
+    line = OPERATION_TIMING_PREFIX + json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+    with _OPERATION_LOG_LOCK:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+
+def download_dataset(
+    spec: DatasetSpec, args: argparse.Namespace, output_dir: Path
+) -> DownloadResult:
+    """Keep the canonical dispatch result and emit an invocation-local body clock.
+
+    Queueing before this call, the timing log, parent reports and later audits
+    are outside this boundary. Observation failures cannot change the result or
+    suppress an exception from the native dispatch.
+    """
+    try:
+        clock = OperationTiming()
+    except Exception:
+        clock = None
+    result = None
+    try:
+        result = _download_dataset_dispatch(spec, args, output_dir)
+        return result
+    finally:
+        if clock is not None:
+            try:
+                timing = clock.snapshot("native_dataset_dispatch_excludes_executor_queue_timing_log_parent_reports_and_later_audits")
+                timing["started_monotonic_ns"] = clock.started_ns
+                _emit_dataset_operation_timing(spec, args, result, timing)
+            except Exception:
+                # Loss of telemetry remains a coverage gap, never a different
+                # download outcome or a replacement for the native exception.
+                pass
 
 
 def _select_specs(tokens: list[str]) -> list[DatasetSpec]:

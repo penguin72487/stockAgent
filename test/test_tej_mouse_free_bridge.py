@@ -153,6 +153,23 @@ def test_ownerless_modal_requires_exact_thread_disabled_root_and_unique_source_p
     assert 'Activate(' not in production
 
 
+def test_reviewed_runtime_recovery_rechecks_native_owner_caption_and_one_background_notification():
+    from downloader.tej_history import REVIEWED_RUNTIME_NOTICES
+    native=BRIDGE.split('public static void AcknowledgeReviewedRuntimeDialog',1)[1].split('public static long[] VisibleProcessWindows',1)[0]
+    action=BRIDGE.split("if($requestDoc.action -eq 'ack_source_memory_error')",1)[1].split("if($requestDoc.action -eq 'ack_excel_error')",1)[0]
+    for message,code in REVIEWED_RUNTIME_NOTICES.items():
+        assert message in native and code in native
+        assert message in action and code in action
+    for proof in ('rp!=dp','rp!=bp','rt!=dt','dt!=bt','GetWindow(d,4)!=r','GetParent(b)!=d',
+                  'IsWindowEnabled(r)','caption!=expected','matching!=1','buttons.Length!=1','(id!=1&&id!=2)'):
+        assert proof in native
+    assert native.count('Message(dialog,0x111u,id,button)')==1
+    assert action.count('AcknowledgeReviewedRuntimeDialog(')==1
+    assert 'exact_reviewed_runtime_single_ok_no_foreground_v2' in action
+    for forbidden in ('Activate(', '0xF5', 'PostMessageW', 'accDoDefaultAction'):
+        assert forbidden not in native and forbidden not in action
+
+
 def test_query_uses_exact_pinned_workbook_not_users_active_excel_view():
     binding=BRIDGE.split("$owns=$mutex.WaitOne(0)",1)[1].split("if($requestDoc.action -eq 'inspect_notices')",1)[0]
     for proof in ('$excel.Workbooks.Item($ExpectedWorkbook)', '$book.Name -cne $ExpectedWorkbook',

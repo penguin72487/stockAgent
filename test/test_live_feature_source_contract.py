@@ -22,6 +22,59 @@ def test_ordinary_live_modes_do_not_read_a_factorized_manifest(monkeypatch):
     require_live_feature_source(data)
 
 
+def test_manifest_metadata_cache_is_generation_fenced_and_returns_owned_evidence(tmp_path, monkeypatch):
+    from pathlib import Path
+    from stockagent.live import feature_source_contract as owner
+    path = tmp_path / "source.json"
+    manifest = {"contract": "tw_factorized_nullable_panel_values_lag1_v2", "status": "complete",
+        "logical_model_channels": 12000, "dates": ["2026-10-21"],
+        "paper_inference": {"contract": "factorized_paper_projection_lag1_v1", "status": "verified",
+            "raw_source_publication": False, "parent_manifest_sha256": "x", "decision_session": "2026-10-22"}}
+    path.write_text(json.dumps(manifest))
+    data = SimpleNamespace(factorized_feature_manifest=str(path))
+    owner._manifest_metadata.cache_clear()
+    reads = 0
+    real_read = Path.read_bytes
+    def read(p):
+        nonlocal reads
+        reads += 1
+        return real_read(p)
+    monkeypatch.setattr(Path, "read_bytes", read)
+    first = inspect_live_feature_source(data)
+    assert first["ready"]
+    first["paper_inference"]["status"] = "changed by caller"
+    assert inspect_live_feature_source(data)["ready"]
+    assert reads == 1
+    before = path.stat()
+    path.write_text(path.read_text().replace("12000", "13000"))
+    import os
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert inspect_live_feature_source(data)["logical_model_channels"] == 13000
+    assert reads == 2
+    path.unlink()
+    assert inspect_live_feature_source(data)["blockers"][0]["code"] == "factorized_manifest_missing"
+
+
+def test_metadata_read_race_and_invalid_bytes_keep_failure_evidence(tmp_path, monkeypatch):
+    from pathlib import Path
+    from stockagent.live import feature_source_contract as owner
+    path = tmp_path / "source.json"
+    path.write_bytes(b'{"status":"complete"}')
+    real_read = Path.read_bytes
+    def race(p):
+        raw = real_read(p)
+        p.write_bytes(b'{"status":"modified"}')
+        return raw
+    monkeypatch.setattr(Path, "read_bytes", race)
+    data = SimpleNamespace(factorized_feature_manifest=str(path))
+    assert inspect_live_feature_source(data)["blockers"][0]["code"] == "factorized_manifest_unreadable"
+    monkeypatch.setattr(Path, "read_bytes", real_read)
+    path.write_bytes(b'not-json')
+    observed = inspect_live_feature_source(data)
+    assert observed["manifest_sha256"] == hashlib.sha256(b'not-json').hexdigest()
+    assert observed["blockers"][0]["code"] == "factorized_manifest_invalid"
+
+
 def test_missing_factorized_manifest_is_not_a_six_feature_fallback(tmp_path):
     data = SimpleNamespace(factorized_feature_manifest=str(tmp_path / "missing.json"), feature_include=["open_raw", "close_raw"])
     with pytest.raises(LiveFeatureContractError) as raised:

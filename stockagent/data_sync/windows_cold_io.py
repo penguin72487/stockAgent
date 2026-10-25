@@ -1,6 +1,6 @@
 """Bounded binary pipes to native Windows FileStream, not WSL 9p data I/O.
 
-Only the enrolled D cold namespace and guarded backup staging are allowed. Canonical authority, locking,
+Only the enrolled D cold namespace and guarded backup/completed staging are allowed. Canonical authority, locking,
 manifests and inode checks remain in Linux; this is solely a byte I/O adapter.
 Non-D paths retain normal file I/O (including unit-test temporary directories).
 """
@@ -16,6 +16,7 @@ from pathlib import Path, PureWindowsPath
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 
 from stockagent.data_sync.desync_snapshots import SnapshotError
@@ -29,7 +30,92 @@ ALIASES = (
     (Path('/srv/stockagent-backup-ingress-lab203'), 'stockagent-backup-ingress-lab203'),
     (Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203'), 'stockagent-backup-ingress-lab203'),
     (Path('/srv/stockagent-d-volume/stockagent-immutable-lake'), 'stockagent-immutable-lake'),
+    (Path('/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch'), 'stockagent-completed-benchmark-scratch'),
+    (Path('/srv/stockagent-d-volume/stockagent-completed-offline-scratch'), 'stockagent-completed-offline-scratch'),
 )
+READ_ONLY_STAGE_PREFIXES = (
+    'D:\\stockagent-completed-benchmark-scratch\\',
+    'D:\\stockagent-completed-offline-scratch\\',
+)
+
+_INTEROP_DIRECTORY = Path('/run/WSL')
+_INTEROP_LOCK = threading.Lock()
+_INTEROP_CACHE = None
+_INTEROP_MARKER = b'stockagent-cold-interop-v1'
+
+
+def _interop_socket(path):
+    """Admit local WSL init sockets, including its fixed 1 -> 2 alias."""
+    try:
+        path = Path(path)
+        parent = _INTEROP_DIRECTORY.lstat()
+        if (path.parent != _INTEROP_DIRECTORY or _INTEROP_DIRECTORY.is_symlink()
+                or parent.st_uid != 0 or parent.st_mode & 0o022
+                or re.fullmatch(r'[1-9][0-9]*_interop', path.name) is None):
+            return None
+        entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode):
+            if (path.name != '1_interop' or entry.st_uid != 0
+                    or os.readlink(path) != str(_INTEROP_DIRECTORY / '2_interop')):
+                return None
+            path = _INTEROP_DIRECTORY / '2_interop'
+            entry = path.lstat()
+        pid = path.name.removesuffix('_interop')
+        if (not stat.S_ISSOCK(entry.st_mode) or entry.st_uid != os.geteuid()
+                or Path('/proc', pid, 'exe').resolve(strict=True) != Path('/init')):
+            return None
+        return str(path), entry.st_dev, entry.st_ino
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _windows_process_environment():
+    """Validate a bridge before opening bytes; never replay a failed write.
+
+    A socket's existence does not prove its Windows process context still
+    works. Run the canonical encoded batch with an empty member list, then
+    require its exact marker, at most eight trusted init endpoints. Cache that
+    result briefly; each caller keeps its own env so concurrent activities
+    cannot change one another's transport context.
+    """
+    global _INTEROP_CACHE
+    if not _INTEROP_DIRECTORY.is_dir():
+        return None
+    with _INTEROP_LOCK:
+        now = time.monotonic()
+        if _INTEROP_CACHE is not None:
+            signature, checked = _INTEROP_CACHE
+            if now - checked < 60 and _interop_socket(signature[0]) == signature:
+                return {**os.environ, 'WSL_INTEROP': signature[0]}
+        preferred = os.environ.get('WSL_INTEROP')
+        paths = [Path(preferred)] if preferred else []
+        paths.extend(sorted(_INTEROP_DIRECTORY.glob('*_interop'),
+                            key=lambda p: int(p.name.split('_', 1)[0])
+                            if re.fullmatch(r'[1-9][0-9]*_interop', p.name) else -1,
+                            reverse=True))
+        probe = _native_command([], batched=True) + "\n[Console]::Write('stockagent-cold-interop-v1')"
+        encoded_probe = base64.b64encode(probe.encode('utf-16le')).decode()
+        seen, attempts = set(), 0
+        for path in paths:
+            signature = _interop_socket(path)
+            if signature is None or signature in seen:
+                continue
+            seen.add(signature)
+            attempts += 1
+            env = {**os.environ, 'WSL_INTEROP': signature[0]}
+            try:
+                result = subprocess.run(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive',
+                    '-EncodedCommand', encoded_probe], input=b'[]\n',
+                    env=env, capture_output=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                result = None
+            if result is not None and result.returncode == 0 and result.stdout == _INTEROP_MARKER:
+                _INTEROP_CACHE = signature, time.monotonic()
+                return env
+            if attempts == 8:
+                break
+        _INTEROP_CACHE = None
+        raise SnapshotError('No verified local WSL interop bridge; native file I/O not started')
 
 
 def admit_workspace(path: Path, required_bytes: int, *, windows_distribution: str | None = None) -> dict:
@@ -137,6 +223,12 @@ def _configuration_on_checked_mount(
         mount = Path('/srv/stockagent-d-volume')
         if mode != 'hash' or mounted_volume(mount)[2] != 'D:' or Path(path).stat().st_dev != mount.stat().st_dev:
             raise SnapshotError('Native lake hash requires its enrolled D volume and read-only mode')
+    if native.startswith(READ_ONLY_STAGE_PREFIXES):
+        from stockagent.data_sync.packed_backup import mounted_volume
+        mount = Path('/srv/stockagent-d-volume')
+        if (mode != 'read' or mounted_volume(mount)[2] != 'D:'
+                or Path(path).stat().st_dev != mount.stat().st_dev):
+            raise SnapshotError('Native completed-stage read requires its actual D volume and read-only mode')
     config = {'path': native, 'mode': mode, 'offset': offset,
               'prefix_sha256': prefix_sha256, 'reserve_bytes': reserve_bytes}
     if mode == 'write' and not native.startswith('D:\\stockagent-cold-primary\\'):
@@ -160,7 +252,7 @@ def _configuration_on_checked_mount(
     return config
 
 
-def _launch(configs, *, batched=False):
+def _native_command(configs, *, batched=False):
     # No shell interpolation, external script path or inherited plaintext key.
     if batched:
         # Metadata goes through stdin so Windows' command-line length does not
@@ -172,11 +264,20 @@ def _launch(configs, *, batched=False):
     else:
         encoded_config = base64.b64encode(json.dumps(configs[0]).encode()).decode()
         command = "$env:STOCKAGENT_BINARY_IO_CONFIG='" + encoded_config + "';\n" + SCRIPT.read_text()
-    encoded = base64.b64encode(command.encode('utf-16le')).decode()
+    return command
+
+
+def _launch(configs, *, batched=False):
+    encoded = base64.b64encode(_native_command(configs, batched=batched).encode('utf-16le')).decode()
+    environment = _windows_process_environment()
     errors = tempfile.TemporaryFile()
-    process = subprocess.Popen(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive',
-                                '-EncodedCommand', encoded], stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, stderr=errors)
+    try:
+        process = subprocess.Popen(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive',
+                                    '-EncodedCommand', encoded], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=errors, env=environment)
+    except BaseException:
+        errors.close()
+        raise
     return process, errors
 
 
@@ -366,14 +467,15 @@ def binary_reader_many(members):
 
 
 @contextmanager
-def binary_reader(path):
+def binary_reader(path, *, expected_bytes=None):
     path = Path(path)
     if windows_path(path) is None:
         with path.open('rb') as stream:
             yield stream
         return
     for attempt in range(3):
-        process, errors = _process(path, mode='read')
+        process, errors = _process(path, mode='read',
+            **({'expected_bytes': expected_bytes} if expected_bytes is not None else {}))
         process.stdin.close()
         retry = False
         try:

@@ -32,6 +32,83 @@ def example(tmp_path):
     return root, source, row, catalog
 
 
+@pytest.mark.parametrize('problem', ['', 'changed-receipt', 'different-source'])
+def test_adjacent_finmind_reports_bind_before_canonical_retirement(tmp_path, monkeypatch, problem):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    from test_benchmark_fixture_reuse import _finmind_group_case
+
+    source, paths, _ = _finmind_group_case(tmp_path)
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    saved = cleanup.benchmark_evidence(source, destination=target / 'retained-evidence')
+    (target / 'retained-benchmark-evidence.json').write_text(json.dumps(saved))
+    artifact_root = tmp_path / 'artifacts'
+    relative = source.relative_to(artifact_root).as_posix()
+    if problem == 'different-source':
+        relative = relative.replace('20261015', '20261016')
+    if problem == 'changed-receipt':
+        path = target / 'retained-evidence' / paths[0].name
+        changed = json.loads(path.read_bytes())
+        changed['additional_observation'] = True
+        path.write_text(json.dumps(changed))
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *a: {'ok': True})
+    calls = []
+
+    def apply(spec, **options):
+        assert source.is_dir()
+        assert options['owned_verified_plan'] is plan
+        calls.append(True)
+        return {'deleted': True}
+
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', apply)
+    plan = {'blockers': [], 'plan_fingerprint': 'a' * 64,
+            'full_verification': {'verified_at_epoch': time.time()}}
+    call = lambda: cleanup.retire_after_convergence(
+        SimpleNamespace(relative_root=relative), None, target, plan, {'artifact_root': artifact_root})
+    if problem:
+        with pytest.raises(SnapshotError):
+            call()
+        assert not calls
+    else:
+        assert call() == {'deleted': True} and calls == [True]
+    assert source.is_dir() and all(path.is_file() for path in paths)
+
+
+def test_adjacent_finmind_reports_bind_after_source_removal_in_final_readback(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    from test_benchmark_fixture_reuse import _finmind_group_case
+
+    source, paths, _ = _finmind_group_case(tmp_path)
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    saved = cleanup.benchmark_evidence(source, destination=target / 'retained-evidence')
+    (target / 'retained-benchmark-evidence.json').write_text(json.dumps(saved))
+    (target / 'stage-prune-plan.json').write_text(json.dumps({'reclaimable_allocated_file_bytes': 0}))
+    (target / 'stage-pruned.json').write_text(json.dumps({'pruned': True}))
+    artifact_root = tmp_path / 'artifacts'
+    relative = source.relative_to(artifact_root).as_posix()
+    source.rmdir()
+    monkeypatch.setattr(cleanup, 'source_layout', lambda origin: (
+        artifact_root, tmp_path / 'mirror', tmp_path / 'states', tmp_path / 'activations'))
+    recovery_calls = []
+
+    def verify(*args):
+        recovery_calls.append(True)
+        return {'snapshot_id': 'fixed-version', 'manifest_sha256': 'b' * 64}
+
+    monkeypatch.setattr(cleanup, 'verify_cold_archive', verify)
+    spec = SimpleNamespace(relative_root=relative, dataset='legacy-test', stage_root=tmp_path / 'stage')
+    accepted = cleanup.finish_retirement(spec, SimpleNamespace(sync_root=tmp_path / 'cold'), target, {
+        'deleted': True, 'snapshot_id': 'fixed-version', 'manifest_sha256': 'b' * 64,
+        'reclaimed_allocated_file_bytes': 0})
+    assert accepted['retired'] is True and recovery_calls == [True]
+    assert accepted['local_benchmark_evidence_bytes'] == saved['bytes']
+    assert all(path.is_file() for path in paths) and not source.exists()
+
+
 def test_manual_offline_capture_preserves_unique_bytes_and_cannot_run_automatically(tmp_path):
     root, source, row, catalog = example(tmp_path)
     spec = load_legacy_specs(catalog)[row['dataset']]
@@ -55,6 +132,252 @@ def _completed_benchmark(source):
     for path in source.glob('*.json'):
         old = time.time() - 2 * 86400
         os.utime(path, (old, old))
+
+
+def _completed_finmind_reservation(source, *, automatic=False, reused=False):
+    queue = '/observed/data_finmind/complement/queue.sqlite3'
+    fixture = str(source / 'queues')
+    variants = ('baseline', 'automatic', 'candidate') if automatic else ('baseline', 'candidate')
+    snapshot = ({f'{v}/{owner}': {'path': f'{fixture}/{v}/{owner}/queue.sqlite3',
+                                'bytes': 42, 'sha256_before_setup': 'a' * 64}
+                 for v in ('baseline', 'candidate') for owner in ('sponsor', 'complement')}
+                if reused else {f'{owner}/queue.sqlite3': {
+                    'source_path': f'/observed/data_finmind/{owner}/queue.sqlite3',
+                    'bytes': 42, 'sha256': 'a' * 64} for owner in ('sponsor', 'complement')})
+    value = {'schema_version': 1, 'state': 'measurement_complete',
+        'scope': 'fixed_real_two_owner_queues_full_reservation_status_and_durable_claim_release',
+        'code_stable': True, 'exact_output_parity': True, 'source_workflow_unchanged': True,
+        'provider_calls': 0, 'production_queue_mutations': 0, 'source_queue': queue,
+        'fixture': fixture, 'whole_output_sha256': 'b' * 64, 'snapshots': snapshot,
+        'code_sha256': {f'/observed/{name}': 'c' * 64 for name in (
+            'benchmark_finmind_reservation.py', 'download_finmind_complement.py',
+            'finmind_scheduling.py', 'finmind_queue_indexes.py')},
+        'index_setup': {owner: {'wall_seconds': 1., 'cpu_seconds': .5,
+                               'allocated_index_bytes': 4096, 'indexed_rows': 3}
+                        for owner in ('sponsor', 'complement')},
+        'status_plans': {v: {owner: ['SCAN tasks'] for owner in ('sponsor', 'complement')}
+                         for v in ('baseline', 'candidate')},
+        'reservation_plans': {v: {owner: ['SEARCH tasks'] for owner in ('sponsor', 'complement')}
+                              for v in variants},
+        'trials': [{'variant': v, 'repeat': repeat, 'wall_seconds': 1., 'cpu_seconds': .8,
+                    'reservation_wall_seconds': .2, 'reservation_cpu_seconds': .1,
+                    'queue_changes': 0, 'whole_output_sha256': 'b' * 64}
+                   for repeat in range(2) for v in (*variants, *reversed(variants))],
+        'claim_release_trials': [{'variant': v, 'repeat': repeat, 'group': group,
+                                 'tasks': 3, 'transactions': 6, 'exact_task_rows_restored': True,
+                                 'wall_seconds': 1., 'cpu_seconds': .1}
+                                for repeat in range(2)
+                                for v in (('baseline', 'candidate') if repeat % 2 == 0 else ('candidate', 'baseline'))
+                                for group in ('history', 'release')]}
+    (source / 'comparison.json').write_text(json.dumps(value))
+    return value
+
+
+def _finmind_throughput_case(root):
+    import hashlib
+    from stockagent.data_sync.benchmark_fixtures import FINMIND_THROUGHPUT_REPORTS
+
+    source = root / 'artifacts/benchmarks/finlab-finmind-throughput-20261018/reservation'
+    external = root / 'artifacts/data_quality/finlab_finmind_throughput_2026-10-18'
+    source.mkdir(parents=True)
+    external.mkdir(parents=True)
+    for stage, name in enumerate(FINMIND_THROUGHPUT_REPORTS):
+        value = _completed_finmind_reservation(source, automatic=stage == 0, reused=stage > 0)
+        value['fixture'] = str(source)
+        if stage:
+            for key, row in value['snapshots'].items():
+                row['path'] = str(source / key / 'queue.sqlite3')
+            value['prepared_from'] = str(external / FINMIND_THROUGHPUT_REPORTS[stage-1])
+        output = {'reservation': {'queue_errors': []}, 'status': {'complete': 3, 'missing': None}}
+        selections = list(zip(
+                ('includes_us_publication_recheck', 'includes_periodic_preparation', 'includes_correction_candidates'),
+                ('publication_rechecks', 'periodic_refreshes', 'correction_candidates')))
+        for position in ((), (0,), (0, 1), (2,))[stage]:
+            flag, collection = selections[position]
+            value[flag] = True
+            output[collection] = [{'raw_value': -3.5, 'symbol': '0050'}]
+        digest = hashlib.sha256(json.dumps(output, sort_keys=True, separators=(',', ':'),
+                                           ensure_ascii=False).encode()).hexdigest()
+        value['whole_output_sha256'] = digest
+        stem = name.removesuffix('.json')
+        context_name = stem + '-context.json'
+        value['captured_context'] = str(source / context_name)
+        context = {'fixed_clock': '2026-10-18T00:00:00+00:00', 'captured_live_status': {'complete': 3},
+                   'current_stock_ids': ['0050'], 'official_delisted_ids': ['1000']}
+        if stage == 3:
+            context.update(correction_plan_sha256='a'*64, correction_requests=[{
+                'owner': 'complement', 'request_id': 'fixed-request', 'dataset': 'TaiwanStockKBar',
+                'start_date': '2021-03-05', 'end_date': '2021-04-14'}])
+        (source / context_name).write_text(json.dumps(context))
+        for index, trial in enumerate(value['trials']):
+            trial['whole_output_sha256'] = digest
+            file = source / f"{stem}-{trial['variant']}-output-{trial['repeat']}-{index}.json"
+            file.write_text(json.dumps(output))
+        (external / name).write_text(json.dumps(value))
+    (source / 'comparison.json').unlink()  # Test builder's uncommitted intermediate only.
+    return source, external
+
+
+def test_throughput_companion_reports_preserve_original_full_outputs_and_completion(tmp_path):
+    from stockagent.data_sync.benchmark_fixtures import (
+        completed_benchmark_evidence, FINMIND_THROUGHPUT_RESERVATION_CONTRACT,
+    )
+    source, external = _finmind_throughput_case(tmp_path)
+    before = {file: file.read_bytes() for parent in (source, external) for file in parent.glob('*.json')}
+    retained = tmp_path / 'retained-evidence'
+    proof = completed_benchmark_evidence(source, destination=retained)
+    assert proof['producer_contract'] == FINMIND_THROUGHPUT_RESERVATION_CONTRACT
+    assert len(proof['files']) == 44
+    assert all(file.read_bytes() == raw for file, raw in before.items())
+    replay = completed_benchmark_evidence(retained, original_source=source,
+        required_contract=FINMIND_THROUGHPUT_RESERVATION_CONTRACT)
+    assert replay == proof
+
+
+def test_throughput_completion_survives_capture_quarantine_and_final_retained_readback(tmp_path):
+    import uuid
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.legacy_artifact_archive import LegacyArchiveSpec, verify_archive_directory
+    from stockagent.data_sync.benchmark_fixtures import FINMIND_THROUGHPUT_RESERVATION_CONTRACT
+
+    source, external = _finmind_throughput_case(tmp_path)
+    artifact_root = tmp_path / 'artifacts'
+    relative = source.relative_to(artifact_root).as_posix()
+    receipt = tmp_path / 'retirement-receipt'
+    receipt.mkdir()
+    retained = cleanup.benchmark_evidence(source, destination=receipt / 'retained-evidence')
+    (receipt / 'retained-benchmark-evidence.json').write_text(json.dumps(retained))
+    assert cleanup.verified_retained_benchmark(receipt, source) == retained
+    for path in source.rglob('*'):
+        stamp = time.time() - 2 * 86400
+        os.utime(path, (stamp, stamp))
+    spec = LegacyArchiveSpec('legacy-wsl-throughput', relative, 7, tmp_path / 'stage',
+                            12, False, 'gzip-1-csv-over-8m', MANUAL_WSL_CAPTURE_CONTRACT)
+    packed = tmp_path / 'cold'
+    published = publish_archive(spec, artifact_root, packed,
+                                repo_root=tmp_path, manual_capture=True)
+    proof = verify_cold_archive(spec, packed)
+    assert proof['snapshot_id'] == published['snapshot_id']
+    assert proof['decoded_originals_verified'] and proof['files'] == 40
+    state_root = tmp_path / 'retirements'
+    quarantine = state_root / 'quarantine' / spec.dataset / ('12-' + uuid.uuid4().hex)
+    quarantine.mkdir(parents=True)
+    source.rename(quarantine / 'source')
+    (state_root / (spec.dataset + '.json')).write_text(json.dumps({
+        'schema_version': 1, 'state': 'retiring', 'dataset': spec.dataset,
+        'relative_root': relative, 'quarantine': str(quarantine),
+        'snapshot_id': published['snapshot_id'], 'manifest_sha256': published['manifest_sha256']}))
+    assert source_plan(quarantine / 'source', spec, manual_capture=True, original_source=source)
+    # Capture verification follows the original path supplied by the archive
+    # spec, then validates the durable quarantine; producer JSON cannot pick it.
+    verify_archive_directory(spec.stage_root / spec.dataset / 'archive',
+        spec=spec, source=quarantine / 'source', artifact_root=artifact_root, manual_capture=True)
+    assert cleanup.verified_retained_benchmark(receipt, source) == retained
+    assert retained['producer_contract'] == FINMIND_THROUGHPUT_RESERVATION_CONTRACT
+
+
+@pytest.mark.parametrize('defect', ['missing-report', 'wrong-previous', 'wrong-fixture', 'partial-output',
+                                    'corrupt-output', 'extra-attempt', 'wrong-clock', 'missing-stage'])
+def test_throughput_companion_reports_reject_incomplete_or_unbound_work(tmp_path, defect):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+
+    source, external = _finmind_throughput_case(tmp_path)
+    file = external / 'periodic_query_control.json'
+    value = json.loads(file.read_bytes())
+    if defect == 'missing-report':
+        file.unlink()
+    elif defect in {'wrong-previous', 'wrong-fixture', 'missing-stage'}:
+        key = {'wrong-previous': 'prepared_from', 'wrong-fixture': 'fixture',
+               'missing-stage': 'includes_periodic_preparation'}[defect]
+        value[key] = False if defect == 'missing-stage' else '/different/original'
+        file.write_text(json.dumps(value))
+    elif defect == 'extra-attempt':
+        (source / 'unknown-attempt.json').write_text('{}')
+    elif defect == 'wrong-clock':
+        path = source / 'periodic_query_control-context.json'
+        context = json.loads(path.read_bytes())
+        context['fixed_clock'] = '2026-10-18T00:00:00'
+        path.write_text(json.dumps(context))
+    else:
+        path = source / 'periodic_query_control-baseline-output-0-0.json'
+        if defect == 'partial-output':
+            path.unlink()
+        else:
+            path.write_text('{"reservation": {}, "status": {}}')
+    with pytest.raises((SnapshotError, FileNotFoundError), match='|'.join((
+            'supported completed', 'No such file'))):
+        completed_benchmark_evidence(source)
+
+
+@pytest.mark.parametrize('automatic,reused', [(False, False), (True, False), (True, True)])
+def test_finmind_reservation_preserves_native_completion_without_rewriting_receipts(tmp_path, automatic, reused):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence, FINMIND_RESERVATION_CONTRACT
+    source = tmp_path / 'case'
+    source.mkdir()
+    _completed_finmind_reservation(source, automatic=automatic, reused=reused)
+    original = (source / 'comparison.json').read_bytes()
+    retained = tmp_path / 'retained'
+    proof = completed_benchmark_evidence(source, destination=retained)
+    assert proof['producer_contract'] == FINMIND_RESERVATION_CONTRACT
+    assert proof['producer_state'] == 'measurement_complete'
+    assert completed_benchmark_evidence(retained) == proof
+    assert (retained / 'comparison.json').read_bytes() == original
+    assert (source / 'comparison.json').read_bytes() == original
+    assert not (source / 'fixture.json').exists()
+    assert not (retained / 'abba-receipt.json').exists()
+
+
+@pytest.mark.parametrize('defect', [
+    'incomplete', 'different_scope', 'code_drift', 'missing_code', 'call', 'mutation',
+    'different_output', 'missing_trial', 'reordered_trial', 'boolean_repeat', 'not_restored',
+    'missing_write', 'transaction_count', 'different_write_tasks', 'missing_owner',
+    'snapshot_escape', 'wrong_snapshot_hash', 'setup_nan', 'plan_missing_owner',
+    'source_escape', 'prepared_without_prior', 'foreign_comparison', 'second_incomplete',
+])
+def test_finmind_reservation_rejects_partial_or_contradictory_completion(tmp_path, defect):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    value = _completed_finmind_reservation(tmp_path)
+    if defect == 'incomplete': value['state'] = 'running'
+    elif defect == 'different_scope': value['scope'] = 'status_only'
+    elif defect == 'code_drift': value['code_stable'] = False
+    elif defect == 'missing_code': value['code_sha256'].pop('/observed/finmind_scheduling.py')
+    elif defect == 'call': value['provider_calls'] = 1
+    elif defect == 'mutation': value['production_queue_mutations'] = 1
+    elif defect == 'different_output': value['trials'][-1]['whole_output_sha256'] = 'd' * 64
+    elif defect == 'missing_trial': value['trials'].pop()
+    elif defect == 'reordered_trial': value['trials'][0], value['trials'][1] = value['trials'][1], value['trials'][0]
+    elif defect == 'boolean_repeat': value['trials'][0]['repeat'] = False
+    elif defect == 'not_restored': value['claim_release_trials'][0]['exact_task_rows_restored'] = False
+    elif defect == 'missing_write': value['claim_release_trials'].pop()
+    elif defect == 'transaction_count': value['claim_release_trials'][0]['transactions'] = 4
+    elif defect == 'different_write_tasks':
+        value['claim_release_trials'][0].update(tasks=2, transactions=4)
+    elif defect == 'missing_owner': value['snapshots'].pop('sponsor/queue.sqlite3')
+    elif defect == 'snapshot_escape': value['snapshots']['sponsor/queue.sqlite3']['source_path'] = '/other/queue.sqlite3'
+    elif defect == 'wrong_snapshot_hash': value['snapshots']['sponsor/queue.sqlite3']['sha256'] = 'unknown'
+    elif defect == 'setup_nan': value['index_setup']['sponsor']['wall_seconds'] = float('nan')
+    elif defect == 'plan_missing_owner': value['reservation_plans']['baseline'].pop('complement')
+    elif defect == 'source_escape': value['source_queue'] = '/observed/../data_finmind/complement/queue.sqlite3'
+    elif defect == 'prepared_without_prior': value['prepared_from'] = str(tmp_path / 'missing.json')
+    elif defect == 'foreign_comparison': (tmp_path / 'comparison-unknown.json').write_text('{}')
+    elif defect == 'second_incomplete': (tmp_path / 'comparison-v2.json').write_text(json.dumps({**value, 'state': 'running'}))
+    (tmp_path / 'comparison.json').write_text(json.dumps(value))
+    with pytest.raises(SnapshotError, match='no supported completed producer'):
+        completed_benchmark_evidence(tmp_path)
+
+
+def test_finmind_reservation_reused_fixture_requires_original_bound_receipt(tmp_path):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    original = _completed_finmind_reservation(tmp_path)
+    current = _completed_finmind_reservation(tmp_path, automatic=True, reused=True)
+    current['prepared_from'] = str(tmp_path / 'comparison.json')
+    (tmp_path / 'comparison.json').write_text(json.dumps(original))
+    (tmp_path / 'comparison-three-plans.json').write_text(json.dumps(current))
+    assert completed_benchmark_evidence(tmp_path)['producer_state'] == 'measurement_complete'
+    current['fixture'] = str(tmp_path / 'other-fixture')
+    (tmp_path / 'comparison-three-plans.json').write_text(json.dumps(current))
+    with pytest.raises(SnapshotError, match='no supported completed producer'):
+        completed_benchmark_evidence(tmp_path)
 
 
 def test_one_explicit_completed_benchmark_case_uses_existing_exact_archive_owner(tmp_path):
@@ -82,6 +405,120 @@ def test_one_explicit_completed_benchmark_case_uses_existing_exact_archive_owner
     proof = verify_cold_archive(spec, packed)
     assert proof['decoded_originals_verified'] and proof['snapshot_id'] == published['snapshot_id']
     assert proof['files'] == 3 and target.is_dir()  # Publication never implies deletion.
+
+
+def _completed_official_daily(source):
+    import hashlib
+    names = ('twse_daily_ohlcv.parquet', 'tpex_daily_ohlcv.parquet',
+             'tw_corporate_action_reference.parquet', 'twse_delisted_company.parquet',
+             'tpex_delisted_company.parquet', 'twse_listed_company_basic.parquet',
+             'tpex_basic_company.parquet', 'twse_api_company_newlisting.parquet',
+             'twse_taiex_ohlc.parquet', 'twse_taiex_ohlc.summary.json')
+    captured = source / 'captured'
+    captured.mkdir()
+    proofs = []
+    for name in names:
+        path = captured / name
+        path.write_bytes(name.encode())
+        proofs.append({'path': str(path), 'original': '/original/' + name,
+                       'sha256': hashlib.sha256(path.read_bytes()).hexdigest()})
+    stages = {name: {'wall_seconds': 1., 'cpu_seconds': .5} for name in (
+        'capture_fixed_sources', 'prior_fixture', 'prior_full_merge', 'restore_actual_latest_sources',
+        'new_source_session_merge', 'daily_complete_typed_oracle', 'independent_full_merge',
+        'full_complete_typed_oracle', 'unchanged_merge', 'unchanged_complete_typed_oracle')}
+    code = {key: 'a' * 64 for key in ('builder', 'typed_proof', 'parser_shared',
+                                     'group_projection', 'merge_projection', 'partitioned_parquet')}
+    code.update(polars='1.0', numpy='2.0', arrow='20.0')
+    work = {}
+    for name, mode, reused, rebuilt in (('previous', 'full', 0, 20),
+                                      ('daily', 'suffix', 20, 1), ('unchanged', 'unchanged', 21, 0)):
+        work[name] = {'contract': 'canonical_row_local_parquet_group_projection_v1',
+            'merge_projection': {'contract': 'official_ohlcv_exact_session_merge_v1',
+                'full_source_receipts_required': True, 'mode': mode,
+                'reused_rows': reused, 'rebuilt_rows': rebuilt, 'old_generations_removed': 0}}
+    receipt = {'status': 'accepted_real_source_merge_daily_not_full_base_pit_or_live_readiness',
+        'retrospective_fixture_not_historical_pit': True, 'benchmark_sha256': 'b' * 64,
+        'production_source_writes': 0, 'service_restarts': 0, 'ledger_writes': 0,
+        'prior': '2026-10-19', 'latest': '2026-10-20', 'code': code, 'stages': stages,
+        'previous_shape': [20, 3], 'daily_shape': [21, 3], 'work': work, 'source_capture': proofs,
+        'oracle': {'values_sha256': 'c' * 64, 'receipts': [[], [], []], 'statistics': {}}}
+    (source / 'receipt.json').write_text(json.dumps(receipt))
+    (source / 'progress.json').write_text(json.dumps({'stages': stages, 'code': code}))
+    for path in source.rglob('*'):
+        if path.is_file():
+            os.utime(path, (time.time() - 2 * 86400,) * 2)
+    return receipt
+
+
+def test_standalone_official_daily_requires_exact_producer_and_full_cold_recovery(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.benchmark_fixtures import OFFICIAL_DAILY_CONTRACT
+    root, source, row, catalog = example(tmp_path)
+    relative = 'benchmarks/official-real-daily-20261020-v87'
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    receipt = _completed_official_daily(target)
+    original = (target / 'receipt.json').read_bytes()
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    observed = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    assert observed['blockers'] == []
+    retained = tmp_path / 'retained'
+    evidence = cleanup.benchmark_evidence(target, destination=retained, required_contract=OFFICIAL_DAILY_CONTRACT)
+    assert evidence == cleanup.benchmark_evidence(retained)
+    assert evidence['producer_state'] == receipt['status']
+    published = publish_archive(spec, root, tmp_path / 'packed', repo_root=root.parent, manual_capture=True)
+    recovered = verify_cold_archive(spec, tmp_path / 'packed')
+    assert recovered['decoded_originals_verified'] and recovered['snapshot_id'] == published['snapshot_id']
+    assert recovered['files'] == 13 and (target / 'receipt.json').read_bytes() == original
+    assert cleanup.stage_profile({'staging_profile': cleanup.D_BENCHMARK_STAGE_PROFILE,
+                                 'items': [{'relative_root': relative}]}) == (cleanup.D_BENCHMARK_STAGE_ROOT, True)
+    with pytest.raises(SnapshotError, match='standalone case'):
+        cleanup.benchmark_evidence(target, required_contract='complete_panel_storage_comparison_v1')
+    assert not cleanup.reviewed_wsl_artifact_root('benchmarks/official-real-daily-20261020')
+    assert not cleanup.reviewed_wsl_artifact_root(relative + '/nested/case')
+
+
+@pytest.mark.parametrize('defect', [
+    'unfinished', 'missing_progress', 'progress_changed', 'missing_stage', 'nonfinite_time',
+    'boolean_time', 'code_hash', 'source_digest', 'source_missing', 'source_duplicate',
+    'relative_source', 'oracle_hash', 'shape_bool', 'clock_order', 'production_write',
+    'boolean_zero', 'mode', 'lost_rows', 'old_generation_removed', 'rebuilt_unchanged',
+    'source_proof_disabled', 'reference',
+])
+def test_official_daily_rejects_incomplete_or_malformed_completion(tmp_path, defect):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    value = _completed_official_daily(tmp_path)
+    if defect == 'unfinished': value['status'] = 'running'
+    elif defect == 'missing_stage': del value['stages']['independent_full_merge']
+    elif defect == 'nonfinite_time': value['stages']['unchanged_merge']['wall_seconds'] = float('nan')
+    elif defect == 'boolean_time': value['stages']['unchanged_merge']['wall_seconds'] = True
+    elif defect == 'code_hash': value['code']['builder'] = 'unknown'
+    elif defect == 'source_digest': value['source_capture'][0]['sha256'] = 'unknown'
+    elif defect == 'source_missing': value['source_capture'].pop()
+    elif defect == 'source_duplicate': value['source_capture'][1] = value['source_capture'][0]
+    elif defect == 'relative_source': value['source_capture'][0]['path'] = 'captured/source.parquet'
+    elif defect == 'oracle_hash': value['oracle']['values_sha256'] = 'unknown'
+    elif defect == 'shape_bool': value['daily_shape'][0] = True
+    elif defect == 'clock_order': value['prior'] = value['latest']
+    elif defect == 'production_write': value['production_source_writes'] = 1
+    elif defect == 'boolean_zero': value['ledger_writes'] = False
+    elif defect == 'mode': value['work']['daily']['merge_projection']['mode'] = 'full'
+    elif defect == 'lost_rows': value['work']['daily']['merge_projection']['rebuilt_rows'] = 0
+    elif defect == 'old_generation_removed': value['work']['daily']['merge_projection']['old_generations_removed'] = 1
+    elif defect == 'rebuilt_unchanged':
+        value['work']['unchanged']['merge_projection'].update(reused_rows=20, rebuilt_rows=1)
+    elif defect == 'source_proof_disabled': value['work']['daily']['merge_projection']['full_source_receipts_required'] = False
+    elif defect == 'reference': value['fixed_pre_change_reference'] = {'sha256': 'unknown'}
+    (tmp_path / 'receipt.json').write_text(json.dumps(value))
+    (tmp_path / 'progress.json').write_text(json.dumps({'stages': value['stages'], 'code': value['code']}))
+    if defect == 'missing_progress': (tmp_path / 'progress.json').unlink()
+    elif defect == 'progress_changed': (tmp_path / 'progress.json').write_text('{}')
+    with pytest.raises(SnapshotError, match='completed producer'):
+        completed_benchmark_evidence(tmp_path)
+    assert (tmp_path / 'receipt.json').is_file()
 
 
 def _completed_openbb_selector(source):
@@ -187,6 +624,293 @@ def test_temporary_stage_selection_is_fixed_and_bound_to_one_completed_benchmark
     inventory = {'staging_profile': cleanup.D_BENCHMARK_STAGE_PROFILE,
                  'items': [{'relative_root': 'benchmarks/suite/completed-case'}]}
     assert cleanup.stage_profile(inventory) == (cleanup.D_BENCHMARK_STAGE_ROOT, True)
+
+
+def _completed_research_staging(source):
+    from stockagent.data_sync.benchmark_fixtures import RESEARCH_STAGING_CONTRACT
+    value = {'contract': RESEARCH_STAGING_CONTRACT,
+             'status': 'accepted_real_byte_staging_not_full_pipeline',
+             'source': {'path': '/private/original.parquet', 'bytes': 32, 'sha256': 'a' * 64},
+             'code_sha256': {f'/code/{name}': 'b' * 64 for name in (
+                 'benchmark_research_stage_copy.py', 'stage_tw_public_research_release.py',
+                 'immutable_cache_files.py')},
+             'baseline_ast_sha256': 'c' * 64,
+             'baseline_has_no_explicit_fsync': True, 'candidate_new_writes_fsync': True,
+             'provider_calls': 0, 'production_writes': False, 'service_restarts': 0,
+             'samples': [{'variant': variant, 'wall_seconds': .5, 'cpu_seconds': .2,
+                          'written_payload_bytes': 32 if variant == 'baseline' else 0}
+                         for variant in ('baseline', 'candidate', 'candidate', 'baseline')],
+             'baseline_seed': {'wall_seconds': .5, 'cpu_seconds': .2},
+             'candidate_seed': {'wall_seconds': .5, 'cpu_seconds': .2}}
+    (source / 'receipt.json').write_text(json.dumps(value))
+    old = time.time() - 2 * 86400
+    os.utime(source / 'receipt.json', (old, old))
+    return value
+
+
+def _completed_panel_storage(source):
+    import copy
+    records = []
+    for kind in ('whole', 'chunks', 'chunks', 'whole'):
+        build = dict(contract='panel_time_chunk_reuse_v2' if kind == 'chunks' else 'panel_array_reuse_v1',
+                     written_arrays=1, written_array_bytes=32, reused_arrays=0, avoided_array_bytes=0,
+                     written_chunks=0, written_chunk_bytes=0, reused_chunks=0, avoided_chunk_bytes=0)
+        records.append({'kind': kind, 'complete_axes_equal': True,
+            'complete_array_hashes': {'features': 'a' * 64, 'close_prices': 'b' * 64},
+            'load_seconds': .1, 'full_readback_verification_seconds': .2,
+            'stages': {name: {'wall_seconds': .2, 'cpu_seconds': .1, 'storage_build': copy.deepcopy(build)}
+                       for name in ('initial', 'append')}})
+    value = {'state': 'accepted_complete_panel_storage_workflow', 'order': 'ABBA',
+        'original_values_receipts_preserved': True, 'reader_rollout_required_before_writer_opt_in': True,
+        'provider_calls': 0, 'production_cache_mutations': 0, 'dates': 3, 'symbols': 2, 'features': 1,
+        'chunk_bytes': 8388608, 'minimum_chunked_bytes': 8388608,
+        'source_manifest': '/private/panel/manifest.json',
+        'source_proofs': [{'path': '/private/panel/manifest.json', 'sha256': 'c' * 64, 'metadata': {'size': 32}}],
+        'source_code': {name: 'd' * 64 for name in ('scripts/benchmark_panel_chunk_storage.py',
+            'stockagent/data/panel_cache.py', 'stockagent/data/panel_chunks.py')}, 'records': records}
+    (source / 'acceptance.json').write_text(json.dumps(value))
+    (source / 'progress.json').write_text(json.dumps({'records': records}))
+    return value
+
+
+def _original_panel_storage(source):
+    """The actual first producer shape, with unknown code/policy left absent."""
+    value = _completed_panel_storage(source)
+    for key in ('source_code', 'chunk_bytes', 'minimum_chunked_bytes'):
+        del value[key]
+    value['observed_at_utc'] = '2026-10-15T18:15:34.520547+00:00'
+    for record in value['records']:
+        record.update(features_memmap=True, peak_process_rss_bytes=65536,
+                      post_measurement_exact_links=0)
+    (source / 'acceptance.json').write_text(json.dumps(value))
+    (source / 'progress.json').write_text(json.dumps({'records': value['records']}))
+    return value
+
+
+@pytest.mark.parametrize('original_format', [False, True])
+@pytest.mark.parametrize('suffix', ['final', 'v1', '8m_v1'])
+def test_completed_panel_storage_case_keeps_original_bytes_and_uses_full_cold_restore(
+        tmp_path, suffix, original_format):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.benchmark_fixtures import PANEL_STORAGE_CONTRACT
+    root, source, row, catalog = example(tmp_path)
+    relative = 'benchmarks/panel_chunk_storage_20261016_' + suffix
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    (_original_panel_storage if original_format else _completed_panel_storage)(target)
+    for path in target.glob('*.json'):
+        old = time.time() - 2 * 86400
+        os.utime(path, (old, old))
+    before = {p.name: p.read_bytes() for p in target.iterdir()}
+    observed = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    assert observed['blockers'] == []
+    proof = cleanup.benchmark_evidence(target, destination=tmp_path / 'retained')
+    assert proof['producer_contract'] == PANEL_STORAGE_CONTRACT
+    if original_format:
+        assert proof['producer_receipt_format'] == 'panel_original_abba_without_policy_v1'
+        assert proof['source_code_identity'] == proof['chunk_policy'] == 'not_recorded_by_original_producer'
+    assert proof == cleanup.benchmark_evidence(tmp_path / 'retained')
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    with pytest.raises(SnapshotError, match='explicit manual capture'):
+        source_plan(target, spec)
+    published = publish_archive(spec, root, tmp_path / 'packed', repo_root=root.parent, manual_capture=True)
+    recovered = verify_cold_archive(spec, tmp_path / 'packed')
+    assert recovered['snapshot_id'] == published['snapshot_id'] and recovered['decoded_originals_verified']
+    assert recovered['files'] == 3
+    assert {p.name: p.read_bytes() for p in target.iterdir()} == before
+
+
+@pytest.mark.parametrize('defect', ['missing_progress', 'different_progress', 'wrong_state', 'order',
+    'partial', 'unequal_hash', 'empty_hashes', 'missing_append', 'nonfinite_time', 'missing_code',
+    'relative_input', 'repeated_input', 'missing_manifest_proof', 'provider_call', 'production_write',
+    'missing_counter', 'wrong_storage_contract', 'boolean_counter', 'lost_values'])
+def test_panel_storage_completion_rejects_partial_changed_and_unbound_evidence(tmp_path, defect):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    value = _completed_panel_storage(tmp_path)
+    if defect == 'wrong_state': value['state'] = 'running'
+    elif defect == 'order': value['order'] = 'ABAB'
+    elif defect == 'partial': value['records'].pop()
+    elif defect == 'unequal_hash': value['records'][1]['complete_array_hashes']['features'] = 'e' * 64
+    elif defect == 'empty_hashes':
+        for row in value['records']: row['complete_array_hashes'] = {}
+    elif defect == 'missing_append': del value['records'][0]['stages']['append']
+    elif defect == 'nonfinite_time': value['records'][0]['stages']['append']['wall_seconds'] = float('nan')
+    elif defect == 'missing_code': value['source_code'].pop('stockagent/data/panel_chunks.py')
+    elif defect == 'relative_input': value['source_proofs'][0]['path'] = 'manifest.json'
+    elif defect == 'repeated_input': value['source_proofs'].append(value['source_proofs'][0])
+    elif defect == 'missing_manifest_proof': value['source_manifest'] = '/unknown/manifest.json'
+    elif defect == 'provider_call': value['provider_calls'] = 1
+    elif defect == 'production_write': value['production_cache_mutations'] = True
+    elif defect == 'missing_counter': del value['records'][0]['stages']['append']['storage_build']['written_arrays']
+    elif defect == 'wrong_storage_contract': value['records'][0]['stages']['append']['storage_build']['contract'] = 'unknown'
+    elif defect == 'boolean_counter': value['records'][0]['stages']['append']['storage_build']['written_arrays'] = True
+    elif defect == 'lost_values': value['original_values_receipts_preserved'] = False
+    (tmp_path / 'acceptance.json').write_text(json.dumps(value))
+    (tmp_path / 'progress.json').write_text(json.dumps({'records': value['records']}))
+    if defect == 'missing_progress': (tmp_path / 'progress.json').unlink()
+    elif defect == 'different_progress': (tmp_path / 'progress.json').write_text('{}')
+    with pytest.raises(SnapshotError, match='completed producer'):
+        completed_benchmark_evidence(tmp_path)
+    assert (tmp_path / 'acceptance.json').exists()  # Rejection never retires evidence.
+
+
+@pytest.mark.parametrize('defect', ['partial_modern_policy', 'unknown_header', 'missing_clock',
+    'naive_clock', 'invalid_clock', 'incomplete_record', 'bool_rss', 'negative_links',
+    'unequal_hash', 'different_progress', 'provider_call', 'nonfinite_time'])
+def test_original_panel_receipt_rejects_hybrid_and_incomplete_evidence(tmp_path, defect):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    value = _original_panel_storage(tmp_path)
+    if defect == 'partial_modern_policy': value['chunk_bytes'] = 8388608
+    elif defect == 'unknown_header': value['new_success_claim'] = True
+    elif defect == 'missing_clock': del value['observed_at_utc']
+    elif defect == 'naive_clock': value['observed_at_utc'] = '2026-10-15T18:15:34'
+    elif defect == 'invalid_clock': value['observed_at_utc'] = '2026-99-15T18:15:34Z'
+    elif defect == 'incomplete_record': del value['records'][0]['features_memmap']
+    elif defect == 'bool_rss': value['records'][0]['peak_process_rss_bytes'] = True
+    elif defect == 'negative_links': value['records'][0]['post_measurement_exact_links'] = -1
+    elif defect == 'unequal_hash': value['records'][1]['complete_array_hashes']['features'] = 'f' * 64
+    elif defect == 'provider_call': value['provider_calls'] = 1
+    elif defect == 'nonfinite_time': value['records'][0]['stages']['append']['cpu_seconds'] = float('inf')
+    (tmp_path / 'acceptance.json').write_text(json.dumps(value))
+    (tmp_path / 'progress.json').write_text(json.dumps({'records': value['records']}))
+    if defect == 'different_progress': (tmp_path / 'progress.json').write_text('{}')
+    before = (tmp_path / 'acceptance.json').read_bytes()
+    with pytest.raises(SnapshotError, match='completed producer'):
+        completed_benchmark_evidence(tmp_path)
+    assert (tmp_path / 'acceptance.json').read_bytes() == before
+
+
+def test_standalone_panel_cannot_borrow_other_producer_or_expand_to_suite(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence, RESEARCH_STAGING_CONTRACT
+    _completed_panel_storage(tmp_path)
+    with pytest.raises(SnapshotError, match='standalone case'):
+        completed_benchmark_evidence(tmp_path, required_contract=RESEARCH_STAGING_CONTRACT)
+    assert not cleanup.reviewed_wsl_artifact_root('benchmarks/panel_chunk_storage_20261016')
+    assert not cleanup.reviewed_wsl_artifact_root('benchmarks/panel_chunk_storage_20261016_final/nested/case')
+
+
+def test_standalone_research_staging_preserves_original_receipt_and_exact_cold_recovery(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, row, catalog = example(tmp_path)
+    relative = 'benchmarks/research-stage-copy-20261021-v94'
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    terminal = _completed_research_staging(target)
+    original = (target / 'receipt.json').read_bytes()
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    observed = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    assert observed['blockers'] == []
+    retained = tmp_path / 'retained-evidence'
+    proof = cleanup.benchmark_evidence(target, destination=retained)
+    assert proof == cleanup.benchmark_evidence(retained)
+    assert proof['producer_state'] == terminal['status']
+    assert (retained / 'receipt.json').read_bytes() == original
+    assert cleanup.stage_profile({'staging_profile': cleanup.D_BENCHMARK_STAGE_PROFILE,
+                                 'items': [{'relative_root': relative}]}) == (cleanup.D_BENCHMARK_STAGE_ROOT, True)
+    published = publish_archive(spec, root, tmp_path / 'packed', repo_root=root.parent, manual_capture=True)
+    recovered = verify_cold_archive(spec, tmp_path / 'packed')
+    assert recovered['decoded_originals_verified'] and recovered['snapshot_id'] == published['snapshot_id']
+    assert recovered['files'] == 2 and (target / 'receipt.json').read_bytes() == original
+
+
+@pytest.mark.parametrize('problem', [
+    'unfinished', 'order', 'truncated', 'rewritten_candidate', 'source_digest',
+    'source_bool', 'code_digest', 'calls_bool', 'writes', 'restart', 'nan_time', 'seed',
+])
+def test_standalone_staging_rejects_incomplete_or_foreign_completion_without_deletion(tmp_path, problem):
+    from stockagent.data_sync.benchmark_fixtures import completed_benchmark_evidence
+    value = _completed_research_staging(tmp_path)
+    if problem == 'unfinished':
+        value['status'] = 'running'
+    elif problem == 'order':
+        value['samples'][0], value['samples'][1] = value['samples'][1], value['samples'][0]
+    elif problem == 'truncated':
+        value['samples'].pop()
+    elif problem == 'rewritten_candidate':
+        value['samples'][1]['written_payload_bytes'] = 32
+    elif problem == 'source_digest':
+        value['source']['sha256'] = 'unknown'
+    elif problem == 'source_bool':
+        value['source']['bytes'] = True
+    elif problem == 'code_digest':
+        value['code_sha256']['/code/immutable_cache_files.py'] = 'unknown'
+    elif problem == 'calls_bool':
+        value['provider_calls'] = False
+    elif problem == 'writes':
+        value['production_writes'] = True
+    elif problem == 'restart':
+        value['service_restarts'] = 1
+    elif problem == 'nan_time':
+        value['samples'][0]['wall_seconds'] = float('nan')
+    else:
+        value.pop('baseline_seed')
+    receipt = tmp_path / 'receipt.json'
+    receipt.write_text(json.dumps(value))
+    before = receipt.read_bytes()
+    with pytest.raises(SnapshotError, match='completed producer'):
+        completed_benchmark_evidence(tmp_path)
+    assert receipt.read_bytes() == before
+
+
+def test_standalone_case_cannot_reuse_an_unrelated_suite_completion(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, row, catalog = example(tmp_path)
+    relative = 'benchmarks/research-stage-copy-20261021-v94'
+    target = root / relative
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    _completed_benchmark(target)
+    row['relative_root'] = relative
+    catalog.write_text(json.dumps({'schema_version': 1, 'authority_node_id': 'penguin', 'archives': [row]}))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    with pytest.raises(SnapshotError, match='standalone case'):
+        source_plan(target, spec, manual_capture=True)
+    observed = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    assert any('standalone case' in reason for reason in observed['blockers'])
+
+
+def test_offline_stage_selection_uses_its_own_fixed_d_root():
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.D_OFFLINE_STAGE_PROFILE,
+                 'items': [{'relative_root': 'operations/closed-audit/remote'}]}
+    assert cleanup.stage_profile(inventory) == (cleanup.D_OFFLINE_STAGE_ROOT, True)
+    with pytest.raises(SnapshotError, match='select only one'):
+        cleanup.inventory([], None, guarded_d_scratch=True, guarded_d_offline_scratch=True)
+
+
+@pytest.mark.parametrize('relative', ['operations', 'data_finlab', 'data_finlab/parquet',
+                                      'benchmarks/suite/case', 'markets/experiment',
+                                      'live/active', 'operations/../data_news'])
+def test_offline_d_stage_cannot_capture_raw_sources_or_other_roles(relative):
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.D_OFFLINE_STAGE_PROFILE,
+                 'items': [{'relative_root': relative}]}
+    with pytest.raises(SnapshotError):
+        cleanup.stage_profile(inventory)
+
+
+@pytest.mark.parametrize('change', ['multiple', 'existing', 'origin', 'catalog'])
+def test_offline_d_stage_never_overrides_frozen_source_or_archive_roles(change):
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.D_OFFLINE_STAGE_PROFILE,
+                 'items': [{'relative_root': 'operations/closed-audit'}]}
+    if change == 'multiple':
+        inventory['items'] *= 2
+    elif change == 'existing':
+        inventory['items'][0]['existing_dataset'] = 'old-archive'
+    elif change == 'origin':
+        inventory['source_origin'] = 'retained-hot-mirror-preservation-v1'
+    else:
+        inventory['existing_catalog_sha256'] = 'a' * 64
+    with pytest.raises(SnapshotError, match='staging profile'):
+        cleanup.stage_profile(inventory)
 
 
 @pytest.mark.parametrize('problem', ['foreign', 'suite-root', 'raw-source', 'multiple',
@@ -751,6 +1475,87 @@ def test_reuse_completed_publication_requires_fixed_identity_and_claims_no_recov
     assert source.is_dir()
 
 
+@pytest.mark.parametrize('defect', [None, 'source', 'encoding'])
+def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_path, monkeypatch, defect):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync import legacy_artifact_archive as archives
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed, target = tmp_path/'packed', tmp_path/'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'publication.lock')
+    checked_roots = []
+    monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: checked_roots.append(path))
+    manifest = prepare_archive(spec, root, manual_capture=True, repo_root=root.parent)
+    archive = spec.stage_root/spec.dataset/'archive'
+    if defect == 'source':
+        (source/'unique-result.bin').write_bytes(b'new source generation')
+    elif defect == 'encoding':
+        (archive/manifest['files'][0]['encoded_path']).write_bytes(b'broken encoded bytes')
+    def forbidden(*args, **kwargs):
+        pytest.fail('complete encodings use the canonical publisher rather than another outer full scan')
+    for name in ('prepare_archive', 'verify_archive_directory'):
+        monkeypatch.setattr(cleanup, name, forbidden)
+    calls = []
+    verifier = archives.verify_archive_directory
+    def checked(*args, **kwargs):
+        calls.append('canonical-complete-verification')
+        return verifier(*args, **kwargs)
+    monkeypatch.setattr(archives, 'verify_archive_directory', checked)
+    if defect:
+        with pytest.raises(SnapshotError):
+            cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
+        assert calls == ['canonical-complete-verification']
+        assert not (target/'publication.json').exists()
+        assert not (packed/'heads'/spec.dataset).exists()
+    else:
+        published = cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
+        assert calls == ['canonical-complete-verification'] * 2
+        assert json.loads((target/'publication.json').read_bytes()) == published
+        proof = verify_cold_archive(spec, packed)
+        assert proof['decoded_originals_verified'] and proof['snapshot_id'] == published['snapshot_id']
+    assert checked_roots == [packed]
+    assert source.is_dir()
+
+
+@pytest.mark.parametrize('defect', [None, 'source', 'encoding'])
+def test_fixed_publication_resume_avoids_preparation_but_keeps_all_byte_audits(tmp_path, monkeypatch, defect):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.legacy_artifact_archive import verify_archive_directory
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed, target = tmp_path/'packed', tmp_path/'receipt'
+    target.mkdir()
+    published = publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    (target/'publication.json').write_text(json.dumps(published))
+    archive = spec.stage_root/spec.dataset/'archive'
+    if defect == 'source':
+        (source/'unique-result.bin').write_bytes(b'new source generation')
+    elif defect == 'encoding':
+        member = next(p for p in archive.rglob('*') if p.is_file() and p.name != 'legacy_archive_manifest.json')
+        member.write_bytes(b'broken encoded bytes')
+    def forbidden(*args, **kwargs):
+        pytest.fail('a fixed publication resumes at mandatory D recovery, not preparation/republication')
+    for name in ('prepare_archive', 'verify_archive_directory', 'publish_archive'):
+        monkeypatch.setattr(cleanup, name, forbidden)
+    resumed = cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
+    assert resumed == published and 'cold_verified' not in resumed
+    if defect == 'encoding':
+        with pytest.raises((SnapshotError, OSError, ValueError)):
+            cleanup.verify_for_retirement(spec, packed, target)
+    else:
+        proof = cleanup.verify_for_retirement(spec, packed, target)
+        assert proof['decoded_originals_verified'] and proof['snapshot_id'] == resumed['snapshot_id']
+        if defect == 'source':
+            with pytest.raises(SnapshotError):
+                verify_archive_directory(archive, source, spec=spec, artifact_root=root,
+                                         repo_root=root.parent, manual_capture=True)
+        else:
+            assert verify_archive_directory(archive, source, spec=spec, artifact_root=root,
+                repo_root=root.parent, manual_capture=True)['files'] == 1
+    assert source.exists()  # Neither resumption nor recovery is deletion permission.
+
+
 def test_queued_cleanup_cannot_enter_the_existing_cohort_transaction(tmp_path, monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     import fcntl
@@ -829,16 +1634,23 @@ def test_recovery_interrupt_keeps_partial_telemetry_and_never_accepts_retirement
     assert source.is_dir() and not (target / 'retirement.json').exists()
 
 
-def test_inventory_drift_only_admits_removed_hardlinks(tmp_path,monkeypatch):
+def test_inventory_drift_only_admits_removed_hardlinks(tmp_path):
     from scripts import retire_local_offline_artifacts as cleanup
     root,source,row,catalog=example(tmp_path)
-    monkeypatch.setattr(cleanup,'artifact_service_references',lambda roots,repo:{str(p):[] for p in roots})
-    monkeypatch.setattr(cleanup,'active_configuration_references',lambda *a:[])
     neighbor=tmp_path/'other-hardlink'
     os.link(source/'unique-result.bin',neighbor)
-    before=cleanup.observe(root,'replays/old-result')
+    before=cleanup.observe(root,'replays/old-result', service_refs=[], configuration_refs=[], process_refs=[])
     neighbor.unlink()
-    after=cleanup.observe(root,'replays/old-result')
+    observed=cleanup.observe(root,'replays/old-result', service_refs=[], configuration_refs=[], process_refs=[])
+    first_ctime=before['observation_rows'][0]['signature'][4]
+    observed_ctime=observed['observation_rows'][0]['signature'][4]
+    expected=[{'path':'unique-result.bin','before_links':2,'current_links':1}]
+    # Actual WSL CLOCK_REALTIME can step backwards, including during unlink.
+    # The real observation must stay denied in that case. Use explicit fixture
+    # clocks for the separate pure admission tests, never amend a real receipt.
+    assert cleanup.shared_link_observation_drift(before,observed)==(expected if observed_ctime>=first_ctime else None)
+    after=json.loads(json.dumps(observed))
+    after['observation_rows'][0]['signature'][4]=first_ctime+1
     assert cleanup.shared_link_observation_drift(before,after)==[
         {'path':'unique-result.bin','before_links':2,'current_links':1}]
     for position in (0,1,2,3,5):
@@ -846,6 +1658,93 @@ def test_inventory_drift_only_admits_removed_hardlinks(tmp_path,monkeypatch):
         assert cleanup.shared_link_observation_drift(before,changed) is None
     no_link_change=json.loads(json.dumps(after));no_link_change['observation_rows'][0]['signature'][6]=2
     assert cleanup.shared_link_observation_drift(before,no_link_change) is None
+    clock_backwards=json.loads(json.dumps(after));clock_backwards['observation_rows'][0]['signature'][4]=first_ctime-1
+    assert cleanup.shared_link_observation_drift(before,clock_backwards) is None
+
+
+def _renumber_observations(cleanup, root, relative):
+    current = cleanup.observe(root, relative, service_refs=[], configuration_refs=[], process_refs=[])
+    original = json.loads(json.dumps(current))
+    for row in original['observation_rows']:
+        row['signature'][0] += 1
+    return original, current
+
+
+def test_uniform_device_renumber_preserves_all_other_observations(tmp_path):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, _row, _catalog = example(tmp_path)
+    (source / 'empty-directory').mkdir()
+    original, current = _renumber_observations(cleanup, root, 'replays/old-result')
+    result = cleanup.uniform_device_renumber_drift(original, current)
+    assert result['original_device'] == source.stat().st_dev + 1
+    assert result['current_device'] == source.stat().st_dev
+    assert result['unchanged_other_observation_rows'] == 2
+    assert result['source_bytes_verified'] is False
+    assert result['full_original_and_cold_verification_required'] is True
+
+
+@pytest.mark.parametrize('position', [1, 2, 3, 4, 5, 6])
+def test_device_renumber_rejects_any_other_stat_change(tmp_path, position):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, _source, _row, _catalog = example(tmp_path)
+    original, current = _renumber_observations(cleanup, root, 'replays/old-result')
+    current['observation_rows'][0]['signature'][position] += 1
+    assert cleanup.uniform_device_renumber_drift(original, current) is None
+
+
+@pytest.mark.parametrize('defect', ['partial-device', 'different-devices', 'missing-row',
+                                  'path', 'kind', 'cross-filesystem', 'old-inventory'])
+def test_device_renumber_requires_one_complete_unchanged_tree(tmp_path, defect):
+    from scripts import retire_local_offline_artifacts as cleanup
+    root, source, _row, _catalog = example(tmp_path)
+    (source / 'directory').mkdir()
+    original, current = _renumber_observations(cleanup, root, 'replays/old-result')
+    row = current['observation_rows'][0]
+    if defect == 'partial-device':
+        row['signature'][0] = original['observation_rows'][0]['signature'][0]
+    elif defect == 'different-devices':
+        row['signature'][0] += 2
+    elif defect == 'missing-row':
+        current['observation_rows'].pop()
+    elif defect == 'path':
+        row['path'] = 'other'
+    elif defect == 'kind':
+        row['kind'] = 'unsupported'
+    elif defect == 'cross-filesystem':
+        row['cross_filesystem'] = True
+    else:
+        original.pop('observation_rows')
+    assert cleanup.uniform_device_renumber_drift(original, current) is None
+
+
+@pytest.mark.parametrize('corrupt', [False, True])
+def test_renumbered_source_reuses_original_capture_only_with_complete_sha(tmp_path, monkeypatch, corrupt):
+    import stockagent.data_sync.legacy_artifact_archive as canonical
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    signature = canonical._source_signature
+    with monkeypatch.context() as capture:
+        capture.setattr(canonical, '_source_signature',
+                        lambda info: {**signature(info), 'device': info.st_dev + 1})
+        prepare_archive(spec, root, manual_capture=True)
+    manifest_path = spec.stage_root / spec.dataset / 'archive/legacy_archive_manifest.json'
+    original_manifest = manifest_path.read_bytes()
+    if corrupt:
+        path = source / 'unique-result.bin'
+        info = path.stat()
+        path.write_bytes(b'X' * info.st_size)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+    monkeypatch.setattr(canonical, 'prepare_archive',
+                        lambda *a, **kw: pytest.fail('retain the original complete capture'))
+    if corrupt:
+        with pytest.raises(SnapshotError, match='source differs'):
+            publish_archive(spec, root, tmp_path / 'cold', repo_root=root.parent, manual_capture=True)
+        assert not (tmp_path / 'cold/heads').exists()
+    else:
+        published = publish_archive(spec, root, tmp_path / 'cold', repo_root=root.parent, manual_capture=True)
+        recovered = verify_cold_archive(spec, tmp_path / 'cold')
+        assert recovered['snapshot_id'] == published['snapshot_id'] and recovered['decoded_originals_verified']
+    assert manifest_path.read_bytes() == original_manifest
 
 
 @pytest.mark.parametrize('problem', [None, 'wait-failed', 'transport-changed',
@@ -872,11 +1771,10 @@ def test_scan_wait_keeps_original_full_audit_and_all_final_gates(tmp_path, monke
     waits = []
     def wait(cfg, seconds):
         with cleanup.COMMON_OWNER.open('a') as probe:
-            with pytest.raises(BlockingIOError):
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        assert 0 <= seconds <= 300
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert 0 <= seconds <= 60
         waits.append(True)
-        if problem == 'expired-during':
+        if problem in ('expired-during', 'wait-failed'):
             monkeypatch.setattr(cleanup.time, 'time', lambda: verified_at + 1501)
         if problem == 'source':
             file = source/'checkpoint.pt';info=file.stat()
@@ -890,7 +1788,7 @@ def test_scan_wait_keeps_original_full_audit_and_all_final_gates(tmp_path, monke
     monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
     monkeypatch.setattr(retirement, 'verify_packed_snapshot',
                         lambda *a, **kw: pytest.fail('full audit repeated while holding mutation owner'))
-    if problem in ('wait-failed', 'transport-changed', 'consumer', 'source'):
+    if problem in ('transport-changed', 'consumer', 'source'):
         with pytest.raises(SnapshotError):
             cleanup.retire_after_convergence(spec, None, target, plan, options)
         assert source.exists() and hot.exists()
@@ -902,6 +1800,106 @@ def test_scan_wait_keeps_original_full_audit_and_all_final_gates(tmp_path, monke
             assert result['deleted'] is True and not source.exists() and not hot.exists()
             assert plan['full_verification']['verified_at_epoch'] == verified_at
     assert bool(waits) is (problem not in ('consumer', 'expired-before'))
+
+
+@pytest.mark.parametrize('outcome', ['success', 'exhausted', 'expired', 'unlink', 'combined', 'source'])
+def test_transport_preflight_retry_is_bounded_and_never_replays_mutation(tmp_path, monkeypatch, outcome):
+    from types import SimpleNamespace
+    import fcntl
+    from scripts import retire_local_offline_artifacts as cleanup
+    marker = tmp_path / 'untouched-source'
+    marker.write_bytes(b'original unique observation')
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    verified_at = time.time()
+    clock = {'now': verified_at}
+    monkeypatch.setattr(cleanup.time, 'time', lambda: clock['now'])
+    spec = SimpleNamespace(relative_root='replays/example')
+    plan = {'blockers': [], 'plan_fingerprint': 'a' * 64,
+            'full_verification': {'verified_at_epoch': verified_at}}
+    waits, applies = [], []
+    def wait(cfg, seconds):
+        assert 0 <= seconds <= 60
+        with cleanup.COMMON_OWNER.open('a') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waits.append(seconds)
+        return {'ok': True}
+    def apply(value, **options):
+        assert value is spec and options['owned_verified_plan'] is plan
+        assert options['expected_fingerprint'] == plan['plan_fingerprint']
+        assert options['manual_immediate'] is True
+        with cleanup.COMMON_OWNER.open('a') as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        applies.append(True)
+        if outcome == 'success' and len(applies) == 2:
+            return {'deleted': True}
+        if outcome == 'expired':
+            clock['now'] = verified_at + 1501
+        message = {
+            'unlink': 'legacy retirement unlink blocked: cold-peer-not-converged',
+            'combined': 'legacy retirement blocked: cold-peer-not-converged, artifact-release-is-pinned',
+            'source': 'legacy retirement plan changed; rerun dry run',
+        }.get(outcome, 'legacy retirement blocked: cold-peer-not-converged')
+        raise SnapshotError(message)
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', apply)
+    call = lambda: cleanup.retire_after_convergence(spec, None, target, plan, {'manual_immediate': True})
+    if outcome == 'success':
+        assert call() == {'deleted': True}
+    elif outcome == 'expired':
+        assert call() is None
+    else:
+        with pytest.raises(SnapshotError):
+            call()
+    expected = 2 if outcome == 'success' else 3 if outcome == 'exhausted' else 1
+    assert len(waits) == len(applies) == expected
+    journal = [json.loads(path.read_bytes()) for path in target.glob('transport-preflight-retry-*.json')]
+    assert len(journal) == (1 if outcome in ('success', 'expired') else 2 if outcome == 'exhausted' else 0)
+    assert all(row['proof_time_extended'] is False and row['original_verified_at_epoch'] == verified_at
+               for row in journal)
+    assert plan['full_verification']['verified_at_epoch'] == verified_at
+    assert marker.read_bytes() == b'original unique observation'
+
+
+@pytest.mark.parametrize('scan_seconds', [360, 900])
+def test_long_healthy_scan_waits_without_repeating_or_extending_full_audit(tmp_path, monkeypatch, scan_seconds):
+    from types import SimpleNamespace
+    import fcntl
+    from scripts import retire_local_offline_artifacts as cleanup
+    target = tmp_path / 'receipt'; target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'owner.lock')
+    verified_at = time.time()
+    clock = {'now': verified_at}
+    monkeypatch.setattr(cleanup.time, 'time', lambda: clock['now'])
+    plan = {'blockers': ['cold-peer-not-converged'], 'plan_fingerprint': 'b' * 64,
+            'full_verification': {'verified_at_epoch': verified_at}}
+    waits, applies = [], []
+    def wait(cfg, seconds):
+        assert 0 < seconds <= 60
+        with cleanup.COMMON_OWNER.open('a') as other_owner:
+            fcntl.flock(other_owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        clock['now'] += seconds
+        waits.append(seconds)
+        return {'ok': clock['now'] - verified_at >= scan_seconds}
+    def apply(spec, **options):
+        with cleanup.COMMON_OWNER.open('a') as other_owner:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other_owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert options['owned_verified_plan'] is plan
+        assert plan['full_verification']['verified_at_epoch'] == verified_at
+        applies.append(True)
+        return {'deleted': True}
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', apply)
+    monkeypatch.setattr(cleanup, 'plan_legacy_retirement',
+                        lambda *a, **kw: pytest.fail('fresh full audit repeated for a healthy scan'))
+    assert cleanup.retire_after_convergence(SimpleNamespace(relative_root='replays/example'), None,
+                                           target, plan, {}) == {'deleted': True}
+    assert sum(waits) == scan_seconds and applies == [True]
+    saved = json.loads((target / 'retirement-peer-wait.json').read_bytes())
+    assert saved['original_verified_at_epoch'] == verified_at and saved['proof_time_extended'] is False
 
 
 def test_batched_active_configuration_keeps_independent_jobs_and_unreadable_configs_protected(tmp_path):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass
 from datetime import date
@@ -7,6 +8,7 @@ import fnmatch
 from functools import lru_cache
 import math
 from pathlib import Path
+from threading import RLock
 from typing import Any, get_args, get_type_hints
 
 import yaml
@@ -2240,6 +2242,11 @@ class TransformerBasePortfolioModelConfig:
     # Batch market coefficients, resolved against actual prior NAV/inventory
     # inside the canonical exact margin account (distinct output/checkpoint ABI).
     futures_causal_account_policy: bool = False
+    # Optional prior-mark requested net-notional/NAV cap, after account feedback.
+    # Zero is requested neutrality; whole-contract execution remains authoritative.
+    futures_net_notional_cap: float | None = None
+    # Optional prior-only TX-beta notional/NAV cap; exclusive with the net cap.
+    futures_beta_notional_cap: float | None = None
     # Historical models quantized group actions against one fixed reference
     # capital before the recurrent integer executor quantized them again against
     # live equity. New exact-account experiments may retain denomination context
@@ -4678,6 +4685,22 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or trading["long_only"] or trading["min_trade_weight"] != 0
     ):
         raise ValueError("causal account policy requires ordinary, prior-only, uncentered exact margin log-cash training with margin amounts and no model size projection")
+    net_cap = phase_model_config["futures_net_notional_cap"]
+    if net_cap is not None and (
+        not isinstance(net_cap, (float, int)) or isinstance(net_cap, bool)
+        or not math.isfinite(net_cap) or net_cap < 0
+        or not phase_model_config["futures_causal_account_policy"]
+    ):
+        raise ValueError("prior net notional cap requires a causal account policy and a finite nonnegative cap")
+    beta_cap = phase_model_config["futures_beta_notional_cap"]
+    if beta_cap is not None and (
+        not isinstance(beta_cap, (float, int)) or isinstance(beta_cap, bool)
+        or not math.isfinite(beta_cap) or beta_cap < 0
+        or net_cap is not None or not phase_model_config["futures_causal_account_policy"]
+        or trading["tw_futures_portfolio_benchmark_mode"] != "tx_front_rolling_1x_gross"
+        or training["lookback"] < 2
+    ):
+        raise ValueError("prior beta notional cap requires causal TX observations, lookback >= 2 and no net cap")
     step_drawdown = training["futures_training_max_drawdown"]
     if not isinstance(training["futures_training_stop_on_rejected_step"], bool):
         raise ValueError("futures_training_stop_on_rejected_step must be a boolean")
@@ -5731,6 +5754,76 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         ],
     )
     return raw
+
+
+_CONFIG_SNAPSHOT_CACHE: OrderedDict[
+    tuple[bool, str], tuple[dict[Path, tuple[int, ...]], ExperimentConfig]
+] = OrderedDict()
+_CONFIG_SNAPSHOT_LOCK = RLock()
+_CONFIG_SNAPSHOT_MAX_ENTRIES = 64
+
+
+def clear_config_snapshot_cache() -> None:
+    """Release parsed CPU-only configuration snapshots, never runtime state."""
+    with _CONFIG_SNAPSHOT_LOCK:
+        _CONFIG_SNAPSHOT_CACHE.clear()
+
+
+def _config_sources_unchanged(sources: dict[Path, tuple[int, ...]]) -> bool:
+    try:
+        return bool(sources) and all(
+            _config_source_identity(path) == identity for path, identity in sources.items()
+        )
+    except OSError:
+        return False
+
+
+def load_config_cached(path: str | Path) -> ExperimentConfig:
+    """Reuse validated setup only while every inherited source is unchanged.
+
+    No TTL, source-data cache or mutable configuration is shared with callers.
+    Check both sides of the copy so a concurrent edit cannot admit an old
+    snapshot. A miss still uses the canonical complete loader and validation.
+    Keep the requested lexical path: resolving a symlink once would miss its
+    later retargeting. Failed/partial loads are never cached.
+    """
+    original = Path(path).expanduser()
+    requested = original.absolute()
+    key = (original.is_absolute(), str(requested))
+    with _CONFIG_SNAPSHOT_LOCK:
+        cached = _CONFIG_SNAPSHOT_CACHE.get(key)
+        if cached is not None:
+            _CONFIG_SNAPSHOT_CACHE.move_to_end(key)
+    if cached is not None and _config_sources_unchanged(cached[0]):
+        result = deepcopy(cached[1])
+        if _config_sources_unchanged(cached[0]):
+            return result
+        with _CONFIG_SNAPSHOT_LOCK:
+            if _CONFIG_SNAPSHOT_CACHE.get(key) is cached:
+                del _CONFIG_SNAPSHOT_CACHE[key]
+        raise ValueError(f"Config source changed during cached load: {requested}")
+    with _CONFIG_SNAPSHOT_LOCK:
+        if _CONFIG_SNAPSHOT_CACHE.get(key) is cached:
+            _CONFIG_SNAPSHOT_CACHE.pop(key, None)
+    sources: dict[Path, tuple[int, ...]] = {}
+    requested_identity = _config_source_identity(requested)
+    # The canonical loader resolves relative paths before following inheritance,
+    # but retains absolute paths. Preserve that behavior for symlinked configs.
+    config = load_config(original, source_signatures=sources)
+    if _config_source_identity(requested) != requested_identity:
+        raise ValueError(f"Config source changed during load: {requested}")
+    sources[requested] = requested_identity
+    if not _config_sources_unchanged(sources):
+        raise ValueError(f"Config source changed during load: {requested}")
+    result = deepcopy(config)
+    if not _config_sources_unchanged(sources):
+        raise ValueError(f"Config source changed during config copy: {requested}")
+    with _CONFIG_SNAPSHOT_LOCK:
+        _CONFIG_SNAPSHOT_CACHE[key] = (sources, config)
+        _CONFIG_SNAPSHOT_CACHE.move_to_end(key)
+        while len(_CONFIG_SNAPSHOT_CACHE) > _CONFIG_SNAPSHOT_MAX_ENTRIES:
+            _CONFIG_SNAPSHOT_CACHE.popitem(last=False)
+    return result
 
 
 def load_config(

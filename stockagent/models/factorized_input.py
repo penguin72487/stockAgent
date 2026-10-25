@@ -8,6 +8,7 @@ execution is introduced. Raw observations remain in their source packages.
 from __future__ import annotations
 from collections import OrderedDict
 import hashlib
+import math
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
@@ -136,9 +137,31 @@ def _factorized_stock_chunk_size(model, slab, mask, *, raw_basis=False):
     return max(1, min(cap, budget // max(1, rows * slab.size(2) * 4)))
 
 
+def _live_candle_prefix_key(model, window):
+    """Exact source/encoder generation; final-row observations are not cached."""
+    from stockagent.data.factorized_panel import FactorizedDateView, _live_host_packets_reusable
+    features = window.features
+    source = features.source if isinstance(features, FactorizedDateView) else features
+    if not _live_host_packets_reusable(source) or window.shape[0] < 2:
+        return None
+    candle = model.candle_encoder
+    device = candle.candle_query.device
+    try:
+        generation = tuple((name, value.data_ptr(), value._version,
+                            str(value.dtype), str(value.device), tuple(value.shape))
+                           for name, value in (*candle.named_parameters(), *candle.named_buffers()))
+    except RuntimeError:
+        return None
+    return (id(features), features.content_fingerprint["sha256"], window.start, window.stop,
+            tuple(window.shape), generation, repr(candle), candle.training,
+            candle.sanitize_inputs, candle.projection_fp32, torch.is_autocast_enabled(device.type),
+            str(torch.get_autocast_dtype(device.type)), torch.get_float32_matmul_precision(),
+            torch.backends.cuda.matmul.allow_tf32)
+
+
 def forward_factorized_live_window(model, window, mask, *, return_aux=None,
                                    symbol_indices=None, portfolio_context=None,
-                                   materialize_candle_aux=True):
+                                   materialize_candle_aux=True, prepared_full_shape_prefix=False):
     """Lossless bounded transport, full-shape original math, private workspace."""
     if model.training or not torch.is_inference_mode_enabled():
         raise RuntimeError("factorized live windows require eval and inference mode")
@@ -163,10 +186,46 @@ def forward_factorized_live_window(model, window, mask, *, return_aux=None,
     # Candle projection itself is not bit-equivalent on all CUDA kernels.
     # Only storage transport is chunked. This freshly reconstructed allocation
     # is owned by this call, so RMS can normalize in place without a 5 GiB clone.
-    raw = window.materialize(model.candle_encoder.candle_query.device)
+    device = model.candle_encoder.candle_query.device
+    key = _live_candle_prefix_key(model, window) if prepared_full_shape_prefix else None
+    cached = model.__dict__.get("_live_full_shape_prefix") if prepared_full_shape_prefix else None
+    hit = key is not None and cached is not None and cached[0] == key and cached[1] is window.features
+    if hit:
+        # A tail-sized GEMM changed native MGDA rounding. Preserve the entire
+        # ORIGINAL GEMM/reduction shape, but transport only the current row.
+        # No fabricated zero historical embeddings enter the temporal model:
+        # discard those workspace results and restore the exact saved prefix.
+        tail = type(window)(window.features, window.stop - 1, window.stop, overlay=window.overlay)
+        raw = torch.zeros((1, *window.shape), device=device, dtype=torch.float32)
+        last = tail.materialize(device)
+        raw[:, -1:].copy_(last)
+        del last
+        window.transport_stats = {**tail.transport_stats, "prepared_full_shape_prefix_hit": True,
+            "prepared_prefix_bytes": cached[2].numel() * cached[2].element_size(),
+            "logical_full_window_bytes": 4 * math.prod(window.shape)}
+    else:
+        raw = window.materialize(device)
+        if prepared_full_shape_prefix:
+            window.transport_stats["prepared_full_shape_prefix_hit"] = False
     h, token_aux = model.candle_encoder(raw, return_aux=collect, owned_inference=True,
                                       materialize_aux=materialize_candle_aux)
     del raw
+    if hit:
+        if cached[3] is not None:
+            torch.cuda.current_stream(device).wait_event(cached[3])
+        h = torch.cat((cached[2], h[:, -1:]), dim=1)
+        if collect and materialize_candle_aux:
+            token_aux = {"candle_tokens": h.unsqueeze(-2),
+                "candle_token_weights": h.new_ones(*h.shape[:-1], 1), "candle_embedding": h}
+    elif key is not None and h[:, :-1].numel() * h.element_size() <= 64 * 1024**2:
+        prefix = h[:, :-1].detach().clone()
+        ready = None
+        if device.type == "cuda":
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device))
+        model.__dict__["_live_full_shape_prefix"] = (key, window.features, prefix, ready)
+    elif prepared_full_shape_prefix:
+        model.__dict__.pop("_live_full_shape_prefix", None)
     h = model._add_window_positions(h, int(mask.size(1)), symbol_indices)
     output = model._forward_embedded(h, mask, return_aux=return_aux,
                                     portfolio_context=portfolio_context)

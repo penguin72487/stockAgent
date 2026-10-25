@@ -24,6 +24,98 @@ def _ledger():
         "provider_aliases": {"unregistered:example.org": "moneydj"}}
 
 
+def test_contentplatform_review_reuses_completed_scope_without_granting_missing_bodies():
+    from scripts.plan_news_sources import review_resume_plan
+
+    path=Path('configs/news_fulltext.json')
+    before=configuration_revision(path),load_news_configuration(path)
+    ledger=load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review=ledger['contentplatform']
+    assert ledger['unregistered:www.contentplatform.info']==review
+    assert review['capture_decision']=='review_incomplete'
+    scope=review['current_scope_review']
+    assert (scope['known_URL_heads'],scope['stored_body_heads'])==(75,14)
+    assert sum(scope['states'].values())==75
+    assert scope['states']=={'article_identity_not_verified':5,'article_rights_or_scope_excluded':56,'complete':14}
+    assert scope['previous_complete_bodies_preserved']+scope['v2_retained_formal_body_heads']+scope['v2_owner_new_body_heads']==14
+    assert scope['body_versions_verified']==scope['current_heads_verified']==14
+    assert scope['body_batches_verified']==9
+    assert scope['old_complete_body_GETs']==scope['v2_retained_materialization_GETs']==0
+    assert scope['loaded_code_and_local_HTTPS_progress_verified']
+    assert scope['bounded_first_pass_complete'] and not scope['all_known_bodies_complete']
+    assert not any(scope[key] for key in ('source_authorization_granted','whole_publisher_history_complete',
+        'source_maximum_verified','official_numeric_rate_limit_verified','whole_history_ETA_verified'))
+    state=review_resume_plan({'enabled':False},review)
+    assert state['source_review_work_state']=='partially_completed'
+    assert not state['recorded_review_stage_complete']
+    assert not state['review_annotation_grants_capture_access']
+    assert before==(configuration_revision(path),load_news_configuration(path))
+
+
+def test_fuhouse_review_annotation_preserves_canonical_scope_and_unfinished_work():
+    from scripts.plan_news_sources import review_resume_plan
+
+    path = Path('configs/news_fulltext.json')
+    before = configuration_revision(path), load_news_configuration(path)
+    ledger = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    review = ledger['policy_setn_fuhouse']
+    assert review == ledger['unregistered:fuhouse.setn.com']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['known_URL_heads'], scope['stored_body_heads']) == (83, 56)
+    assert sum(scope['states'].values()) == scope['known_URL_heads']
+    assert scope['historical_homepage_review']['known_URL_heads'] == 82
+    assert scope['historical_homepage_review']['stored_body_heads'] == 0
+    assert scope['historical_native_v1_review']['stored_body_heads'] == 1
+    assert scope['historical_native_v2_review']['stored_body_heads'] == 3
+    assert scope['historical_native_v3_review']['stored_body_heads'] == 50
+    assert scope['article_HTTP_requests_by_review'] == 13
+    assert scope['new_v2_formal_bodies'] == 2
+    assert scope['normal_owner_v2_repair_unique_URLs'] == scope['normal_owner_v2_repair_publisher_HTTP_requests'] == 53
+    assert scope['normal_owner_v2_repair_new_bodies'] == 0
+    assert scope['new_v3_retained_formal_bodies'] == 4
+    assert scope['normal_owner_v3_repair_unique_URLs'] == scope['normal_owner_v3_repair_publisher_HTTP_requests'] == 49
+    assert scope['normal_owner_v3_repair_new_bodies'] == 43
+    assert scope['normal_owner_v3_repair_remaining_parse_failures'] == 6
+    assert scope['states'].get('article_attribution_not_verified',0) == 0
+    assert scope['states'].get('article_identity_not_verified',0) == 0
+    assert scope['states']['article_rights_or_scope_excluded'] == 27
+    assert scope['eligible_native_original_heads'] == scope['eligible_native_original_body_heads'] == 56
+    assert scope['unfinished_native_original_heads'] == scope['v4_remaining_native_parse_failures'] == 0
+    assert scope['known_scope_native_originals_complete']
+    assert scope['new_v4_retained_formal_bodies'] == 6
+    assert scope['v4_new_diagnostic_unique_URLs'] == scope['v4_new_diagnostic_publisher_HTTP_requests'] == 6
+    assert scope['v4_retained_adoption_publisher_HTTP_requests'] == 0
+    assert scope['retained_raw_adoption_publisher_requests'] == 0
+    assert scope['original_HTTP_identity_and_pacing_preserved']
+    assert scope['observed_adaptive_interval_seconds'] == 2
+    assert scope['observed_peak_HTTP_inflight'] == 1 and scope['observed_calibration_state'] == 'ramping'
+    assert scope['local_and_HTTPS_body_receipts_verified']
+    assert not any(scope[k] for k in ('source_authorization_granted',
+        'whole_publisher_history_complete', 'exact_historical_PIT_verified',
+        'source_maximum_verified', 'whole_history_ETA_verified'))
+    state = review_resume_plan({'enabled': False}, review)
+    assert state['source_review_work_state'] == 'partially_completed'
+    assert not state['recorded_review_stage_complete']
+    assert not state['review_annotation_grants_capture_access']
+    assert json.loads(state['remaining_review_questions_json']) == scope['remaining_questions']
+    assert before == (configuration_revision(path), load_news_configuration(path))
+
+
+def test_stock_article_hops_do_not_admit_an_alias_or_request_the_unobserved_destination():
+    ledger = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
+    scope = ledger['unregistered:stock.setn.com']['current_scope_review']
+    assert scope['known_URL_heads'] == 164 and scope['stored_body_heads'] == 0
+    assert scope['article_HTTP_requests_by_review'] == 2
+    assert scope['stock_article_requests'] == scope['literal_inews_next_hop_requests'] == 1
+    assert scope['article_redirect_statuses'] == [301, 301]
+    assert scope['literal_article_locations'] == [
+        'http://inews.setn.com/news/1681579', 'https://inews.setn.com/news/1681579']
+    assert scope['final_HTTPS_representation_requests'] == scope['article_aliases_admitted'] == 0
+    assert scope['historical_homepage_review']['article_HTTP_requests_by_review'] == 0
+    assert not scope['whole_publisher_history_complete']
+
+
 def test_inews_native_progress_does_not_promote_a_review_to_permission_or_whole_history():
     from scripts.plan_news_sources import review_resume_plan
 
@@ -82,7 +174,9 @@ def test_review_reading_preserves_separately_admitted_or_disabled_source_configu
     entry = next(p for p in before[1]['providers'] if p['id'] == provider)
     if provider == 'gvm':
         assert entry['enabled'] and entry['authorization']['kind'] == 'personal_research'
-        assert entry['acquisition_mode'] == 'finite' and len(entry['finite_article_urls']) == 2
+        assert entry['acquisition_mode'] == 'continuous'
+        assert entry['private_known_url_scope'] == 'personal_noncommercial_originals_v1'
+        assert not entry.get('finite_article_urls')
     else:
         assert not entry['enabled'] and entry['authorization']['kind'] == 'awaiting_authorization'
     assert before == (configuration_revision(config_path), load_news_configuration(config_path))
@@ -109,27 +203,36 @@ def test_gvm_private_pair_is_not_all_subsites_editorial_or_historical_clock_comp
         'official_numeric_rate_limit_verified'))
 
 
-def test_production_gvm_http_identity_and_literal_pair_are_exactly_closed():
-    from downloader.news_fulltext_gvm import GVM_FINITE_HTTP_BINDING
-    from downloader.news_fulltext_http import NewsHTTP
-    from downloader.news_fulltext_policy import NewsError, PolicyRegistry
+def test_production_gvm_known_url_revision_does_not_inherit_finite_capacity_or_discovery():
+    from copy import deepcopy
+    from downloader.news_fulltext_gvm import GVM_FINITE_HTTP_BINDING, GVM_V2_VERIFICATION
+    from downloader.news_fulltext_policy import PolicyRegistry
 
-    registry = PolicyRegistry(load_news_configuration(Path('configs/news_fulltext.json')), base=Path('.'))
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    registry = PolicyRegistry(config, base=Path('.'))
     source = registry.sources['gvm']
-    assert (source.data_fingerprint, source.authorization_fingerprint,
-            source.http_capacity_source_fingerprint,
-            source.http_capacity_authorization_fingerprint) == GVM_FINITE_HTTP_BINDING
-    assert source.finite_article_urls == (
-        'https://www.gvm.com.tw/article/132737', 'https://www.gvm.com.tw/article/76333')
-    # Transport validation alone: no HTTP owner, connection, or publisher probe.
-    transport = object.__new__(NewsHTTP)
-    transport.registry = registry
-    for url in (*source.finite_article_urls, 'https://www.gvm.com.tw/robots.txt'):
-        assert transport._require(url) is source
-    for url in ('https://www.gvm.com.tw/article/99999', 'https://www.gvm.com.tw/',
-                source.finite_article_urls[0] + '?extra=1'):
-        with pytest.raises(NewsError, match='article_rights_or_scope_excluded'):
-            transport._require(url)
+    assert source.data_fingerprint != GVM_FINITE_HTTP_BINDING[0]
+    assert source.authorization_fingerprint != GVM_FINITE_HTTP_BINDING[1]
+    assert not source.http_capacity_authorization_fingerprint
+    if source.embedded_article_layout == 'gvm_public_native_article_v2':
+        assert not source.http_capacity_source_fingerprint
+    else:
+        # Current body-only revisions preserve their exact known-URL V2 HTTP
+        # owner. That owner is distinct from both earlier finite identities.
+        predecessor = deepcopy(config)
+        entry = next(p for p in predecessor['providers'] if p['id'] == 'gvm')
+        entry.update(embedded_article_layout='gvm_public_native_article_v2', adapter_verification=GVM_V2_VERIFICATION)
+        prior = PolicyRegistry(predecessor, base=Path('.')).sources['gvm']
+        assert source.http_capacity_source_fingerprint == prior.data_fingerprint
+        assert source.http_capacity_source_fingerprint not in (GVM_FINITE_HTTP_BINDING[0], GVM_FINITE_HTTP_BINDING[2])
+    assert source.known_url_only and source.acquisition_mode == 'continuous'
+    assert source.embedded_article_layout in {'gvm_public_native_article_v2', 'gvm_public_native_article_v3',
+        'gvm_public_native_article_v4', 'gvm_public_native_article_v5', 'gvm_public_native_article_v6',
+        'gvm_public_native_article_v7', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10', 'gvm_public_native_article_v11'}
+    assert source.interval_seconds == 10 and source.parallelism == 1
+    assert source.domains == ('www.gvm.com.tw',) and not source.finite_article_urls
+    assert not any((source.feeds, source.sitemaps, source.wordpress_apis, source.cnyes_apis,
+                    source.index_pages, source.incremental_index_pages, source.fulltext_feeds))
 
 
 def test_mirrordaily_partial_quote_and_contributor_terms_are_not_fulltext_access():
@@ -265,8 +368,21 @@ def test_new_source_scope_reviews_resume_only_open_questions_without_capture(pro
     assert not state['review_questions_are_exhaustive_body_work']
     entry = next(p for p in before[1]['providers'] if p['id'] == provider)
     if provider == 'knews':
-        assert entry['enabled'] and entry['acquisition_mode'] == 'finite'
-        assert len(entry['finite_article_urls']) == 2
+        assert entry['enabled']
+        if entry['acquisition_mode'] == 'finite':
+            assert len(entry['finite_article_urls']) == 2
+        else:
+            assert entry['acquisition_mode'] == 'continuous' and not entry.get('finite_article_urls')
+            assert entry['private_known_url_scope'] == 'personal_noncommercial_originals_v1'
+            from downloader.news_fulltext_knews import KNEWS_V2_VERIFICATION, KNEWS_V3_VERIFICATION, KNEWS_V4_VERIFICATION, KNEWS_V5_VERIFICATION, KNEWS_V6_VERIFICATION, KNEWS_V7_VERIFICATION
+            versions = {'knews_public_native_article_v2': KNEWS_V2_VERIFICATION,
+                        'knews_public_native_article_v3': KNEWS_V3_VERIFICATION,
+                        'knews_public_native_article_v4': KNEWS_V4_VERIFICATION,
+                        'knews_public_native_article_v5': KNEWS_V5_VERIFICATION,
+                        'knews_public_native_article_v6': KNEWS_V6_VERIFICATION,
+                        'knews_public_native_article_v7': KNEWS_V7_VERIFICATION}
+            assert entry['embedded_article_layout'] in versions
+            assert entry['adapter_verification'] == versions[entry['embedded_article_layout']]
         assert entry['authorization']['kind'] == 'personal_research'
     else:
         assert not entry['enabled'] and entry['authorization']['kind'] == 'awaiting_authorization'
@@ -386,7 +502,7 @@ def test_knews_news_shopping_member_and_search_scopes_are_not_interchangeable():
 def test_knews_two_native_originals_do_not_close_the703_remaining_URL_heads():
     from scripts.plan_news_sources import review_resume_plan
     review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['knews']
-    scope = review['current_scope_review']
+    scope = review.get('finite_native_capture_review_20261022', review['current_scope_review'])
     assert review['capture_decision'] == 'review_incomplete'
     assert review['diagnostic_snapshot_review']['reviewed_at_utc'] < review['reviewed_at_utc']
     assert scope['known_URL_heads'] == scope['www_host_URL_heads'] + scope['bare_host_URL_heads_not_proven_aliases'] == 705
@@ -404,9 +520,114 @@ def test_knews_two_native_originals_do_not_close_the703_remaining_URL_heads():
     assert {(r['source_header_credit'], r['printed_reporter_name']) for r in scope['native_source_roles']} == {
         ('芮內', '吳珍儀'), ('克里夫', '蕭文康')}
     assert all(not r['different_names_are_verified_aliases'] for r in scope['native_source_roles'])
-    state = review_resume_plan({'enabled': True}, review)
+    state = review_resume_plan({'enabled': True}, {**review, 'current_scope_review': scope})
     assert state['source_review_work_state'] == 'partially_completed'
     assert len(json.loads(state['remaining_review_questions_json'])) == 2
+    assert not state['review_annotation_grants_capture_access']
+
+
+def test_knews_known_url_resume_keeps_completed_finite_evidence_and_open_body_work():
+    from scripts.plan_news_sources import review_resume_plan
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['knews']
+    scope = review['current_scope_review']
+    assert review['finite_native_capture_review_20261022']['finite_scope_complete']
+    assert scope['known_URL_heads'] == scope['literal_news_URL_heads'] + scope['nonarticle_search_heads'] == 685
+    assert scope['previously_unrequested_article_heads_admitted'] + scope['prior_completed_bodies_preserved'] == 678
+    assert scope['new_bodies_with_completed_independent_readback'] == 2
+    assert scope['stored_body_heads'] >= scope['prior_completed_bodies_preserved'] + scope['new_bodies_with_completed_independent_readback']
+    if scope['operational_scope'].startswith(('knews_public_native_article_v3;', 'knews_public_native_article_v4;',
+                                            'knews_public_native_article_v5;', 'knews_public_native_article_v6;',
+                                            'knews_public_native_article_v7;')):
+        assert scope['prior_v2_original_readback_evidence_reused']
+        assert scope['v3_witnessed_editor_missing_bodies_repaired'] == 2
+        assert scope['v3_prior_completed_bodies_preserved'] == 125
+        assert scope['stored_body_heads'] >= 127
+        assert scope['v3_remaining_structural_failures_once_submitted'] == 373
+    if scope['operational_scope'].startswith(('knews_public_native_article_v4;', 'knews_public_native_article_v5;',
+                                            'knews_public_native_article_v6;', 'knews_public_native_article_v7;')):
+        assert scope['v4_prior_completed_bodies_preserved'] == scope['v4_retained_original_parity_count'] == 294
+        assert scope['v4_witnessed_missing_bodies_repaired'] == 4
+        assert scope['v4_missing_targets_admitted_once'] == 381
+        assert scope['v4_followup_structural_targets_attempted'] == 344
+        assert scope['v4_followup_clock_targets_attempted'] == 33
+        assert scope['v4_new_bodies_with_independent_readback'] == (scope['v4_witnessed_missing_bodies_repaired']
+            + scope['v4_followup_structural_new_bodies'] + scope['v4_followup_clock_new_bodies']) == 262
+        assert scope['v4_attempts_per_admitted_target'] == 1
+        assert scope['v4_partial_request_reconciled_without_replay']
+        assert scope['v4_clock_repair_ABI_version'] == 7
+        assert not scope['v4_raw_publication_and_modified_clocks_rewritten']
+        assert scope['stored_body_heads'] >= 556
+        assert sum(scope['states_at_observation'].values()) == scope['known_URL_heads']
+        assert scope['states_at_observation']['complete'] == scope['stored_body_heads_at_observation']
+        assert scope['states_at_observation'].get('invalid_bulk_publication_clock', 0) == 0
+    if scope['operational_scope'].startswith(('knews_public_native_article_v5;', 'knews_public_native_article_v6;',
+                                            'knews_public_native_article_v7;')):
+        assert scope['v5_prior_completed_bodies_preserved'] == scope['v5_retained_original_parity_count'] == 556
+        assert scope['v5_missing_targets_admitted_once'] == (
+            scope['v5_witnessed_missing_bodies_repaired'] + scope['v5_followup_targets_attempted']) == 119
+        assert scope['v5_followup_targets_attempted'] == (
+            scope['v5_followup_new_bodies'] + scope['v5_followup_validation_failures']) == 115
+        assert scope['v5_new_bodies_with_independent_readback'] == (
+            scope['v5_witnessed_missing_bodies_repaired'] + scope['v5_followup_new_bodies']) == 35
+        assert scope['stored_body_heads'] == scope['stored_body_heads_at_observation'] >= (
+            scope['v5_prior_completed_bodies_preserved'] + scope['v5_new_bodies_with_independent_readback']) == 591
+        if scope['operational_scope'].startswith('knews_public_native_article_v5;'):
+            assert scope['stored_body_heads_at_observation'] == 591
+            assert scope['v5_followup_validation_failures'] == (
+                scope['states_at_observation']['article_identity_not_verified']
+                + scope['states_at_observation']['article_attribution_not_verified']) == 84
+        assert scope['states_at_observation'].get('body_not_found', 0) == 0
+        assert scope['v5_attempts_per_admitted_target'] == 1
+        assert not scope['v5_raw_publication_and_modified_clocks_rewritten']
+        assert scope['v5_prior_clock_once_markers_preserved'] == 34
+        assert scope['v5_clock_once_lookup_uses_covering_index']
+        assert not scope['v5_index_latency_or_whole_pipeline_speedup_measured']
+    if scope['operational_scope'].startswith(('knews_public_native_article_v6;', 'knews_public_native_article_v7;')):
+        assert scope['v6_prior_completed_bodies_preserved'] == scope['v6_retained_original_parity_count'] == 591
+        assert scope['v6_missing_targets_admitted_once'] == (
+            scope['v6_witnessed_missing_bodies_repaired'] + scope['v6_followup_targets_attempted']) == 84
+        assert scope['v6_followup_targets_attempted'] == (
+            scope['v6_followup_new_bodies'] + scope['v6_followup_validation_failures']) == 80
+        assert scope['v6_new_bodies_with_independent_readback'] == (
+            scope['v6_witnessed_missing_bodies_repaired'] + scope['v6_followup_new_bodies'])
+        assert scope['stored_body_heads_at_observation'] >= (
+            scope['v6_prior_completed_bodies_preserved'] + scope['v6_new_bodies_with_independent_readback'])
+        if scope['operational_scope'].startswith('knews_public_native_article_v6;'):
+            assert scope['stored_body_heads_at_observation'] == 646
+            assert scope['v6_followup_validation_failures'] == sum(scope['states_at_observation'].get(k, 0)
+                for k in ('article_identity_not_verified', 'article_attribution_not_verified'))
+        assert scope['v6_source_requests_for_retained_original_parity'] == 0
+        assert scope['v6_new_diagnostic_source_requests'] == 0
+        assert scope['v6_independent_written_card_blocks_verified'] == 2
+        assert scope['v6_independent_written_cards_verified'] == 20
+        assert scope['v6_attempts_per_admitted_target'] == 1
+        assert not scope['v6_raw_publication_and_modified_clocks_rewritten']
+        assert not scope['v6_media_requested_or_transcribed']
+    if scope['operational_scope'].startswith('knews_public_native_article_v7;'):
+        assert scope['v7_prior_completed_bodies_preserved'] == scope['v7_retained_original_parity_count'] == 646
+        assert scope['v7_missing_targets_admitted_once'] == (
+            scope['v7_witnessed_missing_bodies_repaired'] + scope['v7_followup_targets_attempted']) == 29
+        assert scope['v7_followup_targets_attempted'] == sum(scope['v7_followup_target_states'].values()) == 25
+        assert scope['v7_followup_target_states'].get('complete', 0) == scope['v7_followup_new_bodies']
+        assert scope['v7_followup_targets_attempted'] == (
+            scope['v7_followup_new_bodies'] + scope['v7_followup_validation_failures'])
+        assert scope['v7_new_bodies_with_independent_readback'] == (
+            scope['v7_witnessed_missing_bodies_repaired'] + scope['v7_followup_new_bodies'])
+        assert scope['stored_body_heads_at_observation'] == (
+            scope['v7_prior_completed_bodies_preserved'] + scope['v7_new_bodies_with_independent_readback'])
+        assert scope['v7_source_requests_for_retained_original_parity'] == 0
+        assert scope['v7_additional_diagnostic_source_requests_during_qualification'] == 0
+        assert scope['v7_residual_original_observations'] == 4
+        assert scope['v7_independent_written_cards_verified'] == 3
+        assert scope['v7_attempts_per_admitted_target'] == 1
+        assert not scope['v7_raw_publication_and_modified_clocks_rewritten']
+        assert not scope['v7_media_requested_or_transcribed']
+        assert not scope['v7_missing_printed_reporter_names_filled_from_header']
+    assert not scope['all_known_articles_complete'] and not scope['all_publisher_history_complete']
+    assert not scope['publisher_license_or_fair_use_verdict']
+    state = review_resume_plan({'enabled': True}, review)
+    assert state['source_review_work_state'] == 'partially_completed'
+    assert json.loads(state['remaining_review_questions_json']) == scope['remaining_questions']
     assert not state['review_annotation_grants_capture_access']
 
 
@@ -590,28 +811,39 @@ def test_cmoneylearning_new_literal_bodies_preserve_completed_scope_and_native_g
     review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cmoneylearning']
     progress = review['native_progress']
     assert review['capture_decision'] == 'reviewed_existing_scope'
-    assert progress['counter_scope'] == 'v4 phase deltas plus explicitly labelled current total scope'
-    assert progress['closed_literal_url_scope'] == progress['stored_body_heads'] == 20
-    assert progress['previous_complete_bodies_preserved'] == 19
-    assert progress['new_formal_body_heads'] == progress['source_HTTP_requests_for_new_originals'] == 1
+    assert progress['counter_scope'] == 'v6 phase deltas plus explicitly labelled current total scope'
+    assert progress['closed_literal_url_scope'] == progress['stored_body_heads'] == 28
+    assert progress['previous_complete_bodies_preserved'] == 22
+    assert progress['new_formal_body_heads'] == progress['source_HTTP_requests_for_new_originals'] == 6
     assert progress['previous_complete_bodies_preserved']+progress['new_formal_body_heads']==progress['stored_body_heads']
-    assert progress['original_frozen_cohort_urls'] == 2 and progress['reviewed_supplement_urls'] == 18
-    assert progress['original_frozen_cohort_urls'] + progress['reviewed_supplement_urls'] == 20
-    assert progress['retained_raw_response_bytes'] == 101504
-    assert progress['new_body_UTF8_bytes'] == 7207
+    assert progress['original_frozen_cohort_urls'] == 2 and progress['reviewed_supplement_urls'] == 26
+    assert progress['original_frozen_cohort_urls'] + progress['reviewed_supplement_urls'] == 28
+    assert progress['retained_raw_response_bytes'] == 637187
+    assert progress['new_body_UTF8_bytes'] == 61020
+    assert progress['retained_canonical_locators_reused'] == 6
+    assert progress['canonical_locator_HTTP_requests'] == 0
+    assert progress['newly_closed_CMNews_metadata_questions'] == 0
+    assert progress['previously_closed_CMNews_metadata_questions_preserved'] == 429
+    assert progress['additional_pending_originals_outside_closed_scope'] == 0
     assert progress['remaining_missing_heads_in_this_scope'] == 0
     assert progress['extra_HTTP_for_parser_repair_or_materialization'] == progress['old_complete_bodies_refetched'] == 0
     assert progress['all951_UI_rows_fresh_and_consistent']
-    assert not any(progress[key] for key in ('closed267_questions_rearmed', 'source_clock_or_refusal_reset',
+    assert not any(progress[key] for key in ('closed429_questions_rearmed', 'source_clock_or_refusal_reset',
         'CMNews_alias_equivalence_accepted', 'whole_publisher_history_complete', 'maximum_throughput_verified'))
-    # The previous v3 cohort remains evidenced, not replaced by a new capture.
+    # The previous v5 scope remains evidenced, not replaced by a new capture.
     prior=review['prior_scope_review_evidence']
-    assert prior['path'].endswith('/cmoneylearning_declared_v4_20261023/prior-review-v3.json')
+    assert prior['path'].endswith('/cmoneylearning_six_v6_20261024/prior-review-v5.json')
     assert len(prior['sha256'])==64
-    assert review['engineering_acceptance'].endswith('/cmoneylearning_declared_v4_20261023/ready.json')
+    assert review['engineering_acceptance'].endswith('/cmoneylearning_six_v6_20261024/ready.json')
+    assert review['remaining_worklist'].endswith('/cmoneylearning_six_v6_20261024/remaining-only.json')
+    assert progress['new_unsubmitted_CMNews_identity_questions']==0
+    assert progress['resolved_followups_without_native_job']==2
+    assert review['followup_worklist_verification']['retained_relations_reused']==2
+    assert review['followup_worklist_verification']['source_requests']==0
+    assert not review['followup_worklist_verification']['CMNews_article_or_alias_accepted']
     assert review['semantic_verification']['overlapping_test_counts_are_not_additive']
     entry = next(p for p in before[1]['providers'] if p['id'] == 'cmoneylearning')
-    assert entry['embedded_article_layout'] == 'cmoneylearning_visible_article_v4'
+    assert entry['embedded_article_layout'] == 'cmoneylearning_visible_article_v6'
     assert entry['acquisition_mode'] == 'finite' and entry['allow_reviewed_supplements']
     assert entry['authorization']['kind']=='personal_research'
     assert before == (configuration_revision(path), load_news_configuration(path))

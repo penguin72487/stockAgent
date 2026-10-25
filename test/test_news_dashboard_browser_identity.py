@@ -42,6 +42,37 @@ def test_owner_transport_still_rejects_public_audience_and_public_caching():
             require_owner_transport(headers)
 
 
+def scope_card():
+    return {'body_request_scope_progress': {'contract_version': 1, 'available': True,
+        'active_missing_body_urls': 3, 'source_paused_missing_body_urls': 2,
+        'other_missing_body_urls': 1, 'source_recovery_verified': False},
+        'body_work_progress': {'active_missing_body_urls': 3},
+        'displayed_request_scope_counts': [2, 1], 'request_scope_note_present': True,
+        'conditional_eta_seconds': None, 'conditional_finish_at_utc': None,
+        'conditional_eta_unavailable_reason': 'source_request_scope_paused'}
+
+
+def test_request_scope_acceptance_checks_rendered_counts_and_withdrawn_countdown():
+    from scripts.verify_news_dashboard import request_scope_progress_check
+
+    assert request_scope_progress_check(scope_card())['accepted']
+    assert request_scope_progress_check({}) is None
+    assert request_scope_progress_check({'body_request_scope_progress': {'available': False}}) is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('displayed_request_scope_counts', [3, 0]), ('request_scope_note_present', False),
+    ('conditional_eta_seconds', 30), ('conditional_finish_at_utc', '2026-10-24T00:00:00+00:00'),
+    ('conditional_eta_unavailable_reason', None),
+])
+def test_request_scope_acceptance_rejects_stale_or_inconsistent_card(field, value):
+    from scripts.verify_news_dashboard import request_scope_progress_check
+
+    checked = scope_card(); checked[field] = value
+    with pytest.raises(AssertionError):
+        request_scope_progress_check(checked)
+
+
 def test_required_source_card_is_exact_when_provider_names_or_prefixes_collide():
     with sync_playwright() as runtime:
         browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'), timeout=10000)

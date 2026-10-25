@@ -25,6 +25,40 @@ def record(root, rows, now=NOW, task=TASK):
     }, now)
 
 
+def test_monotonic_transport_clock_survives_fanout_and_persistence_without_changing_source_values(tmp_path, monkeypatch):
+    # A future UTC start simulates a wall clock step. Preserve that original
+    # observation; it must not erase or become the independent monotonic cost.
+    monkeypatch.setattr(updates.time, 'monotonic', lambda: 102.75)
+    raw = [{'close': -0.0, 'date': '2026-09-30', 'extra': None}]
+    received = updates.received_rows(raw, datetime.now(UTC) + timedelta(days=1), monotonic_started=100.)
+    assert received == raw and received[0] is raw[0]
+    assert received.observation['network_seconds'] == 0
+    timing = {'contract': updates.TRANSPORT_TIMING_CONTRACT, 'seconds': 2.75}
+    assert received.observation['transport_timing'] == timing
+    subset = updates.retain_observation(received[:], received)
+    assert subset.observation is received.observation
+    evidence = record(tmp_path, subset)
+    assert evidence['transport_timing'] == timing
+    assert evidence['response_rows'] == evidence['rows'] == 1
+    with sqlite3.connect(tmp_path / updates.DB_NAME) as connection:
+        saved = json.loads(connection.execute('SELECT metadata_json FROM checks').fetchone()[0])
+    assert saved == evidence
+    assert record(tmp_path, subset) == evidence  # Idempotence preserves the original clock.
+
+
+def test_old_transport_observations_do_not_invent_monotonic_time(tmp_path):
+    observed = updates.received_rows([], NOW)
+    assert 'transport_timing' not in observed.observation
+    assert 'transport_timing' not in record(tmp_path, observed)
+
+
+@pytest.mark.parametrize('seconds', [True, -1, float('inf'), float('nan'), '2.75'])
+def test_invalid_transport_timing_never_becomes_a_persisted_measurement(tmp_path, seconds):
+    observed = response([{'close': 100}])
+    observed.observation['transport_timing'] = {'contract': updates.TRANSPORT_TIMING_CONTRACT, 'seconds': seconds}
+    assert 'transport_timing' not in record(tmp_path, observed)
+
+
 def test_fingerprint_is_order_independent_without_losing_duplicates_or_nulls():
     a, b = {'date': '2026-09-30', 'value': -3}, {'value': None, 'date': '2026-09-29'}
     assert updates.row_fingerprint([a, b]) == updates.row_fingerprint([b, dict(reversed(list(a.items())))])

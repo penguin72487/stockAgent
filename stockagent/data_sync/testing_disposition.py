@@ -41,7 +41,7 @@ def load_policy(path: Path) -> dict:
         if row["kind"] not in {"directory", "file"} or row["reason"] not in {"smoke-test", "benchmark", "validation-test"}:
             raise SnapshotError("unreviewed testing target type")
         if row["base"] == "artifact":
-            if len(relative.parts) < 2 or relative.parts[0] not in {"smoke", "markets", "operations", "ablations", "cache"}:
+            if len(relative.parts) < 2 or relative.parts[0] not in {"smoke", "markets", "operations", "ablations", "cache", "benchmarks"}:
                 raise SnapshotError("testing discard cannot target an artifact namespace")
         elif (len(relative.parts) < 3 or not relative.parts[0].startswith(
                 ("stockagent-remote-build-measurement-", "stockagent-control-pilot-")) or row["kind"] != "file"):

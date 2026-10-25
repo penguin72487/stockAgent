@@ -76,7 +76,8 @@ def test_actual_source_entries_are_enrolled_without_enrolling_artifact_families(
                            if "publication_family" not in entry else {})
 
 
-def test_rollout_readback_distinguishes_policy_from_an_actual_committed_head(layout_repo, monkeypatch):
+@pytest.mark.parametrize('shared', [False, True])
+def test_rollout_readback_distinguishes_policy_from_an_actual_committed_head(layout_repo, monkeypatch, shared):
     from types import SimpleNamespace
     import stockagent.data_sync.dataset_version_layout as layout
     entries = _load_catalog(layout_repo / "configs/data_sync/packed_datasets.json")
@@ -86,17 +87,67 @@ def test_rollout_readback_distinguishes_policy_from_an_actual_committed_head(lay
     assert row["configured_v2_publication_branches"] == ["finlab-research"]
     assert row["shared_v2_head_observed"] is False
     cold = layout_repo / "cold"
-    (cold / "heads" / "finlab-research").mkdir(parents=True)
-    monkeypatch.setattr(layout, "resolve_latest_packed", lambda *args, **kwargs: SimpleNamespace(
-        manifest={"snapshot_id": "fixture", "schema_version": 2,
-                  "archive": {"file_chunk_bytes": 8 * 1024**2}}, manifest_sha256="a" * 64))
+    from stockagent.data_sync.dataset_migration import private_history_root
+    from stockagent.data_sync.packed_snapshots import initialize_packed_layout
+    initialize_packed_layout(cold, node_id='fixture')
+    next(entry for entry in entries if entry['dataset'] == 'finlab-research')['publish'] = shared
+    head_root = cold if shared else private_history_root(cold, version_policy(layout_repo))
+    (head_root / "heads" / "finlab-research").mkdir(parents=True)
+    calls = []
+    def resolve(root, dataset, *, require_objects):
+        calls.append((root, dataset, require_objects))
+        return SimpleNamespace(manifest={"snapshot_id": "fixture", "schema_version": 2,
+            "archive": {"file_chunk_bytes": 8 * 1024**2}}, manifest_sha256="a" * 64)
+    monkeypatch.setattr(layout, "resolve_latest_packed", resolve)
     after = inventory_version_layout(layout_repo, entries, sync_root=cold)
     row = next(item for item in after["roots"] if item["root"] == "data_finlab")
-    assert row["rollout_state"] == "shared_v2_head_observed"
-    assert row["shared_v2_head_observed"] is True
+    assert calls == [(head_root, 'finlab-research', False)]
+    assert row["rollout_state"] == ("shared_v2_head_observed" if shared else 'host_private_v2_head_observed')
+    assert row["shared_v2_head_observed"] is shared
+    assert row['private_v2_head_observed'] is not shared
+    assert row['current_v2_head_observed'] is True
     assert row["publication_bindings"][0]["head"]["objects_verified"] is False
-    assert row["publication_bindings"][0]["publish"] is False
+    assert row["publication_bindings"][0]["head"]['storage_scope'] == ('shared' if shared else 'host_private')
+    assert row["publication_bindings"][0]["publish"] is shared
     assert row["native_workspace_migrated"] is False
+
+
+def test_private_history_observation_never_initializes_or_accepts_a_shared_alias(layout_repo, monkeypatch):
+    import stockagent.data_sync.dataset_version_layout as layout
+    entries = _load_catalog(layout_repo / 'configs/data_sync/packed_datasets.json')
+    cold = layout_repo / 'cold'
+    (cold / 'heads/finlab-research').mkdir(parents=True)
+    monkeypatch.setattr(layout, 'resolve_latest_packed', lambda *a, **kw: pytest.fail('wrong store consulted'))
+    result = inventory_version_layout(layout_repo, entries, sync_root=cold)
+    row = next(item for item in result['roots'] if item['root'] == 'data_finlab')
+    assert row['rollout_state'] == 'policy_enrolled_head_pending'
+    assert not row['current_v2_head_observed']
+    assert not (cold / '.local-state/private-history').exists()
+    assert result['source_payload_writes'] == result['legacy_deletions'] == 0
+
+
+@pytest.mark.parametrize('invalid', ['permissions', 'marker', 'symlink', 'exclusion'])
+def test_invalid_private_authority_cannot_look_like_verified_incremental_history(layout_repo, invalid):
+    from stockagent.data_sync.dataset_migration import private_history_root
+    from stockagent.data_sync.packed_snapshots import initialize_packed_layout
+    entries = _load_catalog(layout_repo / 'configs/data_sync/packed_datasets.json')
+    cold = layout_repo / 'cold'
+    initialize_packed_layout(cold, node_id='fixture')
+    private = private_history_root(cold, version_policy(layout_repo))
+    if invalid == 'permissions':
+        private.chmod(0o755)
+    elif invalid == 'marker':
+        (private / 'private-history.json').write_text('{}')
+    elif invalid == 'symlink':
+        private.rename(private.with_name('retained-private'))
+        private.symlink_to(private.with_name('retained-private'), target_is_directory=True)
+    else:
+        (cold / '.stignore').write_text('')
+    result = inventory_version_layout(layout_repo, entries, sync_root=cold)
+    assert result['state'] == 'failed'
+    assert result['errors'] == ['private history unreadable: SnapshotError']
+    assert not any(item['private_v2_head_observed'] for item in result['roots'])
+    assert result['source_payload_writes'] == result['legacy_deletions'] == 0
 
 
 @pytest.mark.parametrize("accepted", [False, True])

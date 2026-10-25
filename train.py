@@ -2158,6 +2158,7 @@ def main() -> None:
                     benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
                     include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
                     include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
+                    include_beta_observation=config.training.financial_transformer.futures_beta_notional_cap is not None,
                     account_policy_lookback=config.training.lookback,
                 )
             if config.trading.tw_futures_portfolio_decision_time is not None:

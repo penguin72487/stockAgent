@@ -64,6 +64,19 @@ Guidelines:
   pre-fetch and post-fetch source coverage. Never re-download a locally covered
   pair or substitute an interpolated/fabricated price.
 
+- For the explicitly selected `progressive_open_reference_rebalance_v1` paper
+  policy, a new signal is an immutable decision, not a replacement fill. Use the
+  frozen session sizing NAV and reconcile each signed target against current
+  signed inventory, not cumulative acquired shares. Close FIFO before opening
+  the opposite side; retain original acquisition IDs, weights, prices, fees,
+  TP/SL and closed cohorts, with latest targets in separate fields. A missing
+  sizing open is an unknown target, never a zero-liquidation instruction. Stops
+  and the 13:20 exit window override pending additions. Carrying a prior real
+  trade into a model input cannot create an executable quote. Preserve the
+  selected strict/margin-carry policy; progressive updates do not silently
+  replace that independent contract or turn a late 09:01 replay into live fills.
+  See [the candidate and acceptance evidence](../tw_opening_latency_stages_2026-10-14.md#逐版訊號與已成交庫存再平衡候選2026-10-24).
+
 - A source-pinned completed-minute replay must not be rejected for lacking a
   live Shioaji L1 `book_exchange_at`. Keep the live causal predicate unchanged;
   admit historical entry/exit quotes only within the explicit replay contract,

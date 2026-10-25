@@ -57,6 +57,36 @@ coordinated code, config, test, and documentation change.
   scheduled releases inherit its chunk policy. Registration is not native
   migration, cold recovery, remote rollout or deletion proof. See
   [all-dataset layout](../dataset_incremental_storage.md).
+- Source partitions are a separate producer/reader ABI. The shared
+  `partitioned_parquet` reader/writer supports explicit `period="rows"` with
+  `date_column=None` and a fixed `partition_rows` for an entire canonical table.
+  It preserves the supplied order, raw values, nulls, types and metadata;
+  unchanged typed partition hashes reuse immutable members. Corrections and
+  shrinkage supply the complete table, not an inferred unchanged prefix.
+  Generation manifests under `.manifest.json.parts` are read-only fixed
+  versions, not writer pointers. Preserve capacity admission, writer ownership,
+  per-new-member typed readback and durable atomic manifest publication.
+  A fully verified unchanged input, source/schema/code identity and immutable
+  generation reuse the original pointer inode without write admission or
+  link/rename/fsync; even a temporary hardlink changes reader-visible ctime.
+  Verify the complete prior payload and generation bytes before this no-op.
+  Actual changes reserve the new partitions plus bounded metadata, retain old
+  generations, and pass the same readback/durability gates before publication.
+  A reader may reuse its already parsed member footer within that one verified
+  source snapshot. Keep complete member SHA/schema/row checks and before/after
+  generation fences; close owned Parquet readers on success and failure. This
+  is not a cross-process metadata cache or permission to skip predicate reads.
+  This optional ABI does not activate a provider's collector or its consumers.
+  Qualify the complete publication/recovery/read workflow before opting one in;
+  the [2026-10-24 FinLab study](../filesystem_incremental_audit_2026-10-23.md)
+  retained the production writer after measuring slower complete workflows.
+- Full materialized verification may use the existing native read-only byte
+  adapter for 64 MiB through 8 GiB files in the two enrolled D completed-scratch
+  prefixes. Hold a regular no-follow/nonblocking Linux FD, hash every byte,
+  and recheck FD and named-file size, inode/device, mode, links and timestamps.
+  Keep the complete materialized inventory fingerprint and all cold/source
+  gates. Small/oversized files and other namespaces retain their reader;
+  native errors fail without a silent slow fallback or cached acceptance.
 - Bound publication metadata as well as payload buffers. Consume already
   validated prior-file reuse hints once and release their rows progressively.
   The shared `packed_metadata.MetadataRows` keeps small inventories in RAM and
@@ -92,8 +122,37 @@ coordinated code, config, test, and documentation change.
   references **including the cleanup process**. Persist intent, quarantine and
   repeat the file/hash/reference gates before unlinking its one index and empty
   directory. Unknown members, schemas, aliases and live references stay intact.
+  An explicit `metadata-scratch-plan --empty-index` instead proves the exact
+  initial producer schema, zero committed rows, no freelist/application state,
+  intact SQLite checks and at most 64 KiB of committed database pages. It may
+  retire abandoned uncommitted trailing pages only with the same full-file SHA,
+  current-process/inode checks, quarantine and final unlink/readback. Populated
+  indexes still require the original superseded-operation binding; this option
+  neither scans other roots nor treats a damaged database as empty.
   These indexes are reconstructible scratch, not source/CAS/NAS authorities;
   this is not prefix-based `/var/tmp` GC or permission to remove cold history.
+  A frozen offline-artifact census may admit a uniform whole-tree device
+  renumber after remount/reboot only when every path/type, inode, size,
+  mtime/ctime, mode and link count is unchanged, all rows remain on one
+  filesystem, and both complete observation inventories exist. Record the
+  device mapping separately as admission-only evidence; retain the original
+  inventory, dataset identity and capture provenance. Complete source/encoded
+  SHA and original decoding, current process/pin/lease/transport, quarantine
+  and deletion readback still decide retirement. Mixed devices, partial
+  mappings and any other metadata drift require separate reconciliation.
+  If an interrupted legacy stage has every exact per-file receipt and encoded
+  member but lacks its final manifest, the existing capture owner may finish
+  it with `recover_complete_archive_manifest`. Keep the recorded observations;
+  allow only an entire file-plan device renumber, verify every encoded SHA and
+  decoded original plus the current source SHA, exact stage membership and
+  single-link files, fresh consumers and before/after source/directory/stage
+  generations. Write only the original-format preservation manifest within a
+  bounded metadata budget. This is not cold acceptance or READY. Incomplete
+  encodings still use ordinary preparation and its source-size-plus-reserve
+  admission; corrupt or unknown complete stages remain for audit. Reusing a
+  complete stage must not create a duplicate payload wave merely to restore
+  missing metadata or to change temporary placement. An explicit placement
+  amendment retains the original frozen source items and plan separately.
   Complete-file cold verification may fuse ZIP CRC and original-file SHA in
   one decompression pass, but must still read every stored member (including
   unused members of a reused subset pack) and reconstruct every current
@@ -101,12 +160,35 @@ coordinated code, config, test, and documentation change.
   overlap a bounded number of per-file fsync jobs using owned duplicate file
   descriptors; drain every barrier before publishing a target or `READY`, and
   propagate any barrier failure. No skipped durability or early readiness.
+- Immutable replication may reuse the exact full-SHA inventory returned by
+  its own initial verification, including manifest/READY descriptors. It is
+  not a durable hash cache: conflict detection, destination verification before
+  READY, and independent final source/destination verification remain required.
+  Current NAS object progress counts the intersection of the current registry
+  and accepted historical keys; retain historical coverage separately instead
+  of putting a different scope in the numerator.
+- DuckLake catalog export keeps the existing complete v1 delivery and native
+  PG/DuckLake recovery contract. Its catalog owner may share data files only
+  from the latest committed, explicitly enrolled incremental export: verify
+  source SHA/size, donor bytes, read-only mode, same filesystem and independent
+  source inode, then retain complete seal/readback and source-change fences.
+  Never link the mutable DuckLake producer or chmod an old writable donor in
+  place. New/changed files and unsupported hardlinks use durable independent
+  copies. Record copied/shared files and bytes in the original export journal;
+  directory sharing is not NAS deduplication or deletion authority. Older
+  writable catalog history is retained until separately qualified for repacking.
 - Immutable TAIFEX rule evidence may share SHA-256-addressed, read-only local
   objects through `artifact_dedup.link_immutable_source`. Copy the producer once
   into `.rule-source-objects` beside the preparation bundles; never hard-link
   a mutable official source. Keep each bundle's logical `sources/` paths and
   manifest hashes unchanged. These local objects are not cold publications or
   training/readiness proofs, and must never be modified in place.
+- A hot-artifact retirement pin gate reads the current pin set on every pass.
+  It may use bounded per-dataset directory enumeration and exact literal pin
+  filenames to avoid listing every historical version. Check every dataset,
+  retain all same-basename matches and the original path/JSON/dependency guards;
+  reject malformed filenames and redirected matches. Do not cache pin state or
+  use this selected-pin query to narrow a full cold-CAS reference-graph audit.
 - "Real-time synchronization" means that the Syncthing watcher starts copying
   an atomic release immediately after all publication gates pass.  It never
   means syncing half-written downloader output.  Scheduled and continuous
@@ -293,6 +375,11 @@ The restored result, fixed migration and current busy queue are documented in
   dependencies merely to admit storage scratch. Unattended WSL capacity checks
   use the existing node distribution enrollment, never a guessed distribution
   or virtual VHDX free-space figure; unavailable identity remains a hard error.
+  The physical registry/volume query uses the same bounded, verified local
+  WSL interop bridge as native byte I/O. An existing init socket alone is not
+  process-context readiness. Pass the selected environment to that query only;
+  never mutate concurrent activities' global environment or substitute virtual
+  capacity when bridge/query/identity validation fails.
 - The same publisher supports opt-in `included_root_files`: an explicit,
   nonempty list of at most 4096 immediate regular files, not a glob or subtree.
   It publishes directly from the original root without a duplicate staging
@@ -480,6 +567,11 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   including failed/busy attempts, so failure chains cannot monopolize the
   publication handoff. A single source's full recovery may still take hours;
   the attempt bound is not a wall-time deadline or permission to interrupt it.
+  A safe code handoff acquires all enrolled version/source/catalog boundaries
+  before stopping the worker. If a later boundary is busy, release the partial
+  set before a kernel wait on that lock; waiting must not reserve unrelated
+  owners. Reacquire the complete set afterwards, preserve the deadline and
+  propagate body errors without repeating service controls.
   It retries busy owners without holding their locks, and checks again
   on the configured daily cycle after the baseline. Restricted sources stay
   private. Each busy/failed source retains its own retry deadline. New activity
@@ -1205,7 +1297,31 @@ catalog credentials or hard-code an interpreter path.
   source unlink and during final readback. Completion admission lives in the
   shared benchmark implementation and canonical source plan as well as the CLI;
   bypassing the outer inventory command must not admit unknown/unfinished work.
+  A standalone `benchmarks/research-stage-copy-YYYYMMDD-vN` case uses its existing
+  `real_captured_research_staging_abba_v1` terminal `receipt.json` instead of
+  fixture/sidecar files. Admit only that producer ABI: exact terminal state,
+  source/code digests, finite inline ABBA timings, unchanged candidate writes
+  and zero provider/production side effects. The named standalone path cannot
+  borrow another producer's completion. Preserve its original receipt bytes;
+  full original/cold recovery and every retirement gate remain independent.
   This is producer-declared completion, not a fresh numerical benchmark oracle.
+  Standalone `panel_chunk_storage_YYYYMMDD_{final,vN,Nm_vN}` cases use their
+  original `acceptance.json` and matching `progress.json`. The common evidence
+  reader recognizes only the exact terminal state, complete whole/chunks/chunks/whole
+  order, equal full array hashes/axes, initial/append timings and storage counters,
+  source/code digests and zero provider/production writes. The original first
+  producer is a separate exact receipt shape: it already has all four full
+  array hashes, axes, stages, counters, source proofs and matching progress,
+  but omits all three code/chunk-policy header fields together. Its bounded
+  original header/record shape and aware observation clock may establish
+  completion only; preserve the missing code identity and chunk policy as
+  explicitly not recorded. Partial modern headers, mixed/unknown fields and
+  missing full-readback evidence remain unqualified; never backfill original
+  receipts. Bind either ABI to the standalone name in capture and retirement.
+  See the [original Panel readback](../filesystem_incremental_audit_2026-10-23.md#2026-10-24-1247-原-panel-副本與-v29-最終驗收).
+  Keep original receipt bytes,
+  independent full cold recovery, consumer/pin/transport gates and exact inode
+  accounting, including external aliases. This grants no automatic cleanup.
   The canonical OpenBB selector producer has distinct fixture and comparison
   ABIs (`openbb_private_full_manifest_source_selector_v1` and
   `openbb_full_manifest_unassigned_source_abba_v1`). Recognize only that exact
@@ -1213,6 +1329,75 @@ catalog credentials or hard-code an interpreter path.
   source hashes, task/limit counts and zero-write/call evidence. Unknown pairs,
   missing or modified sidecars and uncompleted comparisons remain blocked;
   do not rewrite old receipts to make their contract names match.
+  The exact `public-feature-assembly-YYYYMMDD[suffix]` producer pairs
+  `tw_public_private_full_builder_fixture_v1` with
+  `tw_public_complete_builder_exact_parity_v1`. Its two named sibling receipts
+  bind fresh complete-file verification to the original fixture and every
+  original trial receipt's raw bytes, full output hashes, source scope and zero
+  provider/production writes. Timing comparisons use only repeated trials of
+  the same harness; other completed trials must still match complete source
+  and output bytes. Preserve both fresh evidence and failed historical checks,
+  without backdating or rewriting original receipts. Retained/quarantine reads
+  use the frozen original-path binding; all full cold and live retirement gates
+  remain mandatory. See the [2026-10-24 plan and verification](../filesystem_incremental_audit_2026-10-23.md#1650-完成證據接線追加方案實作前).
+  The named `finmind-group-status-abba-v2-YYYYMMDD-fixture` producer stores its
+  original v2/v3 comparison receipts beside the fixture. Recognize only those
+  two exact sibling names, the v3-to-v2 prepared-from binding, complete ABBA
+  status/receipt/Parquet hashes and zero provider/production writes. Keep both
+  original sibling files and their exact retained bytes. Pre-unlink checks,
+  post-unlink acceptance and independent readback bind the copied
+  `retained-evidence` to the frozen original source path
+  and this explicit producer contract; it must not infer paths from metadata
+  or treat these external receipts as original fixture archive members.
+  Validate that retained-reader path immediately after capture too, before
+  large archive I/O; this does not replace any final source/cold/consumer gate.
+  The exact `benchmarks/finlab-finmind-throughput-YYYYMMDD/reservation` producer
+  instead retains four comparison reports in the corresponding dated
+  `artifacts/data_quality/finlab_finmind_throughput_YYYY-MM-DD` directory.
+  Bind their original prepared-from chain, captured contexts, all 36 full
+  output hashes, complete ABBA/claim-release trials and zero provider/production
+  writes. Correction preparation is its own stage, not an inferred cumulative
+  flag. Preserve all 44 metadata files; external reports are not source archive
+  members. The common exact original-path binding applies before capture,
+  after quarantine, on owned resume and after source removal for both families.
+  A completed publication receipt may resume its exact current D snapshot and
+  manifest without repeating preparation when its archive manifest still
+  exists. This is a publication checkpoint, not cached acceptance: always run
+  independent complete D recovery, the fresh source/mirror/D byte audit and
+  all current consumer/quarantine/unlink gates. Changed source or corrupted
+  encoding must still fail before deletion; a changed fixed head must fail
+  rather than silently select another version.
+  A complete uncommitted encoding resumes through the canonical publisher's
+  full pre/post-commit archive/source checks, without another identical outer
+  scan. Missing manifests still require recovery/preparation; independent cold
+  recovery and all fresh retirement gates remain mandatory.
+  Transient Syncthing scans may wait in bounded observations within the same
+  process's original 1,500-second full-audit validity. Release the shared
+  mutation owner while waiting, and reacquire it before the canonical apply
+  refreshes all gates. A 300-second scan timeout alone must not discard a
+  still-valid audit and restart all byte I/O. Never extend the proof timestamp,
+  accept non-idle transport, or reuse the owned byte proof across processes;
+  expiration requires the full audit again. Only the exact pre-mutation
+  `cold-peer-not-converged` failure admits the existing bounded retry;
+  combined blockers and post-mutation errors retain their hard stop.
+  After the canonical rename to quarantine `source`, retain that same original
+  producer identity. Derive it only from the reviewed artifact root/spec;
+  validate the existing `retiring` transaction, exact quarantine/dataset/root,
+  nonce, fixed snapshot and manifest binding before reading the two original
+  sibling receipts. An arbitrary directory named `source` cannot borrow this
+  completion evidence. Exercise actual publication, rename, interrupted resume,
+  exact unlink and cold restore in lifecycle tests; an outer CLI mock cannot
+  establish that a renamed source is accepted by the shared archive reader.
+  An interrupted transaction has already performed its rename. Its v2 owned
+  resume proof binds the existing PID/start-ticks/boot identity and may place
+  the complete decode/source audit outside the shared
+  publication owner, then reuse it only with the same exact quarantine,
+  current full inode/ctime binding, fixed cold release, full original counts,
+  verified archive-manifest SHA and original 1500-second proof deadline.
+  Include external sibling completion bytes in every binding; inline receipts
+  are already part of the source tree. Recheck all usage/pin/transport gates
+  and the full binding before unlink. Unknown/v1 reuse proofs are rejected.
+  This does not remove the first-rename or encoding-stage-rename byte audits.
   Large mutable SQLite work copies
   cannot share immutable-input hardlinks. A cold publication or copied report
   alone still cannot retire them; all original recovery, consumer, transport
@@ -1455,6 +1640,15 @@ catalog credentials or hard-code an interpreter path.
   checks; keep the production 8 KiB mount. Prefix resume requires exact
   compressed SHA before append. Retain failed fragments; never count transport
   as cold acceptance. See [bulk return](../vast_bulk_compressed_return_2026-10-04.md).
+  Large completed encodings in the two fixed D benchmark/offline scratch roots
+  may use that adapter in read-only mode for 64 MiB through 8 GiB members.
+  Keep the Linux no-follow regular-file descriptor open, validate native exit
+  and full EOF, then recheck both descriptor/path generations. Hash and decode
+  every byte as before; small, oversized and non-enrolled members retain the
+  local reader. The native configuration and Windows script both reject stage
+  writes/copies; retain Linux path and actual D-volume admission before launch.
+  Quarantine, full cold recovery and exact stage pruning remain separate
+  mandatory checks.
 - The 2026-10-06 bounded preservation v2 keeps received compressed frames and
   publishes carriers larger than 2 GiB as ordered, independently SHA-verified
   parts, each at most 2 GiB, plus the original-member index and exact part plan.
@@ -1521,6 +1715,12 @@ catalog credentials or hard-code an interpreter path.
   hashing after quarantine. Expiration requires another full audit outside the
   mutation owner. No CLI accepts a saved proof to bypass a fresh audit, and
   automatic retention keeps its existing full verification path.
+  The original manual CLI may retry at most three transport preflights under
+  that owner and original clock, only for the exact canonical
+  `legacy retirement blocked: cold-peer-not-converged` error, which precedes
+  state/activation/quarantine mutation. Recheck convergence and all canonical
+  apply gates each time; preserve retry evidence without renewing the proof.
+  Mixed blockers, changed sources, or any quarantine/unlink error propagate.
 - Native full-blob SHA batching retains before/after signatures and full digest
   comparison. Bound each invocation by 16 objects, 8 GiB per object and 16 GiB
   total, matching the adapter contract; larger blobs use full streaming SHA.
@@ -1599,11 +1799,21 @@ catalog credentials or hard-code an interpreter path.
   budget the full source size plus a 32 GiB C reserve, and publish only to the
   canonical D store. An explicit `retire_local_offline_artifacts.py inventory
   --guarded-d-scratch` may instead freeze `completed-benchmark-d-scratch-v1`
-  for one new, completed `benchmarks/<suite>/<case>` only. This uses the separate
+  for one new, completed `benchmarks/<suite>/<case>` or the specifically admitted
+  standalone research-staging case above. This uses the separate
   fixed `/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch`, full
   source-size admission plus the unchanged 32 GiB reserve on D, durable encoding
   and the same guarded canonical publication. Existing enrolled archives, other
   physical source roles and arbitrary stage overrides cannot use this profile.
+  `--guarded-d-offline-scratch` freezes the distinct
+  `completed-offline-d-scratch-v1` profile for one explicitly selected,
+  reviewed `operations/<case>` subtree. Its sole stage root is
+  `/srv/stockagent-d-volume/stockagent-completed-offline-scratch`; require the
+  original manual-capture contract, at least 12 stable hours, full source-size
+  admission plus 32 GiB on D, mount guard and all original recovery/retirement
+  checks. It cannot capture the whole namespace, raw providers, active jobs,
+  other physical roles or override an existing archive. A new frozen inventory
+  selects the role; never edit a previously frozen inventory to relocate work.
   Preserve all interrupted ordinary D staging as audit evidence until
   separately verified redundant. After exact hot retirement, the explicit
   `prune-stage-plan` / `prune-stage-apply` transaction may remove only that
@@ -1611,7 +1821,8 @@ catalog credentials or hard-code an interpreter path.
   encoded hashes, every cold member's independent reconstruction, exact control
   receipts, no unknown/symlink files, pin/process gates and unchanged dry-run
   signatures; rename to private quarantine and repeat the D/recovery/signature
-  gates immediately before unlink. The separate completed-benchmark D scratch
+  gates immediately before unlink. The separate completed-benchmark and
+  completed-offline D scratch
   may use this exact prune transaction only after its own hot retirement and
   independent cold proof. Ordinary legacy D staging, incomplete work and cold
   objects remain excluded; this exception never admits their deletion.

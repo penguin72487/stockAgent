@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+from itertools import islice
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -223,9 +224,7 @@ def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Pat
         blockers.append("service-dependency")
     pins = _pinned_snapshot_ids(materialized_root)
     if pins:
-        for p in (cold_root / "manifests").glob("*/*.json"):
-            if p.stem not in pins:
-                continue
+        for p in _pinned_manifest_paths(cold_root, pins):
             m = json.loads(real(p).read_bytes()); meta = m.get("metadata", {})
             relative = meta.get("source_relative_root", meta.get("artifact_relative_root"))
             if isinstance(relative, str):
@@ -233,6 +232,45 @@ def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Pat
                 if source == protected or source in protected.parents or protected in source.parents:
                     blockers.append("pinned-release")
     return sorted(set(blockers))
+
+
+def _pinned_manifest_paths(cold_root: Path, pins):
+    """Read exact pin filenames across datasets, not every historical version.
+
+    Enumerate small directories once; probe exact names after a bounded prefix
+    of a large directory. No historical file count or persistent cache is used.
+    Duplicate basenames in every dataset and literal metacharacters are kept;
+    selected redirected paths still reach real() and fail the original gate.
+    """
+    names = set()
+    for snapshot in pins:
+        if (not isinstance(snapshot, str) or not snapshot
+                or Path(snapshot).name != snapshot or snapshot in ('.', '..')):
+            raise SnapshotError('pinned snapshot is not an exact manifest filename')
+        names.add(snapshot + '.json')
+    if not names:
+        return
+    directory = cold_root / 'manifests'
+    if not directory.exists():
+        return
+    with os.scandir(directory) as datasets:
+        for dataset in datasets:
+            if not dataset.is_dir():
+                continue
+            limit = 2 * len(names)
+            with os.scandir(dataset.path) as versions:
+                prefix = list(islice(versions, limit + 1))
+            observed = {entry.name: Path(entry.path) for entry in prefix if entry.name in names}
+            yield from observed.values()
+            if len(prefix) <= limit:
+                continue
+            for name in sorted(names - observed.keys()):
+                path = Path(dataset.path) / name
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    continue
+                yield path
 
 
 def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_root: Path,

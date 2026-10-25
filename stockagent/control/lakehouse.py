@@ -375,6 +375,45 @@ def register(c: dict) -> dict:
             con.close()
 
 
+def _previous_catalog_export(c: dict, expected_snapshot: int):
+    """Select one committed incremental donor, never scan historical payloads."""
+    from stockagent.data_sync.catalog_incremental import CONTRACT, read_catalog_donor
+    candidates = []
+    for path in Path(c['state_root']).glob('export-*.json'):
+        match = re.fullmatch(r'export-([0-9]+)\.json', path.name)
+        if match and int(match[1]) < expected_snapshot:
+            candidates.append((int(match[1]), path))
+    for snapshot, path in sorted(candidates, reverse=True):
+        if path.is_symlink() or path.stat().st_size > 1024**2:
+            raise ValueError('catalog donor enrollment is redirected or oversized')
+        row = json.loads(path.read_bytes())
+        if not isinstance(row, dict):
+            raise ValueError('catalog donor enrollment is not an object')
+        if row.get('state') != 'published':
+            continue
+        # Once the latest published export is from the old copy format there
+        # is no enrolled immutable donor. Seed once, without reading history.
+        if row.get('data_materialization', {}).get('contract') != CONTRACT:
+            return None
+        identity = row.get('delivery_identity_sha256')
+        from stockagent.data_sync.immutable_replication import HASH
+        if not isinstance(identity, str) or not HASH.fullmatch(identity):
+            raise ValueError('catalog donor enrollment identity differs')
+        root = Path(c['lake_root']) / 'releases' / ('lake-' + identity)
+        if row.get('snapshot_id') != snapshot or row.get('delivery_root') != str(root):
+            raise ValueError('catalog donor enrollment scope differs')
+        donor = read_catalog_donor(root)
+        manifest = donor.manifest
+        context = manifest['context']
+        if (manifest['identity_sha256'] != identity
+                or context.get('kind') != 'ducklake_catalog_and_data'
+                or context.get('ducklake_snapshot_id') != snapshot
+                or any(context.get(key) != c[key] for key in ('producer_device_id', 'receiver_device_id'))):
+            raise ValueError('catalog donor sealed identity differs')
+        return donor
+    return None
+
+
 def export(c: dict, expected_snapshot: int) -> dict:
     guard(c)
     state = Path(c["state_root"])
@@ -407,7 +446,9 @@ def export(c: dict, expected_snapshot: int) -> dict:
         root = Path(c["lake_root"])
         staging = root / (".export-" + uuid.uuid4().hex)
         staging.mkdir(parents=True)
-        shutil.copytree(root / "data", staging / "data")
+        from stockagent.data_sync.catalog_incremental import copy_catalog_data
+        data_files, materialization = copy_catalog_data(
+            root / 'data', staging / 'data', previous=_previous_catalog_export(c, expected_snapshot))
         import psycopg
         from stockagent.control.backup import logical_database_state
         from stockagent.data_sync.backup_auxiliary import CONTROL
@@ -433,13 +474,16 @@ def export(c: dict, expected_snapshot: int) -> dict:
                                                         "catalog_database": c["catalog_database"], "catalog_role": c["catalog_role"]})
         manifest = seal(staging, {"kind": "ducklake_catalog_and_data", "ducklake_snapshot_id": expected_snapshot,
                                  "producer_device_id": c["producer_device_id"], "receiver_device_id": c["receiver_device_id"]})
+        if {name: value for name, value in manifest['files'].items() if name.startswith('data/')} != data_files:
+            raise ValueError('sealed catalog data differs from the observed source')
         destination = root / "releases" / ("lake-" + manifest["identity_sha256"])
         destination.parent.mkdir(exist_ok=True)
         if destination.exists():
             raise ValueError("immutable export already exists without its journal")
         transport = Path(c["transport_root"]) / destination.name
         result = {"state": "publication_prepared", "snapshot_id": expected_snapshot, "delivery_identity_sha256": manifest["identity_sha256"],
-                  "delivery_root": str(destination), "transport_root": str(transport), "staging_root": str(staging)}
+                  "delivery_root": str(destination), "transport_root": str(transport), "staging_root": str(staging),
+                  "data_materialization": materialization}
         atomic_write_json(journal, result)
         return finish_export(c, result, journal)
 
@@ -784,14 +828,19 @@ def stage_source_wave(c: dict) -> dict:
         finally:
             con.close()
         total = sum(row[2] for row in rows)
-        covered = sum(row[2] for row in rows if row[0] + "@" + row[1] in acknowledged)
+        covered = covered_count = 0
+        for relative, sha, count in rows:
+            if relative + '@' + sha in acknowledged:
+                covered += count
+                covered_count += 1
         pending_bytes = sum(ledger['deliveries'][key]['bytes'] for key in pending)
         retained_bytes = sum(row['bytes'] for row in ledger['deliveries'].values()
             if row.get('transport_retirement', {}).get('state') != 'retired')
         result = {"state": "waiting_nas_archive_acceptance" if pending else "monitoring_increments",
                   "observed_at_utc": datetime.now(timezone.utc).isoformat(), "available_object_bytes": total,
                   "nas_archive_covered_bytes": covered, "available_object_count": len(rows),
-                  "nas_archive_covered_objects": len(acknowledged), "pending_delivery_ids": pending,
+                  "nas_archive_covered_objects": covered_count,
+                  "nas_archive_historical_objects": len(acknowledged), "pending_delivery_ids": pending,
                   "pending_bytes": pending_bytes,
                   "maximum_pending_deliveries": None if policy['decouple_nas_acceptance'] else policy['maximum_pending_deliveries'],
                   "maximum_wave_bytes": policy['maximum_wave_bytes'],

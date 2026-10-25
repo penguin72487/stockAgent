@@ -21,7 +21,7 @@
   "tick_queue_depth": 4,
   "tick_authorization_slots": 8,
   "tick_http_keepalive": true,
-  "general_batch_size": 8,
+  "general_batch_size": 32,
   "pre_reset_publication_recheck_minutes": 10,
   "processing_threads": 1
 }

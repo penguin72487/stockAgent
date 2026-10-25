@@ -46,6 +46,8 @@ let lastFetchMs = null;
 let refreshInFlight = false;
 let refreshQueued = false;
 let refreshForceQueued = false;
+let refreshPushedQueued = null;
+let latestServiceNotice = null;
 let lastRenderedRevision = null;
 let lastFilterRevision = null;
 let lastSourceUpdatedAt = "";
@@ -1878,7 +1880,17 @@ function renderSignals() {
       : `模型決策列 ${number(recorded)}`;
     return `<div><span>${esc(strategyLabel(market))} 完整訊號／執行稽核</span><strong class="${missing || (expected && !complete) ? "negative" : "positive"}">${completeness} · 非零訊號 ${number(row.nonzero_signal_count)} · 成交 ${number(row.filled_signal_count)}</strong><small>${belowLot ? `資金不足一張 ${number(belowLot)} 筆，完整訊號仍保留於下表` : esc(reasons || "全部非零訊號皆已成交")}</small></div>`;
   }).join("");
-  setHtml("signal-direction-summary", directionHtml + openingAuditHtml);
+  const revisionHtml = (snapshot?.modes || []).filter((mode) =>
+    mode.day_trade_signal_update_policy === "progressive_open_reference_rebalance_v1"
+    && Number.isInteger(mode.opening_signal_revision?.index)).map((mode) => {
+      const inventory = mode.inventory_rebalance;
+      const progress = inventory?.contract_valid === true
+        ? inventory.target_complete === true ? "實際庫存已達本版完整目標"
+          : `庫存仍差 ${number(inventory.remaining_delta_shares)} 股 · ${number(inventory.unresolved_symbol_count)} 檔待取價`
+        : "待核對完整庫存差額";
+      return `<div><span>${esc(strategyLabel(mode.market))} 即時再平衡</span><strong>版本 ${number(mode.opening_signal_revision.index)} · ${esc(shortTime(mode.signal_at))}</strong><small>${progress}。新開盤價優先；缺價沿用可追溯前次成交價。僅交易目標差額，原成交保留。</small></div>`;
+    }).join("");
+  setHtml("signal-direction-summary", directionHtml + openingAuditHtml + revisionHtml);
   detailComponents.pagedTable({
     id: "signal", rows: visibleRows, total: acceptedSelection ? signalTotal : 0,
     loading: signalLoading || !acceptedSelection,
@@ -2009,8 +2021,14 @@ function renderAudit(data) {
 
 function revisionOf(data) {
   const counts = data.record_counts || {};
+  const service = data.service_sync || {};
   return JSON.stringify([
     data.session_date,
+    // Compact status deliberately omits full ledger counts. A new target can
+    // leave equity and position counts unchanged (including no new fills).
+    // Follow the canonical MATERIAL revision, never its heartbeat sequence,
+    // so newly applied signals/rebalances cannot retain old mode-card DOM.
+    service.engine_generation, service.content_revision,
     counts.signals, counts.orders, counts.fills, counts.marks, counts.benchmark_marks, counts.events,
     data.opening_signal_latency?.observed_mode_count,
     data.opening_signal_latency?.final_ready_ms,
@@ -2023,7 +2041,8 @@ function revisionOf(data) {
     data.preopen?.updated_at,
     data.unattended_guardian?.observed_at_taipei,
     data.modes.map((row) => [
-      row.market, row.label, row.total_equity_twd, row.open_position_count,
+      row.market, row.label, row.public_signal_key, row.opening_signal_revision?.index,
+      row.total_equity_twd, row.open_position_count,
       row.stale_position_count, row.indicative_valuation_position_count, row.force_exit_failures,
       row.terminal_flatten_count, row.terminal_flatten_degraded_count,
       row.engine_status,
@@ -2036,7 +2055,13 @@ function render({heavy = true} = {}) {
   if (!snapshot) return;
   renderHeader(snapshot);
   renderOverview(snapshot);
-  if (!heavy) return;
+  if (!heavy) {
+    // A newer applied commit can cancel a pending double-rAF observation
+    // without changing the cards' material content. Re-observe the existing
+    // visible DOM; do not force heavy rendering or fabricate an SSE notice.
+    measureRevisionPaint("status_revision_paint", snapshot.modes, "mode-cards");
+    return;
+  }
   renderOperations(snapshot);
   renderModes(snapshot);
   renderBenchmarks(snapshot);
@@ -2238,11 +2263,12 @@ async function loadEvents({append = false, force = false} = {}) {
   }
 }
 
-async function refresh({force = false} = {}) {
+async function refresh({force = false, pushedSnapshot = null} = {}) {
   if (document.hidden) return;
   if (refreshInFlight) {
     refreshQueued = true;
     refreshForceQueued = refreshForceQueued || force;
+    if (pushedSnapshot) refreshPushedQueued = pushedSnapshot;
     return;
   }
   if (force) {
@@ -2254,16 +2280,26 @@ async function refresh({force = false} = {}) {
   try {
     const started = performance.now();
     const date = selectedDate();
-    const response = await fetchWithTimeout(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
-    const nextSnapshot = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
+    const nextSnapshot = pushedSnapshot || await (async () => {
+      const response = await fetchWithTimeout(`api/status${date ? `?date=${encodeURIComponent(date)}` : ""}`, {cache: "no-store"});
+      return Dashboard.readJsonResponse(response, {expectedRoot: "object"});
+    })();
     if (date !== selectedDate()) { refreshQueued = true; return; }
+    // A pending HTTP response must not roll back a newer pushed commit. A
+    // pushed latest-session DTO can never replace a user's historical scope.
+    if (pushedSnapshot && date && date !== nextSnapshot.session_date) { refreshQueued = true; return; }
+    const sync = nextSnapshot.service_sync || {};
+    if (latestServiceNotice?.engine_generation && sync.engine_generation !== latestServiceNotice.engine_generation) return;
+    if (appliedStatusRevision?.engine_generation === sync.engine_generation && (
+      Number(sync.state_revision) < Number(appliedStatusRevision.state_revision) ||
+      Number(sync.content_revision) < Number(appliedStatusRevision.content_revision))) return;
     const previousRange = detailRangeKey();
     snapshot = nextSnapshot;
     if (appliedStatusRevision && ["revision_token", "engine_generation", "state_revision"]
       .some(key => appliedStatusRevision[key] !== nextSnapshot.service_sync?.[key])) appliedStatusPhase = "revision_change";
     appliedStatusRevision = {...nextSnapshot.service_sync};
     lastServiceRevision = String(snapshot.service_sync?.revision_token || lastServiceRevision || "");
-    lastFetchMs = performance.now() - started;
+    lastFetchMs = pushedSnapshot ? null : performance.now() - started;
     const sourceUpdatedAt = String(snapshot.source_updated_at || "");
     const sourceHasChanged = sourceUpdatedAt && sourceUpdatedAt !== lastSourceUpdatedAt;
     if (sourceHasChanged || force) {
@@ -2305,9 +2341,11 @@ async function refresh({force = false} = {}) {
     if (!document.hidden && twPublicMonitorActivated) void loadTwPublicMonitor();
     if (refreshQueued) {
       const queuedForce = refreshForceQueued;
+      const queuedSnapshot = refreshPushedQueued;
       refreshQueued = false;
       refreshForceQueued = false;
-      void refresh({force: queuedForce});
+      refreshPushedQueued = null;
+      void refresh({force: queuedForce, pushedSnapshot: queuedSnapshot});
     }
   }
 }
@@ -2363,7 +2401,11 @@ function installEventViewActivation() {
   defer(activateEventView);
 }
 
-function acceptServiceRevision(serviceSync, {transport = "poll"} = {}) {
+function acceptServiceRevision(serviceSync, {transport = "poll", statusExpected = false} = {}) {
+  if (latestServiceNotice?.engine_generation === serviceSync.engine_generation && (
+    Number(serviceSync.state_revision) < Number(latestServiceNotice.state_revision) ||
+    Number(serviceSync.content_revision) < Number(latestServiceNotice.content_revision))) return;
+  latestServiceNotice = serviceSync;
   revisionPaintObserver?.notice(serviceSync, transport);
   scheduleSessionRollover(serviceSync);
   const revision = String(serviceSync.revision_token || "");
@@ -2375,7 +2417,15 @@ function acceptServiceRevision(serviceSync, {transport = "poll"} = {}) {
     snapshot.service_sync = serviceSync;
     renderOperations(snapshot);
   }
-  if (changed) void refresh();
+  if (changed && !statusExpected) void refresh();
+}
+
+function acceptServiceStatus(nextSnapshot) {
+  if (document.hidden || !Array.isArray(nextSnapshot.modes) || !nextSnapshot.service_sync) return;
+  if (nextSnapshot.service_sync.revision_token !== latestServiceNotice?.revision_token) return;
+  const date = selectedDate();
+  if (date && date !== nextSnapshot.session_date) { void refresh(); return; }
+  void refresh({pushedSnapshot: nextSnapshot});
 }
 
 async function refreshServiceRevision() {
@@ -2513,7 +2563,9 @@ Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});
 Dashboard.scheduleRefresh(() => {
   void refresh();
 }, {intervalMs: PRICE_REFRESH_MS});
-Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, refreshServiceRevision, {fallbackMs: SERVICE_REVISION_REFRESH_MS});
+Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, refreshServiceRevision, {
+  fallbackMs: SERVICE_REVISION_REFRESH_MS, onStatus: acceptServiceStatus,
+});
 Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
 installTwPublicMonitorActivation();
 installEventViewActivation();

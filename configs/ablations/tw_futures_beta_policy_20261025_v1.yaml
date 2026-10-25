@@ -1,0 +1,79 @@
+base_config: configs/markets/tw_futures_beta_policy_20261025_v1.yaml
+output_root: artifacts/markets/tw_futures_beta_policy_20261025_v1
+fold_selection: last
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 8
+  torch_compile_threads: 8
+  capacity_retry:
+    max_retries: 2
+    minimum_train_batch: 32
+postprocess_plots:
+  - split: val
+    prefix: val
+    comparison_mode: absolute
+    scope_label: Prior TX beta study; validation-only checkpoint selection
+  - split: test
+    prefix: test
+    comparison_mode: absolute
+    scope_label: Previously inspected research period; not an untouched holdout
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: false
+  fixed_overrides:
+    training:
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      early_stopping_min_delta: 0.0001
+      pretrained_initialization_root: null
+      warm_start_from_previous_fold: false
+      loss_type: log_utility
+    runner:
+      resume: false
+      require_cuda: true
+  dimensions:
+    - name: twd_equity
+      enabled: true
+      variants:
+        - name: beta0_0845
+          description: 先驗台指 beta 中性／Prior TX-beta neutral；08:45；AdamW。
+          overrides: {}
+        - name: beta025_0845
+          description: 限制先驗台指 beta／Bounded prior TX beta；08:45；曝險上限為 NAV 的25%。
+          overrides:
+            training:
+              financial_transformer:
+                futures_beta_notional_cap: 0.25
+        - name: beta0_muon_0845
+          description: 先驗台指 beta 中性＋Muon／Prior TX-beta neutral with Muon；08:45。
+          overrides:
+            training:
+              optimizer_name: muon
+              optimizer_options:
+                matrix_lr_scale: 1.0
+                aux_lr_scale: 1.0
+                adjust_lr_fn: match_rms_adamw
+        - name: beta0_0900
+          description: 先驗台指 beta 中性／Prior TX-beta neutral；09:00；AdamW；相同歷史特徵。
+          overrides: &clock0900
+            trading:
+              tw_futures_portfolio_decision_time: '09:00'
+              tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0900/entries.parquet
+              tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_equity_weekly_spread_20261023_v3/twd_equity/clocks/0900/opening_reference.parquet
+        - name: beta025_0900
+          description: 限制先驗台指 beta／Bounded prior TX beta；09:00；曝險上限為 NAV 的25%。
+          overrides:
+            <<: *clock0900
+            training:
+              financial_transformer:
+                futures_beta_notional_cap: 0.25
+        - name: beta0_muon_0900
+          description: 先驗台指 beta 中性＋Muon／Prior TX-beta neutral with Muon；09:00。
+          overrides:
+            <<: *clock0900
+            training:
+              optimizer_name: muon
+              optimizer_options:
+                matrix_lr_scale: 1.0
+                aux_lr_scale: 1.0
+                adjust_lr_fn: match_rms_adamw

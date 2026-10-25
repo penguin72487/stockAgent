@@ -9,9 +9,11 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import shutil
+from stat import S_ISSOCK
 import subprocess
 import sys
 import time
@@ -97,14 +99,29 @@ def parse_snapshot(value):
     }
 
 
-def snapshot():
+def _query_environment(interop_socket):
+    if interop_socket is None:
+        return None
+    path = Path(interop_socket)
+    if not path.is_absolute() or not S_ISSOCK(path.lstat().st_mode):
+        raise ValueError("explicit WSL interop endpoint must be an absolute socket path")
+    environment = os.environ.copy()
+    environment["WSL_INTEROP"] = str(path)
+    return environment
+
+
+def snapshot(*, interop_socket=None):
     if shutil.which("powershell.exe") is None:
         return {"state": "unavailable", "reason": "windows_powershell_unavailable"}
     started = time.perf_counter()
     try:
+        options = {}
+        environment = _query_environment(interop_socket)
+        if environment is not None:
+            options["env"] = environment
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", QUERY],
-            capture_output=True, timeout=30, check=True,
+            capture_output=True, timeout=30, check=True, **options,
         )
         if len(result.stdout) > 2 * 2**20:
             raise ValueError("windows_gpu_counter_output_exceeds_2MiB")
@@ -120,15 +137,27 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, choices=(1, 2, 3), default=2)
+    parser.add_argument("--wsl-interop-socket", type=Path,
+                        help="Explicit live caller socket for a supervised WSL query; no endpoint discovery or fallback")
     args = parser.parse_args()
     if args.output.exists() or args.output.is_symlink():
         raise FileExistsError("preserve prior GPU ownership evidence")
     if not args.output.resolve().is_relative_to((ROOT / "artifacts/operations").resolve()):
         raise ValueError("GPU ownership evidence must remain under artifacts/operations")
+    try:
+        _query_environment(args.wsl_interop_socket)
+    except (OSError, ValueError) as exc:
+        parser.error(f"invalid explicit WSL interop endpoint: {type(exc).__name__}")
     result = {
-        "contract": "windows_wddm_gpu_owner_observation_v1",
+        "contract": "windows_wddm_gpu_owner_observation_v2",
         "observed_at_utc": datetime.now(timezone.utc).isoformat(), "sources": SOURCES,
-        "board_before": gpu_snapshot(), "samples": [snapshot() for _ in range(args.samples)],
+        "windows_transport": {
+            "interop_socket_selection": "explicit" if args.wsl_interop_socket is not None else "inherited",
+            "explicit_socket_path": str(args.wsl_interop_socket) if args.wsl_interop_socket is not None else None,
+            "parent_environment_modified": False,
+        },
+        "board_before": gpu_snapshot(),
+        "samples": [snapshot(interop_socket=args.wsl_interop_socket) for _ in range(args.samples)],
         "board_after": gpu_snapshot(), "provider_requests": 0, "cuda_initialized_by_probe": False,
         "services_or_applications_stopped": False, "source_files_written": 0,
         "boundary": "sequential_non_atomic_WDDM_samples_not_total_VRAM_reconciliation_or_CUDA_readiness",
