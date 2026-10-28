@@ -31,6 +31,7 @@ from scripts.download_finlab_history import (  # noqa: E402
     DEFAULT_OUTPUT, TAIPEI, _atomic_json, classify_provider_error,
     credential_available, quota_cycle_start, quota_room_mb, safe_stem,
 )
+from scripts.check_acquisition_capacity import check_dispatch  # noqa: E402
 from stockagent.data.finlab_transport import (  # noqa: E402
     HTTP_COUNTERS, WorkerHTTPTransport, SignedMinutePrefetch, validate_prefetch_sdk,
 )
@@ -59,6 +60,30 @@ def _partition_paths(root: Path, key: str, day: date) -> tuple[Path, Path]:
             root / "intraday/attempts" / stem / name)
 
 
+def _priority_scope_path(root: Path, key: str, day: date) -> Path:
+    """Local eligibility evidence, separate from provider attempts and receipts."""
+    return root / "intraday/priority_scope" / safe_stem(key) / f"{day.isoformat()}.json"
+
+
+def _priority_scope_wait(root: Path, key: str, day: date, *, now: datetime,
+                         source_identity: str | None) -> dict | None:
+    """Reuse one cycle of an unchanged, locally checked negative scope only."""
+    if not source_identity:
+        return None
+    try:
+        result = json.loads(_priority_scope_path(root, key, day).read_text(encoding="utf-8"))
+        checked = datetime.fromisoformat(result["checked_at_utc"])
+        if (isinstance(result, dict) and result.get("contract") == "finlab_stock_priority_local_scope_v1"
+                and result.get("dataset") == key and result.get("trade_date") == day.isoformat()
+                and result.get("source_identity") == source_identity
+                and result.get("reason") in {"symbol_not_in_universe", "unverified_session", "symbol_ineligible"}
+                and checked.tzinfo is not None and quota_cycle_start(now) <= checked <= now):
+            return result
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
 def _checked_this_cycle(path: Path, field: str, now: datetime) -> bool:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -77,7 +102,7 @@ def _checked_this_cycle(path: Path, field: str, now: datetime) -> bool:
         return False
 
 
-def _stored_receipt(path: Path, root: Path, key: str, day: date) -> dict | None:
+def _stored_receipt(path: Path, root: Path, key: str, day: date, *, verify_hash: bool = False) -> dict | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("dataset") != key or payload.get("trade_date") != day.isoformat():
@@ -90,7 +115,8 @@ def _stored_receipt(path: Path, root: Path, key: str, day: date) -> dict | None:
                 and not relative.is_absolute() and relative.parts[:2] == ("intraday", "objects")
                 and ".." not in relative.parts and object_path.is_file()
                 and object_path.stat().st_size == int(payload.get("parquet_size_bytes", -1))
-                and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("sha256", "")))):
+                and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("sha256", "")))
+                and (not verify_hash or _file_sha256(object_path) == payload['sha256'])):
             return payload
     except (OSError, ValueError, KeyError, TypeError):
         pass
@@ -129,6 +155,16 @@ def _validate_frame(frame, key: str, day: date, *, attrs: dict | None = None) ->
     local_times = frame["timestamp"].dt.convert_time_zone("Asia/Taipei")
     if key.startswith(("tw_tick:", "tw_minute:")) and not (local_times.dt.date() == day).all():
         raise ValueError("intraday timestamps contain another Taipei trade date")
+    if key.startswith("tw_futures_minute:"):
+        if "session" not in frame.columns or frame["session"].null_count() or not (
+                frame["session"].is_in(["regular", "after_hours"]).all()):
+            raise ValueError("futures minutes need regular/after-hours session labels")
+        if attrs.get("volume_scope") != "outright_only":
+            raise ValueError("futures minute volume scope must be explicitly outright-only")
+        local_days = local_times.dt.date()
+        if (local_days > day).any() or frame.filter(
+                (pl.col("session") == "regular") & (local_days != day)).height:
+            raise ValueError("futures minute timestamp does not match the trade-date session")
     if key.startswith("tw_tick:"):
         if "sequence" not in frame.columns:
             raise ValueError("tick rows need source sequence; same timestamps are distinct trades")
@@ -178,6 +214,10 @@ def persist_partition_frame(root: Path, key: str, day: date, frame, *,
     status = _validate_frame(frame, key, day, attrs=attrs)
     volume_evidence = {"raw_volume_unit": "provider_native",
                        "canonical_volume_unit": "unresolved"}
+    if key.startswith("tw_futures_minute:"):
+        volume_evidence = {"raw_volume_unit": "contracts",
+                           "canonical_volume_unit": "contracts_not_independently_reconciled",
+                           "volume_scope": attrs.get("volume_scope")}
     if status == "downloaded_unverified_for_pit" and key.startswith(("tw_tick:", "tw_minute:")):
         from scripts.finlab_volume_units import with_verified_volume_shares
 
@@ -192,13 +232,18 @@ def persist_partition_frame(root: Path, key: str, day: date, frame, *,
         "rows": len(frame), "fields": list(map(str, frame.columns)),
         "first_timestamp": first_timestamp,
         "last_timestamp": last_timestamp,
-        "source_grain": "stock_trade_day_tick" if key.startswith("tw_tick:")
-                        else "stock_trade_day_left_labelled_minute",
+        "source_grain": ("stock_trade_day_tick" if key.startswith("tw_tick:") else
+                         "futures_contract_month_trade_day_left_labelled_minute"
+                         if key.startswith("tw_futures_minute:") else "stock_trade_day_left_labelled_minute"),
         "publication_time_status": "not_verified_for_training",
         "processing_contract_version": PROCESSING_CONTRACT_VERSION,
         "processing_engine": PROCESSING_ENGINE,
         **volume_evidence,
     }
+    if key.startswith('tw_futures_minute:'):
+        from importlib.metadata import version
+        payload.update(source_contract='finlab_futures_contract_month_minute_v1',
+                       source_sdk_version=version('finlab'))
     if status == "downloaded_unverified_for_pit":
         objects = root / "intraday/objects"
         objects.mkdir(parents=True, exist_ok=True)
@@ -630,6 +675,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.end_date < args.start_date or args.limit < 1 or args.reserve_mb < 0:
         parser.error("invalid intraday range, limit, or quota reserve")
+    capacity_exit = check_dispatch(args.output_root, report_admitted=False)
+    if capacity_exit:
+        return capacity_exit
     result = sync(args.output_root, start=args.start_date, end=args.end_date,
                   limit=args.limit, reserve_mb=args.reserve_mb, now=datetime.now(UTC))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True), flush=True)

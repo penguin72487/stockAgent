@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from stockagent.live.tw_day_trade_simulation import REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+from stockagent.live.tw_day_trade_simulation import REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
 
 
 SNAPSHOT_NAME = "prior_paper_source_records.jsonl"
@@ -93,7 +93,7 @@ def stage(candidate: Path) -> dict:
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if ((receipt.get("replay_contract") or {}).get("entry")
-            != REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL):
+            not in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS):
         raise ValueError("candidate is not the historical full-target contract")
     proof = receipt.get("prior_paper_fill_provenance") or {}
     if _sha256(manifest_path) != proof.get("candidate_manifest_sha256"):

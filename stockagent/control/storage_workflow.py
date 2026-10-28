@@ -7,7 +7,7 @@ with workflow.unsafe.imports_passed_through():
     from contextlib import contextmanager
     import contextvars
     import threading
-    from stockagent.control.lakehouse import configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
+    from stockagent.control.lakehouse import CatalogOwnerBusy, configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
     from downloader.artifact_io import atomic_write_json
     from pathlib import Path
     from stockagent.data_sync.dataset_migration import advance_catalog_versions
@@ -34,8 +34,13 @@ def activity_lease():
 @activity.defn
 def register_versions() -> dict:
     activity.heartbeat("capturing authoritative source catalog")
-    with activity_lease():
-        result = register(configuration())
+    try:
+        with activity_lease():
+            result = register(configuration())
+    except CatalogOwnerBusy:
+        # Another canonical activity owns this exact lock. This is a normal
+        # scheduling wait, not a failed source or permission to read latest.
+        return {'state': 'waiting_catalog_owner', 'retry_after_seconds': 15}
     activity.heartbeat(result["snapshot_id"])
     return result
 
@@ -121,7 +126,9 @@ class SourceReplicationLifecycle:
     async def run(self, request: dict) -> None:
         retry = RetryPolicy(initial_interval=timedelta(seconds=5), maximum_interval=timedelta(minutes=2))
         for _ in range(60):
-            result = await workflow.execute_activity(stage_source_replication, start_to_close_timeout=timedelta(hours=2),
+            long_capture = workflow.patched('source-replication-long-catalog-capture-v1')
+            result = await workflow.execute_activity(stage_source_replication,
+                                                     start_to_close_timeout=timedelta(hours=24 if long_capture else 2),
                                                      heartbeat_timeout=timedelta(seconds=60), retry_policy=retry)
             self.phase = result
             if result["state"] == "waiting_nas_archive_acceptance":
@@ -147,8 +154,17 @@ class StorageLifecycle:
         pending_export = request.get('pending_export')
         for _ in range(60):
             self.phase = {"state": "registering_dataset_versions"}
-            catalog = ({'snapshot_id': pending_export['snapshot_id']} if pending_export else
-                await workflow.execute_activity(register_versions, start_to_close_timeout=timedelta(minutes=20), heartbeat_timeout=timedelta(seconds=60), retry_policy=retry))
+            if pending_export:
+                catalog = {'snapshot_id': pending_export['snapshot_id']}
+            else:
+                long_capture = workflow.patched('storage-long-catalog-capture-v1')
+                catalog = await workflow.execute_activity(register_versions,
+                    start_to_close_timeout=timedelta(hours=24) if long_capture else timedelta(minutes=20),
+                    heartbeat_timeout=timedelta(seconds=60), retry_policy=retry)
+            if catalog.get('state') == 'waiting_catalog_owner':
+                self.phase = catalog
+                await workflow.sleep(timedelta(seconds=catalog['retry_after_seconds']))
+                continue
             if catalog["snapshot_id"] != last:
                 self.phase = {"state": "exporting_version", "snapshot_id": catalog["snapshot_id"]}
                 exported = pending_export or await workflow.execute_activity(export_version, catalog["snapshot_id"], start_to_close_timeout=timedelta(minutes=20), heartbeat_timeout=timedelta(seconds=60), retry_policy=retry)

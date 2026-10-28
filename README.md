@@ -1323,18 +1323,25 @@ if ((Get-FileHash -LiteralPath $wslStorageWorker).Hash.ToLowerInvariant() -ne $w
 $wslStorageRegistration = Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' |
     Get-ItemProperty | Where-Object DistributionName -eq $wslStorageDistro
 $wslStorageVhd = Join-Path $wslStorageRegistration.BasePath 'ext4.vhdx'
+$wslStorageTarget = 3221225472000L # 3000 GiB；先選定明確 bytes，不混用 TB/TiB。
 
 # 預設唯讀 Plan；先核對 distro、精確 VHD、容量及 Windows 排程。
-& $wslStorageWorker -Mode Plan -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd
+& $wslStorageWorker -Mode Plan -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -TargetSizeBytes $wslStorageTarget
 # 不啟停 WSL；若目前正在使用，只留下 skipped-running 收據。
 & $wslStorageWorker -Mode CompactIfStopped -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -Apply
 # 明確允許停機後，在原生 Windows 的系統管理員終端執行：
-& $wslStorageWorker -Mode Expand -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -Apply
+& $wslStorageWorker -Mode Expand -DistroName $wslStorageDistro -ExpectedVhdPath $wslStorageVhd -TargetSizeBytes $wslStorageTarget -Apply
 ```
 
-`Expand` 上限為 2,499,999,170,560 bytes（不超過十進位 2.5 TB），不縮小虛擬容量。
+`Expand` 可明確指定至 3 TiB（3,298,534,883,328 bytes），要求 MiB 對齊，
+不縮小虛擬容量。未指定時仍沿用原 2,499,999,170,560-byte 預設。
+停機後先沿原唯讀 Quick 壓縮，再以 Windows 實際可用量核對完整新增容量加
+32 GiB reserve；虛擬上限不能當作已取得的實體空間。
 它保存三個已知 Windows 自動啟動排程，正常 systemd 關機後沿官方 `wsl --manage`
 擴容、離線壓縮，最後恢復原排程。需要系統管理員權限；IDE／Codex 會短暫斷線。
+其他正在執行的 distro 預設會阻擋停機；只有明確允許一併維護的名稱才能用
+`-CompanionDistroNames 'Wazuh-Security'` 納入正常關機及重啟驗證。
+開機讀回同時驗裝置 bytes、ext4 block count × block size、原 UUID 及原服務稽核。
 收據在 `%LOCALAPPDATA%\StockAgent\WslStorage\receipts\<time>-<mode>\status.json`，
 `needs-attention` 需查同目錄 `wsl.log`；不能把排程啟動視為擴容或業務恢復完成。
 維護程序中斷時用同目錄 task XML／`tasks` 原狀態恢復排程，勿啟用舊 filesystem-repair

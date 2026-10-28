@@ -198,6 +198,47 @@ def test_tree_portable_fingerprint_ignores_mtime_but_detects_size(
     )
 
 
+def test_parallel_tree_scan_preserves_complete_ordered_fingerprints(tmp_path: Path) -> None:
+    import os
+
+    root = tmp_path / 'source'
+    (root / 'nested' / 'empty').mkdir(parents=True)
+    for index in range(140):
+        (root / 'nested' / f'{index:04d}').write_bytes(str(index).encode())
+    os.link(root / 'nested' / '0000', root / 'hardlink')
+    (root / 'link-to-file').symlink_to('nested/0001')
+    (root / 'link-to-directory').symlink_to('nested', target_is_directory=True)
+    serial = scan_tree(root)
+    assert scan_tree(root, file_workers=4) == serial
+    (root / 'nested' / 'extra').write_bytes(b'new')
+    assert scan_tree(root, file_workers=4) != serial
+    assert scan_tree(root, file_workers=4) == scan_tree(root)
+
+
+@pytest.mark.parametrize('workers', [True, 0, 5])
+def test_parallel_tree_scan_rejects_invalid_worker_count(tmp_path, workers):
+    with pytest.raises(ValueError, match='workers'):
+        scan_tree(tmp_path, file_workers=workers)
+
+
+def test_tree_scan_rejects_unreadable_subdirectory(tmp_path, monkeypatch):
+    import os
+    root = tmp_path / 'source'
+    blocked = root / 'blocked'
+    blocked.mkdir(parents=True)
+    original_scandir = os.scandir
+
+    def denied(path):
+        if Path(path) == blocked:
+            raise PermissionError('injected unreadable subtree')
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, 'scandir', denied)
+    for workers in (1, 4):
+        with pytest.raises(PermissionError, match='unreadable subtree'):
+            scan_tree(root, file_workers=workers)
+
+
 def test_init_refuses_sync_root_inside_git_worktree(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)

@@ -57,25 +57,32 @@ TW_CURRENT_RULE_ORDINAL = int(np.iinfo(np.int64).max)
 # A bounded historical registry for the selected all-futures intraday archive.
 # This is deliberately not a latest-specification fallback for arbitrary dates.
 # Sources, product identity and limits: docs/tw_futures_price_grid_evidence_2026-09-27.md.
-TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 4
+TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION = 7
 TAIFEX_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2020-03-23", "D")
 TAIFEX_STOCK_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2011-01-03", "D")
+TAIFEX_ETF_FUTURES_HISTORY_FIRST_DATE = np.datetime64("2014-10-06", "D")
+TAIFEX_FOREIGN_ETF_EXTENDED_SESSION_DATE = np.datetime64("2015-07-20", "D")
 TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH = np.datetime64("2026-09-27", "D")
+# The dated July amendment plus the 2026-10-27 official specification review
+# extend only stock-futures quote/session rules, not index/ETF product rules.
+TAIFEX_STOCK_FUTURES_HISTORY_VERIFIED_THROUGH = np.datetime64("2026-10-27", "D")
 # product: (tick, first verified date, exclusive end or None).  For products
 # already trading in 2020 the lower bound is this archive's scope, not listing.
 _TAIFEX_INDEX_HISTORY = {
     "TX": (1.0, "2011-01-03", None),
     "MTX": (1.0, "2011-01-03", None),
-    "TE": (0.05, "2020-03-23", None),
-    "TF": (0.2, "2020-03-23", None),
-    "T5F": (1.0, "2020-03-23", "2022-09-22"),
-    "GTF": (0.05, "2020-03-23", None),
-    "XIF": (1.0, "2020-03-23", None),
+    "TE": (0.05, "2011-01-03", None),
+    "TF": (0.2, "2011-01-03", None),
+    "T5F": (1.0, "2011-01-03", "2022-09-22"),
+    "GTF": (0.05, "2011-01-03", None),
+    "XIF": (1.0, "2011-01-03", None),
     "TJF": (0.25, "2020-03-23", None),
     "UDF": (1.0, "2020-03-23", None),
     "SPF": (0.25, "2020-03-23", None),
     "UNF": (1.0, "2020-03-23", None),
-    "G2F": (1.0, "2020-03-23", None),
+    # Official September-2019 launch pamphlet; do not confuse an earlier
+    # archive's lower bound with the product's verified historical rules.
+    "G2F": (1.0, "2019-09-30", None),
     "E4F": (1.0, "2020-06-08", None),
     "BTF": (1.0, "2020-06-08", None),
     "F1F": (1.0, "2020-11-23", None),
@@ -135,10 +142,14 @@ def trade_date_ordinals(values: Any | None, shape: tuple[int, ...]) -> np.ndarra
 
 
 def _security_types(values: Any, shape: tuple[int, ...]) -> np.ndarray:
-    kinds = np.broadcast_to(np.asarray(values), shape)
+    # Product metadata often has shape [symbols, 1] for a minute panel. Check
+    # the broadcast contract, but classify each original value only once;
+    # downstream boolean operations broadcast without expanding string arrays.
+    kinds = np.asarray(values)
+    expanded = np.broadcast_to(kinds, shape)
     if not np.all(
         np.isin(
-            kinds,
+            kinds if expanded.size else expanded,
             [
                 "stock",
                 "emerging_stock",
@@ -288,15 +299,22 @@ def _taifex_futures_history_metadata(
     kinds = np.broadcast_to(np.asarray(asset_classes).astype(str), shape)
     if not np.all(np.isin(kinds, ["stock_future", "etf_future", "index_future"])):
         raise ValueError("unsupported TAIFEX futures asset class")
-    # The launch-era official stock-futures booklet establishes the six tick
-    # bands and 08:45 day session. Keep unrelated index/ETF periods bounded.
-    # Listing, adjusted contract units and expiry still need the dated master.
-    earlier = np.isin(products, ["TX", "MTX"]) | (kinds == "stock_future")
-    first = np.where(earlier,
+    # The official May-2011 tick table covers these domestic indices; the
+    # September-2014 ETF booklet establishes its two bands. Listing, adjusted
+    # units and expiry remain dated-master facts, never current-code inference.
+    first = np.where(kinds == "stock_future",
                      int(TAIFEX_STOCK_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)),
                      int(TAIFEX_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)))
-    if np.any((ordinals < first) | (ordinals > int(TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)))):
-        raise ValueError("TAIFEX futures date outside verified historical window (TX/MTX/stock 2011+, other products 2020+)")
+    first = np.where(kinds == 'etf_future', int(TAIFEX_ETF_FUTURES_HISTORY_FIRST_DATE.astype(np.int64)), first)
+    for product, (_, start, _) in _TAIFEX_INDEX_HISTORY.items():
+        first = np.where((kinds == "index_future") & (products == product),
+                         min(int(np.datetime64(start, "D").astype(np.int64)),
+                             int(TAIFEX_FUTURES_HISTORY_FIRST_DATE.astype(np.int64))), first)
+    last = np.where(kinds == "stock_future",
+                    int(TAIFEX_STOCK_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)),
+                    int(TAIFEX_FUTURES_HISTORY_VERIFIED_THROUGH.astype(np.int64)))
+    if np.any((ordinals < first) | (ordinals > last)):
+        raise ValueError("TAIFEX futures date outside verified historical window (dated product registry, stock 2011+, ETF 2014-10-06+)")
     if np.any(np.isin(products, ["", "NONE", "NAN"])):
         raise ValueError("historical TAIFEX futures product code is required")
     index_product = np.isin(products, list(_TAIFEX_INDEX_HISTORY))
@@ -324,7 +342,7 @@ def _taifex_futures_history_metadata(
 def taifex_futures_tick_size_numpy(
     price: np.ndarray, dates: Any, *, product_codes: Any, asset_classes: Any,
 ) -> np.ndarray:
-    """Dated outright ticks: TX/MTX/stock 2011+, other products 2020+.
+    """Dated ticks: reviewed domestic indices/stock 2011+, ETF 2014-10-06+.
 
     Index grids are product-specific. Stock and ETF grids reuse ``tick_size_numpy``
     including the stock-futures 2026-07-06 amendment. The dated contract master,
@@ -386,7 +404,9 @@ def taifex_futures_day_session_minutes(
         return 525, 825
     if is_last_trading_day:
         return 525, 810
-    return 525, (975 if product in _TAIFEX_FOREIGN_ETF_PRODUCTS else 825)
+    foreign_extended = (product in _TAIFEX_FOREIGN_ETF_PRODUCTS
+        and np.datetime64(day, 'D') >= TAIFEX_FOREIGN_ETF_EXTENDED_SESSION_DATE)
+    return 525, (975 if foreign_extended else 825)
 
 
 def taifex_option_tick_size_numpy(

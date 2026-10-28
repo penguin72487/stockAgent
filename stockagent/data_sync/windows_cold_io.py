@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import selectors
 from pathlib import Path, PureWindowsPath
 import stat
 import subprocess
@@ -21,8 +22,19 @@ import time
 
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
+
+class WorkspaceCapacityDeferred(SnapshotError):
+    """Verified backing capacity is insufficient for optional local staging."""
+
+    def __init__(self, message, *, physical_free_bytes=None, required_bytes=None):
+        super().__init__(message)
+        self.physical_free_bytes = physical_free_bytes
+        self.required_bytes = required_bytes
+
+
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'scripts/windows_cold_binary_io.ps1'
+POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
 ALIASES = (
     (Path('/srv/stockagent-packed'), 'stockagent-cold-primary/packed'),
     (Path('/srv/stockagent-d-volume/stockagent-cold-primary'), 'stockagent-cold-primary'),
@@ -74,46 +86,74 @@ def _windows_process_environment():
 
     A socket's existence does not prove its Windows process context still
     works. Run the canonical encoded batch with an empty member list, then
-    require its exact marker, at most eight trusted init endpoints. Cache that
-    result briefly; each caller keeps its own env so concurrent activities
-    cannot change one another's transport context.
+    require its exact marker, at most eight probes across trusted init endpoints.
+    A timed-out empty admission can retry within that same budget; no target
+    file configuration has been sent. Cache that
+    result briefly. An expired, unchanged verified endpoint is tried first,
+    but must pass a new empty probe. Each caller keeps its own env so concurrent
+    activities cannot change one another's transport context.
     """
     global _INTEROP_CACHE
     if not _INTEROP_DIRECTORY.is_dir():
         return None
     with _INTEROP_LOCK:
         now = time.monotonic()
+        previous_verified = None
         if _INTEROP_CACHE is not None:
             signature, checked = _INTEROP_CACHE
-            if now - checked < 60 and _interop_socket(signature[0]) == signature:
-                return {**os.environ, 'WSL_INTEROP': signature[0]}
+            if _interop_socket(signature[0]) == signature:
+                previous_verified = Path(signature[0])
+                if now - checked < 60:
+                    return {**os.environ, 'WSL_INTEROP': signature[0]}
         preferred = os.environ.get('WSL_INTEROP')
-        paths = [Path(preferred)] if preferred else []
+        paths = [previous_verified] if previous_verified is not None else []
+        if preferred:
+            paths.append(Path(preferred))
         paths.extend(sorted(_INTEROP_DIRECTORY.glob('*_interop'),
                             key=lambda p: int(p.name.split('_', 1)[0])
                             if re.fullmatch(r'[1-9][0-9]*_interop', p.name) else -1,
                             reverse=True))
         probe = _native_command([], batched=True) + "\n[Console]::Write('stockagent-cold-interop-v1')"
         encoded_probe = base64.b64encode(probe.encode('utf-16le')).decode()
-        seen, attempts = set(), 0
+        seen, candidates, attempts = set(), [], 0
         for path in paths:
             signature = _interop_socket(path)
             if signature is None or signature in seen:
                 continue
             seen.add(signature)
-            attempts += 1
-            env = {**os.environ, 'WSL_INTEROP': signature[0]}
-            try:
-                result = subprocess.run(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive',
-                    '-EncodedCommand', encoded_probe], input=b'[]\n',
-                    env=env, capture_output=True, timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                result = None
-            if result is not None and result.returncode == 0 and result.stdout == _INTEROP_MARKER:
-                _INTEROP_CACHE = signature, time.monotonic()
-                return env
-            if attempts == 8:
+            candidates.append(signature)
+            if len(candidates) == 8:
                 break
+        for delay in (0, .25, 1.0):
+            if not candidates or attempts >= 8:
+                break
+            if delay:
+                time.sleep(delay)
+            pending, candidates = candidates, []
+            for signature in pending:
+                if _interop_socket(signature[0]) != signature:
+                    continue
+                attempts += 1
+                env = {**os.environ, 'WSL_INTEROP': signature[0]}
+                try:
+                    result = subprocess.run([POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive',
+                        '-EncodedCommand', encoded_probe], input=b'[]\n',
+                        env=env, capture_output=True, timeout=5)
+                except subprocess.TimeoutExpired as error:
+                    # No target path or payload has left Python. Only an
+                    # empty-output admission timeout may retry; malformed
+                    # markers and script/permission errors remain rejected.
+                    if not error.output:
+                        candidates.append(signature)
+                    result = None
+                except OSError:
+                    result = None
+                if (result is not None and result.returncode == 0 and result.stdout == _INTEROP_MARKER
+                        and _interop_socket(signature[0]) == signature):
+                    _INTEROP_CACHE = signature, time.monotonic()
+                    return env
+                if attempts == 8:
+                    break
         _INTEROP_CACHE = None
         raise SnapshotError('No verified local WSL interop bridge; native file I/O not started')
 
@@ -144,10 +184,11 @@ def admit_workspace(path: Path, required_bytes: int, *, windows_distribution: st
             raise SnapshotError("explicit WSL backing distribution is invalid")
         config = {"windows_distribution": (os.environ.get("WSL_DISTRO_NAME", "")
                                            if windows_distribution is None else windows_distribution),
-                  "powershell": "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"}
+                  "powershell": POWERSHELL}
         free = min(free, physical_free_bytes(config))
     if free < required_bytes:
-        raise SnapshotError("training return workspace lacks real physical free space")
+        raise WorkspaceCapacityDeferred("training return workspace lacks real physical free space",
+                                        physical_free_bytes=free, required_bytes=required_bytes)
     return {"filesystem": filesystem, "physical_free_bytes": free, "required_bytes": required_bytes}
 
 
@@ -252,12 +293,27 @@ def _configuration_on_checked_mount(
     return config
 
 
-def _native_command(configs, *, batched=False):
+def _batch_ready_marker(token):
+    if not isinstance(token, str) or re.fullmatch('[0-9a-f]{32}', token) is None:
+        raise SnapshotError('Native batch readiness token is invalid')
+    return ('stockagent-native-batch-ready-v1:' + token).encode('ascii')
+
+
+def _native_command(configs, *, batched=False, startup_token=None):
     # No shell interpolation, external script path or inherited plaintext key.
+    readiness = b'' if startup_token is None else _batch_ready_marker(startup_token)
+    if readiness and not batched:
+        raise SnapshotError('Native readiness is only for bounded metadata batches')
     if batched:
         # Metadata goes through stdin so Windows' command-line length does not
         # grow with the batch. The only executable bytes are the fixed script.
         command = "[Console]::InputEncoding = New-Object Text.UTF8Encoding($false)\n"
+        if readiness:
+            # No file operation can begin before metadata is sent. Flush an
+            # exact nonce first so a lost WSL launch cannot consume the full
+            # payload I/O deadline while doing no useful work.
+            command += "[Console]::Out.Write('" + readiness.decode('ascii') + "' + [char]10)\n"
+            command += "[Console]::Out.Flush()\n"
         command += "$batch = [Console]::In.ReadLine() | ConvertFrom-Json\nforeach ($item in $batch) {\n"
         command += "$env:STOCKAGENT_BINARY_IO_CONFIG = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($item | ConvertTo-Json -Compress)))\n"
         command += SCRIPT.read_text() + '\n}\n'
@@ -267,12 +323,13 @@ def _native_command(configs, *, batched=False):
     return command
 
 
-def _launch(configs, *, batched=False):
-    encoded = base64.b64encode(_native_command(configs, batched=batched).encode('utf-16le')).decode()
+def _launch(configs, *, batched=False, startup_token=None):
+    encoded = base64.b64encode(_native_command(configs, batched=batched,
+        startup_token=startup_token).encode('utf-16le')).decode()
     environment = _windows_process_environment()
     errors = tempfile.TemporaryFile()
     try:
-        process = subprocess.Popen(['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive',
+        process = subprocess.Popen([POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive',
                                     '-EncodedCommand', encoded], stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=errors, env=environment)
     except BaseException:
@@ -285,35 +342,78 @@ def _process(path, **kwargs):
     return _launch([_configuration(path, **kwargs)])
 
 
+class _BatchNotReady(Exception):
+    def __init__(self, reason, received):
+        super().__init__(reason)
+        self.reason = reason
+        self.received = received
+
+
+def _await_batch_ready(process, token, *, timeout=15.0):
+    """Consume only the exact startup line, with no metadata or payload sent."""
+    expected = _batch_ready_marker(token) + b'\n'
+    received = b''
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while len(received) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise _BatchNotReady('timeout', received)
+            # Raw reads avoid BufferedReader prefetch stealing the following
+            # JSON proofs from communicate(). There is one reader per pipe.
+            chunk = os.read(process.stdout.fileno(), len(expected) - len(received))
+            if not chunk:
+                raise _BatchNotReady('eof', received)
+            received += chunk
+            if not expected.startswith(received):
+                raise _BatchNotReady('invalid-marker', received)
+
+
 def _batch(configs):
     if (not 1 <= len(configs) <= 16 or any(c['mode'] not in {'copy', 'hash'} for c in configs)
             or sum(c['expected_bytes'] for c in configs) > 16 * 1024**3):
         raise SnapshotError('Native batch exceeds its immutable I/O bounds')
     read_only = all(c['mode'] == 'hash' for c in configs)
     for attempt in range(3):
-        process, errors = _launch(configs, batched=True)
+        token = os.urandom(16).hex()
+        process, errors = _launch(configs, batched=True, startup_token=token)
         retry = False
         try:
-            output, _ = process.communicate(json.dumps(configs, ensure_ascii=True).encode() + b'\n', timeout=3600)
-            if process.returncode or len(output) > 16 * 1024:
-                errors.seek(0)
-                failure = errors.read(4096)
-                if (read_only and process.returncode and not output and attempt < 2
-                        and retryable_interop_startup(failure)):
+            try:
+                _await_batch_ready(process, token)
+            except _BatchNotReady as failure:
+                # No metadata has left Python. Only a read-only operation
+                # with zero startup bytes may be retried, at most twice.
+                if (read_only and not failure.received
+                        and failure.reason in {'timeout', 'eof'} and attempt < 2):
                     retry = True
                 else:
-                    category = ('interop-startup-timeout' if retryable_interop_startup(failure)
-                                else 'native-command-rejected')
-                    raise SnapshotError(f'Native batch failed ({category}, exit={process.returncode}, '
-                                        f'output_bytes={len(output)}); retain every partial member')
+                    raise SnapshotError(f'Native batch failed (startup-{failure.reason}, '
+                        f'output_bytes={len(failure.received)}); no metadata sent') from failure
             if not retry:
-                rows = [json.loads(line) for line in output.splitlines()]
-                if len(rows) != len(configs):
-                    raise SnapshotError('Native batch omitted an exact member proof')
-                return rows
+                output, _ = process.communicate(json.dumps(configs, ensure_ascii=True).encode() + b'\n', timeout=3600)
+                if process.returncode or len(output) > 16 * 1024:
+                    errors.seek(0)
+                    failure = errors.read(4096)
+                    if (read_only and process.returncode and not output and attempt < 2
+                            and retryable_interop_startup(failure)):
+                        retry = True
+                    else:
+                        category = ('interop-startup-timeout' if retryable_interop_startup(failure)
+                                    else 'native-command-rejected')
+                        raise SnapshotError(f'Native batch failed ({category}, exit={process.returncode}, '
+                                            f'output_bytes={len(output)}); retain every partial member')
+                if not retry:
+                    rows = [json.loads(line) for line in output.splitlines()]
+                    if len(rows) != len(configs):
+                        raise SnapshotError('Native batch omitted an exact member proof')
+                    return rows
         finally:
             if process.poll() is None:
                 process.terminate();process.wait(timeout=30)
+            if process.stdin is not None:
+                process.stdin.close()
             process.stdout.close();errors.close()
         if retry:
             time.sleep((0.2, 1.0)[attempt])
@@ -523,7 +623,10 @@ def hash_file(path):
 
 class BinaryWriter:
     def __init__(self, path, *, offset=0, prefix_sha256=None, reserve_bytes=32 * 1024**3):
-        if offset < 0 or (offset and (not isinstance(prefix_sha256, str) or len(prefix_sha256) != 64)):
+        if (type(offset) is not int or offset < 0
+                or (offset and prefix_sha256 is None)
+                or (prefix_sha256 is not None and (not isinstance(prefix_sha256, str)
+                                                   or re.fullmatch(r'[a-f0-9]{64}', prefix_sha256) is None))):
             raise SnapshotError('Native append requires exact retained prefix size and SHA')
         self.path, self.offset = Path(path), offset
         self.appended = 0

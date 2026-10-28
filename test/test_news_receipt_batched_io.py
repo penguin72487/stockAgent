@@ -170,11 +170,11 @@ def test_oversized_receipt_is_completely_reread_and_decoded_on_owner(config, tmp
         relative, receipt_relative = queue.db.execute('SELECT path,receipt_path FROM accepted_batches').fetchone()
         raw = json.dumps({'parquet_path': relative, 'large': '台灣' * 128})
         (tmp_path / receipt_relative).write_text(raw)
-        seen, original = [], Path.read_bytes
+        seen, original = [], queue_module.read_acceptance_receipt_input
         def read(path):
             seen.append((path, threading.get_ident()))
             return original(path)
-        monkeypatch.setattr(Path, 'read_bytes', read)
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', read)
         queue.recover_acceptance(read_ahead_workers=2)
         assert seen == [(tmp_path / receipt_relative, threading.get_ident())]
     finally:

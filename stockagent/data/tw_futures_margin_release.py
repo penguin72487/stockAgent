@@ -24,7 +24,9 @@ from stockagent.data.tw_futures_portfolio_daily import (
     futures_slot_layout_version,
 )
 
-MARGIN_MATERIALIZATION_VERSION = 2
+MARGIN_MATERIALIZATION_VERSION = 3
+SUPPORTED_MARGIN_MATERIALIZATION_VERSIONS = (2, MARGIN_MATERIALIZATION_VERSION)
+PRIOR_EXCHANGE_LIQUIDITY_CONTRACT = "prior_exchange_session_liquidity_v1"
 CONTEXT_ONLY_PREFIX_CONTRACT = "proved_empty_inventory_context_prefix_v1"
 WHOLE_CONTRACT_PREFIX_CONTRACT = "proved_whole_contract_empty_prefix_v2"
 KEYS = ["date", "product", "contract"]
@@ -190,7 +192,8 @@ def validate_admitted_context_prefix(frame: pl.DataFrame, rules: pl.DataFrame,
 
 
 def select_complete_margin_components(frame: pl.DataFrame, rules: pl.DataFrame,
-        blockers: pl.DataFrame, *, start, end, context_only_keys=None) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+        blockers: pl.DataFrame, *, start, end, context_only_keys=None,
+        allow_component_history_before_start: bool = False) -> tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """Select explicitly disclosed, complete inventory components for research.
 
     A corporate conversion joins its source and destination lifetimes. One bad
@@ -198,6 +201,8 @@ def select_complete_margin_components(frame: pl.DataFrame, rules: pl.DataFrame,
     This is retrospective source-quality selection, not historical eligibility.
     Neither observations nor prices are repaired by this operation.
     """
+    if type(allow_component_history_before_start) is not bool:
+        raise ValueError('component history admission requires an explicit boolean')
     keys = ["date", "physical_contract"]
     for data in (frame, rules, blockers):
         if data.select(keys).is_duplicated().any():
@@ -240,11 +245,19 @@ def select_complete_margin_components(frame: pl.DataFrame, rules: pl.DataFrame,
     allowed_status = ["official_final", "observed_at_dataset_boundary", "corporate_transfer_candidate",
                       "derived_same_security_final", "zero_open_interest_delisting"]
     # Validity is closed over every member, not just the quoted destination.
-    coverage = coverage.with_columns((~pl.col("unresolved_accounting")
-        & ~pl.col("missing_component_origin") & pl.col("within_requested_start")
+    valid = (~pl.col("unresolved_accounting")
+        & ~pl.col("missing_component_origin")
         & pl.col("has_account_days")
-        & pl.col("lifetime_status").is_in(allowed_status)).all().over("inventory_component")
-        .alias("selected"))
+        & pl.col("lifetime_status").is_in(allowed_status))
+    if allow_component_history_before_start:
+        # An already listed contract is still tradable after the requested
+        # start. Retain its verified earlier ancestry as account context; all
+        # component members must remain valid, including pre-window members.
+        overlap = ((pl.col('end') >= start) & (pl.col('start') <= end))
+        selected_component = valid.all().over('inventory_component') & overlap.any().over('inventory_component')
+    else:
+        selected_component = (valid & pl.col('within_requested_start')).all().over('inventory_component')
+    coverage = coverage.with_columns(selected_component.alias('selected'))
     selected = frame.join(coverage.filter(pl.col("selected")).select("physical_contract"),
         on="physical_contract", how="semi").filter(pl.col("date") <= end)
     if context_only_keys is not None:
@@ -343,6 +356,66 @@ def read_bound_output(path: Path, *, output_key: str | None = None,
     return frame.collect(), manifest
 
 
+def load_dated_product_specifications(source: Path, rule_source: Path | None = None) -> pl.DataFrame:
+    """Append source-bound staged specifications without rewriting old intervals."""
+    parent = source/'specifications/specifications.parquet'
+    original, _ = read_bound_output(parent)
+    if rule_source is None or rule_source == source/'rules':
+        return original
+    manifest = json.loads((rule_source/'manifest.json').read_text())
+    proof = manifest.get('product_specification_delta')
+    if proof is None:
+        return original
+    relative = Path(proof.get('path', ''))
+    contract = proof.get('contract')
+    if (contract not in {'append_only_staged_etf_specifications_v1',
+                         'append_only_reviewed_staged_specifications_v2',
+                         'append_only_reviewed_dated_specifications_v3'}
+            or manifest.get('parent_source_manifest_sha256') != sha256_file(source/'source_manifest.json')
+            or proof.get('parent_specifications_sha256') != sha256_file(parent)
+            or not relative.parts or relative.is_absolute() or '..' in relative.parts):
+        raise ValueError('staged specification delta differs from its immutable parent')
+    path = (rule_source/relative).resolve()
+    if not path.is_relative_to(rule_source.resolve()) or sha256_file(path) != proof.get('sha256'):
+        raise ValueError('staged specification delta SHA/path mismatch')
+    combined, _ = read_bound_output(path)
+    keys = ['product', 'effective_date']
+    if combined.select(keys).is_duplicated().any() or set(original.columns)-set(combined.columns):
+        raise ValueError('specification extension changed its existing schema or keys')
+    old = combined.join(original.select(keys),on=keys,how='semi')
+    if not old.select(original.columns).sort(keys).equals(original.sort(keys)):
+        raise ValueError('specification extension rewrote an original interval')
+    added = combined.join(original.select(keys),on=keys,how='anti')
+    if added.is_empty() or (contract != 'append_only_reviewed_dated_specifications_v3'
+                           and added.filter(pl.col('limit_kind') != 'staged_ratio').height):
+        raise ValueError('specification extension exceeds its staged boundary')
+    if contract == 'append_only_staged_etf_specifications_v1':
+        if added.filter(pl.col('effective_date') != pl.date(2026,7,6)).height:
+            raise ValueError('specification extension exceeds its staged ETF boundary')
+    else:
+        review = proof.get('review', {})
+        relative_review = Path(review.get('path', ''))
+        if (not relative_review.parts or relative_review.is_absolute() or '..' in relative_review.parts):
+            raise ValueError('reviewed specification evidence requires a relative path')
+        review_path = (rule_source/relative_review).resolve()
+        if (not review_path.is_relative_to(rule_source.resolve())
+                or sha256_file(review_path) != review.get('sha256')):
+            raise ValueError('reviewed specification evidence SHA/path mismatch')
+        reviewed = json.loads(review_path.read_text())
+        expected_review = ('source_reviewed_dated_specification_rows_v2'
+            if contract == 'append_only_reviewed_dated_specifications_v3'
+            else 'source_reviewed_staged_specification_rows_v1')
+        if (reviewed.get('contract') != expected_review
+                or reviewed.get('specifications') != json.loads(added.sort(keys).write_json())
+                or not reviewed.get('source_content_sha256s')
+                or set(added['source_content_sha256s'].explode().drop_nulls())
+                    - set(reviewed['source_content_sha256s'])):
+            raise ValueError('staged specification intervals differ from their explicit source review')
+    from stockagent.data.tw_futures_execution_terms import bind_product_specifications
+    bind_product_specifications(added.select(pl.col('effective_date').alias('date'),'product'),combined)
+    return combined
+
+
 def materialize_margin_market_rows(
     physical: pl.DataFrame, observations: pl.DataFrame, universe: pl.DataFrame,
     *, slot_count: int = 2816, market_dates: pl.DataFrame | None = None,
@@ -379,10 +452,35 @@ def materialize_margin_market_rows(
     if (calendar_source['date'].null_count() or calendar_source['date'].is_duplicated().any()
             or physical.select('date').unique().join(calendar_source,on='date',how='anti').height):
         raise ValueError('repair calendar must uniquely cover every physical date')
+    # Accounting-only nodes preserve settlement and inventory, but they are
+    # not exchange sessions and cannot erase the previous session's liquidity.
+    # The full calendar owns this classification even for scoped replays.
+    if market_dates is not None and "accounting_only_date" in market_dates.columns:
+        flags = market_dates.select("date", "accounting_only_date")
+    elif "accounting_only_date" in physical.columns:
+        flags = physical.select("date", "accounting_only_date").unique()
+    else:
+        flags = calendar_source.with_columns(pl.lit(False).alias("accounting_only_date"))
+    if (flags.schema["accounting_only_date"] != pl.Boolean
+            or flags["accounting_only_date"].null_count()
+            or flags["date"].is_duplicated().any()):
+        raise ValueError("accounting calendar requires one explicit Boolean classification per date")
+    calendar_source = calendar_source.join(flags, on="date", how="left", validate="1:1")
+    if calendar_source["accounting_only_date"].null_count():
+        raise ValueError("accounting calendar classification is missing for a market or cash date")
+    if "accounting_only_date" in physical.columns:
+        mismatch = physical.select("date", "accounting_only_date").unique().join(
+            flags, on="date", how="left", validate="m:1", suffix="_calendar")
+        if mismatch.filter(pl.col("accounting_only_date_calendar").is_null()
+                | (pl.col("accounting_only_date") != pl.col("accounting_only_date_calendar"))).height:
+            raise ValueError("physical and account calendar date classifications disagree")
     calendar = calendar_source.sort("date").with_columns(
         pl.col("date").shift(1).alias("previous_market_date"),
         pl.col("date").shift(-1).alias("next_market_date"),
-    )
+        pl.col("accounting_only_date").shift(1).fill_null(False).alias("_previous_accounting_only"),
+        pl.when(~pl.col("accounting_only_date")).then(pl.col("date")).otherwise(None)
+            .forward_fill().shift(1).alias("previous_exchange_session_date"),
+    ).drop("accounting_only_date")
     lives = physical.group_by("product", "contract", "physical_instance").agg(
         pl.col("date").min().alias("first_observed_date"),
         pl.col("date").max().alias("last_observed_date"),
@@ -446,6 +544,27 @@ def materialize_margin_market_rows(
         .otherwise(pl.col("settlement")).alias("close"),
         pl.col("observed_high").alias("high"), pl.col("observed_low").alias("low"),
     )
+    accounting_days = calendar_source.filter(pl.col("accounting_only_date"))["date"]
+    if frame.filter(pl.col("date").is_in(accounting_days)
+                    & ((pl.col("volume") > 0) | pl.col("executable"))).height:
+        raise ValueError("accounting-only date contains positive trading volume or an executable price")
+    if calendar["_previous_accounting_only"].any():
+        # Join by exact physical generation and immediately preceding exchange
+        # session. Missing observations stay NULL: never carry across an actual
+        # market day or borrow another generation's volume or open interest.
+        exchange_rows = frame.select(
+            pl.col("date").alias("previous_exchange_session_date"), "physical_contract",
+            pl.col("volume").alias("_previous_exchange_volume"),
+            pl.col("open_interest").alias("_previous_exchange_open_interest"),
+        )
+        frame = frame.join(exchange_rows, on=["previous_exchange_session_date", "physical_contract"],
+            how="left", validate="m:1").with_columns(
+            pl.when(pl.col("_previous_accounting_only")).then(pl.col("_previous_exchange_volume"))
+                .otherwise(pl.col("previous_volume")).alias("previous_volume"),
+            pl.when(pl.col("_previous_accounting_only")).then(pl.col("_previous_exchange_open_interest"))
+                .otherwise(pl.col("previous_open_interest")).alias("previous_open_interest"),
+        ).drop("_previous_exchange_volume", "_previous_exchange_open_interest")
+    frame = frame.drop("_previous_accounting_only")
     tenors = pl.DataFrame({"contract": sorted(frame["contract"].unique())}).with_columns(
         pl.col("contract").map_elements(calendar_expiry_date, return_dtype=pl.Date).alias("tenor_sort_date"),
         pl.col("contract").str.slice(4, 2).cast(pl.Int16).alias("delivery_month"),
@@ -553,6 +672,7 @@ def materialize_all_twd_margin_inputs(*, physical_history: Path, raw_daily: Path
     outputs = {p.name: {"sha256": sha256_file(p), "bytes": p.stat().st_size} for p in output.iterdir() if p.is_file()}
     outputs["continuous_daily"] = outputs["continuous_daily.parquet"]
     summary = dict(dataset="taifex_futures_portfolio_daily", materialization_version=MARGIN_MATERIALIZATION_VERSION,
+        prior_exchange_liquidity_contract=PRIOR_EXCHANGE_LIQUIDITY_CONTRACT,
         status="accounting_admission_required", all_products_execution_ready=False,
         all_products_training_ready=False, point_in_time_verified=False,
         contract_version=futures_slot_layout_version(slot_count),
@@ -715,6 +835,9 @@ def build_all_twd_execution_terms(*, materialization: Path, margin_inputs: Path,
         blocker_counts={c: int(required[c].sum()) for c in flags}, validation_issues=issues,
         outputs=outputs, sources=sources, adjusted_terminal_components=spec_proof.get("adjusted_terminal_components"),
         all_products_training_ready=False, elapsed_s=time.monotonic()-started)
+    if 'price_limit_permission_contract' in rules.columns and rules['price_limit_permission_contract'].is_not_null().any():
+        from stockagent.data.tw_futures_price_limits import price_limit_release_contract
+        summary.update(price_limit_permission_contract=price_limit_release_contract(rules),research_only=True)
     if policy is not None:
         summary.update(research_only=True, financial_point_in_time_verified=complete,
             position_research_policy=policy_proof,
@@ -886,8 +1009,13 @@ def publish_all_twd_margin_release(*, materialization: Path, execution_terms: Pa
         raise
     # Publish the training-visible manifest last. A failed validation leaves no
     # loadable daily release, even if some files were already written.
+    liquidity_contract = parent.get("prior_exchange_liquidity_contract")
+    if liquidity_contract not in (None, PRIOR_EXCHANGE_LIQUIDITY_CONTRACT):
+        raise ValueError("unknown prior-exchange liquidity materialization contract")
+    if liquidity_contract is not None and "previous_exchange_session_date" not in frame.columns:
+        raise ValueError("prior-exchange liquidity contract lacks its dated source axis")
     daily_manifest = dict(parent, status="complete", point_in_time_verified=not research,
-        materialization_version=MARGIN_MATERIALIZATION_VERSION,
+        materialization_version=(MARGIN_MATERIALIZATION_VERSION if liquidity_contract else 2),
         nonexecuting_opening_carry_valuations=int(frame["opening_is_carry_valuation"].sum())
             if "opening_is_carry_valuation" in frame.columns else 0,
         all_products_execution_ready=True, all_products_training_ready=False,

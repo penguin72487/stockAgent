@@ -66,7 +66,7 @@ from downloader.shioaji_history_repair import (
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 SOURCE = "shioaji_historical_market_data_v2"
-INVENTORY_SCHEMA_VERSION = 1
+INVENTORY_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 2
 SUMMARY_SCHEMA_VERSION = 2
 FOP_HISTORY_START = date(2020, 3, 22)
@@ -107,6 +107,10 @@ class HistoryContract:
     option_right: str = ""
     expiry_weekday: str = ""
     active_selection: bool = True
+    # These are native contract metadata, not the clipped history-query range.
+    # In particular delivery_date can be later than last_trading_date.
+    source_begin_date: date | None = None
+    last_trading_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,16 +318,23 @@ def _history_contract(
         end = completed_session
         asset_class = "index"
     else:
-        begin = max(_date_value(values.get("begin_date")) or FOP_HISTORY_START, FOP_HISTORY_START)
+        source_begin = _date_value(values.get("begin_date"))
+        last_trading = _date_value(values.get("last_trading_date"))
+        begin = max(source_begin or FOP_HISTORY_START, FOP_HISTORY_START)
         final = (
-            _date_value(values.get("last_trading_date"))
+            last_trading
             or _date_value(values.get("delivery_date"))
             or completed_session
         )
         end = min(final, completed_session)
         asset_class = "options" if security_type == "OPT" else "futures"
     if begin > end:
-        return None
+        # Preserve a newly listed/currently offered contract even when its
+        # first day follows the last completed history session. The inverted
+        # query interval is explicitly empty; no future history is requested.
+        if (security_type == "IND" or source_begin is None or source_begin <= completed_session
+                or (last_trading is not None and last_trading < source_begin)):
+            return None
     strike = values.get("strike_price")
     return HistoryContract(
         collection=collection,
@@ -342,6 +353,8 @@ def _history_contract(
         strike_price=float(strike) if strike is not None else None,
         option_right=_enum_text(values.get("option_right")),
         expiry_weekday=str(values.get("expiry_weekday") or ""),
+        source_begin_date=_date_value(values.get("begin_date")),
+        last_trading_date=_date_value(values.get("last_trading_date")),
     )
 
 
@@ -451,6 +464,9 @@ def _contract_record(row: HistoryContract, *, observed_at: str) -> dict[str, Any
         "exchange": row.exchange,
         "begin_date": row.begin_date,
         "end_date": row.end_date,
+        "has_completed_history": row.begin_date <= row.end_date,
+        "source_begin_date": row.source_begin_date,
+        "last_trading_date": row.last_trading_date,
         "delivery_date": row.delivery_date,
         "delivery_month": row.delivery_month,
         "tenor_rank": row.tenor_rank,
@@ -477,6 +493,7 @@ def _write_inventory(
     if path.is_file():
         for item in pl.read_parquet(path).to_dicts():
             item["active_selection"] = False
+            item["has_completed_history"] = item["begin_date"] <= item["end_date"]
             previous[(str(item["security_type"]), str(item["code"]))] = item
     for item in current_records:
         key = str(item["security_type"]), str(item["code"])
@@ -485,6 +502,7 @@ def _write_inventory(
             item["first_observed_at_utc"] = prior.get("first_observed_at_utc") or observed
             item['begin_date'] = min(item['begin_date'], prior['begin_date'])
             item['end_date'] = max(item['end_date'], prior['end_date'])
+            item['has_completed_history'] = item['begin_date'] <= item['end_date']
         previous[key] = item
     merged = sorted(
         previous.values(),
@@ -494,13 +512,16 @@ def _write_inventory(
             str(item.get("code") or ""),
         ),
     )
-    frame = pl.DataFrame(merged, infer_schema_length=None)
+    # Old retained rows have no native lifecycle fields. Leave them null;
+    # clipped query bounds and delivery dates cannot reconstruct these values.
+    date_fields = {"source_begin_date": pl.Date, "last_trading_date": pl.Date}
+    frame = pl.DataFrame(merged, infer_schema_length=None, schema_overrides=date_fields)
     temporary = path.with_suffix(".parquet.tmp")
     frame.write_parquet(temporary, compression="snappy", statistics=True)
     os.replace(temporary, path)
     current_path = inventory_dir / "current_contracts.parquet"
     current_tmp = current_path.with_suffix(".parquet.tmp")
-    pl.DataFrame(current_records, infer_schema_length=None).write_parquet(
+    pl.DataFrame(current_records, infer_schema_length=None, schema_overrides=date_fields).write_parquet(
         current_tmp, compression="snappy"
     )
     os.replace(current_tmp, current_path)
@@ -524,6 +545,7 @@ def _write_inventory(
         "generated_at_utc": observed,
         "completed_session": completed_session.isoformat(),
         "current_contracts": len(rows),
+        "current_contracts_without_completed_history": sum(row.begin_date > row.end_date for row in rows),
         "retained_contracts": len(merged),
         "by_collection": by_collection,
         "option_expiries": option_expiries,
@@ -535,6 +557,13 @@ def _write_inventory(
         "contracts_sha256": _sha256(path),
         "current_contracts_path": str(current_path),
         "current_contracts_sha256": _sha256(current_path),
+        "lifecycle_date_contract": (
+            "source_begin_date and last_trading_date are native nullable Contract V2 fields; "
+            "begin_date and end_date remain clipped history-query bounds; delivery_date "
+            "is not a substitute for last_trading_date; retained metadata is only known "
+            "at each row's last_observed_at_utc; active selection is catalog membership, "
+            "not proof of trading eligibility; an inverted query interval has no completed history"
+        ),
         "retention_contract": (
             "current Contract V2 selections are merged into a stable union; expired "
             "codes are never silently removed"
@@ -565,6 +594,8 @@ def _row_from_record(item: dict[str, Any]) -> HistoryContract:
         option_right=str(item.get("option_right") or ""),
         expiry_weekday=str(item.get("expiry_weekday") or ""),
         active_selection=bool(item.get("active_selection")),
+        source_begin_date=_date_value(item.get("source_begin_date")),
+        last_trading_date=_date_value(item.get("last_trading_date")),
     )
 
 
@@ -838,6 +869,9 @@ def _write_summary(
     collection_rows: dict[str, dict[str, Any]] = {}
     tick_days: dict[str, set[date]] = {}
     tick_symbols: dict[str, set[str]] = {}
+    kbar_days: dict[str, set[date]] = {}
+    kbar_symbols: dict[str, set[str]] = {}
+    kbar_unknown_dates: dict[str, int] = {}
     totals = {
         "contracts": 0,
         "kbar_chunks": 0,
@@ -895,6 +929,13 @@ def _write_summary(
                 bucket["stored_bytes"] += int(receipt.get("size") or 0)
                 missing_kbar_dates += len(gaps)
                 partial_kbar_chunks += bool(gaps and receipt['status'] == 'complete')
+                if receipt['status'] == 'complete' and int(receipt.get('rows') or 0) > 0:
+                    actual_days = {_date_value(value) for value in receipt.get('observed_trading_dates') or ()}
+                    actual_days.discard(None)
+                    if not actual_days:
+                        kbar_unknown_dates[row.collection] = kbar_unknown_dates.get(row.collection, 0) + 1
+                    kbar_days.setdefault(row.collection, set()).update(actual_days)
+                    kbar_symbols.setdefault(row.collection, set()).add(row.code)
                 if receipt['status'] == 'source_empty':
                     source_empty_queries += 1
                     positive_empty_queries += positive
@@ -940,6 +981,13 @@ def _write_summary(
     # tick_dates is an additive contract-day target count. These separate
     # statistics describe the union of actual nonempty, verified Tick dates.
     for collection, bucket in collection_rows.items():
+        actual_kbars = kbar_days.get(collection, set())
+        bucket.update(kbar_data_days=len(actual_kbars) if not kbar_unknown_dates.get(collection) else None,
+                      kbar_known_data_days=len(actual_kbars),
+                      kbar_unknown_date_chunks=kbar_unknown_dates.get(collection, 0),
+                      kbar_first_data_date=min(actual_kbars).isoformat() if actual_kbars else None,
+                      kbar_last_data_date=max(actual_kbars).isoformat() if actual_kbars else None,
+                      kbar_symbols_with_data=len(kbar_symbols.get(collection, set())))
         actual = tick_days.get(collection, set())
         bucket.update(tick_data_days=len(actual) if not kbars_only else None,
                       tick_first_data_date=min(actual).isoformat() if actual else None,

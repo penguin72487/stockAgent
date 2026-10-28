@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule finite day-trade FinLab source checks
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=stockagent-finlab-daytrade-priority.service
+
+[Install]
+WantedBy=timers.target

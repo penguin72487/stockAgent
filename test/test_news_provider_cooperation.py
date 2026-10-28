@@ -28,6 +28,62 @@ def cooperative_config(config):
     return config
 
 
+@pytest.mark.parametrize('continuous_budgets', [False, True])
+def test_cmoney_pristine_path_sweep_waits_for_disk_and_other_provider_continues(
+        config, tmp_path, monkeypatch, continuous_budgets):
+    cmoney = config['providers'][0]
+    cmoney.update(id='cmoney', domains=['cmoney.tw'], parallelism=1,
+                  article_path_pattern=r'^/(forum/article/[0-9]+|notes/note[.]aspx)')
+    other = deepcopy(cmoney)
+    other.update(id='publisher', domains=['publisher.test'], article_path_pattern=r'^/story$')
+    config['providers'] = [cmoney, other]
+    config.update(workers=2, batch_articles=1)
+    forum = 'https://www.cmoney.tw/forum/article/55'
+    focus = 'https://publisher.test/story'
+    notes = [f'https://www.cmoney.tw/notes/note-detail.aspx?nid={i}' for i in range(3)]
+    routes = {'https://www.cmoney.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              forum: FakeResponse(article_html()), focus: FakeResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    slices = []
+    original = queue.backfill_cmoney_note_detail_exclusions
+
+    def slice_one(*, stop=None):
+        result = original(limit=1, stop=stop)
+        slices.append((result, tuple(url for url, _ in session.calls)))
+        return result
+
+    monkeypatch.setattr(queue, 'backfill_cmoney_note_detail_exclusions', slice_one)
+    blocked = [True]
+    monkeypatch.setattr('downloader.news_fulltext.refresh_disk_admission', lambda *_: blocked[0])
+    try:
+        with queue.db:
+            queue.add_articles([{'url': url} for url in notes + [forum, focus]])
+            queue.db.executemany("UPDATE articles SET state='pending',error_code=NULL WHERE url=?",
+                                 ((url,) for url in notes))
+        before = [dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()) for url in notes]
+        result = run_cycle(queue, http, config, max_articles=4, max_discovery_requests=0,
+                           continuous_budgets=continuous_budgets)
+        assert result['activity'] == 'waiting_disk' and not slices and not session.calls
+        assert [dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()) for url in notes] == before
+        blocked[0] = False
+        result = run_cycle(queue, http, config, max_articles=4, max_discovery_requests=0,
+                           continuous_budgets=continuous_budgets)
+        assert slices and slices[-1][0]['completed']
+        assert any(focus in calls and forum not in calls and not item['completed'] for item, calls in slices)
+        assert all(queue.db.execute('SELECT state,attempts FROM articles WHERE url=?', (url,)).fetchone()[:]
+                   == ('unsupported_article_path', 0) for url in notes)
+        assert all(queue.db.execute('SELECT state FROM articles WHERE url=?', (url,)).fetchone()[0] == 'complete'
+                   for url in (forum, focus))
+        assert not any('note-detail.aspx' in url for url, _ in session.calls)
+        assert result['cycle']['durably_accepted_versions'] == 2
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        http.close()
+        queue.close()
+
+
 def test_priority_body_is_durable_while_background_response_still_waits(config, tmp_path, monkeypatch):
     config = cooperative_config(config)
     background_started, focus_committed = Event(), Event()

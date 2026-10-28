@@ -15,9 +15,11 @@ WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_eligibility_watcher.sh"
-Nice=5
-CPUWeight=50
-IOWeight=50
+# Exact-session eligibility feeds day-trade execution and must take precedence
+# over historical downloads and storage maintenance.
+Nice=0
+CPUWeight=10000
+IOWeight=10000
 TimeoutStartSec=2h
 Restart=on-failure
 RestartSec=30s

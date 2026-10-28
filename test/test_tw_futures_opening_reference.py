@@ -142,7 +142,11 @@ def test_opening_reference_feature_and_source_change_reject_incompatible_resume(
     from test_tw_stock_context_futures_portfolio import _stock_panel
     c = load_config('configs/markets/tw_futures_v8_margin_components_causal_account_capital100m_v5.yaml')
     entry = tmp_path/'entries.parquet'; entry.write_bytes(b'entry fixture')
-    entry.with_name('manifest.json').write_text('{}')
+    from stockagent.data.tw_futures_decision_clock import CLOCK_DATASET, decision_clock_contract
+    entry.with_name('manifest.json').write_text(json.dumps(dict(
+        dataset=CLOCK_DATASET, clock=decision_clock_contract('09:00'), status='complete',
+        entries_sha256=sha256_file(entry),
+    )))
     c.trading.tw_futures_portfolio_entry_clock_path = str(entry)
     c.trading.tw_futures_portfolio_decision_time = '09:00'
     old = build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)

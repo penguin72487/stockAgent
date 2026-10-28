@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from scripts.snapshot_data_refresh_services import publish_feature_inventory_snapshot  # noqa: E402
 from stockagent.live import data_monitor_inventory as inventory  # noqa: E402
+from stockagent.live.data_monitor_record_store import stable_record_cache_bytes  # noqa: E402
 from stockagent.live.data_monitor_dashboard import feature_source_metadata_sha256  # noqa: E402
 from stockagent.live.data_monitor_feature_shards import ProjectionStore, _read_private, projection_abi  # noqa: E402
 
@@ -35,7 +36,7 @@ def capture(root: Path) -> dict:
     started = time.perf_counter()
     cache_path = root / "artifacts/live/data_monitor/record_inventory_cache.json"
     before = inventory._cache_signature(cache_path)
-    body = _read_private(cache_path, max_bytes=512 * 1024 * 1024)
+    body = stable_record_cache_bytes(cache_path)
     payload = json.loads(body)
     if before is None or before != inventory._cache_signature(cache_path):
         raise ValueError("cache advanced while capturing")

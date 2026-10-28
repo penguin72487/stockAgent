@@ -34,10 +34,13 @@ PLAN_CONTRACT = "exact_packed_and_control_restic_backup_v1"
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
-def private_json(path: Path, value: dict) -> None:
+def private_json(path: Path, value: dict, *, compact: bool = False) -> None:
     old = os.umask(0o077)
     try:
-        atomic_write_json(path, value)
+        if compact:
+            atomic_write_json(path, value, compact=True, stream=True)
+        else:
+            atomic_write_json(path, value)
     finally:
         os.umask(old)
 
@@ -360,20 +363,32 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
         raise SnapshotError("incremental source bytes differ from the canonical selection")
 
 
-def copy_verified_many(members):
+def copy_verified_many(members, *, native_windows_io: bool = False):
     """Amortize native process startup without weakening per-member proofs."""
+    if type(native_windows_io) is not bool:
+        raise SnapshotError('native grouped copy I/O must be an explicit boolean')
     from stockagent.data_sync.windows_cold_io import windows_path, copy_many
     native = []
     for source, destination, sha, count in members:
         origin, target = windows_path(source), windows_path(destination)
-        if (NATIVE_COPY_MIN_BYTES <= count <= 8*1024**3 and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
+        if ((native_windows_io or NATIVE_COPY_MIN_BYTES <= count) and count <= 8*1024**3
+                and origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
                 and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
             native.append((source, destination, sha, count))
         else:
-            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
-    for offset in range(0, len(native), 16):
-        group = native[offset:offset + 16]
-        if len(group) == 1:
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count,
+                                **({'native_windows_io': True} if native_windows_io else {}))
+    groups, group, count = [], [], 0
+    for member in native:
+        if group and (len(group) == 16 or count + member[3] > 16 * 1024**3):
+            groups.append(group)
+            group, count = [], 0
+        group.append(member)
+        count += member[3]
+    if group:
+        groups.append(group)
+    for group in groups:
+        if len(group) == 1 and not native_windows_io:
             source, destination, sha, count = group[0]
             copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
         else:
@@ -382,7 +397,8 @@ def copy_verified_many(members):
 
 def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: Path, *,
                                 catalog_identity: str, read_root: Path | None = None,
-                                copy_workers: int = 1, verify_workers: int = 1) -> dict:
+                                copy_workers: int = 1, verify_workers: int = 1,
+                                namespace: str = 'cold', native_windows_io: bool = False) -> dict:
     """Export bounded, deduplicated canonical objects or fixed metadata.
 
     A wave deliberately need not contain a whole release. Its envelope proves
@@ -392,6 +408,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
     from scripts.verify_backup_delivery import CONTRACT, verify
     if any(type(n) is not int or not 1 <= n <= 16 for n in (copy_workers, verify_workers)):
         raise SnapshotError("incremental export needs 1 to 16 bounded workers")
+    if namespace not in ('cold', 'private-history') or type(native_windows_io) is not bool:
+        raise SnapshotError('incremental export needs an explicit cold/private namespace and I/O policy')
     if not _HASH.fullmatch(catalog_identity) or not rows:
         raise SnapshotError("incremental delivery requires a pinned nonempty catalog selection")
     cold = cold_root.absolute()
@@ -409,7 +427,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         if relative.startswith("objects/"):
             if object_descriptor(relative) != row["sha256"]:
                 raise SnapshotError("incremental object differs from its canonical descriptor")
-        elif not (re.fullmatch(r"(?:manifests|heads)/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.json", relative)
+        elif not ((namespace == 'private-history' and relative == 'private-history.json')
+                  or re.fullmatch(r"(?:manifests|heads)/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+\.json", relative)
                   or re.fullmatch(r"head-history/heads/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/[0-9a-f]{64}\.json", relative)):
             raise SnapshotError("incremental selection is outside canonical cold metadata/objects")
         if type(row["bytes"]) is not int or row["bytes"] < 0:
@@ -437,27 +456,65 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         def copy_member(row):
             unchanged(row)
             source = None if "captured_bytes_utf8" in row else _regular(safe_path(reader_root, row["relative"]))
-            relative = "cold/" + row["relative"]
+            relative = namespace + '/' + row["relative"]
             target = safe_path(destination, relative)
             copy_verified_bytes(source, target, expected_sha256=row["sha256"], expected_bytes=row["bytes"],
-                                payload=row["captured_bytes_utf8"].encode("utf-8") if source is None else None)
+                                payload=row["captured_bytes_utf8"].encode("utf-8") if source is None else None,
+                                **({'native_windows_io': True} if native_windows_io else {}))
             unchanged(row)
             return {"relative": relative, "sha256": row["sha256"], "bytes": row["bytes"]}
 
+        copy_groups, portable = [], []
+        if native_windows_io:
+            group, group_bytes = [], 0
+            for row in rows:
+                if 'captured_bytes_utf8' not in row:
+                    if group and (len(group) == 16 or group_bytes + row['bytes'] > 16 * 1024**3):
+                        copy_groups.append(group)
+                        group, group_bytes = [], 0
+                    group.append(row)
+                    group_bytes += row['bytes']
+                else:
+                    portable.append(row)
+            if group:
+                copy_groups.append(group)
+        else:
+            portable = rows
+
+        def copy_group(group):
+            # Reuse the enrolled immutable copy adapter: one Windows startup
+            # for up to 16 small files, with complete per-member SHA, flush,
+            # source signatures and the independent destination verifier below.
+            for row in group:
+                unchanged(row)
+            copy_verified_many([(_regular(safe_path(reader_root, row['relative'])),
+                                 safe_path(destination, namespace + '/' + row['relative']),
+                                 row['sha256'], row['bytes']) for row in group], native_windows_io=True)
+            for row in group:
+                unchanged(row)
+            return [{'relative': namespace + '/' + row['relative'],
+                     'sha256': row['sha256'], 'bytes': row['bytes']} for row in group]
+
         if copy_workers == 1:
-            members = [copy_member(row) for row in rows]
+            members = [member for group in copy_groups for member in copy_group(group)]
+            members.extend(copy_member(row) for row in portable)
         else:
             with ThreadPoolExecutor(max_workers=copy_workers, thread_name_prefix="backup-copy") as pool:
-                members = list(pool.map(copy_member, rows))
+                members = [member for group in pool.map(copy_group, copy_groups) for member in group]
+                members.extend(pool.map(copy_member, portable))
         pinned.recheck()
         body = {"contract": CONTRACT, "source_plan_identity_sha256": catalog_identity,
                 "files": sorted(members, key=lambda r: r["relative"]), "producer_node_id": "penguin",
                 "source_scope": "fixed canonical cold metadata and/or immutable object increment",
                 "selection": "incremental_object_wave", "all_history_verified": False,
                 "unpublished_sources_included": False, "complete_release_in_this_delivery": False}
+        if namespace == 'private-history':
+            body.update(selection='private_immutable_object_wave',
+                        source_scope='authorized personal backup of fixed private cold metadata/objects')
         envelope = {**body, "identity_sha256": identity_sha256(body)}
         private_json(destination / "backup-envelope.json", envelope)
-        transport = verify(destination, envelope["identity_sha256"], require_ready=False, workers=verify_workers)
+        transport = verify(destination, envelope["identity_sha256"], require_ready=False, workers=verify_workers,
+                           **({'native_windows_io': True} if native_windows_io else {}))
         for row in rows:
             unchanged(row)
         pinned.recheck()

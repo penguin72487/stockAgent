@@ -25,6 +25,9 @@ def _feature_implementation_sha256() -> str:
     code = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
         "tw_public_features.py", "tw_public_incremental.py", "tw_delisting_rules.py", "tw_security.py",
         "partitioned_parquet.py")}
+    code["live/market_status.py"] = hashlib.sha256(
+        (root.parent / "live" / "market_status.py").read_bytes()
+    ).hexdigest()
     return hashlib.sha256(json.dumps({"code": code, "polars": pl.__version__}, sort_keys=True).encode()).hexdigest()
 
 
@@ -2128,11 +2131,28 @@ def _require_day_trade_date_coverage(
     universe: pl.DataFrame,
     eligible: pl.DataFrame,
     allow_missing_latest_session: bool = False,
+    input_dir: Path | None = None,
 ) -> pl.DataFrame:
     universe_dates = universe.select("date").unique()
     eligible_dates = eligible.select("date").unique()
     missing = universe_dates.join(eligible_dates, on="date", how="anti").sort("date")
     extra = eligible_dates.join(universe_dates, on="date", how="anti").sort("date")
+    if not extra.is_empty() and input_dir is not None:
+        # A next-session master may be published before an unscheduled
+        # closure.  Retain that original source snapshot, but do not demand a
+        # fictitious OHLCV row on a date whose absence is independently
+        # proven by the complete, byte-verified TAIEX session receipt.
+        # Unknown dates and actual sessions still fail coverage below.
+        from stockagent.live.market_status import tw_stock_day_decision
+
+        closed_dates = []
+        for day in extra.get_column("date").to_list():
+            decision = tw_stock_day_decision(day, parquet_root=input_dir)
+            if (decision.status == "closed" and decision.reason
+                    == "receipt-verified TWSE TAIEX historical non-session"):
+                closed_dates.append(day)
+        if closed_dates:
+            extra = extra.filter(~pl.col("date").is_in(closed_dates))
     if allow_missing_latest_session and extra.is_empty() and missing.height == 1:
         missing_date = missing.item()
         latest_universe_date = universe_dates.select(pl.col("date").max()).item()
@@ -2219,6 +2239,7 @@ def _build_day_trade_rule_features(
             universe=universe,
             eligible=eligible,
             allow_missing_latest_session=allow_missing_latest_session,
+            input_dir=input_dir,
         )
         if symbols is not None:
             symbol_filter = sorted(symbols)

@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.artifact_io import atomic_write_json
+from stockagent.live.paper_journal import open_paper_journal, verified_journal_projection
 from stockagent.live.tw_day_trade_simulation import TAIPEI
 
 
@@ -93,7 +94,7 @@ EVENT_COLUMNS = (
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
@@ -115,13 +116,14 @@ def _atomic_parquet(frame: pl.DataFrame, target: Path) -> str:
 
 
 def _selected_frame(path: Path, columns: tuple[str, ...]) -> pl.DataFrame:
-    schema = pl.scan_ndjson(path).collect_schema()
-    available = set(schema.names())
-    missing = {"session_date", "market", "symbol"} - available
-    if missing:
-        raise ValueError(f"historical ledger {path} misses {sorted(missing)}")
-    selected = [name for name in columns if name in available]
-    return pl.scan_ndjson(path).select(selected).collect()
+    with verified_journal_projection(path) as accepted:
+        frame = pl.scan_ndjson(accepted)
+        available = set(frame.collect_schema().names())
+        missing = {"session_date", "market", "symbol"} - available
+        if missing:
+            raise ValueError(f"historical ledger {path} misses {sorted(missing)}")
+        selected = [name for name in columns if name in available]
+        return frame.select(selected).collect()
 
 
 def _event_frame(ledger: Path) -> pl.DataFrame:
@@ -187,7 +189,8 @@ def _write_position_release(
             raise TypeError(f"invalid position snapshot: {path}")
         write_payload(payload)
 
-    state = json.loads((ledger / "state.json").read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(ledger / "state.json")
     for market, mode in (state.get("modes") or {}).items():
         if not isinstance(mode, dict) or not mode.get("session_date"):
             continue

@@ -22,6 +22,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine, _atomic_json
+from stockagent.live.paper_mode_snapshot import MANIFEST_KEY, expand_paper_state
+from stockagent.live.paper_journal import open_paper_journal
 
 INPUTS = ("state.json", "events.jsonl", "orders.jsonl", "fills.jsonl")
 
@@ -29,7 +31,7 @@ INPUTS = ("state.json", "events.jsonl", "orders.jsonl", "fills.jsonl")
 def prefix_sha256(path, size):
     digest = hashlib.sha256()
     remaining = size
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         while remaining:
             chunk = handle.read(min(1024 * 1024, remaining))
             if not chunk:
@@ -77,13 +79,22 @@ def audit(state_dir, output):
         hashes = {}
         for path in paths:
             copy = isolated / path.name
-            shutil.copyfile(path, copy)
+            # A restart audit exports exact accepted bytes into its private
+            # standalone legacy fixture; never bypass a bad immutable head.
+            with open_paper_journal(path) as incoming, copy.open("wb") as outgoing:
+                shutil.copyfileobj(incoming, outgoing, 1024 * 1024)
             hashes[path.name] = {"size_bytes": copy.stat().st_size,
                                  "sha256": hashlib.sha256(copy.read_bytes()).hexdigest()}
         after = {path.name: (path.stat().st_size, path.stat().st_mtime_ns) for path in paths}
         if before != after:
             raise RuntimeError("canonical state changed during audit; retry at a stable boundary")
-        original = json.loads((isolated / "state.json").read_text())
+        disk_state = json.loads((isolated / "state.json").read_text())
+        original = expand_paper_state(disk_state, state_dir)
+        if MANIFEST_KEY in disk_state:
+            # The retained recovery checkpoint must stand alone. Hashes above
+            # still bind the exact source manifest; export complete values,
+            # never a manifest with missing children in the isolated folder.
+            _atomic_json(isolated / "state.json", original)
         for market, mode in (original.get("modes") or {}).items():
             if mode.get("entry_retry_pending_commit") or mode.get("ledger_state_divergence"):
                 raise RuntimeError(f"{market}: pending or divergent ledger commit; reload not accepted")
@@ -107,6 +118,9 @@ def audit(state_dir, output):
                    "observed_at": datetime.now(ZoneInfo("Asia/Taipei")).isoformat(),
                    "state_dir": str(state_dir), "inputs": hashes,
                    "inventory_restored_exactly": True,
+                   "state_export": {"representation": "standalone_complete_inline_json",
+                       "source_partitioned": MANIFEST_KEY in disk_state,
+                       "sha256": hashlib.sha256(output.with_suffix(".state.json").read_bytes()).hexdigest()},
                    "open_position_count": sum(bool(p.get("signed_shares"))
                        for mode in original.get("modes", {}).values()
                        for p in (mode.get("positions") or {}).values()),

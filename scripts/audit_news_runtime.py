@@ -33,7 +33,8 @@ def runtime_source_paths(repo):
     """Include the out-of-prefix receipt reader used by owner recovery."""
     return sorted((repo / 'downloader').glob('news_fulltext*.py')) + [
         repo / 'downloader/news_receipt_io.py',
-        repo / 'stockagent/data/news_source_catalog.py', repo / 'stockagent/data/news_source_urls.py',
+        repo / 'stockagent/data/news_disk_contract.py', repo / 'stockagent/data/news_source_catalog.py',
+        repo / 'stockagent/data/news_source_urls.py',
         repo / 'stockagent/private_json.py',
         repo / 'scripts/download_news_fulltext.py']
 

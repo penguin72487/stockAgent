@@ -209,6 +209,19 @@ def retain_identity_metadata(queue, row, error, context):
         if provider == 'gvm':
             from downloader.news_fulltext_gvm import gvm_failure_context
             facts['gvm_received_failure_context'] = gvm_failure_context(error)
+        if provider == 'moneyweekly':
+            # Keep bounded transport facts from this already received failure.
+            # A relative Location is not an absolute URL; retain its digest
+            # and the actual resolved hop without exporting its query/body.
+            facts['moneyweekly_route_transport'] = {
+                'contract_version': 1,
+                'hops': [dict(from_url=_display_url(hop.from_url), status=hop.status,
+                    to_url=_display_url(hop.to_url), location_sha256=hashlib.sha256(hop.location.encode()).hexdigest(),
+                    location_is_relative=not bool(urlsplit(hop.location).scheme),
+                    response_sha256=hop.response_sha256, response_bytes=hop.response_bytes,
+                    observed_at_utc=hop.observed_at_utc) for hop in context.response.redirects[:5]],
+                'truncated': len(context.response.redirects) > 5,
+            }
         if error.code == 'article_license_not_verified':
             facts['native_article_license_validation'] = article_license_validation_metadata(soup, source)
         if source.embedded_article_layout in INEWS_LAYOUT_VERSIONS:

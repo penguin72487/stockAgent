@@ -1,0 +1,18 @@
+# Isolate update geometry while retaining the existing learned cash/carry account.
+base_config: tw_futures_residual_signals_20261027_v1.yaml
+experiment_name: tw-futures-plain-sgd-20261027-v1
+training:
+  loss_type: log_utility
+  optimizer_name: sgd
+  learning_rate: 0.1
+  weight_decay: 0.0
+  optimizer_options:
+    momentum: 0.0
+    dampening: 0.0
+    nesterov: false
+  financial_transformer:
+    futures_residual_signal_context: true
+    futures_joint_market_tokens: 4
+runner:
+  output_dir: artifacts/markets/tw_futures_plain_sgd_20261027_v1/twd_equity__sgd_0845
+  resume: false

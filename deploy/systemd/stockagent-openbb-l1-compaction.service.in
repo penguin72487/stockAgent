@@ -17,22 +17,24 @@ Environment="OPENBB_OUTPUT_DIR=data_openBB"
 ExecCondition=/usr/bin/bash "__REPO_ROOT__/scripts/run_outside_tw_opening_resource_window.sh" --minimum-runway-minutes 45 --protected-until 13:35
 # Bootstrap with one exact full audit, then use same-transaction task changes;
 # schema drift, excessive changes and the daily integrity interval force full.
-ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --archive-idle-only --incremental-source-audit --schema-grouped-sec-views --max-source-files 32768 --max-files-per-segment 128 --max-source-bytes-per-segment 16777216 --max-uncompressed-bytes-per-segment 33554432 --max-source-rows-per-segment 500000 --min-files-per-segment 32 --include-tail --threads 2 --memory-limit 1GB --no-progress
+# Derivative proofs revalidate file identity; exact counts and pending worksets
+# follow task/member mutations in their original SQLite transaction. Complete
+# persisted catalog proofs expire or invalidate on any DB/WAL/runtime change;
+# every publication still verifies current source inputs and reader policy.
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_openbb_l1_compaction.sh" --archive-idle-only --incremental-source-audit --memory-source-audit --incremental-metadata-audit --incremental-member-counts --incremental-unassigned-index --incremental-view-publication --schema-grouped-sec-views --max-source-files 32768 --max-files-per-segment 128 --max-source-bytes-per-segment 16777216 --max-uncompressed-bytes-per-segment 33554432 --max-source-rows-per-segment 500000 --min-files-per-segment 32 --include-tail --no-progress
 UMask=0077
-Nice=15
-CPUWeight=10
-IOWeight=10
-IOSchedulingClass=idle
-# DuckDB's 1 GB execution budget still coexists with Arrow/Python metadata and
-# the cgroup's file cache. The 2026-09-26 05:44 natural run reached the
-# 2.5 GiB soft limit and recorded 29,631 memory.high events while remaining
-# below the 3 GiB hard stop. Allow 256 MiB more reclaimable cache, without
-# changing batch size, the hard stop, or the source/derivative audits.
-MemoryHigh=2816M
-MemoryMax=3G
+Nice=0
+CPUWeight=100
+IOWeight=100
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+# Runtime threads follow CPU affinity; DuckDB has no artificial memory ceiling.
+# Segment sizes remain output-layout choices, not CPU or I/O throttles.
+MemoryHigh=infinity
+MemoryMax=infinity
 # The full receipt-preserving stale scan is largely fixed cost. Bound each
 # batch at 32,768 source shards while retaining the per-segment byte/row limits,
-# 3 GiB hard memory stop, 40-minute timeout, and opening/auction guard. The
+# complete derivative/source proofs, timeout, and opening/auction guard. The
 # timer is relative to unit inactivity, so instances cannot overlap.
 TimeoutStartSec=40min
 NoNewPrivileges=true

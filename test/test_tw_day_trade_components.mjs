@@ -312,6 +312,17 @@ test("mode card keeps filtered returns separate from the shared Discord account 
   mode.indicative_valuation_position_count = 0;
   context.renderModes({modes: [mode]});
   assert.doesNotMatch(output, /參考快照估值（非成交證據）/);
+  assert.match(output, /模擬目標／成交／缺口/);
+  assert.match(output, /等待成交資訊/);
+  assert.doesNotMatch(output, /data-paper-entry-counts/);
+  Object.assign(mode, {entry_requested_shares: 1000, entry_filled_shares: 500, entry_unfilled_shares: 500});
+  context.renderModes({modes: [mode]});
+  assert.match(output, /data-paper-entry-counts data-requested="1000" data-filled="500" data-unfilled="500"/);
+  assert.match(output, /1000／500／500 股/);
+  mode.entry_filled_shares = null;
+  context.renderModes({modes: [mode]});
+  assert.match(output, /等待成交資訊/);
+  assert.doesNotMatch(output, /data-paper-entry-counts/);
 });
 
 test("both TW charts key large history by date and source revision only", () => {

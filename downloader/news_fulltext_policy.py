@@ -16,7 +16,7 @@ import math
 from pathlib import Path
 import re
 import socket
-from typing import Any
+from typing import Any, Literal, overload
 from urllib.parse import parse_qsl, unquote_plus, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup, CData, NavigableString, Tag
@@ -27,13 +27,14 @@ import soupsieve
 CONTRACT_VERSION = 1
 _GLOBALVOICES_HTML_BODY_CONTRACT_VERSION = 10
 GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION = 1
+GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION = 1
 GLOBALVOICES_FEED_BODY_CONTRACT_VERSION = 3
 CAPTURE_POLICY_VERSION = 2
 TRACKING_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 # Reviewed source revisions, not an unbounded parser or automatic upgrade.
 # Keep old capture identities stable and parse multi-digit versions correctly.
 _FED_RELEASE_LAYOUT_VERSIONS = {f"fed_table_release_v{version}": version for version in range(1, 11)}
-ETTODAY_LAYOUT_VERSIONS = {f'ettoday_visible_article_v{version}': version for version in range(1, 40)}
+ETTODAY_LAYOUT_VERSIONS = {f'ettoday_visible_article_v{version}': version for version in range(1, 43)}
 MAX_LAYOUT_VERSIONS = {f'max_visible_post_v{version}': version for version in range(1, 10)}
 POCKET_LAYOUT_VERSIONS = {f'pocket_visible_article_v{version}': version for version in range(1, 13)}
 # One closed registry for native recognition, live fetch and diagnostics. A
@@ -43,7 +44,7 @@ TAIWANNEWS_LAYOUT_VERSIONS = {f'taiwannews_completed_public_original_v{version}'
 
 # A source gate postpones the current request, not a completed download failure.
 # Earlier redirect/policy requests remain independently counted by NewsHTTP.
-REQUEST_DEFERRAL_CONTRACT_VERSION = 2
+REQUEST_DEFERRAL_CONTRACT_VERSION = 3
 REQUEST_DEFERRAL_CODES = frozenset({
     'provider_cooldown', 'provider_pacing_cooldown', 'host_gateway_cooldown', 'robots_origin_policy_cooldown', 'stopping',
 })
@@ -60,8 +61,21 @@ class NewsError(Exception):
         self.request_deferred = request_deferred
 
 
-def normalize_url(value: Any) -> str:
-    """Remove only known tracking parameters; preserve identity and query order."""
+@overload
+def normalize_url(value: Any, *, include_host_path: Literal[False] = False) -> str: ...
+
+
+@overload
+def normalize_url(value: Any, *, include_host_path: Literal[True]) -> tuple[str, str, str]: ...
+
+
+def normalize_url(value: Any, *, include_host_path: bool = False) -> str | tuple[str, str, str]:
+    """Remove known tracking parameters while preserving identity and query order.
+
+    The optional components are taken from the same validated parse. They let
+    bulk metadata ingestion avoid splitting the normalized URL again; they do
+    not change the URL identity or perform a separate admission check.
+    """
     if not isinstance(value, str) or not value.strip():
         raise NewsError("invalid_url")
     if len(value) > 8192 or any(char in value for char in "\r\n\t\\"):
@@ -87,7 +101,11 @@ def normalize_url(value: Any) -> str:
         key = unquote_plus(parameter.split("=", 1)[0]).lower()
         if key not in TRACKING_KEYS and not key.startswith("utm_"):
             query.append(parameter)
-    return urlunsplit((parts.scheme.lower(), host, parts.path or "/", "&".join(query), ""))
+    path = parts.path or "/"
+    normalized = urlunsplit((parts.scheme.lower(), host, path, "&".join(query), ""))
+    if include_host_path:
+        return normalized, host, path
+    return normalized
 
 
 def public_address_check(url: str) -> None:
@@ -189,6 +207,11 @@ def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
     # recover bodies and must not replay bulk/parser failures or saved heads.
     normalized.pop('verified_native_degenerate_outcome_contract_version', None)
     normalized.pop('verified_native_photo_credit_outcome_contract_version', None)
+    normalized.pop('verified_native_empty_body_outcome_contract_version', None)
+    normalized.pop('verified_native_paid_preview_outcome_contract_version', None)
+    # This exact figure proof only changes locally retained HTML versions. It
+    # must not requeue bulk/API failures or reset HTTP pacing/refusal evidence.
+    normalized.pop('verified_outer_chart_caption_contract_version', None)
     entry = dict(payload['entry'])
     for field in ('acquisition_mode', 'private_known_url_scope', 'note',
                   'interval_seconds', 'parallelism', 'discovery_interval_seconds',
@@ -386,7 +409,7 @@ class PolicyRegistry:
                              and domains == ("cmnews.com.tw",) and auth.get("kind") == "personal_research"
                              and entry.get("require_configured_container") is True
                              and entry.get("require_author_attribution") is True)
-            cmoneylearning_layout = (embedded in {'cmoneylearning_visible_article_v1', 'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6'} and provider == 'cmoneylearning'
+            cmoneylearning_layout = (embedded in {'cmoneylearning_visible_article_v1', 'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6', 'cmoneylearning_visible_article_v7', 'cmoneylearning_visible_article_v8'} and provider == 'cmoneylearning'
                                      and domains == ('cmoneylearning.com.tw',) and auth.get('kind') == 'personal_research'
                                      and auth.get('evidence_url') == 'https://www.cmoney.tw/member/tos.aspx'
                                      and entry.get('acquisition_mode') == 'finite'
@@ -399,13 +422,19 @@ class PolicyRegistry:
                     CMONEY_LEARNING_V4_PATH_PATTERN, CMONEY_LEARNING_V4_AUTH_SCOPE,
                     CMONEY_LEARNING_V5_PATH_PATTERN, CMONEY_LEARNING_V5_AUTH_SCOPE,
                     CMONEY_LEARNING_V6_PATH_PATTERN, CMONEY_LEARNING_V6_AUTH_SCOPE,
+                    CMONEY_LEARNING_V7_PATH_PATTERN, CMONEY_LEARNING_V7_AUTH_SCOPE,
+                    CMONEY_LEARNING_V8_PATH_PATTERN, CMONEY_LEARNING_V8_AUTH_SCOPE,
                 )
                 original_v2 = embedded == 'cmoneylearning_visible_article_v2'
                 original_v3 = embedded == 'cmoneylearning_visible_article_v3'
                 original_v4 = embedded == 'cmoneylearning_visible_article_v4'
                 original_v5 = embedded == 'cmoneylearning_visible_article_v5'
                 original_v6 = embedded == 'cmoneylearning_visible_article_v6'
-                original_pattern = (CMONEY_LEARNING_V6_PATH_PATTERN if original_v6 else
+                original_v7 = embedded == 'cmoneylearning_visible_article_v7'
+                original_v8 = embedded == 'cmoneylearning_visible_article_v8'
+                original_pattern = (CMONEY_LEARNING_V8_PATH_PATTERN if original_v8 else
+                                    CMONEY_LEARNING_V7_PATH_PATTERN if original_v7 else
+                                    CMONEY_LEARNING_V6_PATH_PATTERN if original_v6 else
                                     CMONEY_LEARNING_V5_PATH_PATTERN if original_v5 else
                                     CMONEY_LEARNING_V4_PATH_PATTERN if original_v4 else
                                     CMONEY_LEARNING_V3_PATH_PATTERN if original_v3 else
@@ -414,7 +443,9 @@ class PolicyRegistry:
                                         and entry.get('article_path_pattern') == original_pattern
                                         and entry.get('exclude_selectors') == []
                                         and entry.get('title_selector') == 'h1.articleContent__title'
-                                        and (not (original_v2 or original_v3 or original_v4 or original_v5 or original_v6) or auth.get('scope') == (
+                                        and (not (original_v2 or original_v3 or original_v4 or original_v5 or original_v6 or original_v7 or original_v8) or auth.get('scope') == (
+                                             CMONEY_LEARNING_V8_AUTH_SCOPE if original_v8 else
+                                             CMONEY_LEARNING_V7_AUTH_SCOPE if original_v7 else
                                              CMONEY_LEARNING_V6_AUTH_SCOPE if original_v6 else
                                              CMONEY_LEARNING_V5_AUTH_SCOPE if original_v5 else
                                              CMONEY_LEARNING_V4_AUTH_SCOPE if original_v4 else
@@ -871,11 +902,11 @@ class PolicyRegistry:
                         'cnyes_apis', 'fulltext_feeds', 'historical_fulltext_feeds', 'index_pages',
                         'incremental_index_pages', 'metadata_feeds', 'cnyes_public_index')))
             knews_layout = False
-            if embedded in {'knews_public_native_article_v1', 'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7'}:
+            if embedded in {'knews_public_native_article_v1', 'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'}:
                 from downloader.news_fulltext_knews import (
                     KNEWS_AUTHOR_SELECTOR, KNEWS_BODY_SELECTOR, KNEWS_EXCLUSIONS,
                     KNEWS_PATH_PATTERN, KNEWS_REVIEWED_HEADER_AUTHORS, KNEWS_REVIEWED_URLS, KNEWS_V2_VERIFICATION,
-                    KNEWS_V3_VERIFICATION, KNEWS_V4_VERIFICATION, KNEWS_V5_VERIFICATION, KNEWS_V6_VERIFICATION, KNEWS_V7_VERIFICATION,
+                    KNEWS_V3_VERIFICATION, KNEWS_V4_VERIFICATION, KNEWS_V5_VERIFICATION, KNEWS_V6_VERIFICATION, KNEWS_V7_VERIFICATION, KNEWS_V8_VERIFICATION, KNEWS_V9_VERIFICATION, KNEWS_V10_VERIFICATION,
                 )
                 knews_layout = (provider == 'knews' and domains == ('www.knews.com.tw',)
                     and auth.get('kind') == 'personal_research'
@@ -884,7 +915,7 @@ class PolicyRegistry:
                           and entry.get('acquisition_mode') == 'finite'
                           and entry.get('finite_article_urls') == list(KNEWS_REVIEWED_URLS)
                           and entry.get('permitted_author_names') == list(KNEWS_REVIEWED_HEADER_AUTHORS))
-                         or (embedded in {'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7'}
+                         or (embedded in {'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'}
                              and entry.get('acquisition_mode') == 'continuous' and known_url_only
                              and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
                              and not entry.get('finite_article_urls') and not entry.get('permitted_author_names')
@@ -894,7 +925,10 @@ class PolicyRegistry:
                                  'knews_public_native_article_v4': KNEWS_V4_VERIFICATION,
                                  'knews_public_native_article_v5': KNEWS_V5_VERIFICATION,
                                  'knews_public_native_article_v6': KNEWS_V6_VERIFICATION,
-                                 'knews_public_native_article_v7': KNEWS_V7_VERIFICATION}[embedded]))
+                                 'knews_public_native_article_v7': KNEWS_V7_VERIFICATION,
+                                 'knews_public_native_article_v8': KNEWS_V8_VERIFICATION,
+                                 'knews_public_native_article_v9': KNEWS_V9_VERIFICATION,
+                                 'knews_public_native_article_v10': KNEWS_V10_VERIFICATION}[embedded]))
                     and not entry.get('allow_reviewed_supplements')
                     and entry.get('require_configured_container') is True
                     and entry.get('require_author_attribution') is True
@@ -997,9 +1031,9 @@ class PolicyRegistry:
                     and entry.get('exclude_selectors') == list(UPMEDIA_EXCLUSIONS)
                     and not entry.get('permitted_author_names') and not entry.get('allow_short_configured_body'))
             contentplatform_layout = False
-            if embedded in {'contentplatform_native_article_v1', 'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}:
+            if embedded in {'contentplatform_native_article_v1', 'contentplatform_native_article_v2', 'contentplatform_native_article_v3', 'contentplatform_native_article_v4', 'contentplatform_native_article_v5', 'contentplatform_native_article_v6', 'contentplatform_native_article_v7', 'contentplatform_native_article_v8'}:
                 from downloader.news_fulltext_contentplatform import (
-                    CONTENTPLATFORM_BODY, CONTENTPLATFORM_PATH, CONTENTPLATFORM_TITLE,
+                    CONTENTPLATFORM_BODY, CONTENTPLATFORM_PATH, CONTENTPLATFORM_TITLE, CONTENTPLATFORM_V4_AUTH_SCOPE,
                 )
                 contentplatform_layout = (provider == 'contentplatform'
                     and domains == ('www.contentplatform.info',)
@@ -1013,8 +1047,64 @@ class PolicyRegistry:
                     and entry.get('article_selectors') == [CONTENTPLATFORM_BODY]
                     and entry.get('title_selector') == CONTENTPLATFORM_TITLE
                     and entry.get('exclude_selectors') == []
+                    and (embedded not in {'contentplatform_native_article_v4', 'contentplatform_native_article_v5', 'contentplatform_native_article_v6', 'contentplatform_native_article_v7', 'contentplatform_native_article_v8'} or
+                         auth.get('scope') == CONTENTPLATFORM_V4_AUTH_SCOPE and auth.get('reviewed_on') == '2026-10-26')
                     and not entry.get('allow_short_configured_body'))
-            if embedded and not (einfo_layout or cmnews_layout or cmoneylearning_layout or tainan_layout or macau_layout or kmdn_layout or coolloud_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or taiwanhot_layout or voa_layout or tfc_layout or nccu_layout or nchu_layout or mcu_layout or max_layout or taichung_layout or changhua_layout or events_layout or ftnn_layout or tvbs_layout or ettoday_layout or mnews_layout or pocket_layout or watchmedia_layout or pinview_layout or peoplemedia_layout or bastillepost_layout or mitrade_layout or idn_layout or videoland_layout or stockfeel_layout or taiwannews_layout or gvm_layout or cw_layout or wealth_layout or knews_layout or setn_layout or fuhouse_layout or inews_layout or upmedia_layout or contentplatform_layout):
+            manager_layout = False
+            if embedded in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}:
+                from downloader.news_fulltext_managertoday import MANAGER_BODY, MANAGER_PATH, MANAGER_V4_VERIFICATION, MANAGER_V5_VERIFICATION
+                manager_layout = (provider == 'managertoday' and domains == ('www.managertoday.com.tw',)
+                    and auth.get('kind') == 'personal_research'
+                    and auth.get('evidence_url') == 'https://www.managertoday.com.tw/'
+                    and entry.get('acquisition_mode') == 'continuous' and known_url_only
+                    and entry.get('private_known_url_scope') == 'personal_noncommercial_originals_v1'
+                    and entry.get('require_configured_container') is True
+                    and entry.get('require_author_attribution') is True
+                    and entry.get('html_parser') == 'lxml'
+                    and entry.get('article_path_pattern') == MANAGER_PATH
+                    and entry.get('article_selectors') == [MANAGER_BODY]
+                    and entry.get('title_selector') == 'h1'
+                    and entry.get('exclude_selectors') == []
+                    and (not embedded.endswith('_v4') or entry.get('adapter_verification') == MANAGER_V4_VERIFICATION)
+                    and (not embedded.endswith('_v5') or entry.get('adapter_verification') == MANAGER_V5_VERIFICATION)
+                    and not entry.get('allow_short_configured_body'))
+            gnn_layout = False
+            if embedded in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}:
+                from downloader.news_fulltext_gnn import GNN_ORIGIN, GNN_PATH, GNN_BODY
+                gnn_layout = (provider=='gnn' and domains==('gnn.gamer.com.tw',)
+                    and auth.get('kind')=='personal_research' and auth.get('evidence_url')==GNN_ORIGIN+'/'
+                    and entry.get('acquisition_mode')=='continuous' and known_url_only
+                    and entry.get('private_known_url_scope')=='personal_noncommercial_originals_v1'
+                    and entry.get('require_configured_container') is True
+                    and entry.get('require_author_attribution') is True
+                    and entry.get('html_parser')=='lxml'
+                    and entry.get('article_path_pattern')==GNN_PATH
+                    and entry.get('article_selectors')==[GNN_BODY]
+                    and entry.get('title_selector')=='h1' and entry.get('exclude_selectors')==[]
+                    and not entry.get('allow_short_configured_body'))
+            nstock_layout = False
+            if embedded == 'nstock_finite_announcement_v1':
+                from downloader.news_fulltext_nstock import (NSTOCK_BODY_SELECTOR,
+                    NSTOCK_PATH_PATTERN, NSTOCK_REVIEWED_URLS)
+                nstock_layout = (provider == 'nstock' and domains == ('www.nstock.tw',)
+                    and auth.get('kind') == 'personal_research'
+                    and auth.get('evidence_url') == 'https://www.nstock.tw/app/user-agreement'
+                    and entry.get('acquisition_mode') == 'finite'
+                    and entry.get('finite_article_urls') == list(NSTOCK_REVIEWED_URLS)
+                    and entry.get('finite_identity_query_keys') == ['id']
+                    and entry.get('html_parser') == 'lxml'
+                    and entry.get('article_path_pattern') == NSTOCK_PATH_PATTERN
+                    and entry.get('article_selectors') == [NSTOCK_BODY_SELECTOR]
+                    and entry.get('title_selector') == 'h1'
+                    and entry.get('require_configured_container') is True
+                    and entry.get('require_author_attribution') is True
+                    and entry.get('exclude_selectors') == []
+                    and not entry.get('allow_short_configured_body')
+                    and not entry.get('allow_reviewed_supplements')
+                    and not any(entry.get(field) for field in ('feeds', 'sitemaps',
+                        'wordpress_apis', 'cnyes_apis', 'fulltext_feeds', 'historical_fulltext_feeds',
+                        'index_pages', 'incremental_index_pages', 'metadata_feeds', 'cnyes_public_index')))
+            if embedded and not (einfo_layout or cmnews_layout or cmoneylearning_layout or tainan_layout or macau_layout or kmdn_layout or coolloud_layout or cnews_layout or cmmedia_layout or nownews_layout or ftv_layout or taiwanhot_layout or voa_layout or tfc_layout or nccu_layout or nchu_layout or mcu_layout or max_layout or taichung_layout or changhua_layout or events_layout or ftnn_layout or tvbs_layout or ettoday_layout or mnews_layout or pocket_layout or watchmedia_layout or pinview_layout or peoplemedia_layout or bastillepost_layout or mitrade_layout or idn_layout or videoland_layout or stockfeel_layout or taiwannews_layout or gvm_layout or cw_layout or wealth_layout or knews_layout or setn_layout or fuhouse_layout or inews_layout or upmedia_layout or contentplatform_layout or manager_layout or gnn_layout or nstock_layout):
                 raise ValueError("unreviewed embedded article parser")
             acquisition_mode = entry.get("acquisition_mode", "continuous")
             if not isinstance(acquisition_mode, str) or acquisition_mode not in {"continuous", "finite"}:
@@ -1174,6 +1264,7 @@ class PolicyRegistry:
                 fingerprint_payload['verified_short_html_body_contract_version'] = 5
                 fingerprint_payload['verified_native_prose_spacing_contract_version'] = 1
                 fingerprint_payload['mobile_canonical_html_contract_version'] = 43
+                fingerprint_payload['verified_outer_chart_caption_contract_version'] = 1
                 fingerprint_payload['verified_empty_html_outcome_contract_version'] = 8
                 fingerprint_payload['verified_office_comment_empty_outcome_contract_version'] = 1
                 fingerprint_payload['verified_native_degenerate_outcome_contract_version'] = 1
@@ -1190,7 +1281,7 @@ class PolicyRegistry:
                 fingerprint_payload["fed_legacy_adapter_contract_version"] = max(3, _FED_RELEASE_LAYOUT_VERSIONS[legacy])
             if embedded:
                 fingerprint_payload["embedded_article_adapter_contract_version"] = (
-                    {"cmnews_visible_article_v1": 8, "cmoneylearning_visible_article_v2": 3, "cmoneylearning_visible_article_v3": 6, "cmoneylearning_visible_article_v4": 7, "cmoneylearning_visible_article_v5": 8, "cmoneylearning_visible_article_v6": 9, 'stockfeel_visible_original_v2': 2, 'stockfeel_visible_original_v3': 3, 'stockfeel_visible_original_v4': 4, 'stockfeel_visible_original_v5': 5, 'stockfeel_visible_original_v6': 6, 'stockfeel_visible_original_v7': 7, "einfo_next_post_v1": 2, "cnews_visible_article_v1": 4,
+                    {"cmnews_visible_article_v1": 8, "cmoneylearning_visible_article_v2": 3, "cmoneylearning_visible_article_v3": 6, "cmoneylearning_visible_article_v4": 7, "cmoneylearning_visible_article_v5": 8, "cmoneylearning_visible_article_v6": 9, "cmoneylearning_visible_article_v7": 10, "cmoneylearning_visible_article_v8": 11, 'stockfeel_visible_original_v2': 2, 'stockfeel_visible_original_v3': 3, 'stockfeel_visible_original_v4': 4, 'stockfeel_visible_original_v5': 5, 'stockfeel_visible_original_v6': 6, 'stockfeel_visible_original_v7': 7, "einfo_next_post_v1": 2, "cnews_visible_article_v1": 4,
                      "ftv_visible_article_v1": 5, "ftv_visible_article_v2": 6, "ftv_visible_article_v3": 7, "ftv_visible_article_v4": 8, "ftv_visible_article_v5": 9, "ftv_visible_article_v6": 10, "ftv_visible_article_v7": 11, "nownews_visible_article_v1": 2,
                      "ftnn_visible_article_v1": 2, "ftnn_visible_article_v2": 3, "ftnn_visible_article_v3": 4,
                      "ftnn_visible_article_v4": 5, "ftnn_visible_article_v5": 6, "ftnn_visible_article_v6": 7,
@@ -1201,6 +1292,14 @@ class PolicyRegistry:
                      'idn_visible_article_v2': 2, 'idn_visible_article_v3': 3, 'videoland_visible_article_v2': 2, 'videoland_visible_article_v3': 3, 'videoland_visible_article_v4': 4,
                      'upmedia_public_modern_article_v2': 2, 'upmedia_public_modern_article_v3': 3, 'upmedia_public_modern_article_v4': 4,
                      'contentplatform_native_article_v2': 2, 'contentplatform_native_article_v3': 3,
+                     'contentplatform_native_article_v4': 4,
+                     'contentplatform_native_article_v5': 5,
+                     'contentplatform_native_article_v6': 6,
+                     'contentplatform_native_article_v7': 7,
+                     'contentplatform_native_article_v8': 8,
+                     'gnn_native_credited_article_v2': 2,
+                     'gnn_native_written_article_v3': 3,
+                     'gnn_native_legacy_article_v4': 4,
                      **BASTILLE_LAYOUT_VERSIONS, **TAIWANNEWS_LAYOUT_VERSIONS,
                      'gvm_public_native_article_v3': 3, 'gvm_public_native_article_v4': 4, 'gvm_public_native_article_v5': 5, 'gvm_public_native_article_v6': 6, 'gvm_public_native_article_v7': 7, 'gvm_public_native_article_v8': 8, 'gvm_public_native_article_v9': 9, 'gvm_public_native_article_v10': 10, 'gvm_public_native_article_v11': 11,
                      'setn_fuhouse_native_article_v2': 2, 'setn_fuhouse_native_article_v3': 3, 'setn_fuhouse_native_article_v4': 4,
@@ -1209,6 +1308,11 @@ class PolicyRegistry:
                      'knews_public_native_article_v5': 5,
                      'knews_public_native_article_v6': 6,
                      'knews_public_native_article_v7': 7,
+                     'knews_public_native_article_v8': 8,
+                     'knews_public_native_article_v9': 9,
+                     'knews_public_native_article_v10': 10,
+                     'manager_public_written_article_v4': 4,
+                     'manager_public_written_article_v5': 5,
                      **ETTODAY_LAYOUT_VERSIONS,
                      "tainan_visible_news_v1": 2, "voa_reviewed_private_article_v2": 3,
                      "taichung_visible_news_v1": 2,
@@ -1222,6 +1326,8 @@ class PolicyRegistry:
                 fingerprint_payload['mixed_nontext_native_embed_classification_version'] = 1
                 if GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION:
                     fingerprint_payload['verified_native_photo_credit_outcome_contract_version'] = GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION
+                if GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION:
+                    fingerprint_payload['verified_native_empty_body_outcome_contract_version'] = GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION
             if provider == 'genetinfo':
                 fingerprint_payload['image_only_body_classification_version'] = 1
             if short_body:
@@ -1233,14 +1339,48 @@ class PolicyRegistry:
             if wealth_layout:
                 fingerprint_payload['native_visible_writer_prefix_and_day_clock_contract_version'] = 1
             if provider == 'moneyweekly':
-                fingerprint_payload['moneyweekly_source_identity_contract_version'] = 3
+                from downloader.news_fulltext_moneyweekly import LEGACY_ARTICLE_PATTERN, NATIVE_ARTICLE_PATTERN, NATIVE_ROUTE_CONTRACT_VERSION
+                from downloader.news_fulltext_moneyweekly_outcomes import CONTRACT_VERSION as PAID_PREVIEW_VERSION, FINGERPRINT_KEY
+                fingerprint_payload['moneyweekly_source_identity_contract_version'] = NATIVE_ROUTE_CONTRACT_VERSION if pattern == NATIVE_ARTICLE_PATTERN else 3
                 fingerprint_payload['moneyweekly_short_prose_contract_version'] = 1
+                if PAID_PREVIEW_VERSION and pattern == NATIVE_ARTICLE_PATTERN:
+                    fingerprint_payload[FINGERPRINT_KEY] = PAID_PREVIEW_VERSION
             data_fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode()).hexdigest()
             capacity_fingerprint = ''
             capacity_authorization_fingerprint = ''
             prior_capture_fingerprint = ''
             capture_history = ()
-            if provider == 'moneyweekly' and not embedded:
+            if manager_layout and embedded in {'manager_public_written_article_v4','manager_public_written_article_v5'}:
+                from downloader.news_fulltext_managertoday import MANAGER_V4_HTTP_BINDING, MANAGER_V5_HTTP_BINDING
+                # Only the exact reviewed predecessor/config pair inherits its
+                # existing HTTP identity. Other scope/pacing edits do not.
+                binding = MANAGER_V5_HTTP_BINDING if embedded.endswith('_v5') else MANAGER_V4_HTTP_BINDING
+                if len(binding) == 5:
+                    if (data_fingerprint, fingerprint) == binding[1:3]:
+                        prior_capture_fingerprint = binding[0]
+                        capture_history = (binding[0],)
+                        capacity_fingerprint, capacity_authorization_fingerprint = binding[3:]
+            elif gnn_layout and embedded in {'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}:
+                # Parsing native supplier credits/non-prose media changes the
+                # capture ABI, never the exact source/auth pacing or refusal.
+                prior_payload = {**fingerprint_payload,
+                    'entry': {**capture_entry, 'embedded_article_layout': 'gnn_native_reporter_article_v1'},
+                    'embedded_article_adapter_contract_version': 1}
+                first_capture = hashlib.sha256(json.dumps(prior_payload, sort_keys=True).encode()).hexdigest()
+                capacity_fingerprint = first_capture
+                capture_history = (first_capture,)
+                if embedded != 'gnn_native_credited_article_v2':
+                    credited_payload = {**fingerprint_payload,
+                        'entry': {**capture_entry, 'embedded_article_layout': 'gnn_native_credited_article_v2'},
+                        'embedded_article_adapter_contract_version': 2}
+                    capture_history += (hashlib.sha256(json.dumps(credited_payload, sort_keys=True).encode()).hexdigest(),)
+                if embedded == 'gnn_native_legacy_article_v4':
+                    written_payload = {**fingerprint_payload,
+                        'entry': {**capture_entry, 'embedded_article_layout': 'gnn_native_written_article_v3'},
+                        'embedded_article_adapter_contract_version': 3}
+                    capture_history += (hashlib.sha256(json.dumps(written_payload, sort_keys=True).encode()).hexdigest(),)
+                prior_capture_fingerprint = capture_history[-1]
+            elif provider == 'moneyweekly' and not embedded:
                 # A short native editor and one reviewed publisher contributor
                 # change parsing, not HTTP load or an existing source refusal.
                 # Reuse only the exact attested predecessor, including every
@@ -1258,16 +1398,33 @@ class PolicyRegistry:
                     'https://www.moneyweekly.com.tw/ArticleData/Info/Article/147720'])
                 if ((permitted_authors == ['理周投研部', '洪崇晏'] and auth == old_auth)
                         or (permitted_authors == ['理周投研部', '洪崇晏', '林庭頡'] and auth == reviewed_auth)):
-                    predecessor = dict(fingerprint_payload)
+                    native_routes = fingerprint_payload['moneyweekly_source_identity_contract_version'] >= 4
+                    historical_payload = dict(fingerprint_payload)
+                    historical_payload.pop('verified_native_paid_preview_outcome_contract_version', None)
+                    prior_payload = {**historical_payload, 'moneyweekly_source_identity_contract_version': 3,
+                        'entry': {**capture_entry, 'article_path_pattern': LEGACY_ARTICLE_PATTERN}} if native_routes else historical_payload
+                    previous_capture = hashlib.sha256(json.dumps(prior_payload, sort_keys=True).encode()).hexdigest()
+                    predecessor = dict(prior_payload)
                     predecessor.pop('moneyweekly_short_prose_contract_version')
                     predecessor['moneyweekly_source_identity_contract_version'] = 2
-                    predecessor['entry'] = {**capture_entry, 'authorization': old_auth,
+                    predecessor['entry'] = {**prior_payload['entry'], 'authorization': old_auth,
                         'permitted_author_names': ['理周投研部', '洪崇晏']}
                     predecessor['authorization'] = old_auth
                     prior = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
                     if prior == '66a7bdb4cd1750deeb470285f7c9d6df67f4b7d663a3e7ace0e6a0935fb56d3e':
                         capacity_fingerprint = prior_capture_fingerprint = prior
                         capacity_authorization_fingerprint = hashlib.sha256(json.dumps(old_auth, sort_keys=True).encode()).hexdigest()
+                        if native_routes:
+                            prior_capture_fingerprint = previous_capture
+                            previous_native = {**historical_payload, 'moneyweekly_source_identity_contract_version': 4}
+                            capture_history = (prior, previous_capture,
+                                hashlib.sha256(json.dumps(previous_native, sort_keys=True).encode()).hexdigest())
+                        if 'verified_native_paid_preview_outcome_contract_version' in fingerprint_payload:
+                            previous_native_capture = hashlib.sha256(json.dumps(historical_payload, sort_keys=True).encode()).hexdigest()
+                            # The route-recheck ABI still binds its original
+                            # legacy predecessor. Add the negative-outcome ABI's
+                            # predecessor without replacing that route identity.
+                            capture_history = tuple(dict.fromkeys((*capture_history, previous_native_capture)))
             elif gvm_layout and finite_urls:
                 from downloader.news_fulltext_gvm import GVM_FINITE_HTTP_BINDING
                 if (data_fingerprint, fingerprint) == GVM_FINITE_HTTP_BINDING[:2]:
@@ -1366,6 +1523,36 @@ class PolicyRegistry:
                 capture_history = (prior_capture_fingerprint,)
                 if (prior_capture_fingerprint, fingerprint) == KNEWS_WRITTEN_BLOCKS_HTTP_BINDING[:2]:
                     capacity_fingerprint, capacity_authorization_fingerprint = KNEWS_WRITTEN_BLOCKS_HTTP_BINDING[2:]
+            elif knews_layout and embedded == 'knews_public_native_article_v8':
+                from downloader.news_fulltext_knews import KNEWS_SPARSE_HTTP_BINDING, KNEWS_V7_VERIFICATION
+                predecessor_entry = {**capture_entry, 'embedded_article_layout': 'knews_public_native_article_v7',
+                    'adapter_verification': KNEWS_V7_VERIFICATION}
+                capacity_payload = {**fingerprint_payload, 'entry': predecessor_entry,
+                    'embedded_article_adapter_contract_version': 7}
+                prior_capture_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+                capture_history = (prior_capture_fingerprint,)
+                if (prior_capture_fingerprint, fingerprint) == KNEWS_SPARSE_HTTP_BINDING[:2]:
+                    capacity_fingerprint, capacity_authorization_fingerprint = KNEWS_SPARSE_HTTP_BINDING[2:]
+            elif knews_layout and embedded == 'knews_public_native_article_v9':
+                from downloader.news_fulltext_knews import KNEWS_TABLE_HTTP_BINDING, KNEWS_V8_VERIFICATION
+                predecessor_entry = {**capture_entry, 'embedded_article_layout': 'knews_public_native_article_v8',
+                    'adapter_verification': KNEWS_V8_VERIFICATION}
+                capacity_payload = {**fingerprint_payload, 'entry': predecessor_entry,
+                    'embedded_article_adapter_contract_version': 8}
+                prior_capture_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+                capture_history = (prior_capture_fingerprint,)
+                if (prior_capture_fingerprint, fingerprint) == KNEWS_TABLE_HTTP_BINDING[:2]:
+                    capacity_fingerprint, capacity_authorization_fingerprint = KNEWS_TABLE_HTTP_BINDING[2:]
+            elif knews_layout and embedded == 'knews_public_native_article_v10':
+                from downloader.news_fulltext_knews import KNEWS_GRID_HTTP_BINDING, KNEWS_V9_VERIFICATION
+                predecessor_entry = {**capture_entry, 'embedded_article_layout': 'knews_public_native_article_v9',
+                    'adapter_verification': KNEWS_V9_VERIFICATION}
+                capacity_payload = {**fingerprint_payload, 'entry': predecessor_entry,
+                    'embedded_article_adapter_contract_version': 9}
+                prior_capture_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+                capture_history = (prior_capture_fingerprint,)
+                if (prior_capture_fingerprint, fingerprint) == KNEWS_GRID_HTTP_BINDING[:2]:
+                    capacity_fingerprint, capacity_authorization_fingerprint = KNEWS_GRID_HTTP_BINDING[2:]
             elif setn_layout and finite_urls:
                 from downloader.news_fulltext_setn import SETN_FINITE_HTTP_BINDING
                 if (data_fingerprint, fingerprint) == SETN_FINITE_HTTP_BINDING[:2]:
@@ -1434,13 +1621,17 @@ class PolicyRegistry:
                 if len(binding) == 5 and (data_fingerprint, fingerprint) == binding[1:3]:
                     capacity_fingerprint, capacity_authorization_fingerprint = binding[3:]
                     prior_capture_fingerprint = binding[0]
-            elif cmoneylearning_layout and embedded in {'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6'}:
+            elif cmoneylearning_layout and embedded in {'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6', 'cmoneylearning_visible_article_v7', 'cmoneylearning_visible_article_v8'}:
                 from downloader.news_fulltext_cmoneylearning import (
                     CMONEY_LEARNING_V2_HTTP_BINDING, CMONEY_LEARNING_V3_HTTP_BINDING, CMONEY_LEARNING_V4_HTTP_BINDING,
                     CMONEY_LEARNING_V5_HTTP_BINDING,
                     CMONEY_LEARNING_V6_HTTP_BINDING,
+                    CMONEY_LEARNING_V7_HTTP_BINDING,
+                    CMONEY_LEARNING_V8_HTTP_BINDING,
                 )
-                binding = (CMONEY_LEARNING_V6_HTTP_BINDING if original_v6 else
+                binding = (CMONEY_LEARNING_V8_HTTP_BINDING if original_v8 else
+                           CMONEY_LEARNING_V7_HTTP_BINDING if original_v7 else
+                           CMONEY_LEARNING_V6_HTTP_BINDING if original_v6 else
                            CMONEY_LEARNING_V5_HTTP_BINDING if original_v5 else
                            CMONEY_LEARNING_V4_HTTP_BINDING if original_v4 else
                            CMONEY_LEARNING_V3_HTTP_BINDING if original_v3 else CMONEY_LEARNING_V2_HTTP_BINDING)
@@ -1452,8 +1643,15 @@ class PolicyRegistry:
                 # than inheriting unrelated endpoint/config/rights changes.
                 capacity_payload = dict(fingerprint_payload)
                 capacity_payload.pop('verified_native_photo_credit_outcome_contract_version', None)
+                capacity_payload.pop('verified_native_empty_body_outcome_contract_version', None)
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
                 prior_capture_fingerprint = capacity_fingerprint
+                capture_history = (capacity_fingerprint,)
+                if GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION:
+                    predecessor = dict(fingerprint_payload)
+                    predecessor.pop('verified_native_empty_body_outcome_contract_version')
+                    prior_capture_fingerprint = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
+                    capture_history = tuple(dict.fromkeys((*capture_history, prior_capture_fingerprint)))
             elif provider == 'cnyes':
                 # Word spacing and verified source-test outcomes are parser
                 # ABIs, not HTTP policy.
@@ -1468,7 +1666,11 @@ class PolicyRegistry:
                 capacity_payload.pop('verified_native_degenerate_outcome_contract_version')
                 capacity_payload.pop('verified_untitled_no_events_bulletin_contract_version')
                 capacity_payload.pop('verified_source_signature_image_outcome_contract_version')
+                capacity_payload.pop('verified_outer_chart_caption_contract_version')
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
+                prior_capture_payload = dict(fingerprint_payload)
+                prior_capture_payload.pop('verified_outer_chart_caption_contract_version')
+                prior_capture_fingerprint = hashlib.sha256(json.dumps(prior_capture_payload, sort_keys=True).encode()).hexdigest()
             elif ftnn_layout:
                 # The dual native release/revision proof is an HTML-only ABI.
                 # Normalize only that adapter version to retain the exact
@@ -1590,6 +1792,62 @@ class PolicyRegistry:
                     prior_payload['entry'] = {**capture_entry, 'embedded_article_layout': f'pocket_visible_article_v{prior}'}
                     prior_payload['embedded_article_adapter_contract_version'] = prior
                     prior_capture_fingerprint = hashlib.sha256(json.dumps(prior_payload, sort_keys=True).encode()).hexdigest()
+            elif contentplatform_layout and embedded == 'contentplatform_native_article_v8':
+                from downloader.news_fulltext_contentplatform import (
+                    CONTENTPLATFORM_V4_HTTP_BINDING, CONTENTPLATFORM_V7_CAPTURE,
+                    CONTENTPLATFORM_V7_VERIFICATION, CONTENTPLATFORM_V8_VERIFICATION)
+                predecessor = {**fingerprint_payload,
+                    'entry': {**capture_entry, 'embedded_article_layout': 'contentplatform_native_article_v7',
+                        'adapter_verification': CONTENTPLATFORM_V7_VERIFICATION},
+                    'embedded_article_adapter_contract_version': 7}
+                prior = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
+                if ((prior, fingerprint) == (CONTENTPLATFORM_V7_CAPTURE, CONTENTPLATFORM_V4_HTTP_BINDING[1])
+                        and capture_entry.get('adapter_verification') == CONTENTPLATFORM_V8_VERIFICATION):
+                    capacity_fingerprint, capacity_authorization_fingerprint = CONTENTPLATFORM_V4_HTTP_BINDING[2:4]
+                    prior_capture_fingerprint = prior
+            elif contentplatform_layout and embedded == 'contentplatform_native_article_v7':
+                from downloader.news_fulltext_contentplatform import (
+                    CONTENTPLATFORM_V4_HTTP_BINDING, CONTENTPLATFORM_V6_CAPTURE,
+                    CONTENTPLATFORM_V6_VERIFICATION, CONTENTPLATFORM_V7_VERIFICATION)
+                predecessor = {**fingerprint_payload,
+                    'entry': {**capture_entry, 'embedded_article_layout': 'contentplatform_native_article_v6',
+                        'adapter_verification': CONTENTPLATFORM_V6_VERIFICATION},
+                    'embedded_article_adapter_contract_version': 6}
+                prior = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
+                if ((prior, fingerprint) == (CONTENTPLATFORM_V6_CAPTURE, CONTENTPLATFORM_V4_HTTP_BINDING[1])
+                        and capture_entry.get('adapter_verification') == CONTENTPLATFORM_V7_VERIFICATION):
+                    capacity_fingerprint, capacity_authorization_fingerprint = CONTENTPLATFORM_V4_HTTP_BINDING[2:4]
+                    prior_capture_fingerprint = prior
+            elif contentplatform_layout and embedded == 'contentplatform_native_article_v6':
+                from downloader.news_fulltext_contentplatform import (
+                    CONTENTPLATFORM_V4_HTTP_BINDING, CONTENTPLATFORM_V5_ORIGINAL_BINDING,
+                    CONTENTPLATFORM_V5_VERIFICATION, CONTENTPLATFORM_V6_VERIFICATION)
+                predecessor = {**fingerprint_payload,
+                    'entry': {**capture_entry, 'embedded_article_layout': 'contentplatform_native_article_v5',
+                        'adapter_verification': CONTENTPLATFORM_V5_VERIFICATION},
+                    'embedded_article_adapter_contract_version': 5}
+                prior = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
+                if ((prior, fingerprint) == CONTENTPLATFORM_V5_ORIGINAL_BINDING[:2]
+                        and capture_entry.get('adapter_verification') == CONTENTPLATFORM_V6_VERIFICATION):
+                    capacity_fingerprint, capacity_authorization_fingerprint = CONTENTPLATFORM_V4_HTTP_BINDING[2:4]
+                    prior_capture_fingerprint = prior
+            elif contentplatform_layout and embedded == 'contentplatform_native_article_v5':
+                from downloader.news_fulltext_contentplatform import (
+                    CONTENTPLATFORM_V4_HTTP_BINDING, CONTENTPLATFORM_V4_VERIFICATION, CONTENTPLATFORM_V5_VERIFICATION)
+                predecessor = {**fingerprint_payload,
+                    'entry': {**capture_entry, 'embedded_article_layout': 'contentplatform_native_article_v4',
+                        'adapter_verification': CONTENTPLATFORM_V4_VERIFICATION},
+                    'embedded_article_adapter_contract_version': 4}
+                prior = hashlib.sha256(json.dumps(predecessor, sort_keys=True).encode()).hexdigest()
+                if (prior, fingerprint) == CONTENTPLATFORM_V4_HTTP_BINDING[:2] and capture_entry.get('adapter_verification') == CONTENTPLATFORM_V5_VERIFICATION:
+                    capacity_fingerprint, capacity_authorization_fingerprint = CONTENTPLATFORM_V4_HTTP_BINDING[2:4]
+                    prior_capture_fingerprint = prior
+            elif contentplatform_layout and embedded == 'contentplatform_native_article_v4':
+                from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_V4_HTTP_BINDING
+                binding = CONTENTPLATFORM_V4_HTTP_BINDING
+                if len(binding) == 5 and (data_fingerprint, fingerprint) == binding[:2]:
+                    capacity_fingerprint, capacity_authorization_fingerprint = binding[2:4]
+                    prior_capture_fingerprint = binding[4]
             elif contentplatform_layout and embedded in {'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}:
                 # Only observed inline image-only wrappers changed.
                 # Keep the exact old HTTP/cooldown scope and one predecessor
@@ -1775,6 +2033,7 @@ class PolicyRegistry:
                 bulk_payload.pop('verified_short_html_body_contract_version', None)
                 bulk_payload.pop('verified_native_prose_spacing_contract_version', None)
                 bulk_payload.pop('mobile_canonical_html_contract_version', None)
+                bulk_payload.pop('verified_outer_chart_caption_contract_version', None)
                 bulk_payload.pop('verified_empty_html_outcome_contract_version', None)
                 bulk_payload.pop('verified_office_comment_empty_outcome_contract_version', None)
                 bulk_payload.pop('verified_native_degenerate_outcome_contract_version', None)
@@ -1794,6 +2053,7 @@ class PolicyRegistry:
                 # repair does not re-fetch healthy historical feed pages.
                 feed_payload.pop('verified_small_html_body_contract_version', None)
                 feed_payload.pop('verified_native_photo_credit_outcome_contract_version', None)
+                feed_payload.pop('verified_native_empty_body_outcome_contract_version', None)
                 if provider == 'globalvoices' and GLOBALVOICES_FEED_BODY_CONTRACT_VERSION >= 2:
                     prior_feed_fingerprint = hashlib.sha256(json.dumps(feed_payload, sort_keys=True).encode()).hexdigest()
                     # Derive each retained ABI from this exact source/rights
@@ -2174,7 +2434,7 @@ def public_article_document(payload: bytes, source: SourcePolicy, *, page_url: s
 
 def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | None = None) -> dict[str, Any]:
     """Prefer declared body over summaries. No boilerplate/page-wide fallback."""
-    if (source.embedded_article_layout in {'stockfeel_visible_original_v7', 'cw_public_editor_compilation_v1', 'businessweekly_wealth_public_written_v1'}
+    if (source.embedded_article_layout in {'stockfeel_visible_original_v7', 'cw_public_editor_compilation_v1', 'businessweekly_wealth_public_written_v1', 'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5', 'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}
             or source.embedded_article_layout in TAIWANNEWS_LAYOUT_VERSIONS) and b'\x00' in payload:
         # HTML parsers can silently remove literal NULs. The unlinked-name
         # contract must not turn a lossy spelling into a declared identity.
@@ -2204,7 +2464,7 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     elif source.embedded_article_layout == "cmnews_visible_article_v1":
         from downloader.news_fulltext_publishers import cmnews_visible_article
         article, article_scope = cmnews_visible_article(soup, page_url=page_url)
-    elif source.embedded_article_layout in {'cmoneylearning_visible_article_v1', 'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6'}:
+    elif source.embedded_article_layout in {'cmoneylearning_visible_article_v1', 'cmoneylearning_visible_article_v2', 'cmoneylearning_visible_article_v3', 'cmoneylearning_visible_article_v4', 'cmoneylearning_visible_article_v5', 'cmoneylearning_visible_article_v6', 'cmoneylearning_visible_article_v7', 'cmoneylearning_visible_article_v8'}:
         from downloader.news_fulltext_cmoneylearning import cmoneylearning_visible_article
         article, article_scope = cmoneylearning_visible_article(soup, page_url=page_url,
             adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
@@ -2337,13 +2597,16 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
     elif source.embedded_article_layout == 'businessweekly_wealth_public_written_v1':
         from downloader.news_fulltext_businessweekly import businessweekly_wealth_public_written
         article, article_scope = businessweekly_wealth_public_written(soup, page_url=page_url)
-    elif source.embedded_article_layout in {'knews_public_native_article_v1', 'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7'}:
+    elif source.embedded_article_layout in {'knews_public_native_article_v1', 'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'}:
         from downloader.news_fulltext_knews import knews_public_native_article
         article, article_scope = knews_public_native_article(soup, page_url=page_url,
             version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
     elif source.embedded_article_layout == 'setn_public_native_article_v1':
         from downloader.news_fulltext_setn import setn_public_native_article
         article, article_scope = setn_public_native_article(soup, page_url=page_url)
+    elif source.embedded_article_layout == 'nstock_finite_announcement_v1':
+        from downloader.news_fulltext_nstock import nstock_finite_announcement
+        article, article_scope = nstock_finite_announcement(soup, page_url=page_url)
     elif source.embedded_article_layout in {'setn_fuhouse_native_article_v1', 'setn_fuhouse_native_article_v2', 'setn_fuhouse_native_article_v3', 'setn_fuhouse_native_article_v4'}:
         from downloader.news_fulltext_setn import setn_fuhouse_native_article
         article, article_scope = setn_fuhouse_native_article(soup, page_url=page_url,
@@ -2356,10 +2619,17 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         from downloader.news_fulltext_upmedia import UPMEDIA_LAYOUT_VERSIONS, upmedia_public_modern_article
         article, article_scope = upmedia_public_modern_article(soup, page_url=page_url,
             adapter_contract_version=UPMEDIA_LAYOUT_VERSIONS[source.embedded_article_layout], raw_payload=payload)
-    elif source.embedded_article_layout in {'contentplatform_native_article_v1', 'contentplatform_native_article_v2', 'contentplatform_native_article_v3'}:
+    elif source.embedded_article_layout in {'contentplatform_native_article_v1', 'contentplatform_native_article_v2', 'contentplatform_native_article_v3', 'contentplatform_native_article_v4', 'contentplatform_native_article_v5', 'contentplatform_native_article_v6', 'contentplatform_native_article_v7', 'contentplatform_native_article_v8'}:
         from downloader.news_fulltext_contentplatform import contentplatform_native_article
         article, article_scope = contentplatform_native_article(soup, page_url=page_url,
             adapter_contract_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
+    elif source.embedded_article_layout in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}:
+        from downloader.news_fulltext_managertoday import manager_public_written_article
+        article, article_scope = manager_public_written_article(soup, page_url=page_url,
+            adapter_version=int(source.embedded_article_layout.rsplit('_v', 1)[1]))
+    elif source.embedded_article_layout in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}:
+        from downloader.news_fulltext_gnn import gnn_native_article
+        article, article_scope = gnn_native_article(soup, page_url=page_url, layout=source.embedded_article_layout)
     if source.required_license_url_prefix and not license_basis and not any(url.startswith(source.required_license_url_prefix) for url in licenses):
         raise NewsError("article_license_not_verified")
     canonical = _select_first(soup, 'link[rel="canonical"]')
@@ -2378,7 +2648,7 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
         soup = article_scope
     if source.provider == 'moneyweekly':
         from downloader.news_fulltext_publishers import moneyweekly_article_identity
-        moneyweekly_article_identity(soup, page_url=expected_url)
+        moneyweekly_article_identity(soup, page_url=expected_url, source=source)
     if source.provider == 'pansci':
         # Infinite-scroll pages embed several complete stories. Establish the
         # first story's source identity before any body/byline/date extraction.
@@ -2423,6 +2693,8 @@ def extract_article(payload: bytes, source: SourcePolicy, *, page_url: str | Non
             break
     body = _plain_text(str(article.get("articleBody", "")), parser=source.html_parser)
     method = "jsonld_article_body"
+    if source.embedded_article_layout == 'nstock_finite_announcement_v1':
+        method = 'nstock_literal_public_announcement_v1'
     if not body and source.provider == 'cnyes':
         from downloader.news_fulltext_publishers import cnyes_verified_image_only_body
         if cnyes_verified_image_only_body(soup, source, article, page_url=expected_url):

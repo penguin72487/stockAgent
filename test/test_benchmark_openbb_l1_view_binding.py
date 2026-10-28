@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -11,6 +12,63 @@ import pyarrow.parquet as pq
 import pytest
 
 from scripts.benchmark_openbb_l1_view_binding import benchmark
+from scripts.benchmark_openbb_l1_view_binding import ordered_arrow_values_sha256
+
+
+@pytest.mark.parametrize("dtype,values", [
+    (pa.int64(), [-(2**63), None, 2**63-1]),
+    (pa.uint64(), [0, None, 2**64-1]),
+    (pa.float64(), [-0., None, 5e-324]),
+    (pa.bool_(), [True, None, False]),
+    (pa.string(), ["台灣", None, ""]),
+    (pa.large_string(), ["台灣", None, ""]),
+    (pa.binary(), [b"\x00\xff", None, b""]),
+    (pa.large_binary(), [b"\x00\xff", None, b""]),
+    (pa.binary(2), [b"\x00\xff", None, b"ab"]),
+    (pa.decimal128(38, 3), [Decimal("-0.001"), None, Decimal("9" * 35 + ".123")]),
+    (pa.decimal256(70, 3), [Decimal("-0.001"), None, Decimal("9" * 60 + ".123")]),
+    (pa.date32(), [1, None, -123]),
+    (pa.date64(), [86400000, None, -86400000]),
+    (pa.time32("s"), [1, None, 86399]),
+    (pa.time64("ns"), [1, None, 86399999999999]),
+    (pa.timestamp("ns", tz="Asia/Taipei"), [1, None, 1234567890123456789]),
+    (pa.duration("ns"), [1, None, -123456789]),
+    (pa.list_(pa.int64()), [[1, None], None, [2**62]]),
+])
+def test_ordered_arrow_digest_is_independent_of_chunks_and_slices(dtype, values):
+    original = pa.array(values, type=dtype)
+    extended = pa.concat_arrays([original, original, original]).slice(len(original),len(original))
+    chunked = pa.chunked_array([extended.slice(0,1),extended.slice(1)])
+    first = pa.table({"v": original})
+    assert ordered_arrow_values_sha256(first) == ordered_arrow_values_sha256(pa.table({"v": chunked}))
+    assert ordered_arrow_values_sha256(first) != ordered_arrow_values_sha256(pa.table({"other": original}))
+    assert ordered_arrow_values_sha256(first) != ordered_arrow_values_sha256(pa.table({"v": original.take([2,1,0])}))
+
+
+def test_ordered_arrow_digest_preserves_float_bits_and_ignores_null_slot_garbage():
+    import numpy as np
+    floats = np.array([0x7ff8000000000001,0x8000000000000000],dtype=np.uint64).view(np.float64)
+    first = pa.table({"v":pa.array(floats)})
+    before = [bytes(buffer) if buffer is not None else None for buffer in first.column(0).chunk(0).buffers()]
+    floats2 = np.array([0x7ff8000000000002,0x8000000000000000],dtype=np.uint64).view(np.float64)
+    floats3 = np.array([0x7ff8000000000001,0],dtype=np.uint64).view(np.float64)
+    digest = ordered_arrow_values_sha256(first)
+    assert digest != ordered_arrow_values_sha256(pa.table({"v":pa.array(floats2)}))
+    assert digest != ordered_arrow_values_sha256(pa.table({"v":pa.array(floats3)}))
+    assert before == [bytes(buffer) if buffer is not None else None for buffer in first.column(0).chunk(0).buffers()]
+    def array(garbage):
+        return pa.Array.from_buffers(pa.int64(),3,[pa.py_buffer(b"\x05"),
+            pa.py_buffer(np.array([1,garbage,3],dtype="<i8").tobytes())],null_count=1)
+    assert ordered_arrow_values_sha256(pa.table({"v":array(999)})) == ordered_arrow_values_sha256(pa.table({"v":array(-999)}))
+
+
+def test_ordered_arrow_digest_keeps_null_positions_types_and_all_null_columns():
+    def digest(values,dtype=pa.int64()):return ordered_arrow_values_sha256(pa.table({"v":pa.array(values,type=dtype)}))
+    assert digest([1,None,2]) != digest([1,2,None])
+    assert digest([None,None]) != digest([None])
+    assert digest([None,None]) != digest([None,None],pa.string())
+    assert digest([1,None,2]) != digest([1,None,2],pa.uint64())
+    assert digest([]) == digest([])
 
 
 def _manifest(

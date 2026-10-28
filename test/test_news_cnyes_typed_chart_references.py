@@ -1,4 +1,5 @@
 """Typed chart forests retain labels/references, never synthesize market data."""
+import hashlib
 import html
 import json
 
@@ -33,10 +34,13 @@ def nested(label=LABEL, src=CHART):
 PARAGRAPH = f'<figure>{image()}<p>{LABEL}</p><p>\xa0</p><p>\xa0</p></figure>'
 BEFORE = f'<figure><p>\xa0</p>{image()}<p>{LABEL}</p><p>\xa0</p></figure>'
 EMPTY_WRAPPED = nested('\xa0').replace('</figure>\n</figure>', '</figure><figcaption>\xa0</figcaption>\n</figure>')
+OUTER_LABEL = f'<figure><figure>{image(KLINE)}<figcaption>\xa0</figcaption></figure><figcaption>當篇公司 K 線圖</figcaption></figure>'
+OUTER_DAY_LABEL = f'<figure><figure>{image(KLINE)}<figcaption>\xa0</figcaption></figure><figcaption>{LABEL}</figcaption></figure>'
 CASES = [(PARAGRAPH, LABEL, CHART), (BEFORE, LABEL, CHART),
          (nested(), LABEL, CHART), (nested(src=KLINE), LABEL, KLINE),
          (nested(LIVE_LABEL, LIVE), LIVE_LABEL, LIVE), ('<figure>' + nested() + '</figure>', LABEL, CHART),
-         (EMPTY_WRAPPED, '', CHART)]
+         (EMPTY_WRAPPED, '', CHART), (OUTER_LABEL, '當篇公司 K 線圖', KLINE),
+         (OUTER_DAY_LABEL, LABEL, KLINE)]
 
 
 @pytest.mark.parametrize('parser', ['html.parser', 'lxml'])
@@ -100,6 +104,11 @@ def test_chart_requires_exact_whole_visible_current_membership(cnyes_config, tmp
     '<figure><figure>' + nested() + '</figure></figure>',
     nested(src=KLINE + '&stockcode=2330'), nested(src=KLINE.replace('bgcolor=2', 'bgcolor=3')),
     EMPTY_WRAPPED.replace('\xa0', ' '), EMPTY_WRAPPED.replace('\xa0', '不存在的圖說'),
+    OUTER_LABEL.replace('\xa0', ' '), OUTER_LABEL.replace('\xa0', '內層真實數字 -123.45'),
+    OUTER_LABEL.replace('當篇公司 K 線圖', '價格 -123.45'),
+    OUTER_LABEL.replace('<figure>', '<figure hidden>', 1),
+    OUTER_LABEL.replace('</figure><figcaption>', '<p>額外財務數字 -12.50</p></figure><figcaption>'),
+    '<figure>' + OUTER_LABEL + '</figure>',
 ])
 def test_unknown_shapes_are_not_reclassified_as_declared_chart(cnyes_config, tmp_path, changed):
     from bs4 import BeautifulSoup
@@ -125,3 +134,26 @@ def test_typed_chart_does_not_change_existing_ordinary_caption_contract(cnyes_co
         source(cnyes_config, tmp_path), page_url=MOBILE)
     assert json.loads(value['verified_image_captions_json']) == [{'text': LABEL, 'image_src': CHART}]
     assert value['verified_article_notices_json'] is None
+
+
+def test_outer_chart_version_preserves_prior_pacing_bulk_and_parser_schedule(cnyes_config, tmp_path, monkeypatch):
+    current, sha256 = source(cnyes_config, tmp_path), hashlib.sha256
+
+    def without_outer_chart(value):
+        try:
+            payload = json.loads(value)
+        except (ValueError, TypeError, UnicodeDecodeError):
+            return sha256(value)
+        if isinstance(payload, dict) and 'verified_outer_chart_caption_contract_version' in payload:
+            del payload['verified_outer_chart_caption_contract_version']
+            return sha256(json.dumps(payload, sort_keys=True).encode())
+        return sha256(value)
+
+    monkeypatch.setattr('downloader.news_fulltext_policy.hashlib.sha256', without_outer_chart)
+    previous = source(cnyes_config, tmp_path)
+    assert current.data_fingerprint != previous.data_fingerprint
+    assert current.parser_repair_prior_capture_fingerprint == previous.data_fingerprint
+    assert current.parser_repair_fingerprint == previous.parser_repair_fingerprint
+    assert current.http_capacity_source_fingerprint == previous.http_capacity_source_fingerprint
+    assert current.cnyes_bulk_data_fingerprint == previous.cnyes_bulk_data_fingerprint
+    assert current.authorization_fingerprint == previous.authorization_fingerprint

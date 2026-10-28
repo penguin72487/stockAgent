@@ -74,8 +74,6 @@ def _narrow_summary_probe(
     started = time.perf_counter()
     for day in selected:
         spans = index.spans[day]
-        if len(spans) != 1:
-            raise ValueError(f"non-contiguous session: {day}")
         shard = dashboard._validated_projected_ledger_session_file(
             source,
             index=index,
@@ -102,7 +100,8 @@ def _narrow_summary_probe(
         resolved.alias("__resolved_weight"),
         resolved.abs().alias("__absolute_weight"),
     )
-    raw_state = json.loads(state.read_bytes())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    raw_state = read_paper_state(state)
     capitals = {
         str(market): dashboard._finite_float(raw.get("initial_capital_twd"))
         for market, raw in (raw_state.get("modes") or {}).items()
@@ -144,6 +143,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--hide-zero-targets", action="store_true")
+    parser.add_argument(
+        "--public-price-root", type=Path,
+        help="Also measure exact public quote enrichment, disclosure and JSON encoding; no network",
+    )
+    parser.add_argument("--expected-public-sha", help="Optional exact public DTO comparison")
     parser.add_argument("--expected-total", type=int)
     parser.add_argument(
         "--probe-narrow-summary", action="store_true",
@@ -164,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
         or not args.state_dir.is_dir()
     ):
         parser.error("existing state and explicit gateway projection cache directories are required")
+    if args.public_price_root is not None and not args.public_price_root.is_dir():
+        parser.error("public-price-root must be an existing canonical public data directory")
+    if args.expected_public_sha and args.public_price_root is None:
+        parser.error("expected-public-sha requires public-price-root")
     try:
         if date.fromisoformat(args.start_date) > date.fromisoformat(args.end_date):
             parser.error("start-date must not exceed end-date")
@@ -182,6 +191,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--expected-total is required for a narrow probe")
     if args.probe_narrow_summary and args.legacy_full_projection:
         parser.error("narrow probe and legacy full projection are mutually exclusive")
+    if args.probe_narrow_summary and args.public_price_root is not None:
+        parser.error("a narrow summary probe cannot measure the public full page")
+    quote_source = None
+    quote_before = None
+    if args.public_price_root is not None:
+        from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource
+        quote_source = OfficialDailyQuoteSource(args.public_price_root)
+        quote_before = quote_source.signature()
     stages: dict[str, float] = {}
     started = time.perf_counter()
     if args.probe_narrow_summary:
@@ -203,6 +220,7 @@ def main(argv: list[str] | None = None) -> int:
             start_date=args.start_date,
             end_date=args.end_date,
             limit=args.limit,
+            hide_zero_targets=args.hide_zero_targets,
             timing_ms=stages,
             _allow_narrow_projection=not args.legacy_full_projection,
         )
@@ -210,10 +228,28 @@ def main(argv: list[str] | None = None) -> int:
             result.get("direction_summary") or {},
             result.get("opening_execution_audit") or {},
         )
+    public_sha = None
+    public_bytes = None
+    public_quote_rows = None
+    if quote_source is not None:
+        from stockagent.live.public_dashboards import sanitize_tw_signals
+        phase = time.perf_counter()
+        public_payload = sanitize_tw_signals(result, quote_source=quote_source)
+        stages["public_quote_projection"] = round((time.perf_counter() - phase) * 1_000, 3)
+        phase = time.perf_counter()
+        encoded = json.dumps(public_payload, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"), allow_nan=False).encode("utf-8")
+        public_sha = hashlib.sha256(encoded).hexdigest()
+        public_bytes = len(encoded)
+        public_quote_rows = sum(isinstance(row, dict) and "official_daily_quote" in row
+                                for row in public_payload.get("rows", []))
+        stages["public_json_encoding"] = round((time.perf_counter() - phase) * 1_000, 3)
     elapsed_ms = round((time.perf_counter() - started) * 1_000, 3)
     after = (_signature(source), _signature(state))
+    quotes_unchanged = quote_source is None or quote_before == quote_source.signature()
     complete = (
         before == after
+        and quotes_unchanged
         and result.get("scan_limit_reached") is False
         and (
             args.probe_narrow_summary
@@ -228,6 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_summary_sha is None
             or summary_sha == args.expected_summary_sha
         )
+        and (args.expected_public_sha is None or public_sha == args.expected_public_sha)
     )
     digest = (
         None if args.probe_narrow_summary else hashlib.sha256(
@@ -244,8 +281,11 @@ def main(argv: list[str] | None = None) -> int:
         "complete": complete,
         "start_date": args.start_date,
         "end_date": args.end_date,
+        "hide_zero_targets": args.hide_zero_targets,
         "total": result.get("total"),
         "returned": result.get("returned"),
+        "source_rows_scanned": result.get("source_rows_scanned"),
+        "record_count": result.get("record_count"),
         "scan_limit_reached": result.get("scan_limit_reached"),
         "source_unchanged": before == after,
         "signals_signature": list(before[0]) if before[0] is not None else None,
@@ -255,6 +295,12 @@ def main(argv: list[str] | None = None) -> int:
         "stages_ms": stages,
         "summary_sha256": summary_sha,
         "result_sha256": digest,
+        "public_result_sha256": public_sha,
+        "public_json_bytes": public_bytes,
+        "public_rows_with_official_daily_quote": public_quote_rows,
+        "public_quote_source_unchanged": quotes_unchanged if quote_source is not None else None,
+        "public_quote_source_signature": quote_before,
+        "network_measured": False,
     }, separators=(",", ":")))
     return 0 if complete else 2
 

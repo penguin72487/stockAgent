@@ -2,6 +2,55 @@
 
 Read the relevant section for panel backends, feature availability, or crypto acquisition. Preserve data semantics and point-in-time gates. Hardware timings and provider observations require current verification before reuse.
 
+## FinMind finite product source verification
+
+Whole-market daily acquisition does not complete a separately requested
+per-product full-history source comparison. Register explicitly enumerated existing
+`id_history` keys with `downloader/finmind_product_query_verification.py` and an
+explicit `finmind-finite-product-query-verification-v1` plan, source evidence
+and SHA. The canonical Complement dispatcher may admit only those exact keys
+across dataset-level delegation; unregistered neighbors remain delegated.
+Keep incremental precedence, quota/reserve, retry clocks, terminal/empty states,
+worker lock, original captures and financial adoption separate. Registration
+never reopens tasks or proves provider completeness. A code handoff uses the
+existing drained-idle reload lifecycle and the pinned semantic JUnit acceptance
+`finmind_finite_product_query_semantics_v1`; it is not a speed measurement.
+See the [725-source repair evidence](../tw_futures_universe725_recovery_2026-10-25.md).
+
+A registered, finite source check may preempt due US/UK/Japan `id_history`
+backfills, including pending acquisitions and due retries. The canonical owner
+subtracts only these whitelisted, nondelegated due rows from its temporary
+reservation view; dated publications, upcoming reservations, provider usage,
+pacing and retry cooldowns remain protected. Task states and retry clocks do
+not change. This supersedes the accepted-renewals-only rule after the user's
+2026-10-27 priority request; that rule starved the 39 requested new keys behind
+foreign history acquisition. See the [765-code recovery evidence](../../artifacts/markets/tw_futures_universe765_recovery_20261027_v1/README.md).
+The check retains its original task priority and due clock and uses the same
+serial exact-key handler. This prevents a many-thousand-symbol renewal backlog
+from starving a bounded user-requested source comparison.
+
+## Finite queries through canonical provider owners
+
+Other programs may submit `provider_priority_query_v1` through
+`scripts/request_provider_data.py` or `downloader.provider_priority`. Requests
+have one or more exact registered items, a reason and at most seven days of priority.
+The 2026-10-28 request removes fixed item-count, active-registry and plan-byte
+ceilings. Duplicate scopes coalesce; local SQL batches respect SQLite's actual
+parameter limit without truncating total demand. Preserve old receipt IDs.
+Use the native maximum verified range and existing shared tasks/receipts;
+an item is not a vendor request. Source row/page/usage limits still apply.
+Registration/status make no vendor calls and never reopen terminal/unknown
+tasks. Due releases, quota, protected opening, retry isolation and dedicated
+delegation remain binding. As with finite product checks, only the known
+US/UK/Japan ID-history renewal reservation may yield to a ready finite read;
+dated releases and upcoming reservations are retained. FinMind JSON admission
+and selection use the same view. See the [guide and reusable skill](../provider_priority_scheduling_2026-10-27.md).
+
+TEJ incremental cycles retain the initial history cutoff and unfinished lazy
+plan. Native query splits retain cycle lineage. A `checked` cycle proves the
+bounded source queries ended, including explicit empty responses; it does not
+prove the source published all values or certify historical revision coverage.
+
 ## Data Panel Backend Contract
 
 The full US Yahoo universe is a distinct data-processing regime. Benchmark it
@@ -116,6 +165,18 @@ chunks. No automatic legacy deletion, GC, compaction or remote publication is
 enabled. Full source comparison and acceptance still run; physical delta storage
 does not imply delta-only CPU work. Other providers are not implicitly migrated.
 See [implementation and evidence](../news_incremental_storage_2026-10-16.md).
+
+The headline scope `cnyes_market_route_metadata_only_v1` keeps no-body CNYES
+`/twstock/` market-page references, including strictly decoded literal Google
+envelopes, as source observations rather than news headlines. It retains
+existing accepted bodies and does not equate a market page with an article.
+This changes the corpus data scope: a new build must use a separate root and a
+new compatible input snapshot; old ABI 1/2 manifests remain readable and must
+not be silently rewritten. Corpus construction and DuckDB verification use
+the news owner's sampled physical-backing check as well as filesystem free
+space; stale or unavailable samples defer work. This sampled 25 GiB guard is
+not an exact forecast or a reservation for a complete rebuild. See the
+[bounded readback and unresolved rebuild](../news_all_source_repair_2026-10-09.md).
 
 ## Crypto Downloader Baseline
 

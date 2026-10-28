@@ -14,6 +14,10 @@ import json
 from pathlib import Path
 import time
 from typing import Any, Final, Mapping
+from stockagent.live.paper_mode_snapshot import (
+    CONTRACT as MODE_SNAPSHOT_CONTRACT, mode_object_generations,
+)
+from stockagent.live.paper_journal import layout_generations
 
 
 SERVICE_SYNC_FILENAME: Final[str] = "service_sync.json"
@@ -34,7 +38,8 @@ def paper_journal_generations(root: Path) -> dict[str, list[int] | None]:
     authorize skipping the canonical reader's rewrite detection or hashing.
     Missing files are explicit, and permission/I/O errors remain errors.
     """
-    return _paper_file_generations(root, PAPER_JOURNAL_FILENAMES)
+    return {**_paper_file_generations(root, PAPER_JOURNAL_FILENAMES),
+            **layout_generations(Path(root))}
 
 
 def paper_projection_generations(root: Path) -> dict[str, list[int] | None]:
@@ -82,8 +87,14 @@ def committed_paper_read_guard(root: Path):
         raise PaperReadChanged("invalid committed paper identity")
 
     def matches():
-        return (paper_projection_generations(root) == receipt.get("projection_generations")
-                and paper_journal_generations(root) == receipt.get("journal_generations"))
+        try:
+            return (paper_projection_generations(root) == receipt.get("projection_generations")
+                    and paper_journal_generations(root) == receipt.get("journal_generations")
+                    and (receipt.get("state_storage_contract") is None
+                         or (receipt.get("state_storage_contract") == MODE_SNAPSHOT_CONTRACT
+                             and mode_object_generations(root) == receipt.get("mode_object_generations"))))
+        except (OSError, ValueError, TypeError):
+            return False
 
     if not matches():
         raise PaperReadChanged("paper files are ahead of their commit marker")

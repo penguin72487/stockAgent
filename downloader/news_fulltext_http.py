@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import errno
@@ -57,6 +58,11 @@ ACCESS_DIAGNOSTIC_HEADERS = frozenset({
     "cf-mitigated", "x-robots-tag", "allow", "etag", "last-modified",
 })
 
+# This rare repair is status-only and runs only after overflow plus a real
+# successful policy check. Never let a corrupt cache tree create an unbounded
+# scan in a normal status heartbeat.
+MAX_ROBOTS_RECHECK_SCAN_FILES = 65536
+
 
 class _RequestSlotCancellation:
     """Cancel a queued slot without confusing client waiting with an HTTP error."""
@@ -111,6 +117,17 @@ class NewsHTTP:
         self.robots_parsers: dict[str, tuple[float, Protego]] = {}
         self.robot_delays: dict[str, float] = {}
         self.robots_policy_pauses: dict[str, dict[str, float]] = {}
+        # Negative REP evidence remains unresolved after its retry deadline.
+        # This is status evidence only: it must never extend a scheduling gate.
+        self.robots_policy_rechecks: dict[str, dict[str, float | None]] = {}
+        self.robots_policy_rechecks_overflow: set[str] = set()
+        self.robots_recheck_rescan_needed: set[str] = set()
+        self.robots_recheck_rescan_not_before: dict[str, float] = {}
+        self.robots_recheck_revisions: dict[str, int] = {}
+        self.robots_recheck_writers: dict[str, int] = {}
+        self.robots_recheck_unpersisted: dict[str, set[str]] = {}
+        self.robots_recheck_unpersisted_overflow: set[str] = set()
+        self.robots_recheck_scan_lock = threading.Lock()
         self.last_calls: dict[str, float] = {}
         self.provider_not_before: dict[str, float] = {}
         # Actual shared-slot deadlines are separate from source refusals. The
@@ -145,6 +162,50 @@ class NewsHTTP:
         self.requests_by_provider: dict[str, int] = {}
         self.response_bytes = 0
         self._sessions: list = []
+        self._restore_robots_policy_pauses()
+
+    def _restore_robots_policy_pauses(self):
+        """Restore durable negative REP state before the first scheduler snapshot.
+
+        A checkpoint only postpones requests; it never restores a positive
+        robots policy or changes the authorization for an origin. Validate its
+        file identity and current provider as well as the existing retry
+        contract. The normal request path still performs the actual REP check.
+        """
+        now = time.time()
+        max_cache_bytes = 6 * self.config['max_response_bytes'] + 65536
+        for path in (self.root / 'robots').glob('*.json'):
+            if not re.fullmatch(r'[0-9a-f]{64}\.json', path.name):
+                continue
+            try:
+                if path.stat().st_size > max_cache_bytes:
+                    continue
+                cache = json.loads(path.read_bytes())
+                origin = cache.get('origin') if isinstance(cache, dict) else None
+                if (not isinstance(origin, str) or policy_origin(origin) != origin
+                        or path.name != hashlib.sha256(origin.encode()).hexdigest() + '.json'):
+                    continue
+                source = self.registry.match(origin + '/')
+                if source is None or source.provider not in self.limiters:
+                    continue
+                retry = robots_policy_retry(cache, origin, now)
+                if isinstance(cache, dict) and 'policy_retry' in cache:
+                    # A malformed negative checkpoint cannot prove recovery.
+                    self._remember_robots_policy_recheck(
+                        source, origin, retry['not_before_epoch'] if retry else None)
+                if retry and retry['not_before_epoch'] > now:
+                    try:
+                        self._remember_robots_policy_pause(source, origin, retry['not_before_epoch'])
+                    except NewsError as error:
+                        if error.code != 'robots_origin_policy_capacity_exhausted':
+                            raise
+                        # The existing bounded fallback defers this provider.
+                    else:
+                        self.metrics.count(source.provider, 'robots_origin_policy_pauses_restored')
+            except (OSError, ValueError, TypeError, NewsError):
+                # Bad local state never grants permission; _robots still needs
+                # a fresh policy. One malformed file must not block startup.
+                continue
 
     def hard_interval_floor(self, provider):
         return max(self.registry.sources[provider].official_min_interval_seconds,
@@ -193,6 +254,11 @@ class NewsHTTP:
             # with that interval's restart/stale-state interpretation as well.
             self._refresh_pacing_deadline(provider)
 
+    def traffic_snapshot(self):
+        """Current owner's sent requests and received bytes; no I/O or requests."""
+        with self.lock:
+            return dict(self.requests_by_provider), self.response_bytes
+
     def cooldown_snapshot(self):
         """Scheduler readiness, including long client waits; no slot is claimed."""
         with self.lock:
@@ -240,6 +306,9 @@ class NewsHTTP:
         self._check_pacing(provider, shared=shared_pacing)
 
     def capacity_snapshot(self):
+        # Usual snapshots do no disk I/O. An overflow is reconciled only after
+        # a real recovery, in one background reader without publisher calls.
+        self._schedule_robots_recheck_refresh()
         with self.lock:
             controls = {p: {"client_interval_seconds": self.client_intervals[p],
                             "effective_interval_seconds": self.effective_interval(p),
@@ -251,6 +320,12 @@ class NewsHTTP:
             for provider, control in controls.items():
                 control['temporarily_paused_gateway_hosts'] = self.host_circuits.blocked(provider)
                 control['temporarily_paused_robots_origins'] = self.blocked_robots_origins(provider)
+                # Unlike the scheduler's blocked maps these include expired
+                # failures until a real response clears their evidence.
+                control['unverified_gateway_hosts'] = dict(self.host_circuits.paused.get(provider, {}))
+                control['unverified_robots_origins'] = dict(self.robots_policy_rechecks.get(provider, {}))
+                control['unverified_robots_origins_overflow'] = (provider in self.robots_policy_rechecks_overflow
+                    or provider in self.robots_recheck_unpersisted_overflow)
         return {"providers": controls, "request_pacing_wait_contract_version": 1,
                 "finite_robots_redirect_contract_version": 1,
                 "calibration": self.capacity_controller.snapshot(for_status=True) if self.capacity_controller else None}
@@ -612,24 +687,32 @@ class NewsHTTP:
         self._persist_problem('transport', source.provider, observation, day=now.strftime('%Y%m%d'))
 
     def _raw(self, url: str, headers: dict | None = None, *, robots_origin=None, metadata_feed=None) -> Response:
-        source = (self._require_robots_request(url, robots_origin, metadata_feed)
-                  if robots_origin is not None else self._require(url, metadata_feed))
-        self._check_request_gates(source.provider, url)
         try:
-            with self.metrics.measure("address_validation", source.provider):
-                self.address_check(url)
+            source = (self._require_robots_request(url, robots_origin, metadata_feed)
+                      if robots_origin is not None else self._require(url, metadata_feed))
+            self._check_request_gates(source.provider, url)
+            try:
+                with self.metrics.measure("address_validation", source.provider):
+                    self.address_check(url)
+            except NewsError as error:
+                if error.code == 'non_public_address' and robots_origin is not None:
+                    # No request was sent. Revalidate this authority's REP later,
+                    # instead of permanently failing every article behind it.
+                    # The same all-address/redirect checks still run on retry.
+                    self.metrics.count(source.provider, 'robots_pretransport_address_rejections')
+                    raise NewsError('robots_non_public_address', retry=True, delay=30) from error
+                if error.code == "dns_error":
+                    self.defer(source.provider, max(30, error.delay))
+                raise
+            self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None,
+                                  metadata_feed=metadata_feed, robots_origin=robots_origin)
         except NewsError as error:
-            if error.code == 'non_public_address' and robots_origin is not None:
-                # No request was sent. Revalidate this authority's REP later,
-                # instead of permanently failing every article behind it.
-                # The same all-address/redirect checks still run on retry.
-                self.metrics.count(source.provider, 'robots_pretransport_address_rejections')
-                raise NewsError('robots_non_public_address', retry=True, delay=30) from error
-            if error.code == "dns_error":
-                self.defer(source.provider, max(30, error.delay))
+            if error.request_deferred:
+                # Only this pre-transport catch can establish that _raw has
+                # not dispatched. An observer/transport error after send may
+                # itself carry a gate-shaped error and is not such evidence.
+                error.raw_request_not_sent = True
             raise
-        self._reserve_request(source, url, endpoint='robots' if robots_origin is not None else None,
-                              metadata_feed=metadata_feed, robots_origin=robots_origin)
         started = time.monotonic()
         started_cpu = time.thread_time()
         endpoint = 'robots' if robots_origin is not None else self.endpoint_kind(source, url)
@@ -701,6 +784,10 @@ class NewsHTTP:
                 outcome = "complete"
                 phase = 'complete'
         except NewsError as error:
+            if error.request_deferred:
+                # Even a reused gate-shaped exception from a callback cannot
+                # attest that this already-dispatched request was unsent.
+                error.raw_request_not_sent = False
             isolated_robots_origin = bool(getattr(error, 'robots_pressure_corroboration', {}).get('isolated'))
             outcome = ('robots_origin_policy_unreachable' if getattr(error, 'robots_origin_isolation', False) else
                        'isolated_gateway_host_error' if getattr(error, 'isolated_gateway_host', False) else
@@ -791,8 +878,153 @@ class NewsHTTP:
                     self.metrics.count(source.provider, 'gateway_host_checkpoint_write_errors')
         return result
 
+    @contextmanager
+    def _robots_checkpoint_write(self, provider, origin, *, recovery=False):
+        """Fence a status-only rescan against in-flight checkpoint writes."""
+        with self.lock:
+            self.robots_recheck_writers[provider] = self.robots_recheck_writers.get(provider, 0) + 1
+            self.robots_recheck_revisions[provider] = self.robots_recheck_revisions.get(provider, 0) + 1
+        complete = False
+        try:
+            yield
+            complete = True
+        finally:
+            with self.lock:
+                uncertain = self.robots_recheck_unpersisted.setdefault(provider, set())
+                if complete:
+                    uncertain.discard(origin)
+                elif origin in uncertain or len(uncertain) < MAX_ROBOTS_ORIGINS_PER_PROVIDER:
+                    uncertain.add(origin)
+                else:
+                    # An unrecorded failed write is not evidence of recovery.
+                    self.robots_recheck_unpersisted_overflow.add(provider)
+                self.robots_recheck_writers[provider] -= 1
+                self.robots_recheck_revisions[provider] = self.robots_recheck_revisions.get(provider, 0) + 1
+                if complete and recovery and provider in self.robots_policy_rechecks_overflow:
+                    self.robots_recheck_rescan_needed.add(provider)
+                    self.robots_recheck_rescan_not_before.pop(provider, None)
+
+    def _schedule_robots_recheck_refresh(self):
+        """Schedule at most one nonblocking status-only checkpoint scan."""
+        now = time.monotonic()
+        with self.lock:
+            targets = {provider: self.robots_recheck_revisions.get(provider, 0)
+                for provider in self.robots_recheck_rescan_needed
+                if provider in self.robots_policy_rechecks_overflow
+                and not self.robots_recheck_writers.get(provider, 0)
+                and not self.robots_recheck_unpersisted.get(provider)
+                and provider not in self.robots_recheck_unpersisted_overflow
+                and self.robots_recheck_rescan_not_before.get(provider, 0) <= now}
+        if self.stop.is_set() or not targets or not self.robots_recheck_scan_lock.acquire(blocking=False):
+            return
+        try:
+            threading.Thread(target=self._refresh_robots_recheck_overflows, args=(targets,),
+                             name='news-robots-recheck-scan', daemon=True).start()
+        except RuntimeError:
+            self.robots_recheck_scan_lock.release()
+            with self.lock:
+                for provider in targets:
+                    self.robots_recheck_rescan_not_before[provider] = time.monotonic() + 30
+
+    def _refresh_robots_recheck_overflows(self, targets):
+        """Recover a bounded status index after real policy recovery.
+
+        The persisted per-origin checkpoints remain authoritative. This never
+        changes an HTTP gate or sends a request. A concurrent or unpersisted
+        checkpoint, unreadable file, changed directory or scan limit leaves
+        the result unknown; another snapshot may retry the same work.
+        """
+        try:
+            if self.stop.is_set():
+                return
+            rows: dict[str, dict[str, float | None]] = {provider: {} for provider in targets}
+            overflow = set()
+            directory = self.root / 'robots'
+            before = directory.stat()
+            if not directory.is_dir():
+                raise OSError('robots checkpoint directory unavailable')
+            max_cache_bytes = 6 * self.config['max_response_bytes'] + 65536
+            now_epoch = time.time()
+            scanned = 0
+            for path in directory.glob('*.json'):
+                if self.stop.is_set():
+                    return
+                if not re.fullmatch(r'[0-9a-f]{64}\.json', path.name):
+                    continue
+                scanned += 1
+                if scanned > MAX_ROBOTS_RECHECK_SCAN_FILES:
+                    raise OSError('robots checkpoint scan limit exceeded')
+                stat = path.stat()
+                if stat.st_size > max_cache_bytes:
+                    raise OSError('robots checkpoint exceeds scan limit')
+                payload = path.read_bytes()
+                after_file = path.stat()
+                if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns) != (
+                        after_file.st_dev, after_file.st_ino, after_file.st_size,
+                        after_file.st_mtime_ns, after_file.st_ctime_ns):
+                    return  # Do not infer recovery from a concurrently changed checkpoint.
+                cache = json.loads(payload)
+                if not isinstance(cache, dict):
+                    raise ValueError('invalid robots checkpoint')
+                if 'policy_retry' not in cache:
+                    continue
+                origin = cache.get('origin')
+                if (not isinstance(origin, str) or policy_origin(origin) != origin
+                        or path.name != hashlib.sha256(origin.encode()).hexdigest() + '.json'):
+                    raise ValueError('invalid robots checkpoint origin')
+                source = self.registry.match(origin + '/')
+                if source is None or source.provider not in targets:
+                    continue
+                retry = robots_policy_retry(cache, origin, now_epoch)
+                entries = rows[source.provider]
+                if len(entries) < MAX_ROBOTS_ORIGINS_PER_PROVIDER:
+                    entries[origin] = retry['not_before_epoch'] if retry else None
+                else:
+                    overflow.add(source.provider)
+            after = directory.stat()
+            if (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_ctime_ns) != (
+                    after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns):
+                return  # A concurrent replacement requires a fresh scan.
+            with self.lock:
+                if self.stop.is_set():
+                    return
+                for provider, revision in targets.items():
+                    if (revision != self.robots_recheck_revisions.get(provider, 0)
+                            or self.robots_recheck_writers.get(provider, 0)
+                            or self.robots_recheck_unpersisted.get(provider)
+                            or provider in self.robots_recheck_unpersisted_overflow):
+                        continue
+                    self.robots_policy_rechecks[provider] = rows[provider]
+                    if provider in overflow:
+                        self.robots_policy_rechecks_overflow.add(provider)
+                    else:
+                        self.robots_policy_rechecks_overflow.discard(provider)
+                    self.robots_recheck_rescan_needed.discard(provider)
+                    self.robots_recheck_rescan_not_before.pop(provider, None)
+        except (OSError, ValueError, TypeError, NewsError):
+            # A broken scan must not spin on every status call or imply that
+            # unexamined origins have recovered.
+            with self.lock:
+                retry_at = time.monotonic() + 30
+                for provider in targets:
+                    self.robots_recheck_rescan_not_before[provider] = retry_at
+        finally:
+            self.robots_recheck_scan_lock.release()
+
+    def _remember_robots_policy_recheck(self, source, origin, deadline):
+        """Bound unresolved evidence without changing the request deadline."""
+        with self.lock:
+            self.robots_recheck_revisions[source.provider] = self.robots_recheck_revisions.get(source.provider, 0) + 1
+            rows = self.robots_policy_rechecks.setdefault(source.provider, {})
+            if origin in rows or len(rows) < MAX_ROBOTS_ORIGINS_PER_PROVIDER:
+                rows[origin] = deadline
+            else:
+                # Do not silently present a partial list as complete.
+                self.robots_policy_rechecks_overflow.add(source.provider)
+
     def _remember_robots_policy_pause(self, source, origin, deadline):
         with self.lock:
+            self._remember_robots_policy_recheck(source, origin, deadline)
             now = time.time()
             rows = self.robots_policy_pauses.setdefault(source.provider, {})
             for expired in [key for key, until in rows.items() if until <= now]:
@@ -804,17 +1036,30 @@ class NewsHTTP:
 
     def _pause_robots_policy(self, source, origin, cache_path, cache, previous, error):
         state = next_robots_policy_retry(source, error, previous, time.time())
-        self._remember_robots_policy_pause(source, origin, state['not_before_epoch'])
-        self.robots_parsers.pop(origin, None)
+        capacity_error = None
         try:
-            # Keep a previous policy/validators as evidence, NOT permission.
-            # Its Allow lines cannot be reused after a failed policy probe.
-            atomic_write_json(cache_path, {**(cache or {}), 'origin': origin, 'policy_retry': state}, durable=True)
+            with self._robots_checkpoint_write(source.provider, origin):
+                try:
+                    self._remember_robots_policy_pause(source, origin, state['not_before_epoch'])
+                except NewsError as failure:
+                    if failure.code != 'robots_origin_policy_capacity_exhausted':
+                        raise
+                    # The existing provider fallback stays in force, but the
+                    # failed origin still needs its own durable checkpoint.
+                    capacity_error = failure
+                self.robots_parsers.pop(origin, None)
+                # Keep previous validators as evidence, never as permission.
+                atomic_write_json(cache_path, {**(cache or {}), 'origin': origin, 'policy_retry': state}, durable=True)
         except OSError:
             self.metrics.count(source.provider, 'robots_policy_checkpoint_write_errors')
-            self.defer(source.provider, 300)
+            try:
+                self.defer(source.provider, 300)
+            except OSError:
+                pass  # The in-memory provider deadline and unknown evidence remain.
             raise NewsError('robots_policy_checkpoint_failure', retry=True, delay=300) from None
         self.metrics.count(source.provider, 'robots_origin_policy_circuit_opened')
+        if capacity_error is not None:
+            raise capacity_error
         error.delay = state['delay_seconds']
         error.robots_origin_isolation = True
 
@@ -896,9 +1141,13 @@ class NewsHTTP:
                         self._pause_robots_policy(source, origin, cache_path, previous_policy_cache, previous, error)
                     raise
                 cache.pop('policy_retry', None)
-                atomic_write_json(cache_path, cache)
                 with self.lock:
-                    self.robots_policy_pauses.get(source.provider, {}).pop(origin, None)
+                    recovery = (had_failure or origin in self.robots_recheck_unpersisted.get(source.provider, set()))
+                with self._robots_checkpoint_write(source.provider, origin, recovery=recovery):
+                    atomic_write_json(cache_path, cache)
+                    with self.lock:
+                        self.robots_policy_pauses.get(source.provider, {}).pop(origin, None)
+                        self.robots_policy_rechecks.get(source.provider, {}).pop(origin, None)
                 if had_failure:
                     self.metrics.count(source.provider, 'robots_origin_policy_recoveries')
             parser = Protego.parse(cache["body"].lstrip("\ufeff"))
@@ -941,6 +1190,11 @@ class NewsHTTP:
             try:
                 parser = self._robots(url, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
             except NewsError as error:
+                if error.request_deferred:
+                    # This flag is scoped to this get() call's initial URL,
+                    # not all HTTP activity: REP requests may have occurred.
+                    # Once a redirect was received, the initial URL was sent.
+                    error.initial_request_not_sent = not redirects
                 if getattr(error, 'robots_origin_isolation', False):
                     raise  # No extension of an intact origin deadline, no publisher-wide pause.
                 if error.code.startswith("robots_"):
@@ -956,7 +1210,15 @@ class NewsHTTP:
                 raise NewsError("robots_disallowed")
             request_headers = ({**(initial_headers or {}), **(validators if url == bound_url else {})}
                                if bound_url else headers)
-            response = self._raw(url, request_headers, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
+            try:
+                response = self._raw(url, request_headers, **({'metadata_feed': metadata_feed} if metadata_feed is not None else {}))
+            except NewsError as error:
+                if error.request_deferred:
+                    # Only _raw's pre-transport catch proves this hop unsent.
+                    # Earlier initial redirects still count as a send.
+                    error.initial_request_not_sent = (not redirects and
+                        getattr(error, 'raw_request_not_sent', False) is True)
+                raise
             if response.status not in {301, 302, 303, 307, 308} or not follow_redirects:
                 return replace(response, redirects=tuple(redirects)) if redirects else response
             location = response.headers.get("location")

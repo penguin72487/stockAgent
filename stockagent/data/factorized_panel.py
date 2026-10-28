@@ -1101,6 +1101,7 @@ class FactorizedLiveWindow:
         self.overlay = overlay
         self.nbytes = 0 if overlay is None else overlay[1].nbytes
         self.transport_stats = {}
+        self._reconstruction_events = None
 
     def with_last_feature(self, index, values):
         if not 0 <= int(index) < self.shape[-1]:
@@ -1141,6 +1142,20 @@ class FactorizedLiveWindow:
         source.transfer_mode = "compact_cuda_packed" if device.type == "cuda" else "dense_cpu"
         slab = FactorizedPanelSlab(source, rows, pin_slabs=device.type == "cuda", device=device,
                                    prepared_host_packets=prepared_host_packets)
+        # The quote vector is request-owned, symbol-aligned and only O(stocks).
+        # Copy/transfer it ONCE, before enqueuing reconstruction. A blocking
+        # .to(cuda) inside every chunk also waits for preceding reconstruction
+        # kernels, needlessly serializing the host with the device 22 times on
+        # a full market window. Slices below retain exactly the same FP32 bits;
+        # no shared mutable full-window allocation or model value is cached.
+        overlay = None
+        if self.overlay is not None:
+            column, values = self.overlay
+            overlay = torch.from_numpy(values.copy()).to(device)
+        self.transport_stats.update(
+            opening_overlay_host_to_device_transfers=int(overlay is not None and device.type == "cuda"),
+            opening_overlay_host_to_device_bytes=(self.overlay[1].nbytes
+                if overlay is not None and device.type == "cuda" else 0))
         for begin in range(0, self.shape[1], chunk_stocks):
             end = min(self.shape[1], begin+chunk_stocks)
             raw = slab.stock_chunk(begin, end, **({} if destination is None else
@@ -1148,9 +1163,8 @@ class FactorizedLiveWindow:
             # Same nan/inf sentinel and FP32 storage as the canonical host
             # normalizer. The freshly reconstructed tensor is privately owned.
             raw.nan_to_num_(nan=0., posinf=0., neginf=0.)
-            if self.overlay is not None:
-                column, values = self.overlay
-                raw[-1, :, column].copy_(torch.from_numpy(values[begin:end].copy()).to(device))
+            if overlay is not None:
+                raw[-1, :, column].copy_(overlay[begin:end])
             yield raw.unsqueeze(0)
         self.transport_stats.update({"logical_dense_bytes": source.transfer_stats["logical_dense_bytes"],
                                      "host_payload_bytes": source.transfer_stats["host_payload_bytes"],
@@ -1175,6 +1189,15 @@ class FactorizedLiveWindow:
             prepared_host_packets_requested=bool(prepared_host_packets),
             prepared_host_packets_active=prepared)
         result = torch.empty((1, *self.shape), dtype=torch.float32, device=device)
+        self._reconstruction_events = None
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                if not torch.cuda.is_current_stream_capturing():
+                    stream = torch.cuda.current_stream(device)
+                    begin_event = torch.cuda.Event(enable_timing=True)
+                    end_event = torch.cuda.Event(enable_timing=True)
+                    begin_event.record(stream)
+                    self._reconstruction_events = (begin_event, end_event)
         # Direct destination assembly regressed in complete ABBA runs. Retain
         # private chunks unless explicitly comparing that experimental axis.
         direct = direct_destination
@@ -1188,6 +1211,8 @@ class FactorizedLiveWindow:
             if not direct:
                 result[:, :, begin:end].copy_(raw)
             begin = end
+        if self._reconstruction_events is not None:
+            self._reconstruction_events[1].record(torch.cuda.current_stream(device))
         self.transport_stats.update(source_cache_misses_after=cache.misses,
             source_cache_hits_after=cache.hits, source_cache_resident_bytes=cache.bytes)
         self.transport_stats.update(host_packet_cache_hits_after=cache.prepared_hits,
@@ -1197,6 +1222,19 @@ class FactorizedLiveWindow:
         self.transport_stats["live_device_packet_resident_bytes"] = cache._live_device_bytes
         self.transport_stats["input_reconstruct_enqueue_ms"] = round((time.perf_counter()-started)*1000, 3)
         return result
+
+    def finish_reconstruction_timing(self):
+        """Observe completed CUDA events after the caller's existing barrier.
+
+        Never synchronize just for telemetry, and never label CPU enqueue time
+        as device completion. Stream elapsed includes waits/host submission gaps;
+        it is not a sum of GPU kernel durations or the whole input-prep latency.
+        """
+        events = self._reconstruction_events
+        ready = events is not None and events[1].query()
+        self.transport_stats.update(input_reconstruct_device_timing_complete=bool(ready),
+            input_reconstruct_stream_ms=(round(events[0].elapsed_time(events[1]), 3) if ready else None),
+            input_reconstruct_device_clock="cuda_stream_interval_not_host_enqueue_v1")
 
 
 def attach_factorized_live_features(panel, manifest_path: str | Path, *, host_cache_bytes=None,

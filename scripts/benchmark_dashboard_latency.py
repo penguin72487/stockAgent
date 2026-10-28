@@ -507,7 +507,8 @@ def profile_opening_attempt_tail(state_dir, repeats):
     from stockagent.live import tw_day_trade_dashboard as dashboard
 
     source = Path(state_dir) / "opening_signal_latency.jsonl"
-    state = json.loads((Path(state_dir) / "state.json").read_bytes())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(Path(state_dir) / "state.json")
     markets = sorted((state.get("modes") or {}).keys())
     session_date = datetime.now(dashboard.TAIPEI).date().isoformat()
 
@@ -581,7 +582,8 @@ def profile_opening_attempt_append(state_dir, repeats):
     """
     from stockagent.live import tw_day_trade_dashboard as dashboard
     source = Path(state_dir) / "opening_signal_latency.jsonl"
-    state = json.loads((Path(state_dir) / "state.json").read_bytes())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(Path(state_dir) / "state.json")
     markets = sorted((state.get("modes") or {}).keys())
     session_date = datetime.now(dashboard.TAIPEI).date().isoformat()
     signature = lambda: dashboard._tail_file_signature(source.stat())

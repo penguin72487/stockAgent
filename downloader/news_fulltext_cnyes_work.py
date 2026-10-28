@@ -24,6 +24,7 @@ CONTRACT_VERSION = 4
 LOOKUP_DISCOVERY_VERSION = 1
 PROGRESS_VERSION = 1
 REQUEST_SCOPE_PROGRESS_VERSION = 1
+PENDING_SOURCE_RECHECKS_VERSION = 1
 MAX_REQUEST_SCOPE_URLS = 2048
 STATES = ('pending', 'retry', 'retry_cooldown')
 ACTIVE_STATES = (*STATES, 'inflight')
@@ -168,6 +169,9 @@ def request_scope_progress(db, work, control, *, now_epoch):
         'active_missing_body_urls': None, 'source_paused_missing_body_urls': None,
         'other_missing_body_urls': None, 'policy_paused_missing_body_urls': None,
         'gateway_paused_missing_body_urls': None, 'next_source_probe_at_utc': None,
+        'pending_source_rechecks': {'contract_version': PENDING_SOURCE_RECHECKS_VERSION,
+            'available': False, 'unverified_missing_body_urls': None,
+            'due_missing_body_urls': None, 'next_probe_at_utc': None},
         'source_recovery_verified': False}
     total = work.get('active_missing_body_urls')
     if (type(total) is not int or not 0 <= total <= MAX_REQUEST_SCOPE_URLS
@@ -182,6 +186,22 @@ def request_scope_progress(db, work, control, *, now_epoch):
                     or type(deadline) not in {int, float} or not math.isfinite(deadline)
                     or not 0 <= deadline <= 253402214400 for key, deadline in gates.items())):
             return result
+    unresolved_policies = control.get('unverified_robots_origins')
+    unresolved_gateways = control.get('unverified_gateway_hosts')
+    overflow = control.get('unverified_robots_origins_overflow')
+    rechecks_available = (overflow is False and all(
+        isinstance(gates, dict) and len(gates) <= 32
+        and all(isinstance(key, str) and 0 < len(key) <= 320
+                and type(deadline) in {int, float} and math.isfinite(deadline)
+                and 0 <= deadline <= 253402214400
+                for key, deadline in gates.items())
+        for gates in (unresolved_policies, unresolved_gateways)))
+    if rechecks_available:
+        rechecks_available = all(
+            key in unresolved and unresolved[key] >= deadline
+            for active, unresolved in ((policies, unresolved_policies),
+                                       (gateways, unresolved_gateways))
+            for key, deadline in active.items() if deadline > now_epoch)
     # These existing partial indexes exclude the millions of retained heads.
     rows = db.execute("SELECT url,state FROM articles INDEXED BY dispatch_cnyes_body_value "
         "WHERE provider='cnyes' AND body_sha256 IS NULL "
@@ -195,12 +215,10 @@ def request_scope_progress(db, work, control, *, now_epoch):
             (expected['inflight'] + 1,)).fetchall())
     if len(rows) != total or Counter(row['state'] for row in rows) != expected:
         return result
-    paused = policy_count = gateway_count = 0
+    paused = policy_count = gateway_count = rechecks = due_rechecks = 0
     deadlines = []
+    recheck_deadlines = []
     for row in rows:
-        # An already in-flight request is not prevented by a later gate.
-        if row['state'] == 'inflight':
-            continue
         if not isinstance(row['url'], str) or len(row['url']) > 4096:
             return result
         try:
@@ -215,16 +233,33 @@ def request_scope_progress(db, work, control, *, now_epoch):
         # never become public status fields or equivalence assertions.
         policy = policies.get(f'{parts.scheme}://{parts.netloc}', 0)
         gateway = gateways.get(parts.hostname, 0)
-        policy_count += policy > now_epoch
-        gateway_count += gateway > now_epoch
         deadline = max(policy, gateway)
-        if deadline > now_epoch:
-            paused += 1
-            deadlines.append(deadline)
+        # An in-flight request is not prevented by a later scheduler gate,
+        # but it can still be checking unresolved negative evidence.
+        if row['state'] != 'inflight':
+            policy_count += policy > now_epoch
+            gateway_count += gateway > now_epoch
+            if deadline > now_epoch:
+                paused += 1
+                deadlines.append(deadline)
+        if rechecks_available:
+            origin = f'{parts.scheme}://{parts.netloc}'
+            if origin in unresolved_policies or parts.hostname in unresolved_gateways:
+                recheck = max(deadline, unresolved_policies.get(origin, 0),
+                              unresolved_gateways.get(parts.hostname, 0))
+                rechecks += 1
+                due_rechecks += recheck <= now_epoch
+                recheck_deadlines.append(recheck)
+    recheck_progress = ({'contract_version': PENDING_SOURCE_RECHECKS_VERSION,
+        'available': True, 'unverified_missing_body_urls': rechecks,
+        'due_missing_body_urls': due_rechecks,
+        'next_probe_at_utc': datetime.fromtimestamp(min(recheck_deadlines), UTC).isoformat()
+            if recheck_deadlines else None} if rechecks_available else result['pending_source_rechecks'])
     return {**result, 'available': True, 'active_missing_body_urls': total,
         'source_paused_missing_body_urls': paused, 'other_missing_body_urls': total - paused,
         'policy_paused_missing_body_urls': policy_count,
         'gateway_paused_missing_body_urls': gateway_count,
+        'pending_source_rechecks': recheck_progress,
         'next_source_probe_at_utc': datetime.fromtimestamp(min(deadlines), UTC).isoformat() if deadlines else None}
 
 
@@ -278,8 +313,12 @@ def classify(queue, row):
     other = queue.db.execute('SELECT body_sha256 FROM articles WHERE id=? AND provider=\'cnyes\'',
                              (target,)).fetchone()
     known = bool(other and other[0])
-    queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=? WHERE id=?',
-                     (target, known, row['id']))
+    # Reobserving an unchanged metadata partition must not rewrite its candidate
+    # indexes. The primary body may have arrived since the last observation, so
+    # still compare both fields against the current source state in this update.
+    queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=? '
+                     'WHERE id=? AND (cnyes_canonical_candidate_id IS NOT ? OR cnyes_known_body_candidate!=?)',
+                     (target, known, row['id'], target, known))
     return known
 
 

@@ -17,7 +17,7 @@ from stockagent.data.finlab_acquisition_contract import quota_cycle_start, utc_t
 
 
 CONTRACT_VERSION = 1
-ACQUISITION_POLICY_VERSION = 14
+ACQUISITION_POLICY_VERSION = 15
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs/finlab_quota_policy.json"
 
 

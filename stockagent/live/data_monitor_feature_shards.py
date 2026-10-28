@@ -41,6 +41,74 @@ class ProjectionObjectError(ValueError):
     """A known cache object needs reconstruction, not source repair."""
 
 
+class _UnchangedScan:
+    """Reuse witnessed footer facts after a new complete identity probe.
+
+    Only the no-change quick-index generation and an exactly bound projection
+    manifest qualify. Label changes, missing objects, changed membership,
+    source mutation or generation drift retain the complete canonical reader.
+    """
+    def __init__(self, selected, items, summary):
+        self.selected, self.items, self.raw_summary = selected, items, summary
+        self.finished = False
+
+    def __iter__(self):
+        for owner, paths in self.selected.items():
+            old = self.items[owner]
+            yield inventory.FeatureDataset(owner, len(paths), old['valid_files'],
+                old['source_observation_root'], {}, {}, {})
+        self.finished = True
+
+    def summary(self, *, datasets_with_schema):
+        if not self.finished:
+            raise ValueError('cannot publish an incomplete feature inventory scan')
+        return {**self.raw_summary, 'datasets_with_schema': datasets_with_schema}
+
+
+def _unchanged_scan(root, snapshot, previous, source_rows, timing_ms):
+    proof = snapshot.unchanged_selection
+    selected = snapshot.selected
+    if (type(proof) is not dict or selected is None or snapshot.changed_dataset_ids != frozenset()
+            or snapshot.previous_cache_signature != snapshot.cache_signature
+            or previous.get('cache_signature') != snapshot.cache_signature
+            or previous.get('feature_revision') != proof.get('feature_revision')
+            or previous.get('source_observation_root') != proof.get('source_observation_root')):
+        return None
+    items, summary = previous.get('datasets'), previous.get('verified_summary')
+    if (type(items) is not dict or items.keys() != selected.keys() or type(summary) is not dict
+            or summary.get('source_observation_matches_cache') is not True
+            or summary.get('source_observation_root') != proof.get('source_observation_root')):
+        return None
+    for owner, paths in selected.items():
+        old = items[owner]
+        if (type(old) is not dict or old.get('dataset_id') != owner
+                or old.get('metadata') != list(dashboard._feature_source_metadata(source_rows, owner))
+                or type(old.get('fields')) is not int or not 0 <= old['fields'] <= 10_000_000
+                or type(old.get('valid_files')) is not int or not 0 <= old['valid_files'] <= len(paths)
+                or old.get('files_total') != len(paths)
+                or not isinstance(old.get('source_observation_root'), str)
+                or len(old['source_observation_root']) != 32):
+            return None
+    if (summary.get('files_total') != sum(map(len, selected.values()))
+            or summary.get('files_with_schema') != sum(item['valid_files'] for item in items.values())
+            or summary.get('datasets_total') != sum(bool(paths) for paths in selected.values())):
+        return None
+    cache_path = root/'artifacts/live/data_monitor/record_inventory_cache.json'
+    if inventory._cache_signature(cache_path) != snapshot.cache_signature:
+        return None
+    started = time.perf_counter()
+    # This fresh full probe includes partition member identities. The earlier
+    # record probe is not a freshness exemption at feature publication time.
+    with inventory._partition_snapshot_scope():
+        fingerprint = inventory._selection_fingerprint(selected)
+    timing_ms['verify_file_signatures'] = (time.perf_counter()-started)*1_000
+    if (fingerprint is None or fingerprint != proof.get('fingerprint')
+            or inventory._cache_signature(cache_path) != snapshot.cache_signature):
+        return None
+    timing_ms['unchanged_generation_proof'] = 1.0
+    return _UnchangedScan(selected, items, summary)
+
+
 def _encode(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"),
                       sort_keys=False, allow_nan=False).encode("utf-8")
@@ -266,7 +334,6 @@ def _publish_feature_shards(
     with store.locked():
         abi = projection_abi()
         previous = store.manifest()
-        scan = inventory.FeatureInventoryScan(repo_root, snapshot=snapshot, timing_ms=timing_ms)
         reusable = bool(
             allow_reuse and previous and previous.get("abi") == abi
             and _valid_signature(snapshot.previous_cache_signature)
@@ -275,6 +342,14 @@ def _publish_feature_shards(
         )
         store.prune()
         source_rows = dashboard._feature_source_rows(monitor_status)
+        scan = (_unchanged_scan(repo_root, snapshot, previous, source_rows, timing_ms)
+                if reusable else None)
+        if scan is None:
+            scan = inventory.FeatureInventoryScan(repo_root, snapshot=snapshot, timing_ms=timing_ms)
+            # The complete reader may discover that a quick-index generation
+            # moved before decode and revoke its formerly empty delta.
+            reusable = bool(reusable and snapshot.changed_dataset_ids is not None
+                            and previous['cache_signature'] == snapshot.previous_cache_signature)
         category_order = {name: index for index, name in enumerate(dashboard._MARKET_CATEGORY_LABELS)}
         items: dict[str, dict[str, Any]] = {}
         rebuilt = reused = 0
@@ -303,7 +378,9 @@ def _publish_feature_shards(
             )
             # Use the canonical public validator even on first cache creation.
             feature_page_projections(public)
-            body = b",".join(_encode(row) for row in public["rows"])
+            # One encoder invocation retains identical JSON member bytes and
+            # order without creating an encoder and UTF-8 buffer per field.
+            body = _encode(public["rows"])[1:-1]
             digest, size = store.put(body, suffix="rows")
             preview_digest, preview_size = store.put(_encode(public["rows"][:FEATURE_PREVIEW_LIMIT]), suffix="preview")
             items[owner] = {
@@ -356,6 +433,10 @@ def _publish_feature_shards(
             "schema_version": SHARD_VERSION, "source_data": False,
             "output": str(output.resolve()), "abi": abi,
             "cache_signature": snapshot.cache_signature, "datasets": items,
+            "source_observation_root": raw_summary['source_observation_root'],
+            "feature_revision": (snapshot.unchanged_selection or {}).get('feature_revision')
+                if snapshot.payload is None else snapshot.payload.get('feature_revision'),
+            "verified_summary": raw_summary,
         })
         timing_ms["total"] = (time.perf_counter() - started) * 1_000
         return ShardedFeaturePublication(fields, raw_summary["source_observation_root"], preview, pages,

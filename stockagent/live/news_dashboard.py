@@ -14,10 +14,11 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
+from stockagent.data.news_disk_contract import BACKING_SAMPLE_MAX_AGE_SECONDS
 from stockagent.data.news_worker_lifecycle import read_news_worker_lifecycle
 from stockagent.data.news_source_catalog import (
     configuration_paths, load_news_configuration, load_source_review_ledger,
-    planning_review_path, source_role, classify_news_outcomes,
+    planning_review_path, source_role, classify_news_outcomes, recorded_review_questions,
     NEWS_OUTCOME_CLASSIFICATION_VERSION, NEWS_OUTCOME_STATES,
 )
 
@@ -30,25 +31,124 @@ MAX_STATUS_SNAPSHOT_BYTES = 16 * 1024 * 1024
 MAX_AGE_SECONDS = 180
 
 
+def _url_metadata_inbox(value):
+    """Only publish bounded aggregate work, never private URLs or requests."""
+    if (not isinstance(value, dict) or type(value.get('contract_version')) is not int
+            or value['contract_version'] != 1 or value.get('available') is not True):
+        return None
+    names = ('request_files', 'pending_requests', 'targets_unexamined',
+             'completed_unarchived', 'invalid_or_unreadable')
+    if any(type(value.get(name)) is not int or value[name] < 0 for name in names):
+        return None
+    files, pending, targets, archived, invalid = (value[name] for name in names)
+    if (files > 64 or files != pending + archived + invalid
+            or not pending <= targets <= pending * 512):
+        return None
+    return {'contract_version': 1, **{name: value[name] for name in names}}
+
+
 def _disk_admission(value, observed, now):
     """Fixed public byte/clock fields only; never storage paths or raw extras."""
     if not isinstance(value, dict) or type(value.get('contract_version')) is not int or value['contract_version'] != 1:
         return None
     checked = _stamp(value.get('checked_at_utc'))
+    backing_state = value.get('physical_backing_state')
+    if backing_state not in (None, 'available', 'not_required'):
+        return None
+    max_age = BACKING_SAMPLE_MAX_AGE_SECONDS if backing_state == 'available' else MAX_AGE_SECONDS
     fields = ('free_bytes', 'required_free_bytes', 'shortfall_bytes', 'automatic_recheck_seconds')
-    if (not checked or not observed or not -5 <= (observed-checked).total_seconds() <= MAX_AGE_SECONDS
-            or not -5 <= (now-checked).total_seconds() <= MAX_AGE_SECONDS
+    if (not checked or not observed or not -5 <= (observed-checked).total_seconds() <= max_age
+            or not -5 <= (now-checked).total_seconds() <= max_age
             or any(type(value.get(key)) is not int or not 0 <= value[key] <= 2**63-1 for key in fields)
             or value['automatic_recheck_seconds'] < 10
             or type(value.get('fetch_allowed')) is not bool
             or value['fetch_allowed'] != (value['free_bytes'] >= value['required_free_bytes'])
             or value['shortfall_bytes'] != max(0,value['required_free_bytes']-value['free_bytes'])):
         return None
-    return {'contract_version': 1, 'available': True, 'checked_at_utc': checked.isoformat(),
+    result = {'contract_version': 1, 'available': True, 'checked_at_utc': checked.isoformat(),
         **{key:value[key] for key in fields}, 'fetch_allowed':value['fetch_allowed']}
+    if backing_state == 'available':
+        result['valid_until_utc'] = (checked + timedelta(seconds=max_age)).isoformat()
+    return result
+
+
+def _disk_verification(value, observed, now):
+    """Project an explicit unknown backing sample without inventing free bytes.
+
+    Old or malformed v1 samples remain unavailable. This sideband cannot
+    authorize a request or supply a completion estimate.
+    """
+    if not isinstance(value, dict) or type(value.get('contract_version')) is not int or value['contract_version'] != 1:
+        return None
+    checked = _stamp(value.get('checked_at_utc'))
+    state = value.get('physical_backing_state')
+    inflight = value.get('physical_probe_inflight')
+    fields = ('free_bytes', 'shortfall_bytes', 'backing_free_bytes')
+    required, interval = value.get('required_free_bytes'), value.get('automatic_recheck_seconds')
+    if (not checked or not observed or not -5 <= (observed-checked).total_seconds() <= MAX_AGE_SECONDS
+            or not -5 <= (now-checked).total_seconds() <= MAX_AGE_SECONDS
+            or not isinstance(state, str) or state not in {'pending', 'unavailable', 'stale'}
+            or type(inflight) is not bool or state == 'pending' and not inflight
+            or any(key not in value or value[key] is not None for key in fields)
+            or value.get('fetch_allowed') is not False
+            or type(required) is not int or not 0 <= required <= 2**63-1
+            or type(interval) is not int or not 10 <= interval <= 2**63-1):
+        return None
+    return {'contract_version': 1, 'state': state, 'probe_inflight': inflight,
+            'checked_at_utc': checked.isoformat(), 'required_free_bytes': required,
+            'automatic_recheck_seconds': interval}
 
 
 _ID = re.compile(r"^(?:[a-z][a-z0-9_]{0,63}|unregistered:[a-z0-9.-]{1,253})$")
+_DISCOVERY_ERROR_KINDS = frozenset({'feed', 'metadata_feed', 'index', 'sitemap', 'rss_fulltext',
+                                    'wordpress_posts', 'cnyes_news', 'other'})
+_DISCOVERY_ERROR_REASONS = frozenset({'http_401', 'http_403', 'http_404', 'http_410', 'http_429',
+    'http_451', 'http_other', 'transport', 'unregistered_endpoint', 'invalid_feed',
+    'invalid_feed_body', 'invalid_feed_identity', 'restricted_content', 'unusable_items',
+    'pagination_no_progress', 'pagination_invalid', 'other'})
+_CANDIDATE_WORK_KEYS = ('pending_unadmitted', 'ready', 'reserved', 'orphaned_reservation', 'uncertain_outcome')
+
+
+def _candidate_diagnostic_progress(value, known_providers):
+    """Publish validated counts only; private candidate requests stay local."""
+    if (not isinstance(value, dict) or type(value.get('contract_version')) is not int
+            or value['contract_version'] != 1 or value.get('available') is not True):
+        return None
+    names = ('request_files', 'pending_unadmitted', 'already_registered', 'invalid_or_unreadable')
+    if any(type(value.get(key)) is not int or not 0 <= value[key] <= 16 for key in names):
+        return None
+    if value['request_files'] != sum(value[key] for key in names[1:]):
+        return None
+    states = _CANDIDATE_WORK_KEYS[1:]
+    jobs, raw_providers, raw_unregistered = value.get('jobs'), value.get('providers'), value.get('unregistered')
+    if not isinstance(jobs, dict) or not isinstance(raw_providers, dict) or len(raw_providers) > 4096:
+        return None
+    if any(type(jobs.get(key)) is not int or not 0 <= jobs[key] <= 2**63-1 for key in states):
+        return None
+
+    def clean_bucket(bucket):
+        if (not isinstance(bucket, dict) or any(type(bucket.get(key)) is not int
+                or not 0 <= bucket[key] <= 2**63-1 for key in _CANDIDATE_WORK_KEYS)):
+            return None
+        return {key: bucket[key] for key in _CANDIDATE_WORK_KEYS}
+
+    unregistered = clean_bucket(raw_unregistered)
+    if unregistered is None:
+        return None
+    providers = {}
+    for identifier, raw in raw_providers.items():
+        if (not isinstance(identifier, str) or not _ID.fullmatch(identifier)
+                or identifier not in known_providers or (cleaned := clean_bucket(raw)) is None):
+            return None
+        providers[identifier] = cleaned
+    totals = {key: unregistered[key] + sum(bucket[key] for bucket in providers.values())
+              for key in _CANDIDATE_WORK_KEYS}
+    if totals['pending_unadmitted'] != value['pending_unadmitted'] or any(totals[key] != jobs[key] for key in states):
+        return None
+    return {'contract_version': 1, **{key: value[key] for key in names},
+            'jobs': {key: jobs[key] for key in states}, 'providers': providers, 'unregistered': unregistered}
+
+
 _STATES = NEWS_OUTCOME_STATES
 _READY_STATES = {"pending", "inflight", "retry", "retry_cooldown"}
 # Match the canonical owner's actual cycle/daemon/CLI states. A completed
@@ -221,6 +321,36 @@ def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
             'no_known_primary_includes_unclassified': True}
 
 
+def _pending_source_rechecks(value: Any, total: int, observed: datetime | None) -> dict[str, Any] | None:
+    """Project unresolved source evidence without exposing origins or URLs."""
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or type(raw.get('available')) is not bool):
+        return None
+    fields = ('unverified_missing_body_urls', 'due_missing_body_urls')
+    if not raw['available']:
+        if any(raw.get(key) is not None for key in (*fields, 'next_probe_at_utc')):
+            return None
+        return {'contract_version': 1, 'available': False, **dict.fromkeys(fields),
+                'next_probe_at_utc': None}
+    counts = {key: _count(raw.get(key)) for key in fields}
+    if (any(value is None for value in counts.values())
+            or not 0 <= counts['due_missing_body_urls'] <= counts['unverified_missing_body_urls'] <= total):
+        return None
+    next_probe = _stamp(raw.get('next_probe_at_utc'))
+    if counts['unverified_missing_body_urls']:
+        if observed is None or next_probe is None or (next_probe - observed).total_seconds() > 86400:
+            return None
+        if counts['due_missing_body_urls'] and (next_probe - observed).total_seconds() > 5:
+            return None
+        if not counts['due_missing_body_urls'] and (next_probe - observed).total_seconds() < -5:
+            return None
+    elif raw.get('next_probe_at_utc') is not None:
+        return None
+    return {'contract_version': 1, 'available': True, **counts,
+            'next_probe_at_utc': next_probe.isoformat() if next_probe else None}
+
+
 def _body_request_scope_progress(value: Any, work: Mapping[str, Any] | None,
                                  observed: datetime | None, now: datetime) -> dict[str, Any] | None:
     """Counts only: no private URL/host, gate permission or recovery inference."""
@@ -252,6 +382,8 @@ def _body_request_scope_progress(value: Any, work: Mapping[str, Any] | None,
     return {'contract_version': 1, 'available': True, **counts,
             'next_source_probe_at_utc': deadline.isoformat() if deadline else None,
             'source_probe_ready': deadline <= now if deadline else False,
+            'pending_source_rechecks': _pending_source_rechecks(
+                raw.get('pending_source_rechecks'), total, observed),
             'source_recovery_verified': False}
 
 
@@ -282,7 +414,14 @@ def _cnyes_public_index_progress(value: Any) -> dict[str, Any] | None:
             or rows > pages * 30 or counts['public_ID_row_observations'] > rows
             or counts['dates_all_reported_pages_observed'] + counts['dates_with_changed_source_total'] > dates):
         return None
+    reconciling = None
+    if 'dates_reconciling_page_membership' in raw:
+        reconciling = _count(raw['dates_reconciling_page_membership'])
+        if (reconciling is None or reconciling > dates
+                or counts['dates_all_reported_pages_observed'] + reconciling > dates):
+            return None
     return {'contract_version': 1, 'enabled': True, **counts,
+            'dates_reconciling_page_membership': reconciling,
             'article_bodies_accepted_by_index': 0, 'all_history_complete': False,
             'finish_eta_utc': None, 'progress_ratio': None,
             'source_total_is_not_unique_story_count': True, 'category_gaps_preserved': True}
@@ -313,8 +452,80 @@ def _cnyes_category_gap_count(value: Any) -> int | None:
     return cnyes if counted == total else None
 
 
+def _cnyes_index_source_gate(value: Any, now: datetime) -> dict[str, Any] | None:
+    """Project only the owner's bounded index-scope gate, not private URLs."""
+    parent = _object(value)
+    if 'source_gate' not in parent:
+        return None  # Legacy snapshots did not contain this observation.
+    result = {'state': 'unknown', 'next_probe_at_utc': None,
+              'source_recovery_requires_success': True}
+    raw = _object(parent['source_gate'])
+    state = raw.get('state')
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or state not in {'waiting', 'rechecking', 'clear', 'unknown'}
+            or raw.get('source_recovery_requires_success') is not True):
+        return result
+    probe = _stamp(raw.get('next_probe_at_utc'))
+    if state == 'waiting':
+        if probe is None:
+            return result
+        # The deadline permits a source probe; it does not prove recovery.
+        return {**result, 'state': 'waiting' if probe > now else 'rechecking',
+                'next_probe_at_utc': probe.isoformat() if probe > now else None}
+    if raw.get('next_probe_at_utc') is not None:
+        return result
+    return {**result, 'state': state}
+
+
+def _cnyes_manifest_last_page_gate(value: Any, now: datetime) -> dict[str, Any]:
+    """Project only the final page's own bounded job state, never its URL."""
+    raw = _object(_object(value).get('last_page_gate'))
+    result = {'state': 'unknown', 'next_probe_at_utc': None, 'recovery_requires_success': True}
+    state = raw.get('state')
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or state not in {'waiting', 'rechecking', 'ready', 'unknown'}
+            or raw.get('recovery_requires_success') is not True):
+        return result
+    if state == 'waiting':
+        probe = _stamp(raw.get('next_probe_at_utc'))
+        if probe is None:
+            return result
+        return {**result, 'state': 'waiting' if probe > now else 'rechecking',
+                'next_probe_at_utc': probe.isoformat() if probe > now else None}
+    if raw.get('next_probe_at_utc') is not None:
+        return result
+    return {**result, 'state': state}
+
+
+def _cnyes_manifest_partial_page_gate(value: Any, now: datetime, remaining: int) -> dict[str, Any]:
+    """Project bounded request-local failure evidence, without source URLs."""
+    raw = _object(_object(value).get('partial_page_gate'))
+    result = {'state': 'unknown', 'failed_pages': None, 'next_probe_at_utc': None,
+              'recovery_requires_success': True, 'scope': 'observed_request_local_failures_only'}
+    state, failed = raw.get('state'), _count(raw.get('failed_pages'))
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or state not in {'waiting', 'rechecking', 'none_observed', 'unknown'}
+            or raw.get('recovery_requires_success') is not True
+            or raw.get('scope') != 'observed_request_local_failures_only'):
+        return result
+    if state == 'unknown':
+        return result
+    if failed is None or failed > remaining or (state == 'none_observed') != (failed == 0):
+        return result
+    if state == 'waiting':
+        probe = _stamp(raw.get('next_probe_at_utc'))
+        if probe is None:
+            return result
+        return {**result, 'state': 'waiting' if probe > now else 'rechecking',
+                'failed_pages': failed, 'next_probe_at_utc': probe.isoformat() if probe > now else None}
+    if raw.get('next_probe_at_utc') is not None:
+        return result
+    return {**result, 'state': state, 'failed_pages': failed}
+
+
 def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
-                                   now: datetime, live: bool, current_owner: Any) -> dict[str, Any] | None:
+                                   now: datetime, live: bool, current_owner: Any,
+                                   *, provider_waiting: bool = False) -> dict[str, Any] | None:
     """A source-reported finite metadata phase, separate from all-history ETA.
 
     Page views only validate/project the existing owner snapshot. Recompute
@@ -347,6 +558,15 @@ def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
     ratio = _number(raw.get('progress_ratio'))
     known = raw['totals_known']
     complete = raw['phase_complete']
+    revisions = None
+    if 'dates_reconciling_page_membership' in raw:
+        revisions = _count(raw['dates_reconciling_page_membership'])
+        if (revisions is None or revisions > planned
+                or index['dates_reconciling_page_membership'] is None
+                or revisions > index['dates_reconciling_page_membership'] or (known and revisions)):
+            return None
+    elif index['dates_reconciling_page_membership'] not in (None, 0):
+        return None
     if known:
         if (missing or changed or total_pages is None or total_rows is None or remaining is None
                 or total_pages < max(planned, pages) or total_rows < rows or total_rows > total_pages * 30
@@ -357,6 +577,9 @@ def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
     elif (complete or any(raw.get(key) is not None for key in (
             'source_reported_total_pages', 'source_reported_total_metadata_rows', 'remaining_pages', 'progress_ratio'))):
         return None
+    source_gate = _cnyes_index_source_gate(value, now)
+    last_page_gate = _cnyes_manifest_last_page_gate(raw, now) if remaining == 1 else None
+    partial_page_gate = _cnyes_manifest_partial_page_gate(raw, now, remaining) if remaining is not None and remaining > 1 else None
     forecast = {'contract_version': 1, 'state': 'unavailable', 'sample_seconds': None,
         'sample_count': None, 'verified_pages': None, 'pages_per_second': None,
         'fastest_seconds': None, 'middle_seconds': None, 'slowest_seconds': None,
@@ -368,6 +591,23 @@ def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
         forecast['state'] = 'unknown_denominator'
     elif complete:
         forecast['state'] = 'phase_complete'
+    elif provider_waiting or source_gate is not None and source_gate['state'] == 'waiting':
+        # A current provider-wide scheduler gate makes an old measured rate
+        # or an index-specific gate makes an old measured rate unsuitable as
+        # an active completion clock. Keep verified counts.
+        forecast['state'] = 'provider_waiting'
+    elif source_gate is not None and source_gate['state'] == 'rechecking':
+        forecast['state'] = 'source_rechecking'
+    elif source_gate is None or source_gate['state'] == 'unknown':
+        # Legacy snapshots have no index-scope gate proof. Keep their counts,
+        # but do not treat the missing observation as a recovered source.
+        forecast['state'] = 'source_scope_unknown'
+    elif last_page_gate is not None and last_page_gate['state'] != 'ready':
+        forecast['state'] = {'waiting': 'last_page_waiting', 'rechecking': 'last_page_rechecking',
+                             'unknown': 'last_page_scope_unknown'}[last_page_gate['state']]
+    elif partial_page_gate is not None and partial_page_gate['state'] != 'none_observed':
+        forecast['state'] = {'waiting': 'partial_page_waiting', 'rechecking': 'partial_page_rechecking',
+                             'unknown': 'partial_page_scope_unknown'}[partial_page_gate['state']]
     else:
         saved = _object(raw.get('forecast'))
         clock, metric_clock = _stamp(saved.get('observed_at_utc')), _stamp(metrics.get('snapshot_at_utc'))
@@ -413,11 +653,13 @@ def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
                         sample_seconds=seconds, verified_pages=measured, **expected,
                         middle_finish_at_utc=finish.isoformat())
     return {'contract_version': 1, 'scope': 'actual_category_overflow_source_dates', **counts,
+        'dates_reconciling_page_membership': revisions,
         'totals_known': known, 'source_reported_total_pages': total_pages,
         'source_reported_total_metadata_rows': total_rows, 'remaining_pages': remaining,
         'progress_ratio': pages / total_pages if known else None, 'phase_complete': complete,
         'metadata_only': True, 'body_completion_claimed': False, 'all_history_complete': False,
-        'forecast': forecast}
+        'source_gate': source_gate, 'last_page_gate': last_page_gate,
+        'partial_page_gate': partial_page_gate, 'forecast': forecast}
 
 
 def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None:
@@ -441,6 +683,54 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
     counts = {key: _count(states.get(key, 0)) for key in allowed}
     if any(value is None for value in counts.values()) or sum(counts.values()) > 2**53 - 1:
         return None
+    recovery = raw.get('overflow_retained_recovery')
+    local_recovery = None
+    if isinstance(recovery, Mapping):
+        pending = _count(recovery.get('pending_retained_pages'))
+        retries = _count(recovery.get('local_retry_pages')) if 'local_retry_pages' in recovery else None
+        scan_state = recovery.get('scan_state')
+        if (type(recovery.get('contract_version')) is int and recovery['contract_version'] == 1
+                and scan_state in ('not_started', 'scanning', 'complete', 'unknown')
+                and pending is not None and ('local_retry_pages' not in recovery or retries is not None)
+                and recovery.get('local_raw_only') is True
+                and recovery.get('category_gap_completion_claimed') is False
+                and type(recovery.get('publisher_requests')) is int and recovery['publisher_requests'] == 0):
+            local_recovery = {'contract_version': 1, 'scan_state': scan_state,
+                'pending_retained_pages': pending, 'local_retry_pages': retries, 'local_raw_only': True,
+                'category_gap_completion_claimed': False, 'publisher_requests': 0}
+    nonzero = raw.get('unobserved_nonzero_retained_scan')
+    local_nonzero = None
+    if isinstance(nonzero, Mapping):
+        scan_state = nonzero.get('scan_state')
+        checked = _count(nonzero.get('checked_steps'))
+        queued = _count(nonzero.get('queued_candidate_pages'))
+        counts_valid = (checked is not None and queued is not None and queued <= checked
+                        or scan_state == 'unknown' and nonzero.get('checked_steps') is None
+                        and nonzero.get('queued_candidate_pages') is None)
+        if (type(nonzero.get('contract_version')) is int and nonzero['contract_version'] == 1
+                and scan_state in ('not_started', 'scanning', 'complete', 'unknown') and counts_valid
+                and nonzero.get('local_raw_only') is True and nonzero.get('all_history_complete') is False
+                and type(nonzero.get('publisher_requests')) is int and nonzero['publisher_requests'] == 0):
+            local_nonzero = {'contract_version': 1, 'scan_state': scan_state, 'checked_steps': checked,
+                'queued_candidate_pages': queued, 'local_raw_only': True,
+                'all_history_complete': False, 'publisher_requests': 0}
+    accepted = raw.get('accepted_body_batch_scan')
+    local_accepted = None
+    if isinstance(accepted, Mapping):
+        scan_state = accepted.get('scan_state')
+        scanned = _count(accepted.get('scanned_batches'))
+        indexed = _count(accepted.get('indexed_candidates'))
+        counts_valid = ((scanned is not None and indexed is not None)
+                        or (scan_state == 'unknown' and accepted.get('scanned_batches') is None
+                            and accepted.get('indexed_candidates') is None))
+        if (type(accepted.get('contract_version')) is int and accepted['contract_version'] == 1
+                and scan_state in ('not_started', 'scanning', 'complete', 'local_retry_wait', 'unknown')
+                and counts_valid and accepted.get('local_raw_only') is True
+                and accepted.get('all_history_complete') is False
+                and type(accepted.get('publisher_requests')) is int and accepted['publisher_requests'] == 0):
+            local_accepted = {'contract_version': 1, 'scan_state': scan_state, 'scanned_batches': scanned,
+                'indexed_candidates': indexed, 'local_raw_only': True,
+                'all_history_complete': False, 'publisher_requests': 0}
     return {'contract_version': 1, 'current_source_contract_scope_states': counts,
             'scope_outcome_projection_contract_version': 1,
             'verified_list_scopes': sum(counts[key] for key in complete),
@@ -448,6 +738,9 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
             'inconsistent_source_scopes': sum(counts[key] for key in inconsistent),
             'page_cap_exceeded_scopes': counts['source_page_cap_exceeded'],
             'retired_gap_receipts': retired, 'unresolved_category_scopes': _cnyes_category_gap_count(gaps),
+            'overflow_retained_recovery': local_recovery,
+            'unobserved_nonzero_retained_scan': local_nonzero,
+            'accepted_body_batch_scan': local_accepted,
             'list_coverage_is_not_body_coverage': True, 'all_history_complete': False,
             'finish_eta_utc': None, 'progress_ratio': None}
 
@@ -487,6 +780,151 @@ def _read_news_status(path: Path) -> tuple[dict[str, Any], int]:
 
 def _count(value: Any) -> int | None:
     return value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+
+
+def _discovery_error_rollup(value, expected_total):
+    """Validate aggregate observations only; never expose URLs or raw errors."""
+    raw = _object(value)
+    state = raw.get('state')
+    if type(raw.get('contract_version')) is not int or raw['contract_version'] != 1:
+        return None
+    if state == 'unavailable':
+        if any(raw.get(key) is not None for key in ('scanned_rows', 'active_errors', 'providers')):
+            return None
+        return {'state': state, 'scanned_rows': None, 'active_errors': None, 'providers': None}
+    scanned = _count(raw.get('scanned_rows'))
+    if scanned is None:
+        return None
+    if state == 'building':
+        if raw.get('active_errors') is not None or raw.get('providers') is not None:
+            return None
+        return {'state': state, 'scanned_rows': scanned, 'active_errors': None, 'providers': None}
+    total = _count(raw.get('active_errors'))
+    entries = raw.get('providers')
+    if state != 'ready' or expected_total is None or total != expected_total or not isinstance(entries, dict):
+        return None
+    providers = {}
+    for identifier, value in entries.items():
+        if not isinstance(identifier, str) or not _ID.fullmatch(identifier) or not isinstance(value, dict):
+            return None
+        count = _count(value.get('active_errors'))
+        kinds, reasons = value.get('kinds'), value.get('reasons')
+        if (count is None or count == 0 or not isinstance(kinds, dict) or not isinstance(reasons, dict)
+                or set(kinds) - _DISCOVERY_ERROR_KINDS or set(reasons) - _DISCOVERY_ERROR_REASONS
+                or any(_count(v) in (None, 0) for v in (*kinds.values(), *reasons.values()))
+                or sum(kinds.values()) != count or sum(reasons.values()) != count):
+            return None
+        providers[identifier] = {'active_errors': count, 'kinds': dict(kinds), 'reasons': dict(reasons)}
+    if sum(item['active_errors'] for item in providers.values()) != total:
+        return None
+    return {'state': state, 'scanned_rows': scanned, 'active_errors': total, 'providers': providers}
+
+
+def _cnyes_local_replay_retries(value):
+    """Publish only typed local retry aggregates from the owner's snapshot."""
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('current_source_contract_only') is not True
+            or raw.get('retry_records_are_article_counts') is not False
+            or not isinstance(raw.get('entries'), dict)):
+        return None
+    entries = {}
+    for name in ('api_pages', 'metadata_batches', 'diagnostic_originals'):
+        if name not in raw['entries']:
+            return None
+        item = raw['entries'][name]
+        if item is None:
+            entries[name] = None
+            continue
+        if not isinstance(item, dict) or 'earliest_not_before_utc' not in item:
+            return None
+        records = _count(item.get('records'))
+        try:
+            deadline = _stamp(item.get('earliest_not_before_utc'))
+        except (OverflowError, ValueError):
+            return None
+        if records is None or (records == 0 and item.get('earliest_not_before_utc') is not None) or (records > 0 and deadline is None):
+            return None
+        entries[name] = {'records': records, 'earliest_not_before_utc': deadline.isoformat() if deadline else None}
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'retry_records_are_article_counts': False, 'entries': entries}
+
+
+def _cnyes_metadata_resource_waits(value):
+    """Expose only typed batch-size observations from the owner snapshot."""
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('current_source_contract_only') is not True
+            or raw.get('records_are_article_counts') is not False):
+        return None
+    records = _count(raw.get('records'))
+    above = _count(raw.get('above_current_bound_records'))
+    bound = _count(raw.get('current_bound_bytes'))
+    maximum = _count(raw.get('max_observed_required_bytes'))
+    if (records is None or above is None or bound is None or bound == 0 or above > records
+            or (records == 0 and raw.get('max_observed_required_bytes') is not None)
+            or (records > 0 and (maximum is None or maximum == 0 or (above > 0) != (maximum > bound)))):
+        return None
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'records_are_article_counts': False, 'records': records,
+            'above_current_bound_records': above, 'current_bound_bytes': bound,
+            'max_observed_required_bytes': maximum}
+
+
+def _cnyes_metadata_large_replay(value):
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('current_source_contract_only') is not True
+            or raw.get('retry_records_are_article_completion') is not False
+            or type(raw.get('assigned')) is not bool or 'earliest_not_before_utc' not in raw):
+        return None
+    records = _count(raw.get('retry_records'))
+    try:
+        deadline = _stamp(raw.get('earliest_not_before_utc'))
+    except (OverflowError, ValueError):
+        return None
+    if (records is None or (records == 0 and raw.get('earliest_not_before_utc') is not None)
+            or (records > 0 and deadline is None)):
+        return None
+    result = {'contract_version': 1, 'current_source_contract_only': True,
+              'retry_records_are_article_completion': False, 'assigned': raw['assigned'],
+              'retry_records': records, 'earliest_not_before_utc': deadline.isoformat() if deadline else None}
+    # Cause counts were added independently of the existing public snapshot
+    # contract. An old or malformed breakdown remains unknown, never zero.
+    causes = raw.get('retry_cause_counts')
+    names = ('progress_unknown_timeout', 'counters_unchanged_timeout', 'other')
+    if (type(raw.get('retry_causes_contract_version')) is int and raw['retry_causes_contract_version'] == 1
+            and isinstance(causes, dict) and set(causes) == set(names)):
+        counts = {key: _count(causes[key]) for key in names}
+        if all(value is not None for value in counts.values()) and sum(counts.values()) == records:
+            result.update(retry_causes_contract_version=1, retry_cause_counts=counts)
+    return result
+
+
+def _cnyes_metadata_index_progress(value):
+    """Publish baseline scan counters without a fabricated completion ratio."""
+    raw = _object(value)
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or raw.get('current_source_contract_only') is not True
+            or raw.get('counts_are_article_completion') is not False
+            or raw.get('state') not in ('scanning', 'draining', 'complete')):
+        return None
+    names = ('rows_seen', 'registered_heads', 'dirty_processed', 'cursor_resets')
+    values = {key: _count(raw.get(key)) for key in names}
+    if any(value is None for value in values.values()):
+        return None
+    invalid = _count(raw.get('invalid_heads_observed'))
+    if 'invalid_heads_observed' in raw and invalid is None:
+        return None
+    try:
+        updated = _stamp(raw.get('updated_at_utc'))
+    except (OverflowError, ValueError):
+        return None
+    if updated is None:
+        return None
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'counts_are_article_completion': False, 'state': raw['state'], **values,
+            'invalid_heads_observed': invalid, 'updated_at_utc': updated.isoformat()}
 
 
 def _routing_work(value: Any) -> dict[str, Any] | None:
@@ -710,6 +1148,29 @@ def _source_reviews(repo_root: Path) -> tuple[dict, str]:
         return {}, "unavailable"
 
 
+def _source_review_followup(review, *, review_valid: bool, now: datetime) -> str:
+    """Project only a finite observation state; never private question text.
+
+    An empty or absent legacy inventory is unknown, not evidence of complete
+    source review or body history. A malformed entry affects this projection
+    alone, not successful capture telemetry or other providers.
+    """
+    if not review_valid or not isinstance(review, dict):
+        return 'unknown'
+    scope = review.get('current_scope_review')
+    if not isinstance(scope, dict) or 'remaining_questions' not in scope:
+        return 'unknown'
+    if 'recorded_at_utc' in scope:
+        recorded = _stamp(scope['recorded_at_utc'])
+        if recorded is None or recorded > now + timedelta(seconds=5):
+            return 'unknown'
+    try:
+        completed, remaining = recorded_review_questions(review)
+    except ValueError:
+        return 'unknown'
+    return 'open' if remaining else 'none_recorded' if completed else 'unknown'
+
+
 def _original_sources(status, raw_providers):
     """Validate only typed summary counts; never expose destination URLs.
 
@@ -780,6 +1241,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     source_activity = raw_activity if isinstance(raw_activity, str) and raw_activity in _ACTIVITIES else "unavailable"
     activity = _ACTIVITIES.get(source_activity, "unavailable")
     disk_admission = _disk_admission(status.get('disk_admission'), observed, now)
+    disk_verification = _disk_verification(status.get('disk_admission'), observed, now)
     valid = type(status.get("contract_version")) is int and status["contract_version"] == 1
     lifecycle = read_news_worker_lifecycle(repo_root / 'data_news_fulltext',
         snapshot_owner_id=status.get('owner_id'), snapshot_at=observed, now=now)
@@ -794,9 +1256,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         elif lifecycle_stopped and activity not in {'stopped', 'waiting_restart'}:
             activity = 'stopped'
     if not initializing and not lifecycle_stopped and activity in {'running', 'idle', 'waiting', 'inventorying', 'waiting_disk'}:
-        if 'disk_admission' in status and disk_admission is None:
+        if 'disk_admission' in status and disk_admission is None and disk_verification is None:
             activity = 'unavailable'  # A current heartbeat cannot freshen an old admission sample.
-        elif disk_admission and not disk_admission['fetch_allowed']:
+        elif disk_verification or disk_admission and not disk_admission['fetch_allowed']:
             activity = 'waiting_disk'  # Inventory activity does not remove the write constraint.
     live = valid and fresh and activity in {"running", "idle", "waiting", "inventorying"}
     health = ("unavailable" if not status else "invalid" if not valid else "stale" if not fresh
@@ -814,6 +1276,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         if isinstance(identifier, str) and _ID.fullmatch(identifier):
             configured[identifier] = source
     raw_providers = _object(status.get("providers")) if valid else {}
+    discovery_rollup = (_discovery_error_rollup(status.get('discovery_error_rollup'),
+                                               _count(status.get('discovery_errors'))) if valid else None)
+    candidate_diagnostics = (_candidate_diagnostic_progress(status.get('candidate_diagnostic_progress'),
+        set(configured) | set(raw_providers)) if valid else None)
+    local_replay_retries = _cnyes_local_replay_retries(status.get('cnyes_local_replay_retries')) if valid else None
+    metadata_resource_waits = _cnyes_metadata_resource_waits(status.get('cnyes_metadata_resource_waits')) if valid else None
+    metadata_large_replay = _cnyes_metadata_large_replay(status.get('cnyes_metadata_large_replay')) if valid else None
+    metadata_index_progress = _cnyes_metadata_index_progress(status.get('cnyes_metadata_index_progress')) if valid else None
     original_inventory, original_sources = _original_sources(status if valid else {}, raw_providers)
     # Persisted article counts are reusable. Previous-process timings, requests
     # and capacity windows are not observations of the initializing new owner.
@@ -841,7 +1311,8 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     body_state_declared = 'provider_body_state_counter_contract_version' in status
     body_state_version = status.get('provider_body_state_counter_contract_version')
     body_state_supported = type(body_state_version) is int and body_state_version == 1 and stored_counter_supported
-    for identifier in sorted(set(configured) | set(raw_providers)):
+    discovery_provider_ids = set(discovery_rollup['providers']) if discovery_rollup and discovery_rollup['state'] == 'ready' else set()
+    for identifier in sorted(set(configured) | set(raw_providers) | discovery_provider_ids):
         if not isinstance(identifier, str) or not _ID.fullmatch(identifier):
             continue
         raw, settings = _object(raw_providers.get(identifier)), configured.get(identifier, {})
@@ -910,8 +1381,10 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         body_work = _body_work_progress(work_raw, ready) if identifier == 'cnyes' else None
         request_scope_declared = 'request_scope_progress' in work_raw
         request_scope = _body_request_scope_progress(work_raw.get('request_scope_progress'), body_work, observed, now)
+        rechecks = request_scope.get('pending_source_rechecks') if request_scope else None
         scope_eta_unknown = request_scope_declared and (request_scope is None or not request_scope['available']
-            or request_scope['source_paused_missing_body_urls'] > 0)
+            or request_scope['source_paused_missing_body_urls'] > 0
+            or rechecks is None or not rechecks['available'] or rechecks['unverified_missing_body_urls'] > 0)
         outcome_progress = classify_news_outcomes(dict(counts), registered=identifier in configured,
                                                   body_enabled=body_enabled) if valid else None
         detail = _object(metric_providers.get(identifier))
@@ -949,7 +1422,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             if eta_remaining and observed + timedelta(seconds=eta) <= now:
                 eta = finish = None  # Old projection elapsed without proof of completion.
         state = (activity if initializing and enabled else "unavailable" if not valid else "not_enabled" if not enabled else
-                 "stale" if not fresh else activity if not live else
+                 activity if lifecycle_stopped else "stale" if not fresh else activity if not live else
                  "cooldown" if cooling else
                  ("attention" if metadata_feed['feeds_with_errors'] else "metadata_polling")
                      if metadata_feed and not body_enabled else
@@ -990,10 +1463,16 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         providers.append({
             "id": identifier, "name": name, "configured": identifier in configured,
             "enabled": enabled, "state": state, "authorization_kind": auth,
+            "discovery_errors": (discovery_rollup['providers'].get(identifier,
+                {'active_errors': 0, 'kinds': {}, 'reasons': {}})
+                if discovery_rollup and discovery_rollup['state'] == 'ready' else None),
             "automatic_fulltext_allowed": body_enabled, "metadata_feed_progress": metadata_feed,
             "authorized_api_setup": api_setup,
             "source_policy_review": review_decision,
             "source_reviewed_at_utc": review_at.isoformat() if review_valid else None,
+            "source_review_followup": _source_review_followup(review, review_valid=review_valid, now=now),
+            "candidate_diagnostic_work": (candidate_diagnostics['providers'].get(identifier,
+                {key: 0 for key in _CANDIDATE_WORK_KEYS}) if candidate_diagnostics else None),
             "adapter_registered": identifier in configured,
             "adapter_acceptance": "committed_body_heads_observed" if stored_urls or complete else "no_body_acceptance_observed",
             "source_role": source_role(identifier.removeprefix("unregistered:")) if identifier.startswith("unregistered:") else
@@ -1007,10 +1486,15 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": body_work,
+            "local_replay_retries": local_replay_retries if identifier == 'cnyes' else None,
+            "metadata_resource_waits": metadata_resource_waits if identifier == 'cnyes' else None,
+            "metadata_large_replay": metadata_large_replay if identifier == 'cnyes' else None,
+            "metadata_index_progress": metadata_index_progress if identifier == 'cnyes' else None,
             "body_request_scope_progress": request_scope,
             "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress')) if identifier == 'cnyes' else None,
             "manifest_phase_progress": _cnyes_manifest_phase_progress(raw.get('public_index_progress'), metrics,
-                now, live and raw.get('automatic_collection_enabled') is True, status.get('owner_id')) if identifier == 'cnyes' else None,
+                now, live and raw.get('automatic_collection_enabled') is True, status.get('owner_id'),
+                provider_waiting=cooling) if identifier == 'cnyes' else None,
             "history_list_progress": _cnyes_history_list_progress(raw.get('history_list_progress'), status.get('bulk_gap_projection')) if identifier == 'cnyes' else None,
             "blocked_urls": blocked, "states": counts, 'growth_waiting_urls': growth_waiting,
             'acquisition_mode': mode, 'finite_cohort': cohort, 'finite_supplements': supplement,
@@ -1025,7 +1509,9 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "completion_forecast_rate_basis": (forecast['basis'] if forecast is not None else
                                                'owner_new_stored_url_heads' if heads is not None else 'legacy_owner_version_proxy'),
             "conditional_eta_seconds": eta, "conditional_finish_at_utc": finish,
-            "conditional_eta_unavailable_reason": ('source_request_scope_unknown' if request_scope is None or not request_scope['available']
+            "conditional_eta_unavailable_reason": ('source_request_scope_unknown'
+                if request_scope is None or not request_scope['available']
+                    or (not request_scope['source_paused_missing_body_urls'] and (rechecks is None or not rechecks['available']))
                 else 'source_request_scope_paused') if scope_eta_unknown else None,
             "conditional_eta_scope": 'queued_missing_body_urls' if body_coverage else 'legacy_active_url_states',
             "next_attempt_at_utc": cooldown.isoformat() if cooldown and cooling else None,
@@ -1156,19 +1642,26 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "snapshot_reader_contract_version": 3, "snapshot_read_state": snapshot_read_state,
         "snapshot_read_attempts": snapshot_read_attempts,
         "worker_lifecycle_projection_contract_version": 2,
+        "provider_state_owner_lifecycle_contract_version": 1,
         "disk_admission_projection_contract_version": 1,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         "outcome_progress": outcome_progress,
         "provider_stored_body_counter_contract_version": 1 if stored_counter_supported else None,
         "provider_body_state_counter_contract_version": 1 if body_state_supported else None,
+        "discovery_error_rollup": ({key: discovery_rollup[key] for key in ('state', 'scanned_rows', 'active_errors')}
+                                   if discovery_rollup else None),
         "body_coverage": body_coverage,
         "cnyes_list_progress_projection_contract_version": 1,
         "cnyes_manifest_phase_projection_contract_version": 1,
         "original_source_inventory_contract_version": 1,
         "original_source_inventory": original_inventory,
+        "url_metadata_inbox": _url_metadata_inbox(status.get('url_metadata_inbox')) if valid else None,
+        "candidate_diagnostic_progress": candidate_diagnostics,
         "source_policy_review_contract_version": 1,
         "source_reviews_state": source_reviews_state,
         "source_policy_review_counts": dict(Counter(source["source_policy_review"] for source in providers)),
+        "source_review_followup_contract_version": 1,
+        "source_review_followup_state_counts": dict(Counter(source["source_review_followup"] for source in providers)),
         "generated_at_utc": now.isoformat(), "read_only": True,
         "production_control_possible": False, "health": health,
         "observed_at_utc": observed.isoformat() if observed else None,
@@ -1176,6 +1669,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "snapshot_consistent": consistency,
         "worker": {"activity": activity, "source_activity": source_activity,
                    "disk_admission": disk_admission,
+                   "disk_verification": disk_verification,
                    "fresh": fresh and not initializing and not lifecycle_stopped,
                    "lifecycle": lifecycle,
                    "owner_elapsed_seconds": lifecycle['elapsed_seconds'] if initializing else elapsed,

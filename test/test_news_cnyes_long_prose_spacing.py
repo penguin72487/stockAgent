@@ -126,6 +126,10 @@ def test_only_html_abi_changes_not_bulk_index_or_authorization(cnyes_config, tmp
                 assert payload.pop('verified_native_degenerate_outcome_contract_version') == 1
             assert payload.pop('verified_untitled_no_events_bulletin_contract_version') == 1
             assert payload.pop('verified_source_signature_image_outcome_contract_version') == 1
+            # The later outer-chart proof is also absent from the historical
+            # pre-spacing capture; the pacing payload already removes it.
+            if 'verified_outer_chart_caption_contract_version' in payload:
+                assert payload.pop('verified_outer_chart_caption_contract_version') == 1
             return original_sha(json.dumps(payload, sort_keys=True).encode())
         return original_sha(value)
 

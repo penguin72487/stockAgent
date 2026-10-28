@@ -1341,7 +1341,7 @@ $nativeCache=Initialize-TejNativeHelper $PSCommandPath (Join-Path ([Environment]
 if(Test-Path -LiteralPath $Output){throw 'Refusing to overwrite bridge evidence'}
 $requestDoc=Get-Content -LiteralPath $Request -Raw -Encoding UTF8 | ConvertFrom-Json
 if($requestDoc.desktop_input_contract -and $requestDoc.desktop_input_contract -cne [TejBridgeNative]::InputContract){throw 'Incompatible desktop input contract'}
-if($requestDoc.contract_version -ne 4 -or $requestDoc.action -notin @('inspect','inspect_notices','inspect_source_binding','repair_source_binding','inspect_date_input','inspect_query_runtime','probe_date_focus','probe_date_input','confirm_metadata_error_cleared','plan','recover_plan','resume_plan_empty_fields','download','resolve_empty','recover_preview','ack_excel_error','ack_source_memory_error','ack_preview_column_limit')){throw 'Unsupported request contract'}
+if($requestDoc.contract_version -ne 4 -or $requestDoc.action -notin @('inspect','inspect_notices','inspect_source_binding','repair_source_binding','inspect_date_input','inspect_query_runtime','preserve_unbound_preview','probe_date_focus','probe_date_input','confirm_metadata_error_cleared','plan','recover_plan','resume_plan_empty_fields','download','resolve_empty','recover_preview','ack_excel_error','ack_source_memory_error','ack_preview_column_limit')){throw 'Unsupported request contract'}
 $titlePrefix='TEJ Smart Wizard (Version 4.1.1.7) -- '
 if($ExpectedTitle -cne ($titlePrefix+$ExpectedWorkbook) -and
    (-not $ExpectedTitle.StartsWith($titlePrefix,[StringComparison]::Ordinal) -or
@@ -1862,7 +1862,7 @@ try {
                 $candidate=[Windows.Automation.AutomationElement]::FromHandle([IntPtr]$handle)
                 if($candidate.Current.Name -ceq 'DataGridView') {
                     Assert-Scope $handle
-                    @{native_shape=[TejBridgeNative]::PreviewShape($handle);
+                    @{handle=$handle;native_shape=[TejBridgeNative]::PreviewShape($handle);
                       source_headers=@([TejBridgeNative]::PreviewHeader($handle,30))}
                 }
             })
@@ -2141,6 +2141,45 @@ try {
                  source_scope_proof=$sourceScopeProof;
                  vendor_numeric_scale_readback_basis=$(if($requestDoc.action -eq 'resolve_empty'){'current_ui_only_original_query_setting_unverified'}else{'prepreview_readback_for_this_query'});
                  provider_http_requests=$null;credentials_read=$false;query_comments_read=$false}
+    }
+    if($requestDoc.action -eq 'preserve_unbound_preview') {
+        # An unstaged surviving result cannot be attributed to a historical
+        # request. Preserve its complete native display values independently;
+        # this action supplies neither query-scope proof nor an ingest receipt.
+        if($requestDoc.query_attempt_id -or $requestDoc.original_query_scope_proof -or $requestDoc.original_query_stage){throw 'Unbound preservation cannot claim an original query'}
+        foreach($pair in @(@('Type',$requestDoc.type),@('SmartID',$requestDoc.smart_id),@('Data',$requestDoc.table))) {
+            $h=Control $source $pair[0] '*COMBOBOX*'
+            if([TejBridgeNative]::SelectedComboText($ExpectedWindow,$h) -cne $pair[1]){throw 'Unbound preservation source binding differs'}
+        }
+        $fieldLists=Lists $source
+        if($fieldLists.Count -ne 2 -or (Read-SourceKeyMode) -ne $requestDoc.source_key_mode){throw 'Unbound preservation schema differs'}
+        $selectedFieldOrderVerified=((Items $fieldLists[1].Current.NativeWindowHandle) -join "`t") -ceq (@($requestDoc.fields) -join "`t")
+        if(-not $selectedFieldOrderVerified){throw 'Unbound preservation selected field order differs'}
+        $numericScale=Read-NumericScale
+        $sectorFilterApplicable=$null;$sourceScopeProof=$null;$freshPreviewTransitionVerified=$false
+        if([TejBridgeNative]::Dialogs($ExpectedWindow).Count -ne 0){throw 'Vendor notice blocks unbound preservation'}
+        Show-ExistingPreview
+        $grids=@(Matching-Preview)
+        if($grids.Count -ne 1){throw 'No unique schema-matched unbound Preview'}
+        $gridHandle=$grids[0].Current.NativeWindowHandle
+        $beforeShape=[TejBridgeNative]::PreviewShape($gridHandle)
+        $beforeHeaders=@([TejBridgeNative]::PreviewHeader($gridHandle,30))
+        $beforeSignature=[TejBridgeNative]::PreviewSignature($gridHandle)
+        $payload=Capture-Preview $grids[0]
+        $afterShape=[TejBridgeNative]::PreviewShape($gridHandle)
+        $afterSignature=[TejBridgeNative]::PreviewSignature($gridHandle)
+        if(($beforeShape -join ',') -cne ($afterShape -join ',') -or $beforeSignature -cne $afterSignature){throw 'Unbound Preview changed during full preservation'}
+        $payload.action='preserve_unbound_preview'
+        $payload.preservation_contract='surviving_unstaged_preview_preservation_v1'
+        $payload.grid=@{handle=$gridHandle;native_shape=$beforeShape;source_headers=$beforeHeaders}
+        $payload.preview_signature_before=$beforeSignature;$payload.preview_signature_after=$afterSignature
+        $payload.owned_desktop_process_start_utc=(Get-Process -Id $TejProcessId -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')
+        $payload.vendor_numeric_scale_readback_basis='current_ui_only_original_query_setting_unverified'
+        $payload.date_axis='unattributed_current_preview_not_original_observation'
+        $payload.original_query_result_claimed=$false;$payload.source_rows_adopted=$false
+        $payload.market_data_query_submitted=$false;$payload.date_text_input_sent=$false;$payload.query_button_invoked=$false
+        [TejBridgeNative]::WriteArtifact($Output,($payload|ConvertTo-Json -Depth 8 -Compress))
+        Write-Output 'Unbound Preview fully preserved; original outcome remains unknown';exit
     }
     if($requestDoc.action -in @('resolve_empty','recover_preview')) {
         # Readback reconciles the ONE pending preview's actual selections; no

@@ -21,27 +21,216 @@ from stockagent.data.tw_futures_margin_preparation import margin_candidate_inter
 from stockagent.data.tw_futures_margin_release import read_bound_output
 
 
+def bind_retained_margin_sources(archive, bindings, *, products):
+    """Bind omitted, already captured originals to their dated announcements."""
+    import re
+    from stockagent.data.tw_futures_margin_preparation import check_publication
+
+    admitted = []
+    seen = set()
+    for item in bindings:
+        required = {'source_url', 'content_sha256', 'announcement_url', 'published_date', 'products'}
+        if (set(item) != required or not isinstance(item['products'], list)
+                or not item['products'] or len(set(item['products'])) != len(item['products'])
+                or not set(item['products']) <= set(products)
+                or not re.fullmatch('[a-f0-9]{64}', item['content_sha256'])):
+            raise ValueError('retained margin original exceeds its explicit gap scope or lacks a SHA')
+        url, announcement = item['source_url'], item['announcement_url']
+        if url in seen:
+            raise ValueError('duplicate retained margin original')
+        seen.add(url)
+        notice = archive.conn.execute('SELECT published_date,category FROM announcements WHERE url=?',
+                                      (announcement,)).fetchone()
+        if (notice is None or notice['category'] != 'margins'
+                or notice['published_date'] != item['published_date']
+                or (url != announcement and url not in archive.children(announcement))):
+            raise ValueError('retained margin original is not bound to its dated margin announcement')
+        doc = archive.document(url)
+        if doc['content_sha256'] != item['content_sha256']:
+            raise ValueError('retained margin original SHA mismatch')
+        check_publication(doc['text'], item['published_date'])
+        if url != announcement:
+            archive.document(announcement)
+        admitted.append(dict(item))
+    return admitted
+
+
+def bind_canonical_seasonal_sources(archive, bindings, *, continuations):
+    """Retain an omitted seasonal original without supplying financial values.
+
+    A parent bundle need not contain every original already captured by the
+    canonical collector. Admit only explicitly pinned, completed originals for
+    the requested continuation dates. The existing continuation parser still
+    proves the unchanged-level clause and its join to the earlier amount.
+    """
+    import re
+    from datetime import date
+    from scripts.build_tw_futures_margin_event_candidates import candidate_notice_clock
+
+    requested = set(continuations)
+    admitted, seen = [], set()
+    for item in bindings:
+        required = {'source_url', 'content_sha256', 'published_date'}
+        if (not isinstance(item, dict) or set(item) != required
+                or not isinstance(item['content_sha256'], str)
+                or not re.fullmatch('[a-f0-9]{64}', item['content_sha256'])
+                or (item['source_url'], item['published_date']) not in requested):
+            raise ValueError('canonical seasonal original lacks its requested date and SHA')
+        date.fromisoformat(item['published_date'])
+        url = item['source_url']
+        if url in seen:
+            raise ValueError('duplicate canonical seasonal original')
+        seen.add(url)
+        notice = archive.conn.execute(
+            'SELECT category FROM announcements WHERE url=? AND published_date=?',
+            (url, item['published_date'])).fetchone()
+        source = archive.conn.execute(
+            'SELECT state FROM documents WHERE url=?', (url,)).fetchone()
+        if (notice is None or notice['category'] != 'margins'
+                or source is None or source['state'] != 'complete'):
+            raise ValueError('canonical seasonal original lacks a completed dated margin source')
+        doc = archive.document(url)
+        if doc['content_sha256'] != item['content_sha256']:
+            raise ValueError('canonical seasonal original SHA mismatch')
+        if not candidate_notice_clock(doc['text'], item['published_date'])['issue_date_bound']:
+            raise ValueError('canonical seasonal original lacks its issuing date')
+        admitted.append(dict(item))
+    return admitted
+
+
+def exclude_reused_margin_attachment_bindings(archive, facts, *, products):
+    """Quarantine a backdated attachment view supported by a dated original.
+
+    A reused URL is not evidence that its current bytes existed at every old
+    index date. Only a separately published, byte-bound original with the same
+    complete financial event can supply that event. Preserve the rejected row
+    and both source identities; never repair its claimed publication date.
+    """
+    from datetime import date
+    from scripts.build_tw_futures_margin_event_candidates import (
+        candidate_notice_clock, reextract_retained_margin_text,
+    )
+
+    def signature(row):
+        return (row.get('product'), row.get('margin_kind'),
+                tuple(row.get('after') or ()), tuple(row.get('before') or ()),
+                row.get('effective_date'), row.get('effective_phase'))
+
+    def permanent(row):
+        return (row.get('margin_kind') == 'fixed_twd'
+                and row.get('effective_phase') in
+                    ('product_regular_open', 'after_product_regular_close')
+                and len(row.get('after') or ()) == 3
+                and len(row.get('before') or ()) == 3
+                and not row.get('requires_reversion_review')
+                and (row.get('temporary_end_evidence') or '[]') == '[]'
+                and not row.get('restoration_evidence'))
+
+    anchors = {}
+    for row in facts:
+        if (row['product'] in products and permanent(row)
+                and row.get('issue_date_bound') and not row.get('clock_error')):
+            anchors.setdefault(signature(row), []).append(row)
+    possible = []
+    for index, row in enumerate(facts):
+        if (row['product'] not in products or not permanent(row)
+                or row.get('issue_date_bound')
+                or row.get('clock_error') !=
+                    'historical attachment issuing date disagrees with index'):
+            continue
+        peers = anchors.get(signature(row), [])
+        # Existing same-byte verified views already resolve their own bad
+        # associations in the interval compiler. Do not rewrite them.
+        if any(p['source_content_sha256'] == row['source_content_sha256'] for p in peers):
+            continue
+        peers = [p for p in peers if p['source_url'] != row['source_url']
+                 and row.get('published_date', '') < p.get('published_date', '')]
+        if peers:
+            possible.append((index, row, peers))
+    if not possible:
+        return list(facts), []
+    urls = {r['source_url'] for _, row, peers in possible for r in [row, *peers]}
+    native = reextract_retained_margin_text(archive, source_urls=urls)
+
+    def exact_native(row):
+        return any(signature(n) == signature(row)
+                   and all(n.get(k) == row.get(k) for k in
+                       ('source_url', 'source_content_sha256', 'published_date',
+                        'known_at', 'issue_date_bound')) for n in native)
+
+    rejected = {}
+    for index, row, peers in possible:
+        if not exact_native(row):
+            continue
+        doc = archive.document(row['source_url'])
+        if doc['content_sha256'] != row['source_content_sha256']:
+            raise ValueError('reused margin attachment original SHA mismatch')
+        for peer in peers:
+            if not exact_native(peer):
+                continue
+            announcement = peer.get('announcement_url') or peer['source_url']
+            notice = archive.conn.execute('SELECT published_date,category FROM announcements WHERE url=? '
+                'AND published_date=?', (announcement, peer['published_date'])).fetchone()
+            if (notice is None or notice['category'] != 'margins'
+                    or (announcement != peer['source_url']
+                        and peer['source_url'] not in archive.children(announcement))):
+                continue
+            original = archive.document(peer['source_url'])
+            if original['content_sha256'] != peer['source_content_sha256']:
+                raise ValueError('corroborating margin original SHA mismatch')
+            if announcement != peer['source_url']:
+                archive.document(announcement)
+            if peer.get('known_at') != peer['published_date'] + 'T23:59:59+08:00':
+                continue
+            if date.fromisoformat(peer['published_date']) >= date.fromisoformat(peer['effective_date']):
+                continue
+            clocks = [candidate_notice_clock(d['text'], peer['published_date'])
+                      for d in (doc, original)]
+            if any(not c.get('issue_date_bound') or c.get('clock_error')
+                   or c.get('effective_date') != peer['effective_date']
+                   or c.get('effective_phase') != peer['effective_phase']
+                   or c.get('requires_reversion_review')
+                   or (c.get('temporary_end_evidence') or '[]') != '[]' for c in clocks):
+                continue
+            rejected[index] = dict(
+                contract='independently_bound_reused_margin_attachment_rejection_v1',
+                reason='captured_attachment_bytes_postdate_the_claimed_index_publication',
+                rejected_fact=dict(row), corroborating_fact=dict(peer),
+                rejected_fact_republication_or_numeric_inference=False,
+                source_values_supplied_only_by_the_independent_original=True)
+            break
+    return [r for i, r in enumerate(facts) if i not in rejected], list(rejected.values())
+
+
 def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt: Path,
                            *, archive_root: Path, restoration_evidence=(), source_reviews=(),
-                           reextract_sources=False, selected_products=(), continue_delta: Path | None = None):
+                           reextract_sources=False, selected_products=(), continue_delta: Path | None = None,
+                           code_reviews=(), seasonal_continuations=(), inherited_rules: Path | None = None,
+                           retained_source_bindings=(), reconcile_reused_attachments=False,
+                           canonical_seasonal_source_bindings=()):
     """Re-prove only gap-owning restorations from retained cash evidence."""
     import time
     begun = time.monotonic()
+    if retained_source_bindings and not reextract_sources:
+        raise ValueError('retained margin originals require canonical re-extraction')
     from stockagent.data.tw_futures_margin_preparation import RuleArchive
     from scripts.build_tw_futures_margin_event_candidates import (
-        rebuild_disposal_restorations, source_review_candidates, replace_reviewed_product_facts,
-        repair_missing_margin_source_context,
+        rebuild_disposal_restorations, source_review_candidates, replace_reviewed_margin_facts,
+        repair_missing_margin_source_context, apply_margin_code_reviews,
         reextract_retained_margin_text, retain_margin_code_corrections,
         bind_retained_single_session_margin_clocks, bind_native_margin_period_extension,
         compose_bound_margin_extension_views,
         repair_native_restoration_period_revisions,
         compose_same_notice_margin_clocks,
+        declared_seasonal_margin_continuations,
     )
 
     facts, manifest = read_bound_output(current / 'margin_event_candidates.parquet')
     old_levels, _ = read_bound_output(current / 'margin_level_intervals.parquet')
     parent_levels = old_levels
-    rows = list(manifest['sources'])
+    # Integrated releases also retain legal/accounting inputs without a URL;
+    # they remain bound by their SHA and are not a margin notice candidate.
+    rows = [dict(s, url=s.get('url', '')) for s in manifest['sources']]
     source_roots = {(s['sha256'], s['path'], s['url'], s['kind']): current for s in rows}
     continued = None
     if continue_delta is not None:
@@ -71,19 +260,53 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
         if not set(selected_products) <= products:
             raise ValueError('selected margin products exceed the retained gap scope')
         products = set(selected_products)
+    # Both sides must be rebuilt: correcting an OCR label removes the false
+    # boundary from its old product and adds the evidenced cell to its owner.
+    # The old label must belong to the original gap scope, never an arbitrary
+    # destination introduced by an earlier correction in this same request.
+    gap_products = set(products)
+    code_urls = set()
+    for path in code_reviews:
+        review = json.loads(path.read_text())
+        if (review.get('review_kind') != 'source_bound_margin_product_code_cells'
+                or not review.get('cells')
+                or any(c['ocr_product'] not in gap_products for c in review['cells'])):
+            raise ValueError('margin code review exceeds the retained gap product scope')
+        products.update(c['product'] for c in review['cells'])
+        code_urls.update(c['source_url'] for c in review['cells'])
     urls = set(facts.filter(pl.col('product').is_in(sorted(products))
         & pl.col('requires_reversion_review').fill_null(False))['source_url'])
+    urls.update(code_urls)
+    retained_urls={r['url'] for r in rows}
+    explicit_seasonal_urls = {b.get('source_url') for b in canonical_seasonal_source_bindings
+                             if isinstance(b, dict)}
+    for url,published in seasonal_continuations:
+        if url not in retained_urls and url not in explicit_seasonal_urls:
+            raise ValueError('seasonal continuation requires an already retained original')
+        urls.add(url)
     for path in source_reviews:
         payload = json.loads(path.read_text())
-        for review in payload.get('reviews', [payload]):
-            own = {r['product'] for r in review.get('rows', [])} | set(review.get('products', []))
+        legacy = payload.get('schema_version') == 1 and isinstance(payload.get('legacy'), dict)
+        reviews = ([r for r in payload['legacy']['notices'] if r['kind']=='margin']
+                   if legacy else payload.get('reviews', [payload]))
+        for review in reviews:
+            own = (set(review['values']) if legacy else
+                   {r['product'] for r in review.get('rows', [])} | set(review.get('products', [])))
             if not own or not own <= products:
                 raise ValueError('margin source review exceeds the financial gap product scope')
-            urls.add(review['source_url'])
+            urls.add(review['url'] if legacy else review['source_url'])
+    if reconcile_reused_attachments:
+        # Preserve all existing native text/table views used to verify an
+        # independently dated replacement. Product scope comes from gaps.
+        urls.update(facts.filter(pl.col('product').is_in(sorted(products)))['source_url'])
     review_hashes = set(facts.filter(pl.col('source_url').is_in(sorted(urls)))[
         'visual_review_sha256'].drop_nulls())
     output.mkdir(parents=True, exist_ok=True)
     archive = RuleArchive(archive_root, output)
+    admitted_sources = bind_retained_margin_sources(archive, retained_source_bindings, products=products)
+    admitted_seasonal_sources = bind_canonical_seasonal_sources(
+        archive, canonical_seasonal_source_bindings, continuations=seasonal_continuations)
+    urls.update(r['source_url'] for r in admitted_sources)
     if continued is not None:
         # Keep exact prior evidence before mutating the same pending delta.
         archive.copy(continue_delta / 'manifest.json', continued_sha, url='', kind='continued_margin_delta_manifest')
@@ -137,17 +360,24 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
             archive.cache[source['url']] = json.loads(path.read_text())
     by_hash = {r['sha256']: r for r in rows}
     combined = facts.to_dicts()
+    for path in code_reviews:
+        combined = apply_margin_code_reviews(archive, combined, path)
     fresh = []
     if reextract_sources:
         fresh = reextract_retained_margin_text(archive, source_urls=urls - {''})
         fresh = retain_margin_code_corrections(combined, [r for r in fresh
             if r['product'] in products - {'CPF'}])
+        for original in admitted_sources:
+            extracted = {r['product'] for r in fresh if r['source_url'] == original['source_url']
+                         and r['source_content_sha256'] == original['content_sha256']}
+            if not set(original['products']) <= extracted:
+                raise ValueError('retained margin original does not supply every declared product')
         keys = {(r['source_content_sha256'], r['product']) for r in fresh}
         combined = [r for r in combined if (r['source_content_sha256'], r['product']) not in keys
             or r.get('extraction') == 'observed_disposition_conditional_restoration'] + fresh
     for path in source_reviews:
         reviewed, _ = source_review_candidates(archive, path)
-        combined = replace_reviewed_product_facts(combined, reviewed)
+        combined = replace_reviewed_margin_facts(combined, reviewed)
     clock_repairs = repair_missing_margin_source_context(archive, [r for r in combined
         if r.get('product') in products and r.get('source_url') in urls])
     if reextract_sources:
@@ -167,8 +397,17 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
         compose_bound_margin_extension_views(archive, combined)
     input_proofs = []
     contexts = []
+    fixed_attachment_only = (reconcile_reused_attachments and not seasonal_continuations
+        and products <= {r['product'] for r in combined}
+        and all(r.get('margin_kind') in ('fixed_twd', 'fixed_unresolved_currency')
+                for r in combined if r['product'] in products))
+    retained_dispositions = (bool(seasonal_continuations) or fixed_attachment_only) and not (
+        restoration_evidence or source_reviews or reextract_sources or code_reviews
+        or continue_delta is not None) and not any(
+            r['product'] in products and r.get('extraction') == 'observed_disposition_conditional_restoration'
+            for r in combined)
     for source in rows:
-        if source['kind'] == 'restoration_evidence_manifest':
+        if source['kind'] == 'restoration_evidence_manifest' and not retained_dispositions:
             contexts.append((source, json.loads(verify(source).read_text())))
     # The complete disposition context precedes bounded correction contexts.
     # Every input remains source-bound and partial contexts cannot erase a
@@ -217,9 +456,58 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
     for path in restoration_evidence:
         combined, repaired = repair_native_restoration_period_revisions(archive, combined, path)
         period_repairs.extend(repaired)
+    seasonal_repairs=[]
+    product_classes=None
+    if seasonal_continuations and inherited_rules is not None:
+        source_root=inherited_rules.parent
+        source_manifest=source_root/'source_manifest.json'
+        universe_path=source_root/'universe/products.csv'
+        source_identity=json.loads(source_manifest.read_text())
+        if (sha256_file(source_manifest)!=manifest.get('parent_source_manifest_sha256')
+                or source_identity.get('files',{}).get('universe/products.csv',{}).get('sha256')
+                    !=sha256_file(universe_path)):
+            raise ValueError('seasonal product classes differ from the exact source parent')
+        source_universe=pl.read_csv(universe_path,infer_schema=False)
+        if source_universe['product'].is_duplicated().any():
+            raise ValueError('ambiguous seasonal product class identity')
+        product_classes=dict(source_universe.select('product','asset_class').iter_rows())
+        archive.copy(source_manifest,sha256_file(source_manifest),url='',kind='seasonal_product_class_parent')
+        archive.copy(universe_path,sha256_file(universe_path),url='',kind='seasonal_product_classes')
+    for url,published in seasonal_continuations:
+        new=declared_seasonal_margin_continuations(archive,combined,url,published,products=products,
+                                                 product_classes=product_classes)
+        if not new:raise ValueError('declared seasonal continuation has no uniquely source-bound level')
+        combined.extend(new)
+        seasonal_repairs.extend(dict(product=r['product'],source_url=url,published_date=published,
+            effective_date=r['effective_date'],after=r['after'],evidence=json.loads(r['extension_join_evidence'])) for r in new)
+    ratio_path=current/'dated_margin_ratio_laws.json'
+    inherited_ratio_proof=None
+    if not ratio_path.exists():
+        if inherited_rules is None:
+            raise ValueError('integrated margin delta requires its explicit inherited rules parent')
+        parent_path=inherited_rules/'manifest.json';parent_sha=sha256_file(parent_path)
+        parent_manifest=json.loads(parent_path.read_text())
+        if parent_sha!=manifest.get('parent_manifest_sha256'):
+            raise ValueError('inherited margin ratio laws differ from the exact rules parent')
+        ratio_path=inherited_rules/'dated_margin_ratio_laws.json'
+        ratio_sha=sha256_file(ratio_path)
+        if parent_manifest.get('outputs',{}).get(ratio_path.name,{}).get('sha256')!=ratio_sha:
+            raise ValueError('inherited margin ratio laws lack their parent output SHA')
+        inherited_ratio_proof=dict(parent_manifest_sha256=parent_sha,ratio_laws_sha256=ratio_sha)
+        archive.copy(parent_path,parent_sha,url='',kind='inherited_margin_rules_manifest')
+        archive.copy(ratio_path,ratio_sha,url='',kind='inherited_dated_margin_ratio_laws')
+    elif inherited_rules is not None:
+        raise ValueError('inherited rules input is only valid for an integrated delta without its own ratio laws')
+    attachment_rejections = []
+    if reconcile_reused_attachments:
+        combined, attachment_rejections = exclude_reused_margin_attachment_bindings(
+            archive, combined, products=products)
+        rejection_path = output / 'reused_attachment_rejections.json'
+        atomic_write_json(rejection_path, attachment_rejections)
+        archive.copy(rejection_path, sha256_file(rejection_path), url='',
+                     kind='reused_margin_attachment_rejections')
     levels, issues = margin_candidate_intervals(combined)
-    levels, ratio_issues = compose_margin_ratio_intervals(levels,
-        json.loads((current / 'dated_margin_ratio_laws.json').read_text()))
+    levels, ratio_issues = compose_margin_ratio_intervals(levels,json.loads(ratio_path.read_text()))
     rebuilt = pl.DataFrame(levels, schema=old_levels.schema)
     newly_changed = sorted(p for p in products if not old_levels.filter(pl.col('product') == p).sort(
         'effective_date', 'effective_phase').equals(rebuilt.filter(pl.col('product') == p).sort(
@@ -235,6 +523,8 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
     atomic_write_json(output / 'margin_interval_issues.json', issues + ratio_issues)
     outputs = {name: dict(sha256=sha256_file(output / name)) for name in
                ('margin_event_candidates.parquet', 'margin_level_intervals.parquet', 'margin_interval_issues.json')}
+    if reconcile_reused_attachments:
+        outputs['reused_attachment_rejections.json'] = dict(sha256=sha256_file(rejection_path))
     proof = dict(status='bounded_margin_restoration_sources_prepared',
         parent_manifest_sha256=sha256_file(current / 'manifest.json'), worklist_sha256=sha256_file(worklist),
         targeted_products=sorted(products), targeted_original_urls=sorted(urls), changed_products=affected,
@@ -242,9 +532,19 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
         continued_delta_manifest_sha256=continued_sha if continued is not None else None,
         restoration_inputs=input_proofs, outputs=outputs, sources=list(archive.sources.values()),
         margin_source_reviews=[dict(path=str(p.resolve()), sha256=sha256_file(p)) for p in source_reviews],
+        margin_code_reviews=[dict(path=str(p.resolve()), sha256=sha256_file(p)) for p in code_reviews],
         margin_clock_context_repairs=clock_repairs,
         margin_same_notice_clock_repairs=sibling_clock_repairs,
         margin_restoration_period_revisions=period_repairs,
+        seasonal_continuations=seasonal_repairs,
+        retained_disposition_restorations_reused=retained_dispositions,
+        retained_margin_facts_sha256=sha256_file(current/'margin_event_candidates.parquet')
+            if retained_dispositions else None,
+        inherited_ratio_laws=inherited_ratio_proof,
+        admitted_retained_margin_sources=admitted_sources,
+        admitted_canonical_seasonal_sources=admitted_seasonal_sources,
+        reused_attachment_bindings_rejected=len(attachment_rejections),
+        reused_attachment_reconciliation_selected=bool(reconcile_reused_attachments),
         restoration_cash_scope=json.loads((output/'restoration_cash_scope.json').read_text())
             if (output/'restoration_cash_scope.json').exists() else None,
         elapsed_s=time.monotonic()-begun,
@@ -259,7 +559,8 @@ def prepare_margin_repairs(current: Path, worklist: Path, output: Path, receipt:
 
 def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, receipt: Path,
                              *, product_universe: Path | None = None,
-                             announcements: Path | None = None, numeric_repairs: bool = False):
+                             announcements: Path | None = None, numeric_repairs: bool = False,
+                             review_overrides=(), archive_root: Path | None = None):
     """Re-read only source events implicated by the retained gap coordinates.
 
     This delta is evidence for the single maintained workspace, not another
@@ -272,7 +573,7 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
     from collections import defaultdict
     from scripts.build_tw_futures_margin_event_candidates import (
         candidate_notice_clock, retained_document_text_views,
-        corporate_numeric_anomalies, reconcile_corporate_numeric_views,
+        corporate_numeric_anomalies, reconcile_corporate_numeric_views, retain_review_override,
     )
     from stockagent.data.tw_futures_margin_preparation import (
         corporate_grid_candidates, corporate_retained_view_candidates,
@@ -300,13 +601,21 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
             nearby = file_day is not None and abs((file_day - gap['date']).days) <= 35
             own_month = (gap['contract'] in (row.get('contract_months') or [])
                          and effective is not None and 0 <= (gap['date'] - effective).days <= 365)
-            if nearby or own_month:
+            # An unresolved month list must not make its own dated original
+            # disappear from repair discovery. This locates source bytes only;
+            # parsing must still establish the actual physical month scope.
+            own_unresolved_month = not gap['contract'] and effective == gap['date']
+            if nearby or own_month or own_unresolved_month:
                 targeted.add((row['source_url'], row['source_content_sha256'], row['product']))
                 break
     sources = defaultdict(list)
     sources_by_hash = defaultdict(list)
     for row in manifest['sources']:
-        sources[row['url']].append(row)
+        # Integrated bundles also retain local legal-input receipts with no
+        # document URL. They remain in the SHA inventory and cannot be used
+        # as an announcement/text view for a different source document.
+        if row.get('url'):
+            sources[row['url']].append(row)
         sources_by_hash[row['sha256']].append(row)
     extra_input_hashes = {}
     notice_dates = {}
@@ -347,6 +656,14 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
                 targeted.update((url, document['content_sha256'], p) for p in products)
     checked = {}
     consumed = {}
+    override_archive = None
+    override_admissions = []
+    if review_overrides:
+        if archive_root is None:
+            raise ValueError('corporate extraction overrides require their original archive')
+        from stockagent.data.tw_futures_margin_preparation import RuleArchive
+        override_archive = RuleArchive(archive_root,output)
+        override_admissions = [retain_review_override(override_archive,root) for root in review_overrides]
 
     def verified(source):
         path = current / source['path']
@@ -361,6 +678,26 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
 
     fresh = []
     failures = []
+    def corporate_publication_clock(text,published):
+        clock=candidate_notice_clock(text,published)
+        if clock['issue_date_bound']:
+            return clock
+        # A later official index can legitimately lag the issuing page by
+        # more than the generic seven-day discovery heuristic. Retain the
+        # later index as knowledge time, require one literal issuing date
+        # and a still-future explicit adjustment, and never backdate values.
+        from downloader.taifex_rule_parsing import temporal_mentions
+        issued={r['date_iso'] for r in temporal_mentions(text) if r['role']=='publication'}
+        if len(issued)!=1:
+            return clock
+        issue=next(iter(issued))
+        original=candidate_notice_clock(text,issue)
+        effective=original.get('effective_date')
+        if (original['issue_date_bound'] and original.get('chronological')
+                and effective and issue<=published<effective):
+            return dict(original,publication_clock_contract='later_index_before_adjustment_v1',
+                source_issued_date=issue,index_publication_date=published)
+        return clock
     for url, digest in sorted({(u, d) for u, d, p in targeted}):
         documents = [json.loads(verified(s).read_text()) for s in sources[url] if s['kind'] == 'parsed_v2']
         documents = [d for d in documents if d.get('content_sha256') == digest]
@@ -382,12 +719,21 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
             verified(s)
         archive = SimpleNamespace(bundle=current)
         views = retained_document_text_views(archive, url, documents[0], sources=bound)
+        if override_archive is not None:
+            views = list(dict.fromkeys([*views,*retained_document_text_views(
+                override_archive,url,documents[0])]))
         old = facts.filter((pl.col('source_url') == url) & (pl.col('source_content_sha256') == digest))
         publications = set(old['published_date'].drop_nulls()) | notice_dates.get(url, set())
-        if len(publications) != 1:
-            failures.append(dict(url=url, reason='conflicting_retained_publication'))
+        bound_publications = {p for p in publications if any(
+            corporate_publication_clock(text,p)['issue_date_bound'] for text,_ in views)}
+        if len(bound_publications) != 1:
+            failures.append(dict(url=url, reason='conflicting_retained_publication'
+                if bound_publications else 'no_receipt_bound_publication_text'))
             continue
-        published = next(iter(publications))
+        # A reused URL can contain the amended PDF. Only the unique retained
+        # index date compatible with these same original bytes may bind it;
+        # an older index entry cannot backdate the amended financial values.
+        published = next(iter(bound_publications))
         tables = []
         by_hash = {s['sha256']: s for s in sources[url]}
         for s in sources[url]:
@@ -403,7 +749,7 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
         accepted_views = 0
         checked_views = []
         for text, view_identity in views:
-            clock = candidate_notice_clock(text, published)
+            clock = corporate_publication_clock(text, published)
             if not clock['issue_date_bound']:
                 continue
             accepted_views += 1
@@ -427,7 +773,10 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
                 fresh.append(dict(candidate, source_url=url, announcement_url=url,
                     source_content_sha256=digest, published_date=published,
                     known_at=published + 'T23:59:59+08:00', issue_date_bound=True,
-                    point_in_time_verified=False, retained_publication_views=[view_identity]))
+                    point_in_time_verified=False, retained_publication_views=[view_identity],
+                    publication_clock_evidence=json.dumps({k:clock[k] for k in
+                        ('publication_clock_contract','source_issued_date','index_publication_date') if k in clock},
+                        sort_keys=True)))
         for candidate in corporate_retained_view_candidates(checked_views):
             if (url, digest, candidate['product']) not in targeted:
                 continue
@@ -462,6 +811,8 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
         financial_values_inferred=False, new_provider_requests=0, new_ocr_jobs=0,
         new_accounting_builds=0, source_sha256s=checked,
         numeric_source_repairs=len(repairs),numeric_repair_contract='same_original_exact_event_coherent_numeric_view_v1',
+        review_override_admissions=override_admissions,
+        sources=list(override_archive.sources.values()) if override_archive is not None else [],
         outputs={'corporate_event_candidates.parquet': {'sha256': sha256_file(output / 'corporate_event_candidates.parquet')},
                  'corporate_term_issues.json': {'sha256': sha256_file(output / 'corporate_term_issues.json')},
                  **({'numeric_source_repairs.json':dict(sha256=sha256_file(output/'numeric_source_repairs.json'))}
@@ -471,6 +822,7 @@ def prepare_corporate_repairs(current: Path, worklist: Path, output: Path, recei
         builder_sha256=sha256_file(Path(__file__)))
     atomic_write_json(output / 'manifest.json', proof)
     atomic_write_json(receipt, proof)
+    if override_archive is not None:override_archive.conn.close()
     print(json.dumps({k: proof[k] for k in ('status','targeted_originals','added_views','new_ocr_jobs')}), flush=True)
 
 
@@ -853,9 +1205,173 @@ def stage_opening_margin_boundary_repair(raw_source, pending, review_path, recei
     return proof
 
 
+def compose_bounded_margin_amendments(current, facts, levels, amendments, *, archive):
+    """Join separately diagnosed product gaps without discarding accepted repairs.
+
+    Each addition keeps its own source-bound blocker worklist. Its changed
+    products must still equal the original parent's state in the existing
+    delta: overlapping accepted changes require an explicit combined repair.
+    """
+    if not amendments:
+        return facts, levels, []
+    base, parent = read_bound_output(current/'margin_level_intervals.parquet')
+    parent_sha = sha256_file(current/'manifest.json')
+    evidence = []
+    consumed = set()
+    def states(frame, product):
+        return {json.dumps(row, sort_keys=True, default=str, ensure_ascii=False)
+                for row in frame.filter(pl.col('product')==product).select(base.columns).to_dicts()}
+    for delta, worklist in amendments:
+        incoming, proof = read_bound_output(delta/'margin_level_intervals.parquet')
+        incoming_facts, _ = read_bound_output(delta/'margin_event_candidates.parquet')
+        if (proof.get('status')!='bounded_margin_restoration_sources_prepared'
+                or proof.get('parent_manifest_sha256')!=parent_sha
+                or proof.get('worklist_sha256')!=sha256_file(worklist)
+                or proof.get('financial_values_inferred') is not False):
+            raise ValueError('bounded margin amendment changes its verified source/worklist parent')
+        gaps = pl.read_csv(worklist, try_parse_dates=True, schema_overrides={'contract':pl.String})
+        gap_products = set(gaps.filter(pl.col('missing_opening_margin')
+            | pl.col('missing_settlement_margin'))['product'])
+        # A source-bound OCR correction can name a destination outside the old
+        # blocker list. Re-prove that exact original cell and its corrected
+        # numeric owner; a bare changed_products entry cannot enlarge scope.
+        review_hashes={r['sha256'] for r in proof.get('margin_code_reviews',[])}
+        if review_hashes:
+            original_facts,_=read_bound_output(current/'margin_event_candidates.parquet')
+            old_rows=original_facts.to_dicts();new_rows=incoming_facts.to_dicts()
+            bound_reviews={s['sha256']:s for s in proof['sources']
+                if s['kind']=='visual_margin_code_review'}
+            if not review_hashes<=bound_reviews.keys():
+                raise ValueError('margin code scope lacks its retained review')
+            additions=set()
+            for digest in sorted(review_hashes):
+                item=bound_reviews[digest];path=delta/item['path']
+                if not path.resolve().is_relative_to(delta.resolve()) or sha256_file(path)!=digest:
+                    raise ValueError('margin code scope review SHA/path mismatch')
+                review=json.loads(path.read_text())
+                if review.get('review_kind')!='source_bound_margin_product_code_cells' or not review.get('cells'):
+                    raise ValueError('margin code scope requires exact reviewed cells')
+                for cell in review['cells']:
+                    if cell['ocr_product'] not in gap_products or cell['product']==cell['ocr_product']:
+                        raise ValueError('margin code scope exceeds the original gap products')
+                    fields=('margin_kind','after','before')
+                    def matches(row,product):
+                        return (row['product']==product and row['source_url']==cell['source_url']
+                            and row['source_content_sha256']==cell['content_sha256']
+                            and all(row.get(f)==cell[f] for f in fields))
+                    if (not any(matches(r,cell['ocr_product']) for r in old_rows)
+                            or not any(matches(r,cell['product']) for r in new_rows)
+                            or archive.document(cell['source_url'])['content_sha256']!=cell['content_sha256']):
+                        raise ValueError('margin code scope original/corrected amount cells disagree')
+                    images=[s for s in proof['sources'] if s['sha256']==cell['page_image_sha256']
+                        and s['url']==cell['source_url'] and s['kind'].startswith('visual_margin_')]
+                    if not images or not isinstance(cell['page'],int) or cell['page']<=0:
+                        raise ValueError('margin code scope lacks its exact inspected image')
+                    for image in images:
+                        p=delta/image['path']
+                        if not p.resolve().is_relative_to(delta.resolve()) or sha256_file(p)!=image['sha256']:
+                            raise ValueError('margin code scope image SHA/path mismatch')
+                    additions.add(cell['product'])
+            gap_products.update(additions)
+        products = set(proof.get('changed_products', []))
+        actual = {p for p in set(base['product'])|set(incoming['product'])
+                  if states(base,p)!=states(incoming,p)}
+        if not products or actual!=products or not products<=gap_products or products&consumed:
+            raise ValueError('bounded margin amendment exceeds its exact changed/gap scope')
+        if any(states(levels,p)!=states(base,p) for p in products):
+            raise ValueError('bounded margin amendment overlaps an already accepted product repair')
+        for relative, item in proof['outputs'].items():
+            path = delta/relative
+            if not path.resolve().is_relative_to(delta.resolve()) or sha256_file(path)!=item['sha256']:
+                raise ValueError('bounded margin amendment output SHA/path mismatch')
+            archive.copy(path,item['sha256'],url='',kind='bounded_margin_amendment_output')
+        for item in proof['sources']:
+            path = delta/item['path']
+            if not path.resolve().is_relative_to(delta.resolve()):
+                raise ValueError('bounded margin amendment source escapes its bundle')
+            archive.copy(path,item['sha256'],url=item['url'],kind=item['kind'])
+        manifest_path = archive.copy(delta/'manifest.json',sha256_file(delta/'manifest.json'),
+                                     url='',kind='bounded_margin_amendment_manifest')
+        worklist_path = archive.copy(worklist,sha256_file(worklist),url='',kind='bounded_margin_amendment_worklist')
+        keep = ~pl.col('product').is_in(sorted(products))
+        take = pl.col('product').is_in(sorted(products))
+        facts = pl.concat([facts.filter(keep),incoming_facts.filter(take)],how='diagonal_relaxed')
+        levels = pl.concat([levels.filter(keep),incoming.filter(take).select(base.columns)],how='vertical')
+        evidence.append(dict(manifest_path=manifest_path,manifest_sha256=sha256_file(delta/'manifest.json'),
+            worklist_path=worklist_path,worklist_sha256=sha256_file(worklist),products=sorted(products)))
+        consumed.update(products)
+    return facts, levels, evidence
+
+
+def compose_bounded_corporate_amendments(current, facts, amendments, *, archive):
+    """Add re-read original views with their own exact parent and worklist.
+
+    A corporate diagnosis need not share a margin diagnosis's worklist. It
+    must preserve every original candidate, bind consumed source bytes, and
+    add views only for the explicitly requested corporate products. Inspected
+    cell replacement and financial conflict resolution stay with the caller.
+    """
+    if not amendments:
+        return facts, []
+    original, parent = read_bound_output(current/'corporate_event_candidates.parquet')
+    parent_sha = sha256_file(current/'manifest.json')
+    sources = {s['path']: s for s in parent['sources']}
+    def identity(value):
+        # Diagonal concatenation can promote an exact integer to float. Python
+        # numeric equality preserves that value; serialized text does not.
+        if isinstance(value,dict):
+            return tuple(sorted((k,identity(v)) for k,v in value.items() if v is not None))
+        if isinstance(value,list):
+            return tuple(identity(v) for v in value)
+        return value
+    retained = {identity(r) for r in original.to_dicts()}
+    evidence = []
+    for delta, worklist in amendments:
+        incoming, proof = read_bound_output(delta/'corporate_event_candidates.parquet')
+        if (proof.get('status') != 'bounded_corporate_source_views_prepared'
+                or proof.get('parent_manifest_sha256') != parent_sha
+                or proof.get('worklist_sha256') != sha256_file(worklist)
+                or proof.get('financial_values_inferred') is not False):
+            raise ValueError('bounded corporate amendment changes its verified source/worklist parent')
+        rows = incoming.to_dicts()
+        if not retained <= {identity(r) for r in rows}:
+            raise ValueError('corporate amendment discarded original candidate evidence')
+        added = [r for r in rows if identity(r) not in retained]
+        gaps = pl.read_csv(worklist,try_parse_dates=True,schema_overrides={'contract':pl.String})
+        scope = set(gaps.filter(pl.col('missing_adjusted_terms') | pl.col('unresolved_lifetime')
+                              | pl.col('lost_inventory_continuation'))['product'])
+        if any(r.get('product') not in scope and r.get('from_product') not in scope for r in added):
+            raise ValueError('corporate amendment enlarged its diagnosed product scope')
+        for name, digest in proof['source_sha256s'].items():
+            source = sources.get(name)
+            path = current/name
+            if (source is None or source['sha256'] != digest
+                    or not path.resolve().is_relative_to(current.resolve())
+                    or sha256_file(path) != digest):
+                raise ValueError('corporate amendment source SHA/path mismatch')
+            archive.copy(path,digest,url=source.get('url',''),kind=source['kind'])
+        for source in proof.get('sources',[]):
+            path=delta/source['path']
+            if (not path.resolve().is_relative_to(delta.resolve())
+                    or sha256_file(path)!=source['sha256']):
+                raise ValueError('corporate amendment extraction source SHA/path mismatch')
+            archive.copy(path,source['sha256'],url=source.get('url',''),kind=source['kind'])
+        for path,kind in [(delta/'manifest.json','bounded_corporate_amendment_manifest'),
+                          (worklist,'bounded_corporate_amendment_worklist')]:
+            archive.copy(path,sha256_file(path),url='',kind=kind)
+        if added:
+            facts = pl.concat([facts,pl.from_dicts(added,infer_schema_length=None)],
+                              how='diagonal_relaxed').unique(maintain_order=True)
+        evidence.append(dict(manifest_sha256=sha256_file(delta/'manifest.json'),
+            worklist_sha256=sha256_file(worklist),added_views=len(added),
+            source_failures=proof.get('source_failures',[]),products=sorted(scope)))
+    return facts,evidence
+
+
 def stage_rule_repairs(current: Path, raw_source: Path, corporate_delta: Path, margin_delta: Path,
                        corporate_review: Path, output: Path, receipt: Path, *, archive_root: Path,
-                       refresh_pending: bool = False, additional_corporate_reviews=()):
+                       refresh_pending: bool = False, additional_corporate_reviews=(), margin_amendments=(),
+                       corporate_amendments=()):
     """One pending source delta; the current training release stays immutable."""
     from stockagent.data.tw_futures_margin_preparation import (
         RuleArchive, corporate_terms_intervals, corporate_identity_boundaries,
@@ -895,6 +1411,10 @@ def stage_rule_repairs(current: Path, raw_source: Path, corporate_delta: Path, m
         if sha256_file(current / path) != digest:
             raise ValueError('corporate retained source changed after preparation')
     archive = RuleArchive(archive_root, output)
+    cf, corporate_additions = compose_bounded_corporate_amendments(
+        current,cf,corporate_amendments,archive=archive)
+    margin_facts, margins, margin_additions = compose_bounded_margin_amendments(
+        current, margin_facts, margins, margin_amendments, archive=archive)
     opening_reviews = retained.get('opening_margin_boundary_reviews', []) if retained is not None else []
     opening_payloads = []
     for review in opening_reviews:
@@ -1027,6 +1547,8 @@ def stage_rule_repairs(current: Path, raw_source: Path, corporate_delta: Path, m
         terminal_formula_revision_source_sha256s=sorted({r['source_content_sha256'] for r in reviewed_cf
             if r.get('event_role') == 'terminal_formula_revision_only'}),
         worklist_sha256=corporate_proof['worklist_sha256'],
+        bounded_margin_amendments=margin_additions,
+        bounded_corporate_amendments=corporate_additions,
         changed_products=sorted(changed), changed_interval_products=changed_outputs,
         sources=list(archive.sources.values()),
         outputs={p.name: dict(sha256=sha256_file(p)) for p in output.iterdir()
@@ -1138,8 +1660,17 @@ if __name__=='__main__':
                    help='Additional byte-bound cash/disposition evidence for the exact parent worklist')
     p.add_argument('--margin-source-review', type=Path, action='append', default=[],
                    help='Inspected original margin cells/clocks for only the gap-owning products')
+    p.add_argument('--margin-code-review', type=Path, action='append', default=[],
+                   help='Exact source/page/amount-bound OCR product corrections for retained gaps')
+    p.add_argument('--seasonal-continuation', nargs=2, action='append', default=[],
+                   metavar=('RETAINED_URL','PUBLICATION_DATE'),
+                   help='An explicit unchanged seasonal-margin notice and its retained publication date')
+    p.add_argument('--inherited-margin-rules', type=Path,
+                   help='Exact original rules parent supplying ratio laws omitted by an integrated delta')
     p.add_argument('--reextract-margin-sources', action='store_true',
                    help='Re-read only retained gap-owning source tables with the maintained parser')
+    p.add_argument('--reconcile-reused-margin-attachments', action='store_true',
+                   help='Quarantine backdated URL views only with an independently bound identical event')
     p.add_argument('--stage-output', type=Path)
     p.add_argument('--terminal-review', type=Path, help='One complete inspected deadline fixing for the same pending source delta')
     p.add_argument('--information-halt-bundle', type=Path,
@@ -1151,17 +1682,25 @@ if __name__=='__main__':
     p.add_argument('--raw-source', type=Path)
     p.add_argument('--corporate-delta', type=Path)
     p.add_argument('--margin-delta', type=Path)
+    p.add_argument('--margin-amendment-delta',type=Path,action='append',default=[],
+                   help='Additional disjoint source-bound margin repair in the same staged rule bundle')
+    p.add_argument('--margin-amendment-worklist',type=Path,action='append',default=[],
+                   help='Exact blocker worklist for each additional margin delta, in the same order')
     p.add_argument('--corporate-source-review', type=Path)
     p.add_argument('--additional-corporate-source-review',type=Path,action='append',default=[],
                    help='Additional inspected numeric cells for the same unpromoted source delta')
     p.add_argument('--refresh-pending', action='store_true')
     p.add_argument('--archive-root', type=Path, default=Path('data_taifex_public_history/rules'))
     a=p.parse_args()
+    if (len(a.margin_amendment_delta)!=len(a.margin_amendment_worklist)
+            or a.margin_amendment_delta and (not a.stage_output or not a.corporate_delta or not a.margin_delta)):
+        p.error('bounded margin amendments require paired deltas/worklists in the existing rule staging mode')
     if a.numeric_repairs and not a.corporate_worklist:
         p.error('--numeric-repairs requires the bounded --corporate-worklist mode')
     if a.additional_corporate_source_review and not a.stage_output:
         p.error('additional inspected corporate cells require --stage-output')
-    if (a.restoration_evidence or a.margin_source_review or a.reextract_margin_sources
+    if (a.restoration_evidence or a.margin_source_review or a.margin_code_review or a.reextract_margin_sources
+            or a.seasonal_continuation or a.inherited_margin_rules or a.reconcile_reused_margin_attachments
             or a.margin_product or a.continue_margin_delta) and not a.margin_worklist:
         p.error('additional margin sources require the bounded --margin-worklist preparation mode')
     if a.opening_margin_review:
@@ -1196,14 +1735,18 @@ if __name__=='__main__':
             p.error('stage an already prepared delta without another preparation/promotion mode')
         stage_rule_repairs(a.current, a.raw_source, a.corporate_delta, a.margin_delta,
             a.corporate_source_review, a.stage_output, a.receipt, archive_root=a.archive_root,
-            refresh_pending=a.refresh_pending,additional_corporate_reviews=a.additional_corporate_source_review)
+            refresh_pending=a.refresh_pending,additional_corporate_reviews=a.additional_corporate_source_review,
+            margin_amendments=list(zip(a.margin_amendment_delta,a.margin_amendment_worklist)))
     elif a.margin_worklist:
         if not a.margin_output or a.corporate_worklist or a.amendments:
             p.error('bounded margin preparation requires --margin-output only')
         prepare_margin_repairs(a.current, a.margin_worklist, a.margin_output, a.receipt,
                               archive_root=a.archive_root, restoration_evidence=a.restoration_evidence,
                               source_reviews=a.margin_source_review, reextract_sources=a.reextract_margin_sources,
-                              selected_products=a.margin_product, continue_delta=a.continue_margin_delta)
+                              selected_products=a.margin_product, continue_delta=a.continue_margin_delta,
+                              code_reviews=a.margin_code_review, seasonal_continuations=a.seasonal_continuation,
+                              inherited_rules=a.inherited_margin_rules,
+                              reconcile_reused_attachments=a.reconcile_reused_margin_attachments)
     elif a.corporate_worklist:
         if not a.corporate_output or a.amendments:
             p.error('corporate repair requires --corporate-output and no --amendments')

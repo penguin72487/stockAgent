@@ -11,6 +11,50 @@ from stockagent.data_sync import windows_cold_io
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+def test_native_small_members_use_bounded_full_hash_batches(tmp_path, monkeypatch):
+    rows = []
+    for number in range(35):
+        raw = f'original body {number}'.encode()
+        name = f'{number}.bin'
+        (tmp_path / name).write_bytes(raw)
+        rows.append({'relative': name, 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)})
+    body = {'contract': CONTRACT, 'source_plan_identity_sha256': 'a' * 64, 'files': rows}
+    key = identity(body)
+    (tmp_path / 'backup-envelope.json').write_text(json.dumps({**body, 'identity_sha256': key}))
+    (tmp_path / 'READY').write_text(key + '\n')
+    calls = []
+    monkeypatch.setattr(windows_cold_io, 'windows_path', lambda path: 'D:\\test\\' + path.name)
+    def hashes(paths):
+        calls.append(len(paths))
+        return {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    monkeypatch.setattr(windows_cold_io, 'hash_many', hashes)
+    proof = verify(tmp_path, key, workers=2, native_windows_io=True)
+    assert sorted(calls) == [3, 16, 16]
+    assert proof['files_verified'] == 35
+    (tmp_path / '5.bin').write_bytes(b'corrupted body 5')
+    with pytest.raises(ValueError, match='content differs'):
+        verify(tmp_path, key, workers=2, native_windows_io=True)
+
+
+def test_native_hash_batch_cannot_hide_a_generation_change(tmp_path, monkeypatch):
+    raw = b'original body'
+    path = tmp_path / 'body.bin'
+    path.write_bytes(raw)
+    body = {'contract': CONTRACT, 'source_plan_identity_sha256': 'a' * 64,
+            'files': [{'relative': path.name, 'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw)}]}
+    key = identity(body)
+    (tmp_path / 'backup-envelope.json').write_text(json.dumps({**body, 'identity_sha256': key}))
+    (tmp_path / 'READY').write_text(key + '\n')
+    monkeypatch.setattr(windows_cold_io, 'windows_path', lambda path: 'D:\\test\\' + path.name)
+    def changed(paths):
+        hashes = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+        path.write_bytes(b'a different version')
+        return hashes
+    monkeypatch.setattr(windows_cold_io, 'hash_many', changed)
+    with pytest.raises(ValueError, match='member changed'):
+        verify(tmp_path, key, native_windows_io=True)
+
+
 @pytest.mark.parametrize('native', [False, True])
 def test_large_closed_delivery_rejects_same_size_corruption(tmp_path, native):
     payload = bytes(range(256)) * (9 * 1024**2 // 256)

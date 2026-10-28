@@ -17,6 +17,7 @@ from downloader.news_fulltext_candidate_originals import (
     ETTODAY_IMAGE_ORIGINAL_QUESTION, private_ettoday_image_credit_original_permit,
     ETTODAY_NONEMPTY_ORIGINAL_QUESTION, private_ettoday_nonempty_credit_original_permit,
     ETTODAY_CANONICAL_ORIGINAL_QUESTION, private_ettoday_canonical_credit_original_permit,
+    ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION, private_ettoday_disagreement_original_permit,
 )
 from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry
@@ -86,22 +87,42 @@ def http_stub(queue,envelope=None):
         blocked_gateway_hosts=lambda p:(),blocked_robots_origins=lambda p:())
 
 
-def complete_boundary(queue,settings):
-    request = submit(queue,settings,27)
-    http = http_stub(queue)
+def claim_submitted(queue, http, settings, request):
     # The bounded owner tick may yield after first-time SQLite schema/fsync
     # work. Drive the same submitted handle across ticks; never resubmit it.
-    deadline = time.monotonic()+2
+    deadline = time.monotonic()+5
     while True:
         diagnostic.pump_candidates(queue)
         job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
         if job is not None:
-            break
-        assert time.monotonic()<deadline, 'Submitted boundary was not admitted within bounded owner ticks'
+            assert job['request_id'] == request['request_id']
+            return job
+        assert time.monotonic()<deadline, 'Submitted question was not admitted within bounded owner ticks'
         time.sleep(0.005)
+
+
+def complete_boundary(queue,settings):
+    request = submit(queue,settings,27)
+    http = http_stub(queue)
+    job = claim_submitted(queue,http,settings,request)
     diagnostic.finish_candidate(queue,job,result=diagnostic.fetch_candidate(http,job))
     diagnostic.pump_candidates(queue)
     return request
+
+
+def test_boundary_fixture_waits_across_owner_yields_without_resubmission(queue,settings,monkeypatch):
+    original = diagnostic.pump_candidates
+    ticks = []
+    def yielding(owner, **kwargs):
+        ticks.append(owner)
+        if len(ticks) > 3:
+            return original(owner, **kwargs)
+    monkeypatch.setattr(diagnostic, 'pump_candidates', yielding)
+    before = head(queue)
+    request = complete_boundary(queue,settings)
+    assert len(ticks) >= 4 and head(queue) == before
+    jobs = queue.db.execute('SELECT request_id,state FROM native_candidate_jobs').fetchall()
+    assert [tuple(row) for row in jobs] == [(request['request_id'], 'observed')]
 
 
 def test_actual_signature_and_independent_person_prove_private_scope_not_article(queue,monkeypatch):
@@ -269,9 +290,9 @@ def inline_page(tag='strong',nested_break=False):
 
 def complete_plain_refusal(queue,settings):
     complete_boundary(queue,settings)
-    request = submit(queue,settings); diagnostic.pump_candidates(queue)
+    request = submit(queue,settings)
     http = http_stub(queue,response(inline_page()))
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    job = claim_submitted(queue,http,settings,request)
     try:
         diagnostic.fetch_candidate(http,job)
     except NewsError as error:
@@ -335,6 +356,52 @@ def test_inline_question_rechecks_actual_previous_outcome(queue,settings,mutatio
     with pytest.raises(ValueError): submit(queue,settings,29)
 
 
+@pytest.mark.parametrize(('mutation', 'detail'), [
+    ('error', 'result'), ('raw', 'result'), ('site', 'site'),
+    ('future_clock', 'clock'), ('request_hash', 'hash'),
+    ('identity', 'identity'), ('empty_payload', 'payload'), ('bad_json', 'malformed'),
+])
+def test_inline_claim_keeps_bounded_private_predecessor_failure_cause(queue,settings,mutation,detail):
+    previous = complete_plain_refusal(queue,settings)
+    candidate = submit(queue,settings,29)
+    diagnostic.pump_candidates(queue)
+    before = head(queue)
+    with queue.db:
+        if mutation == 'future_clock':
+            queue.db.execute("UPDATE native_candidate_jobs SET completed_at_utc='2099-01-01T00:00:00+00:00' WHERE request_id=?", (previous['request_id'],))
+        elif mutation == 'request_hash':
+            queue.db.execute("UPDATE native_candidate_jobs SET request_json=request_json||' ' WHERE request_id=?", (previous['request_id'],))
+        elif mutation == 'identity':
+            raw = queue.db.execute('SELECT request_json FROM native_candidate_jobs WHERE request_id=?', (previous['request_id'],)).fetchone()[0]
+            request = json.loads(raw); request['source']['data_fingerprint'] = 'a'*64
+            queue.db.execute('UPDATE native_candidate_jobs SET request_json=? WHERE request_id=?', (json.dumps(request), previous['request_id']))
+        elif mutation in {'empty_payload', 'bad_json'}:
+            queue.db.execute('UPDATE native_candidate_jobs SET result_json=? WHERE request_id=?', (' ' if mutation == 'bad_json' else '', previous['request_id']))
+        else:
+            raw = queue.db.execute('SELECT result_json FROM native_candidate_jobs WHERE request_id=?', (previous['request_id'],)).fetchone()[0]
+            result = json.loads(raw)
+            if mutation == 'error': result['error'] = 'paywall_or_login'
+            elif mutation == 'raw': result['raw_or_names_or_body_retained'] = True
+            else: result['failure_location']['sites'] = []
+            queue.db.execute('UPDATE native_candidate_jobs SET result_json=? WHERE request_id=?', (json.dumps(result), previous['request_id']))
+    http = http_stub(queue)
+    assert diagnostic.claim_candidate(queue,http,settings,'ettoday') is None
+    status = diagnostic.candidate_status(queue.root,candidate['request_id'])
+    assert status['state'] == 'skipped' and not http.calls and head(queue) == before
+    assert status['result_json'] == {'reason': 'head_or_source_no_longer_eligible',
+                                     'ettoday_inline_predecessor_guard': detail}
+
+
+def test_inline_submit_reports_bounded_predecessor_cause_without_changing_guard_error(queue,settings):
+    previous = complete_plain_refusal(queue,settings)
+    with queue.db:
+        queue.db.execute("UPDATE native_candidate_jobs SET completed_at_utc='2099-01-01T00:00:00+00:00' WHERE request_id=?", (previous['request_id'],))
+    with pytest.raises(ValueError) as raised:
+        submit(queue,settings,29)
+    assert str(raised.value) == 'completed_ettoday_plain_credit_original_scope_refusal_required'
+    assert raised.value.__notes__ == ['ettoday_inline_predecessor_guard=clock']
+
+
 def test_inline_original_new_question_preserves_closed_plain_and_boundary_results(queue,settings):
     plain = complete_plain_refusal(queue,settings)
     previous = {r['request_id']:dict(r) for r in queue.db.execute('SELECT * FROM native_candidate_jobs')}
@@ -368,9 +435,9 @@ def test_inline_cli_routes_to_current_owner_after_actual_plain_refusal(queue,set
 
 def complete_inline_refusal(queue,settings):
     complete_plain_refusal(queue,settings)
-    request = submit(queue,settings,29); diagnostic.pump_candidates(queue)
+    request = submit(queue,settings,29)
     http = http_stub(queue,response(inline_page('font')))
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    job = claim_submitted(queue,http,settings,request)
     with pytest.raises(NewsError) as failed:
         diagnostic.fetch_candidate(http,job)
     assert failed.value.code == 'private_ettoday_credit_original_scope_not_verified'
@@ -503,9 +570,9 @@ def image_page():
 
 def complete_image_refusal(queue,settings):
     complete_inline_refusal(queue,settings)
-    request = submit(queue,settings,30); diagnostic.pump_candidates(queue)
+    request = submit(queue,settings,30)
     http = http_stub(queue,response(image_page()))
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    job = claim_submitted(queue,http,settings,request)
     facts = diagnostic.fetch_candidate(http,job)
     assert facts['visible_credit_scope'] == {'verification_stage':'visible_prefix','prefix_nodes':1,
         'comment_nodes':0,'tag_counts':{'img':1},'separator_found':False}
@@ -603,9 +670,9 @@ def nonempty_page(blank_lines=1):
 
 def complete_empty_line_refusal(queue,settings):
     complete_image_refusal(queue,settings)
-    request = submit(queue,settings,31); diagnostic.pump_candidates(queue)
+    request = submit(queue,settings,31)
     http = http_stub(queue,response(nonempty_page()))
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    job = claim_submitted(queue,http,settings,request)
     facts = diagnostic.fetch_candidate(http,job)
     assert facts['visible_credit_scope']['verification_stage'] == 'printed_reporter'
     assert facts['visible_credit_scope']['prefix_characters'] == 0
@@ -772,9 +839,9 @@ def test_canonical_scope_does_not_guess_repair_or_accept_unsafe_source_values(qu
 
 def complete_named_author_refusal(queue,settings):
     complete_empty_line_refusal(queue,settings)
-    request = submit(queue,settings,32); diagnostic.pump_candidates(queue)
+    request = submit(queue,settings,32)
     http = http_stub(queue,response(canonical_author_page()[0]))
-    job = diagnostic.claim_candidate(queue,http,settings,'ettoday')
+    job = claim_submitted(queue,http,settings,request)
     facts = diagnostic.fetch_candidate(http,job)
     assert facts['private_original_scope_error'] == 'article_attribution_not_verified'
     assert facts['visible_credit_scope']['verification_stage'] == 'same_article_person'
@@ -857,4 +924,284 @@ def test_canonical_cli_uses_only_resident_mailbox(queue,settings,monkeypatch,tmp
     assert cli.main(['--output',str(output),'--probe',URL,'--require-current-missing-body-failure',
         '--failure-code','article_attribution_not_verified','--candidate-embedded-layout',LAYOUT,
         '--candidate-evidence-contract','33','--enqueue-candidate']) == 0
+    assert json.loads(output.read_text())['submitted']
+
+
+def complete_combined_schema_refusal(queue, settings):
+    complete_named_author_refusal(queue, settings)
+    request = submit(queue, settings, 33)
+    soup, _ = canonical_author_page()
+    native.update_schema(soup, author={'@type': 'Person', 'name': '來源外作者'})
+    http = http_stub(queue, response(soup))
+    job = claim_submitted(queue, http, settings, request)
+    facts = diagnostic.fetch_candidate(http, job)
+    assert facts['private_original_scope_error'] == 'article_rights_or_scope_excluded'
+    diagnostic.finish_candidate(queue, job, result=facts)
+    diagnostic.pump_candidates(queue)
+    return request
+
+
+@pytest.mark.parametrize('mutation,author_ok,publisher_ok', [
+    ('author', False, True), ('publisher', True, False), ('both', False, False), ('neither', True, True),
+])
+def test_schema_relationship_metadata_separates_predicates_without_values_or_body_parse(
+        queue, monkeypatch, mutation, author_ok, publisher_ok):
+    from downloader.news_fulltext_candidates import candidate_response_metadata
+    monkeypatch.setattr('downloader.news_fulltext_ettoday.ettoday_visible_article',
+        lambda *a, **k: pytest.fail('A relationship diagnosis is not body extraction'))
+    soup, signature = canonical_author_page('exact')
+    if mutation in {'author', 'both'}:
+        native.update_schema(soup, author={'@type': 'Person', 'name': '來源外作者'})
+        soup = native.BeautifulSoup(str(soup), 'lxml')
+    if mutation in {'publisher', 'both'}:
+        native.update_schema(soup, publisher={'@type': 'Organization', 'name': '其他出版單位'})
+    source = queue.registry.sources['ettoday']
+    facts = candidate_response_metadata(response(soup), source, source,
+        evidence_contract_version=51, requested_url=URL)
+    predicates = facts['schema_relationships']
+    assert predicates['identity_and_source_clocks_verified']
+    assert predicates['schema_authors_match_all_visible_reporters'] is author_ok
+    assert predicates['publisher_name_matches'] is publisher_ok
+    assert predicates['publisher_is_organization']
+    assert ('scope_error' in facts) is not (author_ok and publisher_ok)
+    assert not facts['accepted_as_article'] and not facts['raw_or_names_or_body_retained']
+    assert 'private_original_permit' not in facts
+    assert not any(text in json.dumps(facts, ensure_ascii=False)
+                   for text in (signature, native.PROSE, '研究記者', '來源外作者', '其他出版單位'))
+
+
+@pytest.mark.parametrize('mutation', ['identity', 'clock', 'paid', 'hidden'])
+def test_schema_relationship_predicates_do_not_precede_identity_clock_access_or_visibility(queue, mutation):
+    from downloader.news_fulltext_candidates import candidate_response_metadata
+    soup, _ = canonical_author_page()
+    if mutation == 'identity': native.update_schema(soup, url=URL+'0')
+    elif mutation == 'clock': native.update_schema(soup, datePublished=native.MOD)
+    elif mutation == 'paid': native.update_schema(soup, isAccessibleForFree=False)
+    else: soup.select_one('.story font')['hidden'] = ''
+    source = queue.registry.sources['ettoday']
+    facts = candidate_response_metadata(response(soup), source, source,
+        evidence_contract_version=51, requested_url=URL)
+    assert facts['schema_relationships'] == {} and facts['scope_error']
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing', 'uncertain_outcome', 'future_clock', 'request_hash', 'head',
+    'foreign_stage', 'raw', 'permit', 'question', 'status', 'foreign_site',
+])
+def test_schema_relationship_question_requires_closed_unchanged_combined_refusal(queue, settings, mutation):
+    request = complete_combined_schema_refusal(queue, settings)
+    with queue.db:
+        if mutation == 'missing':
+            queue.db.execute('DELETE FROM native_candidate_jobs WHERE request_id=?', (request['request_id'],))
+        elif mutation == 'uncertain_outcome':
+            queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'future_clock':
+            queue.db.execute("UPDATE native_candidate_jobs SET completed_at_utc='2099-01-01T00:00:00+00:00' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'request_hash':
+            queue.db.execute("UPDATE native_candidate_jobs SET request_json=request_json||' ' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'head': queue.db.execute('UPDATE articles SET attempts=attempts+1')
+        else:
+            facts = json.loads(queue.db.execute('SELECT result_json FROM native_candidate_jobs WHERE request_id=?',
+                (request['request_id'],)).fetchone()[0])
+            if mutation == 'foreign_stage': facts['visible_credit_scope']['verification_stage'] = 'source_clocks'
+            elif mutation == 'raw': facts['raw_or_names_or_body_retained'] = True
+            elif mutation == 'permit': facts['private_original_permit'] = {}
+            elif mutation == 'question': facts['question'] = ETTODAY_NONEMPTY_ORIGINAL_QUESTION
+            elif mutation == 'foreign_site': facts['failure_location']['sites'] = []
+            else: facts['status'] = 403
+            queue.db.execute('UPDATE native_candidate_jobs SET result_json=? WHERE request_id=?',
+                (json.dumps(facts), request['request_id']))
+    with pytest.raises(ValueError): submit(queue, settings, 51)
+
+
+def test_schema_relationship_once_only_current_owner_preserves_closed_results_and_article_heads(queue, settings):
+    from downloader.news_fulltext_ettoday import ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+    complete_combined_schema_refusal(queue, settings)
+    previous = {r['request_id']: dict(r) for r in queue.db.execute('SELECT * FROM native_candidate_jobs')}
+    before = head(queue)
+    request = submit(queue, settings, 51)
+    diagnostic.pump_candidates(queue)
+    soup, _ = canonical_author_page()
+    native.update_schema(soup, author={'@type': 'Person', 'name': '來源外作者'})
+    http = http_stub(queue, response(soup))
+    job = diagnostic.claim_candidate(queue, http, settings, 'ettoday')
+    facts = diagnostic.fetch_candidate(http, job)
+    assert type(facts) is dict and facts['question'] == ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+    diagnostic.finish_candidate(queue, job, result=facts)
+    diagnostic.pump_candidates(queue)
+    stored = diagnostic.candidate_status(queue.root, request['request_id'])
+    assert stored['state'] == 'observed' and stored['raw_or_names_or_body_retained'] is False
+    assert 'private_original' not in stored['result_json']
+    assert stored['result_json']['schema_relationships']['publisher_name_matches']
+    assert head(queue) == before and http.calls == [URL]
+    assert all(dict(queue.db.execute('SELECT * FROM native_candidate_jobs WHERE request_id=?', (key,)).fetchone()) == value
+               for key, value in previous.items())
+    assert not submit(queue, settings, 51, reason='Different reason is the same question')['submitted']
+    assert diagnostic._key(diagnostic._head(queue.db.execute('SELECT * FROM articles').fetchone()), 'f'*64,
+        evidence_contract_version=51) == json.loads(queue.db.execute(
+            'SELECT request_json FROM native_candidate_jobs WHERE request_id=?', (job['request_id'],)
+        ).fetchone()[0])['observation_key']
+
+
+@pytest.mark.parametrize('change', ['lease', 'due', 'prior'])
+def test_schema_relationship_claim_rechecks_current_head_and_prior_uncertainty(queue, settings, change):
+    old = complete_combined_schema_refusal(queue, settings)
+    submit(queue, settings, 51)
+    diagnostic.pump_candidates(queue)
+    with queue.db:
+        if change == 'lease': queue.db.execute("UPDATE articles SET lease_owner='other',lease_until=?", (time.time()+3600,))
+        elif change == 'due': queue.db.execute('UPDATE articles SET due=?', (time.time()+3600,))
+        else: queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome' WHERE request_id=?", (old['request_id'],))
+    http = http_stub(queue)
+    assert diagnostic.claim_candidate(queue, http, settings, 'ettoday') is None and not http.calls
+
+
+def test_schema_relationship_cli_only_submits_to_the_existing_owner(queue, settings, monkeypatch, tmp_path):
+    from scripts import probe_news_sources as cli
+    complete_combined_schema_refusal(queue, settings)
+    monkeypatch.setattr(cli, 'load_config', lambda p: (settings, queue.registry, tmp_path))
+    monkeypatch.setattr(cli, 'NewsHTTP', lambda *a, **k: pytest.fail('Mailbox only'))
+    output = tmp_path/'relationships-submitted.json'
+    assert cli.main(['--output', str(output), '--probe', URL, '--require-current-missing-body-failure',
+        '--failure-code', 'article_attribution_not_verified', '--candidate-embedded-layout', LAYOUT,
+        '--candidate-evidence-contract', '51', '--enqueue-candidate']) == 0
+    assert json.loads(output.read_text())['submitted']
+
+
+def person_disagreement_page():
+    soup = nonempty_page()
+    native.update_schema(soup, author={'@type': 'Person', 'name': '來源外作者'})
+    return native.BeautifulSoup(str(soup), 'lxml')
+
+
+def complete_person_disagreement(queue, settings):
+    complete_combined_schema_refusal(queue, settings)
+    request = submit(queue, settings, 51)
+    http = http_stub(queue, response(person_disagreement_page()))
+    job = claim_submitted(queue, http, settings, request)
+    facts = diagnostic.fetch_candidate(http, job)
+    assert facts['scope_error'] == 'article_rights_or_scope_excluded'
+    assert facts['schema_relationships']['visible_reporter_count'] == 1
+    diagnostic.finish_candidate(queue, job, result=facts)
+    diagnostic.pump_candidates(queue)
+    return request
+
+
+def test_disagreement_original_preserves_two_declarations_without_inventing_roles(queue):
+    source = queue.registry.sources['ettoday']
+    soup = person_disagreement_page()
+    with pytest.raises(NewsError):
+        private_ettoday_canonical_credit_original_permit(response(soup), source, URL)
+    facts = {}
+    permit, document = private_ettoday_disagreement_original_permit(
+        response(soup), source, URL, include_document=True, relationship_facts=facts)
+    assert permit['question'] == ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION
+    assert permit['author_declarations_disagree'] and not permit['same_person_or_editor_role_inferred']
+    assert not permit['source_values_rewritten']
+    assert facts['publisher_name_matches'] and facts['identity_and_source_clocks_verified']
+    assert not facts['schema_authors_match_all_visible_reporters']
+    assert not any(s in json.dumps(permit, ensure_ascii=False) for s in (SIGNATURE, '來源外作者', native.PROSE))
+    assert SIGNATURE in document.get_text() and '來源外作者' in str(document)
+
+
+@pytest.mark.parametrize('mutation', [
+    'identity', 'publisher', 'clock', 'paid', 'hidden', 'reprint', 'missing_credit',
+    'organization', 'matching_author', 'blank_author', 'long_author', 'multiple_authors',
+])
+def test_disagreement_original_still_requires_literal_credit_identity_publisher_clock_and_scope(queue, mutation):
+    soup = person_disagreement_page()
+    if mutation == 'identity': native.update_schema(soup, url=URL+'0')
+    elif mutation == 'publisher': native.update_schema(soup, publisher={'@type': 'Organization', 'name': '其他出版單位'})
+    elif mutation == 'clock': native.update_schema(soup, datePublished=native.MOD)
+    elif mutation == 'paid': native.update_schema(soup, isAccessibleForFree=False)
+    elif mutation == 'hidden': soup.select_one('.story font')['hidden'] = ''
+    elif mutation == 'reprint': soup.select_one('.story > p:last-child').string = '本文轉載自其他來源'
+    elif mutation == 'missing_credit': soup.select_one('.story font').string = '沒有署名'
+    elif mutation == 'organization': native.update_schema(soup, author={'@type': 'Organization', 'name': '其他出版單位'})
+    elif mutation == 'matching_author': native.update_schema(soup, author={'@type': 'Person', 'name': '研究記者'})
+    elif mutation == 'blank_author': native.update_schema(soup, author={'@type': 'Person', 'name': ''})
+    elif mutation == 'long_author': native.update_schema(soup, author={'@type': 'Person', 'name': '甲'*129})
+    else: native.update_schema(soup, author=[{'@type': 'Person', 'name': name} for name in ('甲', '乙')])
+    with pytest.raises(NewsError):
+        private_ettoday_disagreement_original_permit(response(soup), queue.registry.sources['ettoday'], URL)
+
+
+@pytest.mark.parametrize('mutation', [
+    'missing', 'uncertain_outcome', 'future_clock', 'request_hash', 'head',
+    'publisher', 'reporter_count', 'bool_as_int', 'raw', 'permit', 'question', 'status',
+])
+def test_disagreement_original_requires_closed_positive_same_head_relationship_observation(queue, settings, mutation):
+    request = complete_person_disagreement(queue, settings)
+    with queue.db:
+        if mutation == 'missing':
+            queue.db.execute('DELETE FROM native_candidate_jobs WHERE request_id=?', (request['request_id'],))
+        elif mutation == 'uncertain_outcome':
+            queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'future_clock':
+            queue.db.execute("UPDATE native_candidate_jobs SET completed_at_utc='2099-01-01T00:00:00+00:00' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'request_hash':
+            queue.db.execute("UPDATE native_candidate_jobs SET request_json=request_json||' ' WHERE request_id=?", (request['request_id'],))
+        elif mutation == 'head': queue.db.execute('UPDATE articles SET attempts=attempts+1')
+        else:
+            facts = json.loads(queue.db.execute('SELECT result_json FROM native_candidate_jobs WHERE request_id=?',
+                (request['request_id'],)).fetchone()[0])
+            if mutation == 'publisher': facts['schema_relationships']['publisher_name_matches'] = False
+            elif mutation == 'reporter_count': facts['schema_relationships']['visible_reporter_count'] = 2
+            elif mutation == 'bool_as_int': facts['schema_relationships']['visible_reporter_count'] = True
+            elif mutation == 'raw': facts['raw_or_names_or_body_retained'] = True
+            elif mutation == 'permit': facts['private_original_permit'] = {}
+            elif mutation == 'question': facts['question'] = ETTODAY_CANONICAL_ORIGINAL_QUESTION
+            else: facts['status'] = 403
+            queue.db.execute('UPDATE native_candidate_jobs SET result_json=? WHERE request_id=?',
+                (json.dumps(facts), request['request_id']))
+    with pytest.raises(ValueError): submit(queue, settings, 52)
+
+
+def test_disagreement_original_resident_write_rechecks_raw_preserves_heads_and_never_replays(queue, settings):
+    complete_person_disagreement(queue, settings)
+    previous = {r['request_id']: dict(r) for r in queue.db.execute('SELECT * FROM native_candidate_jobs')}
+    before = head(queue)
+    request = submit(queue, settings, 52)
+    diagnostic.pump_candidates(queue)
+    http = http_stub(queue, response(person_disagreement_page()))
+    job = diagnostic.claim_candidate(queue, http, settings, 'ettoday')
+    result = diagnostic.fetch_candidate(http, job)
+    assert isinstance(result, PendingOriginal) and result.permit['question'] == ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION
+    broken = person_disagreement_page(); native.update_schema(broken, publisher={'@type': 'Organization', 'name': '其他出版單位'})
+    with pytest.raises(NewsError): retain_original(queue, job, PendingOriginal(response(broken), {}, result.permit))
+    diagnostic.finish_candidate(queue, job, result=result)
+    diagnostic.pump_candidates(queue)
+    status = diagnostic.candidate_status(queue.root, request['request_id'])
+    assert status['state'] == 'observed' and status['raw_retention_state'] == 'retained_verified'
+    path = queue.root/status['result_json']['private_original']['path']
+    record, = pq.ParquetFile(path).read().to_pylist()
+    assert record['raw_response_body'] == result.response.body and path.stat().st_mode & 0o777 == 0o600
+    assert not record['accepted_as_article'] and not record['publish'] and not record['remote_training_export']
+    assert head(queue) == before and http.calls == [URL]
+    assert all(dict(queue.db.execute('SELECT * FROM native_candidate_jobs WHERE request_id=?', (key,)).fetchone()) == value
+               for key, value in previous.items())
+    assert not submit(queue, settings, 52, reason='Same question with another reason')['submitted']
+
+
+@pytest.mark.parametrize('change', ['lease', 'due', 'prior'])
+def test_disagreement_original_claim_rechecks_due_lease_and_prior_uncertainty(queue, settings, change):
+    old = complete_person_disagreement(queue, settings)
+    submit(queue, settings, 52); diagnostic.pump_candidates(queue)
+    with queue.db:
+        if change == 'lease': queue.db.execute("UPDATE articles SET lease_owner='other',lease_until=?", (time.time()+3600,))
+        elif change == 'due': queue.db.execute('UPDATE articles SET due=?', (time.time()+3600,))
+        else: queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome' WHERE request_id=?", (old['request_id'],))
+    http = http_stub(queue)
+    assert diagnostic.claim_candidate(queue, http, settings, 'ettoday') is None and not http.calls
+
+
+def test_disagreement_original_cli_submits_only_to_resident_mailbox(queue, settings, monkeypatch, tmp_path):
+    from scripts import probe_news_sources as cli
+    complete_person_disagreement(queue, settings)
+    monkeypatch.setattr(cli, 'load_config', lambda p: (settings, queue.registry, tmp_path))
+    monkeypatch.setattr(cli, 'NewsHTTP', lambda *a, **k: pytest.fail('Mailbox only'))
+    output = tmp_path/'disagreement-submitted.json'
+    assert cli.main(['--output', str(output), '--probe', URL, '--require-current-missing-body-failure',
+        '--failure-code', 'article_attribution_not_verified', '--candidate-embedded-layout', LAYOUT,
+        '--candidate-evidence-contract', '52', '--enqueue-candidate']) == 0
     assert json.loads(output.read_text())['submitted']

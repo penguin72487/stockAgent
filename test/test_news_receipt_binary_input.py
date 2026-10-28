@@ -45,11 +45,11 @@ def test_only_one_original_read_and_non_utf8_locale_uses_same_captured_text_byte
     from scripts import benchmark_news_acceptance_recovery as module
     path = tmp_path / 'receipt.json'
     path.write_bytes(b'{"original":true}')
-    seen, original = [], Path.read_bytes
-    def read(path):
+    seen, original = [], Path.open
+    def opening(path, *args, **kwargs):
         seen.append(path)
-        return original(path)
-    monkeypatch.setattr(Path, 'read_bytes', read)
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'open', opening)
     monkeypatch.setattr(module.locale, 'getpreferredencoding', lambda _flag: 'cp1252')
     actual = _binary_receipt_input(path)
     assert isinstance(actual, str) and loads(actual) == {'original': True}

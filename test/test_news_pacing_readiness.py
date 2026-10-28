@@ -157,7 +157,7 @@ def test_unseen_shared_slot_race_is_bounded_and_preserves_attempts_and_token(con
         assert caught.value.request_deferred and caught.value.delay > .5
         queue.failed(row, caught.value, 6)
         restored = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
-        assert restored['attempts'] == 5 and restored['state'] == 'retry' and restored['lease_owner'] is None
+        assert restored['attempts'] == 5 and restored['state'] == 'pending' and restored['lease_owner'] is None
         assert restored['body_sha256'] is None and restored['due'] > time.time() + .5
         assert http.limiters['publisher'].pending_waiters() == 0
         assert http.limiters['publisher']._state_path.read_bytes() == slot_before

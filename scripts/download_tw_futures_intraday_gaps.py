@@ -328,10 +328,17 @@ def existing_source_candidates(frame: pl.DataFrame, *, daily_path: Path,
                                official_zip_root: Path) -> pl.DataFrame:
     """Defer existing receipts/ZIPs for builder validation; do not bless content."""
     from downloader.download_shioaji_historical_market_data import _valid_receipt
-    selected = pl.read_parquet(daily_path, columns=['date','physical_contract','shioaji_roots']).join(
-        frame.select('date','physical_contract'), on=['date','physical_contract'], how='semi')
-    aliases = {(r['date'],r['physical_contract']):str(r['shioaji_roots'] or '').split(',')
-               for r in selected.to_dicts()}
+    daily = pl.scan_parquet(daily_path)
+    # Financial releases need not carry optional broker query hints. Their
+    # exact physical identity still supplies the native product root below;
+    # missing aliases neither reject acquisition nor establish PIT eligibility.
+    has_aliases = 'shioaji_roots' in daily.collect_schema().names()
+    selected = daily.select('date', 'physical_contract',
+        *(['shioaji_roots'] if has_aliases else [])).join(
+            frame.select('date','physical_contract').lazy(),
+            on=['date','physical_contract'], how='semi').collect()
+    aliases = ({(r['date'],r['physical_contract']):str(r['shioaji_roots'] or '').split(',')
+                for r in selected.to_dicts()} if has_aliases else {})
     inventory_path = shioaji_root / 'inventory/contracts.parquet'
     inventory = pl.read_parquet(inventory_path).filter(pl.col('collection') == 'exact_futures') if inventory_path.is_file() else pl.DataFrame()
     by_physical: dict[str,list[dict]] = {}

@@ -14,9 +14,151 @@ from stockagent.data_sync.legacy_artifact_archive import (
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 
 
+@pytest.mark.parametrize('workers', [1, 8])
+@pytest.mark.parametrize('mutation', ['replace-same-size-mtime', 'mode', 'mtime',
+    'add', 'delete', 'symlink-file', 'symlink-directory', 'fifo'])
+def test_stage_fingerprint_observes_each_new_generation_and_rejects_redirects(tmp_path, mutation, workers):
+    stage = tmp_path / 'stage'
+    (stage / 'nested').mkdir(parents=True)
+    payload = stage / 'nested/行情.json'
+    payload.write_bytes(b'old')
+    plan = {'dataset': 'engineering-fixture', 'snapshot_id': 'fixed', 'manifest_sha256': 'a' * 64}
+    before = module._stage_prune_fingerprint(stage, plan, file_workers=workers)
+    info = payload.stat()
+    if mutation == 'replace-same-size-mtime':
+        replacement = tmp_path / 'replacement'
+        replacement.write_bytes(b'new')
+        os.utime(replacement, ns=(info.st_atime_ns, info.st_mtime_ns))
+        replacement.replace(payload)
+    elif mutation == 'mode':
+        payload.chmod(0o400)
+    elif mutation == 'mtime':
+        os.utime(payload, ns=(info.st_atime_ns, info.st_mtime_ns + 1))
+    elif mutation == 'add':
+        (stage / 'new').write_bytes(b'new observation')
+    elif mutation == 'delete':
+        payload.unlink()
+    elif mutation == 'symlink-file':
+        payload.unlink()
+        payload.symlink_to(tmp_path / 'outside-source')
+    elif mutation == 'symlink-directory':
+        (stage / 'redirected').symlink_to(tmp_path / 'outside-root', target_is_directory=True)
+        # os.walk classifies a dangling directory symlink as a file. Create
+        # the external directory so this exercises the directory guard too.
+        (tmp_path / 'outside-root').mkdir()
+    else:
+        payload.unlink()
+        os.mkfifo(payload)
+    if mutation in {'symlink-file', 'symlink-directory', 'fifo'}:
+        with pytest.raises(SnapshotError, match='symlink directory|non-regular file'):
+            module._stage_prune_fingerprint(stage, plan, file_workers=workers)
+    else:
+        assert module._stage_prune_fingerprint(stage, plan, file_workers=workers) != before
+
+
+def test_parallel_stage_fingerprint_preserves_full_generation_and_fails_closed(tmp_path, monkeypatch):
+    stage = tmp_path / 'stage'
+    (stage / 'nested').mkdir(parents=True)
+    for index in range(140):
+        (stage / 'nested' / str(index)).write_text(str(index))
+    plan = {'dataset': 'fixture', 'snapshot_id': 'fixed', 'manifest_sha256': 'a' * 64}
+    before = module._stage_prune_fingerprint(stage, plan)
+    assert module._stage_prune_fingerprint(stage, plan, file_workers=4) == before
+    assert module._stage_prune_fingerprint(stage, plan, file_workers=8) == before
+    (stage / 'nested' / '1').write_text('different')
+    assert module._stage_prune_fingerprint(stage, plan, file_workers=4) != before
+    original_scandir = os.scandir
+    def denied(path):
+        if Path(path) == stage / 'nested':
+            raise PermissionError('unreadable stage')
+        return original_scandir(path)
+    monkeypatch.setattr(os, 'scandir', denied)
+    with pytest.raises(PermissionError, match='unreadable stage'):
+        module._stage_prune_fingerprint(stage, plan, file_workers=4)
+    with pytest.raises(PermissionError, match='unreadable stage'):
+        module._stage_prune_fingerprint(stage, plan, file_workers=8)
+
+
+def test_stage_allocation_matches_independent_hardlink_aware_audit(tmp_path):
+    from stockagent.data_sync.artifact_retirement import _reclaimable_file_bytes
+    stage = tmp_path / 'stage'
+    stage.mkdir()
+    (stage / 'single').write_bytes(b'one')
+    (stage / 'two-links').write_bytes(b'two')
+    os.link(stage / 'two-links', stage / 'same-stage-link')
+    (stage / 'external').write_bytes(b'three')
+    os.link(stage / 'external', tmp_path / 'outside-link')
+    reference = _reclaimable_file_bytes(stage)
+    for workers in (1, 4, 8):
+        rows, allocated = module._stage_prune_signatures(stage, file_workers=workers, collect_allocation=True)
+        assert allocated == reference
+        assert rows == module._stage_prune_signatures(stage, file_workers=workers)
+
+
+@pytest.mark.parametrize('soft_limit, expected', [(1024, 8), (63, 4), (module.resource.RLIM_INFINITY, 8)])
+def test_stage_metadata_parallelism_is_bounded_to_exact_approved_d_stage(tmp_path, monkeypatch, soft_limit, expected):
+    spec, _packed, _options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    stage = spec.stage_root / spec.dataset
+    monkeypatch.setattr(module.resource, 'getrlimit', lambda _which: (soft_limit, soft_limit))
+    assert module._stage_prune_metadata_workers(spec, stage) == expected
+    assert module._stage_prune_metadata_workers(spec, stage.with_name('different')) == 1
+    quarantine = stage.with_name(f'.{spec.dataset}.pruning-{os.getpid()}')
+    assert module._stage_prune_metadata_workers(spec, quarantine) == expected
+    other = stage.with_name(f'.{spec.dataset}.pruning-{os.getpid() + 1}')
+    assert module._stage_prune_metadata_workers(spec, other) == 1
+    assert module._stage_prune_metadata_workers(replace(spec, capture_contract=None), stage) == 4
+
+
+@pytest.mark.parametrize('fd_observation', ['busy', 'unreadable'])
+def test_stage_metadata_parallelism_preserves_live_fd_headroom(tmp_path, monkeypatch, fd_observation):
+    spec, _packed, _options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    stage = spec.stage_root / spec.dataset
+    monkeypatch.setattr(module.resource, 'getrlimit', lambda _which: (64, 64))
+    listdir = module.os.listdir
+    def observed(path):
+        if path == '/proc/self/fd':
+            if fd_observation == 'unreadable':
+                raise OSError('descriptor inventory unavailable')
+            return [str(i) for i in range(50)]
+        return listdir(path)
+    monkeypatch.setattr(module.os, 'listdir', observed)
+    assert module._stage_prune_metadata_workers(spec, stage) == 4
+
+
+def test_parallel_d_stage_prune_rechecks_and_recovers_exact_fixed_source(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    monkeypatch.setattr(module.resource, 'getrlimit', lambda _which: (1024, 1024))
+    original_proof = verify_cold_archive(spec, packed)
+    signatures = module._stage_prune_signatures
+    workers_seen = []
+    def observe(*args, **kwargs):
+        workers_seen.append(kwargs.get('file_workers', 1))
+        return signatures(*args, **kwargs)
+    monkeypatch.setattr(module, '_stage_prune_signatures', observe)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                       owned_verified_plan=plan, **options)
+    assert len(workers_seen) >= 5 and all(workers == 8 for workers in workers_seen)
+    assert result['pruned'] and result['cold_objects_deleted'] == 0
+    proof = verify_cold_archive(spec, packed)
+    assert proof['cold_verified'] and proof['decoded_originals_verified']
+    assert all(proof[key] == original_proof[key]
+               for key in ('files', 'original_bytes', 'snapshot_id', 'manifest_sha256'))
+
+
 def fixture(tmp_path, monkeypatch, *, benchmark_d=False, offline_d=False):
     from test_legacy_manual_capture import fixture as source_fixture
     import stockagent.data_sync.materialized_cache as cache
+    import stockagent.data_sync.artifact_maintenance as maintenance
+    # These private source/stage fixtures have their own process inventory.
+    # Retain the real fd/maps/ancestor parsers without walking unrelated host
+    # processes and Windows paths for each synthetic publication.
+    processes = tmp_path / 'proc'
+    processes.mkdir()
+    def process_directories():
+        return sorted(path for path in processes.iterdir() if path.name.isdecimal())
+    monkeypatch.setattr(cache, '_process_directories', process_directories)
+    monkeypatch.setattr(maintenance, '_process_directories', process_directories)
     # This unit fixture owns a private materialization tree. Exercise the real
     # pin reader there, not a multi-million-file production cache per case.
     # Individual fault tests may still override the reader after setup.
@@ -59,6 +201,40 @@ def fixture(tmp_path, monkeypatch, *, benchmark_d=False, offline_d=False):
     return spec, packed, options
 
 
+@pytest.mark.parametrize('after_audit', [False, True])
+def test_stage_prune_keeps_actual_fd_parser_and_fresh_use_gate_in_isolated_proc(
+    tmp_path, monkeypatch, after_audit,
+):
+    spec, packed, options = fixture(tmp_path, monkeypatch)
+    stage = spec.stage_root / spec.dataset
+    original_files = {path.relative_to(stage).as_posix(): path.read_bytes()
+                      for path in stage.rglob('*') if path.is_file()}
+    plan = plan_archive_stage_prune(spec, packed, **options) if after_audit else None
+    process = tmp_path / 'proc/999999999'
+    (process / 'fd').mkdir(parents=True)
+    for name in ('cwd', 'root', 'exe'):
+        (process / name).symlink_to(tmp_path, target_is_directory=True)
+    (process / 'maps').write_text('')
+    (process / 'cmdline').write_bytes(b'isolated-fixture-worker\0')
+    descriptor = process / 'fd/3'
+    descriptor.symlink_to(stage / 'archive/legacy_archive_manifest.json')
+    expected_error = 'final gates changed' if after_audit else 'live process references'
+    with pytest.raises(SnapshotError, match=expected_error):
+        if after_audit:
+            apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                owned_verified_plan=plan, **options)
+        else:
+            plan_archive_stage_prune(spec, packed, **options)
+    protected = next(spec.stage_root.glob(f'.{spec.dataset}.pruning-*')) if after_audit else stage
+    assert {path.relative_to(protected).as_posix(): path.read_bytes()
+            for path in protected.rglob('*') if path.is_file()} == original_files
+    descriptor.unlink()
+    if not after_audit:
+        assert plan_archive_stage_prune(spec, packed, **options)['apply_ready'] is True
+    else:
+        assert not stage.exists() and protected.is_dir()
+
+
 @pytest.mark.parametrize('benchmark_d', [False, True])
 def test_stage_prune_reads_real_pins_from_isolated_fixture(tmp_path, monkeypatch, benchmark_d):
     spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=benchmark_d)
@@ -96,6 +272,20 @@ def test_completed_benchmark_d_scratch_uses_the_same_full_recovery_and_quarantin
     assert not (spec.stage_root / spec.dataset).exists()
     proof = verify_cold_archive(spec, packed)
     assert proof['cold_verified'] and proof['decoded_originals_verified'] and proof['files'] == 4
+
+
+def test_d_stage_parallel_receipt_verification_rejects_corruption(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    stage = spec.stage_root / spec.dataset
+    assert module._d_stage_file_workers(spec, stage / 'archive') == 4
+    quarantine = stage.with_name(f'.{spec.dataset}.pruning-{os.getpid()}')
+    assert module._d_stage_file_workers(spec, quarantine / 'archive') == 4
+    assert module._d_stage_file_workers(spec, stage.with_name('.other.pruning-1') / 'archive') == 1
+    receipt = next((stage / 'receipts').iterdir())
+    receipt.write_text('{}')
+    with pytest.raises(SnapshotError, match='per-file receipt differs'):
+        plan_archive_stage_prune(spec, packed, **options)
+    assert stage.is_dir()
 
 
 def test_offline_d_scratch_uses_exact_cold_recovery_and_quarantine_before_prune(tmp_path, monkeypatch):
@@ -254,6 +444,110 @@ def test_owned_stage_plan_reuses_full_d_proof_and_still_decodes_the_quarantine(t
                                      owned_verified_plan=plan, **options)
     assert result["pruned"] and len(calls) == 1
     assert verify_cold_archive(spec, packed)["decoded_originals_verified"]
+
+
+@pytest.mark.parametrize('failure', [None, 'cold-bytes', 'cold-generation', 'source', 'clock-backwards'])
+def test_long_quarantine_decode_requires_new_complete_d_recovery(tmp_path, monkeypatch, failure):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    old_proof = dict(plan['full_verification'])
+    clock = [old_proof['verified_at_epoch'] + 1]
+    monkeypatch.setattr(module.time, 'time', lambda: clock[0])
+    decode = module.verify_archive_directory
+    calls = []
+    def slow_decode(*args, **kwargs):
+        proof = decode(*args, **kwargs)
+        clock[0] += -100 if failure == 'clock-backwards' else 1600
+        if failure in {'cold-bytes', 'cold-generation'}:
+            release = resolve_latest_packed(packed, spec.dataset)
+            payload = packed / release.manifest['archive']['objects'][0]['relpath']
+            saved = payload.stat()
+            payload.write_bytes(b'X' * saved.st_size)
+            os.utime(payload, ns=(saved.st_atime_ns, saved.st_mtime_ns))
+        if failure == 'source':
+            (options['artifact_root'] / spec.relative_root).mkdir()
+        return proof
+    verify = module.verify_packed_snapshot
+    def full_recovery(*args, **kwargs):
+        calls.append(kwargs)
+        assert kwargs.get('reconstruct_all') is True
+        return verify(*args, **kwargs)
+    monkeypatch.setattr(module, 'verify_archive_directory', slow_decode)
+    monkeypatch.setattr(module, 'verify_packed_snapshot', full_recovery)
+    if failure is None:
+        result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                           owned_verified_plan=plan, **options)
+        assert result['pruned'] and len(calls) == 1
+        assert result['prior_full_verification'] == old_proof
+        assert result['full_verification']['verified_at_epoch'] > old_proof['verified_at_epoch']
+        assert plan['full_verification'] == old_proof
+    else:
+        with pytest.raises(SnapshotError):
+            apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+        assert list(spec.stage_root.glob(f'.{spec.dataset}.pruning-*'))
+
+
+@pytest.mark.parametrize('failure', [None, 'modified', 'source', 'active-owner', 'multiple', 'cold'])
+def test_interrupted_stage_quarantine_restores_only_exact_identity_for_new_audit(tmp_path, monkeypatch, failure):
+    spec, packed, options = fixture(tmp_path, monkeypatch, benchmark_d=True)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    stage = spec.stage_root / spec.dataset
+    pid = os.getpid() if failure == 'active-owner' else 999999999
+    quarantine = stage.with_name(f'.{spec.dataset}.pruning-{pid}')
+    stage.rename(quarantine)
+    plan['full_verification']['verified_at_epoch'] -= 2000
+    if failure == 'modified':
+        (quarantine / 'unique').write_text('preserve')
+    elif failure == 'source':
+        (options['artifact_root'] / spec.relative_root).mkdir()
+    elif failure == 'multiple':
+        quarantine.with_name(f'.{spec.dataset}.pruning-999999998').mkdir()
+    elif failure == 'cold':
+        release = resolve_latest_packed(packed, spec.dataset)
+        payload = packed / release.manifest['archive']['objects'][0]['relpath']
+        payload.write_bytes(b'corrupt')
+    journal = tmp_path / 'recovery.json'
+    def recover():
+        return module.recover_archive_stage_quarantine(spec, packed, owned_failed_plan=plan,
+                                                       journal=journal, **options)
+    if failure is None:
+        result = recover()
+        assert not result['deletion_authorized'] and not result['proof_time_extended']
+        assert result['state'] == 'stage_restored_requires_full_audit'
+        assert stage.is_dir() and not quarantine.exists()
+        with pytest.raises(SnapshotError, match='expired'):
+            apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+        fresh = plan_archive_stage_prune(spec, packed, **options)
+        assert apply_archive_stage_prune(spec, packed, expected_fingerprint=fresh['stage_fingerprint'],
+                                          owned_verified_plan=fresh, **options)['pruned']
+    else:
+        with pytest.raises(SnapshotError):
+            recover()
+        assert quarantine.is_dir() and not stage.exists()
+
+
+def test_canonical_finisher_resumes_expired_stage_quarantine_without_recreating_sources(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    spec, packed, options = fixture(tmp_path, monkeypatch, offline_d=True)
+    target = tmp_path / 'retirement-receipts'
+    target.mkdir()
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    (target / 'stage-prune-plan.json').write_text(json.dumps(plan))
+    stage = spec.stage_root / spec.dataset
+    stage.rename(stage.with_name(f'.{spec.dataset}.pruning-999999999'))
+    monkeypatch.setattr(cleanup, 'source_layout', lambda _: (
+        options['artifact_root'], tmp_path / 'mirror', options['state_root'], tmp_path / 'activations'))
+    retired = {'deleted': True, 'snapshot_id': plan['snapshot_id'],
+               'manifest_sha256': plan['manifest_sha256'], 'reclaimed_allocated_file_bytes': 1234}
+    accepted = cleanup.finish_retirement(spec, SimpleNamespace(sync_root=packed), target, retired,
+        fixed_d_stage_only=True, expected_fixed_manifest_sha256=plan['manifest_sha256'])
+    assert accepted['retired'] is True and accepted['cold_objects_deleted'] == 0
+    assert not stage.exists() and not list(spec.stage_root.glob(f'.{spec.dataset}.pruning-*'))
+    assert list(target.glob('stage-quarantine-recovery-*.json'))
+    assert verify_cold_archive(spec, packed)['decoded_originals_verified']
 
 
 @pytest.mark.parametrize('benchmark_d', [False, True])

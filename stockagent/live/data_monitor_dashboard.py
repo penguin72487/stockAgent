@@ -67,6 +67,7 @@ DATA_MONITOR_SUMMARY_KEYS: Final[tuple[str, ...]] = (
     "market_categories",
     "record_inventory_progress",
     "tick_inventory",
+    "bar_inventory",
     "integrity_checks",
     "definitions",
     "tw_public_acquisition",
@@ -81,6 +82,8 @@ def project_data_monitor_summary(payload: Mapping[str, Any]) -> dict[str, Any]:
     result = {key: payload[key] for key in DATA_MONITOR_SUMMARY_KEYS if key in payload}
     if isinstance(result.get("tick_inventory"), Mapping):
         result["tick_inventory"] = tick_summary(result["tick_inventory"])
+    if isinstance(result.get("bar_inventory"), Mapping):
+        result["bar_inventory"] = {key: value for key, value in result["bar_inventory"].items() if key != "groups"}
     return result
 
 
@@ -788,6 +791,14 @@ _REFRESH_SERVICE_SNAPSHOT_MAX_AGE_SECONDS: Final[int] = 180
 def _read_json(path: Path, default: Any = None) -> Any:
     from stockagent.live.dashboard_updates import read_json_snapshot
     return read_json_snapshot(path, default)
+
+
+def _read_json_once(path: Path) -> Any:
+    from stockagent.live.dashboard_updates import read_json_snapshot
+    # The complete FinLab pass exceeds the 512-entry shared LRU, so every
+    # pass evicts itself before reuse. Avoid marshalling disposable packets;
+    # preserve every full source read, identity fence and original JSON value.
+    return read_json_snapshot(path, {}, cache=False)
 
 
 def _systemd_time(value: Any) -> datetime | None:
@@ -1741,6 +1752,25 @@ def _generic_group(
             )
     if not payloads and source_root.exists():
         warning.append("已登錄資料根，但尚未找到可驗證的摘要或 manifest。")
+    source_storage = None
+    if dataset == "cftc-legacy-pre2000" and source_root.is_dir():
+        from stockagent.data_sync.closed_source import local_closed_source_status
+        from stockagent.data_sync.desync_snapshots import SnapshotError
+        try:
+            source_storage = local_closed_source_status(source_root)
+        except (OSError, ValueError, TypeError, SnapshotError):
+            status, status_label = "degraded", "歷史冷庫綁定或本機工作集不一致"
+            warning.append("冷庫綁定或服務工作集驗證失敗；保留來源，等待原下載器修復。")
+        else:
+            if source_storage is not None:
+                pending = source_storage["raw_bytes_local"]
+                warning.append(
+                    "封閉歷史已綁定 D 槽固定版本；本機只需三個服務資料表。"
+                    + (f"另有 {pending:,} bytes 原始 ZIP 等待獨立回收驗收。" if pending
+                       else "原始 ZIP 已經原回收流程驗收完成。" if source_storage["raw_retirement_complete"]
+                       else "原始 ZIP 已離開本機工作區，但沒有完整回收收據。")
+                    + "此頁只讀取綁定收據與本機大小，未重新驗證冷庫內容。"
+                )
     return {
         "id": f"group:{dataset}",
         "parent_id": None,
@@ -1763,6 +1793,7 @@ def _generic_group(
         "detail": str(config.get("note") or "已登錄資料群組。"),
         "warnings": warning,
         "detail_link": None,
+        **({"source_storage": source_storage} if source_storage is not None else {}),
     }
 
 
@@ -4020,12 +4051,12 @@ def _finlab_candidate_sources(root: Path, *, now: datetime) -> list[dict[str, An
     attempts_by_key: dict[str, Mapping[str, Any]] = {}
     if receipts_root.is_dir():
         for path in receipts_root.glob("*.json"):
-            receipt = _read_json(path, {})
+            receipt = _read_json_once(path)
             if isinstance(receipt, Mapping) and receipt.get("dataset"):
                 by_key[str(receipt["dataset"])] = receipt
     if attempts_root.is_dir():
         for path in attempts_root.glob("*.json"):
-            attempt = _read_json(path, {})
+            attempt = _read_json_once(path)
             if isinstance(attempt, Mapping) and attempt.get("dataset"):
                 attempts_by_key[str(attempt["dataset"])] = attempt
     finlab_root = (root / "data_finlab").resolve()
@@ -7301,6 +7332,7 @@ def build_data_monitor_public_status(
     inventory_max_refresh_files: int = 4_096,
     record_inventory: Mapping[str, Any] | None = None,
     tick_inventory: Mapping[str, Any] | None = None,
+    bar_inventory: Mapping[str, Any] | None = None,
     timing_ms: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Build the complete public registry and current monitor projection."""
@@ -7316,6 +7348,7 @@ def build_data_monitor_public_status(
 
     root = Path(repo_root)
     tick_inventory = dict(tick_inventory or {})
+    bar_inventory = dict(bar_inventory or {})
     observed = (now or datetime.now(UTC)).astimezone(UTC)
     if record_inventory is not None and refresh_inventory:
         raise ValueError("cannot refresh an already observed record inventory")
@@ -7547,6 +7580,8 @@ def build_data_monitor_public_status(
         row["sort_index"] = index
     tick_sources = {item["source_id"]: item for item in tick_inventory.get("groups", [])
                     if item.get("source_id")}
+    bar_sources = {item["source_id"]: item for item in bar_inventory.get("groups", [])
+                   if item.get("source_id") and not item["source_id"].startswith("finmind:")}
     for row in rows:
         category = _market_category(row)
         row["market_category"] = category
@@ -7562,6 +7597,13 @@ def build_data_monitor_public_status(
             row["market_category_label"] = tick["market_category_label"]
         row["record_stats"]["earliest_date"] = row["record_stats"].get("first")
         row["record_stats"]["latest_date"] = row["record_stats"].get("last")
+        bar = bar_sources.get(row.get("id"))
+        if bar is not None:
+            row["record_stats"].update({key: bar.get(key) for key in (
+                "count", "earliest_date", "latest_date", "days", "known_days", "date_basis", "basis",
+                "row_unit", "non_null_values", "rows_with_values", "day_statistics_state")})
+            row["record_stats"].update(first=bar.get("earliest_date"), last=bar.get("latest_date"))
+            row["record_stats"]["state"] = "verified" if bar["statistics_state"] == "parquet_footers" else bar["statistics_state"]
     groups = [row for row in rows if row.get("scope") == "storage_group"]
     logical = [row for row in rows if row.get("scope") != "storage_group"]
     status_counts: dict[str, int] = {}
@@ -7768,6 +7810,7 @@ def build_data_monitor_public_status(
         },
         "provider_summaries": _provider_summaries(rows),
         "tick_inventory": tick_inventory,
+        "bar_inventory": bar_inventory,
         "market_categories": [
             {
                 "id": category,

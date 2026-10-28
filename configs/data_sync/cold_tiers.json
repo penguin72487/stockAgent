@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "contract": "stockagent.cold_tiers.v1",
+  "authority_node_id": "penguin",
+  "sync_root": "/srv/stockagent-packed",
+  "state_root": "/srv/stockagent-packed/.local-state/cold-tiers",
+  "stable_after_hours": 6,
+  "minimum_object_bytes": 1048576,
+  "maximum_cycle_bytes": 8589934592,
+  "maximum_cycle_objects": 1024,
+  "maximum_cycle_seconds": 120,
+  "native_batch_bytes": 268435456,
+  "minimum_saving_ratio": 0.05,
+  "reserve_bytes": 68719476736,
+  "compression": "LZX",
+  "daily_window_timezone": "Asia/Taipei",
+  "daily_window_start_hour": 3,
+  "daily_window_end_hour": 7,
+  "baseline_seed_objects_per_cycle": 4096,
+  "delete_original_objects": false
+}

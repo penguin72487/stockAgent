@@ -191,6 +191,27 @@ def test_private_preview_clears_a_known_future_open_gap_without_changing_formal_
     assert not live and not observed.any() and cutoff == clock == "2026-10-21"
 
 
+def test_private_preview_reuses_original_immutable_base_not_an_uncacheable_copy():
+    from stockagent.live import signal_engine as signals
+    panel = SimpleNamespace(num_symbols=2, symbols=["A", "B"],
+        dates=np.array(["2026-10-20", "2026-10-21"], dtype="datetime64[D]"),
+        close_prices=np.array([[100., 50.], [102., 51.]]), daily_volumes=np.ones((2, 2)),
+        alive_mask=np.ones((2, 2), dtype=bool), feature_names=[signals.DAY_TRADE_OPEN_GAP_FEATURE],
+        features=np.full((2, 2, 1), .3, dtype=np.float32))
+    base = signals._cached_normalized_model_window(panel, panel_idx=1, lookback=2)
+    original = base.tobytes()
+    kwargs = dict(panel_idx=1, lookback=2, price_snapshot=quote_provider.PriceSnapshot(
+        prices=np.array([102., 51.]), source="panel"), resolved_asof="2026-10-22 08:50:00",
+        source_timezone="Asia/Taipei", base_model_window=base, preopen_quote_priority=True)
+    control = signals._day_trade_live_model_window(panel, **kwargs)[0]
+    warm = signals._day_trade_live_model_window(panel, **kwargs, defer_dense_overlay=True)[0]
+    assert isinstance(warm, signals.DenseOpeningWindow) and warm.base is base
+    assert not base.flags.writeable and not warm.values.flags.writeable
+    np.testing.assert_array_equal(warm.materialize().view(np.uint32), control.view(np.uint32))
+    assert base.tobytes() == original
+    np.testing.assert_array_equal(panel.features, np.full((2, 2, 1), .3, dtype=np.float32))
+
+
 @pytest.mark.parametrize("final_arm", [False, True])
 @pytest.mark.parametrize("at,expected", [("08:50:00", True), ("09:05:00", False)])
 def test_both_warmup_hooks_reuse_one_model_call_and_never_backdate_after_open(
@@ -207,7 +228,11 @@ def test_both_warmup_hooks_reuse_one_model_call_and_never_backdate_after_open(
     cfg = SimpleNamespace(market="test", timezone="Asia/Taipei", config_path="not-opened.yaml",
                           overnight_simulation_enabled=False, day_trade_rule_data_dir=None)
     monkeypatch.setattr(bot, "load_config", lambda _: SimpleNamespace(data=SimpleNamespace(parquet_root=tmp_path)))
-    monkeypatch.setattr(bot, "_signal_kwargs", lambda **_: {"price_source": "panel"})
+    configuration_calls = []
+    def warm_kwargs(**kwargs):
+        configuration_calls.append(kwargs)
+        return {"price_source": "panel", "_prepare_progressive_opening_input": kwargs.get("write") is False}
+    monkeypatch.setattr(bot, "_signal_kwargs", warm_kwargs)
     monkeypatch.setattr(bot, "_runtime_status", lambda _: SimpleNamespace(data=SimpleNamespace(fresh=True)))
     monkeypatch.setattr(bot, "resolve_day_trade_rule_data_dir", lambda *_args, **_kwargs: tmp_path)
     monkeypatch.setattr(bot, "require_exact_session_eligibility", lambda **_: {})
@@ -228,6 +253,8 @@ def test_both_warmup_hooks_reuse_one_model_call_and_never_backdate_after_open(
     run = bot._final_arm_market_signal_sync if final_arm else bot._prewarm_market_signal_serialized
     assert run(cfg) is result
     assert len(calls) == 1 and calls[0]["write"] is False
+    assert configuration_calls[0]["write"] is False
+    assert calls[0]["_prepare_progressive_opening_input"] is True
     assert calls[0]["preopen_quote_priority"] is expected
     assert result.summary["opening_quote_priority"]["status"] == ("prepared" if expected else "not_preopen")
     assert order(tmp_path, ["B", "A"])[0] == (["A", "B"] if expected else ["B", "A"])

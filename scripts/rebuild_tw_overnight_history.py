@@ -33,6 +33,7 @@ from stockagent.data.tw_overnight import (
     read_overnight_1325_partition,
 )
 from stockagent.live.market_config import load_market_config
+from stockagent.live.paper_journal import open_paper_journal, verified_journal_projection
 from stockagent.live.signal_engine import _build_panel, generate_live_signal
 from stockagent.live.tw_day_trade_simulation import TAIPEI, load_symbol_metadata
 from stockagent.live.tw_overnight_replay import TwOvernightHistoricalReplayEngine
@@ -642,16 +643,18 @@ def replay(args: argparse.Namespace, plan: dict[str, Any]) -> None:
             )},
         } for spec in specs],
     }
-    marks = pl.read_ndjson(engine.marks_path).select(
-        'market', 'session_date', 'minute', 'initial_capital_twd', 'total_equity_twd',
-        'cumulative_realized_net_pnl_twd', 'open_net_liquidation_pnl_twd',
-        'open_position_count', 'valuation_stale', 'valuation_basis',
-    )
+    with verified_journal_projection(engine.marks_path) as accepted_marks:
+        marks = pl.read_ndjson(accepted_marks).select(
+            'market', 'session_date', 'minute', 'initial_capital_twd', 'total_equity_twd',
+            'cumulative_realized_net_pnl_twd', 'open_net_liquidation_pnl_twd',
+            'open_position_count', 'valuation_stale', 'valuation_basis',
+        )
     marks.write_parquet(args.output / 'equity_history.parquet')
     marks.write_csv(args.output / 'equity_history.csv')
     if marks.height != len(plan['sessions']) * len(specs) * 2:
         raise RuntimeError('Opening/closing equity event coverage is incomplete')
-    fills = [json.loads(line) for line in engine.fills_path.read_text().splitlines()]
+    with open_paper_journal(engine.fills_path, "r", encoding="utf-8") as stream:
+        fills = [json.loads(line) for line in stream]
     price_maps = {
         day: {row['symbol']: row for row in pl.read_parquet(
             args.output / 'inputs' / day / 'prices.parquet').to_dicts()}
@@ -733,7 +736,8 @@ def audit_unresolved_exits(output: Path) -> None:
               if result.get('ledger_relative_path') else Path(result['ledger']).resolve())
     if not ledger.is_relative_to(output.resolve()):
         raise ValueError('Historical ledger escapes the result directory')
-    state = json.loads((ledger / 'state.json').read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(ledger / 'state.json')
     unresolved = []
     for item in result['markets']:
         mode = state['modes'][item['market']]
@@ -768,11 +772,12 @@ def audit_unresolved_exits(output: Path) -> None:
             row['last_official_close'] = prices['close'][-1] if prices.height else None
     result['unresolved_positions'] = unresolved
     marks = pl.read_parquet(output / 'equity_history.parquet')
-    fills = [json.loads(line) for line in (ledger / 'fills.jsonl').read_text().splitlines()]
+    with open_paper_journal(ledger / 'fills.jsonl', "r", encoding="utf-8") as stream:
+        fills = [json.loads(line) for line in stream]
     entries = {row['position_id']: row for row in fills if row['purpose'] == 'close_auction_entry'}
     entry_orders = {}
     rejected_opens = []
-    with (ledger / 'orders.jsonl').open() as handle:
+    with open_paper_journal(ledger / 'orders.jsonl', "r", encoding="utf-8") as handle:
         for line in handle:
             row = json.loads(line)
             if row.get('purpose') == 'close_auction_entry' and row.get('status') == 'working':

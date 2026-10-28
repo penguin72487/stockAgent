@@ -28,6 +28,16 @@ from stockagent.live.opening_price_journal import (
     NO_FIRST_PRINT_PROOF_TTL_SECONDS, journal_absence_proof_ms, observation_values,
 )
 
+try:
+    import msgspec
+except ImportError:  # The canonical stdlib reader remains usable without it.
+    _ATTEMPT_SESSION_DECODER = None
+else:
+    class _AttemptSessionProjection(msgspec.Struct):
+        session_date: object = msgspec.UNSET
+
+    _ATTEMPT_SESSION_DECODER = msgspec.json.Decoder(_AttemptSessionProjection)
+
 
 def _atomic_json(path, payload):
     atomic_write_json(path, payload, durable=True)
@@ -578,7 +588,8 @@ def opening_coverage_milestones(path: Path, session_date: str, symbols: list[str
         "provider_phase_latency": provider_phase_latency(provider_events, symbols, start)}
 
 
-def opening_publication_slo(session_date: str, attempts: dict, expected_markets: list[str]) -> dict:
+def opening_publication_slo(session_date: str, attempts: dict, expected_markets: list[str],
+                            *, observed_at: datetime | None = None) -> dict:
     """Opening gate to ALL immutable execution pointers, not hot inference.
 
     Recompute from original timezone-aware clocks. A missing mode or an invalid
@@ -588,11 +599,13 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
     """
     if not expected_markets or len(set(expected_markets)) != len(expected_markets):
         raise ValueError("opening publication SLO requires a nonempty unique mode roster")
+    if observed_at is not None and observed_at.tzinfo is None:
+        raise ValueError("publication observer clock requires timezone")
     gate = datetime.fromisoformat(session_date + "T09:00:00+08:00")
     modes = {}
     for market in expected_markets:
         stats = attempts.get(market, {})
-        accepted, invalid = [], 0
+        accepted, invalid, future = [], 0, 0
         for row in stats.get("ready", []):
             try:
                 if (row.get("status") != "ready" or row.get("session_date") != session_date
@@ -605,6 +618,9 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
                     raise ValueError("missing clock timezone")
                 if original_gate != gate or not gate <= ready <= published:
                     raise ValueError("invalid publication clock order")
+                if observed_at is not None and published > observed_at:
+                    future += 1
+                    continue
                 accepted.append((published, row))
             except (KeyError, TypeError, ValueError):
                 invalid += 1
@@ -615,6 +631,7 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
             "attempt_count": stats.get("attempt_count", 0),
             "failed_count": stats.get("failed_count", 0),
             "invalid_ready_records": invalid,
+            "publication_after_observation_count": future,
             "signal_id": row.get("signal_id"),
             "artifact_published_at": row.get("artifact_published_at"),
             "published_from_open_ms": round((published - gate).total_seconds() * 1000, 3) if published else None,
@@ -637,31 +654,350 @@ def opening_publication_slo(session_date: str, attempts: dict, expected_markets:
     }
 
 
-def read_attempts(path: Path, session_date: str) -> tuple[dict, int]:
+def read_attempts(path: Path, session_date: str, *, revision_rows: list | None = None) -> tuple[dict, int]:
     """Stream retained native facts; missing/corrupt evidence never means fast."""
     attempts, malformed = {}, 0
     try:
         with path.open() as handle:
             for line in handle:
                 try:
+                    # Old sessions can contain megabytes of source diagnostics
+                    # per row. Validate the complete JSON but construct only
+                    # its session key. Keep full stdlib decoding for this
+                    # session, JSON extensions, nonobjects and any decode
+                    # error: corrupt historical evidence must still be counted.
+                    if _ATTEMPT_SESSION_DECODER is not None:
+                        try:
+                            projected = _ATTEMPT_SESSION_DECODER.decode(line)
+                        except (TypeError, ValueError):
+                            pass
+                        else:
+                            if projected.session_date != session_date:
+                                continue
                     row = json.loads(line)
                     if not isinstance(row, dict):
                         raise ValueError("not an attempt")
                     if row.get("session_date") != session_date:
                         continue
                     market = row["market"]
+                    if not isinstance(market, str) or not market:
+                        raise ValueError("invalid market")
+                    if row.get("event") == "opening_signal_revision":
+                        # Revisions have their own worker/coverage clock, not
+                        # the initial 09:00 attempt's status/gate contract.
+                        if revision_rows is not None:
+                            revision_rows.append(row)
+                        continue
+                    status = row["status"]
                     stats = attempts.setdefault(market, {"attempt_count": 0, "failed_count": 0,
                         "first": row, "last": row, "ready": []})
                     stats["attempt_count"] += 1
-                    stats["failed_count"] += int(row["status"] == "failed")
+                    stats["failed_count"] += int(status == "failed")
                     stats["last"] = row
-                    if row["status"] == "ready":
+                    if status == "ready":
                         stats["ready"].append(row)
                 except (KeyError, TypeError, ValueError):
                     malformed += 1
     except FileNotFoundError:
         return {}, 0
     return attempts, malformed
+
+
+def opening_revision_timings(session_date: str, rows: list, expected_markets: list[str],
+                             *, observed_at: datetime) -> dict:
+    """Original per-revision clocks; never replace the 09:00/fill/paint SLO.
+
+    Model inputs resolved with prior trades are distinct from observed price
+    coverage. Keep both denominators; a provisional 100% is not a fresh 100%.
+    """
+    if observed_at.tzinfo is None:
+        raise ValueError("revision observer requires an aware clock")
+    gate = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    accepted, conflicts, invalid, excluded = {}, set(), 0, 0
+    for row in rows:
+        try:
+            market, signal_id = row["market"], row["signal_id"]
+            if market not in expected_markets:
+                excluded += 1
+                continue
+            started = datetime.fromisoformat(row["worker_started_at"])
+            published = datetime.fromisoformat(row["artifact_published_at"])
+            if (row.get("session_date") != session_date or not isinstance(signal_id, str) or not signal_id
+                    or any(at.tzinfo is None for at in (started, published))
+                    or not gate <= started < gate + timedelta(hours=4, minutes=20)
+                    or published < started):
+                raise ValueError("invalid revision identity/clock")
+            if published > observed_at:
+                excluded += 1
+                continue
+            started = started.astimezone(ZoneInfo("Asia/Taipei"))
+            published = published.astimezone(ZoneInfo("Asia/Taipei"))
+            coverage = row["opening_input_coverage"]
+            required = coverage["opening_price_active_symbol_count"]
+            opened, no_print, provisional, resolved = (coverage[key] for key in (
+                "opening_price_active_count", "opening_no_print_active_count",
+                "opening_provisional_reference_active_count", "opening_input_resolved_count"))
+            if (type(required) is not int or required <= 0
+                    or any(type(n) is not int or not 0 <= n <= required
+                           for n in (opened, no_print, provisional, resolved))
+                    or opened + no_print + provisional != resolved
+                    or not coverage.get("opening_coverage_denominator_contract")):
+                raise ValueError("invalid revision coverage denominator")
+            item = {"signal_id": signal_id, "worker_started_at": started.isoformat(),
+                "artifact_published_at": published.isoformat(),
+                "worker_to_publication_ms": round((published - started).total_seconds() * 1000., 3),
+                "coverage": coverage, "observed_price_coverage_percent": (opened + no_print) * 100. / required,
+                "model_input_resolved_percent": resolved * 100. / required}
+            key = market, signal_id
+            if key in conflicts:
+                raise ValueError("conflicting immutable revision")
+            if key in accepted and accepted[key] != item:
+                conflicts.add(key)
+                accepted.pop(key)
+                raise ValueError("conflicting immutable revision")
+            accepted[key] = item
+        except (KeyError, TypeError, ValueError):
+            invalid += 1
+    modes = {}
+    for market in expected_markets:
+        items = sorted((item for (name, _), item in accepted.items() if name == market),
+                       key=lambda item: item["artifact_published_at"])
+        durations = sorted(item["worker_to_publication_ms"] for item in items)
+        count = len(durations)
+        modes[market] = {"revision_count": count,
+            "min_ms": durations[0] if count else None,
+            "median_ms": ((durations[(count - 1) // 2] + durations[count // 2]) / 2.) if count else None,
+            "max_ms": durations[-1] if count else None,
+            "within_1s_count": sum(ms <= 1000. for ms in durations),
+            "latest": items[-1] if items else None,
+            "coverage_milestones": [{"percent": percent, "first": next((item for item in items
+                if item["observed_price_coverage_percent"] >= percent), None)} for percent in (0, 25, 50, 75, 100)]}
+    return {"contract": "progressive_revision_original_publication_clock_v1",
+        "measurement_boundary": "revision_worker_to_durable_signal_not_source_arrival_fill_or_browser_paint",
+        "state": "degraded" if invalid else "observed" if accepted else "unobserved",
+        "expected_mode_count": len(expected_markets), "revision_count": len(accepted),
+        "invalid_rows": invalid, "excluded_rows": excluded, "modes": modes,
+        "one_second_end_to_end_claim": False, "broker_fill_claim": False}
+
+
+def _browser_clock_stability(events: list, gate_ms: float, end_ms: int) -> dict:
+    """Bound same-host wall/monotonic discontinuities; not UTC accuracy."""
+    points = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        raw = event if event.get("contract") == "observer_clock_anchor_v1" else event.get("observerClock")
+        if not isinstance(raw, dict):
+            continue
+        try:
+            wall = raw["wallUnixMs"]
+            before, after = int(raw["monotonicBeforeNs"]), int(raw["monotonicAfterNs"])
+            if type(wall) is not int or before <= 0 or after < before or after - before > 10_000_000:
+                raise ValueError("invalid clock bracket")
+            points.append((wall, before, after))
+        except (KeyError, TypeError, ValueError):
+            continue
+    points.sort(key=lambda row: row[1])
+    preceding = [index for index, row in enumerate(points) if row[0] <= gate_ms]
+    following = [index for index, row in enumerate(points) if row[0] >= end_ms]
+    if not preceding or not following or preceding[-1] >= following[-1]:
+        return {"stable": False, "reason": "missing_bracketing_clock_samples"}
+    start = preceding[-1]
+    end = next((index for index in following if index > start), None)
+    if end is None:
+        return {"stable": False, "reason": "missing_post_paint_clock_sample"}
+    selected = points[start:end + 1]
+    gaps_ms = [(b[1] - a[2]) / 1_000_000 for a, b in zip(selected, selected[1:])]
+    offsets_ms = [wall - (before + after) / 2_000_000 for wall, before, after in selected]
+    drift = max(offsets_ms) - min(offsets_ms)
+    maximum_gap = max(gaps_ms, default=0.0)
+    stable = maximum_gap <= 2000.0 and drift <= 20.0 and all(gap >= 0 for gap in gaps_ms)
+    return {"stable": stable, "sample_count": len(selected),
+            "maximum_sample_gap_ms": round(maximum_gap, 3),
+            "wall_monotonic_span_ms": round(drift, 3),
+            "boundary": "local_wall_vs_monotonic_only_not_exchange_or_UTC_calibration"}
+
+
+def opening_browser_end_to_end(session_date: str, publication: dict, execution_samples: list,
+                               launch: dict, events: list, *, observed_at: datetime) -> dict:
+    """Join first published signal, durable paper target and visible DOM.
+
+    All identity, revision and quantity comparisons use original records. This
+    is a conservative local public-browser upper bound, not a broker fill or
+    an assertion that the host clock is synchronized with the exchange.
+    """
+    from stockagent.live.opening_execution_latency import execution_quantities
+    from stockagent.live.public_dashboards import public_paper_signal_key
+
+    if observed_at.tzinfo is None:
+        raise ValueError("browser observer requires an aware clock")
+    gate = datetime.fromisoformat(session_date + "T09:00:00+08:00")
+    gate_ms = gate.timestamp() * 1000
+    scheduled = launch.get("scheduled_observation") or {}
+    scheduled = scheduled if isinstance(scheduled, dict) else {}
+    try:
+        started = datetime.fromisoformat(launch["started_at_utc"])
+        finished = datetime.fromisoformat(launch["finished_at_utc"])
+        armed = datetime.fromisoformat(scheduled["scheduled_at_taipei"])
+        launch_valid = bool(
+            launch.get("contract") == "owned_native_dashboard_browser_probe_v1"
+            and launch.get("status") == "passed"
+            and launch.get("url") == "https://penguin72487.dpdns.org/tw-day-trade/"
+            and launch.get("simulation_only") is True and launch.get("broker_orders") is False
+            and launch.get("ledger_writes") is False
+            and scheduled.get("state") == "armed" and scheduled.get("session_date") == session_date
+            and all(value.tzinfo is not None for value in (started, finished, armed))
+            and armed.astimezone(ZoneInfo("Asia/Taipei")).date().isoformat() == session_date
+            and armed.astimezone(ZoneInfo("Asia/Taipei")).hour == 8
+            and armed.astimezone(ZoneInfo("Asia/Taipei")).minute >= 58
+            and armed <= started < gate < finished <= observed_at
+        )
+    except (KeyError, TypeError, ValueError):
+        started, finished, launch_valid = None, None, False
+
+    progress_by_identity: dict[tuple[str, str], list] = {}
+    for row in execution_samples:
+        if not isinstance(row, dict) or row.get("session_date") != session_date:
+            continue
+        market, signal = row.get("market"), row.get("signal_id")
+        if not isinstance(market, str) or not isinstance(signal, str) or not market or not signal:
+            continue
+        progress_by_identity.setdefault((market, signal), []).append(row)
+
+    paints_by_market: dict[str, list] = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        record = event.get("browserRecord")
+        correlation = record.get("correlation") if isinstance(record, dict) else None
+        if not isinstance(correlation, dict) or not isinstance(correlation.get("market"), str):
+            continue
+        paints_by_market.setdefault(correlation["market"], []).append(event)
+
+    modes = {}
+    for market, pointer in publication.get("modes", {}).items():
+        if not isinstance(pointer, dict):
+            modes[market] = {"state": "publication_unavailable"}
+            continue
+        signal = pointer.get("signal_id")
+        key = public_paper_signal_key({"market": market, "session_date": session_date, "signal_id": signal})
+        matches = []
+        try:
+            if pointer.get("state") != "published" or key is None:
+                raise ValueError("missing publication identity")
+            published = datetime.fromisoformat(pointer["artifact_published_at"])
+            if published.tzinfo is None or not gate <= published <= observed_at:
+                raise ValueError("invalid publication clock")
+        except (KeyError, TypeError, ValueError):
+            modes[market] = {"state": "publication_unavailable"}
+            continue
+        for progress in progress_by_identity.get((market, signal), ()):
+            try:
+                committed = datetime.fromisoformat(progress["recorded_at"])
+                revision, run_id = progress.get("state_revision"), progress.get("engine_run_id")
+                if (committed.tzinfo is None or not published <= committed <= observed_at
+                        or progress.get("contract") != "state_fsync_then_paper_target_progress_v1"
+                        or progress.get("measurement_boundary") != "paper_target_quantities_after_state_commit_not_broker_fill"
+                        or progress.get("clock_basis") != "engine_publication_clock_not_economic_event"
+                        or progress.get("simulation_only") is not True
+                        or progress.get("production_order_possible") is not False
+                        or progress.get("live_execution_eligible") is not True
+                        or progress.get("simulation_replay") is not False
+                        or type(revision) is not int or revision <= 0
+                        or not isinstance(run_id, str) or not run_id):
+                    raise ValueError("invalid durable progress")
+                quantities = execution_quantities(progress)
+                if (not quantities["quantity_contract_valid"] or quantities["ledger_state_divergence"]
+                        or quantities["simulation_replay"] or not quantities["live_execution_eligible"]
+                        or not (quantities["all_target_complete"] or quantities["no_execution_required"])):
+                    continue
+                generation = hashlib.sha256(("public_paper_engine_v1:" + run_id).encode()).hexdigest()[:32]
+                for event in paints_by_market.get(market, ()):
+                    record, received = event["browserRecord"], event.get("receivedAtUnixMs")
+                    c = record["correlation"]
+                    painted = record.get("observedAt")
+                    clock = event.get("observerClock")
+                    if (record.get("route") != "/tw-day-trade/" or record.get("kind") != "render"
+                            or record.get("action") != "status_revision_paint"
+                            or record.get("eventType") != "revision_applied"
+                            or c.get("viewEvidence") != "status_mode_snapshot"
+                            or c.get("clockBasis") != "browser_monotonic_foreground_double_raf_opportunity_not_physical_pixel"
+                            or c.get("sessionDate") != session_date or c.get("signalKey") != key
+                            or c.get("engineGeneration") != generation
+                            or type(c.get("stateRevision")) is not int or c["stateRevision"] < revision
+                            or c.get("entryCountsVisible") is not True
+                            or any(type(c.get(name)) is not int or c[name] != quantities[source]
+                                for name, source in (("entryRequestedShares", "entry_requested_shares"),
+                                                     ("entryFilledShares", "entry_filled_shares"),
+                                                     ("entryUnfilledShares", "entry_unfilled_shares")))
+                            or type(received) is not int or type(painted) is not int
+                            or not isinstance(clock, dict) or clock.get("wallUnixMs") != received
+                            or not committed.timestamp() * 1000 <= painted <= received <= observed_at.timestamp() * 1000
+                            or finished is None or received > finished.timestamp() * 1000):
+                        continue
+                    matches.append((received, committed, revision, quantities, c))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        if not matches:
+            modes[market] = {"state": "no_matching_visible_full_target_evidence"}
+            continue
+        received, committed, revision, quantities, c = min(matches, key=lambda value: value[0])
+        modes[market] = {"state": "observed", "public_signal_key": key,
+            "target_state": "filled" if quantities["all_target_complete"] else "no_execution_required",
+            "target_committed_at": committed.isoformat(), "target_state_revision": revision,
+            "displayed_state_revision": c["stateRevision"], "browser_received_at_unix_ms": received,
+            "browser_received_from_open_ms": round(received - gate_ms, 3),
+            "requested_shares": quantities["entry_requested_shares"],
+            "filled_shares": quantities["entry_filled_shares"],
+            "unfilled_shares": quantities["entry_unfilled_shares"]}
+    expected_count = publication.get("expected_mode_count")
+    complete = bool(modes and type(expected_count) is int and len(modes) == expected_count
+                    and all(row["state"] == "observed" for row in modes.values()))
+    latest = max((row["browser_received_at_unix_ms"] for row in modes.values()
+                  if row["state"] == "observed"), default=None)
+    clock = _browser_clock_stability(events, gate_ms, latest) if latest is not None else {
+        "stable": False, "reason": "no_visible_full_target_evidence"}
+    local_ms = round(latest - gate_ms, 3) if complete and latest is not None else None
+    local_pass = local_ms <= 1000 if launch_valid and complete and clock["stable"] else None
+    return {"contract": "native_open_to_all_first_signal_paper_target_and_public_paint_v1",
+        "state": "observed" if launch_valid and complete and clock["stable"] else "unverified",
+        "session_date": session_date, "scheduled_public_browser_launch_valid": launch_valid,
+        "expected_mode_count": expected_count, "observed_mode_count": sum(row["state"] == "observed" for row in modes.values()),
+        "all_modes_received_from_open_upper_bound_ms": local_ms,
+        "under_one_second_on_local_host_clock": local_pass,
+        "strict_exchange_clock_one_second_proven": None,
+        "clock": clock, "modes": modes, "simulation_only": True, "broker_fill_claim": False,
+        "boundary": "original_first_signal_and_paper_target_to_public_foreground_double_raf_not_broker_fill_or_physical_pixel; UTC/exchange offset unverified"}
+
+
+def _scheduled_browser_observation(session_date: str, publication: dict, execution_samples: list,
+                                   *, observed_at: datetime, browser_root: Path) -> dict:
+    """Read the earliest scheduled observer, without replacing failed evidence."""
+    paths = sorted((browser_root / session_date).glob("*.json.launch.json"))
+    if not paths:
+        return {"state": "awaiting_or_missing_scheduled_browser_receipt",
+                "strict_exchange_clock_one_second_proven": None}
+    launcher_path = paths[0]
+    updates_path = Path(str(launcher_path).removesuffix(".launch.json") + ".updates.jsonl")
+    try:
+        launch_bytes = launcher_path.read_bytes()
+        if updates_path.stat().st_size > 32 * 1024 * 1024:
+            raise ValueError("browser update evidence exceeds limit")
+        updates_bytes = updates_path.read_bytes()
+        launch = json.loads(launch_bytes)
+        events = [json.loads(line) for line in updates_bytes.splitlines() if line.strip()]
+        if not isinstance(launch, dict):
+            raise ValueError("invalid launch receipt")
+        result = opening_browser_end_to_end(session_date, publication, execution_samples,
+                                            launch, events, observed_at=observed_at)
+        result["sources"] = {"launch": str(launcher_path),
+            "launch_sha256": hashlib.sha256(launch_bytes).hexdigest(),
+            "updates": str(updates_path), "updates_sha256": hashlib.sha256(updates_bytes).hexdigest(),
+            "candidate_launch_count": len(paths), "selection": "earliest_scheduled_receipt"}
+        return result
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {"state": "invalid_browser_evidence", "error_type": type(exc).__name__,
+                "launch": str(launcher_path), "strict_exchange_clock_one_second_proven": None}
 
 
 def deadline_assessment(report: dict, target_ms: int) -> dict:
@@ -681,6 +1017,10 @@ def deadline_assessment(report: dict, target_ms: int) -> dict:
     return {"contract": "daily_opening_original_clock_deadline_v1",
         "session_date": report["session_date"], "target_ms": target_ms,
         "observed_at": report["observed_at"], "expected_markets": report["expected_markets"],
+        "observation_started_at": report.get("observation_started_at", report["observed_at"]),
+        "deadline_at": (gate + timedelta(milliseconds=target_ms)).isoformat(),
+        "evidence_clock_basis": "retrospective_read_original_events_bounded_by_deadline_v1",
+        "current_mode_snapshot_observed_at": report.get("current_mode_snapshot_observed_at"),
         "scope_matches_preopen": report["scope_matches_preopen"],
         "passed": bool(trustworthy and pub_pass and fill_pass),
         "state": "passed" if trustworthy and pub_pass and fill_pass else "missed_or_unverified",
@@ -789,6 +1129,7 @@ def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output
     except (KeyError, TypeError, ValueError):
         preopen_clock_valid = False
     report = {"schema_version": 1, "session_date": session_date, "observed_at": now.isoformat(),
+        "observation_started_at": now.isoformat(),
         "contract": "daily_native_opening_latency_audit_v1", "expected_markets": expected,
         "scope_matches_preopen": bool(frozen_scope.get("captured_before_open") is True and preopen_clock_valid
             and frozen_scope.get("contract") == scope["contract"]
@@ -825,12 +1166,16 @@ def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output
     elif now < gate:
         report["state"] = "armed" if report["scope_matches_preopen"] and not errors else "scope_unverified"
     else:
-        attempts, malformed = read_attempts(state_dir / "opening_signal_latency.jsonl", session_date)
+        revision_rows = []
+        attempts, malformed = read_attempts(state_dir / "opening_signal_latency.jsonl", session_date,
+                                             revision_rows=revision_rows)
         if malformed:
             errors.append(f"malformed_attempt_rows:{malformed}")
-        report["opening_publication_slo"] = opening_publication_slo(session_date, attempts, expected)
         try:
             native = json.loads((state_dir / "status.json").read_text())
+            report["current_mode_snapshot_observed_at"] = (
+                datetime.now(ZoneInfo("Asia/Taipei")) if observed_at is None else now
+            ).isoformat()
             report["engine_modes"] = native["modes"]
             if not isinstance(report["engine_modes"], dict):
                 raise ValueError("invalid engine modes")
@@ -864,6 +1209,18 @@ def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output
                     report["postclose_symbol_forensics"] = {"state": "unavailable", "error_type": type(exc).__name__}
         except (OSError, KeyError, TypeError, ValueError) as exc:
             report["source_coverage_milestones"] = {"state": "unavailable", "error_type": type(exc).__name__}
+        # Large append-only journals may take tens of seconds to read. The
+        # invocation clock is not the completion/observation clock and later
+        # records read during the scan must not be backdated to its start.
+        evidence_completed = datetime.now(ZoneInfo("Asia/Taipei")) if observed_at is None else now
+        report["observed_at"] = evidence_completed.isoformat()
+        report["opening_publication_slo"] = opening_publication_slo(
+            session_date, attempts, expected, observed_at=evidence_completed)
+        report["browser_end_to_end"] = _scheduled_browser_observation(
+            session_date, report["opening_publication_slo"], report["execution_samples"],
+            observed_at=evidence_completed, browser_root=ROOT / "artifacts/operations/tw_opening_browser")
+        report["progressive_revision_timings"] = opening_revision_timings(
+            session_date, revision_rows, expected, observed_at=evidence_completed)
         report["mode_timings"] = {market: {"attempt_count": stats["attempt_count"],
             "failed_count": stats["failed_count"],
             "first_failure": {key: stats["first"].get(key) for key in ("error_type", "failure_stage", "recorded_at")},
@@ -872,7 +1229,7 @@ def daily_audit(*, session_date: str, state_dir: Path, markets_dir: Path, output
             for market, stats in attempts.items()}
         report["deadlines"] = [deadline_assessment(report, target)
             for target in (1000, 5000, 10000, 11000, 20000, 30000)
-            if now >= gate + timedelta(milliseconds=target)]
+            if evidence_completed >= gate + timedelta(milliseconds=target)]
         for deadline in report["deadlines"]:
             path = root / f"first_assessment_{deadline['target_ms']}ms.json"
             if not path.exists():

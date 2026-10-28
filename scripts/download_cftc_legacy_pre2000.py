@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
@@ -12,21 +13,20 @@ import re
 import sys
 import zipfile
 
-import pandas as pd
-import pyarrow as pa
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.download_taifex_public_history import (  # noqa: E402
-    _atomic_write_bytes,
-    _relative,
-    _sha256_bytes,
-    _write_json,
+from stockagent.data_sync.desync_snapshots import (  # noqa: E402
+    atomic_write_bytes as _atomic_write_bytes,
+    atomic_write_json as _write_json,
+    sha256_file as sha256_path,
 )
-from scripts.taifex_daily_download_common import sha256_path  # noqa: E402
-from downloader.artifact_io import atomic_write_parquet  # noqa: E402
 from downloader.http_transport import (  # noqa: E402
     HttpRequestPolicy,
     ResilientHttpTransport,
@@ -49,6 +49,14 @@ ARCHIVES = (
 DATE_COLUMN = "as_of_date_in_form_yyyy_mm_dd"
 
 
+def _relative(path: Path, root: Path) -> str:
+    return path.relative_to(root).as_posix()
+
+
+def _sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -61,6 +69,7 @@ def _column_name(value: object) -> str:
 
 def _stable_legacy_types(frame: pd.DataFrame) -> pd.DataFrame:
     """Make year/report variants Arrow-compatible without losing code zeros."""
+    import pandas as pd
 
     result = frame.copy()
     text_tokens = (
@@ -90,6 +99,7 @@ def _stable_legacy_types(frame: pd.DataFrame) -> pd.DataFrame:
 def _normalize(
     frame: pd.DataFrame, *, report_mode: str, source_sha256: str
 ) -> pd.DataFrame:
+    import pandas as pd
     frame = frame.copy()
     frame.columns = [_column_name(column) for column in frame.columns]
     if DATE_COLUMN not in frame:
@@ -112,18 +122,84 @@ def _normalize(
 
 
 def _write_parquet(frame: pd.DataFrame, path: Path) -> None:
+    import pyarrow as pa
+    from downloader.artifact_io import atomic_write_parquet
     table = pa.Table.from_pandas(frame, preserve_index=False)
     atomic_write_parquet(path, table, compression="zstd")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="data_cftc_legacy")
     parser.add_argument("--max-retries", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=300.0)
-    args = parser.parse_args()
+    parser.add_argument("--sync-root", type=Path, default=Path("/srv/stockagent-packed"))
+    parser.add_argument("--retention-config", type=Path,
+                        default=REPO_ROOT / "configs/data_sync/packed_retention.json")
+    parser.add_argument("--adopt-closed-release", metavar="FIXED_SNAPSHOT_ID")
+    parser.add_argument("--source-lock-fd", type=int)
+    parser.add_argument("--retire-closed-raw", action="store_true",
+                        help="Dry-run exact raw retirement through the original storage owner")
+    parser.add_argument("--apply-raw-retirement", metavar="PLAN_FINGERPRINT")
+    parser.add_argument("--retirement-policy", type=Path,
+                        default=REPO_ROOT / "configs/data_sync/artifact_retirement.json")
+    parser.add_argument("--retirement-state-root", type=Path,
+                        default=Path("/var/lib/stockagent-cold-artifacts"))
+    args = parser.parse_args(argv)
+    if args.apply_raw_retirement and not args.retire_closed_raw:
+        parser.error("--apply-raw-retirement requires --retire-closed-raw")
+    if args.adopt_closed_release and args.retire_closed_raw:
+        parser.error("adopt and verify the closed release before its separate retirement")
     root = Path(args.output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    # Direct and scheduled invocations borrow/acquire the same original lock.
+    # Keep it through the complete transaction, including ordinary downloads.
+    from scripts.publish_data_releases import _source_coordination_lock
+    entry = {"dataset": "cftc-legacy-pre2000", "source": str(root),
+             "source_coordination_lock_scope": "source_parent",
+             "source_coordination_lock": root.name + "/state/collector.lock"}
+    with _source_coordination_lock(entry, inherited_fd=args.source_lock_fd) as owner:
+        return _collect(root, args, owner)
+
+
+def _collect(root: Path, args: argparse.Namespace, owner: int) -> int:
+    from stockagent.data_sync.closed_source import (
+        BINDING, adopt_closed_source, configured_cache_root, resolve_closed_source,
+    )
+    if args.retire_closed_raw or args.adopt_closed_release or (root / BINDING).exists() or (root / BINDING).is_symlink():
+        cold = args.sync_root.absolute()
+        cache = configured_cache_root(cold, args.retention_config, repo_root=REPO_ROOT)
+        if args.retire_closed_raw:
+            from dataclasses import replace
+            from stockagent.data_sync.packed_retention import RetentionConfig
+            from stockagent.data_sync.artifact_retirement import (
+                apply_closed_source_raw_retirement, plan_closed_source_raw_retirement,
+                load_retirement_peer_names,
+            )
+            from scripts.manage_packed_retention import _syncthing
+            config = RetentionConfig.load(args.retention_config, repo_root=REPO_ROOT)
+            peers = load_retirement_peer_names(args.retirement_policy,
+                                               authority_node_id=config.authority_node_id)
+            config = replace(config, required_peer_names=peers)
+            options = {"source": root, "config": config, "policy_path": args.retirement_policy,
+                "state_root": args.retirement_state_root, "source_lock_fd": owner,
+                "repo_root": REPO_ROOT, "peer_probe": lambda: _syncthing(config)}
+            result = (apply_closed_source_raw_retirement(
+                expected_fingerprint=args.apply_raw_retirement, **options)
+                if args.apply_raw_retirement else plan_closed_source_raw_retirement(**options))
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+            return 75 if result.get("blockers") else 0
+        if args.adopt_closed_release:
+            closed = adopt_closed_source(root, cold, cache,
+                snapshot_id=args.adopt_closed_release, source_lock_fd=owner)
+        else:
+            closed = resolve_closed_source(root, cold, cache)
+        print(json.dumps({"status": "closed_history_verified", "storage": closed[1],
+            "provider_API_calls": 0, "parquet_rewrites": 0, "raw_downloads": 0,
+            "source_files_deleted": 0}, ensure_ascii=False), flush=True)
+        return 0
+    import pandas as pd
+
     transport = ResilientHttpTransport(
         HttpRequestPolicy(
             provider="cftc_public_archive",

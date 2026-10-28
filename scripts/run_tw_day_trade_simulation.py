@@ -39,6 +39,7 @@ from stockagent.live.market_config import (  # noqa: E402
 )
 from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
+    _load_prepared_tw_price_limits,
     day_trade_quote_broker_request_dir,
     fetch_futures_snapshot_prefer_stream,
     fetch_shioaji_historical_stock_0901_vwaps,
@@ -78,19 +79,22 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 _LATEST_SIGNAL_CACHE: dict[
-    str, tuple[tuple[int, int], dict[str, Any], list[dict[str, Any]]]
+    str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], dict[str, Any], list[dict[str, Any]]]
 ] = {}
 _ELIGIBILITY_CACHE: dict[
     tuple[str, str, str], tuple[set[str], dict[str, Any], dict[str, Any]]
 ] = {}
-_LEGACY_SIGNAL_SCAN_CACHE: dict[
-    str, tuple[float, tuple[dict[str, Any], list[dict[str, Any]]] | None]
-] = {}
 _BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 _TX_BENCHMARK_PREVIOUS_CLOSE_CACHE: dict[tuple[str, str, str], dict[str, Any]] = {}
 MISSED_OPENING_COMMIT_DEADLINE = datetime_time(9, 0, 15)
+# The 15-second operational SLO is not the user's replay decision clock.
+# An opening signal published strictly before 09:01 remains a live paper
+# decision even if this consumer discovers it later.
+MISSED_OPENING_SIGNAL_DEADLINE = datetime_time(9, 1)
+OPENING_ENTRY_CLOCK_CONTRACT = "initial_pointer_publication_before_0901_v2"
 MISSED_OPENING_REPLAY_AT = datetime_time(9, 1)
 MISSED_OPENING_SOURCE_SETTLE_DEADLINE = datetime_time(9, 3)
+REPLAY_OPEN_EVIDENCE_CONTRACT = "same_session_first_trade_by_0901_v1"
 MISSED_OPENING_REPLAY_CONTRACT = (
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE
 )
@@ -194,10 +198,132 @@ def _executor_runtime_status(
     )
 
 
-def _missed_opening_recovery_required(observed: datetime) -> bool:
-    """Switch an uncommitted opening to replay after the durable 09:00 SLO."""
+def _signal_intake_window_open(observed: datetime) -> bool:
+    """Only opening/intraday publications may affect this session's ledger.
 
-    return observed.timetz().replace(tzinfo=None) > MISSED_OPENING_COMMIT_DEADLINE
+    Post-close model/cache results can share the display pointer but are not
+    execution instructions. Exit monitoring continues independently.
+    """
+    wall_time = observed.timetz().replace(tzinfo=None)
+    return LIVE_ENTRY_GATE <= wall_time < EXIT_LIMIT_TIME
+
+
+def _executor_reload_notification(
+    engine: TwDayTradeSimulationEngine, specs: list[ModeSpec], observed: datetime,
+    *, already_ready: bool, session_errors: Mapping[str, str] | None = None,
+) -> str:
+    # Reload and readiness intervals can coincide. Always publish the new
+    # status on reload, even after READY, or systemd can display stale open
+    # positions indefinitely while the actual ledger has already flattened.
+    prefix = "" if already_ready else "READY=1\n"
+    return prefix + "STATUS=" + _executor_runtime_status(
+        engine, specs, observed, session_errors=session_errors,
+    )
+
+
+def _missed_opening_recovery_required(initial_published_at: datetime) -> bool:
+    """Classify the initial publication, not the later consumer/SLO clock."""
+
+    return initial_published_at.astimezone(TAIPEI).timetz().replace(tzinfo=None) >= (
+        MISSED_OPENING_SIGNAL_DEADLINE
+    )
+
+
+def _initial_opening_signal_proof(
+    spec: ModeSpec, summary: Mapping[str, Any], detected_at: datetime,
+) -> tuple[dict[str, Any], Path | None, datetime, str] | None:
+    """Find the initial immutable signal and an actual publication clock.
+
+    A later progressive revision cannot decide whether the initial signal was
+    late, nor may it be backdated into a 09:01 replay. A summary's artifact
+    write time precedes publication of its atomic execution pointer, so it is
+    not sufficient on its own. A direct read before the deadline is itself
+    proof of visibility; otherwise require the writer's pointer clock.
+    """
+
+    signal_id = str(summary.get("signal_id") or "")
+    revision = summary.get("opening_signal_revision") or {}
+    if not signal_id or not isinstance(revision, Mapping):
+        return None
+    root_id = str(revision.get("root_signal_id") or signal_id)
+    if (not root_id or Path(root_id).name != root_id
+            or any(char in root_id for char in "\\*?[]")):
+        return None
+    if revision:
+        index = revision.get("index")
+        if (not isinstance(index, int) or isinstance(index, bool) or index < 0
+                or ((index == 0) != (root_id == signal_id))):
+            return None
+    root_summary = dict(summary)
+    root_path: Path | None = None
+    if root_id != signal_id:
+        try:
+            base = Path(spec.live_output_dir).resolve(strict=True)
+            candidates = list(base.glob(f"{detected_at.date().isoformat()}*/{root_id}/summary.json"))
+            if len(candidates) != 1:
+                return None
+            root_path = candidates[0].resolve(strict=True)
+            if not root_path.is_relative_to(base):
+                return None
+            before = root_path.stat()
+            root_summary = json.loads(root_path.read_text(encoding="utf-8"))
+            after = root_path.stat()
+            if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            ):
+                return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(root_summary, dict):
+            return None
+        root_revision = root_summary.get("opening_signal_revision") or {}
+        if (not isinstance(root_revision, Mapping) or root_revision.get("index") != 0
+                or str(root_revision.get("root_signal_id") or "") != root_id):
+            return None
+    if (str(root_summary.get("signal_id") or "") != root_id
+            or str(root_summary.get("market") or "") != str(spec.signal_market or spec.market)
+            or str(root_summary.get("asof_date") or "")[:10] != detected_at.date().isoformat()):
+        return None
+    value = root_summary.get("execution_pointer_written_at")
+    if value:
+        try:
+            published = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if published.tzinfo is None:
+                return None
+            published = published.astimezone(TAIPEI)
+        except (TypeError, ValueError):
+            return None
+        if (published.date() != detected_at.date() or published > detected_at
+                or published.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE):
+            return None
+        proof_kind = "execution_pointer_written_at"
+    elif root_id == signal_id and not _missed_opening_recovery_required(detected_at):
+        # The consumer just read this exact pointer before 09:01.
+        published = detected_at
+        proof_kind = "pointer_observed_by"
+    else:
+        return None
+    return root_summary, root_path, published, proof_kind
+
+
+def _read_initial_opening_rows(
+    spec: ModeSpec, root_summary: Mapping[str, Any], root_path: Path,
+) -> list[dict[str, Any]] | None:
+    """Load only the original decision for a declared late-signal replay."""
+
+    execution_path = root_path.parent / "execution_weights.json"
+    parquet_path = root_path.parent / "target_weights.parquet"
+    try:
+        if execution_path.is_file():
+            return read_execution_weight_rows(
+                execution_path, market=str(spec.signal_market or spec.market),
+                signal_id=str(root_summary.get("signal_id") or ""),
+            )
+        if parquet_path.is_file():
+            return pl.read_parquet(parquet_path).to_dicts()
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, pl.exceptions.PolarsError):
+        pass
+    return None
 
 
 def _missed_opening_receipt_path(state_dir: Path, observed: datetime) -> Path:
@@ -411,6 +537,8 @@ def _resolve_missed_opening_prices(
             "unqueried_symbols": len(set(symbols) - attempted - set(cached)),
             "error_counts": dict(remote_receipt.get("error_counts") or {}),
             "stopped_for_traffic": bool(remote_receipt.get("stopped_for_traffic")),
+            "provider_policy_deferred": bool(remote_receipt.get("provider_policy_deferred")),
+            "deferred_until_taipei": remote_receipt.get("deferred_until_taipei"),
             "attempted_symbols": sorted(attempted),
             "retry_symbols": sorted(retry_symbols),
             "batch_remote_symbols": len(remote_symbols),
@@ -528,6 +656,7 @@ class _MissedOpeningPriceRecovery:
         with self._lock:
             self._prices, self._receipt = prices, receipt
             delay = 60.0 if receipt.get("stopped_for_traffic") else (
+                30.0 if receipt.get("provider_policy_deferred") else
                 5.0 if not receipt.get("unqueried_symbols") and (
                     receipt.get("retry_symbols") or receipt.get("source_settling")
                 ) else 0.0
@@ -718,116 +847,93 @@ def _mode_specs(
     return specs, selected, errors
 
 
+def _signal_file_signature(path: Path) -> tuple[int, ...]:
+    st = path.stat()
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
 def _latest_signal(
     spec: ModeSpec, now: datetime
 ) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Read only a stable, identity-checked current execution pointer.
+
+    The producer writes a summary and compact weights *before* committing the
+    pointer. Directory scans can therefore expose an unpublished signal to
+    the executor; an absent, stale, malformed or changing pointer must wait.
+    """
     pointer_path = spec.live_output_dir / "latest_signal.json"
     try:
-        pointer_stat = pointer_path.stat()
-        signature = (pointer_stat.st_mtime_ns, pointer_stat.st_size)
+        signature = _signal_file_signature(pointer_path)
         cache_key = str(pointer_path.resolve())
         cached = _LATEST_SIGNAL_CACHE.get(cache_key)
-        if cached and cached[0] == signature:
-            summary, rows = cached[1], cached[2]
+        if (cached and cached[0] == signature
+                and _signal_file_signature(Path(cached[3]["summary_path"])) == cached[1]
+                and _signal_file_signature(Path(cached[3]["execution_weights_path"])) == cached[2]
+                and _signal_file_signature(pointer_path) == signature):
+            summary, rows = cached[3], cached[4]
             if str(summary.get("asof_date") or "")[:10] == now.date().isoformat():
                 return dict(summary), list(rows)
             return None
+        if signature[2] > 64 * 1024:
+            return None
         pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        market = str(spec.signal_market or spec.market)
+        signal_id = pointer.get("signal_id")
+        if (pointer.get("schema_version") != 2 or pointer.get("market") != market
+                or not isinstance(signal_id, str) or not signal_id
+                or Path(signal_id).name != signal_id or "\\" in signal_id):
+            return None
+        for name in ("signal_ready_at", "artifact_published_at"):
+            parsed = datetime.fromisoformat(str(pointer.get(name) or "").replace("Z", "+00:00"))
+            if parsed.utcoffset() is None or parsed.astimezone(TAIPEI).date() != now.date():
+                return None
+        ready_at = datetime.fromisoformat(str(pointer["signal_ready_at"]).replace("Z", "+00:00"))
+        published_at = datetime.fromisoformat(str(pointer["artifact_published_at"]).replace("Z", "+00:00"))
+        if published_at < ready_at:
+            return None
         summary_path = Path(str(pointer.get("summary_path") or ""))
         weights_path = Path(str(pointer.get("weights_path") or ""))
         execution_weights_path = Path(str(pointer.get("execution_weights_path") or ""))
+        root = spec.live_output_dir.resolve()
+        summary_path = summary_path.resolve(strict=True)
+        execution_weights_path = execution_weights_path.resolve(strict=True)
+        weights_path = weights_path.resolve()
+        if (not summary_path.is_relative_to(root) or summary_path.name != "summary.json"
+                or summary_path.parent.name != signal_id
+                or execution_weights_path.parent != summary_path.parent
+                or execution_weights_path.name != "execution_weights.json"
+                or weights_path.parent != summary_path.parent
+                or weights_path.name != "target_weights.parquet"):
+            return None
+        summary_signature = _signal_file_signature(summary_path)
+        weights_signature = _signal_file_signature(execution_weights_path)
+        if summary_signature[2] > 16 * 1024 * 1024 or weights_signature[2] > 16 * 1024 * 1024:
+            return None
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         if (
             isinstance(summary, dict)
-            and str(summary.get("market")) == str(spec.signal_market or spec.market)
+            and summary.get("market") == market
+            and summary.get("signal_id") == signal_id
             and str(summary.get("asof_date") or "")[:10] == now.date().isoformat()
-            and (execution_weights_path.is_file() or weights_path.is_file())
+            and summary.get("execution_mode") == "tw_day_trade"
+            and summary.get("signal_ready_at") == pointer.get("signal_ready_at")
+            and summary.get("artifact_published_at") == pointer.get("artifact_published_at")
         ):
-            rows: list[dict[str, Any]] | None = None
-            if execution_weights_path.is_file():
-                try:
-                    rows = read_execution_weight_rows(
-                        execution_weights_path,
-                        market=str(spec.signal_market or spec.market),
-                        signal_id=str(summary.get("signal_id") or ""),
-                    )
-                except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                    rows = None
-            if rows is None:
-                rows = pl.read_parquet(weights_path).to_dicts()
+            rows = read_execution_weight_rows(execution_weights_path, market=market, signal_id=signal_id)
+            if (not rows or len(rows) > 20_000
+                    or _signal_file_signature(pointer_path) != signature
+                    or _signal_file_signature(summary_path) != summary_signature
+                    or _signal_file_signature(execution_weights_path) != weights_signature):
+                return None
             summary = dict(summary)
             summary["summary_path"] = str(summary_path)
             summary["weights_path"] = str(weights_path)
-            summary["execution_weights_path"] = (
-                str(execution_weights_path)
-                if execution_weights_path.is_file()
-                else None
-            )
-            _LATEST_SIGNAL_CACHE[cache_key] = (signature, summary, rows)
+            summary["execution_weights_path"] = str(execution_weights_path)
+            _LATEST_SIGNAL_CACHE[cache_key] = (signature, summary_signature, weights_signature, summary, rows)
             return dict(summary), list(rows)
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
         pass
-
-    # Compatibility path for artifacts written before latest_signal.json.
-    # Current writers avoid this recursive scan on the opening hot path, and
-    # old writers are sampled at most once per five seconds.
-    legacy_cache_key = f"{spec.live_output_dir.resolve()}:{now.date().isoformat()}"
-    cached_legacy = _LEGACY_SIGNAL_SCAN_CACHE.get(legacy_cache_key)
-    monotonic_now = time_module.monotonic()
-    if cached_legacy and monotonic_now < cached_legacy[0]:
-        cached_result = cached_legacy[1]
-        return (
-            (dict(cached_result[0]), list(cached_result[1]))
-            if cached_result is not None
-            else None
-        )
-    candidates = list(
-        spec.live_output_dir.glob(f"{now.date().isoformat()}*/**/summary.json")
-    )
-    ranked: list[tuple[datetime, Path, dict[str, Any]]] = []
-    for path in candidates:
-        try:
-            summary = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(summary, dict) or str(summary.get("market")) != str(
-                spec.signal_market or spec.market
-            ):
-                continue
-            generated = datetime.fromisoformat(str(summary.get("generated_at")))
-            if generated.tzinfo is None:
-                generated = generated.replace(tzinfo=TAIPEI)
-            ranked.append((generated.astimezone(TAIPEI), path, summary))
-        except Exception:
-            continue
-    if not ranked:
-        _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
-        return None
-    _generated, summary_path, summary = max(ranked, key=lambda item: item[0])
-    weights_path = summary_path.with_name("target_weights.parquet")
-    execution_path = summary_path.with_name("execution_weights.json")
-    rows = None
-    if execution_path.is_file() and str(summary.get("execution_weights_path") or ""):
-        declared = Path(summary["execution_weights_path"])
-        if declared.resolve() == execution_path.resolve():
-            try:
-                rows = read_execution_weight_rows(
-                    execution_path, market=str(spec.signal_market or spec.market),
-                    signal_id=str(summary.get("signal_id") or ""),
-                )
-            except (OSError, TypeError, ValueError):
-                pass
-    if rows is None:
-        if not weights_path.is_file():
-            _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (monotonic_now + 5.0, None)
-            return None
-        rows = pl.read_parquet(weights_path).to_dicts()
-    summary = dict(summary)
-    summary["summary_path"] = str(summary_path)
-    result = (summary, rows)
-    _LEGACY_SIGNAL_SCAN_CACHE[legacy_cache_key] = (
-        monotonic_now + 5.0,
-        result,
-    )
-    return dict(summary), list(rows)
+    return None
 
 
 def _entry_candidate_symbols(
@@ -845,9 +951,18 @@ def _entry_candidate_symbols(
         weight = float(row.get("target_weight") or 0.0)
         if weight == 0.0 or not bool(row.get("tradable")):
             continue
-        if weight > 0.0 and not bool(row.get("can_buy")):
+        # Missing an opening price deliberately clears the provisional model
+        # direction flags. This is a request for evidence, not a permanent
+        # denial: match the executor's pending-price rule while retaining the
+        # independent session eligibility and short-open checks below.
+        pending_opening_price = bool(row.get("opening_price_wait_reason")) or (
+            getattr(spec, "signal_update_policy", None) == SIGNAL_UPDATE_PROGRESSIVE
+            and not (np.isfinite(float(row.get("open_price") or 0.0))
+                     and float(row.get("open_price") or 0.0) > 0.0)
+        )
+        if weight > 0.0 and not bool(row.get("can_buy")) and not pending_opening_price:
             continue
-        if weight < 0.0 and not bool(row.get("can_sell")):
+        if weight < 0.0 and not bool(row.get("can_sell")) and not pending_opening_price:
             continue
         symbol = str(row.get("symbol") or "")
         evidence = eligibility.get(symbol)
@@ -889,12 +1004,13 @@ def _entry_and_carry_quote_symbols(*, spec, rows, eligibility, mode):
     return symbols, fallback
 
 
-def _missed_opening_quote_symbols(*, spec, rows, eligibility, mode, observed):
+def _missed_opening_quote_symbols(*, spec, rows, eligibility, mode, observed, price_limits=None):
     """Exclude only provably zero replay orders, using the real account NAV.
 
-    Carried inventory, unsettled corporate-action accounting, unknown opening
-    prices or invalid NAV retain the broad discovery scope. Live best-quote
-    execution does not use this retrospective 09:00 sizing optimization.
+    The lower daily price limit, rather than an unproven later opening value,
+    gives a conservative upper bound on possible shares. Carried inventory,
+    unsettled corporate-action accounting, missing limits or invalid NAV keep
+    the broad discovery scope. Live execution does not use this optimization.
     """
 
     symbols, fallback = _entry_and_carry_quote_symbols(
@@ -911,29 +1027,104 @@ def _missed_opening_quote_symbols(*, spec, rows, eligibility, mode, observed):
     )
     if not np.isfinite(nav) or nav <= 0.0:
         return symbols, fallback
+    if price_limits is None:
+        price_limits, _ = _load_prepared_tw_price_limits(observed.date().isoformat())
     for row in rows:
         symbol = str(row.get("symbol") or "")
-        price = float(row.get("open_price") or 0.0)
+        limits = price_limits.get(symbol) or (None, None, None)
+        try:
+            upper, lower = float(limits[1] or 0.0), float(limits[2] or 0.0)
+        except (TypeError, ValueError, IndexError):
+            continue
         weight = float(row.get("target_weight") or 0.0)
-        if (symbol in symbols and np.isfinite(price) and price > 0.0
+        if (symbol in symbols and np.isfinite(lower) and lower > 0.0
+                and np.isfinite(upper) and upper >= lower
                 and np.isfinite(weight)
-                and whole_lot_target_shares(weight, nav, price, spec.lot_size) == 0):
+                and whole_lot_target_shares(weight, nav, lower, spec.lot_size) == 0):
             symbols.remove(symbol)
             fallback.pop(symbol, None)
     return symbols, fallback
 
 
-def _replay_sizing_open_price(signal_open, quote):
-    # A zero-target row can omit open_price. The broker's observed session open
-    # remains a source price; current/last/09:01 execution price never replaces it.
-    for value in (signal_open, quote.get("open")):
+def _replay_sizing_open_evidence(signal_open, quote, recovery=None, *, session_date=None, symbol=None):
+    """Accept only a first-trade opening proven within the replay minute.
+
+    A late signal or later live snapshot may contain a genuine session open,
+    but that alone does not establish that the first trade existed by 09:01.
+    The completed-minute source or a contemporaneous non-trial quote must
+    supply the independent clock and trade evidence. Never use a model-only
+    carried reference, the 09:01 execution price, or an unclocked open.
+    """
+    def positive(value):
         try:
             value = float(value)
             if np.isfinite(value) and value > 0:
                 return value
         except (TypeError, ValueError):
             pass
-    return None
+        return None
+
+    recovery = recovery if isinstance(recovery, Mapping) else {}
+    source = str(recovery.get("session_open_price_source") or "")
+    trusted_source = source in {
+        "shioaji:historical_first_trade_session_open",
+        "shioaji:historical_kbar_0901_open_first_trade",
+    } or source.startswith("local_minute_parquet_0901_first_print_open:")
+    try:
+        start = datetime.fromisoformat(str(recovery.get("source_window_start")))
+        end = datetime.fromisoformat(str(recovery.get("source_window_end")))
+        valid_window = (
+            session_date is not None and start.tzinfo is not None and end.tzinfo is not None
+            and start.utcoffset() == timedelta(hours=8) and end.utcoffset() == timedelta(hours=8)
+            and start.date() == session_date and end.date() == session_date
+            and datetime_time(9, 0) <= start.time() <= datetime_time(9, 1)
+            and datetime_time(9, 0) <= end.time() <= datetime_time(9, 1)
+            and start <= end
+        )
+    except (TypeError, ValueError):
+        valid_window = False
+    if (trusted_source and valid_window and positive(recovery.get("tick_volume_units_0901"))
+            and (symbol is None or str(recovery.get("symbol") or "") == symbol)
+            and (value := positive(recovery.get("session_open_price_0900"))) is not None):
+        return value, source
+    # `open` is tied to the quote row, not a separate later auction callback.
+    # Check both its local receipt and exchange clock; a same-day quote at
+    # 09:19 is insufficient to backdate a simulated 09:01 opening.
+    quote = quote if isinstance(quote, Mapping) else {}
+    try:
+        received = datetime.fromisoformat(str(quote.get("quote_at")))
+        exchange = datetime.fromisoformat(str(quote.get("book_exchange_at") or quote.get("exchange_quote_at")))
+        contemporaneous = (
+            session_date is not None
+            and received.tzinfo is not None and exchange.tzinfo is not None
+            and received.utcoffset() == timedelta(hours=8)
+            and exchange.utcoffset() == timedelta(hours=8)
+            and received.date() == session_date and exchange.date() == session_date
+            and datetime_time(9, 0) <= received.time() <= datetime_time(9, 1)
+            and datetime_time(9, 0) <= exchange.time() <= datetime_time(9, 1)
+        )
+    except (TypeError, ValueError):
+        contemporaneous = False
+    if (contemporaneous and quote.get("simtrade") is False
+            and positive(quote.get("cumulative_volume_lots"))
+            and (symbol is None or str(quote.get("symbol") or "") == symbol)
+            and (value := positive(quote.get("open"))) is not None):
+        return value, str(quote.get("source") or "observed_session_open")
+    return None, None
+
+
+def _replay_rows_with_verified_opens(rows, sizing_opens):
+    """Prevent the engine's normal row fallback from bypassing replay proof."""
+    return [
+        {**row, "open_price": sizing_opens.get(str(row.get("symbol") or ""))}
+        for row in rows
+    ]
+
+
+def _replay_sizing_open_price(signal_open, quote, recovery=None, *, session_date=None, symbol=None):
+    return _replay_sizing_open_evidence(
+        signal_open, quote, recovery, session_date=session_date, symbol=symbol,
+    )[0]
 
 
 def _fetch_quotes(
@@ -943,11 +1134,16 @@ def _fetch_quotes(
     parquet_root: Path,
     trading_date: datetime,
     use_stream: bool = False,
+    priority_symbols: tuple[str, ...] = (),
+    pending_symbols: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     if not symbols:
         return {}
     if use_stream:
-        return fetch_shioaji_stock_live_quotes(symbols, trading_date=trading_date.date())
+        return fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=trading_date.date(), priority_symbols=priority_symbols,
+            **({"pending_symbols": pending_symbols} if pending_symbols else {}),
+        )
     fallback = np.asarray(
         [float(fallback_by_symbol.get(symbol) or 1.0) for symbol in symbols],
         dtype=np.float64,
@@ -994,13 +1190,18 @@ def _fetch_quotes(
 
 
 def _attach_snapshot_valuation_quotes(quotes, *, engine, observed):
-    """Refresh missing held-side marks without adding any execution evidence.
+    """Refresh missing held-side marks after the session, not execution evidence.
 
     A fresh Snapshot read can value a paper position even when it does not
     expose simtrade. Such a mark is explicitly indicative. It must not supply
     bid/ask, last, minute volume or non-trial flags to the order/fill engine.
+    During the session, do not poll broker Snapshots as an alternative to the
+    live subscription. Missing observations remain explicitly missing/stale.
     """
 
+    clock = observed.astimezone(TAIPEI).timetz().replace(tzinfo=None)
+    if datetime_time(9, 0) <= clock < datetime_time(13, 35):
+        return
     held: dict[str, set[str]] = {}
     fallback: dict[str, float] = {}
     for mode in engine.state.get("modes", {}).values():
@@ -1487,20 +1688,64 @@ def _active_symbols(
     return sorted(symbols), fallback
 
 
-def _causal_pending_quote_symbols(modes: Mapping[str, Mapping[str, Any]]) -> set[str]:
-    """Wake real-time pending orders, including not-yet-sized source waits.
+def _held_symbols(engine: TwDayTradeSimulationEngine) -> tuple[str, ...]:
+    """Protect existing exposure before speculative entry/recovery streams."""
+    return tuple(sorted({
+        str(position.get("symbol"))
+        for mode in engine.state.get("modes", {}).values()
+        for position in (mode.get("positions") or {}).values()
+        if int(position.get("signed_shares") or 0) and position.get("symbol")
+    }))
+
+
+def _causal_pending_quote_work(modes: Mapping[str, Mapping[str, Any]]):
+    """One cheap inventory of causal entries AND inventory reductions.
 
     Replay prices keep their own minute clock and never borrow native books.
     This is a notification subscription, not a fill permission or quote proof.
+    A same-size new revision must re-arm fast observation even when the total
+    outstanding quantity is unchanged. Source/metadata churn alone must not.
     """
-    return {
-        str(order.get("symbol") or symbol)
-        for mode in modes.values()
-        if str(mode.get("entry_fill_policy") or "") == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
-        for symbol, order in (mode.get("pending_entry_orders") or {}).items()
-        if ((order.get("status") == "working" and int(order.get("remaining_shares") or 0) > 0)
-            or (order.get("status") == "waiting_source" and order.get("sizing_pending")))
-    }
+    symbols, remaining, revisions = set(), 0, []
+    for market, mode in sorted(modes.items()):
+        if str(mode.get("entry_fill_policy") or mode.get("configured_entry_fill_policy") or "") != ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET:
+            continue
+        has_work = False
+        for field in ("pending_entry_orders", "pending_reduction_orders"):
+            for symbol, order in (mode.get(field) or {}).items():
+                shares = int(order.get("remaining_shares") or 0)
+                working = order.get("status") == "working" and shares > 0
+                unsized = (field == "pending_entry_orders" and order.get("status") == "waiting_source"
+                           and order.get("sizing_pending"))
+                if not (working or unsized):
+                    continue
+                symbols.add(str(order.get("symbol") or symbol))
+                remaining += shares if working else 0
+                has_work = True
+        if has_work:
+            revisions.append((market, mode.get("session_date"), mode.get("signal_id")))
+    return symbols, remaining, tuple(revisions)
+
+
+def _causal_pending_quote_symbols(modes: Mapping[str, Mapping[str, Any]]) -> set[str]:
+    return _causal_pending_quote_work(modes)[0]
+
+
+def _stream_pending_priority(pending_symbols, held_symbols, wall_time):
+    """After the entry cutoff, only existing exposure can preempt rotation."""
+    pending = set(pending_symbols)
+    if wall_time >= EXIT_LIMIT_TIME:
+        pending.intersection_update(held_symbols)
+    return tuple(sorted(pending))
+
+
+def _missed_opening_live_registration_allowed(wall_time):
+    """Never create backdated opening inventory after live exit priority starts.
+
+    Sources may still be collected for an isolated, reconciled historical
+    candidate; registration into the running ledger has a separate boundary.
+    """
+    return MISSED_OPENING_REPLAY_AT <= wall_time < EXIT_LIMIT_TIME
 
 
 def _active_quote_due(
@@ -1956,9 +2201,28 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if float(args.poll_seconds) <= 0.0:
         raise ValueError("poll-seconds must be positive")
+    # A pinned native owner must prove its actual role/mounts BEFORE opening
+    # the authoritative ledger. Legacy CLI/fixtures remain explicitly unpinned.
+    if os.environ.get("STOCKAGENT_SERVICE_CODE_RELEASE"):
+        from stockagent.live.service_code_release import verify_startup_namespace
+        verify_startup_namespace(REPO_ROOT, role="engine")
     markets_dir = _repo_path(args.markets_dir)
     state_dir = _repo_path(args.state_dir)
     engine_lock = _acquire_engine_lock(state_dir)
+    # This is representation-only recovery under the SAME engine lease, not
+    # another executor. It cannot write a missing fill or acknowledge state.
+    # Unknown/partial writes still fail before the ordinary restore audits.
+    from stockagent.live.paper_journal import recover_pending_journal_heads
+    recovered_heads = recover_pending_journal_heads(state_dir)
+    if recovered_heads:
+        from downloader.artifact_io import atomic_write_json
+        atomic_write_json(state_dir / "journal_recovery.json", {
+            "contract": "native_engine_expected_append_head_recovery_v1",
+            "recorded_at": datetime.now(TAIPEI).isoformat(timespec="microseconds"),
+            "recovered": recovered_heads, "financial_commit_acknowledged": False,
+            "state_ledger_audit_pending": True,
+        }, durable=True)
+        print(f"[tw-day-trade-sim] immutable_journal_heads_recovered={len(recovered_heads)} financial_audit=pending", flush=True)
     engine = TwDayTradeSimulationEngine(state_dir, publication_clock=lambda: datetime.now(TAIPEI))
     if args.rearm_flat_session:
         specs, _live_configs, errors = _mode_specs(markets_dir)
@@ -2005,7 +2269,8 @@ def main(argv: list[str] | None = None) -> int:
     last_stream_rotation_at = 0.0
     stream_reconciliation_pending = False
     last_stream_coverage_minute: str | None = None
-    last_pending_entry_shares: int | None = None
+    last_pending_intent_shares: int | None = None
+    last_pending_revision_key: tuple = ()
     entry_fast_until = 0.0
     last_benchmark_minute: str | None = None
     last_ledger_mark_minute: str | None = None
@@ -2141,11 +2406,11 @@ def main(argv: list[str] | None = None) -> int:
             last_reload = monotonic_now
             last_readiness = monotonic_now
             last_liveness = monotonic_now
-            if not ready_notified:
-                notify_systemd(
-                    f"READY=1\nSTATUS={_executor_runtime_status(engine, specs, observed, session_errors=session_errors)}"
-                )
-                ready_notified = True
+            notify_systemd(_executor_reload_notification(
+                engine, specs, observed, already_ready=ready_notified,
+                session_errors=session_errors,
+            ))
+            ready_notified = True
         session_gate_started = time_module.perf_counter()
         session_open, session_errors = _verified_stock_session(
             specs,
@@ -2434,10 +2699,10 @@ def main(argv: list[str] | None = None) -> int:
             timespec="minutes"
         )
         for spec in specs:
-            if observed.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
-                # Live signals start at 09:00. The engine separately enforces
-                # that every execution quote is strictly later than the atomic
-                # signal publication timestamp.
+            if not _signal_intake_window_open(observed):
+                # After the 13:20 entry cutoff, the shared display pointer may
+                # contain a close cache, not a current execution instruction.
+                # Exit processing below must still run independently.
                 continue
             mode = engine.state.get("modes", {}).get(spec.market, {})
             if str(mode.get("engine_status") or "") == (
@@ -2447,8 +2712,7 @@ def main(argv: list[str] | None = None) -> int:
             session_already_entered = str(
                 mode.get("session_date") or ""
             ) == observed.date().isoformat() and bool(mode.get("entry_completed_at"))
-            if session_already_entered and (spec.signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE
-                    or mode.get("simulation_replay")):
+            if session_already_entered and spec.signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE:
                 continue
             if opening_batch_active and not session_already_entered:
                 batched = opening_signals.get(spec.market)
@@ -2461,11 +2725,48 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 summary, rows = latest
                 detected_at = datetime.now(TAIPEI)
+            if monotonic_now < pending_retry_after.get(spec.market, 0.0):
+                continue
+            missed_opening_recovery = False
+            if not session_already_entered:
+                proof = _initial_opening_signal_proof(spec, summary, detected_at)
+                if proof is None:
+                    # Do not guess from the model decision clock or an
+                    # artifact written before the execution pointer.
+                    pending_retry_after[spec.market] = time_module.monotonic() + 0.5
+                    print(
+                        f"[tw-day-trade-sim] market={spec.market} "
+                        "opening_signal_identity=waiting_initial_publication_proof",
+                        flush=True,
+                    )
+                    continue
+                initial_summary, initial_path, publication_proof_at, proof_kind = proof
+                missed_opening_recovery = _missed_opening_recovery_required(publication_proof_at)
+                if missed_opening_recovery and initial_path is not None:
+                    initial_rows = _read_initial_opening_rows(spec, initial_summary, initial_path)
+                    if initial_rows is None:
+                        pending_retry_after[spec.market] = time_module.monotonic() + 0.5
+                        print(
+                            f"[tw-day-trade-sim] market={spec.market} "
+                            "opening_signal_identity=waiting_initial_weights",
+                            flush=True,
+                        )
+                        continue
+                    # Replaying a later progressive revision at 09:01 would
+                    # backdate inputs that were not in the original decision.
+                    summary, rows = initial_summary, initial_rows
+                summary = {
+                    **summary,
+                    "opening_entry_clock_contract": OPENING_ENTRY_CLOCK_CONTRACT,
+                    "initial_opening_signal_id": initial_summary.get("signal_id"),
+                    "initial_opening_publication_proof": {
+                        "kind": proof_kind,
+                        "at": publication_proof_at.isoformat(timespec="microseconds"),
+                    },
+                }
             signal_id = str(summary.get("signal_id") or "")
             signal_first_detected_at.setdefault((spec.market, signal_id), detected_at)
             if signal_id in set(mode.get("processed_signal_ids") or ()):
-                continue
-            if monotonic_now < pending_retry_after.get(spec.market, 0.0):
                 continue
             live = live_configs[spec.market]
             eligibility_started = time_module.perf_counter()
@@ -2487,8 +2788,6 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             # A genuine intraday revision executes now at later causal books;
             # it must never be backdated into the late-opening 09:01 replay.
-            missed_opening_recovery = (not session_already_entered
-                and _missed_opening_recovery_required(detected_at))
             candidate_symbols, candidate_fallback = (
                 _missed_opening_quote_symbols(
                     spec=spec, rows=rows, eligibility=eligibility, mode=mode, observed=observed
@@ -2530,6 +2829,7 @@ def main(argv: list[str] | None = None) -> int:
             pending_fallback.update(candidate_fallback)
 
         active_symbols, active_fallback = _active_symbols(engine)
+        held_symbols = _held_symbols(engine)
         use_execution_stream = any(
             spec.strict_intraday
             or spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
@@ -2545,37 +2845,25 @@ def main(argv: list[str] | None = None) -> int:
                 )
             ) for mode in engine.state.get("modes", {}).values()
         ) and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)
-        causal_pending_entry = any(
-            str(
-                mode.get("configured_entry_fill_policy")
-                or mode.get("entry_fill_policy")
-                or ""
-            ) == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
-            and any(
-                (order.get("status") == "working"
-                 and int(order.get("remaining_shares") or 0) > 0)
-                or (order.get("status") == "waiting_source" and order.get("sizing_pending"))
-                for order in (mode.get("pending_entry_orders") or {}).values()
-            )
-            for mode in engine.state.get("modes", {}).values()
+        pending_quote_symbols, pending_intent_shares, pending_revision_key = _causal_pending_quote_work(
+            engine.state.get("modes", {}))
+        stream_pending_priority = _stream_pending_priority(
+            pending_quote_symbols, held_symbols, wall_time,
         )
-        pending_entry_shares = sum(
-            int(order.get("remaining_shares") or 0)
-            for mode in engine.state.get("modes", {}).values()
-            for order in (mode.get("pending_entry_orders") or {}).values()
-            if order.get("status") == "working"
-        )
-        if pending_entry_shares and pending_entry_shares != last_pending_entry_shares:
+        causal_pending_work = bool(pending_quote_symbols)
+        if causal_pending_work and (pending_intent_shares != last_pending_intent_shares
+                or pending_revision_key != last_pending_revision_key):
             entry_fast_until = monotonic_now + 20.0
-        last_pending_entry_shares = pending_entry_shares
-        stock_quote_wakeup.arm(_causal_pending_quote_symbols(engine.state.get("modes", {})))
+        last_pending_intent_shares = pending_intent_shares
+        last_pending_revision_key = pending_revision_key
+        stock_quote_wakeup.arm(pending_quote_symbols)
         pushed_entry_quote_due = stock_quote_wakeup.consume()
         # A fresh signal/fill briefly checks the pushed Quote feed each second.
         # Unchanged intents back off to 30 seconds: they may be illiquid or
         # unfunded, and must not rewrite the full paper ledger indefinitely.
         causal_pending_interval = 1.0 if monotonic_now < entry_fast_until else 30.0
         causal_pending_quote_due = bool(
-            causal_pending_entry
+            causal_pending_work
             and datetime_time(9, 0) <= wall_time < EXIT_LIMIT_TIME
             and (pushed_entry_quote_due
                  or monotonic_now - last_causal_pending_quote_at >= causal_pending_interval)
@@ -2612,9 +2900,14 @@ def main(argv: list[str] | None = None) -> int:
         all_symbols = sorted(
             pending_symbols
             | recovery_symbols
+            | pending_quote_symbols
             | (set(active_symbols) if quote_due else set())
             | benchmark_symbols
         )
+        # Other work must not evict held positions merely because this loop is
+        # not the minute-mark loop. Avoid a new fetch on an otherwise idle loop.
+        if all_symbols and use_execution_stream:
+            all_symbols = sorted(set(all_symbols) | set(held_symbols))
         quotes: dict[str, dict[str, Any]] = {}
         quote_fetch_ms = 0.0
         if all_symbols and specs:
@@ -2638,6 +2931,8 @@ def main(argv: list[str] | None = None) -> int:
                     parquet_root=specs[0].parquet_root,
                     trading_date=observed,
                     use_stream=use_execution_stream,
+                    priority_symbols=held_symbols,
+                    pending_symbols=stream_pending_priority,
                 )
                 if use_execution_stream:
                     last_stream_rotation_at = monotonic_now
@@ -2692,7 +2987,9 @@ def main(argv: list[str] | None = None) -> int:
             last_stream_rotation_at = monotonic_now
             try:
                 stream_quotes = fetch_shioaji_stock_live_quotes(
-                    active_symbols, trading_date=observed.date()
+                    sorted(set(active_symbols) | pending_quote_symbols),
+                    trading_date=observed.date(), priority_symbols=held_symbols,
+                    pending_symbols=stream_pending_priority,
                 )
                 stream_reconciliation_pending = any(
                     q.get("stream_reconciliation_pending") for q in stream_quotes.values()
@@ -2782,11 +3079,34 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 ledger_started = time_module.perf_counter()
                 register_spec = spec
-                register_summary = summary
+                register_summary = {
+                    **summary,
+                    # The producer's ready/artifact clocks precede the atomic
+                    # pointer. A book seen before this consumer observed the
+                    # pointer cannot causally execute the published signal.
+                    "execution_pointer_observed_at": signal_first_detected_at[
+                        (spec.market, str(summary.get("signal_id") or ""))
+                    ].isoformat(timespec="microseconds"),
+                }
                 register_quotes = quotes
+                register_rows = rows
                 register_observed = datetime.now(TAIPEI)
                 counterfactual_open_replay = False
                 if missed_opening_recovery:
+                    if not _missed_opening_live_registration_allowed(
+                        register_observed.timetz().replace(tzinfo=None)
+                    ):
+                        # Backdating a newly created position after the exit
+                        # window would leave unmonitored inventory in the
+                        # running ledger. Keep source repair separate from a
+                        # flat, independently reconciled replay candidate.
+                        pending_retry_after[spec.market] = time_module.monotonic() + 60.0
+                        print(
+                            f"[tw-day-trade-sim] market={spec.market} "
+                            "missed_opening_recovery=offline_candidate_required_after_exit_cutoff",
+                            flush=True,
+                        )
+                        continue
                     candidate_symbols, _candidate_fallback = _missed_opening_quote_symbols(
                         spec=spec,
                         rows=rows,
@@ -2860,8 +3180,11 @@ def main(argv: list[str] | None = None) -> int:
                     register_summary = {
                         **summary,
                         # A late opening remains an explicit 09:01 replay,
-                        # not permission to replay later live revisions into it.
+                        # while later revisions keep their own real clocks.
                         "missed_opening_original_signal_revision": summary.get("opening_signal_revision"),
+                        **({"missed_opening_original_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+                            "missed_opening_original_policy_fingerprint": summary.get("day_trade_signal_update_policy_fingerprint")}
+                           if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE else {}),
                         "opening_signal_revision": None,
                         "day_trade_signal_update_policy": SIGNAL_UPDATE_ONCE,
                         "simulation_replay": True,
@@ -2872,6 +3195,7 @@ def main(argv: list[str] | None = None) -> int:
                             "immutable_live_signal_official_open_and_shioaji_historical_ticks"
                         ),
                         "entry_fill_contract": MISSED_OPENING_REPLAY_CONTRACT,
+                        "replay_open_evidence_contract": REPLAY_OPEN_EVIDENCE_CONTRACT,
                         "entry_liquidity_assumption": (
                             "50pct_observed_09_01_minute_volume_capped_paper_quantity_"
                             "without_exchange_fill_or_queue_claim"
@@ -2885,6 +3209,7 @@ def main(argv: list[str] | None = None) -> int:
                         ),
                     }
                     register_quotes = {}
+                    replay_sizing_opens = {}
                     open_by_symbol = {
                         str(row.get("symbol") or ""): float(
                             row.get("open_price") or 0.0
@@ -2894,13 +3219,19 @@ def main(argv: list[str] | None = None) -> int:
                     for symbol in row_symbols:
                         base_quote = dict(quotes.get(symbol) or {})
                         price_row = recovery_prices.get(symbol) or {}
+                        sizing_open, sizing_open_source = _replay_sizing_open_evidence(
+                            open_by_symbol.get(symbol), base_quote, price_row,
+                            session_date=observed.date(), symbol=symbol,
+                        )
+                        replay_sizing_opens[symbol] = sizing_open
                         price = float(
                             price_row.get("execution_price_0901") or 0.0
                         )
                         valid_price = price if np.isfinite(price) and price > 0.0 else None
                         register_quotes[symbol] = {
                             **base_quote,
-                            "open": _replay_sizing_open_price(open_by_symbol.get(symbol), base_quote),
+                            "open": sizing_open,
+                            "sizing_open_price_source": sizing_open_source,
                             "last": valid_price,
                             "bid": None,
                             "ask": None,
@@ -2919,12 +3250,18 @@ def main(argv: list[str] | None = None) -> int:
                             or "missing_observed_09_01_minute_price",
                             "entry_price_source": price_row.get("source"),
                         }
+                    register_rows = _replay_rows_with_verified_opens(rows, replay_sizing_opens)
                     register_observed = replay_at
                     counterfactual_open_replay = True
+                if (counterfactual_open_replay and not _missed_opening_live_registration_allowed(
+                    datetime.now(TAIPEI).timetz().replace(tzinfo=None)
+                )):
+                    pending_retry_after[spec.market] = time_module.monotonic() + 60.0
+                    continue
                 result = engine.register_signal(
                     spec=register_spec,
                     summary=register_summary,
-                    signal_rows=rows,
+                    signal_rows=register_rows,
                     quotes=register_quotes,
                     eligibility=eligibility,
                     eligibility_coverage=coverage,
@@ -2933,7 +3270,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 ledger_ms = (time_module.perf_counter() - ledger_started) * 1000.0
                 persisted_at = datetime.now(TAIPEI)
-                if result in {"waiting_quote", "waiting_first_minute"}:
+                if result == "waiting_replay_lineage":
+                    pending_retry_after[spec.market] = time_module.monotonic() + 60.0
+                elif result in {"waiting_quote", "waiting_first_minute"}:
                     pending_retry_after[spec.market] = (
                         time_module.monotonic()
                         + _pending_signal_retry_delay_seconds(result, persisted_at)
@@ -3034,7 +3373,7 @@ def main(argv: list[str] | None = None) -> int:
                 datetime.now(TAIPEI),
                 fast_seconds=float(args.poll_seconds),
                 has_pending_signal=stream_reconciliation_pending or bool(pending) or (
-                    causal_pending_entry and time_module.monotonic() < entry_fast_until
+                    causal_pending_work and time_module.monotonic() < entry_fast_until
                 ),
                 has_open_position=bool(active_symbols),
                 has_pending_opening_stream=opening_stream_reconciliation_pending,

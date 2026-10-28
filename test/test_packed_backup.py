@@ -1,7 +1,10 @@
 import json
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -499,20 +502,144 @@ def test_safe_paths_reject_escape_and_symlinks(tmp_path):
             safe_path(tmp_path, relative)
 
 
-def test_pinned_object_signatures_reject_changed_directory(tmp_path):
+@pytest.mark.parametrize('parallel_signatures', [False, True])
+def test_pinned_object_signatures_reject_changed_directory(tmp_path, parallel_signatures):
     root = tmp_path / "packed"
     shard = root / "objects/blobs/aa"
     shard.mkdir(parents=True)
     relative = "objects/blobs/aa/" + "a" * 64 + ".blob"
     target = root / relative
     target.write_bytes(b"object")
-    with PinnedObjectSignatures(root) as reader:
+    with PinnedObjectSignatures(root, parallel_signatures=parallel_signatures) as reader:
         assert reader.signature(relative) == module.signature(safe_path(root, relative))
         moved = tmp_path / "moved"
         shard.rename(moved)
         shard.symlink_to(moved, target_is_directory=True)
         with pytest.raises(SnapshotError, match="directory changed"):
             reader.recheck()
+
+
+def test_regular_member_signature_keeps_cas_entrypoint_strict(tmp_path):
+    member = tmp_path / 'encodings/deep/original.raw'
+    member.parent.mkdir(parents=True)
+    member.write_bytes(b'original archive bytes')
+    with PinnedObjectSignatures(tmp_path) as reader:
+        assert reader.regular_file_signature('encodings/deep/original.raw') == module.signature(member)
+        with pytest.raises(SnapshotError):
+            reader.signature('encodings/deep/original.raw')
+        reader.recheck()
+
+
+def test_parallel_member_signatures_overlap_and_keep_recheck_fences(tmp_path, monkeypatch):
+    for name in ('first', 'second'):
+        (tmp_path / name).write_bytes(name.encode())
+    expected = [module.signature(tmp_path / name) for name in ('first', 'second')]
+    original_stat = os.stat
+    overlap = threading.Barrier(2, timeout=5)
+
+    def observed_stat(path, *args, **kwargs):
+        if path in ('first', 'second') and kwargs.get('dir_fd') is not None:
+            overlap.wait()
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'stat', observed_stat)
+    with PinnedObjectSignatures(tmp_path, parallel_signatures=True) as reader:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            assert list(workers.map(reader.regular_file_signature, ('first', 'second'))) == expected
+        reader.recheck()
+        assert reader._inflight_signatures == 0
+
+
+@pytest.mark.parametrize('finish', ['close', 'recheck'])
+def test_parallel_signatures_finish_before_close_or_recheck(tmp_path, monkeypatch, finish):
+    (tmp_path / 'member').write_bytes(b'original')
+    started, release = threading.Event(), threading.Event()
+    original_stat = os.stat
+
+    def slow_stat(path, *args, **kwargs):
+        if path == 'member' and kwargs.get('dir_fd') is not None:
+            started.set()
+            assert release.wait(5)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'stat', slow_stat)
+    reader = PinnedObjectSignatures(tmp_path, parallel_signatures=True)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            signature = workers.submit(reader.regular_file_signature, 'member')
+            assert started.wait(5)
+            finished = workers.submit(getattr(reader, finish))
+            assert not finished.done()
+            release.set()
+            assert signature.result(timeout=5)[2] == len(b'original')
+            finished.result(timeout=5)
+        assert reader._inflight_signatures == 0
+    finally:
+        release.set()
+        reader.close()
+
+
+def test_parallel_signature_error_releases_its_pin(tmp_path):
+    (tmp_path / 'not-a-file').mkdir()
+    with PinnedObjectSignatures(tmp_path, parallel_signatures=True) as reader:
+        with pytest.raises(SnapshotError, match='not a regular'):
+            reader.regular_file_signature('not-a-file')
+        assert reader._inflight_signatures == 0
+        reader.recheck()
+
+
+def test_parallel_signature_survives_cache_eviction_without_losing_fence(tmp_path, monkeypatch):
+    for directory in ('first', 'second'):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / 'member').write_bytes(directory.encode())
+    started, release = threading.Event(), threading.Event()
+    original_stat = os.stat
+    calls = 0
+    calls_lock = threading.Lock()
+
+    def slow_first_stat(path, *args, **kwargs):
+        nonlocal calls
+        if path == 'member' and kwargs.get('dir_fd') is not None:
+            with calls_lock:
+                calls += 1
+                first = calls == 1
+            if first:
+                started.set()
+                assert release.wait(5)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'stat', slow_first_stat)
+    with PinnedObjectSignatures(tmp_path, max_open_directories=2,
+                                parallel_signatures=True) as reader:
+        try:
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                first = workers.submit(reader.regular_file_signature, 'first/member')
+                assert started.wait(5)
+                second = workers.submit(reader.regular_file_signature, 'second/member')
+                assert second.result(timeout=5)[2] == len(b'second')
+                assert ('first',) not in reader._directories
+                release.set()
+                assert first.result(timeout=5)[2] == len(b'first')
+            reader.recheck()
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize('parallel_signatures', [False, True])
+@pytest.mark.parametrize('kind', ['symlink', 'directory', 'fifo'])
+def test_regular_member_signature_rejects_nonregular_leaf_without_opening(tmp_path, kind, parallel_signatures):
+    member = tmp_path / 'member'
+    if kind == 'symlink':
+        other = tmp_path / 'other'
+        other.write_bytes(b'preserve')
+        member.symlink_to(other)
+    elif kind == 'directory':
+        member.mkdir()
+    else:
+        os.mkfifo(member)
+    with PinnedObjectSignatures(tmp_path, parallel_signatures=parallel_signatures) as reader:
+        with pytest.raises(SnapshotError, match='not a regular'):
+            reader.regular_file_signature('member')
 
 
 def test_volume_guard_missing_wrong_or_source_disk(setup, monkeypatch):

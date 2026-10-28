@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 import hashlib
 import math
@@ -77,11 +78,31 @@ def _closing_clock(value: Any) -> bool:
     return parsed.hour == 13 and parsed.minute == 30
 
 
+def _projected_daily_quote_rows(
+    path: Path, *, columns: list[str], sessions: set[str],
+    symbol_column: str, symbols: set[str] | None,
+) -> list[dict[str, Any]]:
+    """Push both predicates and columns into the maintained lazy reader.
+
+    Do not decode wide historical source receipts for rows outside this public
+    response. No sorting, aggregation, type coercion or value repair is done.
+    """
+    import polars as pl
+
+    predicate = pl.col("date").is_in(sorted(sessions))
+    if symbols is not None:
+        predicate &= pl.col(symbol_column).is_in(sorted(symbols))
+    return (pl.scan_parquet(path).filter(predicate).select(columns)
+            .collect().to_dicts())
+
+
 class OfficialDailyQuoteSource:
     """Bounded per-session cache; atomic canonical replacement invalidates it.
 
-    Arrow predicates/column projection avoid decoding the entire history. A
-    single flight loads a session once, shared by signals, positions and modes.
+    Lazy predicates/column projection avoid decoding unrelated historical
+    receipts. A single flight loads a complete session once; request-owned
+    partial batches serve historical signals, positions, events and status
+    without evicting/reloading that LRU for every record.
     """
 
     def __init__(self, public_root: Path, *, maximum_sessions: int = 64) -> None:
@@ -98,7 +119,8 @@ class OfficialDailyQuoteSource:
         for dataset, *_ in _SPECS:
             try:
                 stat = (self.public_root / f"{dataset}.parquet").stat()
-                values.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+                values.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns,
+                               stat.st_ctime_ns))
             except OSError:
                 values.append(None)
         return tuple(values)
@@ -107,26 +129,39 @@ class OfficialDailyQuoteSource:
         return hashlib.sha256(repr(self.signature()).encode()).hexdigest()[:16]
 
     def _load(self, session: str) -> dict[str, dict[str, Any]]:
-        import pyarrow.parquet as pq
+        return self._load_sessions({session})[session]
 
-        result: dict[str, dict[str, Any]] = {}
-        ambiguous: set[str] = set()
+    def _load_sessions(
+        self, sessions: set[str], *, symbols: set[str] | None = None,
+    ) -> dict[str, dict[str, dict[str, Any]]]:
+        """Read each venue once for one exact public response's quote needs.
+
+        Symbol filtering is an I/O projection, not a complete-session cache.
+        Never insert a partial session into the shared session LRU.
+        """
+        import pyarrow.parquet as pq
+        from polars.exceptions import PolarsError
+
+        result: dict[str, dict[str, dict[str, Any]]] = {day: {} for day in sessions}
+        ambiguous: set[tuple[str, str]] = set()
         for dataset, venue, symbol_column, source, domains, columns in _SPECS:
             path = self.public_root / f"{dataset}.parquet"
             try:
                 available = set(pq.read_schema(path).names)
                 optional_prices = {key: col for key, col in _OPTIONAL_PRICES[venue].items() if col in available}
                 measures = {key: col for key, col in _OPTIONAL_MEASURES[venue].items() if col in available}
-                rows = pq.read_table(path, filters=[("date", "==", session)], columns=[
+                rows = _projected_daily_quote_rows(path, sessions=sessions, symbols=symbols,
+                    symbol_column=symbol_column, columns=[
                     "date", symbol_column, *columns.values(), "_dataset", "_source",
                     "_downloaded_at_utc", "_url", *optional_prices.values(), *measures.values(),
-                ]).to_pylist()
-            except (OSError, ValueError, KeyError):
+                ])
+            except (OSError, ValueError, KeyError, PolarsError):
                 # A broken source cannot manufacture prices or stop the other venue.
                 continue
             for row in rows:
+                session = str(row.get("date") or "")
                 symbol = str(row.get(symbol_column) or "").strip()
-                if not symbol or row.get("date") != session:
+                if not symbol or session not in sessions:
                     continue
                 clock = row.get("_downloaded_at_utc")
                 host = urlparse(str(row.get("_url") or "")).hostname or ""
@@ -141,7 +176,7 @@ class OfficialDailyQuoteSource:
                     verified = (datetime.fromisoformat(f"{session}T13:30:00+08:00")
                                 <= received <= datetime.now(TAIPEI))
                 if not verified:
-                    ambiguous.add(symbol)
+                    ambiguous.add((session, symbol))
                     continue
                 prices = {field: _price(row.get(column)) for field, column in {**columns, **optional_prices}.items()}
                 if not any(value is not None for value in prices.values()):
@@ -155,14 +190,62 @@ class OfficialDailyQuoteSource:
                     # Retain official no-limit sentinels verbatim. Do not call
                     # these today's prices or infer a universal +/-10% rule.
                     item["limit_scope"] = "next_exchange_session_published_bounds"
-                prior = result.get(symbol)
+                prior = result[session].get(symbol)
                 if prior and (prior["venue"] != venue or any(prior[k] != item[k] for k in prices)):
-                    ambiguous.add(symbol)
+                    ambiguous.add((session, symbol))
                 elif prior is None or str(clock) > str(prior["received_at"]):
-                    result[symbol] = item
-        for symbol in ambiguous:
-            result.pop(symbol, None)
+                    result[session][symbol] = item
+        for session, symbol in ambiguous:
+            result[session].pop(symbol, None)
         return result
+
+    @contextmanager
+    def read_view(self, payload: Any, *, session_date: str | None = None):
+        """Pin the same official generation across all nested public records.
+
+        A historical page can touch more dates than the process LRU holds.
+        Collect its finite date/symbol projection once, rather than cycling
+        through the same large Parquet files per row and per nested position.
+        Role-specific verification remains in ``enrich`` below.
+        """
+        sessions: set[str] = set()
+        symbols: set[str] = set()
+
+        def collect(value: Any, inherited: str | None) -> None:
+            if isinstance(value, Mapping):
+                current = value.get("session_date") or inherited
+                symbol = str(value.get("symbol") or "")
+                if symbol and (day := _day(current)):
+                    symbols.add(symbol)
+                    sessions.add(day)
+                    for key in ("entry_exchange_at", "entry_at", "exit_exchange_at",
+                                "exit_at", "last_quote_at", "last_mark_at"):
+                        if role_day := _session(value.get(key)):
+                            sessions.add(role_day)
+                    if prior_day := _day(value.get("daily_return_previous_close_date")):
+                        sessions.add(prior_day)
+                for key, child in value.items():
+                    if key != DAILY_QUOTE_FIELD:
+                        collect(child, current)
+            elif isinstance(value, list):
+                for child in value:
+                    collect(child, inherited)
+
+        collect(payload, session_date)
+        with self._lock:
+            signature = self.signature()
+            if signature != self._signature:
+                self._sessions.clear()
+                self._prior_sessions.clear()
+                self._signature = signature
+            cached = {day: self._sessions[day] for day in sessions if day in self._sessions}
+            missing = sessions - cached.keys()
+            projected = self._load_sessions(missing, symbols=symbols) if missing else {}
+            if self.signature() != signature:
+                raise OSError("official daily source changed during batch construction")
+        yield _OfficialDailyQuoteReadView(self, cached | projected)
+        if self.signature() != signature:
+            raise OSError("official daily source changed during public projection")
 
     def session(self, session: str) -> dict[str, dict[str, Any]]:
         if _day(session) is None:
@@ -252,7 +335,7 @@ class OfficialDailyQuoteSource:
                 daily["requested_session_date"] = session
                 daily["prior_session_reference_only"] = True
             daily[PROTECTED_OBSERVATIONS_KEY] = {
-                key: self._observation(fact, key, key)
+                key: OfficialDailyQuoteSource._observation(fact, key, key)
                 for key in ("open", "high", "low", "close", *_OPTIONAL_PRICES[fact["venue"]])
                 if fact.get(key) is not None
             }
@@ -266,7 +349,7 @@ class OfficialDailyQuoteSource:
             role_fact = self.session(day).get(symbol) if day else None
             if (role_fact is not None and role_fact[source_field] is not None
                     and record.get(field) == role_fact[source_field]):
-                observations.setdefault(field, self._observation(role_fact, field, source_field))
+                observations.setdefault(field, OfficialDailyQuoteSource._observation(role_fact, field, source_field))
 
         # Sizing uses official open, but a 09:01 VWAP fill is a different fact.
         if record.get("sizing_open_price") is not None:
@@ -314,3 +397,26 @@ class OfficialDailyQuoteSource:
         if observations:
             output[PROTECTED_OBSERVATIONS_KEY] = observations
         return output
+
+
+class _OfficialDailyQuoteReadView:
+    """Request-owned partial sessions; never masquerade as the shared LRU."""
+
+    def __init__(self, source: OfficialDailyQuoteSource,
+                 sessions: dict[str, dict[str, dict[str, Any]]]) -> None:
+        self.source, self.sessions = source, sessions
+
+    def session(self, session: str) -> dict[str, dict[str, Any]]:
+        if session in self.sessions:
+            return self.sessions[session]
+        # Today's reference-only fallback may discover a prior date not named
+        # in the input. It still uses the canonical verified complete reader.
+        result = self.source.session(session)
+        self.sessions[session] = result
+        return result
+
+    def prior_completed_session(self, session: str) -> str | None:
+        return self.source.prior_completed_session(session)
+
+    def enrich(self, record: Mapping[str, Any], *, session_date: str | None = None):
+        return OfficialDailyQuoteSource.enrich(self, record, session_date=session_date)

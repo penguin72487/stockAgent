@@ -13,6 +13,7 @@ def queue(tmp_path, monkeypatch):
     atomic_write_json(tmp_path / 'source-replication-ledger.json', {'deliveries': {
         key: {'nas_acceptance': {'state': 'nas_archive_file_recovery_verified'}} for key in (a, b)}})
     monkeypatch.setattr(module.time, 'time', lambda: 1000)
+    monkeypatch.setattr(module, 'catalog_enrollment', lambda *args: None)
     return tmp_path, a, b
 
 
@@ -126,3 +127,57 @@ def test_normal_capacity_preserves_catalog_kind_alternation(queue, monkeypatch):
     monkeypatch.setattr(module, 'retire_accepted_transport', lambda *args: {'state': 'retired'})
     result = module.retire_one(policy, root)
     assert not result['source_capacity_pressure'] and result['delivery_identity_sha256'] == catalog
+
+
+def test_source_gc_admits_original_enrollment_then_runs_full_retirement(queue, monkeypatch):
+    root, identity, _ = queue
+    ledger = json.loads((root / 'source-replication-ledger.json').read_bytes())
+    enrolled = ledger['deliveries'][identity]
+    enrolled.update(file_keys=['objects/a@' + 'f' * 64], bytes=17)
+    atomic_write_json(root / 'source-replication-ledger.json', ledger)
+    calls = []
+    def admit(c, key, **options):
+        assert key == identity and options == {'enrolled_source': enrolled}
+        calls.append('paired_ack')
+        return {'state': 'nas_archive_file_recovery_verified'}
+    def retire(c, key, proof):
+        calls.append('full_local_retirement')
+        status = json.loads((root / 'transport-gc-status.json').read_bytes())
+        assert status['phase'] == 'verify_and_retire_transport'
+        assert status['nas_admission_seconds'] >= 0
+        return {'state': 'retired'}
+    monkeypatch.setattr(module, 'acceptance', admit)
+    monkeypatch.setattr(module, 'retire_accepted_transport', retire)
+    assert module.retire_one({}, root)['state'] == 'retired'
+    assert calls == ['paired_ack', 'full_local_retirement']
+
+
+@pytest.mark.parametrize('has_enrollment', [False, True])
+def test_catalog_gc_uses_only_exact_published_enrollment(queue, monkeypatch, has_enrollment):
+    root, _, _ = queue
+    identity = 'c' * 64
+    atomic_write_json(root / 'source-replication-ledger.json', {'deliveries': {}})
+    atomic_write_json(root / ('catalog-acceptance-' + identity + '.json'), {
+        'delivery_identity_sha256': identity, 'state': 'nas_archive_file_recovery_verified'})
+    enrolled = {'delivery_identity_sha256': identity, 'state': 'published'}
+    monkeypatch.setattr(module, 'catalog_enrollment', lambda c, key: enrolled if has_enrollment else None)
+    def admit(c, key, **options):
+        assert key == identity
+        assert options == ({'enrolled_catalog': enrolled} if has_enrollment else {})
+        return {'state': 'nas_archive_file_recovery_verified'}
+    monkeypatch.setattr(module, 'acceptance', admit)
+    monkeypatch.setattr(module, 'retire_accepted_transport', lambda *args: {'state': 'retired'})
+    assert module.retire_one({}, root)['state'] == 'retired'
+
+
+def test_changed_enrollment_failure_preserves_transport_and_never_enters_retirement(queue, monkeypatch):
+    root, identity, _ = queue
+    ledger = json.loads((root / 'source-replication-ledger.json').read_bytes())
+    ledger['deliveries'][identity]['file_keys'] = ['incorrect enrollment']
+    atomic_write_json(root / 'source-replication-ledger.json', ledger)
+    def reject(c, key, **options):
+        raise ValueError('NAS receipt differs from enrolled source publication')
+    monkeypatch.setattr(module, 'acceptance', reject)
+    monkeypatch.setattr(module, 'retire_accepted_transport', lambda *args: pytest.fail('invalid enrollment reached retirement'))
+    assert module.retire_one({}, root)['state'] == 'retirement_deferred'
+    assert not list(root.glob('cache-retirement-*.json'))

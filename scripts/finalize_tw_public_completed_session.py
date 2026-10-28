@@ -388,6 +388,12 @@ def main() -> int:
                     )
                     if completed.returncode == 0 and not remaining:
                         break
+                    if name == "build_official_symbol_panel" and completed.returncode == 75:
+                        # This builder reserves exit 75 for a typed capacity
+                        # deferral. Preserve its failure and release the source
+                        # lease; the existing scheduled owner will retry later.
+                        attempts[-1]["retry_deferred"] = "capacity"
+                        break
                     if attempt < int(args.step_attempts):
                         delay = min(
                             30.0,

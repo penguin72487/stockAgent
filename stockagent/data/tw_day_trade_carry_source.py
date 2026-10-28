@@ -325,7 +325,7 @@ PHYSICAL_SOURCE_CACHE_ABI = (
 _PREDECESSOR_PHYSICAL_SOURCE_CACHE_ABI = (
     "tw_day_trade_physical_source_cache_v11_share_replacement_session"
 )
-PHYSICAL_PRICE_LIMIT_CACHE_ABI = "tw_day_trade_physical_price_limits_v1"
+PHYSICAL_PRICE_LIMIT_CACHE_ABI = "tw_day_trade_physical_price_limits_v2_consumed_inputs"
 PHYSICAL_SOURCE_RUN_RECEIPT_SCHEMA = 1
 PHYSICAL_SOURCE_RUN_RECEIPT_ENV = (
     "STOCKAGENT_PINNED_DAY_TRADE_SOURCE_RECEIPT"
@@ -1536,14 +1536,36 @@ def _price_limits(
     }
 
 
+def _price_limit_input_digest(
+    *, receipts: dict[str, dict[str, Any]], dates: np.ndarray,
+    symbols: tuple[str, ...], closes: np.ndarray,
+) -> str:
+    """Bind limits to their actual inputs, using the canonical source hashes.
+
+    Minute receipts, opens, volumes and account policies do not enter
+    ``_price_limits``. Their revisions still invalidate the complete physical
+    source, but must not rebuild these unchanged tensors. Keep entire TPEx and
+    corporate reference hashes: a source correction must never be hidden by
+    metadata or a date-only shortcut. Price-rule changes require an ABI bump.
+    """
+    digest = hashlib.sha256(PHYSICAL_PRICE_LIMIT_CACHE_ABI.encode("ascii"))
+    for name in ("tpex_daily", "corporate_reference"):
+        digest.update(b"\0" + name.encode("ascii") + b"\0")
+        digest.update(receipts[name]["sha256"].encode("ascii"))
+    digest.update(b"\0symbols\0" + json.dumps(symbols).encode("utf-8"))
+    _hash_array(digest, "dates", dates)
+    _hash_array(digest, "closes", closes)
+    return digest.hexdigest()
+
+
 def _load_or_build_price_limit_cache(
-    *, cache_dir: Path, source_digest: str, public_root: Path,
+    *, cache_dir: Path, input_digest: str, public_root: Path,
     dates: np.ndarray, symbols: tuple[str, ...], closes: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
     """Reuse deterministic price-rule tensors across folds and DDP ranks."""
 
     key = hashlib.sha256(
-        (PHYSICAL_PRICE_LIMIT_CACHE_ABI + "\0" + source_digest).encode("ascii")
+        (PHYSICAL_PRICE_LIMIT_CACHE_ABI + "\0" + input_digest).encode("ascii")
     ).hexdigest()[:24]
     root = cache_dir / f"physical-price-limits-{key}"
     manifest_path = root / "manifest.json"
@@ -1565,12 +1587,12 @@ def _load_or_build_price_limit_cache(
             files = candidate.get("files", {})
             if (
                 candidate.get("abi") == PHYSICAL_PRICE_LIMIT_CACHE_ABI
-                and candidate.get("source_digest") == source_digest
+                and candidate.get("input_digest") == input_digest
                 and candidate.get("rows") == int(dates.size)
                 and candidate.get("symbols") == len(symbols)
                 and set(files) == {path.name for path in paths.values()}
                 and ready.get("abi") == PHYSICAL_PRICE_LIMIT_CACHE_ABI
-                and ready.get("source_digest") == source_digest
+                and ready.get("input_digest") == input_digest
                 and ready.get("manifest_sha256") == _sha256(manifest_path)
                 and all(
                     path.is_file()
@@ -1605,7 +1627,7 @@ def _load_or_build_price_limit_cache(
             }
             manifest = {
                 "abi": PHYSICAL_PRICE_LIMIT_CACHE_ABI,
-                "source_digest": source_digest,
+                "input_digest": input_digest,
                 "rows": int(dates.size),
                 "symbols": len(symbols),
                 "counts": counts,
@@ -1616,7 +1638,7 @@ def _load_or_build_price_limit_cache(
                 ready_path,
                 {
                     "abi": PHYSICAL_PRICE_LIMIT_CACHE_ABI,
-                    "source_digest": source_digest,
+                    "input_digest": input_digest,
                     "manifest_sha256": _sha256(manifest_path),
                     "verified_files": len(files),
                 },
@@ -1684,8 +1706,10 @@ def _dense_bars(path: Path, symbols: tuple[str, ...]) -> tuple[np.ndarray, np.nd
         - 1
     )
     keys = slots * 270 + minutes
-    if np.unique(keys).size != keys.size:
-        counts = np.bincount(keys, minlength=width * 270)
+    # Slots and minutes are already bounded by the validated join/filter.
+    # A dense occupancy count is linear; sorting every minute row is redundant.
+    counts = np.bincount(keys, minlength=width * 270)
+    if np.any(counts > 1):
         duplicate = int(np.flatnonzero(counts > 1)[0])
         slot, minute = divmod(duplicate, 270)
         raise ValueError(
@@ -1913,7 +1937,9 @@ def build_prepared_day_trade_carry_source(
 
     lower, upper, security_types, limit_counts = _load_or_build_price_limit_cache(
         cache_dir=Path(cache_dir).resolve(),
-        source_digest=digest,
+        input_digest=_price_limit_input_digest(
+            receipts=receipts, dates=dates, symbols=symbols, closes=closes,
+        ),
         public_root=public_path,
         dates=dates,
         symbols=symbols,
@@ -2134,6 +2160,7 @@ def build_prepared_day_trade_carry_source(
                         mode_counts[name] += number
                     files[output.name] = reused["file"]
                     session_builds[output.name] = reused["build"]
+                    reuse.checkpoint(output, files[output.name], session_builds[output.name])
                     minute_sessions_built += 1
                     continue
                 before_counts = dict(mode_counts)
@@ -2195,9 +2222,10 @@ def build_prepared_day_trade_carry_source(
                 entry_array = np.full((len(symbols), 3), np.nan, dtype=np.float64)
                 entry_array[:, 1] = 0.0
                 entry_array[:, 2] = 0.0
-                entry_path = np.zeros((len(symbols), 270, 2), dtype=np.float64)
-                entry_path[..., 0] = np.nan
-                stop_hits = np.zeros_like(entry_path)
+                if sweep_entries:
+                    entry_path = np.zeros((len(symbols), 270, 2), dtype=np.float64)
+                    entry_path[..., 0] = np.nan
+                    stop_hits = np.zeros_like(entry_path)
                 if good.any():
                     opportunities = paper_minute_opportunities(
                         dense[good], trading_date=day,
@@ -2273,6 +2301,7 @@ def build_prepared_day_trade_carry_source(
                         {name: mode_counts[name] - before_counts[name] for name in session_count_names},
                     ),
                 }
+                reuse.checkpoint(output, files[output.name], session_builds[output.name])
                 minute_sessions_built += 1
                 if minute_sessions_built % 100 == 0:
                     print(

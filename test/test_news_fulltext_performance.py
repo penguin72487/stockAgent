@@ -13,7 +13,8 @@ import pytest
 import requests
 
 from downloader.artifact_io import atomic_write_json
-from downloader.news_fulltext import accept_discovery, fetch_discovery, load_config, run_cycle, run_service
+from downloader.news_fulltext import (_coalesce_inventory_heartbeats, accept_discovery, fetch_discovery,
+                                      load_config, run_cycle, run_service)
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry, _plain_text
 from downloader.news_fulltext_queue import NewsQueue, verify_bodies
 from test_news_fulltext import FakeResponse, article_html, config as config, http_fixture
@@ -75,6 +76,52 @@ def test_full_inventory_uses_time_not_receipt_count_for_status(config, tmp_path,
         assert all(activity == 'inventorying' for _, activity in statuses)
         assert queue.db.execute("SELECT value FROM counters WHERE key='latest_inventory_finmind_receipts_checked'").fetchone()[0] == 1005
         assert queue.metrics.snapshot()['stages']['metadata_inventory_status']['count'] == expected_status_calls
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('complete_while_blocked', [False, True])
+def test_disk_wait_coalesces_inventory_status_without_losing_progress(config, tmp_path, monkeypatch,
+                                                                     complete_while_blocked):
+    root = tmp_path / 'finmind'
+    root.mkdir()
+    source = sqlite3.connect(root / 'queue.sqlite3')
+    source.execute('CREATE TABLE tasks(dataset,state,receipt_path,partition)')
+    for index in range(205):
+        path = root / f'{index:04}.json'
+        path.write_text('{}')
+        source.execute('INSERT INTO tasks VALUES (?,?,?,?)', ('TaiwanStockNews', 'complete', path.name, index))
+    source.commit()
+    source.close()
+    queue = NewsQueue(tmp_path / 'queue', PolicyRegistry(config, base=tmp_path))
+    clock, visited, statuses = [0.0], [], []
+
+    def receipt(_root, path, **kwargs):
+        visited.append(path.name)
+        clock[0] += 0.25
+        return path.name in {'0007.json', '0200.json'}
+
+    monkeypatch.setattr('downloader.news_fulltext_queue.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr(queue, 'ingest_receipt', receipt)
+    monkeypatch.setattr(queue, 'status', lambda **kwargs: statuses.append((clock[0], kwargs['activity'])))
+    try:
+        with _coalesce_inventory_heartbeats(queue):
+            blocked = queue.ingest_local_slice(tmp_path / 'finlab', root,
+                                               maximum_wall_seconds=None if complete_while_blocked else 31)
+        assert not statuses and not hasattr(queue, '_coalesce_inventory_heartbeats')
+        checked = len(visited)
+        counter = queue.db.execute("SELECT value FROM counters WHERE key='latest_inventory_finmind_receipts_checked'").fetchone()[0]
+        assert counter == (205 if complete_while_blocked else 100)
+        assert blocked['complete'] is complete_while_blocked
+        if complete_while_blocked:
+            assert checked == 205 and blocked['imported'] == 2
+        else:
+            assert 100 < checked < 205
+            remaining = queue.ingest_local_slice(tmp_path / 'finlab', root)
+            assert remaining['complete'] and blocked['imported'] + remaining['imported'] == 2
+            assert statuses and all(activity == 'inventorying' for _, activity in statuses)
+            assert queue.db.execute("SELECT value FROM counters WHERE key='latest_inventory_finmind_receipts_checked'").fetchone()[0] == 205
+        assert visited == [f'{i:04}.json' for i in reversed(range(205))]
     finally:
         queue.close()
 
@@ -417,6 +464,60 @@ def test_first_inventory_status_keeps_loaded_http_deadline_and_capacity(config, 
         assert queue.status()['provider_next_attempt_utc'] == {}
     finally:
         http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize('owner', ['service', 'cycle'])
+def test_inventory_http_traffic_snapshot_follows_owner(config, tmp_path, owner):
+    http, _ = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    snapshots = []
+    http.requests_by_provider['publisher'] = 7
+    http.response_bytes = 1234
+    try:
+        if owner == 'service':
+            def inventory():
+                snapshots.append(queue.status(activity='inventorying'))
+                http.stop.set()
+
+            run_service(queue, http, config, max_articles=0, max_discovery_requests=0,
+                        refresh_metadata=inventory, duration_seconds=2)
+        else:
+            run_cycle(queue, http, config, max_articles=0, max_discovery_requests=0)
+            snapshots.append(queue.status(activity='inventorying'))
+        assert snapshots[0]['http_requests_this_run'] == {'publisher': 7}
+        assert snapshots[0]['http_response_bytes_this_run'] == 1234
+
+        # Metadata refresh sees current traffic, rather than a cached earlier
+        # status or zero defaults. The returned mapping cannot mutate HTTP.
+        http.requests_by_provider['publisher'] = 9
+        http.response_bytes = 2345
+        latest = queue.status(activity='inventorying')
+        assert latest['http_requests_this_run'] == {'publisher': 9}
+        assert latest['http_response_bytes_this_run'] == 2345
+        latest['http_requests_this_run']['publisher'] = 0
+        assert http.requests_by_provider == {'publisher': 9}
+        explicit = queue.status(requests_by_provider={}, response_bytes=0)
+        assert explicit['http_requests_this_run'] == {}
+        assert explicit['http_response_bytes_this_run'] == 0
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_new_http_owner_does_not_inherit_previous_status_traffic(config, tmp_path):
+    registry = PolicyRegistry(config, base=tmp_path)
+    previous = NewsQueue(tmp_path, registry)
+    try:
+        previous.status(requests_by_provider={'publisher': 20}, response_bytes=6000)
+    finally:
+        previous.close()
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        initial = queue.status(activity='inventorying')
+        assert initial['http_requests_this_run'] == {}
+        assert initial['http_response_bytes_this_run'] == 0
+    finally:
         queue.close()
 
 

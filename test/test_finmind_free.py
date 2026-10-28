@@ -18,6 +18,7 @@ from downloader.download_finmind_free import (
 )
 from downloader import download_finmind_free as finmind
 from stockagent.live.data_monitor_dashboard import _finmind_free_sources
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 
 
 def _rows(dataset: str, day: date, *, step: int) -> list[dict[str, object]]:
@@ -96,6 +97,7 @@ def test_free_history_cannot_consume_incremental_reserve(tmp_path: Path, monkeyp
     seen = []
     monkeypatch.setenv("FINMIND_TOKEN", "test-only")
     monkeypatch.setattr(finmind, "load_env_file", lambda *_a, **_kw: None)
+    monkeypatch.setattr(finmind, "acquisition_dispatch_status", lambda _root: {"state": "admitted"})
     monkeypatch.setattr(finmind, "_utc_now", lambda: now)
     monkeypatch.setattr(finmind, "verified_account", lambda *_a: {"official_requests_per_hour": 600})
     monkeypatch.setattr(finmind, "rate_limiter", lambda *_a: object())
@@ -113,6 +115,81 @@ def test_free_history_cannot_consume_incremental_reserve(tmp_path: Path, monkeyp
     assert result["state"] == "incremental_reserve"
     assert result["complete"] == 2 and result["total"] == 4
     assert {day for _, day in seen} == {days[-1]}
+
+
+@pytest.mark.parametrize("failure,reason", [
+    ({"state": "deferred", "reason": "filesystem_reserve", "path": "private-workspace"}, "filesystem_reserve"),
+    (CapacityDeferred("redirected_acquisition_workspace"), "redirected_acquisition_workspace"),
+    (OSError("synthetic capacity probe failure"), "capacity_unconfirmed"),
+])
+def test_capacity_pause_precedes_credentials_and_api_and_preserves_counts(tmp_path, monkeypatch, failure, reason):
+    previous = {"state": "waiting_retry", "observed_at_utc": "2026-09-25T00:00:00+00:00",
+                "total_session_day_tasks": 1000, "complete_session_day_tasks": 800,
+                "retry_deferred_tasks": 200, "series": {"existing": {"rows": 123}},
+                "active_task": {"dataset": "old"}, "requests_this_process": 7}
+    (tmp_path / "status.json").write_text(json.dumps(previous))
+    original = tmp_path / "retained-source.parquet"
+    original.write_bytes(b"unchanged original bytes")
+    before = original.stat()
+
+    def admission(_root):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(finmind, "acquisition_dispatch_status", admission)
+    monkeypatch.setattr(finmind, "load_env_file", lambda *_a, **_kw: pytest.fail("read credentials while paused"))
+    monkeypatch.setattr(finmind.requests, "Session", lambda: pytest.fail("created API session while paused"))
+    result = finmind.run_once(tmp_path)
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert result["state"] == "disk_guard" and result["requests"] == 0 and result["retryable"]
+    assert result["capacity_admission"]["reason"] == reason
+    assert "path" not in result["capacity_admission"]
+    assert status["active_task"] is None and status["requests_this_process"] == 0
+    assert status["source_status_observed_at_utc"] == previous["observed_at_utc"]
+    for field in ("total_session_day_tasks", "complete_session_day_tasks", "retry_deferred_tasks", "series"):
+        assert status[field] == previous[field]
+    assert "official_requests_per_hour" not in status
+    assert original.read_bytes() == b"unchanged original bytes"
+    assert original.stat().st_ino == before.st_ino and original.stat().st_mtime_ns == before.st_mtime_ns
+    assert not (tmp_path / "receipts").exists()
+
+
+def test_capacity_drop_between_requests_keeps_committed_session_and_resumes(tmp_path, monkeypatch):
+    now, day = datetime(2026, 9, 27, 8, tzinfo=UTC), date(2026, 9, 23)
+    admissions = iter([{"state": "admitted"}, {"state": "admitted"},
+                       {"state": "deferred", "reason": "filesystem_reserve"}])
+    monkeypatch.setattr(finmind, "acquisition_dispatch_status", lambda _root: next(admissions))
+    monkeypatch.setenv("FINMIND_TOKEN", "")
+    monkeypatch.setattr(finmind, "load_env_file", lambda *_a, **_kw: None)
+    monkeypatch.setattr(finmind, "_utc_now", lambda: now)
+    monkeypatch.setattr(finmind, "rate_limiter", lambda *_a: object())
+    monkeypatch.setattr(finmind, "_load_calendar", lambda *_a: ([day], 0))
+    monkeypatch.setattr(finmind, "_master_due", lambda *_a: False)
+    monkeypatch.setattr(finmind, "fixed_incremental_demand", lambda *_a: 0)
+    monkeypatch.setattr(finmind, "refresh_dispatch_account", lambda account, *_a: account)
+    monkeypatch.setattr(finmind, "backfill_budget", lambda *_a, **_kw: {"allowed": True})
+    fetched = []
+
+    def request(_session, _limiter, dataset, *, start_date, **_kw):
+        fetched.append(dataset)
+        return _rows(dataset, start_date, step=5)
+
+    monkeypatch.setattr(finmind, "_request", request)
+    result = finmind.run_once(tmp_path)
+    assert result["state"] == "disk_guard" and result["requests"] == 1
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["complete_session_day_tasks"] == 1 and status["total_session_day_tasks"] == 2
+    assert len(fetched) == 1
+    saved = tmp_path / "receipts" / fetched[0] / f"{day}.json"
+    saved_bytes = saved.read_bytes()
+    monkeypatch.setattr(finmind, "acquisition_dispatch_status", lambda _root: {"state": "admitted"})
+    resumed = finmind.run_once(tmp_path)
+    assert resumed["state"] == "current" and resumed["requests"] == 1
+    assert resumed["complete"] == resumed["total"] == 2
+    assert len(fetched) == len(set(fetched)) == 2
+    assert saved.read_bytes() == saved_bytes
+    assert "capacity_admission" not in json.loads((tmp_path / "status.json").read_text())
 
 
 def test_session_cutoff_never_accepts_unfinished_current_day() -> None:

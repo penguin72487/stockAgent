@@ -1,7 +1,9 @@
+import io
 import json
 from pathlib import Path
 import zipfile
 
+import numpy as np
 import pytest
 
 from stockagent.training.lifecycle import (
@@ -13,6 +15,10 @@ from stockagent.training.lifecycle import (
     canonical_mode_artifact_contract,
     normalize_epoch_curve_record,
     validate_completed_training_artifacts,
+)
+from stockagent.training.futures_account_artifact_contract import (
+    FUTURES_ACCOUNT_ARCHIVE_SCHEMA, FUTURES_ACCOUNT_ARTIFACT_ABI, FUTURES_ACCOUNT_METRICS_ABI,
+    FUTURES_ACCOUNT_PAYLOAD_FIELDS,
 )
 
 
@@ -50,7 +56,12 @@ def _write_minimal_completed_artifacts(
     ):
         with zipfile.ZipFile(path, "w") as archive:
             for name in _BACKTEST_MEMBER_NAMES:
-                archive.writestr(name, b"array")
+                if name == "artifact_schema_version.npy":
+                    stream = io.BytesIO()
+                    np.save(stream, np.asarray(1, dtype=np.int64), allow_pickle=False)
+                    archive.writestr(name, stream.getvalue())
+                else:
+                    archive.writestr(name, b"array")
     for name in (
         "equity_curve.png",
         "equity_curve_log.png",
@@ -447,6 +458,58 @@ def test_lifecycle_completion_gate_rejects_incomplete_artifacts(
     progress = json.loads(layout.progress_path.read_text())
     assert progress["state"] == "failed"
     assert progress["phase"] == "failed"
+
+
+def test_lifecycle_requires_all_dated_futures_members_and_manifest_abi(tmp_path: Path) -> None:
+    group_name = "train_2020-2021"
+    mode = "tw_stock_context_futures_portfolio"
+    layout = TrainingArtifactLayout(tmp_path)
+    lifecycle = TrainingRunLifecycle(tmp_path, execution_mode=mode, run_mode="train",
+                                     strategy="none", model_name="transformer_base_portfolio")
+    lifecycle.start(fold_ids=[1])
+    lifecycle.start_group(group_name=group_name, group_index=1, group_total=1, fold_ids=[1], epoch_total=1)
+    lifecycle.finish_fold(1)
+    _write_minimal_completed_artifacts(layout, group_name=group_name, fold_id=1, execution_mode=mode)
+    lifecycle.complete(fold_ids=[1])
+    manifest = json.loads(layout.run_manifest_path.read_text())
+    manifest["mode_details"]["futures_account_artifact_abi"] = FUTURES_ACCOUNT_ARTIFACT_ABI
+    manifest["mode_details"]["futures_account_metrics_abi"] = FUTURES_ACCOUNT_METRICS_ABI
+    manifest["mode_details"]["futures_account_source_fingerprint"] = "1" * 64
+    manifest["mode_details"]["futures_execution_release_fingerprint"] = "2" * 64
+    manifest["mode_details"]["risk_clock"] = "dated_futures_account_events_and_stock_decisions"
+    layout.run_manifest_path.write_text(json.dumps(manifest))
+    contract_path = layout.fold_dir(1) / "mode_artifact_contract.json"
+    contract = json.loads(contract_path.read_text())
+    contract["mode_details"] = dict(manifest["mode_details"])
+    contract_path.write_text(json.dumps(contract))
+    base = {name.removesuffix(".npy"): np.asarray(0) for name in _BACKTEST_MEMBER_NAMES}
+    base["artifact_schema_version"] = np.asarray(FUTURES_ACCOUNT_ARCHIVE_SCHEMA, dtype=np.int64)
+    payload = base | {name: np.asarray(0) for name in FUTURES_ACCOUNT_PAYLOAD_FIELDS}
+    test_path = layout.fold_dir(1) / "test_backtest.npz"
+    deploy_path = layout.fold_dir(1) / "deployment_test_backtest.npz"
+    np.savez(test_path, **payload)
+    np.savez(deploy_path, **payload)
+    assert validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=[group_name]).ok
+    contract["mode_details"]["futures_account_source_fingerprint"] = "3" * 64
+    contract_path.write_text(json.dumps(contract))
+    result = validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=[group_name])
+    assert any("source or risk contract disagrees" in issue for issue in result.invalid)
+    contract["mode_details"]["futures_account_source_fingerprint"] = "1" * 64
+    contract_path.write_text(json.dumps(contract))
+    manifest["mode_details"]["futures_execution_release_fingerprint"] = "invalid"
+    layout.run_manifest_path.write_text(json.dumps(manifest))
+    result = validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=[group_name])
+    assert any("must be a SHA256 fingerprint" in issue for issue in result.invalid)
+    manifest["mode_details"]["futures_execution_release_fingerprint"] = "2" * 64
+    layout.run_manifest_path.write_text(json.dumps(manifest))
+    missing = dict(payload)
+    del missing["futures_account_ledger_dates"]
+    np.savez(test_path, **missing)
+    result = validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=[group_name])
+    assert any("futures_account_ledger_dates.npy" in issue for issue in result.invalid)
+    np.savez(test_path, **(payload | {"artifact_schema_version": np.asarray(7)}))
+    result = validate_completed_training_artifacts(tmp_path, fold_ids=[1], group_names=[group_name])
+    assert any("dated futures archive schema" in issue for issue in result.invalid)
 
 
 def test_lifecycle_rejects_partial_selected_fold_completion(tmp_path: Path) -> None:

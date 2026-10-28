@@ -8,6 +8,7 @@ import sqlite3
 import pytest
 
 from scripts.openbb_l1_source_journal import (
+    _install_journal,
     finish_source_audit,
     journal_task_ids,
     prepare_source_audit,
@@ -46,6 +47,25 @@ def _baseline(connection: sqlite3.Connection, path: Path) -> None:
     )
     assert plan.mode == "full"
     finish_source_audit(connection, path, plan, now=NOW)
+
+
+def test_journal_hook_install_is_atomic_and_rolls_back_late_failure(tmp_path):
+    connection = _database(tmp_path / 'manifest.sqlite3')
+    before = connection.execute('SELECT name,sql FROM sqlite_schema ORDER BY name').fetchall()
+    def deny_last_hook(action, name, *args):
+        return (sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_CREATE_TRIGGER
+                and name == 'l1_source_task_update' else sqlite3.SQLITE_OK)
+    connection.set_authorizer(deny_last_hook)
+    with pytest.raises(sqlite3.DatabaseError, match='authorized'):
+        _install_journal(connection)
+    connection.set_authorizer(None)
+    assert not connection.in_transaction
+    assert connection.execute('SELECT name,sql FROM sqlite_schema ORDER BY name').fetchall() == before
+    statements = []
+    connection.set_trace_callback(statements.append)
+    _install_journal(connection)
+    assert statements[0] == 'BEGIN IMMEDIATE' and statements[-1] == 'COMMIT'
+    assert sum(sql == 'COMMIT' for sql in statements) == 1
 
 
 def test_journal_captures_contract_changes_and_preserves_later_cutoff(

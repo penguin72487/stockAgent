@@ -91,6 +91,7 @@ def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
     gc_before = gc.isenabled()
     code_paths = (Path(__file__).resolve(), Path(inventory.__file__),
                   REPO_ROOT / "stockagent/live/data_monitor_record_codec.py",
+                  REPO_ROOT / "stockagent/live/data_monitor_record_store.py",
                   Path(deferred.__file__),
                   REPO_ROOT / "stockagent/private_json.py",
                   REPO_ROOT / "scripts/benchmark_data_monitor_projection_pipeline.py")
@@ -100,7 +101,12 @@ def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
     code_before = code_identity()
     generation = capture(root)
     original_stat = Path.stat
-    body = json.dumps(generation["payload"], separators=(",", ":")).encode()
+    # Codec comparisons must actually publish a new complete cache. An
+    # otherwise identical generation can now legitimately avoid encoding.
+    # Only this private seed's prior revision is invalidated; both variants
+    # mint the same fixed revision, retaining every source/footer/value.
+    seed_payload = {**generation["payload"], "feature_revision": "benchmark-publication-required"}
+    body = json.dumps(seed_payload, separators=(",", ":")).encode()
     native_loads = private_json.loads
     trials = []
     outputs = []
@@ -155,7 +161,7 @@ def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
                         observation.update(encoder_observation)
                     return encoded
 
-                def read_json(path):
+                def read_json(path, **options):
                     if mode == "deferred" and path.name == "record_inventory_cache.json":
                         try:
                             decode = deferred.decode_record_cache if variant == "deferred_native" else native_loads
@@ -164,7 +170,7 @@ def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
                                     else decode(body))
                         except (OSError, ValueError, UnicodeError):
                             return None
-                    return original_read_json(path)
+                    return original_read_json(path, **options)
 
                 if mode in {"deferred", "mapping"}:
                     loads, dumps = native_loads, candidate_dumps
@@ -262,6 +268,7 @@ def benchmark(root: Path, *, repeats: int = 2, mode: str = "decode") -> dict:
             "input_sha256": hashlib.sha256(body).hexdigest(), "input_bytes": len(body),
             "captured_source_sha256": generation["sha256"],
             "input_representation": "ASCII-escaped canonical trial seed; captured source may be UTF-8 JSON",
+            "publication_forced_by_invalid_prior_feature_revision": True,
             "native_available": private_json.native_available(),
             "mode": mode,
             "native_backend": "msgspec-decode_stdlib-encode" if mode == "decode" else "msgspec-validated-metadata-encode",

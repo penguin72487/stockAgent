@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -32,16 +33,47 @@ from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 
 discord_bot: ModuleType | None = None
 ARTIFACT_OWNER_UNIT = "stockagent-discord-artifact-maintenance.service"
+PRIORITY_SOURCE_UNIT = "stockagent-tw-day-trade-priority-source.service"
+PRIORITY_SOURCE_START = wall_time(0, 0)
+# Input recovery can continue after the open when a mode is still missing its
+# validated input. Preserve the separate 13:20 exit/flattening window.
+PRIORITY_SOURCE_END = wall_time(13, 20)
 # Existing owner: 120min start budget + 90s stop grace; reserve controller/queue
 # overhead too. Do not dispatch up to the opening fence using only start time.
 ARTIFACT_RETRY_RUNWAY_MINUTES = 123
 RETRY_RECEIPT_MAX_BYTES = 16 * 1024 * 1024
 UNCHANGED_RETRY_WAKEUP_SECONDS = 300
+# A missing live-session input gets a new chance on the next minute timer;
+# systemd and the producer's existing lease prevent duplicate concurrent work.
+PRIORITY_SOURCE_RETRY_WAKEUP_SECONDS = 60
 # Measured complete 2014--2026 cold source: 3812 s plus source-owner wait.
 # Keep the isolated recovery within its 120-min unit, reserving 30 min for
 # formal inference and 10 min for cache/control overhead. Interactive callers
 # retain their configured ordinary completed-session timeout.
 FACTORIZED_SOURCE_RECOVERY_SECONDS = 80 * 60
+
+
+def _preopen_source_priority_window(observed: datetime) -> bool:
+    """Admit today's input recovery until the intraday exit window."""
+    if observed.tzinfo is None:
+        raise ValueError("preopen source admission requires an aware time")
+    local = observed.astimezone(ZoneInfo("Asia/Taipei"))
+    if not PRIORITY_SOURCE_START <= local.time().replace(tzinfo=None) < PRIORITY_SOURCE_END:
+        return False
+    from stockagent.live.market_status import tw_stock_day_decision
+
+    decision = tw_stock_day_decision(local.date(), parquet_root=ROOT / "data_tw_public",
+                                     observed=local)
+    return decision.is_session
+
+
+def _priority_source_requested(probe: dict, observed: datetime) -> bool:
+    if os.environ.get("STOCKAGENT_PREOPEN_PRIORITY_SOURCE") != "1":
+        return False
+    keys = probe.get("due_keys") or ()
+    return (any(str(key).startswith(("source_projection_refresh:", "source_cache_warming:"))
+                for key in keys)
+            and _preopen_source_priority_window(observed))
 
 
 def _load_discord_bot() -> ModuleType:
@@ -208,13 +240,41 @@ def _stale_factorized_projection_request(*, config_path: str | Path | None = Non
     # Missing legacy producer identity is not proof of an earlier coverage
     # boundary. The exact BASE/calendar preflight remains the acceptance gate.
     scope_gap = bool(required_start and (source_start or dates[0]) > required_start)
+    calendar_change = None
     if dates[-1] >= expected and not scope_gap:
-        return None
+        # A cancelled session can advance the next decision day without
+        # advancing the last completed close. Compare the producer's exact
+        # calendar inputs too; a current tail alone must not suppress repair.
+        # This is a wakeup hint only: the canonical producer still verifies
+        # the official receipts and rebuilds publication-dependent inputs.
+        from stockagent.live.market_status import TW_HOLIDAY_SCHEDULE_NAME
+
+        names = (TW_HOLIDAY_SCHEDULE_NAME, "twse_taiex_ohlc.parquet",
+                 "twse_taiex_ohlc.summary.json")
+        identity = paper.get("source_identity") or {}
+        proof = (identity.get("decision_calendar") or {}).get("input_sha256")
+        if proof is None:
+            calendar_change = {"reason": "decision_calendar_proof_missing"}
+        else:
+            if (not isinstance(proof, dict) or set(proof) != set(names)
+                    or any(not isinstance(value, str) or len(value) != 64
+                           or any(char not in "0123456789abcdef" for char in value)
+                           for value in proof.values())):
+                raise ValueError("invalid factorized decision-calendar input proof")
+            current = {}
+            for name in names:
+                with (ROOT / "data_tw_public" / name).open("rb") as handle:
+                    current[name] = hashlib.file_digest(handle, "sha256").hexdigest()
+            if current == proof:
+                return None
+            calendar_change = {"reason": "decision_calendar_inputs_changed",
+                               "current_calendar_sha256": current}
     return {"status": "projection_refresh_required", "expected_completed_session": expected,
             "projection_end": dates[-1], "manifest": str(path),
             "reason": "formal_history_scope_missing" if scope_gap else "completed_session_missing",
             "required_start_date": required_start,
             "projection_source_start": source_start or dates[0],
+            **(calendar_change or {}),
             "advisory_only": True, "model_executed": False,
             "contract": "factorized_paper_projection_lag1_v1"}
 
@@ -365,7 +425,8 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
         # worker retain the publication/resource gates and last-good proof.
         if warming.get("status") == "projection_refresh_required":
             hint = {key: warming.get(key) for key in
-                    ("status", "contract", "expected_completed_session", "projection_end", "manifest")}
+                    ("status", "contract", "expected_completed_session", "projection_end", "manifest",
+                     "reason", "current_calendar_sha256")}
             prefix = "source_projection_refresh"
         else:
             admission = warming["admission"]
@@ -391,19 +452,24 @@ def request_due_retry() -> int:
     state_path = _retry_dispatch_state_path()
     previous = _read_retry_json(state_path)
     now = datetime.now(timezone.utc)
-    if previous.get("wakeup_fingerprint") == probe["wakeup_fingerprint"]:
+    priority_source = _priority_source_requested(probe, now)
+    owner_unit = PRIORITY_SOURCE_UNIT if priority_source else ARTIFACT_OWNER_UNIT
+    wakeup_seconds = (PRIORITY_SOURCE_RETRY_WAKEUP_SECONDS if priority_source
+                      else UNCHANGED_RETRY_WAKEUP_SECONDS)
+    if (previous.get("wakeup_fingerprint") == probe["wakeup_fingerprint"]
+            and previous.get("owner_unit", ARTIFACT_OWNER_UNIT) == owner_unit):
         accepted_at = datetime.fromisoformat(previous["dispatch_accepted_at"])
         if accepted_at.tzinfo is None:
             raise ValueError("retry dispatch time must be timezone-aware")
         # A backwards wall-clock jump must not stall recovery indefinitely.
         # The canonical worker lock still protects a conservative fresh wakeup.
         elapsed = (now - accepted_at).total_seconds()
-        if 0 <= elapsed < UNCHANGED_RETRY_WAKEUP_SECONDS:
+        if 0 <= elapsed < wakeup_seconds:
             _emit(
                 **probe,
                 requested=False,
                 dispatch_reason="unchanged_retry_wakeup_coalesced",
-                unchanged_wakeup_seconds=UNCHANGED_RETRY_WAKEUP_SECONDS,
+                unchanged_wakeup_seconds=wakeup_seconds,
             )
             return 0
     from scripts.check_outside_tw_opening_resource_window import evaluate
@@ -413,11 +479,11 @@ def request_due_retry() -> int:
         minimum_runway_minutes=ARTIFACT_RETRY_RUNWAY_MINUTES,
         protected_until=wall_time(13, 40),
     )
-    if not window["allowed"]:
+    if not window["allowed"] and not priority_source:
         _emit(**probe, requested=False, reason_window="protected_market_runway")
         return 0
     subprocess.run(
-        ["systemctl", "start", "--no-block", ARTIFACT_OWNER_UNIT],
+        ["systemctl", "start", "--no-block", owner_unit],
         check=True,
         timeout=10,
     )
@@ -427,7 +493,7 @@ def request_due_retry() -> int:
         "schema_version": 1,
         "advisory_only": True,
         "dispatch_accepted_at": datetime.now(timezone.utc).isoformat(),
-        "owner_unit": ARTIFACT_OWNER_UNIT,
+        "owner_unit": owner_unit,
         "due_keys": probe["due_keys"],
         "wakeup_fingerprint": probe["wakeup_fingerprint"],
     }
@@ -439,14 +505,14 @@ def request_due_retry() -> int:
         _emit(
             **probe,
             requested=True,
-            owner_unit=ARTIFACT_OWNER_UNIT,
+            owner_unit=owner_unit,
             dispatch_state_persisted=False,
         )
         raise
     _emit(
         **probe,
         requested=True,
-        owner_unit=ARTIFACT_OWNER_UNIT,
+        owner_unit=owner_unit,
         dispatch_state_persisted=True,
     )
     return 0
@@ -521,7 +587,9 @@ def _emit(**payload: Any) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
 
 
-def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> bool:
+def _recover_deferred_factorized_source(
+    cfg, *, allow_warming: bool = True, allow_market_open: bool = False,
+) -> bool:
     """Let the existing isolated owner recover a gateway-denied cold cache.
 
     Run only the configured canonical updater, after an accepted official close.
@@ -554,7 +622,8 @@ def _recover_deferred_factorized_source(cfg, *, allow_warming: bool = True) -> b
         return False
     bot = _load_discord_bot()
     status = bot._ensure_signal_ready(cfg)
-    if status.market_open or not bot._completed_session_publication_ready(status):
+    if ((status.market_open and not allow_market_open)
+            or not bot._completed_session_publication_ready(status)):
         _emit(status=f"{action}_deferred", market=cfg.market,
               reason="accepted_official_close_required", model_executed=False)
         return False
@@ -590,6 +659,99 @@ def _factorized_source_preparation_busy(cfg) -> bool:
     return False
 
 
+def run_preopen_source_child() -> int:
+    """Run only the shared canonical input producer, never history or inference."""
+    if not _preopen_source_priority_window(datetime.now(timezone.utc)):
+        _emit(status="preopen_source_deferred", reason="outside_admitted_session", model_executed=False)
+        return 75
+    bot = _load_discord_bot()
+    status_path = bot._artifact_backfill_status_path()
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = status_path.with_name(f"{status_path.name}.worker.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _emit(status="preopen_source_deferred", reason="canonical_worker_running", model_executed=False)
+            return 75
+        # An interactive signal may itself be waiting for this exact source.
+        # The shared updater and source locks arbitrate real concurrent writers;
+        # treating the pending consumer as a blocker would deadlock recovery.
+        if not _wait_for_tw_public_refresh(record_maintenance_run=False):
+            _emit(status="preopen_source_deferred", reason="tw_public_refresh_wait_timeout", model_executed=False)
+            return 75
+        if not _preopen_source_priority_window(datetime.now(timezone.utc)):
+            _emit(status="preopen_source_deferred", reason="preopen_deadline", model_executed=False)
+            return 75
+        for market in bot._artifact_maintenance_markets():
+            cfg = bot._resolve_market(market)
+            if not _owns_factorized_source_updater(cfg):
+                continue
+            if _recover_deferred_factorized_source(cfg, allow_market_open=True):
+                # The normal producer validates receipts and generation; this
+                # operation does not certify native warmup or all six modes.
+                _emit(status="preopen_source_pass_finished", market=market, model_executed=False)
+                return 0
+            _emit(status="preopen_source_deferred", market=market, reason="source_not_ready", model_executed=False)
+            return 75
+    _emit(status="preopen_source_deferred", reason="no_enabled_source_consumer", model_executed=False)
+    return 75
+
+
+def _stop_preopen_source_group(proc: subprocess.Popen) -> None:
+    """Terminate the whole owned producer tree, not only its Python parent."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+
+def run_preopen_source_supervised() -> int:
+    """Bound today's input recovery before the separate exit/flattening phase."""
+    now = datetime.now(timezone.utc)
+    if not _preopen_source_priority_window(now):
+        _emit(status="preopen_source_deferred", reason="outside_admitted_session", model_executed=False)
+        return 75
+    local = now.astimezone(ZoneInfo("Asia/Taipei"))
+    deadline = datetime.combine(local.date(), PRIORITY_SOURCE_END, tzinfo=local.tzinfo)
+    remaining = (deadline - local).total_seconds()
+    proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--preopen-source-child"],
+                            cwd=ROOT, start_new_session=True)
+    try:
+        return proc.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        _stop_preopen_source_group(proc)
+        _emit(status="preopen_source_deferred", reason="preopen_deadline", model_executed=False)
+        return 75
+    except BaseException:
+        _stop_preopen_source_group(proc)
+        raise
+
+
+def _verify_maintenance_gateway_generation() -> None:
+    """Never acknowledge cache artifacts after their Gateway owner changes."""
+    pid = os.environ.get("STOCKAGENT_MAINTENANCE_OWNER_PID")
+    receipt = os.environ.get("STOCKAGENT_MAINTENANCE_RELEASE")
+    if pid is None and receipt is None:
+        return  # Direct focused callers do not claim namespace acceptance.
+    if not pid or not pid.isdecimal() or not receipt:
+        raise RuntimeError("incomplete maintenance Gateway source identity")
+    from stockagent.live.service_code_release import configured_release, native_owner_pid
+
+    if (configured_release(ROOT) != Path(receipt)
+            or native_owner_pid(ROOT, role="discord") != int(pid)):
+        raise RuntimeError("Discord Gateway owner or source release changed during maintenance")
+
+
 def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int, int]:
     from scripts import discord_postclose_wakeup as wakeup
     from stockagent.live.completed_inference_cache import LoadedImplementationChanged
@@ -605,10 +767,12 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
             continue
         attempted += 1
         try:
+            _verify_maintenance_gateway_generation()
             if not _recover_deferred_factorized_source(cfg, allow_warming=allow_source_warming):
                 deferred += 1
                 continue
             result = discord_bot._run_completed_session_signal_cache_sync(cfg)
+            _verify_maintenance_gateway_generation()
         except TWPublicSourceUpdatePending:
             # A writer may acquire the lock just after the outer busy check.
             # Stop this source-dependent pass, not the Gateway or source owner.
@@ -641,6 +805,7 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
                 output_dir=str(result.output_dir),
             )
     if attempted and not failures and not deferred:
+        _verify_maintenance_gateway_generation()
         acknowledged = wakeup.acknowledge(ROOT, wakeup_before, discord_bot)
         _emit(status="postclose_wakeup_readback", acknowledged=acknowledged,
               advisory_only=True)
@@ -660,7 +825,7 @@ def _populate_postclose_signal_caches_or_defer(
         return None
 
 
-def _wait_for_tw_public_refresh() -> bool:
+def _wait_for_tw_public_refresh(*, record_maintenance_run: bool = True) -> bool:
     """Wait through a transient writer collision instead of losing the run."""
 
     discord_bot = _load_discord_bot()
@@ -677,10 +842,11 @@ def _wait_for_tw_public_refresh() -> bool:
     while discord_bot._tw_public_refresh_in_progress():
         elapsed = time.monotonic() - started
         if first:
-            discord_bot._record_artifact_maintenance_run(
-                "waiting_source",
-                reason="tw_public_refresh_in_progress",
-            )
+            if record_maintenance_run:
+                discord_bot._record_artifact_maintenance_run(
+                    "waiting_source",
+                    reason="tw_public_refresh_in_progress",
+                )
             _emit(
                 status="waiting_source",
                 reason="tw_public_refresh_in_progress",
@@ -690,7 +856,7 @@ def _wait_for_tw_public_refresh() -> bool:
         if elapsed >= timeout:
             return False
         time.sleep(min(poll, max(0.0, timeout - elapsed)))
-    if not first:
+    if not first and record_maintenance_run:
         # The source became available; make the durable worker state match the
         # work that is about to resume rather than leaving it at waiting_source.
         discord_bot._record_artifact_maintenance_run("running")
@@ -898,10 +1064,12 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 )
                 continue
 
+            _verify_maintenance_gateway_generation()
             attempted += 1
             discord_bot._begin_artifact_backfill(key, market)
             try:
                 result = discord_bot._run_artifact_backfill_sync(cfg)
+                _verify_maintenance_gateway_generation()
             except Exception as exc:
                 failures += 1
                 failed = discord_bot._finish_artifact_backfill(
@@ -982,9 +1150,15 @@ def main() -> None:
     retry_mode.add_argument("--retry-check-only", action="store_true")
     retry_mode.add_argument("--request-due-retry", action="store_true")
     retry_mode.add_argument("--request-due-work", action="store_true")
+    retry_mode.add_argument("--preopen-source-only", action="store_true")
+    retry_mode.add_argument("--preopen-source-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry or args.request_due_work):
+    if args.signal_cache_only and (args.retry_check_only or args.request_due_retry or args.request_due_work
+                                   or args.preopen_source_only or args.preopen_source_child):
         parser.error("retry probe modes cannot generate signal caches")
+    if args.preopen_source_only or args.preopen_source_child:
+        raise SystemExit(run_preopen_source_child() if args.preopen_source_child
+                         else run_preopen_source_supervised())
     if args.retry_check_only or args.request_due_retry or args.request_due_work:
         try:
             if args.request_due_work:

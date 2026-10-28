@@ -38,13 +38,17 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.download_finlab_history import (  # noqa: E402
     DEFAULT_OUTPUT, TAIPEI, _atomic_json, credential_available, quota_cycle_start, safe_stem,
     quota_room_mb,
-    general_work_status, load_catalog,
+    general_work_status, load_catalog, provider_catalog, record_provider_catalog,
 )
 from scripts.download_finlab_intraday import (  # noqa: E402
-    _checked_this_cycle, _partition_paths, _stored_receipt, fetch_partition,
+    _checked_this_cycle, _partition_paths, _priority_scope_path, _stored_receipt, fetch_partition,
     reconcile_stored_tick_unit, fetch_partitions, initialize_intraday_worker,
 )
 from scripts.derive_finlab_minute import derive_partition  # noqa: E402
+from scripts.check_finlab_refresh_due import intraday_source_identity  # noqa: E402
+from scripts.check_acquisition_capacity import check_dispatch  # noqa: E402
+from stockagent.data_sync.cache_capacity import acquisition_dispatch_status  # noqa: E402
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     INTRADAY_PROGRESS_VERSION, INTRADAY_MINIMUM_FREE_GB, process_owner,
 )
@@ -66,6 +70,9 @@ DEFAULT_PUBLIC_ROOT = REPO_ROOT / "data_tw_public"
 KINDS = ("tw_minute", "tw_tick")
 DISPLAY_KINDS = ("tw_minute", "tw_tick")
 DERIVED_INDEX_KIND = "tw_minute_derived"
+# Windows backing free space fluctuated by roughly 19 GiB during storage
+# maintenance; its cause is unproven. This extra headroom is not a reservation.
+CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES = 24 * 1024**3
 
 
 def default_market_end(now: datetime) -> date:
@@ -78,6 +85,15 @@ def default_market_end(now: datetime) -> date:
     """
     local = now.astimezone(TAIPEI)
     return local.date() if (local.hour, local.minute) >= (13, 30) else local.date() - timedelta(days=1)
+
+
+def _supports_futures_partition(key: str) -> bool:
+    """Check SDK family support locally; never turn an SDK gap into a provider failure."""
+    try:
+        from finlab.data.intraday import is_intraday
+        return bool(is_intraday(key))
+    except (ImportError, AttributeError, TypeError):
+        return False
 
 
 def plan_minute_window(anchor: date, sessions: list[date], *, lower_bound: date,
@@ -155,6 +171,40 @@ def _general_work_admission(root: Path, *, now: datetime) -> dict:
     # The ordinary schedule uses a daily quota cycle. A manual Tick command
     # must not silently weaken this gate to the CLI history default of 30 days.
     return general_work_status(discovery, curated, root, now=now, refresh_days=1)
+
+
+def _capacity_deferred_finite_priority(root: Path, admission: dict) -> dict:
+    """Recognize a measured dispatch block, without calling it completed work.
+
+    Only an explicitly selected finite minute or single-stock-tick pass uses this check.
+    Unknown headroom, unverified catalog, other deferrals and normal capacity
+    do not let finite requests overtake due work. The priority capacity gate
+    is still independently checked before source acquisition.
+    """
+    if (admission.get("state") != "general_work_pending"
+            or admission.get("minute_residual_allowed") is not False
+            or type(admission.get("actionable_pending")) is not int
+            or admission["actionable_pending"] <= 0):
+        return {"allowed": False, "reason": "general_state_not_eligible"}
+    try:
+        capacity = acquisition_dispatch_status(root)
+    except (CapacityDeferred, OSError, ValueError) as exc:
+        return {"allowed": False, "reason": "ordinary_capacity_unverified",
+                "error_type": type(exc).__name__}
+    reason = capacity.get("reason")
+    if capacity.get("state") != "deferred" or reason not in {
+            "physical_backing_reserve", "filesystem_reserve"}:
+        return {"allowed": False, "reason": "ordinary_capacity_not_proven_blocked",
+                "ordinary_dispatch": capacity}
+    free_key = "physical_free_bytes" if reason == "physical_backing_reserve" else "available_bytes"
+    required_key = "required_bytes_including_reserve" if reason == "physical_backing_reserve" else "required_bytes"
+    free, required = capacity.get(free_key), capacity.get(required_key)
+    if (type(free) is not int or type(required) is not int
+            or not 0 <= free < required):
+        return {"allowed": False, "reason": "ordinary_capacity_unverified",
+                "ordinary_dispatch": capacity}
+    return {"allowed": True, "reason": "ordinary_capacity_measured_deferred",
+            "ordinary_dispatch": capacity}
 
 
 def _dates_from_parquet(path: Path) -> tuple[date, date] | None:
@@ -440,8 +490,8 @@ def _available_receipt(root: Path, kind: str, symbol: str, day: date) -> dict | 
         return None  # Direct minutes can still repair a local derivation failure.
 
 
-def _unchecked_known_minutes(db: sqlite3.Connection, universe: list[dict], days: list[date], *,
-                             first_observed: str | None, limit: int) -> list[dict]:
+def _unchecked_known_partitions(db: sqlite3.Connection, universe: list[dict], days: list[date], *,
+                             first_observed: str | None, limit: int, kind: str = "tw_minute") -> list[dict]:
     """Recover holes behind an advanced frontier, bounded to a proven date window.
 
     Index presence is only candidate exclusion here. Actual receipt/object
@@ -454,7 +504,7 @@ def _unchecked_known_minutes(db: sqlite3.Connection, universe: list[dict], days:
     known_days = days[bisect_left(days, date.fromisoformat(first_observed)):]
     indexed = {}
     for symbol, text in db.execute("SELECT symbol,trade_date FROM effective_partitions "
-                                  "WHERE kind='tw_minute' AND trade_date>=?", (first_observed,)):
+                                  "WHERE kind=? AND trade_date>=?", (kind, first_observed)):
         indexed.setdefault(symbol, set()).add(text)
     result = []
     # Latest evidence first, while each selected hole retains its exact key/day.
@@ -645,10 +695,11 @@ def _coverage_phases(db: sqlite3.Connection, universe: list[dict], days: list[da
     return result
 
 
-def _minute_priority(db: sqlite3.Connection, universe: list[dict], days: list[date],
+def _source_priority(db: sqlite3.Connection, universe: list[dict], days: list[date],
                      *, first_observed: str | None, phases: list[dict],
-                     source_root: Path | None, quota_policy: QuotaPolicy | None) -> dict:
-    """Shared minute-before-tick decision; never changes publication/retry clocks.
+                     source_root: Path | None, quota_policy: QuotaPolicy | None,
+                     kind: str = "tw_minute") -> dict:
+    """Per-family availability; never changes publication/retry clocks.
 
     The full dashboard already owns its minute phases. Admission supplies the
     same phases without building tick statistics and thousands of display rows.
@@ -663,14 +714,14 @@ def _minute_priority(db: sqlite3.Connection, universe: list[dict], days: list[da
         known = {item["symbol"]: item for item in universe}
         session_set = set(days)
         for symbol, text, status in db.execute("SELECT symbol,trade_date,status FROM effective_partitions "
-                "WHERE kind='tw_minute' AND trade_date>=? AND status NOT IN "
+                "WHERE kind=? AND trade_date>=? AND status NOT IN "
                 "('downloaded_unverified_for_pit','derived_unverified_for_pit','derived_no_regular_trades',"
-                "'verified_closed_date','verified_no_trade','partition_not_ready')", (first_observed,)):
+                "'verified_closed_date','verified_no_trade','partition_not_ready')", (kind, first_observed)):
             day = date.fromisoformat(text)
             item = known.get(symbol)
             if item is None or day not in session_set or not _eligible(item, day):
                 continue
-            path = _partition_paths(source_root, f"tw_minute:{symbol}", day)[1]
+            path = _partition_paths(source_root, f"{kind}:{symbol}", day)[1]
             if not _checked_this_cycle(path, "attempted_at_utc", observed):
                 continue
             blocked_failures += 1
@@ -686,13 +737,13 @@ def _minute_priority(db: sqlite3.Connection, universe: list[dict], days: list[da
             failure_wakes.append(wake)
     publication_policy = quota_policy or load_policy()
     publication_delay = publication_recheck_delay(now=observed, policy=publication_policy)
-    minute_due = db.execute("SELECT COUNT(*) FROM effective_partitions WHERE kind='tw_minute' "
+    minute_due = db.execute("SELECT COUNT(*) FROM effective_partitions WHERE kind=? "
         "AND status='partition_not_ready' AND trade_date>=? AND checked_at_utc<?",
-        ((days[-1]-timedelta(days=30)).isoformat(),
+        (kind, (days[-1]-timedelta(days=30)).isoformat(),
          (observed-publication_delay).isoformat())).fetchone()[0]
-    next_check = db.execute("SELECT MIN(checked_at_utc) FROM effective_partitions WHERE kind='tw_minute' "
+    next_check = db.execute("SELECT MIN(checked_at_utc) FROM effective_partitions WHERE kind=? "
         "AND status='partition_not_ready' AND trade_date>=?",
-        ((days[-1]-timedelta(days=30)).isoformat(),)).fetchone()[0]
+        (kind, (days[-1]-timedelta(days=30)).isoformat())).fetchone()[0]
     next_check_at = min(datetime.fromisoformat(next_check)+publication_delay,
                         quota_cycle_start(observed)+timedelta(days=1)) if next_check else quota_cycle_start(observed)+timedelta(days=1)
     drain_at = quota_cycle_start(observed)+timedelta(days=1, minutes=-publication_policy.drain_before_reset_minutes)
@@ -707,7 +758,8 @@ def _minute_priority(db: sqlite3.Connection, universe: list[dict], days: list[da
         "publication_recheck_seconds": publication_delay.total_seconds(),
         "tick_residual_allowed": actionable_pending == 0 and minute_due == 0,
         "next_source_check_at_utc": next_check_at.isoformat() if actionable_pending == 0 and minute_due == 0 else None,
-        "basis": "available minute history first; unpublished and older unverified supply stay incomplete",
+        "kind": kind,
+        "basis": "available history first; unpublished and older unverified supply stay incomplete",
         "older_discovery_is_bounded": True}
 
 
@@ -730,7 +782,7 @@ def _minute_admission(db: sqlite3.Connection, universe: list[dict], days: list[d
             first_by_kind[kind] = min(first_by_kind.get(kind, first), first)
     first = first_by_kind.get("tw_minute") or first_by_kind.get("tw_tick")
     phases = _coverage_phases(db, universe, days, first_observed=first, kind="tw_minute")
-    return _minute_priority(db, universe, days, first_observed=first, phases=phases,
+    return _source_priority(db, universe, days, first_observed=first, phases=phases,
                             source_root=source_root, quota_policy=quota_policy)
 
 
@@ -831,14 +883,18 @@ def _summarize(db: sqlite3.Connection, universe: list[dict], days: list[date],
             by_kind[kind]["source_kind"] = "derived_from_tw_tick"
     minute_first = by_kind["tw_minute"]["first_data_date"] or by_kind["tw_tick"]["first_data_date"]
     minute_phases = _coverage_phases(db, universe, days, first_observed=minute_first, kind="tw_minute")
-    minute_priority = _minute_priority(db, universe, days, first_observed=minute_first,
+    minute_priority = _source_priority(db, universe, days, first_observed=minute_first,
         phases=minute_phases, source_root=source_root, quota_policy=quota_policy)
+    tick_phases = _coverage_phases(db, universe, days, first_observed=by_kind["tw_tick"]["first_data_date"])
+    tick_priority = _source_priority(db, universe, days, first_observed=by_kind["tw_tick"]["first_data_date"],
+        phases=tick_phases, source_root=source_root, quota_policy=quota_policy, kind="tw_tick")
     return {
         "schema_version": 4, "observed_at_utc": datetime.now(UTC).isoformat(),
         "progress_contract_version": 1,
         "acquisition_mode": "minute_first_tick_residual",
         "acquisition_policy_version": ACQUISITION_POLICY_VERSION, "active_kind": active_kind,
         "minute_priority": minute_priority,
+        "tick_priority": tick_priority,
         "legacy_direct_minute_partitions": db.execute(
             "SELECT COUNT(*) FROM partitions WHERE kind='tw_minute' AND status IN "
             "('downloaded_unverified_for_pit','verified_closed_date','verified_no_trade')"
@@ -859,8 +915,7 @@ def _summarize(db: sqlite3.Connection, universe: list[dict], days: list[date],
             for item in universe
         ),
         "by_kind": by_kind, "symbols": symbols,
-        "coverage_phases": _coverage_phases(
-            db, universe, days, first_observed=by_kind["tw_tick"]["first_data_date"]),
+        "coverage_phases": tick_phases,
         "minute_coverage_phases": minute_phases,
         "daily_price_coverage": daily_price_coverage or {"state": "not_checked"},
         "attempted_this_run": attempts, "successes_this_run": successes,
@@ -876,9 +931,18 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 quota_policy: QuotaPolicy | None = None, workers: int = 1,
                 range_calendar_days: int = 1, range_fetch=fetch_partitions,
                 download_threads: int | None = None, queue_depth: int | None = None,
-                authorization_slots: int | None = None) -> dict:
+                authorization_slots: int | None = None,
+                finite_priority_only: bool = False,
+                capacity_deferred_priority: bool = False) -> dict:
     if kind not in KINDS:
         raise ValueError("unsupported FinLab intraday family")
+    if type(finite_priority_only) is not bool or (finite_priority_only and not 1 <= limit <= 64):
+        raise ValueError("finite priority requires a bounded 1..64 partition pass")
+    if (type(capacity_deferred_priority) is not bool or capacity_deferred_priority and (
+            not finite_priority_only or not 1 <= limit <= (4 if kind == "tw_minute" else 1)
+            or workers != 1 or range_calendar_days != 1
+            or any(value not in (None, 1) for value in (download_threads, queue_depth, authorization_slots)))):
+        raise ValueError("capacity-deferred priority requires at most four serial minute partitions or one stock Tick partition")
     if (type(workers) is not int or not 1 <= workers <= 32
             or type(range_calendar_days) is not int or not 1 <= range_calendar_days <= 31):
         raise ValueError("invalid bounded FinLab pipeline")
@@ -922,11 +986,14 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     full_started_at = datetime.now(UTC)
     if not credential_available():
         raise RuntimeError("no usable FinLab session")
+    dispatch_identity = intraday_source_identity(REPO_ROOT, public_root=public_root)
     universe = load_universe(public_root, start=start)
     daily_price_coverage = annotate_daily_close_coverage(root, universe)
     days = session_days(public_root, start=start, end=end)
     if not days or not universe:
         raise ValueError("no verified stock universe or observed session days")
+    priority_universe = {item['symbol']: item for item in universe}
+    priority_days = set(days)
     index = _open_index(root / "intraday/market_index.sqlite3")
     index_view_identity = _effective_partitions_view_identity(index)
     cursor_path = root / ("intraday/minute_cursor.json" if kind == "tw_minute" else "intraday/market_cursor.json")
@@ -973,7 +1040,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     cycle = quota_cycle_start(now).isoformat()
     if cursor.get("older_probe_cycle") != cycle:
         cursor.update(older_probe_cycle=cycle, older_probe_attempts=0, older_retry_attempts=0)
-    if not cursor.get("bootstrapped"):
+    if not finite_priority_only and not cursor.get("bootstrapped"):
         for path in (root / "intraday/receipts").glob("*/*.json"):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -988,12 +1055,13 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     int(payload.get("rows") or 0),
                     int(payload.get("parquet_size_bytes") or 0))
         cursor["bootstrapped"] = True
-    if not cursor.get("derived_bootstrapped") and source_kind == "tw_tick":
+    if not finite_priority_only and not cursor.get("derived_bootstrapped") and source_kind == "tw_tick":
         _bootstrap_derived(index, root)
         cursor["derived_bootstrapped"] = True
-    _repair_derived_errors(index, root, now=now)
+    if not finite_priority_only:
+        _repair_derived_errors(index, root, now=now)
     slots = len(days) * width
-    former_tasks = _former_probe_tasks(universe, days, kind=source_kind)
+    former_tasks = [] if finite_priority_only else _former_probe_tasks(universe, days, kind=source_kind)
     started = datetime.now(UTC)
     attempts = successes = 0
     state = "batch_limit"
@@ -1018,9 +1086,9 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     # A source/range interruption can leave untouched days behind a committed
     # scan frontier. Repair those finite holes explicitly rather than looping
     # on publication retries while the reported required gap never decreases.
-    if source_kind == "tw_minute":
-        cursor["known_gap_queue"] = _unchecked_known_minutes(index, universe, days,
-            first_observed=first_observed, limit=limit)
+    if not finite_priority_only:
+        cursor["known_gap_queue"] = _unchecked_known_partitions(index, universe, days,
+            first_observed=first_observed, limit=limit, kind=source_kind)
     phase_metrics = {key: {"attempts": 0, "newly_checked": 0, "new_receipted": 0,
                            "rows": 0, "local_bytes": 0, "cycle_seconds": 0.0}
                      for key in ("latest_session", "observed_history", "older_discovery")}
@@ -1037,10 +1105,22 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     queued_windows = inflight_windows = peak_inflight_windows = 0
     worker_slot_seconds = 0.0
     source_backoff_until = read_json(root / "intraday/source_backoff.json").get("retry_at_utc")
+    priority_capacity_checked_at = time.monotonic()
+    priority_catalog_refresh = "not_needed"
     sdk_calls = fallback_calls = window_requests = 0
     source_seconds = persist_seconds = 0.0
     inflight_partitions = 0
-    _atomic_json(cursor_path, cursor)
+    futures_priority_seen: set[tuple[str, date]] = set()
+    futures_priority_next_check = 0.0
+    futures_priority_attempts = futures_priority_successes = 0
+    futures_priority_sdk_unsupported = False
+    futures_priority_overlay_checked = False
+    futures_priority_overlay = None
+    stock_priority_seen: set[tuple[str, date]] = set()
+    stock_priority_next_check = 0.0
+    stock_priority_attempts = stock_priority_successes = 0
+    if not finite_priority_only:
+        _atomic_json(cursor_path, cursor)
 
     def persist_source_backoff():
         """Retain shared provider cooldown even when a worker/owner is killed."""
@@ -1064,7 +1144,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         """Persist only committed frontiers; in-flight reads resume after a kill."""
         nonlocal last_status_clock
         boundary = datetime.now(UTC)
-        if active_key is None:
+        if active_key is None and not finite_priority_only:
             _atomic_json(cursor_path, cursor)
         measured = estimate_attempt_batch(
             durations, limit=limit,
@@ -1079,11 +1159,17 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         progress = {
             "contract_version": INTRADAY_PROGRESS_VERSION, "owner": owner,
             "kind": source_kind, "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
+            "selection_scope": "finite_registered_priority" if finite_priority_only else "full_market",
             "quota_policy": policy_state,
             "run_started_at_utc": started.isoformat(), "observed_at_utc": boundary.isoformat(),
             "state": "running" if state == "batch_limit" and not finished else state,
             "active_key": active_key, "active_trade_date": active_day,
             "attempt_limit": limit, "attempted": attempts, "successful": successes,
+            "futures_priority_attempts": futures_priority_attempts,
+            "futures_priority_successes": futures_priority_successes,
+            "futures_priority_sdk_unsupported": futures_priority_sdk_unsupported,
+            "stock_priority_attempts": stock_priority_attempts,
+            "stock_priority_successes": stock_priority_successes,
             "scanned_candidates": scanned, "cached_skips": cached_skips,
             "quota_checks": quota_checks, "quota_cache_hits": quota_cache_hits,
             "quota_observation_bounds": {"maximum_requests": quota_window.maximum_requests,
@@ -1114,7 +1200,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             "estimate_scope": "current_attempt_batch_not_all_history",
         }
         _atomic_json(root / "intraday/active_run.json", progress)
-        if full or time.monotonic() - last_status_clock >= 60:
+        if not finite_priority_only and (full or time.monotonic() - last_status_clock >= 60):
             summary = _summarize(index, universe, days, started=started,
                                  attempts=attempts, successes=successes, state=progress["state"],
                                  daily_price_coverage=daily_price_coverage, active_kind=source_kind,
@@ -1124,16 +1210,31 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             _atomic_json(root / "intraday/market_status.json", summary)
             last_status_clock = time.monotonic()
 
-    def may_acquire() -> bool:
+    def may_acquire(*, finite_stock_priority: bool = False) -> bool:
         nonlocal general_admission, general_recheck_at, state, quota_checks, quota_cache_hits, policy_state
         nonlocal previous_quota, quota_pending_successes, account_delta_bytes, quota_sample_successes
         nonlocal minute_admission_checks, minute_admission_observation
+        nonlocal priority_capacity_checked_at
         # Leave a complete SDK request's timeout runway before the outer shell
         # watchdog. Stop normally so source/index/frontiers stay recoverable.
         if deadline is not None and time.monotonic() + 180 >= deadline:
             state = "run_time_budget_reached"
             return False
         boundary = datetime.now(UTC)
+        if finite_priority_only:
+            # Preserve the account owner's day-trade handoff and recheck the
+            # physical backing reserve during a potentially long finite pass.
+            from stockagent.data.finlab_gap_priority import pending_daytrade_priority
+            if pending_daytrade_priority(root, now=boundary):
+                state = "priority_handoff"
+                return False
+            if time.monotonic() - priority_capacity_checked_at >= 60:
+                priority_capacity_checked_at = time.monotonic()
+                if check_dispatch(root, report_admitted=False, priority=True,
+                                  additional_priority_headroom_bytes=(
+                                      CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0)):
+                    state = "capacity_deferred"
+                    return False
         if source_backoff_until:
             try:
                 retry_at = datetime.fromisoformat(source_backoff_until)
@@ -1152,6 +1253,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                                      official_calendar_root=public_root)["allowed"]:
                 state = "opening_window_yield"
                 return False
+        minute_blocked = False
         if source_kind == "tw_tick" and enforce_minute_priority and boundary >= general_recheck_at:
             admission_clock = time.monotonic()
             admission = _minute_admission(index, universe, days, source_root=root,
@@ -1163,27 +1265,67 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 "wall_seconds": time.monotonic() - admission_clock,
                 "complete_inventory_generated": False, "decision": admission}
             if not admission["tick_residual_allowed"]:
-                state = "waiting_required_minutes"
-                return False
+                minute_blocked = True
+                if not (capacity_deferred_priority and finite_stock_priority):
+                    state = "waiting_required_minutes"
+                    return False
         # No other regular writer can change receipts under the account lock.
         # Recheck at most once a minute, and always at the daily reset, instead
         # of rereading the thousand-key catalog for every Tick partition.
-        if boundary >= general_recheck_at:
+        if (boundary >= general_recheck_at or capacity_deferred_priority
+                and general_admission.get("finite_capacity_exception", {}).get("allowed") is True):
             general_admission = _general_work_admission(root, now=boundary)
             general_recheck_at = min(boundary + timedelta(minutes=1),
                                     quota_cycle_start(boundary) + timedelta(days=1))
+            if capacity_deferred_priority:
+                general_admission["finite_capacity_exception"] = _capacity_deferred_finite_priority(root, general_admission)
         allowed = (general_admission.get("minute_residual_allowed", general_admission.get("supplemental_allowed", False))
                    if source_kind == "tw_minute" else general_admission.get("supplemental_allowed", False))
+        capacity_exception = capacity_deferred_priority and (
+            general_admission.get("finite_capacity_exception", {}).get("allowed") is True)
+        if minute_blocked and not capacity_exception:
+            # A finite tick may overtake unavailable minute work only while
+            # the normal acquisition owner is verifiably capacity-blocked.
+            # Unknown/recovered capacity never bypasses the minute gate.
+            state = "waiting_required_minutes"
+            return False
+        if not allowed and capacity_exception:
+            # General work remains due, not completed. Before every finite
+            # request independently recheck the existing priority reserve.
+            if check_dispatch(root, report_admitted=False, priority=True,
+                              additional_priority_headroom_bytes=CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES):
+                state = "capacity_deferred"
+                return False
+            allowed = True
+        if (not allowed and finite_stock_priority and source_kind == 'tw_tick'
+                and general_admission.get('minute_residual_allowed') is True
+                and type(general_admission.get('actionable_pending')) is int
+                and general_admission.get('actionable_pending') == 0):
+            # A bounded interactive stock check may run when general work is
+            # blocked rather than actionable. Minute priority, scheduled quota
+            # reserve, source cooldown, opening and disk guards still apply.
+            allowed = True
         if not allowed:
             state = "waiting_required_general_data"
             return False
         policy_state = quota_admission(kind=source_kind, now=boundary, reserve_mb=reserve_mb,
             scheduled_reserve_mb=general_admission.get("scheduled_reserve_mb", 0), policy=quota_policy)
+        if capacity_exception:
+            # The original minute floor does not reserve any upcoming general
+            # work, and its pre-reset drain sets the floor to zero. This
+            # explicit exception uses a higher floor even during the drain.
+            # It is a guard, not a guarantee for unknown-sized whole tables.
+            future = general_admission.get("scheduled_reserve_mb")
+            if type(future) not in (int, float) or not math.isfinite(future) or future < 0:
+                future = 500.0
+            policy_state["effective_reserve_mb"] = max(policy_state["effective_reserve_mb"], 2000.0, future)
+            policy_state["capacity_deferred_priority_reserve_mb"] = 2000.0
+            policy_state["basis"] = "finite_capacity_exception; due_general_quota_cost_remains_unknown"
         effective_reserve = policy_state["effective_reserve_mb"]
         # The SDK still enforces official quota on every source request.
         # Reuse local observations for at most 4 Tick requests / 5 seconds;
         # within 100 MB of the reserve Tick returns to per-request sampling.
-        fresh = quota_window.needs_refresh(
+        fresh = capacity_exception or quota_window.needs_refresh(
             now=boundary, clock=time.monotonic(), reserve_mb=effective_reserve)
         if fresh:
             quota_checks += 1
@@ -1263,6 +1405,133 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         checkpoint()
         if attempts % 64 == 0:
             gc.collect()  # Normal GC remains enabled; no full-heap scan per stock-day.
+
+    def drain_futures_priorities():
+        """Run exact futures partitions inside this owner and its usual admission gates."""
+        nonlocal futures_priority_next_check, futures_priority_attempts, futures_priority_successes
+        nonlocal futures_priority_sdk_unsupported, futures_priority_overlay_checked, futures_priority_overlay
+        nonlocal attempts, successes, active_key, active_day, state, last_success_at, last_completed_clock
+        nonlocal quota_pending_successes, sdk_calls, source_backoff_until
+        if source_kind != 'tw_minute' or time.monotonic() < futures_priority_next_check:
+            return
+        futures_priority_next_check = time.monotonic() + 5
+        from downloader.provider_priority import finlab_futures_candidates
+        from scripts.download_finlab_intraday import record_failed_partition
+        from stockagent.data.finlab_futures_sdk import PartitionFailure, validated_overlay, fetch_with_owner_session
+        for key, day in finlab_futures_candidates(index, datetime.now(UTC)):
+            identity = (key, day)
+            if identity in futures_priority_seen or attempts >= limit or state != 'batch_limit':
+                continue
+            receipt_path, attempt_path = _partition_paths(root, key, day)
+            if (_stored_receipt(receipt_path, root, key, day, verify_hash=True) is not None or
+                    _checked_this_cycle(attempt_path, 'attempted_at_utc', datetime.now(UTC))):
+                futures_priority_seen.add(identity)
+                continue
+            native_sdk = _supports_futures_partition(key)
+            if not native_sdk:
+                if not futures_priority_overlay_checked:
+                    futures_priority_overlay = validated_overlay(root)
+                    futures_priority_overlay_checked = True
+                if futures_priority_overlay is None:
+                    futures_priority_sdk_unsupported = True
+                    futures_priority_seen.add(identity)
+                    continue
+            if not may_acquire():
+                break
+            if finite_priority_only and identity not in finlab_futures_candidates(index, datetime.now(UTC)):
+                # An account or quota check may outlive an intent's expiry.
+                continue
+            futures_priority_seen.add(identity)
+            quota_window.requested()
+            attempts += 1
+            futures_priority_attempts += 1
+            sdk_calls += 1
+            active_key, active_day = key, day.isoformat()
+            phase = phase_metrics.setdefault('finite_futures_priority', {
+                'attempts': 0, 'newly_checked': 0, 'new_receipted': 0,
+                'rows': 0, 'local_bytes': 0, 'cycle_seconds': 0.0})
+            phase['attempts'] += 1
+            phase['newly_checked'] += int(not attempt_path.exists())
+            checkpoint()
+            symbol = key.split(':', 1)[1]
+            try:
+                receipt = (fetch(root, key, day, now=datetime.now(UTC), force_download=False)
+                           if native_sdk else fetch_with_owner_session(root, key, day, overlay=futures_priority_overlay))
+                _record_source(index, root, 'tw_futures_minute', symbol, day, receipt)
+                successes += 1
+                futures_priority_successes += 1
+                quota_pending_successes += 1
+                phase['new_receipted'] += 1
+                phase['rows'] += int(receipt.get('rows') or 0)
+                phase['local_bytes'] += int(receipt.get('parquet_size_bytes') or 0)
+                last_success_at = datetime.now(UTC).isoformat()
+                print(f"[finlab-market] priority {key} {day}: {receipt['status']}", flush=True)
+            except Exception as exc:
+                failure = exc.category if isinstance(exc, PartitionFailure) else record_failed_partition(root, key, day, exc)
+                _record(index, 'tw_futures_minute', symbol, day, failure)
+                print(f"[finlab-market] priority {key} {day}: {failure}", flush=True)
+                if failure in {'quota_exhausted', 'authentication_failed', 'source_rate_limited'}:
+                    state = failure
+                if failure == 'source_rate_limited':
+                    source_backoff_until = read_json(attempt_path).get('retry_at_utc')
+                    _atomic_json(root / 'intraday/source_backoff.json', {
+                        'contract_version': 1, 'observed_at_utc': datetime.now(UTC).isoformat(),
+                        'retry_at_utc': source_backoff_until,
+                        'basis': 'priority_partition_source_rate_limit; no_response_text_retained'})
+            completed_clock = time.monotonic()
+            durations.append(completed_clock - last_completed_clock)
+            phase['cycle_seconds'] += durations[-1]
+            last_completed_clock = completed_clock
+            active_key = active_day = None
+            checkpoint()
+
+    def drain_stock_priorities():
+        """Run verified stock/day intents inside their existing account owner."""
+        nonlocal stock_priority_next_check, stock_priority_attempts, stock_priority_successes
+        if time.monotonic() < stock_priority_next_check:
+            return
+        stock_priority_next_check = time.monotonic() + 5
+        from downloader.provider_priority import finlab_stock_candidates
+        for key, day in finlab_stock_candidates(index, datetime.now(UTC), source_kind):
+            identity = (key, day)
+            if identity in stock_priority_seen or attempts >= limit or state != 'batch_limit':
+                continue
+            symbol = key.split(':', 1)[1]
+            item = priority_universe.get(symbol)
+            if item is None or day not in priority_days or not _eligible(item, day):
+                # This is a local scope observation, never a source attempt or
+                # proof of no trade. Only suppress repeated idle wakeups while
+                # the same source identity remains valid in the quota cycle.
+                # A bounded custom run must not suppress an out-of-range day.
+                if (start <= day <= end and dispatch_identity is not None
+                        and intraday_source_identity(REPO_ROOT, public_root=public_root) == dispatch_identity):
+                    reason = ('symbol_not_in_universe' if item is None else
+                              'unverified_session' if day not in priority_days else 'symbol_ineligible')
+                    _atomic_json(_priority_scope_path(root, key, day), {
+                        'contract': 'finlab_stock_priority_local_scope_v1',
+                        'dataset': key, 'trade_date': day.isoformat(),
+                        'checked_at_utc': datetime.now(UTC).isoformat(),
+                        'source_identity': dispatch_identity, 'reason': reason,
+                        'owner_start_date': start.isoformat(), 'owner_end_date': end.isoformat(),
+                        'provider_calls': 0, 'source_no_trade_claim': False,
+                    })
+                stock_priority_seen.add(identity)
+                continue
+            receipt_path, attempt_path = _partition_paths(root, key, day)
+            if (_stored_receipt(receipt_path, root, key, day, verify_hash=True) is not None or
+                    _checked_this_cycle(attempt_path, 'attempted_at_utc', datetime.now(UTC))):
+                stock_priority_seen.add(identity)
+                continue
+            if not may_acquire(finite_stock_priority=True):
+                break
+            if finite_priority_only and identity not in finlab_stock_candidates(index, datetime.now(UTC), source_kind):
+                continue
+            stock_priority_seen.add(identity)
+            previous_attempts, previous_successes = attempts, successes
+            acquire(source_kind, symbol, day)
+            stock_priority_attempts += attempts - previous_attempts
+            stock_priority_successes += successes - previous_successes
+            checkpoint()
 
     def acquire_wave(jobs):
         """A bounded work-conserving pool; the cohort frontier commits last.
@@ -1432,7 +1701,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         nonlocal state
         queue = cursor["recent_queue"]
         repairs = cursor.get("known_gap_queue", [])
-        if source_kind == "tw_minute" and repairs and not queue:
+        if repairs and not queue:
             repair = repairs.pop(0)
             kind, day = source_kind, date.fromisoformat(repair["day"])
             item = known[repair["symbol"]]
@@ -1464,6 +1733,80 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
 
     try:
         checkpoint(full=True)
+        if finite_priority_only and _general_work_admission(root, now=datetime.now(UTC)).get("state") == "discovery_unverified":
+            # A stale catalog would otherwise make a finite pass wait forever
+            # while bulk history is paused. Refresh only if an exact, active,
+            # unattempted partition exists, with the same account lock and
+            # canonical discovery receipt as the ordinary owner.
+            from downloader.provider_priority import finlab_futures_candidates, finlab_stock_candidates
+            from stockagent.data.finlab_gap_priority import pending_daytrade_priority
+            boundary = datetime.now(UTC)
+            candidates = finlab_stock_candidates(index, boundary, source_kind)
+            if source_kind == "tw_minute":
+                candidates += finlab_futures_candidates(index, boundary)
+            due = False
+            for key, day in candidates:
+                receipt_path, attempt_path = _partition_paths(root, key, day)
+                if (_stored_receipt(receipt_path, root, key, day, verify_hash=True) is None
+                        and not _checked_this_cycle(attempt_path, 'attempted_at_utc', boundary)):
+                    due = True
+                    break
+            if due:
+                if pending_daytrade_priority(root, now=boundary):
+                    state = "priority_handoff"
+                elif not opening_admission(boundary, minimum_runway_minutes=10,
+                                           official_calendar_root=public_root)["allowed"]:
+                    state = "opening_window_yield"
+                elif source_backoff_until and boundary < datetime.fromisoformat(source_backoff_until):
+                    state = "source_rate_limited"
+                elif time.monotonic() - priority_capacity_checked_at >= 60 and check_dispatch(
+                        root, report_admitted=False, priority=True,
+                        additional_priority_headroom_bytes=(
+                            CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0)):
+                    state = "capacity_deferred"
+                else:
+                    priority_capacity_checked_at = time.monotonic()
+                    try:
+                        available = provider_catalog()
+                        if not available:
+                            raise ValueError("empty provider catalog")
+                        curated = {item["key"]: item for item in load_catalog()["datasets"]}
+                        missing = record_provider_catalog(root, available, curated, now=datetime.now(UTC))
+                        priority_catalog_refresh = "observed"
+                        if missing:
+                            state = "priority_catalog_incomplete"
+                    except Exception as exc:
+                        # SDK exceptions may include account URLs. Keep the
+                        # prior source evidence and never print provider text.
+                        print(json.dumps({"state": "priority_catalog_unavailable",
+                                          "error_type": type(exc).__name__}), flush=True)
+                        state = "priority_catalog_unavailable"
+                        priority_catalog_refresh = "failed"
+        drain_futures_priorities()
+        drain_stock_priorities()
+        if finite_priority_only:
+            # Never turn a bounded priority pass into ordinary history work.
+            # This state describes the pass, not completion of the registry.
+            if state == "batch_limit":
+                state = "finite_priority_pass_complete"
+            summary = {
+                "contract": "finlab_finite_intraday_priority_pass_v1",
+                "selection_scope": "finite_registered_priority",
+                "kind": source_kind, "state": state,
+                "started_at_utc": started.isoformat(), "observed_at_utc": datetime.now(UTC).isoformat(),
+                "attempted_this_run": attempts, "successes_this_run": successes,
+                "futures_priority_attempts": futures_priority_attempts,
+                "futures_priority_successes": futures_priority_successes,
+                "futures_priority_sdk_unsupported": futures_priority_sdk_unsupported,
+                "stock_priority_attempts": stock_priority_attempts,
+                "stock_priority_successes": stock_priority_successes,
+                "catalog_refresh": priority_catalog_refresh,
+                "general_acquisition_admission": general_admission, "quota_policy": policy_state,
+                "full_history_completion_claim": False,
+            }
+            _atomic_json(root / "intraday" / f"priority_status_{source_kind}.json", summary)
+            _atomic_json(root / "intraday/priority_status.json", summary)
+            return summary
         # Recent unpublished partitions can appear later the same session;
         # older failures get a fair retry after the next account reset. Do
         # not let retries consume the entire new-symbol discovery budget.
@@ -1476,7 +1819,14 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         # reached unpublished history, even when every recent retry succeeded.
         # Keep unknown old discovery separate; due known-window work can fill
         # the measured bounded pool without waiting for another timer owner.
-        retry_budget = min(limit, max(16, workers * queue_depth)) if pipeline else min(16, max(1, limit // 8))
+        # The rolling dispatcher already bounds live responses by workers and
+        # rechecks quota/time/preemption per actual request. A work quantum is
+        # not a socket count: draining after one wave forced repeated complete
+        # market scans while hundreds of known publication checks stayed due.
+        retry_budget = limit if pipeline else min(16, max(1, limit // 8))
+        known_start = first_observed or days[-1].isoformat()
+        older_retry_room = (int(cursor.get("older_probe_attempts", 0)) < 16
+                            and int(cursor.get("older_retry_attempts", 0)) < 4)
         # A rejected signing transaction is transient, not an empty partition.
         # Select bounded extra rows so its stock-day range can be retried as one
         # native query instead of spending one call per failed day.
@@ -1485,14 +1835,17 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                WHERE kind=? AND status NOT IN ('downloaded_unverified_for_pit',
                                     'derived_unverified_for_pit','derived_no_regular_trades',
                                     'verified_closed_date','verified_no_trade')
+                 AND (? OR trade_date>=?)
                  AND (checked_at_utc < ? OR (status='provider_error' AND checked_at_utc < ?) OR
                       (status='source_rate_limited' AND checked_at_utc < ?) OR
                       (status='partition_not_ready' AND trade_date >= ?
                        AND checked_at_utc < ?))
-               ORDER BY CASE WHEN status='provider_error' THEN 0 ELSE 1 END,
+               ORDER BY CASE WHEN trade_date>=? THEN 0 ELSE 1 END,
+                        CASE WHEN status='provider_error' THEN 0 ELSE 1 END,
                         checked_at_utc,trade_date DESC LIMIT ?""",
-            (source_kind, cycle_start, (now-timedelta(seconds=30)).isoformat(),
+            (source_kind, older_retry_room, known_start, cycle_start, (now-timedelta(seconds=30)).isoformat(),
              (now-timedelta(seconds=60)).isoformat(), recent_cutoff, retry_due,
+             known_start,
              retry_budget*31 if pipeline else retry_budget),
         ).fetchall()
         # Workers wrote day receipts oldest first. Start each symbol's retry
@@ -1508,7 +1861,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         retry_planned = set()
         retry_older_planned = 0
         for kind, symbol, day_text in due:
-            if attempts + sum(len(job[2]) for job in retry_jobs) >= limit or len(retry_jobs) >= retry_budget:
+            if (state != 'batch_limit' or attempts + sum(len(job[2]) for job in retry_jobs) >= limit
+                    or len(retry_jobs) >= retry_budget):
                 break
             day = date.fromisoformat(day_text)
             if kind != source_kind or symbol not in known or day not in days or not _eligible(known[symbol], day):
@@ -1586,6 +1940,10 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 queued_windows = inflight_windows = 0
                 checkpoint()
         while state == "batch_limit" and attempts < limit and scanned < max(100_000, limit * 100):
+            drain_futures_priorities()
+            drain_stock_priorities()
+            if state != 'batch_limit' or attempts >= limit:
+                break
             before_wave = json.dumps(cursor)
             jobs = []
             planned = set()
@@ -1702,7 +2060,15 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                              daily_price_coverage=daily_price_coverage, active_kind=source_kind,
                              source_root=root, quota_policy=quota_policy)
         summary["general_acquisition_admission"] = general_admission
+        summary["futures_priority_attempts"] = futures_priority_attempts
+        summary["futures_priority_successes"] = futures_priority_successes
+        summary["futures_priority_sdk_unsupported"] = futures_priority_sdk_unsupported
+        summary["stock_priority_attempts"] = stock_priority_attempts
+        summary["stock_priority_successes"] = stock_priority_successes
+        summary["selection_scope"] = "finite_registered_priority" if finite_priority_only else "full_market"
         summary["quota_policy"] = policy_state
+        if dispatch_identity == intraday_source_identity(REPO_ROOT, public_root=public_root):
+            summary["dispatch_inputs_sha256"] = dispatch_identity
         _atomic_json(root / "intraday/market_status.json", summary)
         last_status_clock = time.monotonic()
         return summary
@@ -1728,6 +2094,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             finished_at = datetime.now(UTC)
             metrics = {
                 "contract_version": BATCH_METRICS_VERSION, "origin": "canonical_owner",
+                "selection_scope": "finite_registered_priority" if finite_priority_only else "full_market",
                 "kind": source_kind, "acquisition_policy_version": ACQUISITION_POLICY_VERSION,
                 "quota_policy": policy_state, "quota_checks": quota_checks,
                 "quota_cache_hits": quota_cache_hits,
@@ -1759,8 +2126,10 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             history = read_json(history_path)
             batches = history.get("batches", []) if history.get("contract_version") == BATCH_METRICS_VERSION else []
             _atomic_json(root / "intraday/batch_receipts" / (full_started_at.strftime("%Y%m%dT%H%M%S%fZ") + ".json"), metrics)
-            _atomic_json(history_path, {"contract_version": BATCH_METRICS_VERSION,
-                                       "batches": [*batches[-255:], metrics]})
+            if not finite_priority_only:
+                # A tiny selected pass cannot calibrate full-market throughput.
+                _atomic_json(history_path, {"contract_version": BATCH_METRICS_VERSION,
+                                           "batches": [*batches[-255:], metrics]})
         finally:
             if pool is not None:
                 if state == "interrupted":
@@ -1800,12 +2169,28 @@ def main() -> int:
                         help="rebuild local candidate/receipt inventory without calling FinLab")
     parser.add_argument("--derive-existing", action="store_true",
                         help="with --status-only, replay all stored ticks into derived minutes")
+    parser.add_argument("--priority-only", action="store_true",
+                        help="run only registered finite partition requests under priority capacity admission")
+    parser.add_argument("--capacity-deferred-priority", action="store_true",
+                        help="allow four registered minute partitions or one stock Tick partition while ordinary dispatch is measurably capacity-blocked")
     args = parser.parse_args()
     settings = load_policy()
-    workers = args.workers if args.workers is not None else (
-        settings.minute_workers if args.kind == "tw_minute" else settings.tick_workers)
-    range_days = args.range_calendar_days if args.range_calendar_days is not None else (
-        settings.minute_range_calendar_days if args.kind == "tw_minute" else settings.tick_range_calendar_days)
+    if args.capacity_deferred_priority and (not args.priority_only or args.limit > (4 if args.kind == "tw_minute" else 1)):
+        parser.error("capacity-deferred-priority requires --priority-only and at most four minutes or one Tick")
+    if args.priority_only:
+        if (args.status_only or args.derive_existing or args.limit > 64 or
+                any(value not in (None, 1) for value in (args.workers, args.range_calendar_days,
+                    args.download_threads, args.queue_depth, args.authorization_slots))):
+            parser.error("priority-only requires at most 64 serial partitions and no inventory mode")
+        workers = range_days = 1
+        args.download_threads = args.queue_depth = args.authorization_slots = 1
+        if args.max_run_seconds is None:
+            args.max_run_seconds = 1200
+    else:
+        workers = args.workers if args.workers is not None else (
+            settings.minute_workers if args.kind == "tw_minute" else settings.tick_workers)
+        range_days = args.range_calendar_days if args.range_calendar_days is not None else (
+            settings.minute_range_calendar_days if args.kind == "tw_minute" else settings.tick_range_calendar_days)
     if (args.end_date < args.start_date or args.limit < 1
             or args.reserve_mb is not None and args.reserve_mb < 0 or args.minimum_free_gb < 0
             or args.max_run_seconds is not None and not 180 < args.max_run_seconds <= 3600):
@@ -1821,6 +2206,14 @@ def main() -> int:
             print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))
             return 0
     else:
+        # The long-lived parent only checked capacity at launch. Recheck at
+        # this new group boundary, before the account lock, SDK or queue writes.
+        capacity_kwargs = {"report_admitted": False, "priority": args.priority_only}
+        if args.capacity_deferred_priority:
+            capacity_kwargs["additional_priority_headroom_bytes"] = CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES
+        capacity_exit = check_dispatch(args.output_root, **capacity_kwargs)
+        if capacity_exit:
+            return capacity_exit
         def terminate(signum, frame):
             raise SystemExit(128 + signum)
         previous_handler = signal.signal(signal.SIGTERM, terminate)
@@ -1835,6 +2228,8 @@ def main() -> int:
                                       download_threads=args.download_threads,
                                       queue_depth=args.queue_depth,
                                       authorization_slots=args.authorization_slots,
+                                      finite_priority_only=args.priority_only,
+                                      capacity_deferred_priority=args.capacity_deferred_priority,
                                       quota_policy=settings)
         except BlockingIOError:
             print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))
@@ -1843,6 +2238,11 @@ def main() -> int:
             signal.signal(signal.SIGTERM, previous_handler)
     print(json.dumps({key: value for key, value in summary.items() if key != "symbols"},
                      ensure_ascii=False, sort_keys=True), flush=True)
+    if args.priority_only and summary["state"] in {
+            "capacity_deferred", "priority_handoff", "opening_window_yield", "source_rate_limited",
+            "waiting_required_general_data", "waiting_required_minutes", "priority_catalog_incomplete",
+            "priority_catalog_unavailable", "quota_margin_reached", "disk_reserve_reached"}:
+        return 75
     return 1 if summary["state"] in {"quota_unknown", "authentication_failed"} else 0
 
 

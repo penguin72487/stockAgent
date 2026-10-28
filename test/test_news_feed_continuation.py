@@ -43,7 +43,17 @@ def test_rss_mixed_page_continues_without_saving_any_envelope_or_body(config, tm
         assert checkpoint['response_sha256'] and 86390 < checkpoint['due'] - time.time() <= 86400
         assert queue.db.execute('SELECT total FROM bulk_page_evidence').fetchone()[0] == -1
         assert queue.db.execute('SELECT count(*) FROM bulk_api_coverage').fetchone()[0] == 0
-        assert accept_discovery(queue, checkpoint, Response(url, 304, {}, b''), [], [], []) == 0
+        # A gate while this page waits for revalidation is not a new source
+        # observation. In particular it must not erase the mixed-rights
+        # classification used by a subsequent conditional 304.
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (url,))
+        ready = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        fail_discovery(queue, ready, NewsError('stopping', retry=True, delay=1, request_deferred=True))
+        deferred = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert deferred['error_code'] == checkpoint['error_code']
+        assert deferred['last_checked_at_utc'] == checkpoint['last_checked_at_utc']
+        assert accept_discovery(queue, deferred, Response(url, 304, {}, b''), [], [], []) == 0
         assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == (2 if all_restricted else 1)
         assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] == checkpoint['error_code']
         # The next genuinely different page commits its own free raw response,

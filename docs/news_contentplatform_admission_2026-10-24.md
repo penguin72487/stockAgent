@@ -1,5 +1,106 @@
 # 報新聞：已知網址的正文接線
 
+## 10/26 晚間續辦：75／75 個已知網址的正文補齊
+
+沿用下節已完成的 68 篇報新聞、40 篇 CMoneyLearning 與 497 筆結案問題，只處理原來 7 個缺文。
+v6 新增 **3 篇**、v7 新增 **2 篇**、v8 新增 **2 篇**；目前 **75／75 有正文，這份已知清冊剩餘 0**。
+下節的 68／75、7 個缺口是較早快照，不再是目前待辦。
+
+- v6 支援書寫包裝中的圖片，保留父節點與前後文字；v7 依實際原件補上 `hr` 與無 WordPress class 的圖片。
+  CSS class 不作文章身分證據，完整書寫內容、literal canonical／mainEntity、作者與發布／修改時鐘仍需驗證。
+- 最後兩個缺口只提交一次新的有界結構問題 55；均通過原生身分、作者與時鐘，失敗位置分別是空元素與 script。
+  兩題已結案，合計 **499 筆結案問題**，沒有重送舊 43／44／45／53 或重新啟用 55。
+  新問題僅保留有限結構資訊，不把診斷算成正文或保存新私有原件。
+- v8 只排除無文字／子節點且沒有資源、事件、自訂資料屬性的空葉元素，實際原件是空 `aside`；
+  script 按 [WHATWG 的元素語意](https://html.spec.whatwg.org/multipage/scripting.html#the-script-element)排除程式碼，
+  不執行、不抓 `src`、不解碼資料區塊。書寫父節點與兄弟文字保留，未知的書寫、隱藏或嵌入內容仍拒絕。
+  完整性明確限定 **靜態 HTML 書寫內容**，不宣稱已取得執行 JavaScript 後產生的內容。
+- **898 項相關測試通過**；與之前 785／816／845／860 的重疊測試不相加。
+  v8 上線前以兩個 parser 離線讀回全部 **73 份既有原件**，正文與既有值保持，只有完整性說明明確化，**0 次來源 HTTP**。
+  正式版本、owner、PID、DB／status 與程序時鐘核對後，只提交最後兩個缺文。
+- v8 的兩篇保留 **496,285 raw bytes、7,253 UTF-8 正文 bytes**。
+  原始回應、正文、Parquet 與耐久收據 SHA、完整書寫 DOM、作者及發布／修改原字串均逐項讀回，兩個 parser 的全部欄位一致。
+  在同一份新入庫原件上重現 v7 的失敗，**0 次額外 HTTP**；原有 **113 篇正文與檔案、499 筆結案**保持。
+  來源授權、容量身分、原 REP／冷卻與每日扣額保持，交易／報價服務未重啟。
+
+公開狀態 API 已讀回報新聞 **75／75、known_queue_clear、此已知範圍 ETA 0**，CMoneyLearning **40／40**。
+來源審查與本次收據已更新；90 個已註冊 provider 與 951 個來源列是不同分母。
+本階段補齊這 75 個已知網址，**全站歷史範圍、最大穩定 RPS 與全歷史 ETA 仍未證明**；本次沒有新的全鏈路速度比較。
+鉅亨仍優先，其 **187 個活動缺文 URL**沿原 AMP robots HTTP 502 的五分鐘恢復時鐘續辦；
+186 個已有其他主頁候選，不能據此把不同網址合併成同一正文。CNA 延後，整體新聞目標維持 active。
+
+證據：[v6 新增 3 篇](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_wrapped_media_v6_20261026/readback.json)、
+[v7 新增 2 篇](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_written_html_v7_20261026/readback.json)、
+[最後兩個結構問題](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_failure_shape55_20261026/readback.json)、
+[73 份原件離線比對](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/offline.json)、
+[v8 正文與收據讀回](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/readback.json)、
+[原失敗重現](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/root-cause-readback.json)、
+[正式載入](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/runtime-admission.json)、
+[階段結案](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/completion.json)、
+[公開審查與交接](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/handoff.json)。
+fixture 初始化及 v7 診斷清單遺漏曾被測試擋下，修正後才上線；負向收據保留，沒有清除失敗來製造成果。
+最後交接驗證器曾將 JSON 清單與 Python tuple 直接比較而誤判設定變更；型別比較已修正，
+實際設定 SHA、revision 與 owner 均保持，同一服務的後續公開讀回通過，原失敗收據保留。
+
+## 10/26 18:28 續辦：正文 15 → 68，只剩 7 個缺口
+
+先沿用 CMoneyLearning 40 篇、報新聞 15 篇及 497 筆已結案問題；既有正文、原件及收據未重抓。
+前述「4 個結構／署名、56 個範圍」是舊版觀測，現在以 **68／75 篇有正文、7 篇解析未通過** 為準。
+
+- 重新核對[官方著作權說明](https://www.contentplatform.info/copyright/)的個人非商業下載條款。
+  平台帳號署名、文內記者、公司與來源聲明是不同的原始宣告，不能因未使用單一「記者／綜合報導」格式就排除正文。
+  v4 仍驗證 literal canonical／mainEntity、原生標題、可見作者／Person／profile、發布與修改時間及存取條件；
+  只重排 60 個當時缺文項目，新增 **9 篇**。這不是著作權歸屬、開放授權或自動訓練／匯出的判定。
+- v5 依兩份實際保留原件支援可見巢狀 `div` 與 WordPress 圖片／圖說結構，保留所有書寫文字，
+  圖片和圖說明確排除；正文容器內原有的相關連結文字仍保留。未知結構、隱藏內容與存取限制維持失敗。
+  **2 份原件沿共同耐久入庫流程重解析，0 次 HTTP、沒有另複製 raw**；
+  只有其餘 49 個無原件缺文交給原下載服務，取得 **42 篇**，本階段共新增 **44 篇**。
+- 保留原件 ABI 5 限定精確 v4 → v5 同授權轉換，核對舊 head、唯一新增失敗 attempt、owner、原件與 sidecar SHA。
+  HTTP 收到回應與稍後寫入解析失敗是兩個時間；兩者皆保留，不能回寫成同一個時間或覆蓋後來的拒絕／租約／重試。
+  原件未保存 redirect chain，紀錄明確標為未保存；沒有捏造 transport 證據。
+- **785 項整合測試通過**，涵蓋既有原件、較新拒絕、租約、deadline、收據中斷恢復與舊版解析；重疊測試不相加。
+  v5 的 44 篇逐項讀回：**10,840,660 raw bytes、176,997 UTF-8 正文 bytes**，含兩份重用原件，不能算成新增網路流量。
+  原始回應／正文／Parquet／耐久收據 SHA、完整書寫 DOM、作者與發布／修改原字串、兩個 parser 的全部欄位均核對。
+  24 篇既有報新聞、40 篇 CMoneyLearning、497 筆結案及交易／報價服務保持；來源容量身分、REP、原冷卻與每日診斷扣額未重設。
+
+剩餘 **386719、418473、477100、494106、512881、538855、547111** 皆為 `article_identity_not_verified`；
+這是尚未解決的解析／身分驗證結果，不宣稱文章不存在、永久損壞或已抓齊。
+後續只處理這 7 個缺口，不重排 68 篇完成正文，也不重送已結案的 43／44／45／53 問題。
+公開網頁已核對 68／75；此分母是目前已知網址，非全站歷史。最大穩定 RPS、全歷史範圍與全部完成 ETA 尚未證明。
+鉅亨仍優先，其 187 個活動缺口依原 AMP robots HTTP 502 恢復時鐘等待；CNA 延後，整體目標維持 active。
+
+證據：[v4 新增 9 篇](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_scope_v4_20261026/readback.json)、
+[v5 原件入庫](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_geometry_v5_20261026/retained-admitted.json)、
+[44 篇正文與收據讀回](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_geometry_v5_20261026/readback.json)、
+[正式載入與時鐘](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_geometry_v5_20261026/runtime-admission.json)、
+[公開進度](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_geometry_v5_20261026/public-status.json)、
+[完成及未完成清單](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_native_geometry_v5_20261026/completion.json)。
+測試曾誤用 fixture 預設網址、混淆全域 User-Agent 與來源指紋、要求兩件耐久操作一定在同一個 0.1 秒切片完成；
+修正測試後才准入。失敗收據保留，准入被擋時沒有停止服務或發出文章請求。
+
+## 10/26 續辦：只查 4 個未完成署名關係，不重抓完成正文
+
+既有 CMoneyLearning 28 篇、報新聞 15 篇及 480 筆已結案問題已核對保持。
+CMNews 的 28 個身分缺口另按確切來源連結清點，15 個宣告原站已有正文、13 個仍缺確切連結；
+這與 CMoneyLearning 的 28 篇正文不是一對一計數，沒有接受 CMNews alias 或重新下載原件。
+
+本次只向原新聞 owner 提交 386719、418473、475631、538855 的固定新問題 evidence 53：
+第一個書寫段落是否以相符原生記者署名開頭，包含署名和正文同段的情況。
+只允許穿過有界透明 div、圖片與無文字的單圖 figure；不跨過前文、圖說、未知包裝、隱藏內容或來源存取條件，
+不在後文搜尋方便匹配的姓名。舊 43／44／45 保持結案，正式正文 parser 與來源身分不變。
+
+[實際結果](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_prefix_20261026/readback.json)
+為 4 次 HTTP 200、980,039 response bytes；三篇到達首個 p，一篇停在 figure，均未確認相符前綴。
+這些新問題已全部回答並結案，合計 484 筆，不再重送 53；新私有原件與正式正文均為 0。
+仍是 **15／75 篇有正文、4 筆結構／署名及 56 筆範圍未解**，不判定來源永久損壞或不存在。
+後續只能取不同的原生署名／figure 宣告或可驗證原文來源關係，不能把這次的否定答案改算成功。
+
+517 項相關測試通過，涵蓋同 owner、重啟不重送、前置收據再驗、原冷卻／robots、完整原件獨立讀回與舊資料保持。
+首輪測試模擬重啟時未關閉舊 fixture owner，修正測試後通過；控制器另誤把成功 log 中的 fixture 名稱當成失敗，
+在尚未重啟前被擋下，已改用 exit receipt 與最後精確 pytest 統計行。失敗紀錄均保留。
+只實際重載新聞一次；[正式 owner／資料與公開進度](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_prefix_20261026/completion.json)
+已核對，原正文 SHA、診斷扣額、來源政策與交易服務未變。此階段沒有全鏈速度或最高 RPS 的新宣告；鉅亨優先，CNA 延後。
+
 ## 10/25 00:15 接續：完成項目不重排，診斷共用一次解析
 
 先核對 CMoneyLearning 28 篇、報新聞 15 篇與原 432 筆結案；上述 43 篇正文與檔案 SHA、

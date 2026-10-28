@@ -217,8 +217,10 @@ def prefetch_source(source: str) -> str:
     body = body.replace('        path = Path(str(row["output_path"]))\n',
                         "        row, path = opened.row, opened.path\n", 1)
     read_start = body.index("            # Opening the Parquet metadata")
-    read_stop = body.index("            if before is not None:\n", read_start)
+    read_stop = body.index("            if collect_proof:\n",
+                           body.index('            parquet_file = footer_opener(str(path))', read_start))
     body = body[:read_start] + (
+        '            collect_proof = view_proofs is not None and row["endpoint"] == SCHEMA_GROUPED_ENDPOINT\n'
         "            footer_open_attempts += int(opened.attempted)\n"
         "            if opened.error is not None:\n"
         "                raise opened.error\n"

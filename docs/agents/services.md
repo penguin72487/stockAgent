@@ -170,6 +170,25 @@ Use the section for the service being changed. Operational acceptance requires f
   reloads retain the configured release, including an engine-only reload's
   comparison against its unchanged Discord owner. Actual pinned-source drift
   still fails closed. See [the recurrence repair](../tw_opening_latency_stages_2026-10-14.md#loadedimplementationchanged-根因與目錄級版本隔離2026-10-20).
+- To prepare an isolated performance change from that compatible production
+  base, use `scripts/freeze_discord_code_release.py --base-release <receipt>`
+  with explicit `--include-source` members. If a selected module also contains
+  unrelated workspace edits, reconstruct reviewed copies below private
+  `artifacts/operations` and pass their directory as `--include-root`; reject
+  redirected roots/members and retain the exact source hashes. Unselected
+  members still come from the verified base. Preparation neither adopts code
+  nor restarts an owner; test the exact derived namespace and use the same
+  qualified reload and native acceptance gates afterward.
+- The same source-release owner supports an independent engine pin through
+  `--engine-only --engine-source-release <receipt>`. It retains off-session,
+  flat/pending-order, source-read and exact ACK gates; it does not adopt or
+  restart the unchanged Discord owner. Verify the engine's unique Python child
+  and exact service cgroup, not its shell supervisor. Before opening the ledger,
+  pinned engine startup verifies the full source manifest and actual read-only
+  namespace. Adoption preserves all six journal byte prefixes and accounting;
+  an engine pin is neither a strategy switch nor immutable-journal enrollment.
+  Use the engine-specific verified drop-in for replacement/rollback; never
+  copy the Discord drop-in or silently reload a pinned engine from the workspace.
 - Healthy FinMind opening retries have a bounded wake clock inside the shared
   fan-in, not behind slow MIS/broker completion or the scheduler's next pass.
   Keep shared snapshot single-flight, request-start cadence, accepted facts,

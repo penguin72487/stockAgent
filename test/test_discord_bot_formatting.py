@@ -583,11 +583,12 @@ def test_preopen_prepare_key_catches_up_missing_day_trade_readiness(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
         lambda cfg, session_date: False,
     )
+    monkeypatch.setattr("services.discord_bot.bot.live_panel_cache_epoch", lambda: 7)
     assert _preopen_prepare_key(configured, now.replace(minute=44)) == (
         "2026-07-06:tw_day_trade:preopen"
     )
     assert _preopen_prepare_key(configured, now.replace(minute=45)) == (
-        "2026-07-06:tw_day_trade:preopen-final-arm"
+        "2026-07-06:tw_day_trade:epoch-7:preopen-final-arm"
     )
     monkeypatch.setattr(
         "services.discord_bot.bot._preopen_market_final_armed_for_session",
@@ -663,6 +664,8 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
     ready_cfg = SimpleNamespace(market="tw_day_trade")
     assert _preopen_market_ready_for_session(ready_cfg, today) is True
     armed_cfg = SimpleNamespace(market="tw_day_trade", timezone="Asia/Taipei")
+    from services.discord_bot import bot as discord_bot
+
     _write_preopen_final_arm(
         armed_cfg,
         status="ready",
@@ -673,7 +676,9 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
                 "panel_cache_hit": True,
                 "checkpoint_cache_hit": True,
                 "model_cache_hit": True,
+                "alignment_cache_hit": True,
             },
+            "panel_cache_epoch": discord_bot.live_panel_cache_epoch(),
             "opening_source_prewarm": {
                 "ready": True,
                 "run_id": _BOT_RUN_ID,
@@ -695,6 +700,69 @@ def test_preopen_readiness_preserves_same_day_ready_rows_across_restart(
         "tw_day_trade"
     ]
     assert preserved["final_arm"]["status"] == "ready"
+
+
+def test_final_arm_invalidated_by_global_panel_clear_and_rearmed(monkeypatch, tmp_path):
+    from services.discord_bot import bot as discord_bot
+
+    path = tmp_path / "preopen.json"
+    monkeypatch.setenv("STOCKAGENT_PREOPEN_READINESS_PATH", str(path))
+    epoch = [11]
+    monkeypatch.setattr(discord_bot, "live_panel_cache_epoch", lambda: epoch[0])
+    monkeypatch.setattr(discord_bot, "_preopen_market_ready_for_session", lambda *_: True)
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *_: (True, "fixture"))
+    monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *_: "retry")
+    cfg = SimpleNamespace(market="tw_day_trade", timezone="Asia/Taipei",
+        preopen_prepare_time="08:30", open_time="09:00", schedule_interval_minutes=None,
+        day_trade_simulation_enabled=True, holidays=())
+    now = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=8, minute=55, second=0)
+    today = now.date().isoformat()
+    summary = {"panel_cache_epoch": 11, "live_latency": {
+        "panel_cache_hit": True, "checkpoint_cache_hit": True,
+        "model_cache_hit": True, "alignment_cache_hit": True},
+        "opening_source_prewarm": {"ready": True, "run_id": _BOT_RUN_ID,
+                                   "source": "twse_tpex:mis"}}
+    _write_preopen_final_arm(cfg, status="ready", started_at=now.isoformat(),
+                             elapsed_seconds=.2, summary=summary)
+    assert _preopen_market_final_armed_for_session(cfg, today)
+    assert _preopen_prepare_key(cfg, now) is None
+    epoch[0] = 12
+    assert not _preopen_market_final_armed_for_session(cfg, today)
+    key = _preopen_prepare_key(cfg, now)
+    assert key == f"{today}:tw_day_trade:epoch-12:preopen-final-arm"
+    assert key != f"{today}:tw_day_trade:epoch-11:preopen-final-arm"
+    summary["panel_cache_epoch"] = 12
+    _write_preopen_final_arm(cfg, status="ready", started_at=now.isoformat(),
+                             elapsed_seconds=.2, summary=summary)
+    assert _preopen_market_final_armed_for_session(cfg, today)
+    summary["live_latency"]["alignment_cache_hit"] = False
+    _write_preopen_final_arm(cfg, status="ready", started_at=now.isoformat(),
+                             elapsed_seconds=.2, summary=summary)
+    assert not _preopen_market_final_armed_for_session(cfg, today)
+
+
+def test_final_arm_rejects_invalidation_during_inference(monkeypatch, tmp_path):
+    from services.discord_bot import bot as discord_bot
+
+    cfg = SimpleNamespace(market="tw_day_trade", timezone="Asia/Taipei",
+                          config_path="unused", overnight_simulation_enabled=False)
+    monkeypatch.setattr(discord_bot, "_preopen_market_ready_for_session", lambda *_: True)
+    monkeypatch.setattr(discord_bot, "load_config", lambda *_: SimpleNamespace(
+        data=SimpleNamespace(parquet_root=tmp_path)))
+    monkeypatch.setattr(discord_bot, "_warm_tw_opening_sources", lambda **_: {})
+    monkeypatch.setattr(discord_bot, "_sync_latest_live_weights_to_market_artifact", lambda *_: None)
+    monkeypatch.setattr(discord_bot, "_signal_kwargs", lambda **_: {})
+    epochs = iter([11, 12])
+    monkeypatch.setattr(discord_bot, "live_panel_cache_epoch", lambda: next(epochs))
+    monkeypatch.setattr(discord_bot, "generate_live_signal", lambda **_: SimpleNamespace(
+        summary={"live_latency": {key: True for key in ("panel_cache_hit",
+            "checkpoint_cache_hit", "model_cache_hit", "alignment_cache_hit")}}))
+    written = []
+    monkeypatch.setattr(discord_bot, "_write_preopen_final_arm",
+                        lambda *_, **kwargs: written.append(kwargs))
+    with pytest.raises(RuntimeError, match="invalidated during cache proof"):
+        discord_bot._final_arm_market_signal_sync(cfg)
+    assert written[-1]["status"] == "failed"
 
 
 def test_day_trade_schedule_catches_up_after_service_restart(

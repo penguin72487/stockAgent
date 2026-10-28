@@ -213,7 +213,10 @@ def test_source_publishes_initial_plan_once_without_promoting_delivery_to_execut
     assert status["state"] == "awaiting_receiver_hook" and status["accepted_count"] == 0
 
 
-def test_source_queues_only_actual_acked_control_state_then_deduplicates_code_changes(stream, auxiliary, tmp_path):
+@pytest.mark.parametrize("changed_binding", [None, "nas_snapshot_id", "envelope_identity_sha256",
+    "envelope_file_sha256", "complete_files", "complete_bytes"])
+def test_source_queues_only_actual_acked_control_state_then_deduplicates_code_changes(
+        stream, auxiliary, tmp_path, monkeypatch, changed_binding):
     queue, *_ = stream
     repo, receipt, _ = auxiliary
     delivery = tmp_path / "closed-control"
@@ -238,6 +241,126 @@ def test_source_queues_only_actual_acked_control_state_then_deduplicates_code_ch
     plan = json.loads(next((queue.transport / "tools/recovery-requests").glob("plan-*.json")).read_bytes())
     assert plan["jobs"][0]["nas_snapshot_id"] == record["acceptance"]["snapshot_id"]
     assert plan["jobs"][0]["table_count"] == plan["jobs"][0]["row_count"] == 0
+    if changed_binding:
+        original_plan = queue.transport / "tools/recovery-requests" / ("plan-" + plan["identity_sha256"] + ".json")
+        job = plan["jobs"][0]
+        job[changed_binding] = (job[changed_binding] + 1 if type(job[changed_binding]) is int else
+                                ("c" * 64 if job[changed_binding] != "c" * 64 else "d" * 64))
+        plan = signed({k: v for k, v in plan.items() if k != "identity_sha256"})
+        original_plan.unlink()
+        atomic_public(original_plan.with_name("plan-" + plan["identity_sha256"] + ".json"), plan)
+
+    reads = []
+
+    def payload_read(path):
+        reads.append(path)
+        raise module.SnapshotError("full local validation reached")
+
+    monkeypatch.setattr(module, "verified_control", payload_read)
+    monkeypatch.setattr(module, "verify_dispatch_delivery", lambda *_: pytest.fail("no new envelope to derive"))
+    result = module.publish_requests(queue.config, queue.transport, ledger)
+    assert result["published_requests"] == 0 and result["total_requests"] == 1
+    assert len(reads) == bool(changed_binding)
+    assert len(result["errors"]) == bool(changed_binding)
+    if not changed_binding:
+        # The no-op proof cannot bypass a fresh ACK validation.
+        record["acceptance"]["complete_files"] += 1
+        assert len(module.publish_requests(queue.config, queue.transport, ledger)["errors"]) == 1
+        assert not reads
+
+
+@pytest.mark.parametrize("invalidate", [None, "signature", "dispatch", "ack", "request", "missing_plan", "legacy"])
+def test_code_only_request_proof_survives_reload_and_rejects_changed_bindings(
+        stream, auxiliary, tmp_path, monkeypatch, invalidate):
+    queue = stream[0]
+    repo, receipt, _ = auxiliary
+    queue.config["automatic_recovery"] = {"enabled": True, "minimum_free_bytes": 1024, "maximum_restore_bytes": 1024**2}
+    ledger = queue.load_ledger()
+    for version in range(2):
+        (repo / "README.md").write_text(f"public code revision {version}\n")
+        delivery = tmp_path / f"control-{version}"
+        exported = export_auxiliary(repo, delivery, control_receipt=receipt)
+        verified = verify(delivery, exported["envelope_identity_sha256"])
+        raw = (delivery / "backup-envelope.json").read_bytes()
+        key = exported["envelope_identity_sha256"]
+        batch = "batch-" + key
+        delivery.rename(queue.transport / batch)
+        dispatch = signed({"contract": DISPATCH, **{k: queue.config[k] for k in module.IDENTITIES},
+            "envelope_identity_sha256": key, "envelope_file_sha256": hashlib.sha256(raw).hexdigest(),
+            "batch_relative": batch, "complete_files": verified["files_verified"] + 2,
+            "complete_bytes": verified["bytes_verified"] + len(raw) + (queue.transport / batch / "READY").stat().st_size,
+            "delivery_kind": "code_and_control_backup"})
+        record = {"dispatch": dispatch}
+        record["acceptance"] = acknowledge(queue, record)
+        ledger["deliveries"][key] = record
+        assert module.publish_requests(queue.config, queue.transport, ledger)["published_requests"] == (version == 0)
+    proof = record["control_recovery_request_proof"]
+    assert proof["contract"] == module.CONTROL_REQUEST_PROOF
+    # Persist through the existing source owner rather than a parallel cache.
+    ledger["deliveries"] = {key: record}
+    module.private_json(queue.ledger_path, ledger)
+    restored = queue.load_ledger()
+    assert restored == ledger
+    record = restored["deliveries"][key]
+    if invalidate is None:
+        from stockagent.data_sync import backup_stream as stream_module
+
+        # Exercise the separate source-owner entrypoint as well as the full
+        # cycle: its unlocked scan reload must retain a newly derived proof.
+        record.pop("control_recovery_request_proof")
+        module.private_json(queue.ledger_path, restored)
+        writes = []
+        original_write = stream_module.private_json
+
+        def record_write(path, value, **kwargs):
+            if path == queue.ledger_path:
+                writes.append(deepcopy(value))
+            return original_write(path, value, **kwargs)
+
+        def scan(current):
+            durable = queue.load_ledger()
+            assert durable["deliveries"][key]["control_recovery_request_proof"] == proof
+            durable["concurrent_owner_evidence"] = "committed_while_network_scan_waited"
+            original_write(queue.ledger_path, durable)
+
+        monkeypatch.setattr(stream_module, "private_json", record_write)
+        monkeypatch.setattr(queue, "ingest", lambda _: [])
+        monkeypatch.setattr(queue, "scan_transport", scan)
+        monkeypatch.setattr(module, "queue_status", lambda *_: {})
+        result = queue.publish_recovery_requests()
+        assert result["published_requests"] == 0 and not result["errors"]
+        assert len(writes) == 2  # existing ingest checkpoint plus the new proof
+        restored = queue.load_ledger()
+        assert restored["concurrent_owner_evidence"] == "committed_while_network_scan_waited"
+        writes.clear()
+        assert not queue.publish_recovery_requests()["errors"]
+        assert len(writes) == 1  # unchanged proofs add no extra checkpoint
+        restored = queue.load_ledger()
+        record = restored["deliveries"][key]
+    if invalidate == "missing_plan":
+        (queue.transport / "tools/recovery-requests" / ("plan-" + proof["request_identity_sha256"] + ".json")).unlink()
+    elif invalidate == "legacy":
+        record.pop("control_recovery_request_proof")
+    elif invalidate:
+        proof = record["control_recovery_request_proof"]
+        field = {"signature": "identity_sha256", "dispatch": "dispatch_identity_sha256", "ack": "acceptance_identity_sha256",
+                 "request": "request_identity_sha256"}[invalidate]
+        proof[field] = "0" * 64
+        if invalidate != "signature":
+            record["control_recovery_request_proof"] = signed({k: v for k, v in proof.items() if k != "identity_sha256"})
+    before = deepcopy(restored)
+    reads = []
+
+    def read_payload(path):
+        reads.append(path)
+        raise module.SnapshotError("fresh full validation required")
+
+    monkeypatch.setattr(module, "verified_control", read_payload)
+    monkeypatch.setattr(module, "verify_dispatch_delivery", lambda *_: pytest.fail("request cannot bypass semantic validation"))
+    result = module.publish_requests(queue.config, queue.transport, restored)
+    assert result["published_requests"] == 0
+    assert len(reads) == bool(invalidate) and len(result["errors"]) == bool(invalidate)
+    assert restored == before
 
 
 def test_windows_capacity_uses_encoded_fixed_registry_query(queue_configuration, monkeypatch):

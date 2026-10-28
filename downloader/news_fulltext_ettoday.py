@@ -23,12 +23,24 @@ ETTODAY_BODY_SELECTOR = ':scope > .story[itemprop="articleBody"]'
 ETTODAY_PATH_PATTERN = r'^(?:/news/[1-9][0-9]*|/news/[0-9]{8}/[1-9][0-9]*[.]htm)$'
 ETTODAY_HOSTS = ('finance.ettoday.net', 'www.ettoday.net')
 ETTODAY_BOUNDARY_QUESTION = 'ettoday_current_native_editor_identity_credit_relations_v1'
+ETTODAY_SCHEMA_RELATIONSHIP_QUESTION = 'ettoday_current_schema_author_publisher_predicates_v1'
+ETTODAY_CREDIT_DECLARATION_QUESTION = 'ettoday_current_finance_public_credit_declarations_v1'
+ETTODAY_PRELUDE_EXCERPT_QUESTION = 'ettoday_current_finance_unclassified_short_prelude_excerpt_v1'
+ETTODAY_ATTRIBUTION_PREDICATES_QUESTION = 'ettoday_current_finance_author_creator_and_refusal_predicates_v1'
+# Exact parser-only transition for the retained finance caption witness.
+# Authorization and learned HTTP/refusal identity remain the original scope.
+ETTODAY_V41_HTTP_BINDING = (
+    '41e43aae4f31e01a5fc82e39f8b5592fa042a8f6dcdade1ada5d59db008d05f5',
+    '3c290654ce3ee23518918aca04132df75592fae9427413f2bd3065293c06bd59',
+    '353ca50e95fcaa910bc448846813ab51879968cef1d13e109517ff6c75167c47',
+    'a1442aca436c0f7c4e9a55732b11d4816f6e502709ca0b1c778b5011a2d31969', '')
 
 
-def ettoday_resident_source(source):
+def ettoday_resident_source(source, *, layout='ettoday_visible_article_v39'):
     """Exact reviewed current source; a question grants no new capture scope."""
     return bool(source.provider == 'ettoday' and source.allowed and source.request_enabled
-        and source.embedded_article_layout == 'ettoday_visible_article_v39'
+        and layout in {'ettoday_visible_article_v39', 'ettoday_visible_article_v40', 'ettoday_visible_article_v41'}
+        and source.embedded_article_layout == layout
         and source.known_url_only and source.acquisition_mode == 'continuous'
         and source.domains == ('ettoday.net',) and source.html_parser == 'lxml'
         and source.authorization.get('kind') == 'personal_research'
@@ -140,6 +152,10 @@ _REPORTER = re.compile(r'記者([\u3400-\u9fff]{2,8}(?:、[\u3400-\u9fff]{2,8}){
 _BARE_REPORTER = re.compile(r'([\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')
 _BARE_REPORTER_PAIR = re.compile(r'([\u3400-\u9fff]{2,8}、[\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')
 _SEARCH_TEAM_NAMED_AUTHOR = re.compile(r'網搜小組／([\u3400-\u9fff]{2,8})報導')
+# Literal native prefix witnessed on finance 3219089. Never autocorrect it to
+# 記者 or use a fuzzy role match; a separate same-article creator must bind the
+# visible name. The exact printed signature survives in the capture notices.
+_FINANCE_LITERAL_ROLE_SIGNATURE = re.compile(r'記埋([\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')
 _HOUSE_ROLE_REPORTERS = (
     ('實習記者', re.compile(r'實習記者([\u3400-\u9fff]{2,8})／[\u3400-\u9fff]{1,12}報導')),
     ('網搜小組', _SEARCH_TEAM_NAMED_AUTHOR),
@@ -424,7 +440,8 @@ def _native_json(text, *, allow_literal_value_controls=False, allow_author_url_c
 
 def _schemas(soup, original, title, published, modified, names, *, adapter_contract_version=1,
              require_headline_witness=False, social_headline_key=None, native_bare_reporters=(),
-             native_newsroom=False, native_named_authors=()):
+             native_newsroom=False, native_named_authors=(), relationship_facts=None,
+             preserve_person_disagreement=False):
     declarations = []
     notices = []
     scripts = soup.select('script[type="application/ld+json"]')
@@ -499,9 +516,38 @@ def _schemas(soup, original, title, published, modified, names, *, adapter_contr
             and len(set(names)) == len(names) and all(isinstance(name, str) and name in names for name in subset_names)
             and len(set(subset_names)) == len(subset_names)
             and [names.index(name) for name in subset_names] == sorted(names.index(name) for name in subset_names))
-        if (not (organization or reporters or last_of_two or ordered_subset) or not isinstance(publisher, dict) or publisher.get('@type') != 'Organization'
+        person_disagreement = (preserve_person_disagreement and len(declarations) == 1
+            and not native_newsroom and not native_named_authors and not native_bare_reporters
+            and len(names) == len(authors) == 1 and isinstance(authors[0], dict)
+            and authors[0].get('@type') == 'Person' and isinstance(authors[0].get('name'), str)
+            and 0 < len(authors[0]['name']) <= 128 and authors[0]['name'].strip() == authors[0]['name']
+            and names[0] != authors[0]['name'])
+        if relationship_facts is not None:
+            # Opt-in same-parse diagnosis of the combined refusal below. Only
+            # fixed predicates/counts leave this function, never literal names,
+            # schema values, prose or a newly granted original/body permit.
+            # Normal capture does not allocate this witness or parse again.
+            relationship_facts.update(
+                identity_and_source_clocks_verified=True,
+                visible_reporter_count=len(names),
+                schema_author_count=len(authors),
+                schema_authors_all_person=all(isinstance(a, dict) and a.get('@type') == 'Person' for a in authors),
+                schema_author_is_exact_publisher=organization,
+                schema_authors_match_all_visible_reporters=reporters,
+                schema_author_matches_last_of_two=last_of_two,
+                schema_authors_match_ordered_subset=ordered_subset,
+                publisher_is_object=isinstance(publisher, dict),
+                publisher_is_organization=isinstance(publisher, dict) and publisher.get('@type') == 'Organization',
+                publisher_name_matches=isinstance(publisher, dict) and _key(publisher.get('name')) == 'ETtoday新聞雲',
+            )
+        if (not (organization or reporters or last_of_two or ordered_subset or person_disagreement) or not isinstance(publisher, dict) or publisher.get('@type') != 'Organization'
                 or _key(publisher.get('name')) != 'ETtoday新聞雲'):
             raise NewsError('article_rights_or_scope_excluded')
+        if person_disagreement:
+            notices.append({'kind': 'native_reporter_and_schema_person_disagree',
+                'visible_reporters': list(names), 'schema_declared_person_authors': deepcopy(authors),
+                'reporter_values_taken_from': 'whole_visible_reporter_signature',
+                'same_person_or_editor_role_inferred': False, 'source_values_rewritten': False})
         if organization:
             notices.append({'kind': 'schema_organization_author_not_reporter', 'text': 'ETtoday新聞雲'})
         elif last_of_two:
@@ -1336,6 +1382,55 @@ def _finance_third_party_prelude(body, *, reviewed_external_credits=False, revie
     return True
 
 
+def _native_inline_reporter_prefix(paragraph):
+    """Separate a witnessed image/BR/strong reporter prefix from real prose.
+
+    Validate the entire prefix before editing the working copy. Only source
+    nodes up to the byline's direct closing BR are removed; following prose,
+    markup, numbers and paragraph attributes are never sliced or rewritten.
+    A caption, image alt, arbitrary first line or schema account is no byline.
+    """
+    nodes = []
+    for node in paragraph.contents:
+        if type(node) is NavigableString and not str(node).strip():
+            continue
+        nodes.append(node)
+        if len(nodes) > 128:
+            return None
+        if type(node) is Tag and node.name == 'strong':
+            break
+    if (len(nodes) < 3 or type(nodes[0]) is not Tag or nodes[0].name != 'img'
+            or any(type(n) is not Tag or n.name != 'br' or n.attrs or n.contents for n in nodes[1:-1])
+            or type(nodes[-1]) is not Tag or nodes[-1].name != 'strong'):
+        return None
+    byline = nodes[-1]
+    if any(type(n) is not NavigableString for n in byline.contents):
+        return None
+    credit = byline.get_text().strip()
+    match = _REPORTER.fullmatch(credit)
+    if match is None:
+        return None
+    names = match[1].split('、')
+    if len(names) != len(set(names)):
+        raise _attribution_failure('duplicate_reporters')
+    separator = byline.next_sibling
+    while type(separator) is NavigableString and not str(separator).strip():
+        separator = separator.next_sibling
+    if (type(separator) is not Tag or separator.name != 'br' or separator.attrs or separator.contents
+            or not any(n.get_text(' ', strip=True) if type(n) is Tag else type(n) is NavigableString and str(n).strip()
+                for n in separator.next_siblings)):
+        return None
+    _visible_text(paragraph)
+    _visible(nodes[0])
+    # Extraction cannot skip a sentence: this prefix contains only an image,
+    # empty separators and the whole literal reporter signature validated above.
+    for node in list(paragraph.contents):
+        node.extract()
+        if node is separator:
+            break
+    return names, credit
+
+
 def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur=False,
                    allow_static_threads=False, allow_caption_credit_only=False,
                    allow_multiple_threads=False, allow_split_reporter=False,
@@ -1346,7 +1441,9 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
                    allow_house_native_report_signature=False, allow_house_native_credit_layouts=False,
                    allow_house_native_prefixes=False, allow_house_static_player=False,
                    allow_house_reviewed_desks=False, allow_house_pure_desk_dispatch=False,
-                   allow_native_bare_report_signature=False, allow_native_search_team_author=False):
+                   allow_native_bare_report_signature=False, allow_native_search_team_author=False,
+                   allow_native_inline_reporter_prefix=False, allow_finance_caption_prelude=False,
+                   allow_finance_literal_role=False):
     """Whole observed story, minus verified UI, credits and image captions.
 
     Caption/attribution are retained separately. Do not use image alt text,
@@ -1355,6 +1452,11 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
     cleaned = deepcopy(body)
     captions, credit, names, credit_notices = [], None, [], []
     paragraphs = cleaned.find_all('p', recursive=False)
+    literal_role_geometry = (allow_finance_literal_role and len(paragraphs) >= 4
+        and not paragraphs[0].get_text(' ', strip=True) and len(paragraphs[0].find_all('img')) == 1
+        and all(n.name in {'img', 'br'} for n in paragraphs[0].find_all())
+        and paragraphs[1].get_text(' ', strip=True).startswith('▲')
+        and len(paragraphs[1].get_text(' ', strip=True)) <= 300)
     newsroom = None
     newsroom_credits = _HOUSE_NEWSROOM_CREDITS_V32 if allow_house_reviewed_desks else _HOUSE_NEWSROOM_CREDITS
     if allow_house_native_credit_layouts and any(p.get_text(' ', strip=True) in _HOUSE_ADVERTORIAL_MARKERS
@@ -1369,12 +1471,13 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
         caption, notice = player
         captions.append(caption)
         credit_notices.append(notice)
-    if allow_house_native_credit_layouts and paragraphs:
+    if (allow_house_native_credit_layouts or allow_finance_caption_prelude) and paragraphs:
         caption_only = _house_image_caption_only(paragraphs[0])
         if caption_only is not None:
             captions.append(caption_only)
             paragraphs[0].clear()
-            credit_notices.append({'kind': 'native_house_image_caption_only_before_separate_reporter',
+            credit_notices.append({'kind': ('native_finance_image_caption_only_before_separate_reporter'
+                if allow_finance_caption_prelude else 'native_house_image_caption_only_before_separate_reporter'),
                 'native_caption': caption_only, 'reporter_is_following_plain_native_paragraph': True,
                 'caption_or_image_metadata_promoted_to_reporter': False, 'source_values_rewritten': False})
     mixed_prefix = (_house_image_caption_prose_credit(paragraphs[0], credit_notices,
@@ -1409,6 +1512,15 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
             credit_notices.append({'kind': 'native_house_caption_trailing_break_reporter_separator',
                 'separator_inside_caption_strong': True, 'plain_standalone_named_reporter_after_caption': True,
                 'source_values_rewritten': False})
+    if allow_native_inline_reporter_prefix and credit is None and paragraphs:
+        inline = _native_inline_reporter_prefix(paragraphs[0])
+        if inline is not None:
+            names, credit = inline
+            image_reporter = True
+            credit_notices.append({'kind': 'native_image_break_strong_reporter_and_prose_same_paragraph',
+                'native_credit': credit, 'following_native_prose_nodes_preserved': True,
+                'image_preserved_in_shared_original': True, 'image_alt_promoted_to_reporter': False,
+                'source_values_rewritten': False})
     for index, node in enumerate(paragraphs):
         text = node.get_text(' ', strip=True)
         if (allow_house_native_report_signature and (credit is None or index <= 5)
@@ -1441,6 +1553,17 @@ def _original_body(body, *, allow_caption_break_credit=False, allow_static_imgur
                     'same_article_exact_person_schema_required': True,
                     'publisher_or_creator_promoted_to_person': False,
                     'employment_or_reporter_title_inferred': False, 'source_values_rewritten': False})
+        if match is None and literal_role_geometry and index == 2:
+            match = _FINANCE_LITERAL_ROLE_SIGNATURE.fullmatch(text)
+            if match is not None:
+                leaves = [c for c in node.contents if not isinstance(c, NavigableString) or str(c).strip()]
+                if len(leaves) != 1 or type(leaves[0]) is not NavigableString:
+                    raise _attribution_failure('unrecognized_precredit_paragraph')
+                credit_notices.append({'kind': 'native_finance_literal_role_with_creator_witness',
+                    'native_credit': text, 'native_role': '記埋', 'native_reporter_names': [match[1]],
+                    'same_article_creator_name_and_identifier_required': True,
+                    'reporter_title_or_employment_inferred': False,
+                    'prefix_corrected_or_source_values_rewritten': False})
         if match is None and allow_bare_reporter:
             pair = _BARE_REPORTER_PAIR.fullmatch(text) if allow_house_native_prefixes else None
             pair_names = pair[1].split('、') if pair else []
@@ -1646,21 +1769,30 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
         allow_house_reviewed_desks=house and adapter_contract_version >= 32,
         allow_house_pure_desk_dispatch=house and adapter_contract_version >= 33,
         allow_native_bare_report_signature=adapter_contract_version >= 37 and not house,
-        allow_native_search_team_author=adapter_contract_version >= 39 and host == ETTODAY_HOSTS[1])
+        allow_native_search_team_author=adapter_contract_version >= 39 and host == ETTODAY_HOSTS[1],
+        allow_native_inline_reporter_prefix=adapter_contract_version >= 40 and host == ETTODAY_HOSTS[1],
+        allow_finance_caption_prelude=adapter_contract_version >= 41 and host == ETTODAY_HOSTS[0],
+        allow_finance_literal_role=adapter_contract_version >= 42 and host == ETTODAY_HOSTS[0])
     newsroom = next((n['native_newsroom'] for n in embed_notices
         if n['kind'] == 'native_publisher_newsroom_signature'), None)
     named_authors = next((tuple(n['native_names']) for n in embed_notices
         if n['kind'] == 'native_search_team_named_author_with_person_schema_witness'), ())
     published, modified, notices = _clocks(soup, scope, host, adapter_contract_version=adapter_contract_version)
     notices += _schemas(soup, original, title, published, modified, names,
-        adapter_contract_version=adapter_contract_version, require_headline_witness=social_variant or native_channel_labels_distinct or house,
+        adapter_contract_version=adapter_contract_version, require_headline_witness=social_variant or native_channel_labels_distinct or house
+            or any(n['kind'] in {'native_image_break_strong_reporter_and_prose_same_paragraph',
+                'native_finance_image_caption_only_before_separate_reporter',
+                'native_finance_literal_role_with_creator_witness'} for n in embed_notices),
         social_headline_key=_key(social_title)[:-len(_key(suffix))] if social_variant else None,
         native_bare_reporters=next((tuple(n['native_reporter_names']) for n in embed_notices
             if n['kind'] in {'native_reporter_prefix_omitted_with_role_and_creator_witness',
                 'native_report_signature_with_matching_creator_witness',
                 'native_house_role_named_reporter_with_creator_witness',
+                'native_finance_literal_role_with_creator_witness',
                 'native_bare_reporter_pair_with_first_photo_and_creator_witness'}), ()),
-        native_newsroom=newsroom is not None, native_named_authors=named_authors)
+        native_newsroom=newsroom is not None, native_named_authors=named_authors,
+        preserve_person_disagreement=adapter_contract_version >= 40 and host == ETTODAY_HOSTS[1]
+            and any(n['kind'] == 'native_image_break_strong_reporter_and_prose_same_paragraph' for n in embed_notices))
     notices += embed_notices
     if native_channel_labels_distinct:
         notices.append({'kind': 'native_subsection_and_social_channel_labels_distinct',
@@ -1708,6 +1840,15 @@ def ettoday_visible_article(soup, *, page_url, adapter_contract_version=1, allow
             'native_role': '網搜小組', 'native_credit': credit,
             'basis': 'visible_current_story_named_signature_and_exact_person_schema',
             'employment_or_reporter_title_inferred': False} for name in names], ensure_ascii=False)
+    if any(n['kind'] == 'native_reporter_and_schema_person_disagree' for n in notices):
+        # This is a source-declared reporter, not a verified employment or
+        # schema-account identity. Keep both contradictory source declarations
+        # in notices rather than promote the schema Person to writer/editor.
+        article['author_attribution_detail_json'] = json.dumps([{
+            'name': name, 'role': 'reporter', 'native_credit': credit,
+            'basis': 'literal_visible_current_story_reporter_signature',
+            'schema_person_declaration_agrees': False, 'same_person_or_editor_role_inferred': False,
+            'employment_independently_verified': False} for name in names], ensure_ascii=False)
     if any(n['kind'] == 'native_empty_static_imgur_declaration' for n in embed_notices):
         article['body_completeness'] += '; native_empty_imgur_declarations_separate; external_media_not_requested_or_transcribed'
     if any(n['kind'] == 'native_static_threads_preview_ui_declaration' for n in embed_notices):
@@ -1871,6 +2012,173 @@ def ettoday_resident_boundary_metadata(soup, *, page_url, allow_house=False):
         body_or_author_text_exported=False, attribution_verified_by_diagnostic=False,
         whole_body_verified_by_diagnostic=False)
     return facts
+
+
+def _ettoday_finance_credit_context(response, source, requested_url):
+    """Share literal public document/clock checks, never article acceptance."""
+    from downloader.news_fulltext_policy import public_article_document
+
+    error = 'ettoday_credit_declaration_scope_not_verified'
+    if (not ettoday_resident_source(source, layout='ettoday_visible_article_v41')
+            or not ettoday_literal_diagnostic_url(requested_url)
+            or urlsplit(requested_url).netloc != ETTODAY_HOSTS[0]
+            or response.status != 200 or response.redirects or response.url != requested_url
+            or not isinstance(response.body, bytes) or not 0 < len(response.body) <= (2 << 20)
+            or response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+                not in {'text/html', 'application/xhtml+xml'}):
+        raise NewsError(error)
+    document = public_article_document(response.body, source, page_url=requested_url)
+    scope = _one(document, '.subject_article', error)
+    heading = _one(scope, ':scope > header > h1.title[itemprop=headline]', error)
+    body = _one(scope, ETTODAY_BODY_SELECTOR, error)
+    _visible_text(heading); _visible(body)
+    facts = ettoday_resident_boundary_metadata(document, page_url=requested_url)
+    relations = facts['schema_identity_relations']
+    if (facts['native_story_count'] != 1 or facts['native_heading_count'] != 1
+            or not facts['canonical_equals_literal_request'] or not facts['og_url_equals_literal_request']
+            or len(relations) != 1 or not all(relations[0].values())
+            or body.select('form,[data-paywall],.paywall,vip-content')):
+        raise NewsError(error)
+    published, modified, _ = _clocks(document, scope, ETTODAY_HOSTS[0], adapter_contract_version=41)
+    return document, body, published, modified, relations[0]
+
+
+def _ettoday_finance_credit_document(response, source, requested_url):
+    return _ettoday_finance_credit_context(response, source, requested_url)[1:]
+
+
+def ettoday_finance_attribution_predicates(response, source, requested_url):
+    """Bound current public attribution declarations and both parser outcomes.
+
+    This is not a body acquisition or an author decision. Retain only selected
+    short schema names/creator values, their relationships to the already
+    observed literal prelude, and code-local refusal sites. No URLs, arbitrary
+    schema properties, following prose, HTML or response headers are exported.
+    """
+    from downloader.news_fulltext_candidates import extraction_failure_location
+
+    document, body, published, modified, relation = _ettoday_finance_credit_context(response, source, requested_url)
+    _, declarations = _ettoday_validation_facts(document, page_url=requested_url,
+        adapter_contract_version=41, allow_house=False)
+    if len(declarations) != 1:
+        raise NewsError('article_identity_not_verified')
+    article = declarations[0]
+
+    def short(value, bound):
+        return value if isinstance(value, str) and 1 <= len(value) <= bound and not re.search(r'[\x00-\x1f\x7f]', value) else None
+
+    def named(value):
+        return {'type': value.get('@type') if isinstance(value, dict) and value.get('@type') in ('Person', 'Organization') else None,
+            'name': short(value.get('name'), 80) if isinstance(value, dict) else None}
+
+    creator = article.get('creator')
+    creator_values = (creator if isinstance(creator, list) and len(creator) <= 4
+        and all(short(value, 160) is not None for value in creator) else None)
+    author = article.get('author')
+    authors = author if isinstance(author, list) else [] if author is None else [author]
+    paragraphs = body.find_all('p', recursive=False, limit=4)
+    prelude = paragraphs[2].get_text(' ', strip=True) if len(paragraphs) >= 3 else ''
+    match = _FINANCE_LITERAL_ROLE_SIGNATURE.fullmatch(prelude)
+    name = match[1] if match is not None else None
+    creator_id_valid = (isinstance(creator, list) and len(creator) == 2
+        and isinstance(creator[1], str) and bool(re.fullmatch(r'[1-9][0-9]{0,9}', creator[1])))
+    outcomes = []
+    for version in (41, 42):
+        try:
+            ettoday_visible_article(deepcopy(document), page_url=requested_url, adapter_contract_version=version)
+            outcome = {'version': version, 'parse_succeeded': True, 'error_code': None,
+                'attribution_failure_stage': None, 'failure_sites': []}
+        except NewsError as error:
+            outcome = {'version': version, 'parse_succeeded': False, 'error_code': error.code,
+                'attribution_failure_stage': getattr(error, 'ettoday_attribution_failure_stage', None),
+                'failure_sites': extraction_failure_location(error)['sites']}
+        outcomes.append(outcome)
+    return {'contract_version': 1, 'question': ETTODAY_ATTRIBUTION_PREDICATES_QUESTION,
+        'published_at_raw': published, 'modified_at_raw': modified, 'native_identity_relations': relation,
+        'prelude_text_sha256': hashlib.sha256(prelude.encode()).hexdigest(),
+        'literal_role_name': name, 'creator_values': creator_values,
+        'creator_is_list': isinstance(creator, list),
+        'creator_count': len(creator) if isinstance(creator, list) else None,
+        'creator_values_withheld': creator is not None and creator_values is None,
+        'creator_identifier_valid': creator_id_valid,
+        'creator_matches_literal_role_name': bool(name is not None and creator_id_valid and creator[0] == creator[1] + '-' + name),
+        'native_authors': [named(value) for value in authors[:4]], 'authors_truncated': len(authors) > 4,
+        'author_is_exact_publisher_organization': author == {'@type':'Organization','name':'ETtoday新聞雲','url':'https://www.ettoday.net/'},
+        'author_person_matches_literal_role_name': bool(name is not None and len(authors) == 1
+            and isinstance(authors[0], dict) and authors[0].get('@type') == 'Person' and authors[0].get('name') == name),
+        'publisher_is_expected_organization': bool(isinstance(article.get('publisher'), dict)
+            and article['publisher'].get('@type') == 'Organization' and _key(article['publisher'].get('name')) == 'ETtoday新聞雲'),
+        'native_publisher': named(article.get('publisher')), 'parser_outcomes': outcomes,
+        'author_or_supplier_accepted': False, 'raw_response_retained': False,
+        'full_body_retained': False, 'source_values_rewritten': False}
+
+
+def ettoday_finance_credit_declarations(response, source, requested_url):
+    """Private short, visibly prefixed credits, never arbitrary prose or raw HTML."""
+    body, published, modified, relation = _ettoday_finance_credit_document(response, source, requested_url)
+    prefix = re.compile(r'^(?:圖(?:、文)?|圖文|文|撰文|作者|資料來源|新聞來源|採訪|整理)[／/：:]')
+    declarations = []
+    paragraphs = body.find_all('p', recursive=False, limit=9)
+    for index, node in enumerate(paragraphs[:8]):
+        text = node.get_text(' ', strip=True)
+        named_prefix = _CREDIT_PREFIX.match(text) and re.search(r'[／/：:]', text)
+        if (not 1 <= len(text) <= 160 or not (prefix.match(text) or named_prefix)
+                or re.search(r'[。！？；!?;\r\n]', text)):
+            continue
+        # Do not interpret image alt, link destinations, hidden/nested bylines,
+        # embedded media, or prose after a byline's BR as a header declaration.
+        if node.find_all() and (len(node.contents) != 1 or type(node.contents[0]) is not Tag
+                or node.contents[0].name not in {'strong', 'b'} or node.contents[0].find_all()):
+            continue
+        try:
+            _visible_text(node)
+        except NewsError:
+            continue
+        declarations.append({'paragraph_index': index, 'text': text,
+            'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+            'direct_child_tags': [n.name for n in node.find_all(recursive=False)],
+            'attribution_accepted': False})
+    return {'contract_version': 1, 'question': ETTODAY_CREDIT_DECLARATION_QUESTION,
+        'published_at_raw': published, 'modified_at_raw': modified,
+        'native_credit_declarations': declarations, 'paragraphs_examined': min(8, len(paragraphs)),
+        'paragraph_scan_truncated': len(paragraphs) > 8,
+        'native_identity_relations': relation, 'body_or_raw_response_retained': False,
+        'author_or_supplier_accepted': False, 'source_values_rewritten': False}
+
+
+def ettoday_finance_prelude_excerpt(response, source, requested_url):
+    """One private unclassified short paragraph, explicitly possibly prose.
+
+    This distinct question follows a closed, empty credit-declaration diagnosis.
+    It does not guess a byline from an opaque hash or call an unfamiliar line an
+    author. Keep only its literal visible text and finite tag shapes, never raw
+    HTML, attributes, link targets, embedded media or the following whole story.
+    """
+    body, published, modified, relation = _ettoday_finance_credit_document(response, source, requested_url)
+    error = 'ettoday_short_prelude_geometry_not_verified'
+    paragraphs = body.find_all('p', recursive=False, limit=4)
+    if len(paragraphs) != 4:
+        raise NewsError(error)
+    image, caption, prelude, following = paragraphs
+    text = prelude.get_text(' ', strip=True)
+    if (image.get_text(' ', strip=True) or len(image.find_all('img')) != 1
+            or any(n.name not in {'img', 'br'} for n in image.find_all())
+            or not caption.get_text(' ', strip=True).startswith('▲')
+            or len(caption.get_text(' ', strip=True)) > 300
+            or not 1 <= len(text) <= 160 or text.startswith('▲')
+            or any(n.name not in {'strong', 'b', 'span', 'em', 'br', 'a'} for n in prelude.find_all())
+            or len(prelude.find_all()) > 16 or not following.get_text(' ', strip=True)):
+        raise NewsError(error)
+    for node in (image, caption, prelude, following):
+        _visible_text(node)
+    return {'contract_version': 1, 'question': ETTODAY_PRELUDE_EXCERPT_QUESTION,
+        'published_at_raw': published, 'modified_at_raw': modified,
+        'native_identity_relations': relation, 'paragraph_index': 2,
+        'text': text, 'text_characters': len(text), 'text_sha256': hashlib.sha256(text.encode()).hexdigest(),
+        'descendant_tags': [n.name for n in prelude.find_all()],
+        'possibly_prose': True, 'raw_response_retained': False, 'full_body_retained': False,
+        'attribution_accepted': False, 'author_or_supplier_accepted': False,
+        'source_values_rewritten': False}
 
 
 def ettoday_credit_anatomy(story):

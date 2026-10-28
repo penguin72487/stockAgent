@@ -133,7 +133,9 @@ def test_opt_in_hook_preserves_the_entire_legacy_financial_kernel():
     import ast, copy, hashlib, inspect
     from scripts.prepare_tw_futures_margin_training import _compile_accounting, _calculation_identity, _verify_valuation_research_extension
     tree = ast.parse(inspect.getsource(_compile_accounting)); function = tree.body[0]
-    function.args.kwonlyargs.pop(); function.args.kw_defaults.pop()
+    index = next(i for i, argument in enumerate(function.args.kwonlyargs)
+                 if argument.arg == 'valuation_research_policy')
+    function.args.kwonlyargs.pop(index); function.args.kw_defaults.pop(index)
     function.body = [node for node in function.body if not (
         isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
         and isinstance(node.test.left, ast.Name) and node.test.left.id == 'valuation_research_policy')]
@@ -143,12 +145,28 @@ def test_opt_in_hook_preserves_the_entire_legacy_financial_kernel():
     policy = dict(baseline_calculation=previous, baseline_accounting_function_source=baseline)
     proof = _verify_valuation_research_extension(policy['baseline_calculation'], _calculation_identity(), policy)
     assert proof['canonical_nonresearch_path_unchanged']
+    # The cache option remains part of the proved baseline. Removing it must
+    # not turn this scoped opt-in proof into general migration permission.
+    changed = ast.parse(baseline)
+    other = next(i for i, arg in enumerate(changed.body[0].args.kwonlyargs)
+                 if arg.arg == 'official_evidence_cache')
+    changed.body[0].args.kwonlyargs.pop(other)
+    changed.body[0].args.kw_defaults.pop(other)
+    altered = ast.unparse(changed) + '\n'
+    incompatible = copy.deepcopy(previous)
+    incompatible['functions']['_compile_accounting'] = hashlib.sha256(altered.encode()).hexdigest()
+    with pytest.raises(ValueError, match='retained financial calculation'):
+        _verify_valuation_research_extension(incompatible, _calculation_identity(),
+            dict(baseline_calculation=incompatible, baseline_accounting_function_source=altered))
 
 
 def test_research_valuation_changes_the_checkpoint_execution_fingerprint():
-    from stockagent.config import load_config
+    from types import SimpleNamespace
+    from stockagent.config import DataConfig, TradingConfig, TrainingConfig
     from stockagent.training.checkpoint_contract import _trading_checkpoint_contract
-    cfg=load_config('configs/experiment_baseline.yaml')
+    cfg=SimpleNamespace(data=DataConfig(parquet_root='unused',benchmark_name='unused'),
+        trading=TradingConfig(frequency='D',buy_fee_rate=.001,sell_fee_rate=.001,long_only=False),
+        training=TrainingConfig(non_blocking_transfer=False))
     cfg.trading.execution_mode='tw_stock_context_futures_portfolio'
     cfg.trading.tw_futures_portfolio_capital_basis='initial_margin'
     official=_trading_checkpoint_contract(cfg)
@@ -191,6 +209,84 @@ def test_research_terminal_conversion_requires_authorization_and_keeps_observati
         validate_research_valuation_rows(chosen)
 
 
+def test_composed_policy_does_not_transfer_terminal_authority_to_another_leaf():
+    from copy import deepcopy
+    from stockagent.data.tw_futures_valuation_research import (
+        TERMINAL_SCOPE_FIELD, validate_composed_terminal_scope, validate_valuation_research_policy)
+    _, _, _, _, first = case()
+    first['terminal_cash_conversion_authorized'] = True
+    second = deepcopy(first)
+    second['physical_instances'] = ['BBF:202603#g0']
+    second['terminal_cash_conversion_authorized'] = False
+    combined = deepcopy(first)
+    combined['physical_instances'] += second['physical_instances']
+    with pytest.raises(ValueError, match='terminal cash conversion authorization'):
+        validate_composed_terminal_scope(combined, [first, second])
+    combined[TERMINAL_SCOPE_FIELD] = first['physical_instances'][:]
+    validate_composed_terminal_scope(combined, [first, second])
+    combined[TERMINAL_SCOPE_FIELD].append(second['physical_instances'][0])
+    with pytest.raises(ValueError, match='terminal cash conversion authorization'):
+        validate_composed_terminal_scope(combined, [first, second])
+    combined[TERMINAL_SCOPE_FIELD].append('not-a-physical-instance')
+    with pytest.raises(ValueError, match='physical-instance subset'):
+        validate_valuation_research_policy(combined)
+
+
+def test_scoped_terminal_conversion_leaves_unauthorized_contract_blocked():
+    from stockagent.data.tw_futures_valuation_research import (
+        TERMINAL_SCOPE_FIELD, apply_research_terminal_cash_conversions,
+        validate_research_terminal_authorization)
+    physical, calendar, terms, specs, policy = case()
+    physical, _ = apply(physical, calendar, terms, specs, policy)
+    first = physical.tail(1).drop('physical_contract').rename({'physical_instance': 'physical_contract'})
+    second = first.with_columns(pl.lit('BBF:202603#g0').alias('physical_contract'))
+    frame = pl.concat([first, second]).with_columns(
+        pl.lit('zero_open_interest_delisting').alias('lifetime_status'), pl.lit(0.).alias('open_interest'))
+    rules = frame.select('date', 'physical_contract', *VALUATION_RESEARCH_COLUMNS).with_columns(
+        pl.lit(None, dtype=pl.Date).alias('carry_from_date'), pl.lit('').alias('carry_from_physical_contract'),
+        pl.lit('mark_only').alias('terminal_event'), pl.lit(220000.).alias('settlement_contract_value_twd'),
+        pl.lit(220000.).alias('terminal_contract_value_twd'), pl.lit(10.).alias('terminal_tax_twd'))
+    flags = frame.select('date', 'physical_contract').with_columns(pl.lit(True).alias('lost_inventory_continuation'))
+    policy['physical_instances'].append('BBF:202603#g0')
+    policy['terminal_cash_conversion_authorized'] = True
+    policy[TERMINAL_SCOPE_FIELD] = ['AAF:202603#g0']
+    updated, chosen, blockers, audit = apply_research_terminal_cash_conversions(frame, rules, flags, policy)
+    assert audit['physical_contract'].to_list() == ['AAF:202603#g0']
+    assert blockers['lost_inventory_continuation'].to_list() == [False, True]
+    assert chosen['terminal_event'].to_list() == ['research_cash_conversion', 'mark_only']
+    assert updated['valuation_price'].equals(frame['valuation_price'])
+    validate_research_terminal_authorization(chosen, policy)
+    forged = chosen.with_columns(pl.lit('research_cash_conversion').alias('terminal_event'))
+    with pytest.raises(ValueError, match='physical-instance authorization'):
+        validate_research_terminal_authorization(forged, policy)
+
+
+def test_synthetic_terminal_destination_requires_an_authorized_seed():
+    from stockagent.data.tw_futures_valuation_research import (
+        TERMINAL_SCOPE_FIELD, apply_research_terminal_cash_conversions)
+    physical, calendar, terms, specs, policy = case()
+    physical, _ = apply(physical, calendar, terms, specs, policy)
+    first = physical.tail(1).drop('physical_contract').rename({'physical_instance': 'physical_contract'})
+    first = first.with_columns(pl.lit(True).alias('valuation_research_terminal_assumption'),
+        pl.lit(True).alias('valuation_research_owner_extension'),
+        pl.lit('AAF:202603#g0').alias('valuation_research_seed_identity'))
+    second = first.with_columns(pl.lit('BB1:202603#g0').alias('physical_contract'),
+        pl.lit('BBF:202603#g0').alias('valuation_research_seed_identity'))
+    frame = pl.concat([first, second]).with_columns(
+        pl.lit('corporate_transfer_candidate').alias('lifetime_status'), pl.lit(0.).alias('open_interest'))
+    rules = frame.select('date', 'physical_contract', *VALUATION_RESEARCH_COLUMNS).with_columns(
+        pl.lit(None, dtype=pl.Date).alias('carry_from_date'), pl.lit('').alias('carry_from_physical_contract'),
+        pl.lit('mark_only').alias('terminal_event'), pl.lit(220000.).alias('settlement_contract_value_twd'),
+        pl.lit(220000.).alias('terminal_contract_value_twd'), pl.lit(10.).alias('terminal_tax_twd'))
+    flags = frame.select('date', 'physical_contract').with_columns(pl.lit(False).alias('lost_inventory_continuation'))
+    policy['physical_instances'].append('BBF:202603#g0')
+    policy['terminal_cash_conversion_authorized'] = True
+    policy[TERMINAL_SCOPE_FIELD] = ['AAF:202603#g0']
+    _, chosen, _, audit = apply_research_terminal_cash_conversions(frame, rules, flags, policy)
+    assert audit['physical_contract'].to_list() == ['AAF:202603#g0']
+    assert chosen['terminal_event'].to_list() == ['research_cash_conversion', 'mark_only']
+
+
 @pytest.mark.parametrize('with_official_final', [False, True])
 @pytest.mark.parametrize('closed_effective_day', [False, True])
 def test_unobserved_converted_month_uses_its_own_final_or_disclosed_research_cash_conversion(with_official_final, closed_effective_day):
@@ -227,6 +323,29 @@ def test_unobserved_converted_month_uses_its_own_final_or_disclosed_research_cas
     else:
         assert converted.height == 1 and converted['valuation_research_terminal_assumption'][0]
         assert not converted['cash_settlement'].any()
+
+
+def test_unobserved_owner_cannot_borrow_another_leafs_terminal_authorization():
+    from stockagent.data.tw_futures_valuation_research import TERMINAL_SCOPE_FIELD
+    physical, calendar, _, specs, policy = case()
+    physical = physical.filter(pl.col('date') <= date(2026, 1, 6))
+    cf = pl.DataFrame([dict(product='AA1', from_product='AAF', effective_date='2026-01-07',
+        contract_months=['202603'], source_content_sha256='b'*64)])
+    terms = pl.DataFrame([dict(product='AA1', contract='202603', effective_date='2026-01-07',
+        valid_until_exclusive=None, from_product='AAF', contract_multiplier=1600., deliverable_cash_twd=4000.,
+        fixed_subscription_rights_twd=0., subscription_rights_at_final_settlement=False,
+        known_at='2026-01-04T12:00:00+08:00', source_content_sha256s=['b'*64],
+        effective_at='2026-01-07T08:45:00+08:00', equity_cash_credit_twd=6000., has_equity_credit_fields=True,
+        carry_quantity_numerator=1, carry_quantity_denominator=1)], schema=CORPORATE_SCHEMA)
+    specs = pl.concat([specs, pl.DataFrame([specification('AA1')], schema=SPEC_FIELDS)])
+    policy['terminal_cash_conversion_authorized'] = True
+    policy[TERMINAL_SCOPE_FIELD] = []
+    policy['continuation_transfers'] = [dict(date='2026-01-06', product='AAF', contract='202603',
+        physical_contract='AAF:202603#g0', corporate_boundary='2026-01-07', corporate_transfer_target='AA1',
+        source_open_interest=0.)]
+    with pytest.raises(ValueError, match='authorized zero-OI research conversion'):
+        prepare_frozen_value_physical_history(physical, calendar, terms=terms, specifications=specs,
+            policy=policy, corporate_candidates=cf, final_settlements=None)
 
 
 @pytest.mark.parametrize('problem', [None, 'parent_hash', 'source', 'rule_bytes', 'policy_bytes'])

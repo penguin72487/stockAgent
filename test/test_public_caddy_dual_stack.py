@@ -4,17 +4,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_public_caddy_uses_one_address_independent_dual_stack_binding() -> None:
+def test_tunnel_caddy_uses_one_loopback_only_dual_stack_binding() -> None:
     config = (ROOT / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
-    assert "default_bind tcp4/0.0.0.0 tcp6/[::]" in config
+    assert "default_bind tcp4/127.0.0.1 tcp6/[::1]" in config
     assert config.count("default_bind ") == 1
     assert "\tbind " not in config
     assert "192.168.50.211" not in config
-    assert "http://penguin72487.ddnsgeek.com {" in config
-    assert "redir https://penguin72487.ddnsgeek.com{uri} permanent" in config
+    assert "http://penguin72487.dpdns.org {" in config
+    assert "http://www.penguin72487.dpdns.org {" in config
+    assert "redir https://penguin72487.dpdns.org{uri} 308" in config
+    assert "tcp4/0.0.0.0" not in config
+    assert "tcp6/[::]" not in config
 
 
-def test_wildcard_public_sockets_do_not_expose_private_control_or_backend() -> None:
+def test_tunnel_origin_does_not_expose_private_control_or_backend() -> None:
     config = (ROOT / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
     assert "admin 127.0.0.1:2019" in config
     assert "reverse_proxy 127.0.0.1:8770" in config
@@ -23,6 +26,22 @@ def test_wildcard_public_sockets_do_not_expose_private_control_or_backend() -> N
     firewall = (ROOT / "scripts/configure_windows_public_caddy_firewall.ps1").read_text(encoding="utf-8")
     assert "LocalPort = @(80, 443)" in firewall
     assert "Program = $CaddyPath" in firewall
+
+
+def test_single_upstream_route_failures_cannot_eject_all_healthy_html_routes() -> None:
+    config = (ROOT / "deploy/caddy/Caddyfile.windows").read_text(encoding="utf-8")
+    directives = {line.split("#", 1)[0].strip().split()[0]
+                  for line in config.splitlines() if line.split("#", 1)[0].strip()}
+    assert "reverse_proxy 127.0.0.1:8770 {" in config
+    assert not directives.intersection({"health_uri", "health_port", "fail_duration", "max_fails",
+                                        "unhealthy_status", "unhealthy_latency", "unhealthy_request_count"})
+    # Removing ejection must not turn application failures into successes or
+    # remove the bounded connect/header timeouts and independent recovery.
+    assert "replace_status" not in directives
+    assert "dial_timeout 2s" in config
+    assert "response_header_timeout 20s" in config
+    supervisor = (ROOT / "scripts/start_windows_public_caddy.ps1").read_text(encoding="utf-8")
+    assert '$gatewayHealthUri = "http://127.0.0.1:8770/healthz"' in supervisor
 
 
 def test_firewall_uses_listener_owner_and_does_not_remove_previous_rule() -> None:

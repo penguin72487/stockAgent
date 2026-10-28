@@ -47,8 +47,10 @@ def source(root, task):
 
 
 def run(connection, root, *, config=None, **changes):
+    from types import SimpleNamespace
     options = {'config': config or {**pipeline.settings(), 'download_workers': 2, 'derivation_workers': 2},
-               'max_calls': 2, 'heartbeat': lambda *a: None}
+               'max_calls': 2, 'heartbeat': lambda *a: None,
+               'capacity_sampler': SimpleNamespace(sample=lambda: {'state': 'admitted'})}
     options.update(changes)
     current = worker._next_task(connection, NOW)
     with ThreadPoolExecutor(2) as downloads, ThreadPoolExecutor(2) as processors:
@@ -94,6 +96,26 @@ def test_due_incremental_preempts_without_sending_new_calls(runtime, monkeypatch
     monkeypatch.setattr(pipeline, '_fetch', lambda *a: pytest.fail('new call while due refresh waits'))
     result = run(connection, root)
     assert result['calls'] == 0 and result['state'] == 'incremental_reserve'
+
+
+def test_physical_capacity_drop_drains_started_object_and_stops_new_calls(runtime, monkeypatch):
+    from types import SimpleNamespace
+    root, connection = runtime
+    admitted = {'state': 'admitted'}
+    blocked = {'state': 'deferred', 'reason': 'physical_backing_reserve'}
+    samples = iter([admitted, admitted, blocked])
+    sampler = SimpleNamespace(sample=lambda: next(samples, blocked))
+    calls = []
+    def fetch(limiter, root, task, token):
+        calls.append(task.partition)
+        return source(root, task)
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    result = run(connection, root, capacity_sampler=sampler)
+    assert result['state'] == 'disk_guard' and result['accepted_requests'] == 1
+    assert len(calls) == 1
+    assert connection.execute("SELECT count(*) FROM tasks WHERE dataset=? AND state='complete'", (DATASET,)).fetchone()[0] == 1
+    assert connection.execute('SELECT count(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    assert connection.execute('SELECT count(*) FROM finmind_pipeline_samples').fetchone()[0] == 0
 
 
 def test_failed_source_does_not_reopen_an_accepted_other_partition(runtime, monkeypatch):

@@ -28,6 +28,8 @@ def main(argv=None):
     p.add_argument("--inventory", type=Path)
     p.add_argument("--priority-plan", type=Path, help="Finite verified source scopes; metadata only, existing service executes")
     p.add_argument("--priority-receipt", type=Path)
+    p.add_argument("--repair-pending-bounds", action="store_true",
+                   help="Replace exact never-attempted priority tasks below the native 100-cell minimum")
     p.add_argument("--config", type=Path, default=Path("configs/tej_history.json"))
     p.add_argument("--session", type=Path, default=Path("data_tej/desktop_session.json"))
     p.add_argument("--cutoff", default=datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat())
@@ -36,6 +38,8 @@ def main(argv=None):
     modes.add_argument("--discover-only", action="store_true", help="Inventory table axes only; never send a Preview data query")
     modes.add_argument("--download-only", action="store_true", help="Download already verified scopes; do not select new tables for discovery")
     p.add_argument("--task-id")
+    p.add_argument('--finite-discovery-request-id',
+                   help='Run at most one globally selected discovery from this active priority request')
     p.add_argument('--table-id',help='One exact registered table for download-only acceptance; same canonical queue and lock')
     p.add_argument("--evidence", type=Path)
     p.add_argument('--acknowledge-unknown-usage', action='store_true',
@@ -66,9 +70,26 @@ def main(argv=None):
         p.error("task-kind selectors are only valid with run")
     if a.table_id is not None and (a.action!='run' or not a.download_only):
         p.error('--table-id requires run --download-only')
+    if a.finite_discovery_request_id is not None and (
+            a.action != 'run' or a.max_tasks != 1 or a.discover_only or a.download_only
+            or a.table_id is not None or a.task_id is not None):
+        p.error('--finite-discovery-request-id requires run, one task and the global selector')
     root = a.root.resolve()
     if root == root.parent or root in {Path.home().resolve(), Path.cwd().resolve()}:
         p.error("root must be a dedicated acquisition directory, not a home or workspace root")
+    if a.finite_discovery_request_id is not None:
+        # Check the enrolled physical backing before the owner takes a lock or
+        # opens the shared desktop. An unknown result cannot admit this finite
+        # exception; this remains a dispatch check, not a write reservation.
+        from stockagent.data_sync.cache_capacity import acquisition_dispatch_status
+        from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+        try:
+            capacity = acquisition_dispatch_status(root)
+        except CapacityDeferred as exc:
+            capacity = {'state': 'deferred', 'reason': exc.details.get('reason'), 'retryable': True}
+        print(json.dumps(capacity), flush=True)
+        if capacity.get('state') != 'admitted':
+            return 75
     config = json.loads(a.config.read_text())
     if a.action == "prioritize":
         if (a.priority_plan is None or a.priority_receipt is None or a.task_id is not None
@@ -77,9 +98,10 @@ def main(argv=None):
                 or a.error_window is not None or a.record_density_prior is not None or a.max_tasks != 1):
             p.error("prioritize requires --priority-plan and --priority-receipt; no desktop/recovery selectors")
         from downloader.tej_priority import register_priority_requests
-        print(json.dumps(register_priority_requests(root, a.priority_plan, a.priority_receipt)))
+        print(json.dumps(register_priority_requests(root, a.priority_plan, a.priority_receipt,
+                                                   repair_pending_bounds=a.repair_pending_bounds)))
         return 0
-    if a.priority_plan is not None or a.priority_receipt is not None:
+    if a.priority_plan is not None or a.priority_receipt is not None or a.repair_pending_bounds:
         p.error("priority arguments are only valid with prioritize")
     if a.action == "watch":
         if (a.task_id is not None or a.table_id is not None or a.evidence is not None
@@ -262,8 +284,11 @@ def main(argv=None):
             kind='discover' if a.discover_only else 'download' if a.download_only else None
             for index in range(a.max_tasks):
                 query_started = time.monotonic()
-                state = run_one(root, bridge, kind=kind,table_id=a.table_id)
+                state = run_one(root, bridge, kind=kind,table_id=a.table_id,
+                                finite_discovery_request_id=a.finite_discovery_request_id)
                 print(json.dumps({"state": state}), flush=True)
+                if state == 'finite_priority_not_ready':
+                    return 75
                 if state == "prequery_retry_scheduled":
                     mark_worker_wait(root,kind='download',seconds=5,local_retry=True)
                     time.sleep(5)

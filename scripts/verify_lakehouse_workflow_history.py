@@ -14,7 +14,11 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text
 from scripts.manage_lakehouse import worker_code_identity

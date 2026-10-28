@@ -14,6 +14,78 @@ from downloader.tej_history import (
 from downloader.tej_key_layout import KEY1_CONTRACT, key_count
 
 CONTRACT = "finite_source_bound_priority_requests_v1"
+SOURCE_RECHECK_CONTRACT = "completed_native_value_conflict_recheck_v1"
+
+
+def _source_recheck_parents(root: Path, item: dict, request: dict, prior: list) -> set[str]:
+    """Permit one separately retained query of a proved conflicting native cell.
+
+    Completed observations stay immutable. This is source correction research,
+    not a retry of an unknown desktop outcome or an unbounded refresh policy.
+    The new request carries the conflict and parent identities into its own
+    durable task hash and export receipt.
+    """
+    proof = request.get("source_recheck")
+    if proof is None:
+        return set()
+    companies, periods = query_axes(request)
+    if (not isinstance(proof, dict)
+            or set(proof) != {"contract", "conflict_evidence", "parent_task_ids"}
+            or proof["contract"] != SOURCE_RECHECK_CONTRACT or key_count(request) != 2
+            or len(companies) != 1 or len(periods) != 1):
+        raise ValueError("A source-conflict recheck requires one exact native daily cell")
+    evidence_ref = proof["conflict_evidence"]
+    if (not isinstance(evidence_ref, dict) or set(evidence_ref) != {"path", "sha256"}
+            or sha256_file(Path(evidence_ref["path"])) != evidence_ref["sha256"]):
+        raise ValueError("Source-conflict evidence SHA mismatch")
+    evidence = json.loads(Path(evidence_ref["path"]).read_text())
+    if (evidence.get("contract") != "native_source_value_conflict_v1"
+            or evidence.get("table_id") != item["table_id"]
+            or evidence.get("company") != next(iter(companies))
+            or evidence.get("period") != next(iter(periods))
+            or not evidence.get("reason") or len(evidence.get("sources", [])) < 2
+            or {s.get("kind") for s in evidence["sources"]}
+               != {"native_original", "independent_original"}):
+        raise ValueError("Exact native and independent conflicting sources required")
+    paths, native_paths = set(), set()
+    for source in evidence["sources"]:
+        path = Path(source["path"]).resolve()
+        if sha256_file(path) != source["sha256"]:
+            raise ValueError("Conflicting source original SHA mismatch")
+        paths.add(path)
+        if source["kind"] == "native_original":
+            native_paths.add(path)
+    if len(paths) < 2:
+        raise ValueError("Independent source originals must be distinct")
+    scope, names = query_axes(request), set(request["fields"])
+    parents, retained_raw_paths = set(), set()
+    for done, existing, old_scope in prior:
+        if not _scopes_overlap(scope, old_scope) or not names.intersection(existing["fields"]):
+            continue
+        if (done["state"] != "complete" or done["scope_contract"] != SOURCE_SCOPE_CONTRACT
+                or existing.get("source_recheck") is not None or not done.get("receipt_path")):
+            raise ValueError("Only a completed original cell can receive one conflict recheck")
+        receipt_path = (root / done["receipt_path"]).resolve()
+        if not receipt_path.is_relative_to(root.resolve()):
+            raise ValueError("Source parent receipt escapes canonical owner")
+        receipt = json.loads(receipt_path.read_text())
+        if (receipt.get("task_id") != done["task_id"] or receipt.get("table_id") != item["table_id"]
+                or receipt.get("source_values_retained") is not True
+                or receipt.get("training_auto_injected") is not False):
+            raise ValueError("Retained native parent receipt required")
+        for field in ("raw", "parquet"):
+            path = (root / receipt[field + "_path"]).resolve()
+            if (not path.is_relative_to(root.resolve())
+                    or sha256_file(path) != receipt[field + "_sha256"]):
+                raise ValueError("Native parent original SHA mismatch")
+            if field == "raw":
+                retained_raw_paths.add(path)
+        parents.add(done["task_id"])
+    if not parents or proof["parent_task_ids"] != sorted(parents):
+        raise ValueError("Source recheck must bind every overlapping completed parent")
+    if not native_paths or not native_paths.issubset(retained_raw_paths):
+        raise ValueError("Conflicting native source must be a retained parent original")
+    return parents
 
 
 def pack_gap_rectangles(wanted: dict[str, set[str]], *, forbidden: set[tuple[str, str]],
@@ -72,10 +144,21 @@ def pack_gap_rectangles(wanted: dict[str, set[str]], *, forbidden: set[tuple[str
             for r in sorted(rectangles, key=lambda r: (min(r["dates"]), min(r["companies"])))]
 
 
+def query_axes(request: dict) -> tuple[frozenset[str], frozenset[str | None]]:
+    """Keep rectangular native scopes factored instead of retaining C*D cells."""
+    companies = frozenset(company_code(label) for label in request["company_labels"])
+    periods = (frozenset({None}) if key_count(request) == 1 else
+               frozenset(normalize_period(period) for period in request["date_labels"]))
+    return companies, periods
+
+
+def _scopes_overlap(left, right) -> bool:
+    return not left[0].isdisjoint(right[0]) and not left[1].isdisjoint(right[1])
+
+
 def query_keys(request: dict) -> set[tuple[str, str | None]]:
-    periods = [None] if key_count(request) == 1 else request["date_labels"]
-    return {(company_code(label), None if period is None else normalize_period(period))
-            for label in request["company_labels"] for period in periods}
+    companies, periods = query_axes(request)
+    return {(company, period) for company in companies for period in periods}
 
 
 def retained_request(row: dict, definition: dict) -> dict | None:
@@ -97,13 +180,18 @@ def retained_request(row: dict, definition: dict) -> dict | None:
     return {**encoded, "fields": json.loads(definition["fields_json"])}
 
 
-def register_priority_requests(root: Path, plan_path: Path, receipt_path: Path) -> dict:
+def register_priority_requests(root: Path, plan_path: Path, receipt_path: Path, *,
+                               repair_pending_bounds: bool = False) -> dict:
     """Short metadata transaction, safe between or during an unrelated query.
 
     The caller explicitly invokes this action. It never retries a source action,
     changes the global plan, clears quarantine, or acquires a second desktop.
     Terminal negative responses count as queried scopes, just like nonempty ones.
+    An explicit single-cell source-conflict recheck has its own retained task;
+    it never resets or overwrites a completed parent.
     """
+    if type(repair_pending_bounds) is not bool:
+        raise ValueError("Explicit pending-bound repair mode required")
     plan = json.loads(plan_path.read_text())
     if (plan.get("contract") != CONTRACT or not isinstance(plan.get("requests"), list)
             or not 1 <= len(plan["requests"]) <= 1000 or not plan.get("sources")):
@@ -150,7 +238,7 @@ def register_priority_requests(root: Path, plan_path: Path, receipt_path: Path) 
                                             "AND state IN ('complete','pending','running','blocked')", (tid,)):
                         existing = retained_request(dict(done), dict(row))
                         if existing is not None:
-                            prior[tid].append((dict(done), existing, query_keys(existing)))
+                            prior[tid].append((dict(done), existing, query_axes(existing)))
                     planned[tid] = []
                 definition = definitions[tid]
                 names = json.loads(definition["fields_json"])
@@ -191,27 +279,52 @@ def register_priority_requests(root: Path, plan_path: Path, receipt_path: Path) 
                 columns = mode + len(names)
                 if (type(request.get("max_rows")) is not int or type(request.get("max_cells")) is not int
                         or not 0 < rows <= request["max_rows"] <= config["max_rows_per_export"]
+                        or not 100 <= request["max_cells"] <= 400000
                         or not (rows + 1) * columns <= request["max_cells"] <= config["max_cells_per_export"]
                         or len(companies) > config["max_companies_per_export"] or columns > 30):
                     raise ValueError("Priority exceeds native export bounds")
-                keys = query_keys(request)
-                for old_keys, old_fields in planned[tid]:
-                    if keys & old_keys and set(names) & old_fields:
+                scope = query_axes(request)
+                for old_scope, old_fields in planned[tid]:
+                    if _scopes_overlap(scope, old_scope) and set(names) & old_fields:
                         raise ValueError("Overlapping requests within priority plan")
-                planned[tid].append((keys, set(names)))
+                planned[tid].append((scope, set(names)))
                 key = stable_id([tid, request])
                 reused = None
-                for done, existing, old_keys in prior[tid]:
-                    overlap = keys & old_keys
-                    if not overlap or not set(names) & set(existing["fields"]):
+                reused_request = None
+                recheck_parents = _source_recheck_parents(root, item, request, prior[tid])
+                for done, existing, old_scope in prior[tid]:
+                    if not _scopes_overlap(scope, old_scope) or not set(names) & set(existing["fields"]):
+                        continue
+                    if done["task_id"] in recheck_parents:
                         continue
                     if (done["scope_contract"] == SOURCE_SCOPE_CONTRACT
-                            and done["state"] == "pending" and overlap == keys == old_keys
+                            and done["state"] == "pending" and scope == old_scope
                             and existing["fields"] == names and reused is None):
                         reused = done
+                        reused_request = existing
                     else:
                         raise ValueError("Priority overlaps captured, in-flight, blocked or partial pending scope")
-                if reused is not None:
+                replace_bound = reused is not None and reused_request["max_cells"] < 100
+                previous_request_sha = None
+                if replace_bound:
+                    # Preserve the never-attempted invalid request under its
+                    # old identity. The replacement has identical source axes,
+                    # fields and row budget; only the bridge's minimum changes.
+                    if (not repair_pending_bounds or request["max_cells"] != 100
+                            or {**reused_request, "max_cells": 100} != request
+                            or any(reused[k] is not None for k in ("attempted_at_utc", "completed_at_utc",
+                                "actual_rows", "receipt_path", "output_path", "active_attempt_id"))
+                            or con.execute("SELECT 1 FROM desktop_attempts WHERE task_id=? LIMIT 1",
+                                           (reused["task_id"],)).fetchone()):
+                        raise ValueError("Exact never-attempted minimum-bound repair required")
+                    encoded = json.dumps(compact_request(request, definition), ensure_ascii=False, separators=(",", ":"))
+                    if con.execute("SELECT 1 FROM tasks WHERE task_id=?", (key,)).fetchone():
+                        raise ValueError("Replacement task identity already retained")
+                    import hashlib
+                    previous_request_sha = hashlib.sha256(reused["request_json"].encode()).hexdigest()
+                    mutations.append(("supersede_bound", reused, priority))
+                    mutations.append(("insert", (key, tid, definition["phase"], encoded, rows), min(priority, reused["priority"])))
+                elif reused is not None:
                     mutations.append(("promote", reused, priority))
                     key = reused["task_id"]
                 else:
@@ -221,11 +334,20 @@ def register_priority_requests(root: Path, plan_path: Path, receipt_path: Path) 
                     mutations.append(("insert", (key, tid, definition["phase"], encoded, rows), priority))
                 result["tasks"].append({"task_id": key, "table_id": tid, "priority": priority,
                                         "requested_grid_rows": rows, "reason": item["reason"],
-                                        "operation": "promote_pending" if reused else "new_finite_task",
+                                        "operation": ("replace_unattempted_invalid_bound" if replace_bound else
+                                                      "promote_pending" if reused else
+                                                      "new_source_conflict_recheck" if recheck_parents else
+                                                      "new_finite_task"),
+                                        "source_recheck_parent_task_ids": sorted(recheck_parents),
+                                        "previous_task_id": reused["task_id"] if replace_bound else None,
+                                        "previous_request_sha256": previous_request_sha,
                                         "previous_priority": reused["priority"] if reused else None})
             # No write until the entire finite batch has passed semantic checks.
             for action, values, priority in mutations:
-                if action == "promote":
+                if action == "supersede_bound":
+                    con.execute("UPDATE tasks SET state='superseded_priority_capacity_v1' WHERE task_id=? AND state='pending'",
+                                (values["task_id"],))
+                elif action == "promote":
                     con.execute("UPDATE tasks SET priority=? WHERE task_id=? AND state='pending'",
                                 (min(priority, values["priority"]), values["task_id"]))
                 else:

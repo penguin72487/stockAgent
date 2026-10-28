@@ -30,7 +30,7 @@ import pyarrow.parquet as pq
 from downloader.artifact_io import atomic_write_json
 from downloader.common import load_env_file
 from downloader.download_finmind_complement import (
-    INSTITUTIONAL_NAMES, LONG_INSTITUTIONAL, WIDE_INSTITUTIONAL,
+    BULK_MAX_RESPONSE_BYTES, INSTITUTIONAL_NAMES, LONG_INSTITUTIONAL, WIDE_INSTITUTIONAL,
     SourceError, Task, _db, _fetch_rows, _sha256, _store, _preflight_bulk_year_schemas,
 )
 from downloader.download_finmind_free import TAIPEI
@@ -53,6 +53,7 @@ from downloader.finmind_observation_dates import (
     EXCLUDED_STATE, PERIOD_DATASETS, next_period_refresh, reconcile_observation_dates,
 )
 from stockagent.live.market_status import TwStockDayDecision, tw_stock_day_decision
+from stockagent.data_sync.acquisition_capacity_sampler import AcquisitionCapacitySampler
 
 
 CATALOG_URL = "https://finmind.github.io/llms-full.txt"
@@ -471,7 +472,8 @@ def _seed(conn: sqlite3.Connection, now: datetime,
 
 
 def _due_query(now: datetime, *, incremental_only: bool = False,
-               datasets: tuple[str, ...] | None = None) -> tuple[str, tuple]:
+               datasets: tuple[str, ...] | None = None,
+               task_keys: tuple[tuple[str, str, str], ...] | None = None) -> tuple[str, tuple]:
     """One eligibility predicate for both dispatch and read-only wake checks."""
     due = (
         "((state='pending' AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)) "
@@ -491,6 +493,11 @@ def _due_query(now: datetime, *, incremental_only: bool = False,
             return '0', ()
         due += f" AND dataset IN ({','.join('?' for _ in datasets)})"
         values += tuple(datasets)
+    if task_keys is not None:
+        if not task_keys:
+            return '0', ()
+        due += ' AND (' + ' OR '.join('(dataset=? AND data_id=? AND partition=?)' for _ in task_keys) + ')'
+        values += tuple(value for key in task_keys for value in key)
     return due, values
 
 
@@ -524,16 +531,30 @@ def _ready_after_wait(root: Path, now: datetime, *, secondary_admission: Callabl
 
 def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = False,
           secondary_admission: Callable[[], dict[str, Any]] | None = None,
-          datasets: tuple[str, ...] | None = None) -> Task | None:
+          datasets: tuple[str, ...] | None = None,
+          task_keys: tuple[tuple[str, str, str], ...] | None = None) -> Task | None:
     conn.execute("CREATE TABLE IF NOT EXISTS dispatch_cursor ("
                  "priority INTEGER PRIMARY KEY,last_dataset TEXT NOT NULL)")
-    due, values = _due_query(now, incremental_only=incremental_only, datasets=datasets)
+    due, values = _due_query(now, incremental_only=incremental_only, datasets=datasets, task_keys=task_keys)
     first = conn.execute(
         f"SELECT priority FROM tasks WHERE {due} ORDER BY priority LIMIT 1", values
     ).fetchone()
     if not first:
         return None
     priority = first[0]
+    preferred = None
+    if priority > 0 and not incremental_only:
+        from downloader.provider_priority import finmind_native_candidate
+        requested = finmind_native_candidate(conn, now, where=due, args=values)
+        if requested is not None:
+            requested_priority = requested[4]
+            # A priority intent cannot turn optional verification into
+            # mandatory work or bypass its existing spare-quota admission.
+            if requested_priority < SECONDARY_VALIDATION_PRIORITY or (
+                    not _primary_unfinished(conn) and secondary_admission is not None
+                    and secondary_admission().get('allowed') is True):
+                preferred = requested
+                priority = requested_priority
     if priority >= SECONDARY_VALIDATION_PRIORITY:
         # A cooling/failed/in-flight mandatory partition is unfinished work,
         # not spare capacity. Priority ordering among *due* rows alone allowed
@@ -547,12 +568,14 @@ def _next(conn: sqlite3.Connection, now: datetime, *, incremental_only: bool = F
         "SELECT last_dataset FROM dispatch_cursor WHERE priority=?", (priority,)
     ).fetchone()
     cursor = previous[0] if previous else ""
-    row = conn.execute(
-        "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
-        f"WHERE priority=? AND dataset>? AND {due} "
-        "ORDER BY CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, dataset,partition DESC LIMIT 1",
-        (priority, cursor, *values),
-    ).fetchone()
+    row = preferred
+    if row is None:
+        row = conn.execute(
+            "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
+            f"WHERE priority=? AND dataset>? AND {due} "
+            "ORDER BY CASE WHEN error_code LIKE 'local_integrity:%' THEN 0 ELSE 1 END, dataset,partition DESC LIMIT 1",
+            (priority, cursor, *values),
+        ).fetchone()
     if not row:
         row = conn.execute(
             "SELECT dataset,data_id,partition,kind,priority,state FROM tasks "
@@ -628,7 +651,7 @@ def _derive_wide(root: Path, partition: str) -> list[dict[str, Any]]:
 
 
 def _fetch(task: Task, token: str, limiter: Any, root: Path,
-           today: date) -> list[dict[str, Any]]:
+           today: date, *, max_response_bytes: int | None = None) -> list[dict[str, Any]]:
     if task.dataset in PRODUCT_HISTORY_STARTS:
         raise SourceError("requires_product_id", retry_after=0)
     if task.kind == "derived":
@@ -645,7 +668,8 @@ def _fetch(task: Task, token: str, limiter: Any, root: Path,
         if task.dataset not in START_DATE_ONLY_DATASETS:
             provider_end = end - timedelta(days=1) if task.dataset in INCLUSIVE_END_DATE_DATASETS else end
             params["end_date"] = provider_end.isoformat()
-    rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params)
+    rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, params,
+                       **({'max_response_bytes': max_response_bytes} if max_response_bytes is not None else {}))
     if task.kind != "snapshot":
         for row in rows:
             stamp = row.get("date")
@@ -938,7 +962,8 @@ def _fail(conn: sqlite3.Connection, task: Task, error: SourceError, now: datetim
 def _status(conn: sqlite3.Connection, root: Path, state: str,
             *, account: dict[str, object] | None = None,
             active: list[Task] | None = None, last: dict[str, Any] | None = None,
-            session_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+            session_policy: dict[str, Any] | None = None,
+            capacity_admission: dict[str, Any] | None = None) -> dict[str, Any]:
     from downloader.acquisition_policy import finmind_secondary_mode
     series = {spec.dataset: {"target": 0, "complete": 0, "observed_empty": 0,
                              "failed": 0, "retry_exhausted": 0, "retained_rows": 0, "retained_bytes": 0,
@@ -1006,21 +1031,61 @@ def _status(conn: sqlite3.Connection, root: Path, state: str,
             "observed_empty_is_data_complete": False,
         },
     }
+    if capacity_admission is not None:
+        result["capacity_admission"] = capacity_admission
+    atomic_write_json(root / "status.json", result)
+    return result
+
+
+def _capacity_pause(root: Path, admission: dict[str, Any]) -> dict[str, Any]:
+    """Keep the last truthful source counts when no new work is admitted."""
+    try:
+        previous = json.loads((root / "status.json").read_text())
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError):
+        previous = {}
+    result = {**previous, "schema_version": 1, "observed_at_utc": datetime.now(UTC).isoformat(),
+              "state": "disk_guard", "active_tasks": [], "capacity_admission": admission,
+              "source_status_observed_at_utc": previous.get(
+                  "source_status_observed_at_utc", previous.get("observed_at_utc"))}
     atomic_write_json(root / "status.json", result)
     return result
 
 
 def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
              secondary_admission: Callable[[], dict[str, Any]] | None = None,
-             datasets: tuple[str, ...] | None = None) -> dict[str, Any]:
+             datasets: tuple[str, ...] | None = None,
+             capacity_sampler: AcquisitionCapacitySampler | None = None,
+             task_keys: tuple[tuple[str, str, str], ...] | None = None,
+             task_keys_validate: Callable[[], None] | None = None) -> dict[str, Any]:
     if workers < 1 or workers > 8 or max_requests < 0:
         raise ValueError("workers must be 1..8 and max_requests nonnegative")
+    if (task_keys is None) != (task_keys_validate is None):
+        raise ValueError('exact task selection requires its source-bound validation')
+    if task_keys is not None:
+        if (not task_keys or len(task_keys) > 64 or len(set(task_keys)) != len(task_keys)
+                or workers != 1 or max_requests != 1
+                or any(dataset != 'TaiwanOptionDaily' or data_id != ''
+                       or date.fromisoformat(partition).isoformat() != partition
+                       for dataset, data_id, partition in task_keys)):
+            raise ValueError('exact Sponsor option selection has invalid keys')
+        if datasets is not None and set(datasets) != {'TaiwanOptionDaily'}:
+            raise ValueError('exact option keys require the matching dataset')
+        datasets = ('TaiwanOptionDaily',)
+        task_keys_validate()
     if datasets is not None:
         datasets = tuple(dict.fromkeys(datasets))
         unknown = set(datasets) - {spec.dataset for spec in SOURCES}
         if not datasets or unknown:
             raise ValueError(f"datasets must select existing Sponsor sources; unknown={sorted(unknown)}")
     root.mkdir(parents=True, exist_ok=True)
+    if capacity_sampler is not None and capacity_sampler.root != root.absolute():
+        raise ValueError("capacity sampler belongs to a different workspace")
+    capacity = capacity_sampler if capacity_sampler is not None else AcquisitionCapacitySampler(root)
+    admission = capacity.initial_sample(timeout_seconds=29) if task_keys is not None else capacity.initial_sample()
+    if admission.get("state") not in {"admitted", "not_enrolled"}:
+        return _capacity_pause(root, admission)
     load_env_file(Path(__file__).resolve().parents[1] / ".env", allowed_names=("FINMIND_TOKEN",))
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     with requests.Session() as session:
@@ -1054,6 +1119,12 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
         atomic_write_json(root / 'correction_status.json', {
             'observed_at_utc': datetime.now(UTC).isoformat(), **correction_summary,
         })
+        # Seeding and audits can outlast one sample. Recheck before dispatch;
+        # never repeatedly admit an expired sample after a slow local phase.
+        admission = capacity.initial_sample(timeout_seconds=29) if task_keys is not None else capacity.initial_sample()
+        if admission.get("state") not in {"admitted", "not_enrolled"}:
+            return _status(conn, root, "disk_guard", account=account,
+                           session_policy=session_policy, capacity_admission=admission)
         _status(conn, root, "running", account=account, session_policy=session_policy)
         last_status_at = time.monotonic()
         last: dict[str, Any] | None = None
@@ -1065,22 +1136,44 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
 
         sent = 0
         halt = False
+        reported_wait = False
+        blocked_admission: dict[str, Any] | None = None
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="finmind-sponsor") as pool:
             while in_flight or (not halt and (not max_requests or sent < max_requests)):
                 local = datetime.now(TAIPEI)
+                admission = capacity.sample()
                 if shutil.disk_usage(root).free < MIN_FREE_BYTES:
                     halt = True
                     reason = "disk_guard"
+                    admission = {"state": "deferred", "reason": "filesystem_reserve",
+                                 "minimum_free_bytes": MIN_FREE_BYTES,
+                                 "guard_kind": "dispatch_preflight_not_write_reservation"}
+                    blocked_admission = admission
+                elif admission.get("state") not in {"admitted", "not_enrolled"}:
+                    halt = True
+                    reason = "disk_guard"
+                    blocked_admission = admission
                 elif protected_stock_opening(local):
                     halt = True
                     reason = "protected_opening"
                 while not halt and len(in_flight) < workers and (not max_requests or sent < max_requests):
+                    if task_keys_validate is not None:
+                        task_keys_validate()
+                    admission = capacity.sample()
+                    if admission.get("state") not in {"admitted", "not_enrolled"}:
+                        halt = True
+                        reason = "disk_guard"
+                        blocked_admission = admission
+                        break
                     dispatch_now = datetime.now(UTC)
                     previous_quota = account.get('official_requests_per_hour')
                     account = refresh_dispatch_account(account, token, root.parent, dispatch_now)
                     if account.get('official_requests_per_hour') != previous_quota:
                         limiter.interval_seconds = pacing_interval(account)
                     reservation = incremental_reservation(root.parent, dispatch_now)
+                    if task_keys is not None:
+                        from downloader.finmind_option_daily_conflicts import priority_reservation
+                        reservation = priority_reservation(root, reservation, dispatch_now)
                     budget = backfill_budget(
                         account, root.parent,
                         fixed_incremental_requests=reservation['reserve_requests'],
@@ -1091,8 +1184,13 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                         halt = True
                         reason = 'incremental_reserve'
                         break
-                    task = _next(conn, dispatch_now, incremental_only=not budget["allowed"],
-                                 secondary_admission=secondary_admission, datasets=datasets)
+                    finite_capacity_deferred = False
+                    if task_keys is not None:
+                        from downloader.finmind_option_finite_priority import capacity_deferred_priority_allowed
+                        finite_capacity_deferred = capacity_deferred_priority_allowed(admission, budget, reservation)
+                    task = _next(conn, dispatch_now,
+                                 incremental_only=not (budget["allowed"] or finite_capacity_deferred),
+                                 secondary_admission=secondary_admission, datasets=datasets, task_keys=task_keys)
                     if task is None:
                         halt = True
                         reason = "incremental_reserve" if not budget["allowed"] else "current_queue"
@@ -1103,19 +1201,24 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
                         ).fetchone():
                             reason = "waiting_necessary_acquisition"
                         break
-                    batch = _claim_batch(conn, task, dispatch_now, allow_history=budget['allowed'])
+                    # A finite exact request must never coalesce unrelated dates.
+                    batch = None if task_keys is not None else _claim_batch(conn, task, dispatch_now, allow_history=budget['allowed'])
                     future = (pool.submit(_fetch_batch, batch, token, limiter, root)
                               if batch is not None else
-                              pool.submit(_fetch, task, token, limiter, root, local.date()))
+                              pool.submit(_fetch, task, token, limiter, root, local.date(),
+                                          **({'max_response_bytes': BULK_MAX_RESPONSE_BYTES} if task_keys is not None else {})))
                     in_flight[future] = (task, batch)
                     sent += task.kind != "derived"
                 if not in_flight:
                     break
-                done, _ = wait(in_flight, timeout=55, return_when=FIRST_COMPLETED)
-                if not done:
+                # Refresh the physical sample while slow requests run; this
+                # does not cancel or discard already submitted work.
+                done, _ = wait(in_flight, timeout=10, return_when=FIRST_COMPLETED)
+                if not done and (not reported_wait or time.monotonic() - last_status_at >= 55):
                     _status(conn, root, "running", account=account, active=active_tasks(),
                             last=last, session_policy=session_policy)
                     last_status_at = time.monotonic()
+                    reported_wait = True
                 for future in done:
                     task, batch = in_flight.pop(future)
                     unfinished = list(batch.tasks if batch is not None else (task,))
@@ -1194,7 +1297,8 @@ def run_once(root: Path, *, max_requests: int = 100, workers: int = 4,
             'verification': correction_progress,
         })
         return _status(conn, root, reason if halt else "batch_complete", account=account,
-                       last=last, session_policy=session_policy)
+                       last=last, session_policy=session_policy,
+                       capacity_admission=blocked_admission if halt and reason == "disk_guard" else None)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1205,9 +1309,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dataset", action="append", choices=sorted(spec.dataset for spec in SOURCES),
                         help="Dispatch only this existing dataset; repeat to select more than one")
     parser.add_argument("--loop", action="store_true")
+    parser.add_argument('--option-daily-conflict-request-id', help='Active source-bound Sponsor priority request')
+    parser.add_argument('--task-key', nargs=3, action='append', metavar=('DATASET', 'DATA_ID', 'PARTITION'))
     parser.add_argument('--reopen-exhausted', action='store_true',
                         help='Explicitly reopen exhausted --dataset scopes, then exit without an API call')
     args = parser.parse_args(argv)
+    if (args.task_key is None) != (args.option_daily_conflict_request_id is None):
+        parser.error('exact option keys and their priority request ID are required together')
+    if args.task_key and (args.loop or args.reopen_exhausted):
+        parser.error('exact option conflict selections are single passes only')
     if args.reopen_exhausted and (not args.dataset or args.loop):
         parser.error('--reopen-exhausted requires --dataset and cannot combine with --loop')
     root = args.root.resolve()
@@ -1226,10 +1336,23 @@ def main(argv: list[str] | None = None) -> int:
                     changed = retry_policy.reopen(conn, tuple(args.dataset), datetime.now(UTC))
                 print(json.dumps({'reopened_exhausted_tasks': changed, 'provider_calls': 0}), flush=True)
                 return 0
+            keys = tuple(tuple(key) for key in args.task_key) if args.task_key else None
+            if keys is not None:
+                from downloader.finmind_option_daily_conflicts import capacity_probe, validate_priority_keys
+
+                validate = lambda: validate_priority_keys(root, args.option_daily_conflict_request_id,
+                                                          keys, datetime.now(UTC))
+                capacity = AcquisitionCapacitySampler(root, probe=lambda path: capacity_probe(
+                    path, args.option_daily_conflict_request_id, keys))
+            else:
+                validate = None
+                # Reuse one sampler across cycles to avoid overlapping probes.
+                capacity = AcquisitionCapacitySampler(root)
             while True:
                 try:
                     result = run_once(root, max_requests=args.max_requests, workers=args.workers,
-                                      datasets=tuple(args.dataset) if args.dataset is not None else None)
+                                      datasets=tuple(args.dataset) if args.dataset is not None else None,
+                                      capacity_sampler=capacity, task_keys=keys, task_keys_validate=validate)
                 except sqlite3.OperationalError as error:
                     if not args.loop or not retryable_queue_error(error):
                         raise
@@ -1239,9 +1362,9 @@ def main(argv: list[str] | None = None) -> int:
                 if not args.loop or result["state"] in {"account_unverified", "not_entitled", "invalid_token"}:
                     return 0 if result["state"] not in {"account_unverified", "not_entitled"} else 2
                 delay = (1800 if result["state"] in {"rate_limited", "ip_banned"} else
-                         600 if result["state"] in {"current_queue", "protected_opening", "disk_guard",
+                         600 if result["state"] in {"current_queue", "protected_opening",
                                                      "waiting_necessary_acquisition"} else
-                         60 if result["state"] == "incremental_reserve" else
+                         60 if result["state"] in {"incremental_reserve", "disk_guard"} else
                          5 if result['state'] == 'queue_busy' else 2)
                 from downloader.acquisition_policy import evaluate_finmind_secondary_admission
                 wake_if = (lambda: _ready_after_wait(

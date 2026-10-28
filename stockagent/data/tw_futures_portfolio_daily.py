@@ -660,6 +660,10 @@ def _stable_expiry_slot_map(contract_meta: Any) -> Any:
     return pl.DataFrame(assigned).sort("product", "contract", *instance_keys)
 
 
+class FuturesPortfolioSlotCapacityExceeded(RuntimeError):
+    """The selected immutable slot layout cannot represent this source."""
+
+
 def _fixed_portfolio_slot_map(
     contract_meta: Any,
     market_dates: Any,
@@ -725,7 +729,7 @@ def _fixed_portfolio_slot_map(
             slot = next_slot
             next_slot += 1
         if slot > capacity:
-            raise RuntimeError(
+            raise FuturesPortfolioSlotCapacityExceeded(
                 "TAIFEX fixed portfolio slot capacity exceeded: "
                 f"required_at_least={slot} configured={capacity}; rebuild into "
                 "a new data/checkpoint contract with a larger audited capacity"

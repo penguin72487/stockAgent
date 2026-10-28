@@ -12,6 +12,7 @@ import pytest
 
 from downloader.news_fulltext import accept_discovery, fetch_discovery, load_config, run_cycle, seed_discovery
 from downloader.news_fulltext_capacity import PublisherCapacity
+from downloader.news_fulltext_host_circuit import GatewayHostCircuit
 from downloader.news_fulltext_http import NewsHTTP, Response
 from downloader.news_fulltext_metadata_feeds import LTN_FEEDS, parse, require_request, progress
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry
@@ -69,6 +70,47 @@ def test_body_and_bulk_fingerprints_exactly_unchanged_by_metadata_scope():
                 source.fulltext_feed_data_fingerprint, source.cnyes_bulk_data_fingerprint) == (
                 prior.allowed, prior.authorization_fingerprint, prior.data_fingerprint,
                 prior.fulltext_feed_data_fingerprint, prior.cnyes_bulk_data_fingerprint)
+
+
+def test_metadata_only_restart_preserves_prior_host_pause_without_granting_body_access(config, tmp_path):
+    registry = PolicyRegistry(config, base=tmp_path)
+    metadata_only = registry.sources['ltn']
+    assert not metadata_only.allowed and metadata_only.request_enabled
+
+    # Model a formerly body-enabled owner and its actual negative checkpoint.
+    # Both observations are synthetic: no publisher or production queue is used.
+    previous_fingerprint = 'a' * 64 if metadata_only.data_fingerprint != 'a' * 64 else 'b' * 64
+    registry.sources['ltn'] = replace(metadata_only, allowed=True, data_fingerprint=previous_fingerprint)
+    previous = GatewayHostCircuit(tmp_path, registry)
+    previous.success('ltn', 'video.ltn.com.tw')
+    for _ in range(3):
+        previous.gateway_failure('ltn', 'news.ltn.com.tw', 502, None)
+    expected = previous.blocked('ltn')['news.ltn.com.tw']
+    checkpoint = (tmp_path / 'gateway_host_cooldowns.json').read_bytes()
+
+    registry.sources['ltn'] = metadata_only
+    restored = GatewayHostCircuit(tmp_path, registry)
+    assert restored.blocked('ltn') == {'news.ltn.com.tw': expected}
+    assert restored.failures['ltn']['news.ltn.com.tw'] == 3
+    assert restored.pause_evidence_fingerprints['ltn']['news.ltn.com.tw'] == previous_fingerprint
+    assert (tmp_path / 'gateway_host_cooldowns.json').read_bytes() == checkpoint
+
+    session = FakeSession({})
+    http = NewsHTTP(registry, config, tmp_path, session_factory=lambda: session,
+                    limiter_factory=FakeLimiter, address_check=lambda _: None)
+    try:
+        with pytest.raises(NewsError, match='host_gateway_cooldown') as deferred:
+            http._raw(LTN_FEEDS[0], metadata_feed=LTN_FEEDS[0])
+        assert deferred.value.raw_request_not_sent
+        with pytest.raises(NewsError, match='awaiting_authorization'):
+            http._raw(LTN_FEEDS[0])
+        assert session.calls == []
+    finally:
+        http.close()
+
+    registry.sources['ltn'] = replace(metadata_only, metadata_feeds=())
+    assert not registry.sources['ltn'].request_enabled
+    assert GatewayHostCircuit(tmp_path, registry).blocked('ltn') == {}
 
 
 @pytest.mark.parametrize('key,value', [('enabled', 1), ('layout', 'other'), ('urls', ['https://news.ltn.com.tw/news/123']),

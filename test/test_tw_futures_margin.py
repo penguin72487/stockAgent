@@ -140,6 +140,20 @@ def test_locked_risk_close_with_nonpositive_equity_still_has_absorbing_ruin():
     assert result.contract_quantities_history[2].item() == 0
 
 
+def test_physical_required_close_without_a_trade_never_becomes_cash_settlement():
+    execution=tape(3)
+    execution[1,0,1]=0.
+    execution[1,0,2]=1.
+    execution[1,0,m.TERMINAL_CAPACITY]=0.
+    execution[1,0,m.CASH_SETTLEMENT]=0.
+    held=run([[.5],[0.],[0.]],execution)
+    assert not held.final_alive and held.final_equity_scale==0
+    assert held.default_reason_history[1].item()!=0
+    assert held.turnovers[1].item()==0., 'A final mark cannot manufacture an exit fill'
+    flat=run([[0.],[0.],[0.]],execution)
+    assert flat.final_alive and flat.final_equity_scale==1.
+
+
 @pytest.mark.parametrize("recover", [False, True])
 def test_unfilled_risk_notice_adds_no_return_or_gradient_penalty(recover):
     outputs = []
@@ -290,6 +304,34 @@ def write_rules(tmp_path, panel, rows):
     return path
 
 
+@pytest.mark.parametrize("mutated", ["daily", "rules", "manifest", "receipt"])
+def test_attachment_validation_reuse_rejects_changed_dependency(tmp_path, mutated):
+    import os
+    panel, rows = rule_panel(tmp_path)
+    path = write_rules(tmp_path, panel, rows)
+    daily_path = Path(panel.stock_context_futures_portfolio_daily.source_path)
+    validated = m.ValidatedMarginSource.load(path, daily_path)
+    ordinary = m.attach_futures_margin_rules(panel, path).stock_context_futures_portfolio_daily
+    shared = m.attach_futures_margin_rules(panel, path, validated_source=validated).stock_context_futures_portfolio_daily
+    for field in ("integer_execution", "candidate_features", "candidate_mask", "holding_log_returns"):
+        np.testing.assert_array_equal(getattr(ordinary, field), getattr(shared, field))
+    # A consumer cannot poison another consumer's manifest or dataframe.
+    rules, manifest = validated.read(path, daily_path)
+    manifest["schema_version"] = -1
+    rules.replace_column(rules.columns.index("initial"), pl.Series("initial", [1.] * len(rows)))
+    fresh_rules, fresh_manifest = validated.read(path, daily_path)
+    assert fresh_manifest["schema_version"] == 1
+    assert fresh_rules["initial"].to_list() == [100.] * len(rows)
+    target = {"daily": daily_path, "rules": path,
+        "manifest": path.with_name("manifest.json"), "receipt": path.with_name("source.json")}[mutated]
+    before = target.stat()
+    contents = target.read_bytes()
+    target.write_bytes(contents[:-1] + bytes([contents[-1] ^ 1]))
+    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(ValueError, match="changed during attachment"):
+        m.attach_futures_margin_rules(panel, path, validated_source=validated)
+
+
 @pytest.mark.parametrize("date_unit", ["D", "ms", "ns"])
 def test_margin_rule_alignment_prior_features_and_no_fill_calendar(tmp_path, date_unit):
     from stockagent.training.dataset import CrossSectionalDataset
@@ -313,6 +355,53 @@ def test_margin_rule_alignment_prior_features_and_no_fill_calendar(tmp_path, dat
     assert 1 in dataset.valid_indices
     assert dataset_to_windowed_tensors(dataset).overnight_log_returns.shape[-1] == 29
     assert not dataset.overnight_log_returns_t[-1, :, 2].any(), "A margin sample boundary must retain marked positions"
+
+
+def test_account_only_day_does_not_change_market_risk_or_beta_windows(tmp_path):
+    from dataclasses import fields
+    from stockagent.data.tw_futures_account_calendar import build_futures_account_calendar
+
+    panel, rows = rule_panel(tmp_path)
+    source = Path(panel.stock_context_futures_portfolio_daily.source_path)
+    frame = pl.read_parquet(source).with_columns(
+        pl.lit(True).alias("source_row_observed"),
+        pl.lit(True).alias("same_contract_as_previous_session"),
+        pl.Series("taifex_settlement_logret_1d", [.05, 9., .06]),
+    )
+    prior = frame.head(1).with_columns(
+        pl.lit(date(2025, 12, 31)).alias("date"),
+        pl.lit(.04).alias("taifex_settlement_logret_1d"),
+    )
+    pl.concat((prior, frame)).write_parquet(source)
+    previous_rule = dict(rows[0], date=date(2025, 12, 31),
+        known_at="2025-12-30T00:00:00+08:00", effective_at="2025-12-30T00:00:00+08:00",
+        settlement_known_at="2025-12-30T00:00:00+08:00",
+        settlement_effective_at="2025-12-30T00:00:00+08:00")
+    path = write_rules(tmp_path, panel, [previous_rule, *rows])
+    daily = replace(panel.stock_context_futures_portfolio_daily,
+        benchmark_log_returns=np.asarray([.02, 9., .03], np.float32),
+        benchmark_observed_returns_mask=np.asarray([True, False, True]))
+    panel = replace(panel, stock_context_futures_portfolio_daily=daily)
+    calendar = build_futures_account_calendar(panel.dates[[0, 2]], panel.dates, [False, True, False])
+    kwargs = dict(benchmark_mode="tx_front_rolling_1x_gross", include_margin_amount=True,
+        include_account_policy_observations=True, include_beta_observation=True,
+        include_residual_signals=True, account_policy_lookback=2)
+    expanded = m.attach_futures_margin_rules(panel, path, futures_account_calendar=calendar, **kwargs)
+    sliced_fields = {}
+    for field in fields(daily):
+        value = getattr(daily, field.name)
+        if isinstance(value, np.ndarray) and value.shape[:1] == (3,):
+            sliced_fields[field.name] = value[[0, 2]]
+    market_panel = replace(panel, dates=panel.dates[[0, 2]],
+        stock_context_futures_portfolio_daily=replace(daily, **sliced_fields))
+    market_only = m.attach_futures_margin_rules(market_panel, path, **kwargs)
+    full_features = expanded.stock_context_futures_portfolio_daily.candidate_features
+    market_features = market_only.stock_context_futures_portfolio_daily.candidate_features
+    np.testing.assert_allclose(full_features[[0, 2]], market_features, rtol=0, atol=0)
+    # Risk columns follow margin context and precede beta/residual signals.
+    risk_index = len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS) + 3
+    assert full_features[2, 0, risk_index] == pytest.approx(.05)
+    assert full_features[2, 0, risk_index + 1] == pytest.approx(.5)
 
 
 @pytest.mark.parametrize('reported_volume', [None, 100.])

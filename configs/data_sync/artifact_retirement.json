@@ -2,6 +2,7 @@
   "schema_version": 1,
   "authority_node_id": "penguin",
   "required_peer_names": [],
+  "closed_source_raw_datasets": ["cftc-legacy-pre2000"],
   "scheduled_datasets": [
     "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9b7356396ce1b5cd",
     "artifact-auto-bybit-perpetual-daily-multi-basis-projec-9a43064c449d8429",

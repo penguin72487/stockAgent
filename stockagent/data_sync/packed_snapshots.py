@@ -15,6 +15,7 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -61,6 +62,10 @@ PACK_WRITE_BUFFER_BYTES = 8 * 1024 * 1024
 METADATA_MEMORY_ROWS = DEFAULT_METADATA_MEMORY_ROWS
 MATERIALIZE_FSYNC_WORKERS = 4
 MIN_PARALLEL_FSYNC_FILES = 128
+OBJECT_PRESENCE_WORKERS = 32
+MIN_PARALLEL_OBJECT_REFERENCES = 128
+OBJECT_PRESENCE_BATCH_REFERENCES = 128
+MATERIALIZED_VERIFY_BATCH_ROWS = 64
 PACKED_ARCHIVE_FORMAT = "stockagent-path-bucket-zip-v1"
 CHUNKED_SNAPSHOT_SCHEMA_VERSION = 2
 CHUNKED_ARCHIVE_FORMAT = "stockagent-chunked-path-bucket-zip-v2"
@@ -69,6 +74,9 @@ MAX_FILE_CHUNK_BYTES = 64 * 1024 * 1024
 MIN_NATIVE_CHUNK_STREAM_BYTES = 64 * 1024 * 1024
 MIN_NATIVE_MATERIALIZED_STAGE_BYTES = 64 * 1024 * 1024
 MAX_NATIVE_MATERIALIZED_STAGE_BYTES = 8 * 1024**3
+MAX_NATIVE_HASH_MEMBER_BYTES = 8 * 1024**3
+MAX_NATIVE_HASH_BATCH_BYTES = 16 * 1024**3
+MAX_NATIVE_SOURCE_HASH_FILES = 16
 INVENTORY_FORMAT = "jsonl-gzip-v1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRIVATE_STAGING_RULES = frozenset({"artifact_io_atomic_sibling_v1", "finmind_parquet_promote_v1",
@@ -164,6 +172,23 @@ class _SourceEntry:
         elif self.kind == "symlink":
             row["target"] = self.target
         return row
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class RetainedSourceFiles:
+    """An explicit same-dataset fixed history, never a moving source head.
+
+    The publisher revalidates these originals, their inventory and generations.
+    Constructing this request does not grant source-retirement permission.
+    """
+
+    release: ResolvedSnapshot
+    names: tuple[str, ...]
+    maximum_bytes: int
+    maximum_object_bytes: int
+    # Only a live decoder result can avoid repeating that same read. It is
+    # never serialized, accepted from disk or substituted by storage hints.
+    _verified_read: _VerifiedPackedFiles | None = dataclasses.field(default=None, repr=False, compare=False)
 
 
 def _entry_record(entry: _SourceEntry) -> dict:
@@ -933,6 +958,54 @@ class _SeekablePackBuffer:
         return None
 
 
+_PACK_PREFETCH_MAX_MEMBER_BYTES = 8 * 1024 * 1024
+
+
+@contextlib.contextmanager
+def _pack_source_inputs(source: Path, entries: Iterable[_SourceEntry], workers: int):
+    """Read a bounded number of small files concurrently, in archive order.
+
+    Each read retains the original descriptor and source-generation checks.
+    The caller rechecks the source path after writing each prefetched member.
+    Large files and atomic control observations keep the streaming path.
+    """
+    if workers == 1:
+        yield ((entry, None) for entry in entries)
+        return
+
+    def read_exact(entry):
+        with _open_source_entry(source, entry) as stream:
+            payload = stream.read(entry.size + 1)
+            if len(payload) != entry.size:
+                raise SnapshotError(f"source file length changed while packing: {_entry_read_path(source, entry)}")
+        return payload, hashlib.sha256(payload).hexdigest()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = deque()
+        iterator = iter(entries)
+
+        def enqueue(entry):
+            eligible = (not entry.atomic_json_control
+                        and 0 <= entry.size <= _PACK_PREFETCH_MAX_MEMBER_BYTES)
+            return entry, pool.submit(read_exact, entry) if eligible else None
+
+        def ordered():
+            for _ in range(workers):
+                try:
+                    pending.append(enqueue(next(iterator)))
+                except StopIteration:
+                    break
+            while pending:
+                entry, future = pending.popleft()
+                yield entry, None if future is None else future.result()
+                try:
+                    pending.append(enqueue(next(iterator)))
+                except StopIteration:
+                    pass
+
+        yield ordered()
+
+
 def _write_pack(
     source: Path,
     entries: Iterable[_SourceEntry],
@@ -940,8 +1013,11 @@ def _write_pack(
     *,
     compression_level: int,
     on_entry: Callable[[_SourceEntry], None] | None = None,
+    source_workers: int = 1,
 ) -> str | None:
-    with temporary.open("xb", buffering=0) as stream:
+    if type(source_workers) is not int or not 1 <= source_workers <= 16:
+        raise ValueError("pack source workers must be an integer from 1 through 16")
+    with temporary.open("xb", buffering=0) as stream, _pack_source_inputs(source, entries, source_workers) as inputs:
         buffered = _SeekablePackBuffer(stream)
         with zipfile.ZipFile(
             buffered,
@@ -950,7 +1026,7 @@ def _write_pack(
             compresslevel=compression_level,
             allowZip64=True,
         ) as archive:
-            for entry in entries:
+            for entry, prefetched in inputs:
                 source_path = _entry_read_path(source, entry)
                 if entry.atomic_json_control:
                     raw = _read_atomic_json_control(source, entry)
@@ -960,19 +1036,26 @@ def _write_pack(
                     if on_entry is not None:
                         on_entry(entry)
                     continue
-                digest = hashlib.sha256()
-                with (
-                    _open_source_entry(source, entry) as input_stream,
-                    archive.open(
-                        _zip_info(entry), mode="w", force_zip64=True
-                    ) as output_stream,
-                ):
-                    while block := input_stream.read(8 * 1024 * 1024):
-                        digest.update(block)
-                        output_stream.write(block)
-                if entry.sha256 is not None and entry.sha256 != digest.hexdigest():
+                if prefetched is None:
+                    digest = hashlib.sha256()
+                    with (
+                        _open_source_entry(source, entry) as input_stream,
+                        archive.open(
+                            _zip_info(entry), mode="w", force_zip64=True
+                        ) as output_stream,
+                    ):
+                        while block := input_stream.read(8 * 1024 * 1024):
+                            digest.update(block)
+                            output_stream.write(block)
+                    observed_digest = digest.hexdigest()
+                else:
+                    payload, observed_digest = prefetched
+                    with archive.open(_zip_info(entry), mode="w", force_zip64=True) as output_stream:
+                        output_stream.write(payload)
+                    _ensure_source_stat(source_path, entry)
+                if entry.sha256 is not None and entry.sha256 != observed_digest:
                     raise SnapshotError(f"source file changed while packing: {source_path}")
-                entry.sha256 = digest.hexdigest()
+                entry.sha256 = observed_digest
                 if on_entry is not None:
                     on_entry(entry)
         return buffered.complete_sha256()
@@ -994,6 +1077,84 @@ def _hash_source_entry(source: Path, entry: _SourceEntry, *, native_d_io: bool =
                 value.update(block)
         digest = value.hexdigest()
     return digest
+
+
+def _hash_source_batch(source: Path, batch: list[_SourceEntry]) -> None:
+    """Hash complete originals through one native child, then accept the batch.
+
+    Keep every no-follow Linux descriptor until native EOF/exit, physical
+    authority and both source generations pass. No partial batch can supply a
+    reuse proof. This retains the original bytes; it is not a content cache.
+    """
+    if len(batch) == 1:
+        batch[0].sha256 = _hash_source_entry(source, batch[0], native_d_io=True)
+        return
+    from stockagent.data_sync.windows_cold_io import binary_reader_many
+    digests = []
+    with contextlib.ExitStack() as opened:
+        members = []
+        for entry in batch:
+            opened.enter_context(_open_source_entry(source, entry))
+            members.append((_entry_read_path(source, entry), entry.size))
+        with binary_reader_many(members) as stream:
+            for path, count in members:
+                digest = hashlib.sha256()
+                remaining = count
+                while remaining:
+                    block = stream.read(min(8 * 1024**2, remaining))
+                    if not block:
+                        raise SnapshotError(f"truncated native source batch: {path}")
+                    remaining -= len(block)
+                    digest.update(block)
+                digests.append(digest.hexdigest())
+            if stream.read(1):
+                raise SnapshotError("native source batch has excess bytes")
+    for entry, digest in zip(batch, digests, strict=True):
+        entry.sha256 = digest
+
+
+def _publication_file_routes(source, entries, previous_files, *, previous,
+                             file_chunk_bytes, file_chunking, loose_file_threshold_bytes,
+                             native_d_io):
+    """Consume hints once, batching only files which require a complete hash.
+
+    First-baseline small files still hash once while packing. Chunked files
+    still use their existing one-pass writer, and atomic controls retain their
+    original snapshot semantics. Other namespaces keep the portable reader.
+    """
+    pending, pending_bytes = [], 0
+    for entry in entries:
+        if entry.kind != "file":
+            continue
+        prior = previous_files.take_file_hint(entry.path)
+        prior_storage = prior.get("storage") if prior else None
+        one_pass = (not entry.atomic_json_control and file_chunk_bytes is not None and entry.size > file_chunk_bytes
+            and entry.size >= loose_file_threshold_bytes
+            and (prior is None or int(prior.get("size", -1)) != entry.size
+                 or (isinstance(prior_storage, Mapping) and prior_storage.get("kind") == "chunks"
+                     and previous is not None
+                     and previous.manifest["archive"].get("file_chunking", "fixed-v1") == file_chunking
+                     and previous.manifest["archive"].get("file_chunk_bytes") == file_chunk_bytes)))
+        new_small_file = prior is None and (entry.atomic_json_control or entry.size < loose_file_threshold_bytes)
+        route = (entry, prior, new_small_file, one_pass)
+        eligible = (native_d_io and not new_small_file and not one_pass and not entry.atomic_json_control
+                    and 0 <= entry.size <= MAX_NATIVE_HASH_MEMBER_BYTES)
+        if eligible:
+            from stockagent.data_sync.windows_cold_io import windows_path
+            eligible = windows_path(_entry_read_path(source, entry)) is not None
+        if pending and (not eligible or len(pending) == MAX_NATIVE_SOURCE_HASH_FILES
+                        or pending_bytes + entry.size > MAX_NATIVE_HASH_BATCH_BYTES):
+            _hash_source_batch(source, [row[0] for row in pending])
+            yield from (row + (True,) for row in pending)
+            pending, pending_bytes = [], 0
+        if eligible:
+            pending.append(route)
+            pending_bytes += entry.size
+        else:
+            yield (*route, False)
+    if pending:
+        _hash_source_batch(source, [row[0] for row in pending])
+        yield from (row + (True,) for row in pending)
 
 
 def _is_ordered_subset(selected: list[str], available: list[str]) -> bool:
@@ -1272,10 +1433,41 @@ def _validate_manifest(manifest: Mapping[str, Any], *,
     return stamp
 
 
+def _collect_object_signatures(paths, *, progress=None, stage='capture-cold-object-generations'):
+    """Read every before/after generation with bounded, ordered metadata I/O."""
+    paths = tuple(paths)
+    signatures = {}
+
+    def capture(path):
+        return path, path.lstat()
+
+    def report():
+        if progress is not None:
+            progress({'stage': stage, 'completed_items': len(signatures),
+                      'total_items': len(paths), 'completed_bytes': 0,
+                      'total_bytes': 0, 'metadata_only': True})
+
+    report()
+    if len(paths) < MIN_PARALLEL_OBJECT_REFERENCES:
+        signatures.update(map(capture, paths))
+        report()
+        return signatures
+
+    pending = iter(paths)
+    with ThreadPoolExecutor(
+        max_workers=OBJECT_PRESENCE_WORKERS, thread_name_prefix='packed-signature'
+    ) as pool:
+        while batch := tuple(itertools.islice(pending, OBJECT_PRESENCE_BATCH_REFERENCES)):
+            signatures.update(pool.map(capture, batch))
+            report()
+    return signatures
+
+
 def _validate_object_presence(sync_root: Path, manifest: Mapping[str, Any]) -> None:
     archive = manifest["archive"]
-    references = [archive["inventory"], *archive["objects"]]
-    for item in references:
+    references = itertools.chain((archive["inventory"],), archive["objects"])
+
+    def validate(item: Mapping[str, Any]) -> None:
         path = _path_under(sync_root, str(item["relpath"]), "object relpath")
         try:
             size = path.stat().st_size
@@ -1288,6 +1480,21 @@ def _validate_object_presence(sync_root: Path, manifest: Mapping[str, Any]) -> N
                 f"snapshot object size mismatch for {path}: "
                 f"expected {item['bytes']}, got {size}"
             )
+
+    if len(archive["objects"]) + 1 < MIN_PARALLEL_OBJECT_REFERENCES:
+        for item in references:
+            validate(item)
+        return
+
+    # DrvFs metadata calls spend most of their time waiting for the host. Keep
+    # a bounded window of read-only checks and consume errors in manifest order.
+    # This preflight never replaces the subsequent full payload SHA/recovery.
+    with ThreadPoolExecutor(
+        max_workers=OBJECT_PRESENCE_WORKERS, thread_name_prefix="packed-presence"
+    ) as pool:
+        while batch := tuple(itertools.islice(references, OBJECT_PRESENCE_BATCH_REFERENCES)):
+            for _ in pool.map(validate, batch):
+                pass
 
 
 def _head_candidates(
@@ -1701,6 +1908,7 @@ def publish_packed_snapshot(
     d_primary_native_blob_writes: bool = False,
     d_primary_native_chunk_reuse: bool = False,
     d_primary_native_chunk_reuse_pipeline: bool = False,
+    pack_source_workers: int = 1,
     file_chunk_bytes: int | None = None,
     publication_lock_nonblocking: bool = False,
     file_chunking: str | None = None,
@@ -1712,6 +1920,7 @@ def publish_packed_snapshot(
     progress: Callable[[dict[str, Any]], None] | None = None,
     private_staging_file_rules: Iterable[str] = (),
     sealed_pack_hints: Any | None = None,
+    retained_source_files: RetainedSourceFiles | None = None,
 ) -> ResolvedSnapshot:
     sync_root = sync_root.resolve()
     source = source.resolve()
@@ -1724,6 +1933,8 @@ def publish_packed_snapshot(
         raise SnapshotError('atomic JSON observations require an explicit private cohort')
     if type(d_primary_native_blob_reads) is not bool:
         raise SnapshotError("d_primary_native_blob_reads must be an explicit boolean")
+    if type(pack_source_workers) is not int or not 1 <= pack_source_workers <= 16:
+        raise SnapshotError("pack source workers must be an integer from 1 through 16")
     if d_primary_native_blob_reads and sync_root != Path("/srv/stockagent-packed"):
         raise SnapshotError("native D blob reads require the canonical enrolled D store")
     if type(d_primary_native_chunk_reuse) is not bool:
@@ -1791,6 +2002,11 @@ def publish_packed_snapshot(
                 raise SnapshotError("frozen controls must be real private staging files outside source/cold")
     excluded = _normalize_excluded_subtrees(excluded_subtrees)
     included = _normalize_included_root_files(included_root_files)
+    if retained_source_files is not None and (
+            not isinstance(retained_source_files, RetainedSourceFiles)
+            or included is not None or maximum_file_bytes is not None
+            or recover_missing_base_objects):
+        raise SnapshotError("retained originals require an explicit complete source without omission/recovery filters")
     if included is not None and (excluded or maximum_file_bytes is not None):
         raise SnapshotError("explicit root files cannot be combined with omission filters")
     selected_options = {"included_root_files": included} if included is not None else {}
@@ -1838,6 +2054,10 @@ def publish_packed_snapshot(
             raise SnapshotError("selected snapshot source directory was replaced")
         if source_guard is not None:
             source_guard()
+        retained = None
+        if retained_source_files is not None:
+            retained = _prepare_retained_source_files(sync_root, dataset, source,
+                retained_source_files, entries, excluded_subtrees=excluded)
         staging_root = sync_root / ".local-state" / "staging"
         staging_root.mkdir(parents=True, exist_ok=True)
         previous: ResolvedSnapshot | None = None
@@ -1854,6 +2074,9 @@ def publish_packed_snapshot(
             )
             previous_files.extend(_iter_inventory(sync_root, previous.manifest))
             _validate_inventory(previous.manifest, previous_files, retain_object_members=False)
+            if (previous.manifest['source'].get('selection', {}).get('retained_source_contract')
+                    and retained is None):
+                raise SnapshotError('retained history cannot be dropped by a physical-workspace-only publication')
             previous_objects = {
                 str(item["sha256"]): dict(item)
                 for item in previous.manifest["archive"]["objects"]
@@ -1916,6 +2139,13 @@ def publish_packed_snapshot(
         # source extent is the same contract as whole-file no-op reuse. Full
         # cold-byte recovery verification remains a separate required gate.
         created_objects: dict[str, dict[str, Any]] = dict(previous_objects)
+        if retained is not None:
+            for digest, item in retained.objects.items():
+                existing = created_objects.get(digest)
+                if existing is not None and any(existing[key] != item[key]
+                        for key in ('kind', 'relpath', 'bytes')):
+                    raise SnapshotError('retained original object disagrees with the previous authority')
+                created_objects.setdefault(digest, dict(item))
         newly_installed_hashes: set[str] = set()
         chunk_verifier = (publication_locks.enter_context(_PipelinedChunkReuse(created_objects))
                           if d_primary_native_chunk_reuse_pipeline else None)
@@ -1934,27 +2164,20 @@ def publish_packed_snapshot(
                              if sealed_pack_hints is not None else {}),
                           "new_objects": len(newly_installed_hashes), "acceptance": False})
         report("routing_and_hashing", force=True)
-        for entry in entries:
-            if entry.kind != "file":
-                continue
+        for entry, prior, new_small_file, one_pass, source_hashed in _publication_file_routes(
+                source, entries, previous_files, previous=previous,
+                file_chunk_bytes=file_chunk_bytes, file_chunking=file_chunking,
+                loose_file_threshold_bytes=loose_file_threshold_bytes,
+                native_d_io=d_primary_native_blob_reads):
             censused_size = entry.size
             # Paths are unique and each hint is consumed once. Release its old
             # row as we go instead of retaining two full file inventories until
             # the final source has been hashed (which can force HDD swap).
-            prior = previous_files.take_file_hint(entry.path)
             prior_storage = prior.get("storage") if prior else None
             # A first baseline (or a size-changing file / already-chunked
             # version) need not read its entire source twice. Hash the complete
             # original AND every extent while installing missing bytes in one
             # bounded pass. Keep unchanged legacy blobs/packs unchanged.
-            one_pass = (not entry.atomic_json_control and file_chunk_bytes is not None and entry.size > file_chunk_bytes
-                and entry.size >= loose_file_threshold_bytes
-                and (prior is None or int(prior.get("size", -1)) != entry.size
-                     or (isinstance(prior_storage, Mapping) and prior_storage.get("kind") == "chunks"
-                         and previous is not None
-                         and previous.manifest["archive"].get("file_chunking", "fixed-v1") == file_chunking
-                         and previous.manifest["archive"].get("file_chunk_bytes") == file_chunk_bytes)))
-            new_small_file = prior is None and (entry.atomic_json_control or entry.size < loose_file_threshold_bytes)
             if new_small_file:
                 # No donor exists, so reading this file now cannot discover
                 # reuse. Its ONE complete SHA/read happens while writing ZIP,
@@ -1966,7 +2189,7 @@ def publish_packed_snapshot(
                     install_options=install_options, chunking=file_chunking,
                     native_existing_chunks=d_primary_native_chunk_reuse,
                     existing_chunk_verifier=chunk_verifier)
-            else:
+            elif not source_hashed:
                 entry.sha256 = _hash_source_entry(source, entry, native_d_io=d_primary_native_blob_reads)
             if entry.atomic_json_control:
                 before["logical_bytes"] += entry.size - censused_size
@@ -2105,7 +2328,7 @@ def publish_packed_snapshot(
                            phase_total=len(buckets))
                 temporary = staging_root / f"pack-{bucket:04d}-{uuid.uuid4().hex}.partial"
                 digest = _write_pack(source, bucket_entries, temporary, compression_level=compression_level,
-                                     on_entry=packed_entry)
+                                     on_entry=packed_entry, source_workers=pack_source_workers)
                 if digest is None:
                     digest = sha256_file(temporary)
                 relpath = _object_relpath("packs", digest, ".zip")
@@ -2173,19 +2396,23 @@ def publish_packed_snapshot(
                                 + b'\0' + extra.encode('utf-8', errors='surrogateescape') + b'\n')
             before['portable_fingerprint_sha256'] = portable.hexdigest()
 
-        report("committing_complete_inventory", force=True,
-               phase_completed=0, phase_total=len(entries))
-        inventory_temp = staging_root / f"inventory-{uuid.uuid4().hex}.partial"
-        def inventory_progress(completed):
-            report("committing_complete_inventory", phase_completed=completed, phase_total=len(entries))
-        inventory_sha = _write_inventory(inventory_temp, entries,
-            **({'progress': inventory_progress} if progress is not None else {}))
-        inventory_relpath = _object_relpath("inventories", inventory_sha, ".jsonl.gz")
-        inventory_path = sync_root.joinpath(*inventory_relpath.parts)
-        inventory_bytes = inventory_temp.stat().st_size
-        inventory_already_present = _install_immutable_object(
-            sync_root, inventory_temp, inventory_path, expected_sha256=inventory_sha, **install_options
-        )
+        def commit_inventory():
+            report("committing_complete_inventory", force=True,
+                   phase_completed=0, phase_total=len(entries))
+            temporary = staging_root / f"inventory-{uuid.uuid4().hex}.partial"
+            def inventory_progress(completed):
+                report("committing_complete_inventory", phase_completed=completed, phase_total=len(entries))
+            digest = _write_inventory(temporary, entries,
+                **({'progress': inventory_progress} if progress is not None else {}))
+            relative = _object_relpath("inventories", digest, ".jsonl.gz")
+            destination = sync_root.joinpath(*relative.parts)
+            size = temporary.stat().st_size
+            present = _install_immutable_object(
+                sync_root, temporary, destination, expected_sha256=digest, **install_options)
+            return digest, relative, size, present
+
+        if retained is None:
+            inventory_sha, inventory_relpath, inventory_bytes, inventory_already_present = commit_inventory()
 
         if private_observation_cohort:
             report("verifying_observation_cohort_stability", force=True,
@@ -2224,6 +2451,21 @@ def publish_packed_snapshot(
         # replaces, the complete inventory and source-stability checks above.
         if source_guard is not None:
             source_guard()
+        if retained is not None:
+            physical_counts = {key: before[key] for key in ('files', 'directories', 'symlinks', 'logical_bytes')}
+            _merge_retained_source_files(entries, before, retained)
+            inventory_sha, inventory_relpath, inventory_bytes, inventory_already_present = commit_inventory()
+            # The merge changes only the logical inventory. Check the original
+            # physical cohort again after metadata commit, plus its cold base.
+            if private_observation_cohort:
+                _guard_observation_cohort(source, retained.physical_entries, selected_root)
+            else:
+                _, current_physical = _collect_entries(source, excluded_subtrees=excluded, retain_entries=False)
+                if current_physical['stability_fingerprint_sha256'] != before['stability_fingerprint_sha256']:
+                    raise SnapshotError('physical source changed during retained-inventory commit')
+            retained.check_generation()
+            if source_guard is not None:
+                source_guard()
         report("source_fences_verified", force=True)
 
         if pending_directories:
@@ -2249,6 +2491,8 @@ def publish_packed_snapshot(
             == ('named_stable_fd_json_v2' if private_atomic_json_controls else None)
             and previous.manifest["source"].get("selection", {}).get("private_staging_file_rules", [])
             == list(staging_rules)
+            and previous.manifest['source'].get('selection', {}).get('retained_source_contract')
+            == ('bounded_raw_history_v1' if retained is not None else None)
             and (included is None or previous.manifest.get("metadata", {}) == dict(metadata or {}))
             and previous.manifest.get("metadata", {}).get("version_dependencies_sha256")
             == (metadata or {}).get("version_dependencies_sha256")
@@ -2353,6 +2597,16 @@ def publish_packed_snapshot(
                         'atomic_json_observations_sha256': observed_digest.hexdigest()}
                        if private_atomic_json_controls else {}),
                     **({"private_staging_file_rules": list(staging_rules)} if staging_rules else {}),
+                    **({'retained_source_contract': 'bounded_raw_history_v1',
+                        'retained_source_base': {
+                            'dataset': retained_source_files.release.manifest['dataset'],
+                            'snapshot_id': retained_source_files.release.manifest['snapshot_id'],
+                            'manifest_sha256': retained_source_files.release.manifest_sha256,
+                            'names_sha256': hashlib.sha256(_canonical_json_bytes(
+                                sorted(retained_source_files.names))).hexdigest(),
+                            'files': len(retained.entries)},
+                        'physical_workspace_counts': physical_counts}
+                       if retained is not None else {}),
                 },
                 **{
                     key: value
@@ -2449,6 +2703,12 @@ def _notify_packed_publication(
     defer_scan: bool = False, retry_full: bool = False,
 ) -> None:
     from stockagent.data_sync.syncthing_scan import queue_after_publish, scan_after_publish
+    from stockagent.data_sync.cold_tiers import enqueue
+
+    # Physical tiering is an independently scheduled consumer of immutable
+    # objects. Only a private local Penguin enrollment enables this metadata
+    # intent; publication never compresses or rewrites a historical object.
+    enqueue(sync_root, dataset, new_object_paths)
 
     if defer_scan:
         # The caller can release its source lease only after this durable
@@ -2635,6 +2895,29 @@ def _validate_inventory(
             "chunk_only_objects": chunk_objects - direct_blob_objects}
 
 
+# Original financial releases have 134--199 MB packs. A 128 MiB bound sends
+# even a 134,390,589-byte pack back to DrvFs seeks on a full SSD. Keep a fixed
+# 256 MiB ceiling, one context-owned pack, and the observed 4x-plus-512-MiB
+# headroom gate below; never reserve SSD staging or retain a second raw tree.
+MAX_NATIVE_PACK_BUFFER_BYTES = 256 * 1024**2
+
+
+def _native_pack_buffer_allowed(path: Path, count: int) -> bool:
+    """Use observed host AND visible ancestor cgroup headroom, or keep streaming.
+
+    The allowance covers native read buffers, BytesIO growth and the decoder;
+    only one pack is retained. Missing capacity/dependency metadata is not RAM.
+    """
+    if not 1024**2 < count <= MAX_NATIVE_PACK_BUFFER_BYTES:
+        return False
+    try:
+        from stockagent.remote_build import observe_node
+        available = observe_node(path.parent, path.parent)['limits']['memory_headroom_bytes']
+        return type(available) is int and available >= 4 * count + 512 * 1024**2
+    except (ImportError, OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 @contextlib.contextmanager
 def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool,
                         prefer_memory: bool = True):
@@ -2674,8 +2957,43 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool,
         if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
             raise SnapshotError('native pack changed during reconstruction')
         return
+    if prefer_memory and _native_pack_buffer_allowed(path, expected_bytes):
+        # A real 73 MiB / 405-original pack measured 5.94 -> 3.00 seconds in
+        # complete SHA/size reconstruction ABBA on the shared penguin host.
+        # Native sequential I/O avoids low-SSD fallback's repeated DrvFS ZIP
+        # seeks. This is bounded transient RAM, never C staging or a cache.
+        with io.BytesIO() as buffer:
+            digest, total = hashlib.sha256(), 0
+            with binary_reader(path, expected_bytes=expected_bytes) as source:
+                while block := source.read(8 * 1024**2):
+                    total += len(block)
+                    if total > expected_bytes:
+                        raise SnapshotError('native pack changed while reading')
+                    digest.update(block)
+                    buffer.write(block)
+            # Native child exit, EOF and source identity must pass BEFORE
+            # exposing even an apparently valid buffer to a ZIP consumer.
+            if (total != expected_bytes or digest.hexdigest() != item['sha256']
+                    or (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint):
+                raise SnapshotError('native pack checksum or immutable source signature differs')
+            buffer.seek(0)
+            yield buffer
+            if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
+                raise SnapshotError('native pack changed during reconstruction')
+        return
     scratch_root = Path("/var/lib")
-    if shutil.disk_usage(scratch_root).free < expected_bytes + 32 * 1024**3:
+    scratch_required = expected_bytes + 32 * 1024**3
+    scratch_available = shutil.disk_usage(scratch_root).free >= scratch_required
+    if scratch_available:
+        from stockagent.data_sync.windows_cold_io import admit_workspace, WorkspaceCapacityDeferred
+        try:
+            admit_workspace(scratch_root, scratch_required)
+        except WorkspaceCapacityDeferred:
+            # A large WSL virtual disk can still have a full physical backing
+            # drive. Only this verified capacity refusal permits the existing
+            # no-scratch path; unknown backing, authority and I/O errors fail.
+            scratch_available = False
+    if not scratch_available:
         # SSD staging is an optimization, not a prerequisite for recovery/GC.
         # With a full SSD use the portable seekable D reader, after a complete
         # native SHA pass, and retain the same immutable-generation fences.
@@ -2687,8 +3005,6 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool,
         if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
             raise SnapshotError("native pack changed during reconstruction")
         return
-    from stockagent.data_sync.windows_cold_io import admit_workspace
-    admit_workspace(scratch_root, expected_bytes + 32 * 1024**3)
     with tempfile.TemporaryFile(dir=scratch_root) as scratch:
         digest, total = hashlib.sha256(), 0
         with binary_reader(path) as source:
@@ -2707,10 +3023,6 @@ def _native_pack_source(path: Path, item: Mapping[str, Any], *, enabled: bool,
         yield scratch
         if (_source_stat(path.lstat()), path.lstat().st_nlink) != fingerprint:
             raise SnapshotError("native pack changed during reconstruction")
-
-
-MAX_NATIVE_HASH_MEMBER_BYTES = 8 * 1024**3
-MAX_NATIVE_HASH_BATCH_BYTES = 16 * 1024**3
 
 
 def _native_blob_hash_batches(members):
@@ -2738,12 +3050,14 @@ def verify_packed_snapshot(
     d_primary_native_pack_reads: bool = False,
     d_primary_native_chunk_reads: bool = False,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    materialized_file_workers: int = 1,
 ) -> dict[str, Any]:
     with _verified_packed_inventory(sync_root, resolved, materialized_path=materialized_path,
             reconstruct_paths=reconstruct_paths, reconstruct_all=reconstruct_all,
             d_primary_native_blob_reads=d_primary_native_blob_reads,
             d_primary_native_pack_reads=d_primary_native_pack_reads,
-            d_primary_native_chunk_reads=d_primary_native_chunk_reads, progress=progress) as (_, proof):
+            d_primary_native_chunk_reads=d_primary_native_chunk_reads, progress=progress,
+            materialized_file_workers=materialized_file_workers) as (_, proof):
         return proof
 
 
@@ -2751,7 +3065,8 @@ def verify_packed_snapshot(
 def _verified_packed_inventory(sync_root, resolved, *, materialized_path=None,
                                 reconstruct_paths=None, reconstruct_all=False,
                                 d_primary_native_blob_reads=False, d_primary_native_pack_reads=False,
-                                progress=None, d_primary_native_chunk_reads=False):
+                                progress=None, d_primary_native_chunk_reads=False,
+                                materialized_file_workers=1):
     sync_root = sync_root.resolve()
     if type(reconstruct_all) is not bool or (reconstruct_all and reconstruct_paths is not None):
         raise SnapshotError("choose either all-file or explicit-path reconstruction")
@@ -2774,7 +3089,8 @@ def _verified_packed_inventory(sync_root, resolved, *, materialized_path=None,
             materialized_path=materialized_path, reconstruct_paths=reconstruct_paths,
             reconstruct_all=reconstruct_all, d_primary_native_blob_reads=d_primary_native_blob_reads,
             d_primary_native_pack_reads=d_primary_native_pack_reads,
-            d_primary_native_chunk_reads=d_primary_native_chunk_reads, progress=progress)
+            d_primary_native_chunk_reads=d_primary_native_chunk_reads, progress=progress,
+            materialized_file_workers=materialized_file_workers)
         yield entries, proof
 
 
@@ -2804,7 +3120,7 @@ def _check_native_pack_read_authority(sync_root: Path) -> None:
 def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
                              reconstruct_paths, reconstruct_all,
                              d_primary_native_blob_reads, d_primary_native_pack_reads, progress,
-                             d_primary_native_chunk_reads=False):
+                             d_primary_native_chunk_reads=False, materialized_file_workers=1):
     manifest = resolved.manifest
     inventory_result = _validate_inventory(manifest, entries)
     object_count = len(manifest['archive']['objects'])
@@ -2836,14 +3152,21 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
     # Objects also serving a direct blob retain the existing first-pass proof.
     deferred_objects = inventory_result['chunk_only_objects'] if reconstruct_all else set()
     pending_objects = set(deferred_objects)
-    deferred_signatures = {}
+    # Capture all deferred generations before any payload is exposed. Parallel
+    # metadata I/O does not admit a chunk: each full SHA and the final seven-field
+    # generation comparison below remain required for reconstruction acceptance.
+    deferred_signatures = _collect_object_signatures(
+        [_path_under(sync_root, str(item['relpath']), 'object relpath')
+         for item in manifest['archive']['objects'] if item['sha256'] in deferred_objects],
+        progress=progress, stage='capture-cold-chunk-generations')
     if d_primary_native_blob_reads:
         from stockagent.data_sync.windows_cold_io import hash_many, _stable
         blob_members = [(_path_under(sync_root, str(item['relpath']), 'object relpath'), int(item['bytes']))
                         for item in manifest['archive']['objects']
                         if item['kind'] == 'blob' and item['sha256'] not in deferred_objects]
         blob_paths = [path for path, count in blob_members if count <= MAX_NATIVE_HASH_MEMBER_BYTES]
-        native_blob_signatures = {path: path.lstat() for path in blob_paths}
+        native_blob_signatures = _collect_object_signatures(
+            blob_paths, progress=progress, stage='capture-cold-blob-generations')
         hashed_bytes = 0
         hash_bytes = sum(count for _, count in blob_members if count <= MAX_NATIVE_HASH_MEMBER_BYTES)
         # Keep every full object hash and native before/after signature gate;
@@ -2862,7 +3185,6 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
     for item in manifest["archive"]["objects"]:
         path = _path_under(sync_root, str(item["relpath"]), "object relpath")
         if item['sha256'] in deferred_objects:
-            deferred_signatures[path] = path.lstat()
             continue  # Not counted as verified until _iter_chunked_file accepts it.
         # Packs are already size-checked above.  For a bounded pack, use the
         # same immutable bytes for SHA-256 and ZIP CRC instead of reading the
@@ -3027,8 +3349,11 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
     if pending_objects or verified_objects != object_count or verified_bytes != object_bytes:
         raise SnapshotError('not every cold object was independently verified')
     from stockagent.data_sync.windows_cold_io import _stable
-    if any(not _stable(before, path.lstat()) for path, before in deferred_signatures.items()):
-        raise SnapshotError('cold chunk changed during fused original reconstruction')
+    if deferred_signatures:
+        after = _collect_object_signatures(deferred_signatures, progress=progress,
+                                          stage='recheck-cold-chunk-generations')
+        if any(not _stable(before, after[path]) for path, before in deferred_signatures.items()):
+            raise SnapshotError('cold chunk changed during fused original reconstruction')
     if deferred_objects and progress is not None:
         progress({'stage': 'verify-cold-objects', 'completed_items': verified_objects,
                   'total_items': object_count, 'completed_bytes': verified_bytes, 'total_bytes': object_bytes})
@@ -3053,7 +3378,12 @@ def _verify_packed_inventory(sync_root, resolved, entries, *, materialized_path,
             'redundant_cold_read_bytes_avoided': sum(int(objects[digest]['bytes']) for digest in deferred_objects),
         }
     if materialized_path is not None:
-        _verify_materialized(materialized_path, manifest, entries)
+        if progress is None:
+            _verify_materialized(materialized_path, manifest, entries,
+                                 file_workers=materialized_file_workers)
+        else:
+            _verify_materialized(materialized_path, manifest, entries, progress=progress,
+                                 file_workers=materialized_file_workers)
         result["materialized_verified"] = True
     if any(not _stable(before, path.lstat()) for path, before in native_blob_signatures.items()):
         raise SnapshotError('native cold blob changed during release verification')
@@ -3203,6 +3533,20 @@ class _FileDurabilityQueue:
             raise failure
 
 
+def _verified_member_blocks(input_stream: Any, expected_size: int, expected_sha256: str, *, label=None):
+    """One bounded original-byte/SHA oracle for memory reads and extraction."""
+    digest = hashlib.sha256()
+    copied = 0
+    while block := input_stream.read(min(8 * 1024 * 1024, expected_size - copied + 1)):
+        copied += len(block)
+        if copied > expected_size:
+            raise SnapshotError("extracted file exceeds admitted size" + (f": {label}" if label is not None else ""))
+        digest.update(block)
+        yield block
+    if copied != expected_size or digest.hexdigest() != expected_sha256:
+        raise SnapshotError("extracted file checksum mismatch" + (f": {label}" if label is not None else ""))
+
+
 def _copy_member_and_verify(
     input_stream: Any,
     destination: Path,
@@ -3215,20 +3559,12 @@ def _copy_member_and_verify(
 ) -> None:
     if type(durable) is not bool:
         raise SnapshotError("member durability requires an explicit boolean")
-    digest = hashlib.sha256()
-    copied = 0
     with destination.open("xb") as output_stream:
         # A source that grows after verification must not exceed the caller's
         # admitted growth. Probe at most one extra byte, never write it.
-        while block := input_stream.read(min(8 * 1024 * 1024, expected_size - copied + 1)):
-            copied += len(block)
-            if copied > expected_size:
-                raise SnapshotError(f"extracted file exceeds admitted size: {destination}")
-            digest.update(block)
+        for block in _verified_member_blocks(input_stream, expected_size, expected_sha256, label=destination):
             output_stream.write(block)
         output_stream.flush()
-        if copied != expected_size or digest.hexdigest() != expected_sha256:
-            raise SnapshotError(f"extracted file checksum mismatch: {destination}")
         # Persist bytes and their final mode with ONE barrier, not a second
         # fsync after path-based chmod. Failed members are never committed.
         os.fchmod(output_stream.fileno(), mode)
@@ -3261,7 +3597,7 @@ def _materialize_regular_files(
 
 def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
                                 d_primary_native_blob_reads, d_primary_native_pack_reads,
-                                durable, on_copy, durability_queue):
+                                durable, on_copy, durability_queue, consume_file=None):
     """One byte-copy engine for complete trees and bounded flat staging.
 
     Callers first validate the entire fixed release and prepare their own path
@@ -3271,18 +3607,25 @@ def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
     objects = {str(item["sha256"]): item for item in manifest["archive"]["objects"]}
     blobs: dict[str, list[dict[str, Any]]] = {}
     packs: dict[str, list[dict[str, Any]]] = {}
+
+    def consume(input_stream, row):
+        if consume_file is None:
+            _copy_member_and_verify(input_stream, destination_for(row),
+                                    expected_size=int(row["size"]),
+                                    expected_sha256=str(row["sha256"]), mode=int(row["mode"]),
+                                    durable=durable, durability_queue=durability_queue)
+        else:
+            consume_file(input_stream, row)
+        if on_copy is not None:
+            on_copy(row)
+
     for row in entries.chunked_rows() if isinstance(entries, MetadataRows) else entries:
         if row["kind"] == "file":
             if row["storage"]["kind"] == "chunks":
                 with contextlib.closing(_ChunkedFileReader(_iter_chunked_file(
                     sync_root, objects, row, native=d_primary_native_blob_reads
                 ))) as input_stream:
-                    _copy_member_and_verify(input_stream, destination_for(row),
-                                            expected_size=int(row["size"]),
-                                            expected_sha256=str(row["sha256"]), mode=int(row["mode"]),
-                                            durable=durable, durability_queue=durability_queue)
-                if on_copy is not None:
-                    on_copy(row)
+                    consume(input_stream, row)
                 continue
             if not isinstance(entries, MetadataRows):
                 groups = blobs if row["storage"]["kind"] == "blob" else packs
@@ -3297,7 +3640,7 @@ def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
         object_path = _path_under(sync_root, str(objects[object_sha]["relpath"]), "object relpath")
         verified_source = None
         for row in rows:
-            path = destination_for(row)
+            path = destination_for(row) if consume_file is None else None
             if verified_source is not None:
                 reader = verified_source.open("rb")
             elif d_primary_native_blob_reads:
@@ -3306,12 +3649,8 @@ def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
             else:
                 reader = object_path.open("rb")
             with reader as input_stream:
-                _copy_member_and_verify(input_stream, path, expected_size=int(row["size"]),
-                                        expected_sha256=str(row["sha256"]), mode=int(row["mode"]),
-                                        durable=durable, durability_queue=durability_queue)
-            if on_copy is not None:
-                on_copy(row)
-            if verified_source is None and int(row["mode"]) & stat.S_IRUSR:
+                consume(input_stream, row)
+            if path is not None and verified_source is None and int(row["mode"]) & stat.S_IRUSR:
                 verified_source = path
     for object_sha, rows in packs.items():
         item = objects[object_sha]
@@ -3320,12 +3659,7 @@ def _materialize_indexed_files(sync_root, manifest, entries, destination_for, *,
                 zipfile.ZipFile(source, mode="r") as archive:
             for row in rows:
                 with archive.open(str(row["storage"]["member"]), mode="r") as input_stream:
-                    _copy_member_and_verify(input_stream, destination_for(row),
-                                            expected_size=int(row["size"]),
-                                            expected_sha256=str(row["sha256"]), mode=int(row["mode"]),
-                                            durable=durable, durability_queue=durability_queue)
-                if on_copy is not None:
-                    on_copy(row)
+                    consume(input_stream, row)
 
 
 def _materialized_file_sha256(path: Path, expected_bytes: int) -> str:
@@ -3361,8 +3695,45 @@ def _verify_materialized(
     materialized_path: Path,
     manifest: Mapping[str, Any],
     entries: Iterable[dict[str, Any]],
+    *,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+    stage: str = 'verify-materialized',
+    file_workers: int = 1,
 ) -> None:
-    for row in entries:
+    if type(file_workers) is not int or not 1 <= file_workers <= 4:
+        raise ValueError('materialized verification workers must be between 1 and 4')
+    source = manifest['source']
+    total_files = source.get('files')
+    total_bytes = source.get('logical_bytes')
+    if type(total_files) is not int or total_files < 0:
+        total_files = None
+    if type(total_bytes) is not int or total_bytes < 0:
+        total_bytes = None
+    entry_counts = [source.get(key) for key in ('files', 'directories', 'symlinks')]
+    total_entries = sum(entry_counts) if all(type(count) is int and count >= 0 for count in entry_counts) else None
+    completed_files = completed_bytes = 0
+    last_progress = time.monotonic() if progress is not None else None
+    large_file_lock = threading.Lock()
+
+    def report_files():
+        progress({'stage': f'{stage}-files', 'completed_items': completed_files,
+                  'total_items': total_files, 'completed_bytes': completed_bytes,
+                  'total_bytes': total_bytes, 'item_scope': 'regular_files_hashed',
+                  'acceptance_proof': False})
+
+    def report_tree(value, *, matched=False):
+        observed = value['files'] + value['directories'] + value['symlinks']
+        # An unexpected entry or byte count is evidence of drift, not 100%.
+        progress({'stage': f'{stage}-tree', 'completed_items': observed,
+                  'total_items': total_entries if total_entries is not None and observed <= total_entries else None,
+                  'completed_bytes': value['logical_bytes'],
+                  'total_bytes': total_bytes if total_bytes is not None and value['logical_bytes'] <= total_bytes else None,
+                  'item_scope': 'filesystem_entries_observed', 'metadata_only': True,
+                  'fingerprint_matched': matched, 'acceptance_proof': False})
+
+    if progress is not None:
+        report_files()
+    def verify_row(row):
         path = materialized_path.joinpath(*PurePosixPath(row["path"]).parts)
         kind = row["kind"]
         if kind == "directory" and not path.is_dir():
@@ -3371,17 +3742,59 @@ def _verify_materialized(
             if not path.is_symlink() or os.readlink(path) != row["target"]:
                 raise SnapshotError(f"materialized symlink differs: {path}")
         if kind == "file":
-            if not path.is_file() or path.stat().st_size != int(row["size"]):
+            try:
+                info = path.stat()
+            except OSError as error:
+                raise SnapshotError(f"materialized file differs: {path}") from error
+            if not stat.S_ISREG(info.st_mode) or info.st_size != int(row["size"]):
                 raise SnapshotError(f"materialized file differs: {path}")
-            if _materialized_file_sha256(path, int(row["size"])) != row["sha256"]:
+            expected_size = int(row["size"])
+            # The measured win is small-file 9p latency. Do not multiply native
+            # large-file subprocesses without a separate throughput benchmark.
+            with large_file_lock if expected_size >= MIN_NATIVE_MATERIALIZED_STAGE_BYTES else contextlib.nullcontext():
+                digest = _materialized_file_sha256(path, expected_size)
+            if digest != row["sha256"]:
                 raise SnapshotError(f"materialized file checksum mismatch: {path}")
-    inventory = scan_tree(materialized_path)
-    expected = manifest["source"]["portable_fingerprint_sha256"]
+            return expected_size
+        return None
+
+    def verified_rows():
+        if file_workers == 1:
+            for row in entries:
+                yield verify_row(row)
+            return
+        # MetadataRows may be backed by a single-threaded SQLite connection.
+        # Consume it only here, and bound both queued rows and concurrent file
+        # opens. Report successful checks in inventory order; an error never
+        # becomes 100% progress or a completed full-tree proof.
+        iterator = iter(entries)
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            while batch := list(itertools.islice(iterator, MATERIALIZED_VERIFY_BATCH_ROWS)):
+                yield from executor.map(verify_row, batch)
+
+    for size in verified_rows():
+        if size is not None:
+            completed_files += 1
+            completed_bytes += size
+        if progress is not None:
+            now = time.monotonic()
+            if now - last_progress >= 5:
+                report_files()
+                last_progress = now
+    if progress is not None:
+        report_files()
+        report_tree({'files': 0, 'directories': 0, 'symlinks': 0, 'logical_bytes': 0})
+        inventory = scan_tree(materialized_path, progress=report_tree, file_workers=file_workers)
+    else:
+        inventory = scan_tree(materialized_path, file_workers=file_workers)
+    expected = source["portable_fingerprint_sha256"]
     if inventory["portable_fingerprint_sha256"] != expected:
         raise SnapshotError(
             f"materialized fingerprint mismatch: expected {expected}, "
             f"got {inventory['portable_fingerprint_sha256']}"
         )
+    if progress is not None:
+        report_tree(inventory, matched=True)
 
 
 def _subtree_entries(
@@ -3680,13 +4093,13 @@ def fetch_packed_snapshot(
 def _check_packed_read_authority(sync_root: Path) -> None:
     if (sync_root / ".stockagent-d-mount-required").exists():
         raise SnapshotError("D-backed cold volume is not mounted; cannot recreate its authority")
-    if sync_root == Path("/srv/stockagent-packed"):
+    if sync_root in {Path("/srv/stockagent-packed"), Path("/srv/stockagent-packed/.local-state/private-history")}:
         from stockagent.data_sync.cold_primary import _check_d_primary_mount
-        _check_d_primary_mount(sync_root)
+        _check_d_primary_mount(Path("/srv/stockagent-packed"))
 
 
 @contextlib.contextmanager
-def _existing_packed_publication_owner(sync_root: Path):
+def _existing_packed_publication_owner(sync_root: Path, *, shared: bool = False):
     """Borrow, never recreate, the publisher/retention owner's exact inode."""
     owner = sync_root / ".local-state/locks/publish-retention-global.lock"
     try:
@@ -3711,7 +4124,7 @@ def _existing_packed_publication_owner(sync_root: Path):
 
     try:
         check_owner()
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         check_owner()  # A replaced pathname is not serialized by this old FD.
         _check_packed_read_authority(sync_root)
         yield
@@ -3719,6 +4132,291 @@ def _existing_packed_publication_owner(sync_root: Path):
         _check_packed_read_authority(sync_root)
     finally:
         os.close(descriptor)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _VerifiedPackedFiles:
+    data: dict[str, bytes]
+    entries: tuple[dict[str, Any], ...]
+    objects: dict[str, dict[str, Any]]
+    check_generation: Callable[[], None]
+    transfer_identity: tuple | None = None
+
+
+def _packed_read_identity(sync_root, resolved, names, maximum_bytes, maximum_object_bytes):
+    return (str(sync_root), resolved.manifest_sha256,
+        hashlib.sha256(_canonical_json_bytes(resolved.manifest)).hexdigest(),
+        tuple(sorted(names)), maximum_bytes, maximum_object_bytes)
+
+
+def _bounded_read_metadata_digest(entries, objects):
+    # Use the native JSON encoder for this bounded metadata, not a Python
+    # fragment iterator on every generation fence. The canonical bytes/digest
+    # are identical; oversized metadata never grants a transferable read proof.
+    raw = json.dumps({'entries': entries, 'objects': objects},
+        ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(raw).hexdigest() if len(raw) <= 8 * 1024**2 else None
+
+
+def read_packed_files(
+    sync_root: Path,
+    resolved: ResolvedSnapshot,
+    *,
+    names: Iterable[str],
+    maximum_bytes: int,
+    maximum_object_bytes: int,
+) -> dict[str, bytes]:
+    """Read bounded exact originals without creating a hot materialization.
+
+    The fixed inventory, selected objects and each requested original are fully
+    verified. This does not prove recovery of unselected files in the release.
+    """
+    return _read_packed_files_verified(sync_root, resolved, names=names,
+        maximum_bytes=maximum_bytes, maximum_object_bytes=maximum_object_bytes).data
+
+
+def _read_packed_files_verified(
+    sync_root: Path,
+    resolved: ResolvedSnapshot,
+    *,
+    names: Iterable[str],
+    maximum_bytes: int,
+    maximum_object_bytes: int,
+    capture_read_proof: bool = False,
+) -> _VerifiedPackedFiles:
+    """Read bounded exact originals without creating a hot materialization.
+
+    Validate the fixed complete inventory, then hash only the selected encoded
+    objects once and consume requested originals through the normal extraction
+    engine. A shared lease on the existing publication/retention inode excludes
+    GC while admitting immutable publishers. This proves the requested bytes,
+    never availability or recovery of unselected files in the full release.
+    """
+    if (type(maximum_bytes) is not int or not 0 < maximum_bytes <= 64 * 1024**2
+            or type(maximum_object_bytes) is not int or not 0 < maximum_object_bytes <= 4 * 1024**3
+            or isinstance(names, (str, bytes))):
+        raise SnapshotError("packed memory read requires explicit bounded byte and name selections")
+    selected_names = set()
+    for name in names:
+        if not isinstance(name, str):
+            raise SnapshotError("packed memory read requires literal relative names")
+        relative = _safe_relative_path(name, "packed memory read").as_posix()
+        if relative != name or relative in selected_names or len(selected_names) >= 4096:
+            raise SnapshotError("packed memory read names are noncanonical, duplicated or exceed the bound")
+        selected_names.add(relative)
+    if not selected_names:
+        raise SnapshotError("packed memory read needs at least one original file")
+    sync_root = sync_root.absolute()
+    _check_packed_read_authority(sync_root)
+    sync_root = sync_root.resolve()
+    _check_packed_read_authority(sync_root)
+
+    directories = {}
+
+    def directory_signature(path):
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode):
+            raise SnapshotError("packed memory read ancestor is redirected or not a directory")
+        # Legitimate immutable publishers may add siblings; directory clocks
+        # and link counts therefore are not generation identities here.
+        return (info.st_dev, info.st_ino, info.st_mode)
+
+    def signature(path):
+        try:
+            relative = path.relative_to(sync_root).as_posix()
+        except ValueError as error:
+            raise SnapshotError("packed memory read path is outside cold authority") from error
+        _safe_relative_path(relative, "packed memory read metadata/object")
+        parent = path.parent
+        while parent not in directories:
+            directories[parent] = directory_signature(parent)
+            if parent == sync_root:
+                break
+            parent = parent.parent
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            raise SnapshotError("packed memory read metadata/object is redirected or not regular")
+        return (_source_stat(info), info.st_mode, info.st_nlink)
+
+    with _existing_packed_publication_owner(sync_root, shared=True):
+        owner_path = sync_root / '.local-state' / 'locks' / 'publish-retention-global.lock'
+        owner_before = signature(owner_path)
+        manifest_path = resolved.manifest_path.absolute()
+        manifest_before = signature(manifest_path)
+        if not 0 < manifest_before[0][2] <= 16 * 1024**2:
+            raise SnapshotError("packed memory read manifest exceeds its metadata bound")
+        descriptor = os.open(manifest_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if (_source_stat(opened), opened.st_mode, opened.st_nlink) != manifest_before:
+                raise SnapshotError("packed memory read manifest changed while opening")
+            manifest_bytes = handle.read(16 * 1024**2 + 1)
+            closed = os.fstat(handle.fileno())
+            if (len(manifest_bytes) != manifest_before[0][2]
+                    or (_source_stat(closed), closed.st_mode, closed.st_nlink) != manifest_before):
+                raise SnapshotError("packed memory read manifest changed while reading")
+        if (signature(manifest_path) != manifest_before
+                or hashlib.sha256(manifest_bytes).hexdigest() != resolved.manifest_sha256):
+            raise SnapshotError("packed memory read manifest changed after resolution")
+        manifest = json.loads(manifest_bytes)
+        _validate_manifest(manifest)
+        if manifest != resolved.manifest:
+            raise SnapshotError("packed memory read resolved manifest differs from its fixed bytes")
+        expected_manifest = _path_under(sync_root,
+            f'manifests/{manifest["dataset"]}/{manifest["snapshot_id"]}.json', "manifest relpath")
+        if manifest_path != expected_manifest:
+            raise SnapshotError("packed memory read manifest is outside its fixed cold namespace")
+        inventory_path = _path_under(sync_root, manifest["archive"]["inventory"]["relpath"], "inventory relpath")
+        inventory_before = signature(inventory_path)
+        if inventory_before[0][2] != int(manifest["archive"]["inventory"]["bytes"]):
+            raise SnapshotError("packed memory read inventory size differs")
+        with _open_inventory(sync_root, manifest) as entries:
+            _validate_inventory(manifest, entries, retain_object_members=False)
+            selected = [row for row in entries if row["path"] in selected_names]
+        if (len(selected) != len(selected_names) or any(row["kind"] != "file" for row in selected)
+                or sum(int(row["size"]) for row in selected) > maximum_bytes):
+            raise SnapshotError("packed memory read selection is missing, non-file or exceeds admitted bytes")
+        objects = {str(row["sha256"]): row for row in manifest["archive"]["objects"]}
+        required = {digest for row in selected for digest, _ in _storage_extents(row["storage"], int(row["size"]))}
+        if (len(required) > 256
+                or sum(int(objects[digest]["bytes"]) for digest in required) > maximum_object_bytes):
+            raise SnapshotError("packed memory read selected encoded objects exceed admitted bytes/count")
+        observed = {}
+        for digest in sorted(required):
+            item = objects[digest]
+            path = _path_under(sync_root, item["relpath"], "object relpath")
+            before = signature(path)
+            if before[0][2] != int(item["bytes"]) or sha256_file(path) != digest or signature(path) != before:
+                raise SnapshotError("packed memory read selected object checksum/size/generation mismatch")
+            observed[path] = before
+        result = {}
+
+        def consume(input_stream, row):
+            with io.BytesIO() as output:
+                for block in _verified_member_blocks(input_stream, int(row["size"]), str(row["sha256"]), label=row["path"]):
+                    output.write(block)
+                result[row["path"]] = output.getvalue()
+
+        try:
+            _materialize_indexed_files(sync_root, manifest, selected, None,
+                d_primary_native_blob_reads=False, d_primary_native_pack_reads=False,
+                durable=False, on_copy=None, durability_queue=None, consume_file=consume)
+        except (zipfile.BadZipFile, EOFError) as error:
+            raise SnapshotError("packed memory read selected original failed decoding") from error
+        selected_objects = {digest: dict(objects[digest]) for digest in required}
+        metadata_digest = (_bounded_read_metadata_digest(selected, selected_objects) if capture_read_proof else None)
+        def check_generation():
+            _check_packed_read_authority(sync_root)
+            if metadata_digest is not None and _bounded_read_metadata_digest(selected, selected_objects) != metadata_digest:
+                raise SnapshotError('packed original read proof metadata changed')
+            if signature(owner_path) != owner_before:
+                raise SnapshotError('packed memory read publication owner changed')
+            if (signature(manifest_path) != manifest_before
+                    or signature(inventory_path) != inventory_before
+                    or any(signature(path) != before for path, before in observed.items())
+                    or any(directory_signature(path) != before for path, before in directories.items())):
+                raise SnapshotError("packed memory read generation changed during original reconstruction")
+
+        if set(result) != selected_names:
+            raise SnapshotError('packed memory read did not reconstruct the exact selection')
+        check_generation()
+        return _VerifiedPackedFiles(result, tuple(selected), selected_objects, check_generation,
+            _packed_read_identity(sync_root, resolved, selected_names, maximum_bytes, maximum_object_bytes)
+            if metadata_digest is not None else None)
+
+
+@dataclasses.dataclass(slots=True)
+class _PreparedRetainedSource:
+    entries: tuple[dict[str, Any], ...]
+    objects: dict[str, dict[str, Any]]
+    check_generation: Callable[[], None]
+    physical_entries: tuple[_SourceEntry, ...] = ()
+
+
+def _prepare_retained_source_files(sync_root, dataset, source, request, physical_entries, *, excluded_subtrees):
+    """Validate the bounded raw union before hashing any current-source payload.
+
+    This initial contract retains regular raw files only. Their directories
+    remain real directories in the workspace; missing parents and symlinks are
+    rejected rather than guessed into a new source tree.
+    """
+    if (request.release.manifest.get('dataset') != dataset
+            or len(physical_entries) > MAX_PACK_MEMBERS
+            or not isinstance(request.names, tuple)
+            or type(request.maximum_bytes) is not int or not 0 < request.maximum_bytes <= 64 * 1024**2
+            or type(request.maximum_object_bytes) is not int or not 0 < request.maximum_object_bytes <= 4 * 1024**3
+            or any(not isinstance(name, str) or not name.startswith('raw/')
+                   or _is_excluded(name, excluded_subtrees) for name in request.names)):
+        raise SnapshotError('retained raw history requires the same dataset and a bounded complete workspace')
+    physical = {entry.path: entry.kind for entry in physical_entries}
+    if 'symlink' in physical.values():
+        raise SnapshotError('bounded retained raw workspaces cannot contain symlinks')
+    for name in request.names:
+        relative = _safe_relative_path(name, 'retained original name')
+        if name in physical and physical[name] != 'file':
+            raise SnapshotError('retained raw name collides with a non-file current entry')
+        if any(physical.get(parent.as_posix()) != 'directory'
+               for parent in relative.parents if parent != PurePosixPath('.')):
+            raise SnapshotError('retained raw parent directories must remain in the physical workspace')
+    if len(set(physical).union(request.names)) > MAX_PACK_MEMBERS:
+        raise SnapshotError('retained raw logical inventory exceeds its metadata bound')
+    verified = request._verified_read
+    if verified is not None:
+        if (not isinstance(verified, _VerifiedPackedFiles)
+                or verified.transfer_identity != _packed_read_identity(sync_root, request.release,
+                    request.names, request.maximum_bytes, request.maximum_object_bytes)):
+            raise SnapshotError('retained source original read proof has a different fixed identity/admission')
+        # The publisher already holds its original retention lease. Recheck all
+        # leaf/ancestor generations and the sealed metadata before reuse, then
+        # again after inventory commit. This is not persistent cached acceptance.
+        verified.check_generation()
+    else:
+        verified = _read_packed_files_verified(sync_root, request.release, names=request.names,
+            maximum_bytes=request.maximum_bytes, maximum_object_bytes=request.maximum_object_bytes)
+    # Keep only storage mappings/guard here. An independent read's temporary
+    # payload dictionary naturally expires; never clear the collector's dict.
+    return _PreparedRetainedSource(verified.entries, verified.objects, verified.check_generation)
+
+
+def _merge_retained_source_files(entries, summary, retained):
+    # Capture the final fully hashed physical cohort, including frozen/atomic
+    # controls, before adding virtual originals. Its stability fence stays exact.
+    retained.physical_entries = tuple(entries)
+    complete = {entry.path: entry for entry in retained.physical_entries}
+    for row in retained.entries:
+        if row['path'] not in complete:
+            original = _SourceEntry(path=row['path'], kind='file', mode=row['mode'],
+                size=row['size'], sha256=row['sha256'], storage=dict(row['storage']))
+            entries.append(original)
+            complete[original.path] = original
+    entries.sort(key=lambda entry: entry.path)
+    children = {}
+    for name, entry in complete.items():
+        parent = PurePosixPath(name).parent.as_posix()
+        children.setdefault(parent, []).append(entry)
+    portable = hashlib.sha256()
+    pending = ['.']
+    seen = 0
+    while pending:
+        parent = pending.pop()
+        siblings = children.get(parent, ())
+        directories = sorted((entry for entry in siblings if entry.kind == 'directory'), key=lambda entry: entry.path)
+        files = sorted((entry for entry in siblings if entry.kind == 'file'), key=lambda entry: entry.path)
+        # Match scan_tree/os.walk: child directories, then files, then visit
+        # sorted child directories depth first. Sorted inventory order differs.
+        for entry in itertools.chain(directories, files):
+            portable.update(('D' if entry.kind == 'directory' else 'F').encode('ascii')
+                + b'\0' + entry.path.encode('utf-8', errors='surrogateescape') + b'\0'
+                + str(entry.size if entry.kind == 'file' else 0).encode('ascii') + b'\0\n')
+            seen += 1
+        pending.extend(entry.path for entry in reversed(directories))
+    if seen != len(complete):
+        raise SnapshotError('retained raw logical inventory is not a complete regular-file tree')
+    summary['portable_fingerprint_sha256'] = portable.hexdigest()
+    summary['files'] = sum(entry.kind == 'file' for entry in complete.values())
+    summary['directories'] = sum(entry.kind == 'directory' for entry in complete.values())
+    summary['symlinks'] = 0
+    summary['logical_bytes'] = sum(entry.size for entry in complete.values() if entry.kind == 'file')
 
 
 def stage_packed_root_files(

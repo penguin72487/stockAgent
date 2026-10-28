@@ -34,7 +34,8 @@ MARKETS = enabled_day_trade_markets(REPO_ROOT / "services/discord_bot/markets")
 
 def _read_json(path: Path) -> dict[str, object] | None:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        from stockagent.live.paper_mode_snapshot import read_paper_state
+        value = read_paper_state(path)
     except (OSError, ValueError):
         return None
     return value if isinstance(value, dict) else None

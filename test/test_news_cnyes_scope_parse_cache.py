@@ -12,7 +12,7 @@ from downloader.news_fulltext_cnyes_index import gap_dates, progress
 from downloader.artifact_io import sha256_file
 from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_queue import NewsQueue
-from scripts.benchmark_news_status_projection import profile_current_status
+from scripts.benchmark_news_status_projection import compare_cnyes_index_rows_cache, profile_current_status
 from test_cnyes_news_bulk import BASE, cfg
 from test_news_cnyes_public_index import DAY, queue
 from test_news_cnyes_index_manifest_schedule import add_gap
@@ -183,3 +183,25 @@ def test_whole_status_replay_byte_equal_and_no_live_writes_or_http(queue, monkey
     assert [tuple(r) for r in queue.db.execute('SELECT * FROM bulk_window_gaps ORDER BY scope_url')] == rows
     with pytest.raises(ValueError, match='one_projection_comparison'):
         profile_current_status(queue.root, queue.registry, 3, compare_scope_cache=True, compare_discovery_summary=True)
+
+
+def test_index_rows_cache_whole_status_comparison_is_read_only(queue, monkeypatch):
+    with queue.db:
+        add_gap(queue, DAY)
+        queue.add_articles([{'url': 'https://news.cnyes.com/news/id/1', 'date': '2020-01-01'}])
+    queue.status(activity='fixture')
+    before = sha256_file(queue.root / 'status.json')
+    changes = queue.db.total_changes
+
+    def no_owner(*args, **kwargs):
+        raise AssertionError('must not initialize an acquisition owner or HTTP client')
+
+    monkeypatch.setattr(NewsQueue, '__init__', no_owner)
+    monkeypatch.setattr(NewsHTTP, '__init__', no_owner)
+    result = compare_cnyes_index_rows_cache(queue.root, queue.registry, 3)
+    assert result['accepted'] and result['database_revision_unchanged']
+    assert result['deterministic_projection_sha256']['uncached'] == result['deterministic_projection_sha256']['cached']
+    assert result['first_cached_trial_includes_cold_cache']
+    assert result['publisher_requests'] == 0 and not result['source_states_mutated'] and not result['status_published']
+    assert sha256_file(queue.root / 'status.json') == before
+    assert queue.db.total_changes == changes

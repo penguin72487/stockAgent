@@ -35,6 +35,18 @@ def queue(tmp_path):
         conn.close()
 
 
+def test_outstanding_adjusted_contracts_are_current_snapshot_not_history(queue, tmp_path):
+    seed = next(item for item in collector.SEEDS if item[0] == 'outstanding_adjusted_contracts')
+    assert seed[2] == collector.BASE + '/cht/4/sSFAdjustedInfo'
+    report = collector.publish_status(queue, tmp_path, start_year=2026,
+                                      end=date(2026, 10, 27), running=False,
+                                      errors=[], export=False)
+    row, = [item for item in report['sources'] if item['source_id'] == seed[0]]
+    assert row['kind'] == 'current_snapshot_not_history'
+    assert row['status'] == 'missing'
+    assert row['first_date'] is None and row['last_date'] is None
+
+
 def test_index_keeps_publication_date_without_inventing_timestamp():
     result = collector.parse_index(index_html(("2026/09/23", "保證金調整", "newsDetail?newsType=1&idx=17377")), date(2026, 1, 1), date(2026, 9, 27))
     assert len(result) == 1

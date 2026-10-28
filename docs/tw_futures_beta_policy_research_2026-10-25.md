@@ -194,6 +194,8 @@ window oracle更快；兩者計時邊界不同，不能當公平加速比。
 11:38台北時間已取得既有雙GPU獨占lease、通過嚴格CUDA配置／運算／同步前檢，進入六組工程。
 v1 prototype只作未啟動的配置核對；lease重新進入路徑於v2修正，舊request保留，沒有跑兩個GPU owner。
 正式收斂結果尚未產生；後續狀態以[工程／正式進度](../artifacts/operations/futures-alpha-research-20261025-v2/progress-latest.json)為準。
+11:53台北時間讀回：前兩組08:45工程已完成並獨立驗收，第三組08:45 Muon正在準備資料；
+三組09:00仍排隊，六組新正式收斂尚未開始。Supervisor持續運行，工程全數檢查後自動只啟動通過的正式案例。
 
 新凍結來源SHA：`49e2a0f6448c01176ef4fba47d0552760c19e47c55512834a60325d852b74bf0`，
 1854檔案。從上一個凍結來源僅加入本研究10個程式差異與新base config；

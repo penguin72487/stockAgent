@@ -11,6 +11,7 @@ Group=root
 WorkingDirectory=__REPO_ROOT__
 Environment="HOME=/root"
 Environment="PYTHONUNBUFFERED=1"
+Environment="COLD_ARTIFACT_INGRESS_STAGING_ROOT=/srv/stockagent-d-volume/stockagent-completed-offline-scratch/remote-return"
 EnvironmentFile=/etc/stockagent/remote-cold-artifact-ingress.env
 ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_remote_cold_artifact_ingress.sh"
 UMask=0077

@@ -136,6 +136,73 @@ def write_evidence_manifest(path: Path, evidence: Evidence, traversal_gaps: list
 _PreparedFileStat = namedtuple("_PreparedFileStat", "st_dev st_ino st_size st_mtime_ns st_ctime_ns")
 
 
+class _BenchmarkMetricCache:
+    """Bound immutable metric rows, retaining parsing and per-path annotation."""
+
+    def __init__(self, *, max_bytes=64 << 20, max_entries=4096):
+        self.max_bytes, self.max_entries = max_bytes, max_entries
+        self.entries, self.bytes = OrderedDict(), 0
+        self.context = None
+        self.hits = self.misses = self.evictions = self.bypasses = 0
+
+    def get(self, key, context):
+        if (self.context is None or len(self.context) != len(context)
+                or any(a is not b for a, b in zip(self.context, context))):
+            self.entries.clear()
+            self.bytes = 0
+            self.context = context
+        value = self.entries.get(key)
+        if value is None:
+            self.misses += 1
+            return None
+        self.entries.move_to_end(key)
+        self.hits += 1
+        return [dict(row) for row in value[0]]
+
+    def remember(self, key, rows):
+        if not rows or type(rows) is not list or self.max_entries <= 0:
+            self.bypasses += 1
+            return
+        frozen, size = [], sys.getsizeof(key) + 512
+        for row in rows:
+            if type(row) is not dict or any(type(k) is not str or type(v) not in (str, int, float)
+                                           for k, v in row.items()):
+                self.bypasses += 1
+                return
+            values = tuple(row.items())
+            frozen.append(values)
+            size += sys.getsizeof(values) + 32
+            size += sum(sys.getsizeof(pair) + sys.getsizeof(pair[0]) + sys.getsizeof(pair[1])
+                        for pair in values)
+            if size > self.max_bytes:
+                self.bypasses += 1
+                return
+        frozen = tuple(frozen)
+        size += sys.getsizeof(frozen)
+        if size > self.max_bytes:
+            self.bypasses += 1
+            return
+        previous = self.entries.pop(key, None)
+        if previous is not None:
+            self.bytes -= previous[1]
+        while self.entries and (len(self.entries) >= self.max_entries or self.bytes + size > self.max_bytes):
+            _, (_, removed) = self.entries.popitem(last=False)
+            self.bytes -= removed
+            self.evictions += 1
+        self.entries[key] = frozen, size
+        self.bytes += size
+
+
+def _cached_benchmark_metrics(evidence, payload, sha):
+    cache = evidence.benchmark_metrics
+    selected = cache.get(sha, (_METRIC_TREE, _METRIC_DESCRIPTOR, _metric_rows, reported_metrics))
+    if selected is not None:
+        return selected
+    rows = _metric_rows(payload)
+    cache.remember(sha, rows)
+    return rows
+
+
 class Evidence:
     def __init__(self, output: Path, *, max_file_bytes: int, max_total_bytes: int,
                  snapshot_storage: str = "individual_gzip"):
@@ -148,6 +215,7 @@ class Evidence:
         # dictionaries repeat under many benchmark generations; retaining a
         # parsed object here would keep their entire payload resident.
         self.benchmark_negatives: OrderedDict[str, tuple[str, bool, str]] = OrderedDict()
+        self.benchmark_metrics = _BenchmarkMetricCache()
         self.read_stats = Counter()
         self.inspection_timings = None
         if snapshot_storage not in ("individual_gzip", "packed_gzip_v1"):
@@ -877,7 +945,8 @@ def capture_benchmark(evidence: Evidence, path: Path, *, explicit: bool = False,
         captured = evidence.object(path)
         if captured:
             payload, sha = captured
-            return payload, sha, (timing.call("metric_tree", _metric_rows, payload) if timing else _metric_rows(payload))
+            return payload, sha, (timing.call("metric_tree", _cached_benchmark_metrics, evidence, payload, sha)
+                                  if timing else _cached_benchmark_metrics(evidence, payload, sha))
         return None
     observed = {}
 
@@ -902,7 +971,8 @@ def capture_benchmark(evidence: Evidence, path: Path, *, explicit: bool = False,
             walk_required = (any(token in raw for token in POSSIBLE_TIME_BYTES)
                              or raw.count(b"{") + raw.count(b"[") >= 64
                              or sys.getrecursionlimit() < 256)
-            metrics = ((timing.call("metric_tree", _metric_rows, payload) if timing else _metric_rows(payload))
+            metrics = ((timing.call("metric_tree", _cached_benchmark_metrics, evidence, payload, sha)
+                        if timing else _cached_benchmark_metrics(evidence, payload, sha))
                        if walk_required else [])
             observed.update(payload=payload, metrics=metrics,
                             classification="parsed_reported_timing_fields" if metrics else "parsed_no_reported_timing_fields",
@@ -930,7 +1000,8 @@ def capture_benchmark(evidence: Evidence, path: Path, *, explicit: bool = False,
         payload = (observed["payload"] if "payload" in observed else
                    timing.call("json_decode", private_json.loads, raw) if timing else private_json.loads(raw))
         metrics = (observed["metrics"] if "metrics" in observed else
-                   timing.call("metric_tree", _metric_rows, payload) if timing else _metric_rows(payload))
+                   timing.call("metric_tree", _cached_benchmark_metrics, evidence, payload, sha)
+                   if timing else _cached_benchmark_metrics(evidence, payload, sha))
         return payload, sha, metrics
     return None
 
@@ -1182,6 +1253,22 @@ def collect_engineering_runs(ledger: Ledger, evidence: Evidence, root: Path, *, 
                    source=sha, locator=row["run_id"], origin="recorded_engineering_command", outcome=row["state"],
                    context={"run_id": row["run_id"], "task_id": row["task_id"], "clock_basis": basis,
                             "workflow_code_sha256": row.get("workflow_code_sha256"), "input_identity": "not_in_timing_projection"})
+        user_cpu = performance.get("child_cpu_user_seconds")
+        system_cpu = performance.get("child_cpu_system_seconds")
+        if (basis == "monotonic_child_launch_through_wait" and finite_seconds(seconds)
+                and finite_seconds(user_cpu) and finite_seconds(system_cpu)):
+            ledger.add(workflow=f"engineering:{row['name']}", stage="complete_command_reaped_children",
+                       metric="cpu_seconds", seconds=user_cpu + system_cpu,
+                       source=sha, locator=row["run_id"] + "/performance",
+                       origin="recorded_engineering_command", outcome=row["state"],
+                       context={"run_id": row["run_id"], "task_id": row["task_id"],
+                                "clock_basis": "reaped_child_user_plus_system_resource_delta",
+                                "native_cpu_user_seconds": user_cpu, "native_cpu_system_seconds": system_cpu,
+                                "original_receipt_sha256": row["original_receipt_sha256"],
+                                "producer_scope": performance.get("scope"),
+                                "cpu_scope": "reaped children; excludes collector, owner parent and detached workers; overlaps complete command wall",
+                                "workflow_code_sha256": row.get("workflow_code_sha256"),
+                                "input_identity": "not_in_timing_projection"})
 
 
 def _crypto_feature_rows(raw, provider):
@@ -1558,24 +1645,68 @@ def _replay_nonnegative_int(value):
 
 
 def _retained_replay_inputs(evidence, protocol):
-    """Retain every declared original and code archive before consuming a replay."""
+    """Retain originals in order, with bounded speculative input reads."""
     require = _replay_require
     require(isinstance(protocol.get("inputs"), list) and 0 < len(protocol["inputs"]) <= 8192
             and isinstance(protocol.get("code"), list) and 0 < len(protocol["code"]) <= 64,
             "retained replay evidence budget differs")
     inputs, code, total = {}, {}, 0
-    for collection, destination in ((protocol["inputs"], inputs), (protocol["code"], code)):
+    # This is only acceleration eligibility. The original ordered checks below
+    # still determine every error and all retained evidence. Malformed later
+    # rows must not move an exception ahead of an earlier archive failure.
+    prefetch, paths, declared_bytes = True, [], 0
+    for collection in (protocol["inputs"], protocol["code"]):
+        identities = set()
         for row in collection:
-            require(isinstance(row, dict) and isinstance(row.get("path"), str)
-                    and isinstance(row.get("archive"), str) and row["path"] not in destination,
-                    "retained replay evidence identity differs")
-            body = evidence.read(Path(row["archive"]))
-            require(body is not None and body[1] == row.get("sha256"), "retained replay archive SHA differs")
-            if destination is inputs:
-                require(row.get("stable") is True and _replay_nonnegative_int(row.get("bytes"))
-                        and row["bytes"] == len(body[0]), "retained replay archive size differs")
-                total += row["bytes"]
-            destination[row["path"]] = row
+            if (not isinstance(row, dict) or not isinstance(row.get("path"), str)
+                    or not isinstance(row.get("archive"), str) or row["path"] in identities):
+                prefetch = False
+                break
+            identities.add(row["path"])
+            if collection is protocol["inputs"]:
+                if (row.get("stable") is not True or not _replay_nonnegative_int(row.get("bytes"))
+                        or row["bytes"] > evidence.max_file_bytes):
+                    prefetch = False
+                    break
+                declared_bytes += row["bytes"]
+                try:
+                    path = Path(row["archive"])
+                    encoded = os.fsencode(path)
+                    if b"\0" in encoded:
+                        prefetch = False
+                        break
+                except (OSError, TypeError, ValueError, UnicodeError):
+                    prefetch = False
+                    break
+                paths.append(path)
+        if not prefetch:
+            break
+    prefetch = (prefetch and _replay_nonnegative_int(protocol.get("original_bytes"))
+                and protocol["original_bytes"] == declared_bytes
+                and declared_bytes <= evidence.max_total_bytes - evidence.total_bytes)
+    # Two 2 MiB batches pending plus one consumed; native conversion is bounded
+    # by (2 * workers + 1) * (batch_bytes + 1), just over 10 MiB of raw bytes.
+    # Code archives are few and remain synchronous. Previously frozen inputs
+    # are read from their own snapshots instead of speculatively reopening them.
+    skip = [path for path in paths if str(path.absolute()) in evidence.sources] if prefetch else ()
+    reads = evidence.ordered_reads(paths if prefetch else (), workers=2 if prefetch else 0,
+                                   skip=skip, batch_size=32, batch_bytes=2 << 20)
+    with closing(reads):
+        for collection, destination in ((protocol["inputs"], inputs), (protocol["code"], code)):
+            for row in collection:
+                require(isinstance(row, dict) and isinstance(row.get("path"), str)
+                        and isinstance(row.get("archive"), str) and row["path"] not in destination,
+                        "retained replay evidence identity differs")
+                prepared = next(reads)[1] if prefetch and destination is inputs else None
+                archive = Path(row["archive"])
+                body = (evidence.read(archive, prepared=prepared) if prepared is not None
+                        else evidence.read(archive))
+                require(body is not None and body[1] == row.get("sha256"), "retained replay archive SHA differs")
+                if destination is inputs:
+                    require(row.get("stable") is True and _replay_nonnegative_int(row.get("bytes"))
+                            and row["bytes"] == len(body[0]), "retained replay archive size differs")
+                    total += row["bytes"]
+                destination[row["path"]] = row
     require(_replay_nonnegative_int(protocol.get("original_bytes")) and protocol["original_bytes"] == total,
             "retained replay original byte denominator differs")
 
@@ -2022,6 +2153,206 @@ def collect_retained_sec_operations(ledger, evidence, reports):
         contract="observed_retained_sec_native_v1", scope_name="retained_sec")
 
 
+"""Candidate extension inserted into the existing workflow collector, never run here."""
+
+
+LOCAL_CREDENTIAL_AUDIT_FILES = (
+    "operation_timings.json", "protocol.json", "baseline_status.json", "instrumented_status.json",
+    "baseline_receipt.json", "instrumented_receipt.json", "readback.json", "completion.json",
+)
+
+
+def _local_credential_audit_samples(ledger, evidence, captured):
+    require = _replay_require
+    (timing, timing_sha), (protocol, protocol_sha), (baseline, baseline_sha), (status, status_sha), \
+        (base_receipt, _), (receipt, _), (readback, readback_sha), (completion, _) = captured
+    require(all(isinstance(row, dict) for row, _ in captured), "credential bundle objects differ")
+    require(protocol.get("state") == "prepared_canonical_local_credential_audit_observation"
+            and protocol.get("expected_declared_providers") == 45
+            and protocol.get("all_45_original_presence_predicates_required") is True
+            and protocol.get("baseline_and_instrumented_public_receipt_semantic_parity_required") is True
+            and protocol.get("no_secret_files_or_secret_values_archived") is True
+            and protocol.get("diagnostic_instrumentation_adds_overhead") is True
+            and protocol.get("instrumented_clocks_not_speed_comparison") is True
+            and protocol.get("production_service_environment_or_loaded_identity_verified") is False,
+            "credential protocol scope differs")
+    for row in (protocol, readback, completion):
+        require(all(type(row.get(k)) is int and row[k] == 0 for k in ("new_provider_calls", "new_gpu_jobs"))
+                and row.get("all_workflows_measured") is False and row.get("hardware_limit_proven") is False,
+                "credential external scope differs")
+        require(row.get("source_registry_stage_bindings_recomputed",
+                        row.get("source_stage_bindings_recomputed")) is False,
+                "credential producer claims global coverage")
+    require(readback.get("state") == "verified_all_45_canonical_presence_predicates_and_receipt_parity"
+            and readback.get("protocol_sha256") == protocol_sha
+            and readback.get("operation_timings_sha256") == timing_sha
+            and readback.get("complete_public_status_semantic_parity") is True
+            and readback.get("original_presence_predicates") == 45
+            and readback.get("all_clock_values_revalidated") is True
+            and readback.get("authentication_or_provider_access_verified") is False
+            and readback.get("full_external_acquisition_verified") is False,
+            "credential independent readback differs")
+    require(completion.get("state") == "verified_complete_canonical_credential_audit_diagnostic"
+            and completion.get("readback_sha256") == readback_sha
+            and completion.get("counts") == dict(tests=55, failures=0, errors=0, skipped=0)
+            and completion.get("controlled_speedup_verified") is False
+            and completion.get("canonical_sources_modified") is False,
+            "credential completion differs")
+
+    # Retain explicit public sources only. Secret files are not producer inputs.
+    roles = {
+        str(ROOT / "scripts/audit_data_credentials.py"): protocol.get("original_audit_source_sha256"),
+        str(ROOT / "downloader/operation_timing.py"): protocol.get("original_timing_helper_sha256"),
+        str(ROOT / "configs/data_api_credentials.json"): None,
+    }
+    sources = protocol.get("sources")
+    require(isinstance(sources, list) and 3 <= len(sources) <= 32
+            and all(isinstance(row, dict) for row in sources), "credential source inventory differs")
+    driver_sha = protocol.get("driver_sha256")
+    require(isinstance(driver_sha, str) and re.fullmatch(r"[0-9a-f]{64}", driver_sha) is not None,
+            "credential observer source SHA absent")
+    observers = [row for row in sources if isinstance(row.get("path"), str)
+        and Path(row["path"]).is_relative_to(ROOT / "artifacts/benchmarks")
+        and Path(row["path"]).suffix == ".py" and row.get("sha256") == driver_sha]
+    require(len(observers) == 1, "credential observer source absent or ambiguous")
+    roles[observers[0]["path"]] = driver_sha
+    require(protocol.get("environment_scope") ==
+            "benchmark inherited process environment plus canonical literal-presence file reader",
+            "credential environment scope differs")
+    archives, source_names = {}, set()
+    for row in sources:
+        name = row.get("path")
+        require(isinstance(name, str) and name not in source_names, "credential source is duplicate")
+        source_names.add(name)
+        if name not in roles:
+            continue
+        require(isinstance(row.get("archive"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", row.get("sha256", "")) is not None
+                and (roles[name] is None or row["sha256"] == roles[name]),
+                "credential public source identity differs")
+        body = evidence.read(Path(row["archive"]))
+        require(body is not None and body[1] == row["sha256"], "credential public archive SHA differs")
+        archives[name] = body
+    require(archives.keys() == roles.keys(), "credential public sources incomplete")
+    registry = json.loads(archives[str(ROOT / "configs/data_api_credentials.json")][0])
+    require(isinstance(registry, dict) and registry.get("secret_values_permitted") is False,
+            "credential registry permits secret values")
+    declared = registry.get("providers")
+    require(isinstance(declared, list) and len(declared) == 45
+            and all(isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"] for row in declared),
+            "credential declared providers differ")
+    # Registry catalog IDs and the producer's public IDs are distinct.
+    # This is the data-only projection of the captured audit's _presence_row;
+    # observed source bytes are never executed to interpret a receipt.
+    public_ids = {}
+    for item in declared:
+        catalog_id = item["id"]
+        require(catalog_id not in public_ids, "credential declared providers duplicate")
+        field = item.get("openbb_field", "")
+        require(isinstance(field, str), "credential public field differs")
+        field = field.strip()
+        public_id = catalog_id
+        if field:
+            public_id = "openbb:" + field
+        elif (item.get("location") == "openbb_settings"
+              and isinstance(item.get("required_names"), list)
+              and len(item["required_names"]) == 1 and not item.get("any_of_names")):
+            require(isinstance(item["required_names"][0], str), "credential public name differs")
+            public_id = "openbb:" + item["required_names"][0].strip()
+        public_ids[catalog_id] = public_id
+    expected = set(public_ids.values())
+    require(len(public_ids) == len(expected) == 45, "credential public identities duplicate")
+
+    for public, public_sha, producer, mode in (
+            (baseline, baseline_sha, base_receipt, "baseline"),
+            (status, status_sha, receipt, "instrumented")):
+        require(public.get("secret_values_included") is False
+                and public.get("validation_scope") == "local_presence_only; no_authentication_or_entitlement_check"
+                and isinstance(public.get("providers"), list) and len(public["providers"]) == 45
+                and all(isinstance(row, dict) and isinstance(row.get("id"), str) for row in public["providers"])
+                and {row["id"] for row in public["providers"]} == expected,
+                "credential public status identities differ")
+        require(all(isinstance(row.get("catalog_id"), str)
+                    and row["catalog_id"] in public_ids
+                    and row["id"] == public_ids[row["catalog_id"]] for row in public["providers"])
+                and {row["catalog_id"] for row in public["providers"]} == public_ids.keys(),
+                "credential public catalog mapping differs")
+        require(producer.get("state") == "completed_canonical_local_presence_audit"
+                and producer.get("mode") == mode and producer.get("status_sha256") == public_sha
+                and producer.get("original_audit_source_sha256") == protocol["original_audit_source_sha256"]
+                and producer.get("original_timing_helper_sha256") == protocol["original_timing_helper_sha256"]
+                and producer.get("status_mode") == "0o600" and producer.get("original_provider_count") == 45
+                and producer.get("no_secret_files_archived") is True
+                and producer.get("production_service_loaded_identity_verified") is False,
+                "credential producer receipt differs")
+    require({k: v for k, v in baseline.items() if k != "generated_at_utc"}
+            == {k: v for k, v in status.items() if k != "generated_at_utc"},
+            "credential complete public status changed")
+    require(timing.get("contract") == "source_operation_monotonic_v1"
+            and timing.get("clock") == "perf_counter_ns" and timing.get("invalid_clock") is False
+            and timing.get("aggregation") == "inclusive stages overlap total; do not sum"
+            and timing.get("scope") == "after_complete_canonical_status_publication"
+            and timing.get("diagnostic_instrumentation_adds_overhead") is True
+            and timing.get("nested_and_inclusive_ranges_overlap") is True
+            and timing.get("process_cpu_excludes_isolated_sdk_subprocess") is True
+            and timing.get("authentication_or_entitlement_verified") is False
+            and timing.get("external_acquisition_measured") is False,
+            "credential clock scope differs")
+    stages = timing.get("stages")
+    allowed = {"registry_validation", "literal_presence_parse", "credential_presence_predicate",
+               "finlab_presence_resolution", "finlab_local_session_probe", "legacy_settings_read",
+               "legacy_presence_projection", "file_permission_check", "environment_name_inventory"}
+    require(isinstance(stages, list) and 45 <= len(stages) <= 256, "credential stage inventory differs")
+    predicates = []
+    for row in stages:
+        require(isinstance(row, dict) and row.get("stage") in allowed
+                and row.get("outcome") == "returned"
+                and type(row.get("seconds")) in (int, float) and finite_seconds(row["seconds"])
+                and _replay_nonnegative_int(row.get("process_cpu_nanoseconds"))
+                and ("provider" not in row or row["provider"] in {"credential:" + v for v in expected}),
+                "credential stage clock differs")
+        if row["stage"] == "credential_presence_predicate":
+            predicates.append(row.get("provider"))
+    require(len(predicates) == 45 and set(predicates) == {"credential:" + v for v in expected},
+            "credential 45 predicate clocks incomplete or duplicate")
+    require(type(timing.get("seconds")) in (int, float) and finite_seconds(timing["seconds"]),
+            "credential total wall clock differs")
+    base = dict(contract="observed_local_credential_audit_v1", protocol_sha256=protocol_sha,
+        public_status_sha256=status_sha, readback_sha256=readback_sha, observer_source_sha256=driver_sha,
+        registry_source_sha256=archives[str(ROOT / "configs/data_api_credentials.json")][1],
+        audit_source_sha256=protocol["original_audit_source_sha256"],
+        timing_helper_sha256=protocol["original_timing_helper_sha256"],
+        environment_scope=protocol.get("environment_scope"), diagnostic_instrumentation_adds_overhead=True,
+        nested_and_inclusive_ranges_overlap=True, process_cpu_excludes_isolated_sdk_subprocess=True,
+        production_service_environment_or_loaded_identity_verified=False,
+        authentication_or_entitlement_verified=False, external_acquisition_measured=False,
+        new_provider_calls=0, new_gpu_jobs=0)
+    for index, row in enumerate(stages):
+        eligible = row["stage"] == "credential_presence_predicate"
+        context = dict(base, source_binding_eligible=eligible,
+                       dataset=row["provider"].removeprefix("credential:") if eligible else None)
+        for metric, seconds, field in (("wall_seconds", row["seconds"], "seconds"),
+                ("process_cpu_seconds", row["process_cpu_nanoseconds"] / 1e9, "process_cpu_nanoseconds")):
+            ledger.add(workflow="operations:local_credential_audit", stage=row["stage"], seconds=seconds,
+                source=timing_sha, locator=f"stages/{index}/{field}",
+                origin="observed_local_credential_audit", outcome="verified_local_presence_only", metric=metric,
+                context=dict(context, **({"native_nanoseconds": row[field]} if field.endswith("nanoseconds") else {})),
+                work=dict(unit="local_presence_predicates" if eligible else "local_audit_calls", units=1))
+    ledger.add(workflow="operations:local_credential_audit", stage="complete_instrumented_local_audit",
+        seconds=timing["seconds"], source=timing_sha, locator="seconds",
+        origin="observed_local_credential_audit", outcome="verified_local_presence_only",
+        context=dict(base, source_binding_eligible=False), work=dict(unit="declared_local_credential_gates", units=45))
+    return dict(declared_providers=45, original_presence_predicates=45, stage_observations=len(stages),
+                public_source_archives_verified=4, full_acquisition_verified=False)
+
+
+def collect_local_credential_audits(ledger, evidence, directories):
+    reports = [[Path(directory) / name for name in LOCAL_CREDENTIAL_AUDIT_FILES] for directory in directories]
+    return _collect_retained_native_operations(ledger, evidence, reports, size=8,
+        accept=_local_credential_audit_samples, kind="local_credential_audit_report",
+        contract="observed_local_credential_audit_v1", scope_name="local_credential_audit")
+
+
 def bind_source_stages(ledger: Ledger) -> int:
     """Bind exact registered IDs; shared cycle wall is not per-source."""
     sources = {row["id"]: row for row in ledger.inventory if row["kind"] == "source_endpoint"}
@@ -2034,6 +2365,7 @@ def bind_source_stages(ledger: Ledger) -> int:
                   "observed_crypto_issuer_parser": "crypto-etf:issuer:",
                   "observed_retained_dune_partition": "dune-query:",
                   "observed_retained_sec_native": "crypto-etf:",
+                  "observed_local_credential_audit": "credential:",
                   "recorded_tw_public_operation": "tw-public:"}.get(sample["origin"])
         if (prefix is None or sample["context"].get("input_identity") == "producer_cycle"
                 or sample["context"].get("source_binding_eligible") is False
@@ -2486,6 +2818,10 @@ def collect_openbb_operations(ledger, evidence, root):
 
 def collect_benchmark(ledger: Ledger, payload, sha: str, path: Path) -> None:
     """Explicitly selected producer samples; full receipt retains acceptance."""
+    cpu_fields = ("cpu_seconds", "complete_cpu_seconds", "descendant_cpu_seconds",
+                  "process_cpu_seconds", "child_cpu_user_seconds", "child_cpu_system_seconds",
+                  "reaped_child_cpu_seconds", "parent_cpu_seconds", "self_cpu_seconds",
+                  "user_cpu_seconds", "system_cpu_seconds")
     if not isinstance(payload, dict):
         return
     if payload.get("contract") == "economic_receipt_validation_v1":
@@ -2584,14 +2920,14 @@ def collect_benchmark(ledger: Ledger, payload, sha: str, path: Path) -> None:
                           "workflow_seconds", "build_seconds", "representations_and_digest_seconds",
                           "workflow_ms", "build_ms", "representations_ms", "independent_readback_ms",
                           "independent_readback_seconds", "process_seconds", "worker_seconds_including_imports",
-                          "cpu_seconds", "complete_cpu_seconds"):
+                          *cpu_fields):
                 value = row.get(field)
                 if not finite_seconds(value):
                     continue
                 ledger.add(workflow=workflow, stage=field, seconds=value / 1000 if field.endswith("_ms") else value,
                            source=sha, locator=f"/{key}/{index}/{field}", origin="selected_benchmark_receipt",
                            outcome="producer_reported_sample_acceptance_in_receipt", context=context,
-                           metric="cpu_seconds" if "cpu" in field else "wall_seconds",
+                           metric="cpu_seconds" if field in cpu_fields else "wall_seconds",
                            work={"units": row.get("rows"), "unit": "rows", "bytes": row.get("bytes_read")})
             phases = [("phases", i, p) for i, p in enumerate(row.get("phases", []))]
             phases.extend(("writes", i, p) for i, p in enumerate(row.get("writes", [])))
@@ -2602,7 +2938,8 @@ def collect_benchmark(ledger: Ledger, payload, sha: str, path: Path) -> None:
                     if TIME_FIELD.search(field) and finite_seconds(value):
                         ledger.add(workflow=workflow, stage=str(phase.get("stage", phase.get("file"))) + ":" + field,
                                    seconds=value / 1000 if field.endswith("_ms") else value, source=sha, locator=f"/{key}/{index}/{phase_kind}/{phase_index}/{field}",
-                                   origin="selected_benchmark_receipt", context=context)
+                                   origin="selected_benchmark_receipt", context=context,
+                                   metric="cpu_seconds" if field in cpu_fields else "wall_seconds")
             for field, value in (row.get("stages") or {}).items():
                 if field.endswith("_ms") and finite_seconds(value):
                     ledger.add(workflow=workflow, stage="live_stage:" + field, seconds=value / 1000,
@@ -3027,6 +3364,8 @@ def collect(args) -> dict:
                      "stockagent/workflow_metric_tree.py", "stockagent/workflow_metric_tree.cpp",
                      "stockagent/workflow_snapshot_streams.py",
                  "stockagent/workflow_snapshot_pack.py",
+                 "downloader/artifact_io.py",
+                 "scripts/audit_data_credentials.py",
                  "stockagent/data_sync/packed_snapshots.py",
                  "stockagent/data_sync/packed_metadata.py",
                  "stockagent/data_sync/desync_snapshots.py",
@@ -3141,6 +3480,7 @@ def collect(args) -> dict:
         collect_crypto_issuer_parser_operations(ledger, evidence, getattr(args, "crypto_issuer_parser_report", []))
         collect_retained_dune_operations(ledger, evidence, getattr(args, "retained_dune_report", []))
         collect_retained_sec_operations(ledger, evidence, getattr(args, "retained_sec_report", []))
+        collect_local_credential_audits(ledger, evidence, getattr(args, "local_credential_audit_report", []))
         finish_phase("acquisition_receipts")
         collect_engineering_runs(ledger, evidence, ROOT / "artifacts/operations/agent-workflow/runs", limit=args.agent_runs)
         finish_phase("engineering_command_receipts")
@@ -3221,6 +3561,8 @@ def collect(args) -> dict:
                             "monitor_snapshot": str(args.monitor_snapshot)},
             "tw_public_operation_ingestion_contract": "tw_public_operation_journal_ingestion_v1",
             "tw_public_release_operation_ingestion_contract": "tw_public_operation_journal_ingestion_v2",
+            "benchmark_receipt_clock_ingestion_contract": "producer_benchmark_cpu_scopes_v2",
+            "engineering_command_cpu_ingestion_contract": "waited_command_reaped_child_cpu_v1",
             "limits": {"training_depth": args.training_depth, "benchmark_depth": args.benchmark_depth,
                        "benchmark_directory_budget": args.benchmark_directory_budget,
                        "excluded_directory_names": sorted(SKIP_DIRS), "max_file_mib": args.max_file_mib,
@@ -3260,6 +3602,9 @@ def collect(args) -> dict:
         # Bind every final output and every retained original snapshot independently.
         report["outputs"] = {str(path.relative_to(output)): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
                              for path in sorted(output.iterdir()) if path.is_file()}
+        if getattr(args, "local_credential_audit_report", []):
+            report["local_credential_audit_ingestion_contract"] = "observed_local_credential_audit_v1"
+            report["input_paths"]["local_credential_audit_report"] = [str(path) for path in args.local_credential_audit_report]
         finish_phase("final_output_hashes")
         report["pre_manifest_wall_seconds"] = phase_started - started
         atomic_write_json(output / "collection.json", report)
@@ -3297,6 +3642,8 @@ def main(argv=None) -> int:
     parser.add_argument("--retained-sec-report", nargs=4, action="append", default=[],
                         metavar=("TIMING", "PROTOCOL", "RESULTS", "READBACK"),
                         help="Explicit retained SEC native clocks; independently verify every original/output row, mapping, manifest and cached document, with no provider operations")
+    parser.add_argument("--local-credential-audit-report", type=Path, action="append", default=[],
+                        help="Fixed completed local credential audit directory; retain 45 presence-gate clocks and original public sources; no provider calls or entitlement claim")
     parser.add_argument("--benchmark-receipt", type=Path, action="append", default=[])
     parser.add_argument("--metric-backend", choices=("python", "auto", "cpp"), default="auto",
                         help="Benchmark field walker and optional Linux batch reads; auto uses a source/ABI-verified cache; cpp explicitly builds an absent cache")

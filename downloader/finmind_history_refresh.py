@@ -20,7 +20,7 @@ from downloader.parquet_integrity import parquet_receipt_error
 
 
 DAILY_EQUITY = frozenset({"USStockPrice", "UKStockPrice", "EuropeStockPrice", "JapanStockPrice"})
-CONTRACT_VERSION = 2  # An empty tail is not an empty replacement of all history.
+CONTRACT_VERSION = 3  # Missing rows in a full response do not prove deletion.
 FULL_RECHECK_DAYS = 7
 OVERLAP_DAYS = 7
 
@@ -118,7 +118,8 @@ def validate_rows(rows: list[dict], identifier: str, start: date, end: date) -> 
         seen.add(raw)
 
 
-def merge_response(old: list[dict], rows: list[dict], identifier: str, plan: dict) -> list[dict]:
+def merge_response(old: list[dict], rows: list[dict], identifier: str, plan: dict,
+                   *, authoritative_replace: bool = False) -> list[dict]:
     start, end = (date.fromisoformat(plan[key]) for key in ("request_start_date", "request_end_date"))
     validate_rows(rows, identifier, start, end)
     if old and not rows:
@@ -131,6 +132,20 @@ def merge_response(old: list[dict], rows: list[dict], identifier: str, plan: dic
         plan['empty_response_policy'] = 'retain_verified_baseline_no_new_observation'
         return sorted(old, key=lambda row: row['date'])
     if plan["query_shape"] == "per_id_full_history":
+        if old and not authoritative_replace:
+            # A partial source recovery can return a nonempty tail even for
+            # 1900..today. Retain independently verified observations absent
+            # from that response; newer observations win on matching dates.
+            # Explicit correction scope may still authorize actual deletion.
+            validate_rows(old, identifier, date(1900, 1, 1), date.max)
+            observed = {row["date"] for row in rows}
+            retained = [row for row in old if row["date"] not in observed]
+            if retained:
+                plan.update(full_response_policy="retain_unreturned_verified_observations",
+                            retained_baseline_rows=len(retained),
+                            full_response_rows=len(rows),
+                            provider_history_completeness_verified=False)
+                return sorted([*retained, *rows], key=lambda row: row["date"])
         return sorted(rows, key=lambda row: row["date"])
     # The overlap is replaced, not appended; corrections/deletions can propagate.
     merged = [row for row in old if not start.isoformat() <= row["date"] <= end.isoformat()]

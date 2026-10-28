@@ -21,6 +21,8 @@ def resolve_tx_benchmark_path(trading) -> Path:
 def load_tx_front_rolling_benchmark(
     data_path: str | Path,
     panel_dates: np.ndarray,
+    *,
+    account_only_mask: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Gross 1x TX front-month close-to-close return with a prior-close roll.
 
@@ -32,6 +34,11 @@ def load_tx_front_rolling_benchmark(
     dates = np.asarray(panel_dates, dtype="datetime64[D]")
     if dates.ndim != 1 or not dates.size or np.isnat(dates).any() or np.any(dates[1:] <= dates[:-1]):
         raise ValueError("TX benchmark panel dates must be finite and increasing")
+    account_only = np.zeros(len(dates), dtype=bool)
+    if account_only_mask is not None:
+        account_only = np.asarray(account_only_mask)
+        if account_only.dtype != np.bool_ or account_only.shape != dates.shape or account_only.all():
+            raise ValueError("TX benchmark account-only mask must classify the dated panel")
     table = pq.read_table(
         data_path,
         columns=["date", "product", "contract", "tenor_rank", "close", "source_row_observed"],
@@ -46,12 +53,17 @@ def load_tx_front_rolling_benchmark(
     front_dates = front["date"].to_numpy().astype("datetime64[D]")
     if front_dates.size != source_dates.size or not np.array_equal(front_dates, source_dates):
         raise ValueError("TX benchmark requires exactly one front contract per source session")
-    if dates[-1] > source_dates[-1]:
+    if np.intersect1d(dates[account_only], source_dates).size:
+        raise ValueError("TX benchmark source contains a market session on an account-only date")
+    last_market_date = dates[~account_only][-1]
+    if last_market_date > source_dates[-1]:
         raise ValueError(
-            f"TX benchmark source ends {source_dates[-1]} before panel {dates[-1]}; "
+            f"TX benchmark source ends {source_dates[-1]} before panel {last_market_date}; "
             "trim the panel to the verified source first"
         )
-    covered = dates >= source_dates[0]
+    # A zero log return here is an accounting alignment placeholder, never an
+    # observed quote or a benchmark trade on the settlement-only date.
+    covered = (dates >= source_dates[0]) & ~account_only
     missing = np.setdiff1d(dates[covered], front_dates)
     if missing.size:
         raise ValueError(f"TX benchmark is missing a panel session: {missing[0]}")

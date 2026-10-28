@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "contract": "acquisition_verification_headroom_v1",
+  "minimum_free_bytes": 68719476736
+}

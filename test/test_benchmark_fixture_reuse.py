@@ -17,6 +17,270 @@ def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _workflow_round_case(parent, number=7):
+    source = parent / f'artifacts/benchmarks/workflow_speed_optimization_20261021/round{number}'
+    source.mkdir(parents=True)
+    acceptance = {'contract': fixtures.WORKFLOW_ROUND_CONTRACTS[number],
+        'state': 'verified_scoped_engineering', 'observed_at_utc': '2026-10-22T13:24:21+00:00',
+        'scope': 'original fixed-input measurements; no all-source or live-service claim',
+        'evidence': [{'path': 'scripts/producer.py', 'bytes': 12, 'sha256': 'a' * 64},
+                     {'path': str(source.relative_to(parent) / 'trial.json'), 'bytes': 13, 'sha256': 'b' * 64}]}
+    boundaries = {'all_workflows_measured': False, 'hardware_limit_proven': False}
+    if number in (8, 9, 10, 11):
+        acceptance.update(boundaries)
+    else:
+        acceptance['remaining_boundaries'] = boundaries
+    readback = {'state': 'verified', 'observed_at_utc': '2026-10-22T13:24:29+00:00',
+        'collector_phases_verified': 13, **boundaries,
+        ('evidence_files_verified' if number == 6 else 'sealed_files_verified'): 2,
+        ('performance_samples_verified' if number in (9, 10, 11) else
+         'optimization_samples_verified' if number == 8 else 'raw_samples_verified'): 4}
+    objects = dict(zip(fixtures.WORKFLOW_ROUND_RECEIPTS,
+        (acceptance, readback, {'state': 'prepared' if number in (8, 9, 10, 11) else 'reviewed'}), strict=True))
+    if number == 8:
+        acceptance.update(optimization_samples=4, confirmation_samples=2,
+                          instrumentation_comparison_samples=2, instrumented_diagnostic_samples=1)
+        readback.update(confirmation_samples_verified=2, instrumentation_comparison_samples_verified=2,
+                        diagnostic_counter_coverage_verified=True, remaining_registry_counts_verified=True,
+                        mean_checks=16, speed_samples_verified=48, summary_groups_verified=8)
+        for value in objects.values():
+            value.update(selected_variant='fifo_batch256', selected_batch_mib=256,
+                         performance_candidate_adopted=True)
+    if number == 9:
+        acceptance.update(performance_samples=4, diagnostic_samples=1,
+                          selected_source='baseline_with_tests', selected_batch_mib=256,
+                          selected_read_workers=1, performance_candidate_adopted=False)
+        readback.update(diagnostic_samples_verified=1, serialization_operations_verified=5,
+                        remaining_registry_counts_verified=True, mean_checks=16,
+                        speed_samples_verified=48, summary_groups_verified=8,
+                        performance_candidate_adopted=False)
+        objects['source_disposition.json'].update(selected_source='baseline_with_tests',
+            selected_batch_mib=256, performance_candidate_adopted=False)
+    if number == 10:
+        acceptance.update(performance_samples=4, encoding_samples=6, encoding_diagnostics=1,
+                          selected_source='baseline_source', selected_batch_mib=256,
+                          selected_read_workers=1, performance_candidate_adopted=False)
+        readback.update(encoding_samples_verified=6, encoding_diagnostic_operations_verified=5,
+                        remaining_registry_counts_verified=True, mean_checks=16,
+                        speed_samples_verified=48, summary_groups_verified=8,
+                        performance_candidate_adopted=False)
+        objects['source_disposition.json'].update(selected_source='baseline_source',
+            selected_batch_mib=256, performance_candidate_adopted=False,
+            source_data_deleted=False, services_restarted=False, new_training_jobs=0)
+    def write(*, bind=True):
+        raw = json.dumps(acceptance).encode()
+        (source / 'optimization_acceptance.json').write_bytes(raw)
+        if bind:
+            readback['acceptance_sha256' if number == 6 else 'seal_sha256'] = hashlib.sha256(raw).hexdigest()
+        for name in fixtures.WORKFLOW_ROUND_RECEIPTS[1:]:
+            (source / name).write_text(json.dumps(objects[name]))
+    write()
+    return source, objects, write
+
+
+@pytest.mark.parametrize('number', [6, 7, 8, 9, 10, 11])
+def test_workflow_round_retains_small_original_receipts_and_preserves_scoped_claims(tmp_path, number):
+    source, objects, _ = _workflow_round_case(tmp_path, number)
+    # Real rounds include giant JSON measurement payloads. They belong to the
+    # full exact archive, never the locally retained control-metadata parser.
+    payload = source / 'encoding.manifest.json'
+    with payload.open('wb') as handle:
+        handle.truncate(16 * 1024**2)
+    contract = fixtures.WORKFLOW_ROUND_CONTRACTS[number]
+    assert fixtures.external_benchmark_contract(source) == contract
+    kept = tmp_path / 'retained-evidence'
+    result = fixtures.completed_benchmark_evidence(source, destination=kept)
+    assert {row['path'] for row in result['files']} == set(fixtures.WORKFLOW_ROUND_RECEIPTS)
+    assert result['producer_state'] == 'verified_scoped_engineering'
+    assert result['scope'] == 'producer_declared_completion_not_benchmark_reexecution'
+    assert payload.is_file() and result['bytes'] < 8192
+    for name in fixtures.WORKFLOW_ROUND_RECEIPTS:
+        assert (kept / name).read_bytes() == (source / name).read_bytes()
+    source.rename(source.with_name(source.name + '-still-preserved'))
+    assert fixtures.completed_benchmark_evidence(kept, original_source=source,
+        required_contract=contract) == result
+    with pytest.raises(fixtures.SnapshotError):
+        fixtures.completed_benchmark_evidence(kept, required_contract=contract)
+
+
+@pytest.mark.parametrize('problem', ['state', 'contract', 'scope', 'missing', 'seal', 'count',
+    'bool_count', 'samples', 'phases', 'partial_readback', 'duplicate', 'escape', 'absolute',
+    'noncanonical', 'backslash', 'null', 'dot', 'hash', 'negative_size', 'bool_size',
+    'naive_time', 'reverse_time', 'all_workflows', 'hardware', 'disposition', 'wrong_round', 'bad_day'])
+@pytest.mark.parametrize('number', [7, 8])
+def test_workflow_round_refuses_partial_unbound_or_malformed_original_receipts(tmp_path, problem, number):
+    source, objects, write = _workflow_round_case(tmp_path, number)
+    accepted, readback, disposition = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    row = accepted['evidence'][0]
+    if problem == 'state': accepted['state'] = 'running'
+    elif problem == 'contract': accepted['contract'] = fixtures.WORKFLOW_ROUND_CONTRACTS[6]
+    elif problem == 'scope': accepted['scope'] = ''
+    elif problem == 'seal': readback['seal_sha256'] = '0' * 64
+    elif problem == 'count': readback['sealed_files_verified'] = 1
+    elif problem == 'bool_count': readback['sealed_files_verified'] = True
+    elif problem == 'samples': readback['optimization_samples_verified' if number == 8 else 'raw_samples_verified'] = 0
+    elif problem == 'phases': readback['collector_phases_verified'] = 12
+    elif problem == 'partial_readback': readback['state'] = 'partial'
+    elif problem == 'duplicate': accepted['evidence'][1] = dict(row)
+    elif problem == 'escape': row['path'] = '../outside'
+    elif problem == 'absolute': row['path'] = '/outside'
+    elif problem == 'noncanonical': row['path'] = 'scripts//producer.py'
+    elif problem == 'backslash': row['path'] = 'scripts\\producer.py'
+    elif problem == 'null': row['path'] = 'scripts/producer\x00.py'
+    elif problem == 'dot': row['path'] = '.'
+    elif problem == 'hash': row['sha256'] = 'x' * 64
+    elif problem == 'negative_size': row['bytes'] = -1
+    elif problem == 'bool_size': row['bytes'] = False
+    elif problem == 'naive_time': accepted['observed_at_utc'] = '2026-10-22T13:24:21'
+    elif problem == 'reverse_time': readback['observed_at_utc'] = '2026-10-21T13:24:21+00:00'
+    elif problem == 'all_workflows':
+        (accepted if number == 8 else accepted['remaining_boundaries'])['all_workflows_measured'] = True
+    elif problem == 'hardware': readback['hardware_limit_proven'] = True
+    elif problem == 'disposition': disposition['state'] = 'running'
+    write(bind=problem != 'seal')
+    if problem == 'missing': (source / 'optimization_acceptance_readback.json').unlink()
+    elif problem == 'wrong_round':
+        target = source.with_name('round9')
+        source.rename(target)
+        source = target
+    elif problem == 'bad_day':
+        target = source.parent.with_name('workflow_speed_optimization_20261301')
+        source.parent.rename(target)
+        source = target / source.name
+    with pytest.raises((fixtures.SnapshotError, OSError)):
+        fixtures.completed_benchmark_evidence(source)
+
+
+@pytest.mark.parametrize('number', [6, 7, 8, 9, 10, 11])
+def test_workflow_round_original_producer_survives_canonical_quarantine_admission(tmp_path, number):
+    import time
+    from stockagent.data_sync.legacy_artifact_archive import (
+        LegacyArchiveSpec, MANUAL_WSL_CAPTURE_CONTRACT, source_plan,
+    )
+    source, _, _ = _workflow_round_case(tmp_path, number)
+    (source / 'raw-measurement.bin').write_bytes(b'original failed and successful trial bodies')
+    stamp = time.time() - 2 * 86400
+    for path in source.iterdir():
+        os.utime(path, (stamp, stamp))
+    relative = source.relative_to(tmp_path / 'artifacts').as_posix()
+    spec = LegacyArchiveSpec('workflow-round-fixture', relative, 7, tmp_path / 'stage',
+        manual_capture_min_stable_hours=12, capture_contract=MANUAL_WSL_CAPTURE_CONTRACT)
+    before = source_plan(source, spec, manual_capture=True)
+    assert len(before) == 4 and 'raw-measurement.bin' in {row['path'] for row in before}
+    state_root = tmp_path / 'states/retirements'
+    quarantine = state_root / 'quarantine' / spec.dataset / ('123-' + 'a' * 32)
+    quarantine.mkdir(parents=True)
+    original = source
+    source.rename(quarantine / 'source')
+    (state_root / (spec.dataset + '.json')).write_text(json.dumps({
+        'schema_version': 1, 'dataset': spec.dataset, 'relative_root': relative,
+        'state': 'retiring', 'quarantine': str(quarantine),
+        'snapshot_id': 'fixed-release', 'manifest_sha256': 'c' * 64}))
+    after = source_plan(quarantine / 'source', spec, manual_capture=True, original_source=original)
+    assert after == before
+    original.mkdir()
+    with pytest.raises(fixtures.SnapshotError, match='original retirement quarantine'):
+        source_plan(quarantine / 'source', spec, manual_capture=True, original_source=original)
+
+
+@pytest.mark.parametrize('problem', [
+    'optimization_count', 'confirmation_count', 'instrumentation_count', 'bool_samples',
+    'diagnostic_count', 'diagnostic_coverage', 'registry_coverage', 'mean_checks',
+    'speed_samples', 'summary_groups', 'empty_variant', 'bool_batch', 'nonpositive_batch',
+    'nonboolean_adoption', 'readback_variant', 'disposition_variant', 'readback_batch',
+    'disposition_batch', 'readback_adoption', 'disposition_adoption', 'missing_selection',
+])
+def test_workflow_round8_refuses_partial_family_counts_or_inconsistent_original_selection(tmp_path, problem):
+    source, objects, write = _workflow_round_case(tmp_path, 8)
+    accepted, readback, disposition = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    if problem == 'optimization_count': accepted['optimization_samples'] = 8
+    elif problem == 'confirmation_count': readback['confirmation_samples_verified'] = 1
+    elif problem == 'instrumentation_count': readback.pop('instrumentation_comparison_samples_verified')
+    elif problem == 'bool_samples': accepted['confirmation_samples'] = True
+    elif problem == 'diagnostic_count': accepted['instrumented_diagnostic_samples'] = 0
+    elif problem == 'diagnostic_coverage': readback['diagnostic_counter_coverage_verified'] = False
+    elif problem == 'registry_coverage': readback.pop('remaining_registry_counts_verified')
+    elif problem == 'mean_checks': readback['mean_checks'] = False
+    elif problem == 'speed_samples': readback['speed_samples_verified'] = 0
+    elif problem == 'summary_groups': readback['summary_groups_verified'] = -1
+    elif problem == 'empty_variant': accepted['selected_variant'] = ''
+    elif problem == 'bool_batch': accepted['selected_batch_mib'] = True
+    elif problem == 'nonpositive_batch': accepted['selected_batch_mib'] = 0
+    elif problem == 'nonboolean_adoption': accepted['performance_candidate_adopted'] = 1
+    elif problem == 'readback_variant': readback['selected_variant'] = 'unsealed'
+    elif problem == 'disposition_variant': disposition['selected_variant'] = 'unsealed'
+    elif problem == 'readback_batch': readback['selected_batch_mib'] = 512
+    elif problem == 'disposition_batch': disposition['selected_batch_mib'] = 512
+    elif problem == 'readback_adoption': readback['performance_candidate_adopted'] = False
+    elif problem == 'disposition_adoption': disposition['performance_candidate_adopted'] = False
+    elif problem == 'missing_selection': disposition.pop('selected_variant')
+    write()
+    with pytest.raises(fixtures.SnapshotError, match='completed'):
+        fixtures.completed_benchmark_evidence(source)
+
+
+@pytest.mark.parametrize('problem', [
+    'performance_count', 'diagnostic_count', 'bool_samples', 'serialization_count',
+    'registry_coverage', 'mean_checks', 'speed_samples', 'summary_groups',
+    'empty_selected_source', 'different_selected_source', 'bool_batch', 'different_batch',
+    'bool_workers', 'zero_workers', 'nonboolean_adoption', 'readback_adoption',
+    'disposition_adoption',
+])
+def test_workflow_round9_refuses_partial_readback_or_inconsistent_original_selection(tmp_path, problem):
+    source, objects, write = _workflow_round_case(tmp_path, 9)
+    accepted, readback, disposition = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    if problem == 'performance_count': accepted['performance_samples'] = 8
+    elif problem == 'diagnostic_count': readback['diagnostic_samples_verified'] = 0
+    elif problem == 'bool_samples': accepted['diagnostic_samples'] = True
+    elif problem == 'serialization_count': readback['serialization_operations_verified'] = 4
+    elif problem == 'registry_coverage': readback.pop('remaining_registry_counts_verified')
+    elif problem == 'mean_checks': readback['mean_checks'] = False
+    elif problem == 'speed_samples': readback['speed_samples_verified'] = 0
+    elif problem == 'summary_groups': readback['summary_groups_verified'] = -1
+    elif problem == 'empty_selected_source': accepted['selected_source'] = ''
+    elif problem == 'different_selected_source': disposition['selected_source'] = 'unsealed'
+    elif problem == 'bool_batch': accepted['selected_batch_mib'] = True
+    elif problem == 'different_batch': disposition['selected_batch_mib'] = 512
+    elif problem == 'bool_workers': accepted['selected_read_workers'] = True
+    elif problem == 'zero_workers': accepted['selected_read_workers'] = 0
+    elif problem == 'nonboolean_adoption': accepted['performance_candidate_adopted'] = 0
+    elif problem == 'readback_adoption': readback['performance_candidate_adopted'] = True
+    elif problem == 'disposition_adoption': disposition['performance_candidate_adopted'] = True
+    write()
+    with pytest.raises(fixtures.SnapshotError, match='completed'):
+        fixtures.completed_benchmark_evidence(source)
+
+
+@pytest.mark.parametrize('problem', [
+    'performance_count', 'encoding_count', 'bool_encoding_count', 'diagnostics',
+    'diagnostic_operations', 'registry_coverage', 'mean_checks', 'speed_samples',
+    'summary_groups', 'different_selected_source', 'different_batch', 'readback_adoption',
+    'source_deleted', 'services_restarted', 'training_jobs', 'boolean_jobs',
+])
+def test_workflow_round10_refuses_partial_or_conflicting_original_receipts(tmp_path, problem):
+    source, objects, write = _workflow_round_case(tmp_path, 10)
+    accepted, readback, disposition = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    if problem == 'performance_count': accepted['performance_samples'] = 8
+    elif problem == 'encoding_count': readback['encoding_samples_verified'] = 5
+    elif problem == 'bool_encoding_count': accepted['encoding_samples'] = True
+    elif problem == 'diagnostics': accepted['encoding_diagnostics'] = 0
+    elif problem == 'diagnostic_operations': readback['encoding_diagnostic_operations_verified'] = 0
+    elif problem == 'registry_coverage': readback.pop('remaining_registry_counts_verified')
+    elif problem == 'mean_checks': readback['mean_checks'] = False
+    elif problem == 'speed_samples': readback['speed_samples_verified'] = 0
+    elif problem == 'summary_groups': readback['summary_groups_verified'] = -1
+    elif problem == 'different_selected_source': disposition['selected_source'] = 'unsealed'
+    elif problem == 'different_batch': disposition['selected_batch_mib'] = 512
+    elif problem == 'readback_adoption': readback['performance_candidate_adopted'] = True
+    elif problem == 'source_deleted': disposition['source_data_deleted'] = True
+    elif problem == 'services_restarted': disposition['services_restarted'] = True
+    elif problem == 'training_jobs': disposition['new_training_jobs'] = 1
+    elif problem == 'boolean_jobs': disposition['new_training_jobs'] = False
+    write()
+    with pytest.raises(fixtures.SnapshotError, match='completed'):
+        fixtures.completed_benchmark_evidence(source)
+
+
 def _taifex_proof_memo_case(parent):
     source = parent / 'artifacts/benchmarks/running_services_20261013/taifex_proof_memo_20261015'
     source.mkdir(parents=True)

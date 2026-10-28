@@ -1,10 +1,12 @@
 """Bounded cache discovery is not acceptance; original validation stays mandatory."""
 from dataclasses import replace
+import json
 import os
 from threading import Event
 
 import pytest
 
+from downloader.artifact_io import sha256_file
 from downloader.news_fulltext_policy import cnyes_bulk_fingerprint
 from downloader.news_fulltext_queue import NewsQueue
 from downloader.news_fulltext_replay import _inventory, ensure_replay_schema, replay_cached_cnyes
@@ -129,6 +131,13 @@ def test_unknown_symlink_names_and_invalid_envelopes_not_accepted_as_text(cfg, t
     queue = NewsQueue(tmp_path, registry)
     try:
         folder = fake_envelopes(tmp_path, 1)
+        # Supply a valid sidecar so this test reaches the invalid Parquet
+        # envelope; an absent sidecar is correctly a retryable local I/O error.
+        digest = '0' * 64
+        envelope = folder / (digest + '.parquet')
+        (folder / (digest + '.parquet.receipt.json')).write_text(json.dumps({
+            'parquet_path': 'quarantine/' + digest + '.parquet', 'publish': False,
+            'response_sha256': digest, 'sha256': sha256_file(envelope)}))
         (folder / ('f' * 64 + '.parquet')).symlink_to(folder / ('0' * 64 + '.parquet'))
         (folder / 'not-a-digest.parquet').write_bytes(b'not an envelope')
         assert replay_cached_cnyes(queue)['accepted_heads'] == 0

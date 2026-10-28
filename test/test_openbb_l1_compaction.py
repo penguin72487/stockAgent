@@ -307,15 +307,179 @@ def test_l1_journal_quiet_source_still_audits_derivative_metadata(
     assert receipt["l0_deleted"] is False
 
 
-def test_l1_systemd_memory_relief_keeps_hard_limit_and_audit() -> None:
+def test_l1_systemd_unrestricted_resources_preserve_source_audit() -> None:
     unit = Path(
         "deploy/systemd/stockagent-openbb-l1-compaction.service.in"
     ).read_text(encoding="utf-8")
-    assert "MemoryHigh=2816M" in unit
-    assert "MemoryMax=3G" in unit
+    assert "MemoryHigh=infinity" in unit
+    assert "MemoryMax=infinity" in unit
+    assert "--threads " not in unit
+    assert "--memory-limit " not in unit
     assert "--incremental-source-audit" in unit
+    assert '--incremental-metadata-audit' in unit
+    assert '--incremental-member-counts' in unit
+    assert '--incremental-unassigned-index' in unit
     assert "--max-source-files 32768" in unit
     assert "--archive-idle-only" in unit
+
+
+def _metadata_receipt(root: Path) -> dict:
+    return json.loads((root / '_state/l1_compaction_latest.json').read_bytes())
+
+
+def _metadata_warm(root: Path, *, grouped=False) -> list[str]:
+    endpoint = compactor.SCHEMA_GROUPED_ENDPOINT if grouped else ENDPOINT
+    _publish_tasks(root, ['aa', 'bb'], endpoint=endpoint)
+    args = [*_incremental_args(root), '--incremental-metadata-audit']
+    if grouped:
+        args.append('--schema-grouped-sec-views')
+    assert run(args) == run(args) == 0
+    assert _metadata_receipt(root)['derivative_metadata_audit']['incremental_proofs']['proofs_written'] == 1
+    return args
+
+
+@pytest.mark.parametrize('grouped', [False, True])
+def test_l1_metadata_proof_survives_fresh_connections_and_full_audit(tmp_path, monkeypatch, grouped):
+    args = _metadata_warm(tmp_path, grouped=grouped)
+    reference = None
+    with duckdb.connect(str(tmp_path / 'openbb_l1.duckdb'), read_only=True) as database:
+        endpoint = compactor.SCHEMA_GROUPED_ENDPOINT if grouped else ENDPOINT
+        reference = database.execute('SELECT * FROM ' + compactor._view_name(endpoint) + ' ORDER BY date').fetchall()
+    original = compactor.pq.ParquetFile
+    opened = []
+    def tracked(path, *a, **kw):
+        opened.append(Path(path))
+        return original(path, *a, **kw)
+    monkeypatch.setattr(compactor.pq, 'ParquetFile', tracked)
+    assert run(args) == 0
+    audit = _metadata_receipt(tmp_path)['derivative_metadata_audit']
+    assert audit['footer_open_attempts'] == 0
+    assert audit['incremental_proofs']['hits'] == 1
+    assert audit['incremental_proofs']['proofs_written'] == 0
+    assert opened == []
+    with duckdb.connect(str(tmp_path / 'openbb_l1.duckdb'), read_only=True) as database:
+        assert database.execute('SELECT * FROM ' + compactor._view_name(endpoint) + ' ORDER BY date').fetchall() == reference
+    assert run([*args, '--force-full-metadata-audit']) == 0
+    assert _metadata_receipt(tmp_path)['derivative_metadata_audit']['footer_open_attempts'] == 1
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize('mutation', ['same_size_restored_mtime', 'replace', 'missing', 'schema', 'manifest'])
+def test_l1_metadata_proof_invalidates_mutated_derivative(tmp_path, mutation):
+    args = _metadata_warm(tmp_path)
+    path = _sec_segment_paths(tmp_path)[0]
+    before = path.stat()
+    if mutation == 'same_size_restored_mtime':
+        with path.open('r+b') as stream:
+            stream.seek(-4, 2)
+            stream.write(b'FAIL')
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.stat().st_size == before.st_size
+        assert path.stat().st_mtime_ns == before.st_mtime_ns
+        assert path.stat().st_ctime_ns != before.st_ctime_ns
+    elif mutation == 'replace':
+        replacement = path.with_suffix('.replacement')
+        replacement.write_bytes(path.read_bytes())
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        replacement.replace(path)
+    elif mutation == 'missing':
+        path.rename(path.with_suffix('.preserved'))
+    elif mutation == 'schema':
+        pq.write_table(pa.table({'other': [1, 2]}), path)
+    else:
+        with sqlite3.connect(tmp_path / '_state/openbb_archive.sqlite3') as connection:
+            connection.execute("UPDATE l1_compaction_segments SET schema_fingerprint=? WHERE status='success'", ('0'*64,))
+    assert run(args) == 0
+    receipt = _metadata_receipt(tmp_path)
+    audit = receipt['derivative_metadata_audit']
+    assert audit['incremental_proofs']['hits'] == 0
+    assert audit['footer_open_attempts'] == (0 if mutation == 'missing' else 1)
+    assert receipt['stale_segments'] == (0 if mutation == 'replace' else 1)
+    assert receipt['l0_deleted'] is False
+
+
+@pytest.mark.parametrize('mutation', ['missing', 'bad_sha', 'bad_json', 'expired', 'future', 'policy'])
+def test_l1_metadata_proof_invalidates_missing_or_damaged_evidence(tmp_path, mutation):
+    from scripts.openbb_l1_metadata_proof import TABLE
+    args = _metadata_warm(tmp_path)
+    with sqlite3.connect(tmp_path / '_state/openbb_archive.sqlite3') as connection:
+        if mutation == 'missing':
+            connection.execute(f'DELETE FROM {TABLE}')
+        elif mutation == 'bad_sha':
+            connection.execute(f"UPDATE {TABLE} SET sha256='bad'")
+        else:
+            body = connection.execute(f'SELECT body FROM {TABLE}').fetchone()[0]
+            value = json.loads(body)
+            if mutation == 'expired':
+                value[3] = 0
+            elif mutation == 'future':
+                value[3] = 2**62
+            elif mutation == 'policy':
+                value[0][2] = 'different-contract'
+            body = b'{' if mutation == 'bad_json' else json.dumps(value).encode()
+            connection.execute(f'UPDATE {TABLE} SET body=?,sha256=?', (body, hashlib.sha256(body).hexdigest()))
+    assert run(args) == 0
+    audit = _metadata_receipt(tmp_path)['derivative_metadata_audit']
+    assert audit['footer_open_attempts'] == audit['incremental_proofs']['proofs_written'] == 1
+    assert audit['incremental_proofs']['hits'] == 0
+
+
+def test_l1_metadata_proof_source_mutation_still_invalidates_members(tmp_path):
+    args = _metadata_warm(tmp_path)
+    with sqlite3.connect(tmp_path / '_state/openbb_archive.sqlite3') as connection:
+        connection.execute("UPDATE tasks SET updated_at='changed' WHERE task_id='aa'")
+    assert run(args) == 0
+    receipt = _metadata_receipt(tmp_path)
+    assert receipt['source_audit']['changed_task_ids'] == 1
+    assert receipt['stale_segments'] == 1
+    assert receipt['derivative_metadata_audit']['incremental_proofs']['proofs_deleted'] == 1
+
+
+def test_l1_metadata_proof_memory_failure_does_not_publish_or_mark_stale(tmp_path, monkeypatch):
+    args = _metadata_warm(tmp_path)
+    def exhausted(*_a, **_kw):
+        raise MemoryError('original resource failure')
+    monkeypatch.setattr(compactor.pq, 'ParquetFile', exhausted)
+    before = (tmp_path / '_state/l1_compaction_latest.json').read_bytes()
+    with pytest.raises(MemoryError, match='original resource failure'):
+        run([*args, '--force-full-metadata-audit'])
+    assert (tmp_path / '_state/l1_compaction_latest.json').read_bytes() == before
+    with sqlite3.connect(tmp_path / '_state/openbb_archive.sqlite3') as connection:
+        assert connection.execute("SELECT COUNT(*) FROM l1_compaction_segments WHERE status='stale'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('mutation',['delete','endpoint'])
+def test_l1_incremental_counts_still_reject_corrupt_membership(tmp_path, mutation):
+    args = [*_metadata_warm(tmp_path), '--incremental-member-counts']
+    assert run(args)==0
+    assert _metadata_receipt(tmp_path)['member_count_audit']['path']=='transactional_counts'
+    before = (tmp_path/'_state/l1_compaction_latest.json').read_bytes()
+    with sqlite3.connect(tmp_path/'_state/openbb_archive.sqlite3') as connection:
+        if mutation=='delete':
+            connection.execute("DELETE FROM l1_compaction_members WHERE task_id='aa'")
+        else:
+            connection.execute("UPDATE l1_compaction_members SET endpoint='wrong' WHERE task_id='aa'")
+    with pytest.raises(RuntimeError,match='member/segment count mismatch'):
+        run(args)
+    assert (tmp_path/'_state/l1_compaction_latest.json').read_bytes()==before
+
+
+def test_l1_transactional_workset_retains_new_and_stale_source_work(tmp_path):
+    args = [*_metadata_warm(tmp_path),'--incremental-member-counts','--incremental-unassigned-index']
+    assert run(args)==0
+    assert 'unassigned_source_incremental_index' in _metadata_receipt(tmp_path)['stage_seconds']
+    _publish_tasks(tmp_path,['new'])
+    assert run(args)==0
+    assert _metadata_receipt(tmp_path)['new_segments']==1
+    with sqlite3.connect(tmp_path/'_state/openbb_archive.sqlite3') as connection:
+        connection.execute("UPDATE tasks SET updated_at='changed' WHERE task_id='aa'")
+    assert run(args)==0
+    receipt = _metadata_receipt(tmp_path)
+    assert receipt['stale_segments']==1
+    assert receipt['new_segments']==1
+    assert receipt['pending_files']==0
+    assert receipt['compacted_files']==3
+    assert receipt['member_count_audit']['path']=='transactional_counts'
 
 
 def test_l1_metadata_probe_compares_complete_rows_and_schema(tmp_path: Path) -> None:
@@ -664,6 +828,25 @@ def _sec_action(root: Path) -> str:
     return receipt["view_endpoint_actions"][compactor.SCHEMA_GROUPED_ENDPOINT]
 
 
+def test_grouped_reuse_retains_original_signature_without_sql_materialization(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    segment = "a" * 24
+    path = compactor._segment_output(tmp_path, compactor.SCHEMA_GROUPED_ENDPOINT, segment)
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"witnessed metadata")
+    proof = compactor.ViewSourceProof(segment, str(path), compactor._view_file_signature(path),
+                                     123, "b" * 64, "c" * 64)
+    with duckdb.connect(":memory:") as database:
+        policy = compactor._schema_group_reader_policy(database)
+        original = hashlib.sha256(json.dumps({"policy": policy, "sources": [asdict(proof)]},
+            sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        def forbidden(*args, **kwargs):
+            raise AssertionError("unchanged grouped view must reuse its persisted SQL")
+        monkeypatch.setattr(compactor, "_parquet_view_query", forbidden)
+        assert compactor._schema_grouped_view(database, [path], tmp_path, {str(path): proof},
+            reuse_signature=original) == (None, original, policy)
+
+
 def test_l1_sec_grouping_is_opt_in_reuses_audit_and_fences_reuse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -907,10 +1090,13 @@ def test_l1_sec_nonfirst_source_drift_keeps_previous_catalog_and_receipt(
         monkeypatch.setattr(compactor, "_schema_grouped_view", after_bind)
     else:
         original = compactor._reusable_view_catalog
+        validations = 0
 
         def after_persisted_validation(path, **kwargs):
+            nonlocal validations
+            validations += 1
             result = original(path, **kwargs)
-            if path.suffix == ".tmp":
+            if path.suffix == ".tmp" or validations == 2:
                 mutate()
             return result
 
@@ -1392,7 +1578,7 @@ def test_l1_view_connections_share_configured_resource_budget(
     assert run(args) == 0
     assert run(args) == 0
     assert [read_only for read_only, _, _ in observed] == [
-        False, False, True, True, False, True,
+        False, False, True, True, True, True,
     ]
     for _, config, settings in observed:
         assert config == {"threads": 2, "memory_limit": "128MB"}

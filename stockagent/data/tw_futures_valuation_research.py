@@ -17,6 +17,7 @@ from downloader.artifact_io import sha256_file
 
 VALUATION_RESEARCH_CONTRACT = "frozen_contract_value_research_v1"
 VALUATION_RESEARCH_SCHEMA = 8
+TERMINAL_SCOPE_FIELD = "terminal_cash_conversion_physical_instances"
 VALUATION_RESEARCH_COLUMNS = {
     "valuation_research_applied": pl.Boolean,
     "valuation_research_method": pl.String,
@@ -43,7 +44,29 @@ def validate_valuation_research_policy(policy: dict) -> dict:
         value = policy.get(field, "")
         if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
             raise ValueError("research valuation requires bound source and prior accounting identities")
+    if TERMINAL_SCOPE_FIELD in policy:
+        scoped = policy[TERMINAL_SCOPE_FIELD]
+        if (not isinstance(scoped, list) or any(not isinstance(x, str) or not x for x in scoped)
+                or len(scoped) != len(set(scoped)) or not set(scoped) <= set(policy["physical_instances"])
+                or (scoped and not policy["terminal_cash_conversion_authorized"])):
+            raise ValueError("research cash conversion requires an explicit physical-instance subset")
     return policy
+
+
+def terminal_cash_conversion_instances(policy: dict) -> set[str]:
+    """Return the physical owners authorized by this individual policy."""
+    validate_valuation_research_policy(policy)
+    if not policy["terminal_cash_conversion_authorized"]:
+        return set()
+    return set(policy.get(TERMINAL_SCOPE_FIELD, policy["physical_instances"]))
+
+
+def validate_composed_terminal_scope(policy: dict, documents: list[dict]) -> None:
+    """Disallow transferring one source policy's authority to another's owners."""
+    validate_valuation_research_policy(policy)
+    allowed = set().union(*(terminal_cash_conversion_instances(d) for d in documents))
+    if terminal_cash_conversion_instances(policy) != allowed:
+        raise ValueError("composed research policy expands or drops terminal cash conversion authorization")
 
 
 def validate_valuation_research_manifest(manifest: dict, root: Path) -> dict:
@@ -62,6 +85,18 @@ def validate_valuation_research_manifest(manifest: dict, root: Path) -> dict:
     if manifest.get("valuation_research_policy_sha256") != proof["sha256"]:
         raise ValueError("research valuation manifest and policy differ")
     policy = validate_valuation_research_policy(json.loads((root / relative).read_text()))
+    # Existing releases retain their original ABI. New scoped releases also
+    # bind their exact terminal permissions to the retained source policies.
+    if TERMINAL_SCOPE_FIELD in policy and policy.get("accepted_policy_inputs"):
+        documents = []
+        for item in policy["accepted_policy_inputs"]:
+            path = Path(item.get("path", ""))
+            if path.is_absolute() or ".." in path.parts or not path.parts or path.parts[0] != "sources":
+                raise ValueError("unsafe research valuation source policy receipt")
+            if sha256_file(root / path) != item.get("sha256"):
+                raise ValueError("research valuation source policy SHA mismatch")
+            documents.append(validate_valuation_research_policy(json.loads((root / path).read_text())))
+        validate_composed_terminal_scope(policy, documents)
     # This ABI can compose the existing disclosed position-risk assumption,
     # without falsely asserting its estimated financial values are verified.
     from stockagent.data.tw_futures_position_research import validate_position_research_policy
@@ -126,7 +161,9 @@ prices/volumes are cleared; the first valuation comes from its prior owner.
             final = (final_settlements.filter((pl.col('product') == target) & (pl.col('contract') == month)
                 & (pl.col('settlement_date') >= boundary)).sort('settlement_date').head(1)
                 if final_settlements is not None else pl.DataFrame())
-            if final.is_empty() and (not policy['terminal_cash_conversion_authorized']
+            scoped_origin = (TERMINAL_SCOPE_FIELD not in policy
+                or item['physical_contract'] in terminal_cash_conversion_instances(policy))
+            if final.is_empty() and (not policy['terminal_cash_conversion_authorized'] or not scoped_origin
                     or item.get('source_open_interest') != 0.):
                 raise ValueError('unobserved owner requires exact own final or authorized zero-OI research conversion')
             expiry = final['settlement_date'][0] if final.height else None
@@ -325,10 +362,15 @@ market fill. Its value is the last book value, with no assumed trading tax.
         pl.col('carry_from_date').alias('date'),
         pl.col('carry_from_physical_contract').alias('physical_contract')).unique()
     broken = flags.filter(pl.col('lost_inventory_continuation')).select(keys)
+    authorized = (sorted(terminal_cash_conversion_instances(policy))
+        if TERMINAL_SCOPE_FIELD in policy else policy['physical_instances'])
     terminal = frame.join(broken, on=keys, how='semi').join(owners, on=keys, how='anti').filter(
         (pl.col('lifetime_status') == 'zero_open_interest_delisting') & (pl.col('open_interest') == 0)
-        & pl.col('physical_contract').is_in(policy['physical_instances']))
+        & pl.col('physical_contract').is_in(authorized))
     synthetic = frame.filter(pl.col('valuation_research_terminal_assumption')).join(owners, on=keys, how='anti')
+    if TERMINAL_SCOPE_FIELD in policy:
+        synthetic = synthetic.filter(pl.col('valuation_research_owner_extension')
+            & pl.col('valuation_research_seed_identity').is_in(authorized))
     selected = pl.concat([terminal.select(keys), synthetic.select(keys)]).unique()
     audit = rules.join(selected, on=keys, how='semi')
     if audit.is_empty():
@@ -360,3 +402,16 @@ market fill. Its value is the last book value, with no assumed trading tax.
     flags = flags.with_columns(pl.when(pl.col('_research_terminal').fill_null(False)).then(False)
         .otherwise(pl.col('lost_inventory_continuation')).alias('lost_inventory_continuation')).drop('_research_terminal')
     return frame, rules, flags, audit
+
+
+def validate_research_terminal_authorization(rules: pl.DataFrame, policy: dict) -> None:
+    """Reject converted rows outside a new policy's explicitly sourced scope."""
+    if TERMINAL_SCOPE_FIELD not in policy:
+        return  # Historical releases retain their original, disclosed ABI.
+    allowed = sorted(terminal_cash_conversion_instances(policy))
+    terminal = rules.filter(pl.col('terminal_event') == 'research_cash_conversion')
+    authorized = (pl.col('physical_contract').is_in(allowed)
+        | (pl.col('valuation_research_owner_extension').fill_null(False)
+           & pl.col('valuation_research_seed_identity').is_in(allowed)))
+    if terminal.filter(~authorized.fill_null(False)).height:
+        raise ValueError('research cash conversion is outside its physical-instance authorization')

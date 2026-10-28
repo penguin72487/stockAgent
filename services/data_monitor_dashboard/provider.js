@@ -176,6 +176,7 @@ function rowNode(row) {
     make("span", "cell-note", `最新：${sourceDate(row.record_stats?.latest_date ?? row.record_stats?.last, row.record_stats)}`));
   if (numeric(row.record_stats?.days) !== null) storage.append(make("span", "cell-note",
     `實際有資料：${integer(row.record_stats.days)} 天`));
+  if (row.record_stats?.row_unit) storage.append(make("span", "cell-note", `筆數單位：${row.record_stats.row_unit}`));
   if (numeric(row.record_stats?.files_total) !== null) storage.append(make("span", "cell-note",
     `檔案核實 ${integer(row.record_stats.files_inspected)}/${integer(row.record_stats.files_total)}`));
   const schedule = make("td");

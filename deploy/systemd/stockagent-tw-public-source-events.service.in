@@ -17,22 +17,21 @@ Restart=always
 RestartSec=5s
 WatchdogSec=5min
 TimeoutStartSec=1min
-Nice=5
-CPUWeight=50
-IOWeight=50
+# Source updates feed the opening path.  Give them a larger share than bulk
+# collection, while the paper executor and Discord retain first priority.
+Nice=0
+CPUWeight=5000
+IOWeight=5000
 # Prefer killing/restarting reproducible bulk maintenance before this
 # stateful event monitor when the host is under memory pressure.
 OOMScoreAdjust=-250
 MemoryAccounting=true
-# A canonical 9.6M-row TW feature rebuild measured ~41 GiB RSS.  The prior
-# 12/16 GiB cgroup ceiling throttled the completed-session finalizer while
-# it owned the source-update lock, delaying every dependent refresh. Keep the
-# opening engine in its separate service/cgroup; never silently lower this
-# bound below a measured full-history rebuild without a new benchmark.
-MemoryHigh=48G
-MemoryMax=64G
-MemorySwapMax=8G
-TasksMax=2048
+# Rebuilds may temporarily be large; do not impose the bulk-job ceilings on
+# the day-trade source owner.  The executor remains separately protected.
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
 TimeoutStopSec=2min
 
 [Install]

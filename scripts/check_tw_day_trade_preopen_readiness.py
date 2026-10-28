@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timedelta
 import json
 import os
 from pathlib import Path
@@ -24,6 +24,8 @@ from stockagent.config import load_config  # noqa: E402
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
 from stockagent.live.market_config import load_market_configs  # noqa: E402
 from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
+from stockagent.live.opening_execution_latency import execution_quantities  # noqa: E402
+from stockagent.live.opening_readiness import opening_transport_proven  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -138,6 +140,54 @@ def _execution_commit_times(
     return commits
 
 
+def _target_progress_commit(
+    rows: Sequence[Mapping[str, Any]], *, session_date: str, market: str,
+    signal_id: str, current: Mapping[str, Any], opening: datetime, observed: datetime,
+) -> tuple[datetime | None, str | None]:
+    """Use only the executor's fsynced, same-signal target-progress evidence.
+
+    Registration timestamps and economic fill timestamps cannot establish when
+    targets actually completed. A later signal revision must not borrow an
+    earlier revision's progress, and a replay must not count as live paper.
+    """
+    candidates: list[tuple[datetime, str]] = []
+    for row in rows:
+        if (row.get("market") != market or row.get("session_date") != session_date
+                or row.get("signal_id") != signal_id):
+            continue
+        revision = row.get("state_revision")
+        try:
+            timestamp = datetime.fromisoformat(str(row.get("recorded_at") or ""))
+        except ValueError:
+            timestamp = None
+        if (row.get("contract") != "state_fsync_then_paper_target_progress_v1"
+                or row.get("measurement_boundary") != "paper_target_quantities_after_state_commit_not_broker_fill"
+                or row.get("clock_basis") != "engine_publication_clock_not_economic_event"
+                or row.get("simulation_only") is not True
+                or row.get("production_order_possible") is not False
+                or row.get("live_execution_eligible") is not True
+                or row.get("simulation_replay") is not False
+                or not row.get("engine_run_id")
+                or type(revision) is not int or revision <= 0
+                or timestamp is None or timestamp.tzinfo is None
+                or not opening <= timestamp <= observed):
+            continue
+        quantities = execution_quantities(row)
+        if (not quantities["quantity_contract_valid"]
+                or quantities["ledger_state_divergence"]
+                or not quantities["live_execution_eligible"]
+                or quantities["simulation_replay"]
+                or quantities["entry_requested_shares"] != current.get("entry_requested_shares")
+                or quantities["entry_filled_shares"] != current.get("entry_filled_shares")
+                or quantities["entry_unfilled_shares"] != current.get("entry_unfilled_shares")):
+            continue
+        if quantities["all_target_complete"]:
+            candidates.append((timestamp, "all_targets_filled"))
+        elif quantities["no_execution_required"]:
+            candidates.append((timestamp, "no_execution_required"))
+    return min(candidates, default=(None, None), key=lambda item: item[0])
+
+
 def _service_states() -> dict[str, str]:
     states: dict[str, str] = {}
     for service in (*REQUIRED_SERVICES, EVENT_MONITOR_SERVICE):
@@ -204,9 +254,11 @@ def evaluate_readiness(
     engine_status_receipt: Mapping[str, Any] | None = None,
     engine_sync_receipt: Mapping[str, Any] | None = None,
     discord_status_receipt: Mapping[str, Any] | None = None,
+    model_cache_receipt: Mapping[str, Any] | None = None,
     execution_latency_rows: Sequence[Mapping[str, Any]] = (),
+    execution_progress_rows: Sequence[Mapping[str, Any]] = (),
     opening_check_after: datetime_time = datetime_time(9, 0, 15),
-    opening_commit_slo_seconds: float = 15.0,
+    opening_commit_slo_seconds: float = 1.0,
 ) -> dict[str, Any]:
     session_date = observed.astimezone(TAIPEI).date().isoformat()
     failures: list[str] = []
@@ -280,6 +332,16 @@ def evaluate_readiness(
     model_rows = model_receipt.get("markets")
     model_rows = dict(model_rows) if isinstance(model_rows, Mapping) else {}
     model_run_id = str(model_receipt.get("run_id") or "")
+    cache_receipt = dict(model_cache_receipt or {})
+    cache_observed = _parse_time(cache_receipt.get("updated_at"))
+    cache_age = ((observed.astimezone(TAIPEI) - cache_observed.astimezone(TAIPEI)).total_seconds()
+                 if cache_observed is not None else None)
+    cache_epoch = cache_receipt.get("live_panel_cache_epoch")
+    cache_owner_observed = bool(
+        model_run_id and cache_receipt.get("run_id") == model_run_id
+        and type(cache_epoch) is int
+        and cache_age is not None and -5.0 <= cache_age <= 10.0
+    )
     model_results: dict[str, dict[str, Any]] = {}
     for market in market_names:
         row = model_rows.get(market)
@@ -301,12 +363,15 @@ def evaluate_readiness(
             and model_run_id
             and final_arm.get("run_id") == model_run_id
             and _same_session(final_arm.get("completed_at"), session_date)
+            and cache_owner_observed
+            and type(final_arm.get("panel_cache_epoch")) is int
+            and final_arm.get("panel_cache_epoch") == cache_epoch
             and latency.get("panel_cache_hit") is True
             and latency.get("checkpoint_cache_hit") is True
             and latency.get("model_cache_hit") is True
-            and opening_prewarm.get("ready") is True
+            and latency.get("alignment_cache_hit") is True
+            and opening_transport_proven(opening_prewarm)
             and opening_prewarm.get("run_id") == model_run_id
-            and opening_prewarm.get("source") == "twse_tpex:mis"
         )
         model_results[market] = {
             "ready": ready,
@@ -316,12 +381,17 @@ def evaluate_readiness(
             "run_id": model_run_id or None,
             "final_arm_run_id": final_arm.get("run_id"),
             "final_arm_completed_at": final_arm.get("completed_at"),
+            "panel_cache_epoch": final_arm.get("panel_cache_epoch"),
+            "observed_cache_epoch": cache_epoch,
+            "cache_owner_observed": cache_owner_observed,
+            "cache_owner_heartbeat_age_seconds": cache_age,
             "cache_proof": {
                 key: latency.get(key)
                 for key in (
                     "panel_cache_hit",
                     "checkpoint_cache_hit",
                     "model_cache_hit",
+                    "alignment_cache_hit",
                 )
             },
             "opening_source_prewarm": {
@@ -564,12 +634,34 @@ def evaluate_readiness(
                 and filled_shares + unfilled_shares == requested_shares
                 and unresolved_rebalance_count == 0
             )
+            # Terminal accounting can include rejected or unfilled shares. It
+            # is not proof that every requested target actually filled. A
+            # zero-order mode needs the independent no-order execution proof.
+            full_targets_filled = bool(
+                execution_complete and requested_shares > 0
+                and filled_shares == requested_shares and unfilled_shares == 0
+            )
+            progress_at, progress_state = _target_progress_commit(
+                execution_progress_rows, session_date=session_date, market=market,
+                signal_id=str(row.get("signal_id") or ""), current=row,
+                opening=execution_boundary, observed=observed,
+            )
+            target_delay_ms = (
+                round((progress_at - execution_boundary).total_seconds() * 1000.0, 3)
+                if progress_at is not None else None
+            )
+            target_slo_met = bool(
+                target_delay_ms is not None
+                and 0.0 <= target_delay_ms <= opening_commit_slo_seconds * 1000.0
+            )
             accepted = bool(
                 committed
                 and accepted_policy
                 and int(row.get("entry_price_offset_ticks") or 0) == 0
                 and execution_complete
+                and (full_targets_filled or progress_state == "no_execution_required")
                 and slo_met
+                and target_slo_met
             )
             mode_results[market] = {
                 "ready": accepted,
@@ -594,10 +686,16 @@ def evaluate_readiness(
                 "pending_entry_shares": pending_shares,
                 "unresolved_rebalance_count": unresolved_rebalance_count,
                 "entry_execution_complete": execution_complete,
+                "all_requested_shares_filled": full_targets_filled,
                 "entry_commit_delay_ms": entry_commit_delay_ms,
-                "commit_measurement_boundary": "09:00_gate_to_actual_simulation_ledger_persisted",
+                "commit_measurement_boundary": "09:00_gate_to_signal_registration_persisted_not_full_target",
                 "commit_slo_seconds": opening_commit_slo_seconds,
                 "commit_slo_met": slo_met,
+                "target_progress_state": progress_state,
+                "target_progress_committed_at": progress_at.isoformat(timespec="microseconds")
+                if progress_at is not None else None,
+                "target_progress_delay_ms": target_delay_ms,
+                "target_progress_slo_met": target_slo_met,
             }
         opening_ready = bool(mode_results) and all(
             row["ready"] for row in mode_results.values()
@@ -611,11 +709,13 @@ def evaluate_readiness(
             ),
             "checked_after": opening_check_after.isoformat(),
             "commit_slo_seconds": opening_commit_slo_seconds,
+            "measurement_boundary": "09:00_to_paper_ledger_only_not_public_browser",
             "modes": mode_results,
         }
         if not opening_ready:
             failures.append(
-                "09:00 live signals and causal paper execution were not durably complete for every mode by 09:00:15"
+                "09:00 live signals and full causal paper targets were not durably complete "
+                f"for every mode within {opening_commit_slo_seconds:g} second(s)"
             )
 
     required_services = (
@@ -649,21 +749,27 @@ def evaluate_readiness(
         # A missed opening deadline is immutable, while this field answers
         # whether the services, sources, and ledgers are healthy right now.
         "operational_ready": operational_ready,
-        "opening_slo_met": (
+        "opening_ledger_slo_met": (
             None
             if opening_execution is None
             else opening_execution.get("ready") is True
         ),
+        # This gate has no per-mode browser paint receipt and must not equate
+        # a paper-ledger commit to the requested public end-to-end SLO.
+        "opening_slo_met": None,
+        "opening_slo_state": "not_assessed_browser_paint_required",
         "strict": strict,
         "session_date": session_date,
         "observed_at_taipei": observed.astimezone(TAIPEI).isoformat(
             timespec="seconds"
         ),
         "deadline_taipei": (
-            f"{session_date}T{opening_check_after.isoformat()}+08:00"
+            (datetime.combine(observed.astimezone(TAIPEI).date(), datetime_time(9, 0), tzinfo=TAIPEI)
+             + timedelta(seconds=opening_commit_slo_seconds)).isoformat()
             if opening_check_due
             else f"{session_date}T09:00:00+08:00"
         ),
+        "opening_evidence_checked_after": opening_check_after.isoformat(),
         "failures": failures,
         "public_data": {
             "ready": public_ready,
@@ -737,6 +843,7 @@ def main() -> int:
     except ValueError as exc:
         raise ValueError("--strict-after must be HH:MM[:SS]") from exc
     observed = datetime.now(TAIPEI)
+    session_observed_date = observed.date()
     session_state, session_reason, markets = _session_contract(observed)
     output = _repo_path(args.output)
     if session_state == "closed":
@@ -768,15 +875,27 @@ def main() -> int:
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
         return 1
 
+    # Sample the independent inputs first and the paired runtime receipts
+    # last.  Evaluating them against the earlier session-check start can make
+    # healthy heartbeats look several seconds into the future.
+    public_receipt = _read_json(_repo_path(args.public_receipt))
+    model_receipt = _read_json(_repo_path(args.model_receipt))
+    simulation_receipt = _read_json(_repo_path(args.simulation_receipt))
+    service_states = _service_states()
+    event_receipt = _read_json(_repo_path(args.event_receipt))
+    engine_status_receipt = _read_json(_repo_path(args.engine_status))
     engine_sync, discord_status = _read_synchronized_runtime_receipts(
-        _repo_path(args.engine_sync),
-        _repo_path(args.discord_status),
+        _repo_path(args.engine_sync), _repo_path(args.discord_status),
     )
     latency_path = _repo_path(args.execution_latency) if args.execution_latency else (
         _repo_path(args.engine_sync).with_name("latency.jsonl")
     )
     latency_rows: list[dict[str, Any]] = []
+    progress_path = _repo_path(args.engine_sync).with_name("execution_latency.jsonl")
+    progress_rows: list[dict[str, Any]] = []
     latency_read_error = None
+    progress_read_error = None
+    observed = datetime.now(TAIPEI)
     if observed.timetz().replace(tzinfo=None) >= datetime_time(9, 0, 15):
         # Reuse the bounded canonical reader; no history scan or extra provider
         # calls on the preopen path. Missing/partial evidence fails closed.
@@ -785,22 +904,45 @@ def main() -> int:
             latency_rows = _tail(latency_path, 2_000)
         except (OSError, TypeError, ValueError) as exc:
             latency_read_error = type(exc).__name__
+        try:
+            progress_rows = _tail(progress_path, 5_000)
+        except (OSError, TypeError, ValueError) as exc:
+            progress_read_error = type(exc).__name__
+    # Use the time AFTER reading the evidence as the freshness boundary. A
+    # receipt newer than this boundary remains invalid, rather than relaxing
+    # the existing tolerance for genuinely future or stale heartbeats.
+    observed = datetime.now(TAIPEI)
+    if observed.date() != session_observed_date:
+        payload = {
+            "schema_version": 1, "status": "failed", "ready": False,
+            "session_date": observed.date().isoformat(),
+            "observed_at_taipei": observed.isoformat(timespec="seconds"),
+            "session_reason": session_reason,
+            "failures": ["session date changed while sampling readiness receipts"],
+        }
+        _atomic_json(output, payload)
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+        return 1
     payload = evaluate_readiness(
         observed=observed,
         strict_after=strict_after,
         market_names=markets,
-        public_receipt=_read_json(_repo_path(args.public_receipt)),
-        model_receipt=_read_json(_repo_path(args.model_receipt)),
-        simulation_receipt=_read_json(_repo_path(args.simulation_receipt)),
-        service_states=_service_states(),
-        event_receipt=_read_json(_repo_path(args.event_receipt)),
-        engine_status_receipt=_read_json(_repo_path(args.engine_status)),
+        public_receipt=public_receipt,
+        model_receipt=model_receipt,
+        simulation_receipt=simulation_receipt,
+        service_states=service_states,
+        event_receipt=event_receipt,
+        engine_status_receipt=engine_status_receipt,
         engine_sync_receipt=engine_sync,
         discord_status_receipt=discord_status,
+        model_cache_receipt=discord_status,
         execution_latency_rows=latency_rows,
+        execution_progress_rows=progress_rows,
     )
     if latency_read_error is not None:
         payload["execution_latency_read_error"] = latency_read_error
+    if progress_read_error is not None:
+        payload["execution_progress_read_error"] = progress_read_error
     payload["session_reason"] = session_reason
     payload["sources"] = {
         "public_receipt": str(_repo_path(args.public_receipt)),
@@ -810,6 +952,7 @@ def main() -> int:
         "engine_status": str(_repo_path(args.engine_status)),
         "engine_sync": str(_repo_path(args.engine_sync)),
         "execution_latency": str(latency_path),
+        "execution_progress": str(progress_path),
         "discord_status": str(_repo_path(args.discord_status)),
     }
     _atomic_json(output, payload)

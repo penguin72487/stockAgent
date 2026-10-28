@@ -19,11 +19,17 @@ description: "操作 StockAgent 四節點架構：penguin authority、D immutabl
 
 | 節點／位置 | 保存與工作責任 |
 | --- | --- |
-| penguin WSL ext4／SSD | 權威原始觀察與 provenance、可變來源狀態、PostgreSQL／下單 ledger、網站和正式服務必要 projection／模型 |
+| penguin WSL ext4／SSD | 增量下載暫存、可變來源狀態、PostgreSQL／下單 ledger、網站和正式服務必要 projection／模型；舊 raw 歷史在 canonical writer／reader 切換與 D 完整還原驗證前仍保護，不代表已遷移 |
 | penguin D HDD，packed 及 guarded immutable lake | 唯一本機主冷庫；不可變 CAS／packs／manifests／heads、Parquet/ZSTD registry 與封閉版本；mutable PG 放 SSD |
 | lab203 | Receive Only 封閉 ingress、中繼 NAS、獨立驗證及回傳機器收據；不承接網站或訓練 |
 | NAS | immutable archive 保存 lake/source 版本；Restic 保存 code/config/SQL 與原歷史；保留／prune 是獨立政策 |
 | Vastai1T | 非持久訓練節點；cold index、當期 exact source、遠端生成的工作集／cache、尚未驗證回傳的結果 |
+
+2026-10-25 使用者指定 D 為唯一本機 immutable raw history 正本；C/WSL 只留
+增量、可變控制及必要工作集。沿用原 owner 逐項遷移，不以角色表或 symlink
+代替 reader／writer、完整恢復及退休驗收。增量／穩定冷區保持同一 CAS 位元組與路徑，
+每日有界透明壓縮，不產生第二套正本；實作與目前未解範圍見
+`docs/storage_roles_and_tiers_2026-10-25.md`。
 
 ## 按任務載入
 

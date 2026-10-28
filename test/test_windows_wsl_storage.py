@@ -17,8 +17,8 @@ def test_default_is_plan_and_mutation_requires_apply():
     assert SCRIPT.index("if ($Mode -eq 'Plan' -or -not $Apply)") < SCRIPT.index("$mutex =")
 
 
-def test_decimal_cap_alignment_and_no_shrink():
-    assert "$TargetSizeBytes -gt 2500000000000" in SCRIPT
+def test_explicit_three_tib_cap_alignment_and_no_shrink():
+    assert "$TargetSizeBytes -gt 3298534883328" in SCRIPT
     assert "$TargetSizeBytes % 1MB -ne 0" in SCRIPT
     assert "throw 'Refusing virtual-disk shrink'" in SCRIPT
     assert "($TargetSizeBytes.ToString() + 'B')" in SCRIPT
@@ -69,6 +69,27 @@ def test_no_data_cleanup_or_other_task_control():
     assert "OfflineRepair" not in SCRIPT
     assert "Preserve Crash Dumps" not in SCRIPT
     assert "One-Time WSL Filesystem Repair" not in SCRIPT
+
+
+def test_capacity_admission_keeps_full_growth_reserve_after_measured_compaction():
+    branch = SCRIPT.split("    } else {\n        $running", 1)[1]
+    assert branch.index("Compact-StoppedVhd") < branch.index("$growth =")
+    assert "host_free_bytes -ge ($growth + 32GB)" in branch
+    assert branch.index("resize_admission.admitted") < branch.index("'offline-resize-started'")
+    assert "$expectedBootBytes = [long](Get-VHD -Path $vhdPath).Size" in branch
+    assert ".Replace('__TARGET__', $expectedBootBytes.ToString())" in branch
+    assert 'test "$fs_bytes" -eq __TARGET__' in branch
+    assert 'LC_ALL=C tune2fs -l' in branch
+
+
+def test_other_running_distros_require_explicit_scope_and_restore_after_failure():
+    assert "[string[]]$CompanionDistroNames = @()" in SCRIPT
+    assert "$_ -ne $DistroName -and $_ -notin $CompanionDistroNames" in SCRIPT
+    assert "Graceful companion poweroff timed out; no forced VM termination" in SCRIPT
+    restoration = SCRIPT.split("} finally {\n    if ($restoreRequired)", 1)[1]
+    assert "foreach ($companion in $companionShutdownRequested)" in restoration
+    assert "'/usr/bin/timeout', '180'" in restoration
+    assert "$WslArguments = @('--cd', '/') + $WslArguments" in SCRIPT
 
 
 def test_hourly_trim_uses_existing_owner_and_admits_wsl_root_only():

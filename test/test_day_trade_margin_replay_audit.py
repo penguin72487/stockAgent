@@ -19,6 +19,7 @@ from scripts.audit_tw_day_trade_margin_replay import (
 )
 from stockagent.live.tw_day_trade_simulation import (
     MARGIN_CARRY_CONTRACT,
+    LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
 )
 
@@ -52,7 +53,7 @@ def _price_only_opening_fixture():
                low=19.3, high=19.4, volume_shares=0., _source_path=path)
     fill = dict(symbol="009802", session_date=day, purpose="entry", price=19.35,
                 fill_at=f"{day}T09:01:00+08:00", recorded_at=f"{day}T09:01:00+08:00",
-                fill_contract=REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                fill_contract=LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
                 simulation_only=True, simulation_replay=True,
                 counterfactual_0901_price_fill=True, synthetic_fill=False,
                 entry_price_method="minute_close", entry_price_source=source)
@@ -68,6 +69,15 @@ def test_full_0901_price_only_audit_uses_exact_opening_owner_not_intraday_tape()
     assert _is_verified_full_0901_price_only_entry(fill, prices, full_target=True)
     assert not _is_verified_full_0901_price_only_entry(fill, prices, full_target=False)
     assert not _full_0901_price_only_sources(frame.filter(pl.col("_source_path") == "/intraday"), [witness])
+
+
+def test_v2_zero_volume_cannot_use_legacy_price_only_exception():
+    witness, bar, fill = _price_only_opening_fixture()
+    prices = _full_0901_price_only_sources(pl.DataFrame([bar]), [witness])
+    assert not _is_verified_full_0901_price_only_entry(
+        fill | {"fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL},
+        prices, full_target=True,
+    )
 
 
 @pytest.mark.parametrize("patch", [

@@ -1113,6 +1113,67 @@ def test_official_expiry_extends_last_print_and_separates_relisted_code():
         physical_lifetime_calendar(observed,pl.concat([final,final.head(1)]),pl.DataFrame({'date':dates}))
 
 
+def test_physical_final_fixing_marks_only_its_own_day_without_a_fill_or_cash_event():
+    from stockagent.data.tw_futures_margin_preparation import (
+        bind_final_day_valuation_marks, PHYSICAL_FINAL_MARK_CONTRACT,
+    )
+    days=[date(2013,6,11),date(2013,6,13),date(2013,6,14)]
+    rows=pl.DataFrame(dict(date=days,official_expiry=[days[1]]*3,
+        settlement_method=['physical_delivery']*3,reported_date_role=['last_trading_day']*3,
+        final_settlement_price=[114.]*3,daily_mark=[112.,None,None],
+        official_volume=[None]*3,official_close=[None]*3,executable=[False]*3),
+        schema_overrides={'official_volume':pl.Float64,'official_close':pl.Float64})
+    result=bind_final_day_valuation_marks(rows)
+    assert result['valuation_price'].to_list()==[112.,114.,None]
+    assert result['physical_final_mark_contract'].to_list()==[None,PHYSICAL_FINAL_MARK_CONTRACT,None]
+    assert not result['cash_settlement'].any()
+    assert result.select(rows.columns).equals(rows)
+    assert bind_final_day_valuation_marks(rows.with_columns(pl.lit(999.).alias('final_settlement_price'))).head(1).equals(result.head(1).with_columns(pl.lit(999.).alias('final_settlement_price')))
+    cash=bind_final_day_valuation_marks(rows.with_columns(pl.lit('cash_settlement').alias('settlement_method'),
+        pl.lit('final_settlement_day').alias('reported_date_role')))
+    assert cash['cash_settlement'].to_list()==[False,True,False]
+    assert cash['physical_final_mark_contract'].null_count()==3
+    for bad in [rows.drop('reported_date_role'),
+                rows.with_columns(pl.lit('final_settlement_day').alias('reported_date_role')),
+                rows.with_columns(pl.lit(float('nan')).alias('final_settlement_price'))]:
+        with pytest.raises(ValueError,match='physical final valuation'):
+            bind_final_day_valuation_marks(bad)
+
+
+def test_cash_only_event_dates_preserve_clocks_and_never_impute_actual_market_gaps():
+    from stockagent.data.tw_futures_margin_preparation import (
+        cash_event_accounting_calendar, carry_cash_only_accounting_marks,
+    )
+    days=[date(2017,1,23),date(2017,1,24),date(2017,1,25),date(2017,2,2)]
+    final=pl.DataFrame(dict(product=['I5F','GBF'],contract=['201701']*2,
+        settlement_date=[days[2],date(2017,1,26)],final_settlement_price=[8475.8,113.],
+        settlement_method=['cash_settlement','physical_delivery'],
+        reported_date_role=['final_settlement_day','last_trading_day'],source_sha256=['a'*64,'b'*64]))
+    calendar=cash_event_accounting_calendar(pl.DataFrame({'date':[days[0],days[1],days[3]]}),final)
+    assert calendar['date'].to_list()==days
+    assert calendar['accounting_only_date'].to_list()==[False,False,True,False]
+    observed=pl.DataFrame(dict(date=days*2,physical_instance=['I5F']*4+['OTHER']*4,
+        daily_mark=[8400.,8430.,None,None,100.,None,None,103.],
+        valuation_price=[8400.,8430.,8475.8,None,100.,None,None,103.],
+        outright_volume=[1,1,None,None,1,1,None,1],cash_settlement=[False,False,True,False]+[False]*4,
+        **{'official_'+c:['1','1','','']+['1','1','','1'] for c in ('open','high','low','close')}))
+    result=carry_cash_only_accounting_marks(observed,calendar)
+    assert result.select(observed.columns).drop('valuation_price').equals(
+        observed.sort('physical_instance','date').drop('valuation_price'))
+    assert result.filter((pl.col('physical_instance')=='I5F')&(pl.col('date')==days[2]))['valuation_price'].item()==8475.8
+    assert result.filter((pl.col('physical_instance')=='OTHER')&(pl.col('date')==days[2]))['valuation_price'].item() is None
+    altered=final.with_columns((pl.col('final_settlement_price')*2).alias('final_settlement_price'))
+    assert cash_event_accounting_calendar(calendar.filter(~pl.col('accounting_only_date')),altered).equals(calendar)
+    fixed=observed.with_columns(pl.when((pl.col('physical_instance')=='OTHER')&(pl.col('date')==days[1]))
+        .then(101.).otherwise(pl.col('valuation_price')).alias('valuation_price'))
+    carried=carry_cash_only_accounting_marks(fixed,calendar)
+    assert carried.filter((pl.col('physical_instance')=='OTHER')&(pl.col('date')==days[2]))['valuation_price'].item()==101.
+    with pytest.raises(ValueError,match='original fixing and SHA'):
+        cash_event_accounting_calendar(calendar.select('date'),final.with_columns(pl.lit('bad').alias('source_sha256')))
+    with pytest.raises(ValueError,match='conflicts with observed'):
+        carry_cash_only_accounting_marks(observed.with_columns(pl.lit(1).alias('outright_volume')),calendar)
+
+
 def test_unknown_expiry_does_not_become_a_legal_close():
     observed = pl.DataFrame(dict(date=[date(2026,9,1),date(2026,9,4)],
         product=['OLD','NEW'],contract=['202608','202609']))

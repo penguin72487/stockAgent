@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+import fcntl
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -49,6 +51,10 @@ from stockagent.data.tw_index_options_daily import (  # noqa: E402
     load_taifex_tx_opening_reference,
     project_taifex_atm_source,
 )
+from stockagent.data_sync.acquisition_capacity_sampler import (  # noqa: E402
+    AcquisitionCapacitySampler,
+)
+from scripts.check_acquisition_capacity import priority_dispatch_status  # noqa: E402
 
 
 TAIFEX_OPTION_DAILY_PAGE: Final[str] = (
@@ -57,6 +63,10 @@ TAIFEX_OPTION_DAILY_PAGE: Final[str] = (
 TAIFEX_OPTION_DOWNLOAD_URL: Final[str] = (
     "https://www.taifex.com.tw/cht/3/optDataDown"
 )
+# Same extra ledger headroom used by the existing finite FinLab priority
+# dispatcher, plus the maximum bytes of this single public-source response.
+FINITE_PRIORITY_HEADROOM_BYTES: Final[int] = 24 * 1024**3
+FINITE_PRIORITY_RESPONSE_BYTES: Final[int] = 64 * 1024**2
 
 
 def _builder_fingerprint() -> dict[str, str]:
@@ -476,6 +486,7 @@ def _download(
     *,
     attempts: int,
     request_interval: float,
+    max_response_bytes: int | None = None,
 ) -> Path:
     return download_taifex_attachment(
         TAIFEX_OPTION_DOWNLOAD_URL,
@@ -485,7 +496,125 @@ def _download(
         request_interval=request_interval,
         user_agent="stockAgent/taifex-option-daily-research",
         cooldown_after_download=True,
+        max_response_bytes=max_response_bytes,
     )
+
+
+def _download_all_products_raw(
+    output_dir: Path,
+    *,
+    start_date: date,
+    end_date: date,
+    attempts: int,
+    request_interval: float,
+    finite_priority: bool = False,
+    finite_priority_monthly: bool = False,
+) -> int:
+    """Acquire all option products as immutable daily-source ranges.
+
+    These sources are daily market records, not intraday fills or a normalized
+    options training dataset. The auxiliary lock is shared with the existing
+    registered official downloader; the capacity gate precedes every request.
+    """
+    if start_date.year != end_date.year or start_date > end_date:
+        raise ValueError("all-products range must be ordered within one calendar year")
+    if finite_priority_monthly and not finite_priority:
+        raise ValueError("monthly priority requires finite priority admission")
+    if finite_priority and not finite_priority_monthly and start_date != end_date:
+        raise ValueError("finite priority is restricted to one exact calendar day")
+    state_dir = output_dir / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "registered_auxiliary_daily.lock"
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("[taifex-option-all] shared auxiliary downloader is active", flush=True)
+            return 75
+        if finite_priority:
+            sampler = AcquisitionCapacitySampler(
+                output_dir,
+                probe=partial(
+                    priority_dispatch_status,
+                    additional_headroom_bytes=(FINITE_PRIORITY_HEADROOM_BYTES
+                                               + FINITE_PRIORITY_RESPONSE_BYTES),
+                ),
+            )
+        else:
+            sampler = AcquisitionCapacitySampler(output_dir)
+        admitted = {"admitted"} if finite_priority else {"admitted", "not_enrolled"}
+        # Priority admission may need both the ordinary and priority physical
+        # probes. Wait for the same in-flight sample, but never accept it past
+        # the sampler's unchanged 30-second freshness limit.
+        capacity_timeout = 29 if finite_priority else 20
+        for range_start, range_end in month_ranges(start_date, end_date):
+            target = output_dir / "raw" / "all_products" / "ranges" / (
+                f"{range_start.isoformat()}_{range_end.isoformat()}_all.csv"
+            )
+            intent_path = target.with_suffix(".intent.json")
+            receipt_path = target.with_suffix(".receipt.json")
+            payload = {
+                "down_type": "1",
+                "queryStartDate": range_start.strftime("%Y/%m/%d"),
+                "queryEndDate": range_end.strftime("%Y/%m/%d"),
+                "commodity_id": "all",
+                "commodity_id2": "",
+            }
+            identity = {
+                "contract": "taifex_option_all_products_daily_raw_v1",
+                "url": TAIFEX_OPTION_DOWNLOAD_URL,
+                "request": payload,
+                "range_start": range_start.isoformat(),
+                "range_end": range_end.isoformat(),
+                "point_in_time_snapshot": False,
+            }
+            if any(path.is_symlink() for path in (target, intent_path, receipt_path)):
+                raise ValueError(f"all-products source path is a symlink: {target}")
+            if receipt_path.exists():
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if any(receipt.get(key) != value for key, value in identity.items()):
+                    raise ValueError(f"all-products receipt identity mismatch: {receipt_path}")
+                validate_taifex_receipt(target)
+                if receipt.get("bytes") != target.stat().st_size or receipt.get("sha256") != sha256_path(target):
+                    raise ValueError(f"all-products receipt digest mismatch: {target}")
+                print(f"[taifex-option-all] verified existing {target}", flush=True)
+                continue
+            if intent_path.exists():
+                intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                if intent != identity:
+                    raise ValueError(f"all-products request identity mismatch: {intent_path}")
+            elif target.exists():
+                raise ValueError(f"all-products source without request provenance: {target}")
+            else:
+                capacity = sampler.initial_sample(timeout_seconds=capacity_timeout)
+                if capacity.get("state") not in admitted:
+                    print(f"[taifex-option-all] capacity deferred: {capacity}", flush=True)
+                    return 75
+                atomic_write_json(intent_path, identity)
+            if not target.exists():
+                capacity = sampler.initial_sample(timeout_seconds=capacity_timeout)
+                if capacity.get("state") not in admitted:
+                    print(f"[taifex-option-all] capacity deferred: {capacity}", flush=True)
+                    return 75
+                _download(payload, target, attempts=attempts, request_interval=request_interval,
+                          max_response_bytes=(FINITE_PRIORITY_RESPONSE_BYTES
+                                              if finite_priority else None))
+            if finite_priority and target.stat().st_size > FINITE_PRIORITY_RESPONSE_BYTES:
+                raise ValueError("existing finite-priority source exceeds its response bound")
+            validate_taifex_receipt(target)
+            source, signature = _hashed_source_receipt(target)
+            receipt = {
+                **identity,
+                "path": str(target),
+                "bytes": source["bytes"],
+                "sha256": source["sha256"],
+                "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            if _file_signature(target) != signature:
+                raise ValueError(f"all-products source changed during receipt creation: {target}")
+            atomic_write_json(receipt_path, receipt)
+            print(f"[taifex-option-all] acquired {target} ({source['bytes']:,} bytes)", flush=True)
+    return 0
 
 
 def _quality_summary(normalized: Path, *, series_scope: str) -> dict[str, object]:
@@ -587,6 +716,23 @@ def main() -> int:
     )
     parser.add_argument("--request-interval", type=float, default=1.0)
     parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument(
+        "--all-products-raw-only", action="store_true",
+        help="Acquire all products' daily source ranges without building a TXO dataset.",
+    )
+    parser.add_argument(
+        "--raw-start-date", type=_parse_date,
+        help="Start date for --all-products-raw-only (default: January 1 of end year).",
+    )
+    priority = parser.add_mutually_exclusive_group()
+    priority.add_argument(
+        "--finite-priority-one-day", action="store_true",
+        help="For one exact all-products day, use the bounded priority reserve and response guard.",
+    )
+    priority.add_argument(
+        "--finite-priority-year-monthly", action="store_true",
+        help="For one calendar year, use bounded priority for each exact monthly request.",
+    )
     args = parser.parse_args()
 
     if args.start_year < 2001:
@@ -599,6 +745,22 @@ def main() -> int:
         parser.error("--attempts must be positive")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
+    if args.all_products_raw_only:
+        raw_start = args.raw_start_date or date(args.end_date.year, 1, 1)
+        if raw_start.year != args.end_date.year or raw_start > args.end_date:
+            parser.error("--raw-start-date must be no later than --end-date in the same year")
+        if args.finite_priority_one_day and raw_start != args.end_date:
+            parser.error("--finite-priority-one-day requires exactly one date")
+        return _download_all_products_raw(
+            output_dir, start_date=raw_start, end_date=args.end_date,
+            attempts=args.attempts, request_interval=args.request_interval,
+            finite_priority=args.finite_priority_one_day or args.finite_priority_year_monthly,
+            finite_priority_monthly=args.finite_priority_year_monthly,
+        )
+    if args.finite_priority_one_day or args.finite_priority_year_monthly:
+        parser.error("finite priority requires --all-products-raw-only")
+    if args.raw_start_date is not None:
+        parser.error("--raw-start-date requires --all-products-raw-only")
     if any(
         cache_root.resolve().is_relative_to(output_dir)
         for cache_root in (FULL_CHAIN_SHARD_CACHE, ATM_SOURCE_CACHE)

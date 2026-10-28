@@ -379,3 +379,121 @@ def test_production_partial_tail_has_exact_summary_parity_and_keeps_raw_receipt(
     assert "quote_transport" not in projected[0]
     assert projected[1] == rows[1]
     assert path.read_bytes() == original
+
+
+def test_opening_tail_projection_survives_process_cache_loss(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    path = tmp_path / "opening_signal_latency.jsonl"
+    raw = (b'{"source":"discord_scheduled_signal","status":"failed","error_code":1,"unused":[2,3]}\n'
+           b'\nnull\n{"source":"executor","quantity":1152921504606846977,"value":-0.0}')
+    path.write_bytes(raw)
+    args = dict(row_decoder=dashboard._decode_opening_latency_row, verified_append=True)
+    expected = dashboard._tail(path, 4, **args)
+    dashboard._TAIL_CACHE.clear()
+    original = dashboard._read_jsonl_tail
+    monkeypatch.setattr(dashboard, "_read_jsonl_tail",
+                        lambda *_a, **_k: pytest.fail("same-generation projection must be reusable"))
+    restored = dashboard._tail(path, 4, **args)
+    assert json.dumps(restored, sort_keys=True) == json.dumps(expected, sort_keys=True)
+    # Persisted physical slots, including blank/non-object rows and the
+    # unterminated final row, must preserve later append semantics too.
+    with path.open("ab") as stream:
+        stream.write(b'\n{"source":"executor","i":2}\n')
+    dashboard._TAIL_CACHE.clear()
+    assert dashboard._tail(path, 4, **args) == [expected[-1], {"source": "executor", "i": 2}]
+    monkeypatch.setattr(dashboard, "_read_jsonl_tail", original)
+    dashboard._TAIL_CACHE.clear()
+    monkeypatch.delenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR")
+    assert dashboard._tail(path, 4, **args) == [expected[-1], {"source": "executor", "i": 2}]
+    assert path.read_bytes().startswith(raw)
+
+
+@pytest.mark.parametrize("change", ["append_rewrite", "replace", "ctime_rewrite", "corrupt_source"])
+def test_persisted_opening_projection_never_hides_source_changes(tmp_path, monkeypatch, change):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    path = tmp_path / "opening_signal_latency.jsonl"
+    original = b'{"source":"executor","i":1}\n'
+    path.write_bytes(original)
+    args = dict(row_decoder=dashboard._decode_opening_latency_row, verified_append=True)
+    assert dashboard._tail(path, 4, **args) == [{"source": "executor", "i": 1}]
+    dashboard._TAIL_CACHE.clear()
+    before = path.stat()
+    updated = original.replace(b'"i":1', b'"i":9')
+    if change == "replace":
+        incoming = tmp_path / "new.jsonl"
+        incoming.write_bytes(updated)
+        os.replace(incoming, path)
+    else:
+        path.write_bytes(updated + (b'{}\n' if change == "append_rewrite" else b''))
+        if change == "ctime_rewrite":
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        elif change == "corrupt_source":
+            path.write_bytes(b'{invalid JSON}\n')
+    if change == "corrupt_source":
+        with pytest.raises(ValueError):
+            dashboard._tail(path, 4, **args)
+    else:
+        result = dashboard._tail(path, 4, **args)
+        assert result[0] == {"source": "executor", "i": 9}
+        assert len(result) == (2 if change == "append_rewrite" else 1)
+
+
+@pytest.mark.parametrize("damage", ["hash", "contract", "source", "slots", "oversize", "symlink", "depth"])
+def test_bad_private_tail_projection_falls_back_to_authority(tmp_path, monkeypatch, damage):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    path = tmp_path / "opening_signal_latency.jsonl"
+    path.write_bytes(b'{"source":"executor","i":1}\n')
+    args = dict(row_decoder=dashboard._decode_opening_latency_row, verified_append=True)
+    expected = dashboard._tail(path, 4, **args)
+    projection = dashboard._opening_tail_projection_path(path, 4)
+    value = json.loads(projection.read_bytes())
+    if damage == "hash":
+        value["sha256"] = "0" * 64
+    elif damage == "contract":
+        value["payload"]["contract"] = "other"
+    elif damage == "source":
+        value["payload"]["source"] = str(tmp_path / "other")
+    elif damage == "slots":
+        value["payload"]["line_slots"][0][0] = -1
+    if damage in {"contract", "source", "slots"}:
+        import hashlib
+        value["sha256"] = hashlib.sha256(dashboard.private_json.ledger_bytes(value["payload"])).hexdigest()
+    projection.write_text(json.dumps(value))
+    if damage == "depth":
+        projection.write_bytes(b"[" * 2_000 + b"0" + b"]" * 2_000)
+    elif damage == "oversize":
+        monkeypatch.setattr(dashboard, "_TAIL_PROJECTION_MAX_BYTES", projection.stat().st_size - 1)
+    elif damage == "symlink":
+        external = tmp_path / "external.json"
+        projection.rename(external)
+        projection.symlink_to(external)
+    dashboard._TAIL_CACHE.clear()
+    original = dashboard._read_jsonl_tail
+    reads = []
+
+    def read(*a, **k):
+        reads.append(1)
+        return original(*a, **k)
+
+    monkeypatch.setattr(dashboard, "_read_jsonl_tail", read)
+    assert dashboard._tail(path, 4, **args) == expected
+    assert reads == [1]
+    if damage == "symlink":
+        assert external.exists() and not projection.is_symlink()
+
+
+def test_projection_write_failure_cannot_fail_a_valid_opening_read(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    path = tmp_path / "opening_signal_latency.jsonl"
+    path.write_bytes(b'{"source":"executor","i":1}\n')
+    monkeypatch.setattr(dashboard, "_atomic_private_bytes", lambda *_: (_ for _ in ()).throw(OSError("no space")))
+    assert dashboard._tail(path, 4, row_decoder=dashboard._decode_opening_latency_row,
+                           verified_append=True) == [{"source": "executor", "i": 1}]

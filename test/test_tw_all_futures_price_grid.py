@@ -154,17 +154,51 @@ def test_float32_input_and_legacy_index_api_keep_existing_contract():
         np.array([12345.]), product_codes="TMF",
     ).item() == 1.
     assert TW_DERIVATIVE_PRICE_CONTRACT_VERSION == 2
-    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 4
+    assert TAIFEX_FUTURES_HISTORY_CONTRACT_VERSION == 7
 
 
-def test_earlier_registry_extension_keeps_unreviewed_index_and_etf_periods_closed():
+def test_stock_forward_rule_is_bounded_and_does_not_extend_other_asset_classes():
+    prices = np.array([1001., 2500., 2501.])
+    assert price_on_taifex_futures_tick_grid_numpy(prices, '2026-10-27',
+        product_codes='PK1', asset_classes='stock_future').tolist() == [True, True, False]
+    assert taifex_futures_day_session_minutes('2026-10-27', product_code='PK1',
+        asset_class='stock_future') == (525, 825)
+    for product, kind, day in [('PK1', 'stock_future', '2026-10-28'),
+                               ('TX', 'index_future', '2026-09-28'),
+                               ('NYF', 'etf_future', '2026-09-28')]:
+        with pytest.raises(ValueError, match='historical window'):
+            taifex_futures_day_session_minutes(day, product_code=product, asset_class=kind)
+
+
+def test_earlier_registry_extension_keeps_unreviewed_products_and_periods_closed():
     for product in ["TX", "MTX"]:
         assert taifex_futures_tick_size_numpy(np.array([9001.]), "2011-01-03",
             product_codes=product, asset_classes="index_future").item() == 1.
-    for product, kind in [("TE", "index_future"), ("NYF", "etf_future")]:
+    for product, kind, day in [('TJF', 'index_future', '2019-01-03'),
+                               ('NYF', 'etf_future', '2014-10-03')]:
         with pytest.raises(ValueError, match="historical window"):
-            taifex_futures_tick_size_numpy(np.array([100.]), "2019-01-03",
+            taifex_futures_tick_size_numpy(np.array([100.]), day,
                 product_codes=product, asset_classes=kind)
+
+
+@pytest.mark.parametrize('product,tick', [('TE', .05), ('TF', .2), ('T5F', 1.), ('GTF', .05), ('XIF', 1.)])
+def test_2011_official_domestic_index_ticks_and_day_sessions(product, tick):
+    assert taifex_futures_tick_size_numpy(np.array([100.]), '2011-02-18',
+        product_codes=product, asset_classes='index_future').item() == tick
+    assert taifex_futures_day_session_minutes('2011-02-18', product_code=product,
+        asset_class='index_future') == (525, 825)
+    with pytest.raises(ValueError, match='historical window'):
+        taifex_futures_day_session_minutes('2010-12-31', product_code=product, asset_class='index_future')
+
+
+def test_2014_etf_bands_and_2015_session_amendment_have_separate_effective_dates():
+    assert taifex_futures_tick_size_numpy(np.array([49.99, 50.]), '2014-10-07',
+        product_codes='NZF', asset_classes='etf_future').tolist() == [.01, .05]
+    assert taifex_futures_day_session_minutes('2015-07-17', product_code='NZF', asset_class='etf_future') == (525, 825)
+    assert taifex_futures_day_session_minutes('2015-07-20', product_code='NZF', asset_class='etf_future') == (525, 975)
+    assert taifex_futures_day_session_minutes('2015-07-20', product_code='NZF', asset_class='etf_future',
+        is_last_trading_day=True) == (525, 810)
+    assert taifex_futures_day_session_minutes('2015-07-20', product_code='NYF', asset_class='etf_future') == (525, 825)
 
 
 def test_2011_stock_futures_keep_historical_bands_and_dated_day_session():
@@ -179,3 +213,14 @@ def test_2011_stock_futures_keep_historical_bands_and_dated_day_session():
         asset_class="stock_future", is_last_trading_day=True) == (525, 810)
     with pytest.raises(ValueError, match="historical window"):
         taifex_futures_day_session_minutes("2010-12-31", product_code="CDF", asset_class="stock_future")
+
+
+def test_g2f_launch_registry_does_not_inherit_a_later_archive_start():
+    assert price_on_taifex_futures_tick_grid_numpy(np.array([5501., 5501.5]), "2019-09-30",
+        product_codes="G2F", asset_classes="index_future").tolist() == [True, False]
+    assert taifex_futures_day_session_minutes("2020-03-19", product_code="G2F",
+        asset_class="index_future") == (525, 825)
+    assert taifex_futures_day_session_minutes("2019-10-16", product_code="G2F",
+        asset_class="index_future", is_last_trading_day=True) == (525, 810)
+    with pytest.raises(ValueError, match="historical window"):
+        taifex_futures_day_session_minutes("2019-09-27", product_code="G2F", asset_class="index_future")

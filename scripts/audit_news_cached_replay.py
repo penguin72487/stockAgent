@@ -18,6 +18,7 @@ import pyarrow.parquet as pq
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_bulk import cnyes_pagination, cnyes_records, wordpress_base, _plain_text
+from downloader.news_fulltext_cnyes_history import digest as history_digest
 from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_metrics import bulk_body_page_classification
 from downloader.news_fulltext_policy import cnyes_bulk_fingerprint
@@ -82,7 +83,7 @@ def audit(root, registry, relative_paths, *, sample_legacy_pages=0):
             'all_history_complete': False, 'publish': False, 'training_injection_enabled': False}
 
 
-def _source_proof(root, registry, source, db, relative, fingerprint):
+def _source_proof(root, registry, source, db, relative, fingerprint, *, target_hashes=None):
     path = source_path(root, relative)
     if path.stat().st_size > 16 << 20:
         raise ValueError('cached_source_envelope_oversized')
@@ -113,6 +114,32 @@ def _source_proof(root, registry, source, db, relative, fingerprint):
     if any(type(p.get('payment')) is not int or p['payment'] != 0 for p in posts):
         raise ValueError('cached_source_contains_restricted_rows')
     records, item_errors = cnyes_records(response, SimpleNamespace(registry=registry), source)
+    target_outcomes = None
+    if target_hashes is not None:
+        # A page checkpoint alone cannot establish what it said about a
+        # particular missing article. Bind each target to the exact saved
+        # post, and report only hashes/outcomes, never copied publisher text.
+        posts_by_id = {post['newsId']: post for post in posts}
+        records_by_url = {record['requested_url']: record for record in records}
+        errors_by_url = {item['url']: item['error'] for item in item_errors
+                         if item['error'] != 'bulk_exact_duplicate_row'}
+        target_outcomes = []
+        for news_id, expected_hashes in sorted(target_hashes.items()):
+            if (type(news_id) is not int or news_id <= 0 or not expected_hashes
+                    or news_id not in posts_by_id):
+                raise ValueError('cached_target_post_missing')
+            post_sha = history_digest(posts_by_id[news_id])
+            if set(expected_hashes) != {post_sha}:
+                raise ValueError('cached_target_post_identity_mismatch')
+            url = f'https://news.cnyes.com/news/id/{news_id}'
+            record = records_by_url.get(url)
+            error = errors_by_url.get(url)
+            if bool(record) == bool(error):
+                raise ValueError('cached_target_parser_outcome_ambiguous')
+            target_outcomes.append({'news_id': news_id, 'source_post_sha256': post_sha,
+                'outcome': 'validated_source_body' if record else error,
+                'body_sha256': record['body_sha256'] if record else None,
+                'body_bytes': record['body_bytes'] if record else None})
     counts = Counter(e['error'] for e in item_errors)
     item_outcomes = []
     for error in item_errors[:16]:
@@ -142,7 +169,7 @@ def _source_proof(root, registry, source, db, relative, fingerprint):
         head_readiness[kind] += 1
     checkpoint = db.execute('SELECT state,accepted_heads,checked_at_utc FROM cached_bulk_replays '
                             'WHERE source_fingerprint=? AND response_sha256=?', (fingerprint, digest)).fetchone()
-    return {'parquet_path': relative, 'parquet_sha256': receipt['sha256'],
+    result = {'parquet_path': relative, 'parquet_sha256': receipt['sha256'],
         'response_sha256': digest, 'request_url': raw['request_url'], 'source_observed_at_utc': raw['captured_at_utc'],
         'pagination': page, 'validated_full_bodies': len(records), 'item_error_counts': dict(counts),
         'bounded_item_outcomes': item_outcomes,
@@ -151,6 +178,9 @@ def _source_proof(root, registry, source, db, relative, fingerprint):
         'source_replay_permitted': bool(source.allowed and source.cnyes_apis),
         'metadata_only_html_fallback': bool(not records and counts and set(counts) <= {'bulk_body_not_provided', 'bulk_exact_duplicate_row'}),
         'parser_or_metadata_verified': not (set(counts) - {'bulk_body_not_provided', 'bulk_exact_duplicate_row'})}
+    if target_outcomes is not None:
+        result['target_outcomes'] = target_outcomes
+    return result
 
 
 def main(argv=None):

@@ -15,7 +15,7 @@ NOW = datetime(2026, 10, 15, 10, 15, tzinfo=ZoneInfo("Asia/Taipei"))
 @pytest.fixture(autouse=True)
 def no_host_deployment_state(monkeypatch):
     from stockagent.live import service_code_release
-    monkeypatch.setattr(service_code_release, "configured_release", lambda _: None)
+    monkeypatch.setattr(service_code_release, "configured_release", lambda _, **_kw: None)
 
 
 def receipts():
@@ -216,6 +216,60 @@ def test_only_proven_entry_bracket_cancellations_are_terminal(change):
             reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
 
 
+@pytest.mark.parametrize("change", [None, "working", "other_status", "wrong_signal", "wrong_session",
+                                    "wrong_market", "wrong_symbol", "missing_settlement", "early_settlement",
+                                    "future_settlement", "naive_settlement", "pending_total", "unknown_size",
+                                    "negative_remaining", "open_position"])
+def test_only_settled_exit_priority_entry_cancellation_is_terminal(change):
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    mode.update(positions={}, session_date=NOW.date().isoformat(),
+                engine_status="session_flat_after_exit", pending_entry_shares=0,
+                closing_auction_settled_at=NOW.replace(hour=13, minute=30).isoformat())
+    order = {"status": "cancelled_exit_priority", "sizing_pending": False,
+             "remaining_shares": 2000,
+             "position": {"signal_id": "immutable", "session_date": NOW.date().isoformat(),
+                          "market": "tw_day_trade_100m", "symbol": "2330"}}
+    mode["pending_entry_orders"] = {"2330": order}
+    closed = NOW.replace(hour=14)
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = closed.isoformat()
+    if change == "working":
+        order["status"] = "working"
+    elif change == "other_status":
+        mode["engine_status"] = "entry_pending"
+    elif change == "wrong_signal":
+        order["position"]["signal_id"] = "other"
+    elif change == "wrong_session":
+        order["position"]["session_date"] = "2026-10-14"
+    elif change == "wrong_market":
+        order["position"]["market"] = "other"
+    elif change == "wrong_symbol":
+        order["position"]["symbol"] = "0050"
+    elif change == "missing_settlement":
+        mode.pop("closing_auction_settled_at")
+    elif change == "early_settlement":
+        mode["closing_auction_settled_at"] = NOW.replace(hour=13, minute=29).isoformat()
+    elif change == "future_settlement":
+        mode["closing_auction_settled_at"] = (closed + timedelta(seconds=1)).isoformat()
+    elif change == "naive_settlement":
+        mode["closing_auction_settled_at"] = "2026-10-15T13:30:00"
+    elif change == "pending_total":
+        mode["pending_entry_shares"] = 2000
+    elif change == "unknown_size":
+        order["sizing_pending"] = None
+    elif change == "negative_remaining":
+        order["remaining_shares"] = -1
+    elif change == "open_position":
+        mode["positions"] = {"2330": {"signed_shares": 1000}}
+    if change is None:
+        plan = reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
+        assert plan["pending_orders"] == plan["nonflat_count"] == 0
+        assert plan["retained_terminal_orders"] == 1
+    else:
+        with pytest.raises(ValueError, match="nonflat|pending orders"):
+            reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
+
+
 @pytest.mark.parametrize("change", ["in_session", "position", "pending_entry", "pending_reduction"])
 def test_engine_only_retains_every_flat_and_clock_guard(change):
     state, bot, sync = receipts()
@@ -264,6 +318,33 @@ def test_engine_only_accepts_new_engine_not_new_bot_or_fake_gpu_residency(change
         sync["ledger_integrity_ready"] = False
     assert reload.native_ready(bot, sync, plan, now=now, expected_code="qualified", expected_entrypoint="bot") is (change is None)
     assert bot["startup_inference_warmup"]["model_cache_resident_ready"] is False
+
+
+@pytest.mark.parametrize("status,same_run", [
+    ("pending", True), ("pending", False), ("running", True),
+    ("degraded", True), ("unknown", True),
+])
+def test_idle_engine_recovery_does_not_require_scheduled_bot_gpu_warmup(status, same_run):
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    mode["positions"].clear()
+    mode["pending_entry_orders"].clear()
+    now = NOW.replace(hour=14)
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = now.isoformat()
+    bot["startup_inference_warmup"].update(status=status,
+        run_id=bot["run_id"] if same_run else "different-run", model_cache_resident_ready=False)
+    original = deepcopy((state, bot, sync))
+    if status == "pending" and same_run:
+        plan = reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+        assert plan["services"] == [reload.SERVICES[1]]
+        assert plan["previous_discord_run_id"] == bot["run_id"]
+        # A joint restart replaces the bot; it has no unchanged-owner exemption.
+        with pytest.raises(ValueError, match="warmup"):
+            reload.reload_plan(state, bot, sync, now=now)
+    else:
+        with pytest.raises(ValueError, match="warmup"):
+            reload.reload_plan(state, bot, sync, now=now, engine_only=True)
+    assert (state, bot, sync) == original
 
 
 def test_selecting_both_independent_owners_is_not_an_engine_only_bypass():
@@ -433,14 +514,16 @@ def test_control_wait_uses_existing_lease_and_never_restarts_when_busy(tmp_path,
     assert result["control_wait_ms"] >= 0 and result["broker_orders"] == 0
 
 
-@pytest.mark.parametrize("engine_only,code_only", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("engine_only,code_only,engine_pinned", [
+    (False, False, False), (True, False, False), (False, True, False), (True, False, True)])
 @pytest.mark.parametrize("pinned", [False, True])
 @pytest.mark.parametrize("failure", [None, "prefix_changed", "protected_changed", "not_ready", "accounting_changed",
                                     "preexisting_old_code", "preexisting_old_entrypoint", "malformed_admission",
                                     "reported_current_code", "journal_fatal", "journal_pending", "slow_prefix_check",
+                                    "heartbeat_boundary_after_prefix",
                                     "code_changed_during_start", "pinned_changed_during_start", "pin_install_failed",
-                                    "source_update_pending"])
-def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned):
+                                    "source_update_pending", "engine_workspace_changed"])
+def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned, engine_pinned):
     from contextlib import contextmanager, nullcontext
     from types import SimpleNamespace
     from scripts import audit_tw_day_trade_restart as audit
@@ -467,27 +550,45 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         path.write_text(json.dumps(value))
     for field, path in zip(("STATE_PATH", "BOT_STATUS", "SYNC_PATH"), paths):
         monkeypatch.setattr(reload, field, path)
-    for name in ("events.jsonl", "orders.jsonl", "fills.jsonl"):
+    from stockagent.live.paper_journal import FILENAMES
+    for name in FILENAMES:
         (tmp_path / name).write_text("immutable ledger prefix\n")
     monkeypatch.setattr(reload, "datetime", Clock)
     monkeypatch.setattr(reload, "control_lease", lambda **_: nullcontext())
     code_changed = [False]
+    engine_workspace_changed = [False]
+    original_identity = cache.file_identity
+    def file_identity(path):
+        result = original_identity(path)
+        if engine_workspace_changed[0] and str(path) == str(reload.REPO_ROOT / service_code_release.ENGINE_CODE_FILES[0]):
+            return {**result, "sha256": "changed mutable workspace, not the pinned engine"}
+        return result
+    monkeypatch.setattr(cache, "file_identity", file_identity)
     monkeypatch.setattr(cache, "implementation_identity", lambda: [{"qualified": "changed" if code_changed[0] else "implementation"}])
     expected = cache.identity_digest({"code": cache.implementation_identity()})
     frozen_changed, installs = [False], []
-    if pinned:
+    if pinned or engine_pinned:
         pinned_code = cache.implementation_identity()
         pinned_entry = cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")
         path = tmp_path / "release.json"
+        engine_path = tmp_path / "engine-release.json"
         monkeypatch.setattr(service_code_release, "DROP_IN", tmp_path / "code.conf")
-        monkeypatch.setattr(service_code_release, "configured_release", lambda _: path)
-        monkeypatch.setattr(service_code_release, "verify_frozen_source", lambda *_: {"receipt": str(path)})
-        monkeypatch.setattr(service_code_release, "namespace_identity", lambda *_: {
-            "code": pinned_code, "entrypoint": pinned_entry, "readonly_verified": True})
+        monkeypatch.setattr(service_code_release, "ENGINE_DROP_IN", tmp_path / "engine-code.conf")
+        monkeypatch.setattr(service_code_release, "configured_release",
+                            lambda _, **kw: (engine_path if engine_pinned else None) if kw.get("role") == "engine"
+                            else path if pinned else None)
+        monkeypatch.setattr(service_code_release, "verify_frozen_source", lambda value, *_: {"receipt": str(value)})
+        def namespace(*_a, **kw):
+            if kw.get("role") == "engine":
+                return {"engine_code": [cache.file_identity(reload.REPO_ROOT / name)
+                                        for name in service_code_release.ENGINE_CODE_FILES]}
+            return {"code": pinned_code, "entrypoint": pinned_entry, "readonly_verified": True}
+        monkeypatch.setattr(service_code_release, "namespace_identity", namespace)
         monkeypatch.setattr(service_code_release, "frozen_generation", lambda *_: (frozen_changed[0],))
-        monkeypatch.setattr(service_code_release, "verify_owner_namespace", lambda *_: {"readonly_mounts_verified": True})
-        def install(*args):
-            installs.append(args)
+        monkeypatch.setattr(service_code_release, "verify_owner_namespace", lambda *_a, **_kw: {"readonly_mounts_verified": True})
+        monkeypatch.setattr(service_code_release, "native_owner_pid", lambda *_a, **_kw: 200)
+        def install(*args, **kw):
+            installs.append((args, kw))
             if failure == "pin_install_failed":
                 raise ValueError("invalid unit preview")
         monkeypatch.setattr(service_code_release, "install_drop_in", install)
@@ -528,7 +629,7 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     monkeypatch.setattr(tw_public_source_guard, "live_tw_public_source_read_guard", source_guard)
     real_prefix = audit.prefix_sha256
     def prefix(path, size):
-        if len(prefix_calls) < 3:
+        if len(prefix_calls) < (6 if engine_pinned else 3):
             assert source_held[0] or source_exempt, "data-reading reload must admit the source before scanning"
         prefix_calls.append((path, size))
         return real_prefix(path, size)
@@ -548,6 +649,8 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
             code_changed[0] = True
         if failure == "pinned_changed_during_start":
             frozen_changed[0] = True
+        if failure == "engine_workspace_changed":
+            engine_workspace_changed[0] = True
         bot["live_implementation_admission"] = {"code_sha256": expected,
             "entrypoint_sha256": cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")["sha256"]}
         if failure != "not_ready":
@@ -570,16 +673,29 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
 
     monkeypatch.setattr(reload, "owner", owner)
     monkeypatch.setattr(reload.subprocess, "run", restart)
-    monkeypatch.setattr(reload, "read_service_ack_pair", lambda *_a, **_kw: (
-        reload.read_object(paths[2]), reload.read_object(paths[1]), {"matched": True}))
-    if failure == "slow_prefix_check":
+    prefix_completed = [False]
+    stale_final_samples = []
+    def pair(*_args, **_kwargs):
+        observed = reload.read_object(paths[2]), reload.read_object(paths[1]), {"matched": True}
+        if failure == "heartbeat_boundary_after_prefix" and prefix_completed[0] and not stale_final_samples:
+            stale_final_samples.append(observed)
+            # The exact ACK may be old while the closed owner is between
+            # heartbeats. Only the NEXT actual fresh sample may be accepted.
+            bot["updated_at"] = sync["heartbeat_at"] = (now+timedelta(seconds=20)).isoformat()
+            paths[1].write_text(json.dumps(bot))
+            paths[2].write_text(json.dumps(sync))
+        return observed
+    monkeypatch.setattr(reload, "read_service_ack_pair", pair)
+    if failure in {"slow_prefix_check", "heartbeat_boundary_after_prefix"}:
         verify_prefix = audit.verify_prefix
         def slow_prefix(*args, **kwargs):
             result = verify_prefix(*args, **kwargs)
             Clock.offset_seconds = 20
-            bot["updated_at"] = sync["heartbeat_at"] = (now+timedelta(seconds=20)).isoformat()
-            paths[1].write_text(json.dumps(bot))
-            paths[2].write_text(json.dumps(sync))
+            prefix_completed[0] = True
+            if failure == "slow_prefix_check":
+                bot["updated_at"] = sync["heartbeat_at"] = (now+timedelta(seconds=20)).isoformat()
+                paths[1].write_text(json.dumps(bot))
+                paths[2].write_text(json.dumps(sync))
             return result
         monkeypatch.setattr(audit, "verify_prefix", slow_prefix)
     ticks = iter((0., 2.))
@@ -589,10 +705,11 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
                                     "--output", str(output), *(["--code-admission-only"] if code_only else [])])
     accepted = failure is None or ((failure == "accounting_changed" or preflight_mismatch) and not engine_only)
     accepted = accepted or (not code_only and failure in {"reported_current_code", "journal_fatal", "journal_pending"})
-    accepted = accepted or failure == "slow_prefix_check"
+    accepted = accepted or failure in {"slow_prefix_check", "heartbeat_boundary_after_prefix"}
+    accepted = accepted or (failure == "engine_workspace_changed" and engine_pinned)
     accepted = accepted or (pinned and failure == "code_changed_during_start")
-    accepted = accepted or (not pinned and failure == "pinned_changed_during_start")
-    accepted = accepted or (failure == "pin_install_failed" and (not pinned or engine_only))
+    accepted = accepted or (not pinned and not engine_pinned and failure == "pinned_changed_during_start")
+    accepted = accepted or (failure == "pin_install_failed" and not engine_pinned and (not pinned or engine_only))
     accepted = accepted or (failure == "source_update_pending" and source_exempt)
     assert reload.main() == (0 if accepted else 75)
     result = json.loads(output.read_bytes())
@@ -607,7 +724,7 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         assert not restarts and not result["restart_requested"]
         assert result["status"] == "blocked" and ("code admission" in result["error"] or "code drift" in result["error"])
         return
-    if pinned and not engine_only and failure == "pin_install_failed":
+    if (pinned and not engine_only or engine_pinned) and failure == "pin_install_failed":
         assert not restarts and not result["restart_requested"]
         assert result["status"] == "blocked" and "unit preview" in result["error"]
         return
@@ -615,19 +732,28 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     assert result["status"] == (("accepted_code_admission_only" if code_only else "accepted")
                                 if accepted else "failed_after_restart")
     if (failure == "code_changed_during_start" and not pinned
-            or failure == "pinned_changed_during_start" and pinned):
+            or failure == "pinned_changed_during_start" and (pinned or engine_pinned)):
         assert result["error_type"] == "RuntimeError" and "code changed during startup" in result["error"]
     if accepted:
-        if failure == "slow_prefix_check":
+        if failure in {"slow_prefix_check", "heartbeat_boundary_after_prefix"}:
             assert result["engine_heartbeat_at"] == (now+timedelta(seconds=20)).isoformat()
+        if failure == "heartbeat_boundary_after_prefix":
+            assert len(stale_final_samples) == 1
         assert result["gpu_warmup_verified"] is not (code_only or engine_only)
         if code_only:
             assert result["gpu_warmup_verified"] is False
             assert result["acceptance_scope"] == "loaded_code_gateway_ack_not_gpu_readiness"
         assert result["engine_restarted"] is engine_only
+        if engine_only:
+            assert result["acceptance_scope"] == "engine_restart_inventory_code_gateway_ack_not_gpu_readiness"
         if pinned:
             assert result["native_code_namespace"]["readonly_mounts_verified"]
-            assert len(installs) == int(not engine_only)
+        assert len(installs) == int(pinned and not engine_only) + int(engine_pinned)
+        if engine_pinned:
+            assert result["native_engine_code_namespace"]["readonly_mounts_verified"]
+            assert result["engine_code_drop_in_installed"] is True
+            assert set(result["ledger_inputs"]) == set(FILENAMES)
+            assert installs[-1][1] == {"role": "engine"}
         assert result["inventory_restored_exactly"] is engine_only
         assert result["protected_before"] == result["protected_after"]
         if engine_only:
@@ -713,6 +839,38 @@ def test_code_admission_cannot_select_an_engine(tmp_path, monkeypatch):
         reload.reload_plan(*receipts(), now=NOW, code_admission_only=True)
     monkeypatch.setattr("sys.argv", ["reload", "--engine-only", "--code-admission-only", "--apply"])
     with pytest.raises(SystemExit): reload.main()
+
+
+@pytest.mark.parametrize("flags", [[], ["--discord-only"], ["--discord-only", "--code-admission-only"]])
+def test_engine_source_selection_requires_independent_engine_owner(monkeypatch, flags):
+    monkeypatch.setattr("sys.argv", ["reload", *flags, "--engine-source-release", "release.json", "--apply"])
+    monkeypatch.setattr(reload, "control_lease", lambda **_: pytest.fail("invalid owner selection acquired a lease"))
+    with pytest.raises(SystemExit):
+        reload.main()
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_engine_startup_proves_pinned_owner_before_opening_ledger(tmp_path, monkeypatch, pinned):
+    from scripts import run_tw_day_trade_simulation as runner
+    from stockagent.live import service_code_release
+    calls = []
+    monkeypatch.delenv(service_code_release.ENVIRONMENT, raising=False)
+    if pinned:
+        monkeypatch.setenv(service_code_release.ENVIRONMENT, str(tmp_path / "release.json"))
+    def check(*args, **kw):
+        calls.append((args, kw))
+        raise ValueError("unaccepted native pin")
+    monkeypatch.setattr(service_code_release, "verify_startup_namespace", check)
+    def lock(_):
+        calls.append("ledger")
+        raise RuntimeError("legacy ledger boundary reached")
+    monkeypatch.setattr(runner, "_acquire_engine_lock", lock)
+    with pytest.raises(ValueError if pinned else RuntimeError, match="unaccepted native pin|legacy ledger"):
+        runner.main(["--once"])
+    if pinned:
+        assert calls == [((runner.REPO_ROOT,), {"role": "engine"})]
+    else:
+        assert calls == ["ledger"]
 
 
 @pytest.mark.parametrize("matched", [True, False])

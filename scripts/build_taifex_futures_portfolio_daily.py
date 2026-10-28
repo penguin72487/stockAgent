@@ -19,11 +19,12 @@ from stockagent.data.tw_futures_portfolio_daily import (  # noqa: E402
     DEFAULT_PUBLIC_FEATURE_PATH,
     DEFAULT_SOURCE_PATH,
     DEFAULT_STOCK_MASTER_PATH,
+    FuturesPortfolioSlotCapacityExceeded,
     build_dataset,
 )
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=DEFAULT_SOURCE_PATH)
     parser.add_argument("--product-master", default=DEFAULT_PRODUCT_MASTER_PATH)
@@ -34,16 +35,22 @@ def main() -> None:
     parser.add_argument("--public-features", default=DEFAULT_PUBLIC_FEATURE_PATH)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     args = parser.parse_args()
-    manifest = build_dataset(
-        source_path=args.source,
-        product_master_path=args.product_master,
-        official_product_code_path=args.official_product_codes,
-        stock_master_path=args.stock_master,
-        public_feature_path=args.public_features,
-        output_root=args.output_root,
-    )
+    try:
+        manifest = build_dataset(
+            source_path=args.source,
+            product_master_path=args.product_master,
+            official_product_code_path=args.official_product_codes,
+            stock_master_path=args.stock_master,
+            public_feature_path=args.public_features,
+            output_root=args.output_root,
+        )
+    except FuturesPortfolioSlotCapacityExceeded as exc:
+        # Retrying the same immutable layout cannot repair a structural limit.
+        print(str(exc), file=sys.stderr)
+        return 75
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

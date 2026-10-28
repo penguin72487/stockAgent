@@ -149,11 +149,19 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         day_trade_unlimited_margin_conversion: bool = False,
         tw_corporate_action_mode: str = "avoid",
         tw_commission_rebate_timing: str = "monthly_15th",
+        futures_account_source: object | None = None,
     ) -> None:
         self.lookback = int(lookback)
         if self.lookback <= 0:
             raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
+        # Explicit source binding is deliberately separate from enabling an
+        # experiment: checkpoint and full lifecycle gates still apply.
+        self.futures_account_source_fingerprint: str | None = None
+        self.futures_execution_release_fingerprint: str | None = None
+        self._futures_account_source = futures_account_source
+        if futures_account_source is not None and self.execution_mode != "tw_stock_context_futures_portfolio":
+            raise ValueError("dated futures source requires stock-context futures execution")
         self.day_trade_unlimited_margin_conversion = bool(
             day_trade_unlimited_margin_conversion
         )
@@ -520,6 +528,25 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                     "tw_stock_context_futures_portfolio requires the attached "
                     "full-stock-context/all-futures data contract"
                 )
+            if getattr(stock_context_futures_daily, "futures_account_calendar", None) is not None:
+                if futures_account_source is None:
+                    raise ValueError(
+                        "dual futures account calendar requires event-aware dataset, "
+                        "training, evaluation and report integration; its settlement tape cannot be discarded"
+                    )
+                from stockagent.training.futures_account_bridge import PreparedFuturesAccountSource
+                if not isinstance(futures_account_source, PreparedFuturesAccountSource):
+                    raise ValueError("dated futures dataset requires a prepared event source")
+                futures_account_source.verify_identity()
+                if futures_account_source.decision_execution is None:
+                    raise ValueError("dated futures dataset requires the prepared decision execution tape")
+                attached_source = PreparedFuturesAccountSource.from_daily(stock_context_futures_daily, panel.dates)
+                if attached_source.fingerprint != futures_account_source.fingerprint:
+                    raise ValueError("dated futures dataset source differs from the attached event tape")
+                self.futures_account_source_fingerprint = futures_account_source.fingerprint
+                self.futures_execution_release_fingerprint = futures_account_source.execution_release_fingerprint
+            elif futures_account_source is not None:
+                raise ValueError("dated futures source cannot label a legacy dataset")
             if not np.array_equal(
                 np.asarray(panel.dates, dtype="datetime64[D]"),
                 np.asarray(stock_context_futures_daily.dates, dtype="datetime64[D]"),
@@ -533,10 +560,17 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 stock_context_futures_daily.candidate_mask,
                 dtype=bool,
             )
-            stock_context_futures_liquidation = np.asarray(
-                stock_context_futures_daily.must_liquidate_mask,
-                dtype=bool,
-            ).copy()
+            if futures_account_source is None:
+                stock_context_futures_liquidation = np.asarray(
+                    stock_context_futures_daily.must_liquidate_mask,
+                    dtype=bool,
+                ).copy()
+            else:
+                # Row admission and execution must use the same source-pinned
+                # liquidation channel even if the attached panel is edited.
+                stock_context_futures_liquidation = np.asarray(
+                    futures_account_source.decision_execution[..., 2].numpy(), dtype=bool,
+                )
             from stockagent.data.tw_futures_portfolio_daily import futures_slot_layout_version
             slots = len(stock_context_futures_daily.symbols)
             if futures_slot_layout_version(slots) != stock_context_futures_daily.futures_data_contract_version:
@@ -887,22 +921,33 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 and stock_context_futures_portfolio_execution
             ):
                 assert stock_context_futures_daily is not None
-                futures_executable = np.asarray(
-                    stock_context_futures_daily.executable_mask, dtype=bool
-                )
                 assert stock_context_futures_liquidation is not None
-                executable_or_terminal = futures_executable[valid_indices].any(
-                    axis=1
-                ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
-                intraday_sessions = getattr(stock_context_futures_daily, "intraday_session_mask", None)
-                if intraday_sessions is not None:
-                    # Calendar/source admission owns row selection. A future
-                    # minute with no fill must still contribute a cash day.
-                    executable_or_terminal = np.asarray(intraday_sessions, dtype=bool)[valid_indices]
-                margin_sessions = getattr(stock_context_futures_daily, "margin_session_mask", None)
-                if margin_sessions is not None:
-                    # No-fill days still settle and can generate margin calls.
-                    executable_or_terminal = np.asarray(margin_sessions, dtype=bool)[valid_indices]
+                if futures_account_source is not None:
+                    margin_sessions = futures_account_source.decision_session_mask
+                    if margin_sessions is not None:
+                        # No-fill days still settle; use the same pinned
+                        # session admission that defines this release.
+                        executable_or_terminal = margin_sessions[valid_indices]
+                    else:
+                        futures_executable = futures_account_source.decision_execution[..., 1].numpy() > .5
+                        executable_or_terminal = futures_executable[valid_indices].any(axis=1) | (
+                            stock_context_futures_liquidation[valid_indices].any(axis=1))
+                else:
+                    futures_executable = np.asarray(
+                        stock_context_futures_daily.executable_mask, dtype=bool
+                    )
+                    executable_or_terminal = futures_executable[valid_indices].any(
+                        axis=1
+                    ) | stock_context_futures_liquidation[valid_indices].any(axis=1)
+                    intraday_sessions = getattr(stock_context_futures_daily, "intraday_session_mask", None)
+                    if intraday_sessions is not None:
+                        # Calendar/source admission owns row selection. A future
+                        # minute with no fill must still contribute a cash day.
+                        executable_or_terminal = np.asarray(intraday_sessions, dtype=bool)[valid_indices]
+                    margin_sessions = getattr(stock_context_futures_daily, "margin_session_mask", None)
+                    if margin_sessions is not None:
+                        # No-fill days still settle and can generate margin calls.
+                        executable_or_terminal = np.asarray(margin_sessions, dtype=bool)[valid_indices]
                 valid_indices = valid_indices[executable_or_terminal]
             elif (valid_indices.size > 0 and stock_futures_day_trade_execution
                   and self.execution_mode != MINUTE_MODE):
@@ -948,9 +993,17 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 stock_context_futures_liquidation[
                     int(self.valid_indices[-1]), :
                 ] = True
-            overnight_returns = stock_context_futures_daily.execution_tensor(
-                must_liquidate_mask=stock_context_futures_liquidation
-            )
+            if futures_account_source is None:
+                overnight_returns = stock_context_futures_daily.execution_tensor(
+                    must_liquidate_mask=stock_context_futures_liquidation
+                )
+            else:
+                # The runtime owns one packed tape shared by every dated split.
+                # It was hashed after packing the source liquidation mask;
+                # sample-end synthetic liquidation is prohibited for this ABI.
+                if not getattr(stock_context_futures_daily, "margin_contract_version", 0):
+                    raise ValueError("dated futures execution requires a margin account")
+                overnight_returns = None
 
         if futures_execution:
             if self.valid_indices.size > 0:
@@ -1264,9 +1317,12 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 features = np.ascontiguousarray(features)
             self.features_t = torch.from_numpy(features)
         self.future_log_returns_t = torch.from_numpy(returns)
-        self.overnight_log_returns_t = torch.from_numpy(
-            np.asarray(overnight_returns, dtype=np.float32)
-        )
+        if futures_account_source is not None:
+            self.overnight_log_returns_t = futures_account_source.decision_execution
+        else:
+            self.overnight_log_returns_t = torch.from_numpy(
+                np.asarray(overnight_returns, dtype=np.float32)
+            )
         self.derivative_candidate_features_t = (
             None
             if derivative_candidate_features is None

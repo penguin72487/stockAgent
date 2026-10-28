@@ -380,6 +380,7 @@ resolve_fintech_python() {{ printf '%s\\n' '{sys.executable}'; }}
 date() {{ if [[ "$*" == "+%H%M%S" ]]; then printf '120000\\n'; else /bin/date "$@"; fi; }}
 run_fintech_python() {{
   case "$1" in
+    */check_acquisition_capacity.py) return 0;;
     */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":1,"processing_threads":1,"tick_partitions_per_pass":1}}';;
     */finlab_release_gate.py) return 0;;
     */build_finlab_research_overlay.py) echo research >> work-order; return {build_exit};;
@@ -420,3 +421,31 @@ if kind == 'tw_minute':
     if build_exit == stage_exit == publish_exit == 0:
         expected_order += ['interop'] + ([] if bootstrap_exit else ['cold-audit'])
     assert order == expected_order
+
+
+@pytest.mark.parametrize('capacity_exit', [75, 2])
+def test_finlab_capacity_denial_stops_before_sdk_or_source_setup(tmp_path, capacity_exit):
+    """A real Bash pass must propagate deferral/error before any downloader."""
+    import subprocess
+    root=Path(__file__).resolve().parents[1]
+    scripts=tmp_path/'scripts'
+    scripts.mkdir()
+    (scripts/'runtime_env.sh').write_text(f'''
+resolve_fintech_python() {{ touch unexpected-sdk-start; return 99; }}
+run_fintech_python() {{
+  case "$1" in
+    */check_acquisition_capacity.py)
+      [[ "$2" == "--path" && "$3" == "$FINLAB_REPO_ROOT" ]] || return 98
+      touch capacity-checked
+      return {capacity_exit};;
+    *) touch unexpected-downloader; return 97;;
+  esac
+}}
+''')
+    result=subprocess.run(['bash',str(root/'scripts/run_finlab_refresh.sh')],cwd=tmp_path,
+        env={**os.environ,'FINLAB_REPO_ROOT':str(tmp_path)},capture_output=True,text=True,timeout=5)
+    assert result.returncode==capacity_exit,result.stdout+result.stderr
+    assert (tmp_path/'capacity-checked').exists()
+    assert not (tmp_path/'unexpected-sdk-start').exists()
+    assert not (tmp_path/'unexpected-downloader').exists()
+    assert not (tmp_path/'data_finlab').exists()

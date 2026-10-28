@@ -12,6 +12,18 @@
   "metadata_backfill_catalog": "/var/lib/stockagent/backup-stream/source-repair-observer-metadata-cohort-20261007.json",
   "metadata_backfill_sha256": "ff0444063d5f8d844341f21017684185a512dc368619b333b8c5375dc6c3eb85",
   "cold_object_replication_owner": "stockagent-source-replication-v1",
+  "private_history_backup": {
+    "contract": "stockagent.private_cold_NAS_enrollment.v1",
+    "enabled": true,
+    "source_relative_root": ".local-state/private-history",
+    "private_backup_authorized": true,
+    "public_publish_allowed": false,
+    "source_cleanup_authorized": false,
+    "route": "existing_paired_encrypted_Restic_relay",
+    "scope": "all_retained_private_immutable_manifests",
+    "user_instruction_date": "2026-10-28",
+    "user_instruction": "確認所有東西可以同步到 lab203 的 NAS；私人冷庫沿原加密備份通道交付，不變更公開分享與來源刪除權限。"
+  },
   "history_disposition": "/root/stockAgent/configs/data_sync/backup_history_disposition_20261004.json",
   "key_custody_confirmation": "/root/stockAgent/configs/data_sync/backup_key_custody_20261004.json",
   "nas_recovery_plan": "/root/stockAgent/configs/data_sync/lab203_nas_recovery_plan_20261004.json",
@@ -29,7 +41,7 @@
   "maximum_batch_bytes": 8589934592,
   "maximum_batch_files": 512,
   "maximum_pending_bytes": 34359738368,
-  "maximum_staging_bytes": 17179869184,
+  "maximum_staging_bytes": 25769803776,
   "maximum_pending_deliveries": 4,
   "pipeline": {
     "maximum_waves_per_cycle": 4,

@@ -190,3 +190,151 @@ def test_amp_invalid_bounds_do_not_create_a_frontier(tmp_path, bound):
     with pytest.raises(ValueError, match='bounded_integer_sample_required'):
         audit_amp_declarations(tmp_path, bound)
     assert not (tmp_path/'queue.sqlite3').exists()
+
+
+def retained_amp_mobile_candidate(queue, *, mutation=None):
+    """A committed mobile original is a separate observation from the AMP URL."""
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    amp = 'https://amp-news.cnyes.com/news/id/1'
+    body = 'private-mobile-body-canary'
+    raw = (f'<html><head><link rel="canonical" href="{primary}">'
+           f'<link rel="amphtml" href="{amp}"></head><body>{body}</body></html>').encode()
+    queue.add_articles([{'url': mobile}, {'url': amp}])
+    row = queue.db.execute('SELECT id FROM articles WHERE url=?', (mobile,)).fetchone()
+    body_hash = hashlib.sha256(body.encode()).hexdigest()
+    record = {'article_id': row['id'].hex(), 'body_sha256': body_hash, 'body': body,
+              'body_bytes': len(body.encode()), 'requested_url': mobile, 'final_url': mobile,
+              'source_request_url': mobile, 'response_sha256': hashlib.sha256(raw).hexdigest(),
+              'source_response_article_id': row['id'].hex(), 'raw_response_body': raw,
+              'extraction_method': 'cnyes_visible_canonical_alias_v1'}
+    if mutation == 'body': record['body'] = 'different'
+    if mutation == 'body_bytes': record['body_bytes'] += 1
+    if mutation == 'raw_hash': record['response_sha256'] = 'b'*64
+    if mutation == 'identity': record['final_url'] = primary
+    path = queue.root/'bodies'/'mobile-synthetic.parquet'
+    atomic_write_parquet(path, table_from_records([record]), durable=True)
+    relative = str(path.relative_to(queue.root))
+    receipt = path.with_suffix('.receipt.json')
+    receipt_data = {'contract_version': 1, 'parquet_path': relative, 'publish': False,
+                    'sha256': sha256_file(path), 'rows': 1}
+    if mutation == 'receipt_path': receipt_data['parquet_path'] = 'other.parquet'
+    if mutation == 'receipt_contract': receipt_data['contract_version'] = 2
+    if mutation == 'receipt_publish': receipt_data['publish'] = True
+    if mutation == 'receipt_hash': receipt_data['sha256'] = 'c'*64
+    atomic_write_json(receipt, receipt_data, durable=True)
+    queue.db.execute('INSERT INTO accepted_batches VALUES (?,?)',
+                     (relative, str(receipt.relative_to(queue.root))))
+    queue.db.execute("UPDATE articles SET state='complete',body_sha256=?,body_bytes=?,parquet_path=? WHERE url=?",
+                     (body_hash, len(body.encode()), relative, mobile))
+    queue.db.commit()
+    return path
+
+
+def test_amp_mobile_originals_are_receipted_readonly_evidence_not_accepted_aliases(queue, monkeypatch):
+    from scripts.audit_news_cnyes_alias_candidates import audit_amp_mobile_declarations
+    monkeypatch.setattr(requests.Session, 'request', lambda *args, **kwargs: pytest.fail('no HTTP'))
+    retained_amp_mobile_candidate(queue)
+    before = [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    result = audit_amp_mobile_declarations(queue.root)
+    assert result['inspection_kind'] == 'retained_mobile_native_amp_declarations'
+    assert result['selected_queued_amp_heads'] == 1 and result['selected_inputs_unchanged']
+    assert result['counts'] == {'native_head_declares_exact_amp_counterpart': 1}
+    assert result['findings'][0]['publisher_declared_counterpart']
+    assert result['publisher_requests'] == result['body_extractors_called'] == 0
+    assert not result['alias_source_equivalence_verified'] and result['aliases_admitted'] == 0
+    assert not result['accepted_body_text_retained'] and 'private-mobile-body-canary' not in json.dumps(result)
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')] == before
+
+
+def test_amp_relative_links_resolve_against_the_observed_document_not_primary():
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    amp = 'https://amp-news.cnyes.com/news/id/1'
+    raw = (f'<html><head><link rel="canonical" href="/news/id/1">'
+           f'<link rel="amphtml" href="{amp}"></head></html>').encode()
+    assert _declared_amp_head(raw, primary, amp, extraction_method='css:article')['publisher_declared_counterpart']
+    assert not _declared_amp_head(raw, primary, amp, document_url=mobile,
+                                  extraction_method='css:article')['publisher_declared_counterpart']
+
+
+def test_amp_relative_links_honor_the_first_native_html_base():
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    amp = 'https://amp-news.cnyes.com/news/id/1'
+    raw = (f'<html><head><base href="https://news.cnyes.com/">'
+           f'<link rel="canonical" href="/news/id/1"><link rel="amphtml" href="{amp}">'
+           '</head></html>').encode()
+    assert _declared_amp_head(raw, primary, amp, document_url=mobile,
+                             extraction_method='css:article')['publisher_declared_counterpart']
+    invalid = raw.replace(b'https://news.cnyes.com/', b'http://[invalid/')
+    assert not _declared_amp_head(invalid, primary, amp, document_url=mobile,
+                                  extraction_method='css:article')['publisher_declared_counterpart']
+
+
+@pytest.mark.parametrize('mutation', ['body', 'body_bytes', 'raw_hash', 'identity', 'receipt_path',
+                                      'receipt_contract', 'receipt_publish', 'receipt_hash'])
+def test_amp_mobile_corruption_fails_closed_without_mutating_queue(queue, mutation):
+    from scripts.audit_news_cnyes_alias_candidates import audit_amp_mobile_declarations
+    retained_amp_mobile_candidate(queue, mutation=mutation)
+    before = [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')]
+    with pytest.raises(ValueError, match='mismatch|invalid'):
+        audit_amp_mobile_declarations(queue.root)
+    assert [tuple(row) for row in queue.db.execute('SELECT * FROM articles ORDER BY id')] == before
+
+
+@pytest.mark.parametrize('budget', ['AMP_MAX_ENCODED_BYTES', 'AMP_MOBILE_MAX_DECODED_BYTES',
+                                     'AMP_MOBILE_MAX_BATCH_DECODED_BYTES', 'AMP_MAX_BATCH_ROWS'])
+def test_amp_mobile_reads_have_encoded_and_decoded_bounds(queue, monkeypatch, budget):
+    import scripts.audit_news_cnyes_alias_candidates as implementation
+    retained_amp_mobile_candidate(queue)
+    monkeypatch.setattr(implementation, budget, 0)
+    with pytest.raises(ValueError, match='budget|rows'):
+        implementation.audit_amp_mobile_declarations(queue.root)
+
+
+def test_amp_mobile_missing_or_incomplete_head_does_not_attempt_artifact_read(queue, monkeypatch):
+    from scripts.audit_news_cnyes_alias_candidates import audit_amp_mobile_declarations
+    import downloader.news_fulltext_queue as implementation
+    queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'},
+                        {'url': 'https://amp-news.cnyes.com/news/id/2'},
+                        {'url': 'https://m.cnyes.com/news/id/2'}])
+    queue.db.execute("UPDATE articles SET state='retry',body_sha256=?,parquet_path=? WHERE url=?",
+                     ('a'*64, 'missing.parquet', 'https://m.cnyes.com/news/id/2'))
+    queue.db.commit()
+    monkeypatch.setattr(implementation, 'source_path', lambda *args: pytest.fail('no artifact is admissible'))
+    result = audit_amp_mobile_declarations(queue.root)
+    assert result['counts'] == {'no_exact_literal_mobile_candidate': 1, 'no_complete_mobile_candidate': 1}
+    assert not any(row['publisher_declared_counterpart'] for row in result['findings'])
+
+
+def test_amp_mobile_readback_detects_head_change(queue, monkeypatch):
+    import scripts.audit_news_cnyes_alias_candidates as implementation
+    retained_amp_mobile_candidate(queue)
+    original = implementation._declared_amp_head
+    def change_head(*args, **kwargs):
+        result = original(*args, **kwargs)
+        queue.db.execute("UPDATE articles SET state='retry' WHERE url='https://m.cnyes.com/news/id/1'")
+        queue.db.commit()
+        return result
+    monkeypatch.setattr(implementation, '_declared_amp_head', change_head)
+    result = implementation.audit_amp_mobile_declarations(queue.root)
+    assert not result['selected_inputs_unchanged'] and result['aliases_admitted'] == 0
+
+
+def test_amp_bounded_reader_allocates_for_actual_file_not_aggregate_budget(tmp_path, monkeypatch):
+    from pathlib import Path
+    from scripts.audit_news_cnyes_alias_candidates import _read_stable_bounded
+    path = tmp_path/'small.bin'
+    path.write_bytes(b'small-content')
+    original = Path.open
+    reads = []
+    class Tracked:
+        def __init__(self, stream): self.stream = stream
+        def __enter__(self): self.stream.__enter__(); return self
+        def __exit__(self, *args): return self.stream.__exit__(*args)
+        def fileno(self): return self.stream.fileno()
+        def read(self, size): reads.append(size); return self.stream.read(size)
+    monkeypatch.setattr(Path, 'open', lambda self, *args, **kwargs: Tracked(original(self, *args, **kwargs)))
+    payload, _ = _read_stable_bounded(path, 64 << 20)
+    assert payload == b'small-content' and reads == [len(payload)+1]

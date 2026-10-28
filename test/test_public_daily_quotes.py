@@ -1,13 +1,16 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from copy import deepcopy
 from datetime import datetime
 import json
+import os
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from stockagent.live.public_daily_quotes import OfficialDailyQuoteSource
+from stockagent.live import public_daily_quotes as quote_module
 from stockagent.live import public_dashboards as public
 from stockagent.live.public_quote_display import PublicQuoteDisplayPolicy, public_quote_display_policy
 
@@ -435,3 +438,107 @@ def test_owner_disclosure_scope_invalidates_both_detail_revisions_not_financial_
             assert before["history_revision"] == after["history_revision"]
     finally:
         server.server_close()
+
+
+@pytest.mark.parametrize("sanitize", [public.sanitize_tw_signals, public.sanitize_tw_positions,
+                                      public.sanitize_tw_events, public.sanitize_tw_status])
+def test_multi_session_response_batches_dates_symbols_and_nested_roles(tmp_path, monkeypatch, sanitize):
+    dates = ["2026-09-18", DAY, "2026-09-22", "2026-09-23"]
+    rows = [official_row(date=day, 證券代號=symbol,
+                        收盤價=str(2480 + index),
+                        _downloaded_at_utc="2026-09-24T09:00:00Z")
+            for index, day in enumerate(dates) for symbol in ("2330", "0050")]
+    source = source_at(tmp_path, rows, maximum_sessions=1)
+    pq.write_table(pa.Table.from_pylist([tpex_row()]), tmp_path / "tpex_daily_ohlcv.parquet")
+    records = [{"symbol": "2330", "session_date": day,
+                "entry_price": 2480., "entry_at": dates[0] + "T13:30:00+08:00",
+                "entry_price_source": "official_close"} for day in dates]
+    value = {**payload(records[0]), "rows": records, "positions": records}
+    # Independent previous single-record reader: same facts/policy/roles, no
+    # batched read, including another session's official auction verification.
+    reference_source = OfficialDailyQuoteSource(tmp_path, maximum_sessions=1)
+    monkeypatch.setattr(reference_source, "read_view", lambda *a, **kw: nullcontext(reference_source))
+    expected = sanitize(value, quote_source=reference_source)
+    calls, read_rows = [], quote_module._projected_daily_quote_rows
+
+    def counted(path, **kwargs):
+        calls.append((str(path), kwargs))
+        return read_rows(path, **kwargs)
+
+    monkeypatch.setattr(quote_module, "_projected_daily_quote_rows", counted)
+    output = sanitize(value, quote_source=source)
+    output_rows = output["positions" if sanitize is public.sanitize_tw_status else "rows"]
+    assert {item["session_date"]: item["official_daily_quote"]["close"] for item in output_rows} == {
+        day: 2480. + index for index, day in enumerate(dates)}
+    batch_calls = [(path, query) for path, query in calls if len(query["sessions"]) > 1]
+    assert len(batch_calls) == 2  # One batch per venue, not one per record/date.
+    assert all(query["sessions"].issubset(dates) for _, query in batch_calls)
+    expected_symbols = ["0050", "2330"] if sanitize is public.sanitize_tw_status else ["2330"]
+    assert all(query["symbols"] == set(expected_symbols) for _, query in batch_calls)
+    assert len(source._sessions) <= 1  # Partial symbol batches never fill the LRU.
+    assert output == expected  # Entire public DTO, including disclosure/role proof.
+
+
+def test_batch_conflicts_are_per_day_and_keep_other_day_and_venue(tmp_path):
+    second = "2026-09-22"
+    source = source_at(tmp_path, [official_row(), official_row(收盤價="2481"),
+        official_row(date=second, 收盤價="2500", _downloaded_at_utc="2026-09-23T09:00:00Z")])
+    pq.write_table(pa.Table.from_pylist([tpex_row()]), tmp_path / "tpex_daily_ohlcv.parquet")
+    value = [{"symbol": "2330", "session_date": day} for day in (DAY, second)]
+    value.append({"symbol": "6168", "session_date": DAY})
+    with source.read_view(value) as view:
+        assert "official_daily_quote" not in view.enrich(value[0])
+        assert view.enrich(value[1])["official_daily_quote"]["close"] == 2500.
+        assert view.enrich(value[2])["official_daily_quote"]["close"] == 28.2
+
+
+@pytest.mark.parametrize("phase", ["load", "enrich"])
+def test_source_replacement_during_batch_projection_fails_closed(tmp_path, monkeypatch, phase):
+    source = source_at(tmp_path)
+    original = source._load_sessions
+    def replace():
+        replacement = tmp_path / "new.parquet"
+        pq.write_table(pa.Table.from_pylist([official_row(收盤價="2481")]), replacement)
+        replacement.replace(tmp_path / "twse_daily_ohlcv.parquet")
+    if phase == "load":
+        def changed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            replace()
+            return result
+        monkeypatch.setattr(source, "_load_sessions", changed)
+    with pytest.raises(OSError, match="official daily source changed"):
+        with source.read_view([{"symbol": "2330", "session_date": DAY}]) as view:
+            assert view.enrich({"symbol": "2330", "session_date": DAY})
+            if phase == "enrich":
+                replace()
+
+
+def test_daily_quote_cache_and_revision_detect_preserved_mtime_rewrite(tmp_path):
+    source = source_at(tmp_path)
+    assert source.session(DAY)["2330"]["close"] == 2480.
+    path = tmp_path / "twse_daily_ohlcv.parquet"
+    before, revision = path.stat(), source.revision()
+    pq.write_table(pa.Table.from_pylist([official_row(收盤價="2,481.00")]), path)
+    assert path.stat().st_size == before.st_size
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert source.revision() != revision
+    assert source.session(DAY)["2330"]["close"] == 2481.
+
+
+def test_partial_symbol_view_never_poisons_complete_session_cache(tmp_path):
+    source = source_at(tmp_path, [official_row(), official_row(證券代號="0050")])
+    with source.read_view([{"symbol": "2330", "session_date": DAY}]) as view:
+        assert set(view.session(DAY)) == {"2330"}
+    assert source._sessions == {}
+    assert set(source.session(DAY)) == {"2330", "0050"}
+
+
+def test_concurrent_batch_views_keep_independent_symbol_projections(tmp_path):
+    source = source_at(tmp_path, [official_row(), official_row(證券代號="0050", 收盤價="2500")])
+    def read(symbol):
+        with source.read_view([{"symbol": symbol, "session_date": DAY}]) as view:
+            assert set(view.session(DAY)) == {symbol}
+            return view.enrich({"symbol": symbol, "session_date": DAY})["official_daily_quote"]["close"]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        assert list(pool.map(read, ["2330", "0050"] * 3)) == [2480., 2500.] * 3
+    assert source._sessions == {}

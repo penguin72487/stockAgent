@@ -626,6 +626,40 @@ def test_temporary_stage_selection_is_fixed_and_bound_to_one_completed_benchmark
     assert cleanup.stage_profile(inventory) == (cleanup.D_BENCHMARK_STAGE_ROOT, True)
 
 
+def test_native_ssd_profile_keeps_the_existing_fixed_root_and_durable_staging():
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.NATIVE_SSD_STAGE_PROFILE,
+                 'items': [{'relative_root': 'benchmarks/suite/completed-case'}]}
+    assert cleanup.stage_profile(inventory) == (cleanup.C_TEMP_STAGE_ROOT, True)
+    assert cleanup.stage_profile({}) == (cleanup.C_TEMP_STAGE_ROOT, False)
+    for other in ('guarded_d_scratch', 'guarded_d_offline_scratch'):
+        with pytest.raises(SnapshotError, match='select only one'):
+            cleanup.inventory([], None, native_ssd_scratch=True, **{other: True})
+
+
+@pytest.mark.parametrize('problem', ['multiple', 'existing', 'origin', 'catalog', 'scope', 'parent', 'arbitrary'])
+def test_native_ssd_profile_cannot_relocate_frozen_or_unknown_source_roles(problem):
+    from scripts import retire_local_offline_artifacts as cleanup
+    inventory = {'staging_profile': cleanup.NATIVE_SSD_STAGE_PROFILE,
+                 'items': [{'relative_root': 'benchmarks/suite/completed-case'}]}
+    if problem == 'multiple':
+        inventory['items'].append({'relative_root': 'benchmarks/suite/other'})
+    elif problem == 'existing':
+        inventory['items'][0]['existing_dataset'] = 'retained-source'
+    elif problem == 'origin':
+        inventory['source_origin'] = cleanup.HOT_MIRROR_ORIGIN
+    elif problem == 'catalog':
+        inventory['existing_catalog_sha256'] = 'a' * 64
+    elif problem == 'scope':
+        inventory['items'][0]['relative_root'] = 'data_finlab/raw'
+    elif problem == 'parent':
+        inventory['items'][0]['relative_root'] = 'benchmarks/suite'
+    else:
+        inventory['staging_profile'] = '/arbitrary/fast/drive'
+    with pytest.raises(SnapshotError, match='staging profile'):
+        cleanup.stage_profile(inventory)
+
+
 def _completed_research_staging(source):
     from stockagent.data_sync.benchmark_fixtures import RESEARCH_STAGING_CONTRACT
     value = {'contract': RESEARCH_STAGING_CONTRACT,
@@ -1476,9 +1510,11 @@ def test_reuse_completed_publication_requires_fixed_identity_and_claims_no_recov
 
 
 @pytest.mark.parametrize('defect', [None, 'source', 'encoding'])
-def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_path, monkeypatch, defect):
+@pytest.mark.parametrize('d_primary', [False, True])
+def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_path, monkeypatch, defect, d_primary):
     from scripts import retire_local_offline_artifacts as cleanup
     from stockagent.data_sync import legacy_artifact_archive as archives
+    from stockagent.data_sync import syncthing_scan as scan
     root, source, row, catalog = example(tmp_path)
     spec = load_legacy_specs(catalog)[row['dataset']]
     packed, target = tmp_path/'packed', tmp_path/'receipt'
@@ -1486,6 +1522,12 @@ def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_pa
     monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'publication.lock')
     checked_roots = []
     monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: checked_roots.append(path))
+    if d_primary:
+        packed.mkdir()
+        (packed / scan.D_PRIMARY_MARKER).write_text('{}')
+        monkeypatch.setattr(cleanup, 'D_PRIMARY_ROOT', packed)
+        monkeypatch.setattr(scan, 'CANONICAL_ROOT', packed)
+    monkeypatch.setattr(scan, '_scan_pending', lambda *a, **kw: pytest.fail('publication must not wait for a network scan'))
     manifest = prepare_archive(spec, root, manual_capture=True, repo_root=root.parent)
     archive = spec.stage_root/spec.dataset/'archive'
     if defect == 'source':
@@ -1512,10 +1554,41 @@ def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_pa
         published = cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
         assert calls == ['canonical-complete-verification'] * 2
         assert json.loads((target/'publication.json').read_bytes()) == published
+        progress = json.loads((target/'publication-progress.json').read_bytes())
+        assert progress['contract'] == 'manual-retirement-publication-progress-v1'
+        assert progress['acceptance'] is False and progress['files_total'] > 0
         proof = verify_cold_archive(spec, packed)
         assert proof['decoded_originals_verified'] and proof['snapshot_id'] == published['snapshot_id']
+        pending = packed / '.local-state/scan-pending' / (spec.dataset + '.json')
+        assert pending.exists() is d_primary
+        if d_primary:
+            intent = json.loads(pending.read_bytes())
+            assert intent['dataset'] == spec.dataset and intent['new_object_paths']
+            assert intent['generation']
     assert checked_roots == [packed]
     assert source.is_dir()
+
+
+def test_manual_d_publication_requires_durable_scan_intent(tmp_path, monkeypatch):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync import syncthing_scan as scan
+
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed, target = tmp_path/'packed', tmp_path/'receipt'
+    packed.mkdir()
+    target.mkdir()
+    (packed / scan.D_PRIMARY_MARKER).write_text('{}')
+    monkeypatch.setattr(cleanup, 'D_PRIMARY_ROOT', packed)
+    monkeypatch.setattr(scan, 'CANONICAL_ROOT', packed)
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'publication.lock')
+    monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: None)
+    monkeypatch.setattr(scan, 'queue_after_publish', lambda *a, **kw: False)
+    monkeypatch.setattr(scan, '_scan_pending', lambda *a, **kw: pytest.fail('must not send another scan'))
+    with pytest.raises(SnapshotError, match='durable scan intent'):
+        cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
+    assert not (target/'publication.json').exists()
+    assert source.is_dir() and (source/'unique-result.bin').is_file()
 
 
 @pytest.mark.parametrize('defect', [None, 'source', 'encoding'])
@@ -1554,6 +1627,121 @@ def test_fixed_publication_resume_avoids_preparation_but_keeps_all_byte_audits(t
             assert verify_archive_directory(archive, source, spec=spec, artifact_root=root,
                 repo_root=root.parent, manual_capture=True)['files'] == 1
     assert source.exists()  # Neither resumption nor recovery is deletion permission.
+
+
+@pytest.mark.parametrize('defect', [None, 'cold-object', 'encoding-after-decode'])
+def test_parallel_d_recovery_keeps_independent_cold_decode_and_post_decode_checks(
+        tmp_path, monkeypatch, defect):
+    import threading
+    import stockagent.data_sync.legacy_artifact_archive as legacy
+    from stockagent.data_sync.packed_snapshots import resolve_latest_packed
+
+    root, source, row, catalog = example(tmp_path)
+    stamp = time.time() - 2 * 86400
+    for index in range(75):
+        path = source / f'extra-{index:03d}'
+        path.write_bytes(f'source-{index:03d}'.encode())
+        os.utime(path, (stamp, stamp))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed = tmp_path / 'packed'
+    published = publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    monkeypatch.setattr(legacy, 'D_BENCHMARK_STAGE_ROOT', spec.stage_root)
+
+    if defect == 'cold-object':
+        resolved = resolve_latest_packed(packed, spec.dataset)
+        object_path = packed / resolved.manifest['archive']['objects'][0]['relpath']
+        raw = object_path.read_bytes()
+        object_path.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+
+    original = legacy._encoded_original_hashes
+    lock = threading.Lock()
+    concurrent = threading.Event()
+    active = peak = 0
+
+    def tracked_hash(*args):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if peak >= 4:
+                concurrent.set()
+        if not concurrent.wait(timeout=5):
+            raise AssertionError('four decoding workers did not start')
+        try:
+            return original(*args)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(legacy, '_encoded_original_hashes', tracked_hash)
+    events = []
+    changed = False
+
+    def progress(event):
+        nonlocal changed
+        events.append(event)
+        if (defect == 'encoding-after-decode' and not changed
+                and event.get('recovery_step') == 'decode-originals'
+                and event.get('stage') == 'decode-originals'
+                and event.get('completed_items') == event.get('total_items')):
+            member = next(p for p in archive.rglob('*') if p.is_file()
+                          and p.name != 'legacy_archive_manifest.json')
+            data = member.read_bytes()
+            member.write_bytes(bytes([data[0] ^ 1]) + data[1:])
+            changed = True
+
+    if defect:
+        with pytest.raises((SnapshotError, OSError)):
+            verify_cold_archive(spec, packed, reuse_encoded_archive=archive, progress=progress)
+        if defect == 'encoding-after-decode':
+            assert changed and peak == 4
+    else:
+        proof = verify_cold_archive(spec, packed, reuse_encoded_archive=archive, progress=progress)
+        assert proof['decoded_originals_verified']
+        assert proof['manifest_sha256'] == published['manifest_sha256']
+        assert proof['cold_reconstruction']['independently_reconstructed_files'] == 77
+        assert peak == 4
+    assert source.is_dir() and (source / 'unique-result.bin').is_file()
+
+
+def test_parallel_legacy_verification_does_not_extend_to_other_stages(tmp_path):
+    from stockagent.data_sync.legacy_artifact_archive import verify_archive_directory
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    with pytest.raises(SnapshotError, match='restricted'):
+        verify_archive_directory(spec.stage_root / spec.dataset / 'archive', source,
+                                 spec=spec, file_workers=4)
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_parallel_legacy_source_audit_keeps_full_source_bytes(tmp_path, monkeypatch, changed):
+    import stockagent.data_sync.legacy_artifact_archive as legacy
+    root, source, row, catalog = example(tmp_path)
+    stamp = time.time() - 2 * 86400
+    for index in range(6):
+        path = source / f'extra-{index:03d}'
+        path.write_bytes(f'source-{index:03d}'.encode())
+        os.utime(path, (stamp, stamp))
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed = tmp_path / 'packed'
+    publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    monkeypatch.setattr(legacy, 'D_BENCHMARK_STAGE_ROOT', spec.stage_root)
+    if changed:
+        path = source / 'extra-001'
+        original = path.stat()
+        path.write_bytes(b'x' * original.st_size)
+        os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+    if changed:
+        with pytest.raises(SnapshotError, match='source differs'):
+            legacy.verify_archive_directory(archive, source, spec=spec, manual_capture=True,
+                artifact_root=root, repo_root=root.parent, file_workers=4)
+    else:
+        proof = legacy.verify_archive_directory(archive, source, spec=spec, manual_capture=True,
+            artifact_root=root, repo_root=root.parent, file_workers=4)
+        assert proof['files'] == 7
+    assert source.exists()
 
 
 def test_queued_cleanup_cannot_enter_the_existing_cohort_transaction(tmp_path, monkeypatch):
@@ -1630,6 +1818,41 @@ def test_recovery_interrupt_keeps_partial_telemetry_and_never_accepts_retirement
     assert progress['state'] == 'interrupted' and progress['error_type'] == 'KeyboardInterrupt'
     assert progress['completed_items'] == 5 and progress['completed_bytes'] == 1024
     assert progress['snapshot_id'] == published['snapshot_id']
+    assert progress['acceptance_proof'] is False
+    assert source.is_dir() and not (target / 'retirement.json').exists()
+
+
+def test_post_decode_corruption_persists_failure_without_retirement(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    import stockagent.data_sync.legacy_artifact_archive as archive_module
+
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed = tmp_path / 'packed'
+    published = publish_archive(spec, root, packed, repo_root=root.parent, manual_capture=True)
+    target = tmp_path / 'receipts'
+    target.mkdir()
+    monkeypatch.setattr(cleanup.shutil, 'disk_usage', lambda path: SimpleNamespace(free=0))
+    verify_originals = archive_module.verify_archive_directory
+
+    def change_encoding_after_decode(*args, **kwargs):
+        proof = verify_originals(*args, **kwargs)
+        encoded = next((spec.stage_root / spec.dataset / 'archive' / 'payload').rglob('*.raw'))
+        contents = encoded.read_bytes()
+        assert contents
+        encoded.write_bytes(bytes([contents[0] ^ 1]) + contents[1:])
+        return proof
+
+    monkeypatch.setattr(archive_module, 'verify_archive_directory', change_encoding_after_decode)
+    with pytest.raises(SnapshotError, match='checksum mismatch'):
+        cleanup.verify_for_retirement(spec, packed, target)
+    progress = json.loads((target / 'recovery-progress.json').read_bytes())
+    assert progress['state'] == 'failed' and progress['error_type'] == 'SnapshotError'
+    assert progress['snapshot_id'] == published['snapshot_id']
+    assert progress['manifest_sha256'] == published['manifest_sha256']
+    assert progress['recovery_step'] == 'decode-originals'
+    assert progress['stage'] == 'verify-materialized-post-decode-files'
     assert progress['acceptance_proof'] is False
     assert source.is_dir() and not (target / 'retirement.json').exists()
 
@@ -2013,3 +2236,122 @@ def test_phase_progress_does_not_resurrect_an_interrupted_disk_phase(tmp_path):
     result = json.loads(path.read_text())
     assert result['phase'] == 'new-attempt' and result['state'] == 'completed'
     assert result['phase_depth'] == 0
+
+
+def test_phase_history_retains_nested_completed_and_failed_timing_without_double_counting(tmp_path):
+    from scripts.retire_local_offline_artifacts import phase
+    with pytest.raises(ValueError):
+        with phase(tmp_path, 'parent'):
+            with phase(tmp_path, 'child'):
+                pass
+            with phase(tmp_path, 'bad-child'):
+                raise ValueError('injected failure')
+    history = json.loads((tmp_path / 'phase-history.json').read_bytes())
+    assert history['contract'] == 'manual-retirement-phase-history-v1'
+    assert [(e['phase'], e['state'], e['phase_depth']) for e in history['events']] == [
+        ('child', 'completed', 1), ('bad-child', 'failed', 1), ('parent', 'failed', 0)]
+    assert all(e['elapsed_seconds'] >= 0 and e['owner_pid'] == os.getpid() for e in history['events'])
+
+
+def test_fixed_d_only_requires_exact_existing_stage_and_pinned_publication(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    stage = tmp_path / 'enrolled-d-stage'
+    archive = stage / 'dataset' / 'archive'
+    archive.mkdir(parents=True)
+    manifest = archive / 'legacy_archive_manifest.json'
+    manifest.write_text('{}')
+    spec = SimpleNamespace(stage_root=stage, dataset='dataset')
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    published = {'dataset': 'dataset', 'snapshot_id': 'fixed-release', 'manifest_sha256': 'a' * 64}
+    monkeypatch.setattr(cleanup, 'D_BENCHMARK_STAGE_ROOT', stage)
+    monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: None)
+    monkeypatch.setattr(cleanup, 'reusable_publication', lambda *a: published)
+    assert cleanup.require_existing_fixed_d_stage(spec, tmp_path / 'cold', target,
+        expected_fixed_manifest_sha256='a' * 64) == published
+    with pytest.raises(SnapshotError, match='changed since'):
+        cleanup.require_existing_fixed_d_stage(spec, tmp_path / 'cold', target,
+            expected_fixed_manifest_sha256='b' * 64)
+    manifest.unlink()
+    monkeypatch.setattr(cleanup, 'prepare_archive', lambda *a, **kw: pytest.fail('must not create a replacement'))
+    with pytest.raises(SnapshotError, match='existing exact D archive'):
+        cleanup.prepare_or_resume_publication(spec, tmp_path, tmp_path / 'cold', target,
+            repo_root=tmp_path, fixed_d_stage_only=True, expected_fixed_manifest_sha256='a' * 64)
+    assert not manifest.exists()
+
+
+def test_fixed_d_only_never_falls_back_to_new_workspace_if_stage_disappears(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    spec = SimpleNamespace(dataset='dataset', stage_root=tmp_path / 'stage')
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'require_existing_fixed_d_stage', lambda *a, **kw: {})
+    monkeypatch.setattr(cleanup, 'resolve_latest_packed', lambda *a: SimpleNamespace(
+        manifest={'source': {'logical_bytes': 100}, 'snapshot_id': 'fixed'}, manifest_sha256='a' * 64))
+    observed = []
+    def fail_without_fallback(*args, **kwargs):
+        observed.append(kwargs)
+        raise SnapshotError('stage vanished')
+    monkeypatch.setattr(cleanup, 'verify_cold_archive', fail_without_fallback)
+    with pytest.raises(SnapshotError, match='stage vanished'):
+        cleanup.verify_for_retirement(spec, tmp_path / 'cold', target,
+            fixed_d_stage_only=True, expected_fixed_manifest_sha256='a' * 64)
+    assert observed[0]['reuse_encoded_archive'] == spec.stage_root / spec.dataset / 'archive'
+    assert 'verification_root' not in observed[0]
+    assert json.loads((target / 'recovery-progress.json').read_text())['state'] == 'failed'
+
+
+def test_fixed_d_only_rejects_release_change_after_preflight(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    spec = SimpleNamespace(dataset='dataset', stage_root=tmp_path / 'stage')
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'require_existing_fixed_d_stage', lambda *a, **kw: {})
+    monkeypatch.setattr(cleanup, 'resolve_latest_packed', lambda *a: SimpleNamespace(
+        manifest={'source': {'logical_bytes': 100}, 'snapshot_id': 'other'}, manifest_sha256='b' * 64))
+    monkeypatch.setattr(cleanup, 'verify_cold_archive', lambda *a, **kw: pytest.fail('must not read changed release'))
+    with pytest.raises(SnapshotError, match='changed before independent recovery'):
+        cleanup.verify_for_retirement(spec, tmp_path / 'cold', target,
+            fixed_d_stage_only=True, expected_fixed_manifest_sha256='a' * 64)
+
+
+@pytest.mark.parametrize('damage', [None, 'missing-encoding', 'corrupt-cold'])
+def test_new_guarded_d_recovery_retains_complete_cold_decode_proof_without_local_tree(
+        tmp_path, monkeypatch, damage):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.packed_snapshots import resolve_latest_packed
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    cold = tmp_path / 'packed'
+    published = publish_archive(spec, root, cold, repo_root=root.parent, manual_capture=True)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    monkeypatch.setattr(cleanup, 'D_BENCHMARK_STAGE_ROOT', spec.stage_root)
+    monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: None)
+    monkeypatch.setattr(cleanup.shutil, 'disk_usage', lambda path: SimpleNamespace(free=0))
+    monkeypatch.setattr(cleanup.tempfile, 'mkdtemp',
+                        lambda *a, **kw: pytest.fail('D recovery must not allocate a C restore tree'))
+    target = tmp_path / 'receipts'
+    target.mkdir()
+    if damage == 'missing-encoding':
+        (archive / 'legacy_archive_manifest.json').unlink()
+    if damage == 'corrupt-cold':
+        resolved = resolve_latest_packed(cold, spec.dataset)
+        member = cold / resolved.manifest['archive']['objects'][0]['relpath']
+        raw = member.read_bytes()
+        member.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+    if damage:
+        with pytest.raises(SnapshotError):
+            cleanup.verify_for_retirement(spec, cold, target, d_stage_recovery_only=True)
+    else:
+        proof = cleanup.verify_for_retirement(spec, cold, target, d_stage_recovery_only=True)
+        assert proof['cold_verified'] and proof['decoded_originals_verified']
+        assert proof['manifest_sha256'] == published['manifest_sha256']
+        assert proof['verification_scratch_created'] is False
+    assert source.is_dir() and not (target / 'retirement.json').exists()

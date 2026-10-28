@@ -293,13 +293,23 @@ class LocalInventory:
             if self.phase == 'finmind':
                 self.checked += 1
                 now = time.monotonic()
-                if self.checked % 100 == 0 or self.checked == len(self.finmind) or now - self.last_status >= 15:
+                # A disk-blocked resident publishes the same inventory counters
+                # in its one-minute heartbeat. Avoid a second multi-megabyte
+                # status write every 15 seconds while its local slices run.
+                coalesced = getattr(self.queue, '_coalesce_inventory_heartbeats', False)
+                status_due = self.checked == len(self.finmind) or now - self.last_status >= 15
+                if self.checked % 100 == 0 or self.checked == len(self.finmind) or (status_due and not coalesced):
                     with self.queue.db:
                         self.queue.gauge('latest_inventory_finmind_receipts_checked', self.checked)
-                    if self.checked == len(self.finmind) or now - self.last_status >= 15:
+                    if status_due and not coalesced:
                         with self.queue.metrics.measure('metadata_inventory_status'):
                             self.queue.status(activity='inventorying')
                         self.last_status = time.monotonic()
+                if coalesced:
+                    # Prevent an immediate duplicate when the blocked slice
+                    # ends. Normal inventory status resumes after 15 seconds;
+                    # the resident's own live heartbeat is unchanged.
+                    self.last_status = time.monotonic()
         return {'imported': imported, 'complete': False}
 
 

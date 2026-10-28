@@ -30,10 +30,11 @@ def pump(queue):
 
 
 @contextmanager
-def retained(settings, tmp_path, monkeypatch, kind='native_candidate_original', raw=RAW):
+def retained(settings, tmp_path, monkeypatch, kind='native_candidate_original', raw=RAW, previous_photo=0):
     """Use the canonical old retention path, then reopen under the new ABI."""
     with monkeypatch.context() as old:
-        old.setattr(policy,'GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION',0)
+        old.setattr(policy,'GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION',previous_photo)
+        old.setattr(policy,'GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION',0)
         registry=PolicyRegistry(settings,base=tmp_path)
     previous=NewsQueue(tmp_path,registry)
     try:

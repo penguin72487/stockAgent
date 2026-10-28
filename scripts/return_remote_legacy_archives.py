@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -44,11 +45,63 @@ from stockagent.data_sync.syncthing_scan import scan_after_publish
 PUBLICATION_OWNER = Path("/run/lock/stockagent-remote-cold-artifact-ingress.lock")
 
 
+class RemoteTransportUnavailable(SnapshotError):
+    """The SSH transport is unavailable for the whole retained cohort."""
+
+
+def _remote_transport_unavailable(returncode: int, stderr: str) -> bool:
+    # A remote command can fail for an individual artifact. Only classify
+    # recognizable SSH-level failures, together with SSH's own error status,
+    # as a reason to defer the rest of the cohort.
+    if returncode != 255:
+        return False
+    message = stderr.casefold()
+    return any(marker in message for marker in (
+        "no route to host", "network is unreachable", "connection refused",
+        "connection timed out", "connection reset by peer",
+        "connection closed by remote host", "connection closed by remote peer",
+        "could not resolve hostname", "temporary failure in name resolution",
+        "name or service not known", "permission denied (publickey",
+        "host key verification failed",
+    ))
+
+
+def _probe_remote_transport(args) -> bool:
+    """Probe a previously unavailable SSH transport without touching artifacts.
+
+    A successful probe is only reachability/authentication; each item must
+    still pass its normal fresh source, D recovery and retirement checks. An
+    unrecognized command failure falls through to the ordinary item path.
+    """
+    command = [*_ssh_base(args.identity_file, args.ssh_port),
+               _validate_ssh_target(args.ssh_target), "true"]
+    try:
+        result = subprocess.run(command, text=True, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        raise RemoteTransportUnavailable("read-only SSH transport probe timed out") from error
+    if _remote_transport_unavailable(result.returncode, result.stderr):
+        raise RemoteTransportUnavailable("remote transport still unavailable: " + result.stderr[-1800:])
+    return result.returncode == 0
+
+
 def private_control_prefix() -> str:
     # Send exact locally read code through authenticated SSH stdin, never
     # execute synced code or modify the conflicted remote checkout.
     canonical_archive = (ROOT / "stockagent/data_sync/legacy_artifact_archive.py").read_text()
     code = "import sys, types\nimport stockagent.data_sync\n"
+    # The ephemeral checkout can also predate the bounded tree scanner. Update
+    # only these functions inside its existing module, preserving SnapshotError
+    # identity for other remote modules already imported by the package.
+    from stockagent.data_sync.desync_snapshots import (
+        _iter_lstat_bounded, _raise_walk_error, scan_tree,
+    )
+    scanner_source = ("from __future__ import annotations\n"
+                      "import contextlib, itertools\n"
+                      "from concurrent.futures import ThreadPoolExecutor\n"
+                      + "\n".join(inspect.getsource(item) for item in
+                                  (_iter_lstat_bounded, _raise_walk_error, scan_tree)))
+    code += "import stockagent.data_sync.desync_snapshots as scanner\n"
+    code += f"exec({scanner_source!r}, scanner.__dict__)\n"
     # Archive/control code and its packed reader must travel together. The
     # ephemeral checkout can predate the current verified-inventory API; using
     # its reader would make even a read-only inventory fail before admission.
@@ -97,7 +150,9 @@ print(json.dumps(result, sort_keys=True))
                                input=code, text=True, capture_output=True, timeout=1800)
     if completed.returncode:
         # Credentials are never in argv/stdout; return only fixed-code errors.
-        raise SnapshotError("remote archive control failed: " + completed.stderr[-1800:])
+        error = RemoteTransportUnavailable if _remote_transport_unavailable(
+            completed.returncode, completed.stderr) else SnapshotError
+        raise error("remote archive control failed: " + completed.stderr[-1800:])
     for line in reversed(completed.stdout.splitlines()):
         try:
             result = json.loads(line)
@@ -123,6 +178,9 @@ def write_status(args, ledger: dict) -> None:
     compact["cold_verified_source_bytes"] = sum(r.get("logical_bytes", 0) for r in ledger["items"] if r.get("cold_verified"))
     compact["remote_reclaimed_bytes"] = sum(r.get("retirement", {}).get("reclaimed_allocated_bytes", 0) for r in ledger["items"])
     compact["current_root"] = ledger.get("current_root")
+    for field in ("deferred_reason", "deferred_at_epoch", "last_transport_probe_epoch", "transport_probe_count"):
+        if field in ledger:
+            compact[field] = ledger[field]
     compact["transfer_compression"] = getattr(args, "transfer_compression", "none")
     compact["archive_compression"] = getattr(args, "archive_compression", DEFAULT_COMPRESSION_PROFILE)
     compact["batch_directory_fsync"] = getattr(args, "batch_directory_fsync", False)
@@ -564,6 +622,25 @@ def run_cohort(args, policy: dict) -> int:
                           "files": sum(r.get("files", 0) for r in inventory["items"]),
                           "logical_bytes": sum(r.get("logical_bytes", 0) for r in inventory["items"])}))
         return 0
+    progress = args.state_root / "progress.json"
+    previous = None
+    # A known SSH outage applies to the entire cohort. On subsequent timer
+    # ticks, check that transport before loading a potentially huge inventory.
+    # The existing cohort owner is held, no item receipt is changed, and the
+    # normal item-level checks remain authoritative when the connection returns.
+    if args.apply and progress.exists() and progress.stat().st_size <= 16 * 1024**2:
+        previous = json.loads(progress.read_text())
+        if (isinstance(previous, dict) and previous.get("state") == "deferred-remote-transport"
+                and previous.get("deferred_reason") == "remote_transport_unavailable"):
+            try:
+                _probe_remote_transport(args)
+            except RemoteTransportUnavailable as error:
+                previous["last_transport_probe_epoch"] = time.time()
+                count = previous.get("transport_probe_count", 0)
+                previous["transport_probe_count"] = count + 1 if type(count) is int and count >= 0 else 1
+                previous["last_transport_probe_error"] = str(error)[-3000:]
+                write_status(args, previous)
+                return 0
     inventory = json.loads((args.state_root / "inventory.json").read_text())
     specs = load_legacy_specs(args.state_root / "archive-catalog.json")
     specs = {key: replace(spec, compression_profile=getattr(args, "archive_compression", spec.compression_profile))
@@ -572,11 +649,15 @@ def run_cohort(args, policy: dict) -> int:
     ledger = {"state": "dry-run" if not args.apply else "running",
               "items": [{k: v for k, v in r.items() if k != "rows"} for r in inventory["items"]],
               "inventory_path": str(args.state_root / "inventory.json")}
-    progress = args.state_root / "progress.json"
     if progress.exists():
-        ledger = json.loads(progress.read_text())
+        ledger = previous if previous is not None else json.loads(progress.read_text())
         ledger["items"] = [{k: v for k, v in r.items() if k != "rows"} for r in ledger["items"]]
         ledger["state"] = "dry-run" if not args.apply else "running"
+    ledger.pop("deferred_reason", None)
+    ledger.pop("deferred_at_epoch", None)
+    ledger.pop("last_transport_probe_epoch", None)
+    ledger.pop("transport_probe_count", None)
+    ledger.pop("last_transport_probe_error", None)
     if args.reuse_progress:
         prior = json.loads(real(args.reuse_progress).read_text())
         completed = {r["relative_root"]: r for r in prior["items"] if r.get("state") == "remote-source-retired"}
@@ -590,6 +671,7 @@ def run_cohort(args, policy: dict) -> int:
                     raise SnapshotError("previous completed cohort no longer matches D or original absence")
                 row.update(old)
     processed = 0
+    deferred_transport = False
     for row in ordered_items(ledger["items"], args.order, by_root):
         if args.include_root and row["relative_root"] not in args.include_root:
             continue
@@ -635,13 +717,24 @@ def run_cohort(args, policy: dict) -> int:
         except Exception as error:
             row["state"] = "cold-verified-needs-audit" if row.get("cold_verified") else "return-failed-source-preserved"
             row["error"] = str(error)[-3000:]
+            if isinstance(error, RemoteTransportUnavailable):
+                deferred_transport = True
+                ledger["deferred_reason"] = "remote_transport_unavailable"
+                ledger["deferred_at_epoch"] = time.time()
         row["complete_workflow_seconds"] = time.monotonic() - started
         atomic_write_json(args.state_root / "attempts" / (
             dataset_name(row["relative_root"]) + "-" + str(time.time_ns()) + ".json"), row)
         atomic_write_json(args.state_root / "item-status" / (dataset_name(row["relative_root"]) + ".json"), row)
         write_status(args, ledger)
-    ledger["state"] = ("batch-complete" if all(r.get("state") == "remote-source-retired" for r in ledger["items"])
-                       else "batch-finished-with-protected-items") if args.apply else "dry-run-complete"
+        if deferred_transport:
+            break
+    if deferred_transport:
+        # The existing timer will retry this same owner; untouched items keep
+        # their prior receipts and are not reported as independent failures.
+        ledger["state"] = "deferred-remote-transport"
+    else:
+        ledger["state"] = ("batch-complete" if all(r.get("state") == "remote-source-retired" for r in ledger["items"])
+                           else "batch-finished-with-protected-items") if args.apply else "dry-run-complete"
     ledger.pop("current_root", None)
     write_status(args, ledger)
     return 0

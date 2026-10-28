@@ -18,11 +18,12 @@ import polars as pl
 
 from scripts import repair_tw_day_trade_flat_opening as repair
 from scripts import rebuild_tw_day_trade_open_price_replay as replay
+from stockagent.live.paper_journal import open_paper_journal
 
 
 def prefix_sha256(path: Path, length: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         remaining = length
         while remaining:
             block = handle.read(min(8 * 1024 * 1024, remaining))
@@ -34,7 +35,7 @@ def prefix_sha256(path: Path, length: int) -> str:
 
 
 def suffix_rows(path: Path, offset: int):
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         handle.seek(offset)
         for line in handle:
             if line.endswith(b"\n"):

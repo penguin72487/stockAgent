@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry day-trade projection reconciliation when its owner is idle
+
+[Timer]
+OnActiveSec=10s
+OnUnitInactiveSec=15s
+AccuracySec=1s
+Unit=stockagent-finlab-daytrade-projection.service
+
+[Install]
+WantedBy=timers.target

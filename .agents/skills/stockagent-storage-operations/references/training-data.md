@@ -65,6 +65,13 @@ penguin 的 `stockagent-remote-cold-artifact-ingress.timer` 按
 精確 run；既有私有 SSH／rsync ingress 返回結果、canonical D 封存與獨立原值
 重建、新鮮 ACK、再次檢查目前程序／consumer／source／同步後才回收其遠端來源。
 
+Penguin 的回傳 payload scratch 位於已登錄 D sibling
+`/srv/stockagent-d-volume/stockagent-completed-offline-scratch/remote-return`，
+不放 C，也不放進同步 cold root；小型控制收據留 SSD。確認採最多 32 批的私有
+固定 release 佇列，不以整個資料夾持續掃描阻擋下一批保存。佇列滿或 D reserve
+不足則暫緩，不能刪遠端來源騰空。遠端 `/proc` 觀測不完整僅允許完整驗證後保存，
+禁止退休該來源。七日保留及 full convergence／ACK 不因佇列並行而省略。
+
 不把 `checkpoint.pt`、optimizer 停止、同步到 penguin 暫存目錄或 service exit 0
 當完整成果。未完成 run／unique trial results／來源不明 cache 保留。回傳模型
 不自動 promotion，penguin 不永久保留當期 tensor／panel／compiler cache。

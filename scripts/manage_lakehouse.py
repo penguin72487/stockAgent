@@ -18,7 +18,7 @@ from stockagent.runtime_identity import identity_sha256
 from stockagent.data_sync.immutable_replication import digest
 
 
-def worker_code_identity():
+def worker_code_identity(*, source_overrides=None):
     paths = ('stockagent/control/lakehouse.py', 'stockagent/control/storage_workflow.py',
              'stockagent/data_sync/catalog_incremental.py',
              'stockagent/data_sync/immutable_replication.py', 'stockagent/data_sync/offhost_backup.py',
@@ -34,6 +34,7 @@ def worker_code_identity():
              'configs/data_sync/cache_capacity.json',
              'stockagent/data_sync/packing_checkpoint.py',
              'stockagent/data_sync/dataset_migration.py', 'stockagent/data_sync/dataset_version_layout.py',
+             'stockagent/data_sync/closed_source.py', 'stockagent/data_sync/retained_source.py',
              'stockagent/data_sync/private_source_links.py',
              'scripts/publish_data_releases.py', 'configs/data_sync/packed_datasets.json',
              'scripts/finlab_release_gate.py', 'stockagent/data/finlab_acquisition_contract.py',
@@ -53,10 +54,17 @@ def worker_code_identity():
              'stockagent/data_sync/desync_snapshots.py',
              'stockagent/data_sync/nas_coverage.py',
              'stockagent/data_sync/backup_stream.py', 'stockagent/data_sync/testing_disposition.py',
+             'stockagent/data_sync/transport_capacity.py',
              'stockagent/data_sync/windows_cold_io.py', 'scripts/windows_cold_binary_io.ps1',
              'scripts/manage_lakehouse.py', 'scripts/run_lakehouse_control.sh', 'scripts/runtime_env.sh',
              'configs/training_rescue.json')
-    code = {p: digest(ROOT / p) for p in paths}
+    overrides = {} if source_overrides is None else source_overrides
+    if (not isinstance(overrides, dict) or set(overrides) - set(paths)
+            or any(not isinstance(raw, bytes) for raw in overrides.values())):
+        raise ValueError('worker identity overrides require enrolled source bytes')
+    import hashlib
+    code = {p: (hashlib.sha256(overrides[p]).hexdigest() if p in overrides else digest(ROOT / p))
+            for p in paths}
     from stockagent.data_sync.testing_disposition import DEFAULT_POLICY
     if DEFAULT_POLICY.exists():
         code[str(DEFAULT_POLICY.relative_to(ROOT))] = digest(DEFAULT_POLICY)

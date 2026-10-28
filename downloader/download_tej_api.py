@@ -129,16 +129,22 @@ def _partition_at_cap(con, task: dict, receipt: dict, api: TejTrialAPI) -> str:
         boundary = codes[len(codes) // 2]
         parts = [{**params, "coid.lt": boundary}, {**params, "coid.gte": boundary}]
     for part in parts:
+        from downloader.tej_incremental import partition_child
+        child_id = partition_child(con, task['id'], task['table_id'], part, _task_id(task['table_id'], part))
         con.execute("INSERT OR IGNORE INTO tasks(id,table_id,params_json,priority,state) VALUES(?,?,?,?,'pending')",
-                    (_task_id(task["table_id"], part), task["table_id"], json.dumps(part, sort_keys=True), task["priority"]))
+                    (child_id, task["table_id"], json.dumps(part, sort_keys=True), task["priority"]))
+        from downloader.provider_priority import inherit
+        inherit(con, task['id'], [child_id])
     return "superseded_disjoint_partition"
 
 
-def run_queue(api: TejTrialAPI, *, max_pages: int = 500) -> dict:
+def run_queue(api: TejTrialAPI, *, max_pages: int = 500, incremental_config: dict | None = None) -> dict:
     # Received source pages must still be recovered locally without quota.
     # Global inventory/ranking is useful only when this owner can acquire new
     # pages; never pay that cost before a quota/cooldown/auth short circuit.
     api.recover_saved_pages()
+    from downloader.tej_incremental import seed_api
+    seed_api(api, incremental_config)
     with closing(connect(api.root)) as con:
         before = api.budget(con, api.now())
         cooldown = api.cooldown_until(con)
@@ -186,6 +192,14 @@ def run_queue(api: TejTrialAPI, *, max_pages: int = 500) -> dict:
                 "(next_attempt_utc IS NULL OR next_attempt_utc<=?) AND "
                 "(cursor IS NULL OR COALESCE(page_size,10000)<=?) ORDER BY priority,table_id,id LIMIT 1",
                 (now.isoformat(), budget["rows_remaining"])).fetchone()
+            from downloader.provider_priority import queued_candidate
+            requested = queued_candidate(con, now.isoformat(), provider='tej_api',
+                where="tasks.state IN ('pending','retry') AND (next_attempt_utc IS NULL OR next_attempt_utc<=?) "
+                      "AND (cursor IS NULL OR COALESCE(page_size,10000)<=?)",
+                args=(now.isoformat(), budget['rows_remaining']))
+            from downloader.tej_incremental import PRIORITY as incremental_priority
+            if requested is not None and (task is None or task['priority'] > incremental_priority):
+                task = requested
             if not task:
                 reason = "queue_idle_or_waiting_retry"; break
             task = dict(task)
@@ -237,10 +251,13 @@ def status(api: TejTrialAPI) -> dict:
         states = dict(con.execute("SELECT state,COUNT(*) FROM tasks GROUP BY state"))
         totals = con.execute("SELECT COUNT(*),COALESCE(SUM(rows),0) FROM pages").fetchone()
         priority = con.execute("SELECT value FROM meta WHERE key='acquisition_value_priority'").fetchone()
+        from downloader.tej_incremental import summary
+        incrementals = summary(con, api=True)
     return {"contract": "tej_trial_native_pages_v1", "observed_at_utc": api.now().isoformat(),
             "quota": budget, "task_states": states, "stored_pages": totals[0], "stored_rows": totals[1],
             "history_complete": False, "licensed_rows_public": False,
-            "acquisition_priority": json.loads(priority[0]) if priority else None}
+            "acquisition_priority": json.loads(priority[0]) if priority else None,
+            "incremental": incrementals}
 
 
 def publish_financial_reference_fields(api: TejTrialAPI, output: Path) -> dict:
@@ -297,7 +314,9 @@ def main() -> None:
         elif args.action == "run":
             if not 1 <= args.max_pages <= 500:
                 parser.error("max-pages must be 1..500")
-            result = run_queue(api, max_pages=args.max_pages)
+            config_path = Path(__file__).resolve().parents[1] / 'configs/tej_history.json'
+            incremental = json.loads(config_path.read_text()).get('incremental')
+            result = run_queue(api, max_pages=args.max_pages, incremental_config=incremental)
         elif args.action == "allocate":
             from downloader.tej_api_ownership import write_allocation_plan
             result = write_allocation_plan(json.loads((args.output / "catalog.json").read_text()), args.root.parent, args.output)

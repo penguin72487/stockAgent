@@ -14,6 +14,9 @@ STATUS_COLUMNS = (
     "dataset", "state", "rows", "bytes", "first_data_date",
     "last_data_date", "last_attempt_at_utc",
 )
+MONITOR_COUNTS_INDEX = "idx_finmind_monitor_dates_typed"
+MONITOR_COUNTS_COLUMNS = ("dataset", "typeof(rows)", "first_data_date", "last_data_date", "rows")
+MONITOR_COUNTS_PREDICATE = "state='complete' AND rows>0"
 RELEASE_RESERVE_INDEX = "idx_finmind_release_reserve_covering"
 RELEASE_RESERVE_COLUMNS = ("priority", "state", "next_attempt_at_utc", "dataset", "kind",
                            "data_id", "error_code", "rows")
@@ -71,6 +74,52 @@ def eta_recent_index(connection: sqlite3.Connection) -> str:
 def deadline_index(connection: sqlite3.Connection) -> str:
     """The original priority/time projection, shared by both queue owners."""
     return _eta_index(connection, DEADLINE_INDEX, DEADLINE_COLUMNS)
+
+
+def ensure_monitor_counts_index(connection: sqlite3.Connection) -> None:
+    """Queue-owner projection for exact nonempty count/date monitor queries.
+
+    A typed prefix makes the same-snapshot legacy-number guard a small seek.
+    Only positive integer cohorts may change traversal order: floating sums
+    retain the original status projection and its accumulation order.
+    """
+    connection.execute(f"CREATE INDEX IF NOT EXISTS {MONITOR_COUNTS_INDEX} "
+                       f"ON tasks({','.join(MONITOR_COUNTS_COLUMNS)}) WHERE {MONITOR_COUNTS_PREDICATE}")
+
+
+def monitor_counts_index(connection: sqlite3.Connection) -> str:
+    return _eta_index(connection, MONITOR_COUNTS_INDEX, MONITOR_COUNTS_COLUMNS, MONITOR_COUNTS_PREDICATE)
+
+
+def monitor_counts_sql(connection: sqlite3.Connection, query: str, parameters: tuple) -> str:
+    """Choose a physical projection inside the caller's existing transaction.
+
+    Counts remain exact SQL aggregates; no derived counters or task edits.
+    This accepts only the bar owner's dataset cohort aggregate. Unknown query
+    shapes and older owners retain their original SQL. All positive integers
+    can be added in any order without changing SUM or overflow behavior.
+    """
+    if (query.count("FROM tasks WHERE dataset IN (") != 1
+            or not query.endswith("AND state='complete' AND rows>0 GROUP BY dataset")):
+        return query
+    hint = monitor_counts_index(connection)
+    if not hint:
+        return query
+    legacy_hint = _eta_index(connection, STATUS_INDEX, STATUS_COLUMNS)
+    # The owner installs both indexes. Without its original projection there
+    # is no proven legacy accumulation order to fall back to.
+    if not legacy_hint:
+        return query
+    non_integer = connection.execute(
+        f"SELECT 1 FROM tasks{hint} WHERE dataset IN ("
+        + ",".join("?" for _ in parameters)
+        + ") AND state='complete' AND rows>0 "
+        "AND typeof(rows) IN ('null','real','text','blob') LIMIT 1", parameters,
+    ).fetchone()
+    if non_integer:
+        return query.replace("FROM tasks WHERE", f"FROM tasks{legacy_hint} WHERE", 1)
+    return query.replace("FROM tasks WHERE", f"FROM tasks{hint} WHERE", 1).replace(
+        "GROUP BY dataset", "AND typeof(rows)='integer' GROUP BY dataset", 1)
 
 
 def ensure_release_reserve_index(connection: sqlite3.Connection) -> None:
@@ -131,6 +180,7 @@ def ensure_status_index(connection: sqlite3.Connection) -> None:
         f"CREATE INDEX IF NOT EXISTS {STATUS_INDEX} "
         f"ON tasks({','.join(STATUS_COLUMNS)})"
     )
+    ensure_monitor_counts_index(connection)
 
 
 def dispatch_indexes(connection: sqlite3.Connection) -> tuple[str, str, str]:

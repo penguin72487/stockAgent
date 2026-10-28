@@ -346,7 +346,7 @@ def test_nontext_outcome_requires_current_article_identity_clock_authors_and_lic
 
 
 @pytest.mark.parametrize('markup', [
-    '', '<script src="https://unknown.test/load.js"></script>',
+    '<script src="https://unknown.test/load.js"></script>',
     '<iframe src="https://unknown.test/embed/123-title"></iframe>',
     '<iframe src="https://magic.piktochart.com.evil.test/embed/123-title"></iframe>',
     '<iframe src="https://[malformed"></iframe>',
@@ -357,7 +357,7 @@ def test_nontext_outcome_requires_current_article_identity_clock_authors_and_lic
     QUIZ.replace('//cdn.playbuzz.com/widget/feed.js', '//cdn.playbuzz.com.evil.test/widget/feed.js'),
     IMAGE + '<script src="https://unknown.test/load-body.js"></script>',
 ])
-def test_unknown_empty_or_loading_representation_remains_a_parser_gap(markup):
+def test_unknown_loading_representation_remains_a_parser_gap(markup):
     with pytest.raises(NewsError, match='^body_not_found$'):
         extract_article(nontext_page(markup), policy(), page_url=URL)
 

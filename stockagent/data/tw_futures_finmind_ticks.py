@@ -21,7 +21,11 @@ SCHEMA_VERSION = 1
 BULK_SOURCE = 'finmind_whole_market_stock_prints_v1'
 BULK_EQUITY_SOURCE = 'finmind_whole_market_dated_equity_prints_v2'
 BULK_PRICE_POLICY = 'unique_dated_legal_quote_with_identical_float32_encoding_raw_retained_v1'
+BULK_ALL_TWD_SOURCE = 'finmind_whole_market_dated_all_twd_prints_v3'
+BULK_DATED_PRICE_POLICY = 'unique_source_bound_tick_float32_quote_including_subcent_ticks_v3'
 BULK_INVENTORY = 'finmind_whole_market_tick_inventory_v1'
+PRODUCT_FALLBACK_INVENTORY = 'finmind_product_day_tick_fallback_inventory_v1'
+PRODUCT_FALLBACK_SOURCE = 'finmind_exact_product_day_tick_fallback_v2'
 
 
 def pin_bulk_tick_inventory(root: Path, dates: list[date]) -> list[dict]:
@@ -89,8 +93,108 @@ def pin_bulk_tick_inventory(root: Path, dates: list[date]) -> list[dict]:
     return sources
 
 
+def pin_product_fallback_inventory(root: Path, manifest_path: Path, dates: list[date]) -> list[dict]:
+    """Pin each original exact-product receipt and raw member for selected days.
+
+    The manifest is an explicit supplemental source, not a fabricated global
+    response. Product coverage is checked against the official book when read.
+    """
+    import hashlib
+    root, manifest_path = Path(root).resolve(), Path(manifest_path).resolve()
+    if not root.is_dir():
+        raise ValueError('product fallback requires the original collector directory')
+    payload = manifest_path.read_bytes()
+    manifest_sha = hashlib.sha256(payload).hexdigest()
+    document = json.loads(payload)
+    if document.get('contract') != PRODUCT_FALLBACK_INVENTORY or document.get('dataset') != 'TaiwanFuturesTick':
+        raise ValueError('invalid product tick fallback inventory')
+    wanted = {str(d) for d in dates}
+    groups = {day: [] for day in wanted}
+    identities = set()
+    for entry in document.get('objects', []):
+        day, product = entry.get('date'), entry.get('product')
+        if day not in wanted:
+            continue
+        if not isinstance(product, str) or not re.fullmatch(r'[A-Z0-9]{2,3}', product):
+            raise ValueError('invalid product fallback identity')
+        if (day, product) in identities:
+            raise ValueError('duplicate product fallback identity')
+        identities.add((day, product))
+        receipt_path = (root / entry['receipt_path']).resolve()
+        if not receipt_path.is_relative_to(root):
+            raise ValueError('unsafe product fallback receipt path')
+        receipt_bytes = receipt_path.read_bytes()
+        receipt_sha = hashlib.sha256(receipt_bytes).hexdigest()
+        receipt = json.loads(receipt_bytes)
+        if (receipt.get('dataset'), receipt.get('data_id'), receipt.get('partition'), receipt.get('status')) != (
+                'TaiwanFuturesTick', product, day, 'complete'):
+            raise ValueError('product fallback receipt identity differs')
+        path = (root / receipt['parquet_path']).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError('unsafe product fallback payload path')
+        if (entry.get('sha256') != receipt.get('sha256') or entry.get('receipt_sha256') != receipt_sha
+                or entry.get('rows') != receipt.get('rows')):
+            raise ValueError('product fallback inventory differs from native receipt')
+        groups[day].append(dict(product=product, date=day, path=str(path), sha256=receipt['sha256'],
+            receipt_path=str(receipt_path), receipt_sha256=receipt_sha, rows=receipt['rows'],
+            bytes=receipt['parquet_size_bytes'], fetched_at_utc=receipt.get('fetched_at_utc'),
+            historical_point_in_time=receipt.get('historical_point_in_time'),
+            price_representation='native_decimal'))
+    if any(not products for products in groups.values()):
+        raise ValueError('product fallback inventory lacks a selected date')
+    if sha256_file(manifest_path) != manifest_sha:
+        raise ValueError('product fallback inventory changed during pinning')
+    return [dict(date=day, source_kind=PRODUCT_FALLBACK_SOURCE, path=str(manifest_path),
+        sha256=manifest_sha, products=sorted(groups[day], key=lambda item: item['product']))
+        for day in sorted(groups)]
+
+
+def pin_mixed_tick_inventory(root: Path, dates: list[date], fallback_manifest: Path | None = None,
+                             official_manifest: Path | None = None) -> list[dict]:
+    """Use explicit original-source supplements on their dates and whole days elsewhere."""
+    if fallback_manifest is None and official_manifest is None:
+        return pin_bulk_tick_inventory(root, dates)
+    import hashlib
+    selected, official_selected, manifest_sha, official_sha = set(), set(), None, None
+    if fallback_manifest is not None:
+        manifest_bytes = Path(fallback_manifest).read_bytes()
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        document = json.loads(manifest_bytes)
+        if document.get('contract') != PRODUCT_FALLBACK_INVENTORY or document.get('dataset') != 'TaiwanFuturesTick':
+            raise ValueError('invalid product tick fallback inventory')
+        fallback_days = {date.fromisoformat(item['date']) for item in document.get('objects', [])}
+        selected = set(dates) & fallback_days
+        if not selected:
+            raise ValueError('product fallback inventory does not cover a selected date')
+    if official_manifest is not None:
+        official_bytes = Path(official_manifest).read_bytes()
+        official_sha = hashlib.sha256(official_bytes).hexdigest()
+        official = json.loads(official_bytes)
+        official_days = {date.fromisoformat(item['trading_date']) for item in official.get('raw_downloads', [])
+                         if item.get('kind') == 'futures'}
+        official_selected = set(dates) & official_days
+        if not official_selected:
+            raise ValueError('official archive receipt does not cover a selected date')
+        if selected & official_selected:
+            raise ValueError('fallback sources overlap; choose one explicit source per date')
+    global_days = set(dates) - selected - official_selected
+    sources = (pin_bulk_tick_inventory(root, sorted(global_days)) if global_days else [])
+    if selected:
+        fallback = pin_product_fallback_inventory(root, fallback_manifest, sorted(selected))
+        if any(item['sha256'] != manifest_sha for item in fallback):
+            raise ValueError('product fallback inventory changed during date selection')
+        sources += fallback
+    if official_selected:
+        from stockagent.data.tw_futures_official_ticks import pin_official_tick_inventory
+        official_items = pin_official_tick_inventory(official_manifest, sorted(official_selected))
+        if any(item['receipt_sha256'] != official_sha for item in official_items):
+            raise ValueError('official archive receipt changed during date selection')
+        sources += official_items
+    return sorted(sources, key=lambda item: item['date'])
+
+
 def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndarray,
-                             asset_classes='stock_future') -> np.ndarray:
+                             asset_classes='stock_future', tick_sizes=None) -> np.ndarray:
     """Recover a unique legal decimal quote from the provider's F32 encoding.
 
     This is a declared source representation conversion, not arbitrary price
@@ -105,12 +209,17 @@ def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndar
     raw = values.astype(np.float32)
     if not np.array_equal(values, raw.astype(np.float64)):
         raise ValueError('bulk price is not the declared Float32 source encoding')
-    ticks = taifex_futures_tick_size_numpy(values, np.datetime64(day),
-        product_codes=products, asset_classes=asset_classes)
+    ticks = (taifex_futures_tick_size_numpy(values, np.datetime64(day),
+        product_codes=products, asset_classes=asset_classes) if tick_sizes is None
+        else np.asarray(tick_sizes,dtype=np.float64))
+    if ticks.shape!=values.shape or np.any(~np.isfinite(ticks)|(ticks<=0)):
+        raise ValueError('bulk price requires aligned positive dated ticks')
     with np.errstate(invalid='ignore', divide='ignore'):
-        decoded = np.rint(np.rint(values / ticks) * ticks * 100.) / 100.
-    valid = price_on_taifex_futures_tick_grid_numpy(decoded, np.datetime64(day),
-        product_codes=products, asset_classes=asset_classes)
+        decoded = (np.rint(np.rint(values / ticks) * ticks * 100.) / 100. if tick_sizes is None
+                   else np.round(np.rint(values/ticks)*ticks,decimals=12))
+    valid = (price_on_taifex_futures_tick_grid_numpy(decoded, np.datetime64(day),
+        product_codes=products, asset_classes=asset_classes) if tick_sizes is None
+        else np.isfinite(decoded)&(decoded>0)&np.isclose(decoded/ticks,np.rint(decoded/ticks),rtol=0,atol=1e-7))
     if (not valid.all() or not np.array_equal(decoded.astype(np.float32), raw)
             or np.any((decoded + ticks).astype(np.float32) == raw)
             or np.any((decoded - ticks).astype(np.float32) == raw)):
@@ -118,7 +227,8 @@ def decode_bulk_stock_prices(prices: np.ndarray, *, day: date, products: np.ndar
     return decoded
 
 
-def stock_print_views(prints: pl.DataFrame, *, day: date, source_sha256: str):
+def stock_print_views(prints: pl.DataFrame, *, day: date, source_sha256: str,
+                      opening_evidence: pl.DataFrame | None = None):
     """One sorted, physical-identity-bound tape feeds minutes and reference events.
 
     The caller authenticates quantities, physical identity and dated price grid.
@@ -143,26 +253,84 @@ def stock_print_views(prints: pl.DataFrame, *, day: date, source_sha256: str):
     # Only three observations per contract-day are needed for the two selected
     # decisions: actual first session print, actual last prefix print and actual
     # last full-session print. No O(minutes * decisions) reference expansion.
-    first = ordered.group_by(keys).first().with_columns(pl.lit(True).alias('is_session_open'))
-    last = ordered.group_by(keys).last().with_columns(pl.lit(False).alias('is_session_open'))
+    first = ordered.group_by(keys).first()
+    # Source rows with identical timestamps do not prove within-second trade
+    # order. A dated exchange opening observation can certify which actual
+    # first-second print was the open; it is not itself backdated as a print.
+    candidates = ordered.join(first.select(*keys, 'event_ts'), on=[*keys, 'event_ts'], how='inner')
+    if opening_evidence is not None:
+        if set(keys + ['observed_open']) - set(opening_evidence.columns):
+            raise ValueError('opening evidence requires dated physical identity and official open')
+        if opening_evidence.select(keys).is_duplicated().any():
+            raise ValueError('duplicate official opening evidence')
+        candidates = candidates.join(opening_evidence.select(*keys, 'observed_open'),
+                                     on=keys, how='left', validate='m:1')
+    else:
+        candidates = candidates.with_columns(pl.lit(None, dtype=pl.Float64).alias('observed_open'))
+    first_checks = candidates.group_by(keys).agg(
+        pl.col('price').n_unique().alias('_first_second_prices'),
+        pl.col('observed_open').first().alias('_official_open'),
+        pl.when((pl.col('price') - pl.col('observed_open')).abs() <= 1e-6)
+          .then(pl.col('price')).otherwise(None).drop_nulls().first().alias('_matched_open'))
+    first = first.join(first_checks, on=keys, how='left', validate='1:1').with_columns(
+        pl.when(pl.col('_matched_open').is_not_null()).then(pl.col('_matched_open'))
+          .otherwise(pl.col('price')).alias('price'),
+        pl.lit(True).alias('is_session_open'),
+        pl.when(pl.col('_official_open').is_finite() & (pl.col('_official_open') > 0))
+          .then(pl.col('_matched_open').is_null())
+          .otherwise(pl.col('_first_second_prices') > 1).alias('opening_ambiguous')
+        ).drop('_first_second_prices', '_official_open', '_matched_open')
+    last = ordered.group_by(keys).last().with_columns(pl.lit(False).alias('is_session_open'),
+                                                       pl.lit(False).alias('opening_ambiguous'))
     prefix = ordered.filter(pl.col('minute') <= 540).group_by(keys).last().with_columns(
-        pl.lit(False).alias('is_session_open'))
+        pl.lit(False).alias('is_session_open'), pl.lit(False).alias('opening_ambiguous'))
     events = pl.concat([first, last, prefix], how='vertical_relaxed').select(
         'physical_contract', 'price', pl.col('date').alias('trade_date'),
         pl.col('event_ts').cast(pl.Datetime('us')).alias('trade_ts'),
         (pl.col('date').cast(pl.Datetime('us')) + pl.duration(minutes=pl.col('minute'))).alias('available_by'),
-        pl.lit(source_sha256).alias('source_sha256'), 'is_session_open').unique()
+        pl.lit(source_sha256).alias('source_sha256'), 'is_session_open', 'opening_ambiguous').unique()
     return bars, stats, events
 
 
 def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.DataFrame,
-                               source_sha256: str, asset_scope='stock_only'):
-    """Columnar daily adapter for all selected delivery months, including zeros."""
+                               source_sha256: str, asset_scope='stock_only',
+                               price_representation='finmind_float32',
+                               unknown_final_mode='intersection'):
+    """Columnar daily adapter for all selected delivery months, including zeros.
+
+    Community native-decimal supplements must round-trip through the same
+    unique dated tick-grid decoder without changing the original quote. Only
+    the authenticated exchange-original adapter may use the union candidate;
+    this function emits prints only after matching the full official book.
+    """
     from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
     from stockagent.data.tw_futures_decision_clock import clock_asset_classes
     classes = clock_asset_classes(asset_scope)
+    if (unknown_final_mode != 'intersection'
+            and (unknown_final_mode != 'union_for_full_book_verification'
+                 or price_representation != 'native_decimal' or asset_scope != 'all_twd')):
+        raise ValueError('unknown-final union requires native all-TWD full-book verification')
     keys = ['date', 'physical_contract']
-    mapping = expected.select('product', 'contract', 'physical_contract', 'asset_class').unique()
+    metadata=[]
+    if asset_scope=='all_twd':
+        from stockagent.data.tw_futures_decision_clock import dated_entry_sessions
+        metadata=['spec_tick_kind','spec_tick_size']
+        if set(metadata)-set(expected.columns):
+            raise ValueError('all-TWD bulk quotes require dated tick specifications')
+        mapping=expected.select('product','contract','physical_contract','asset_class',*metadata).unique().join(
+            dated_entry_sessions(expected, unknown_final_mode=unknown_final_mode)
+            .select('physical_contract','_start','_end'),
+            on='physical_contract',how='left',validate='1:1')
+        # Product/date membership and tick kind are supplied by the bound
+        # exchange specification. Do not substitute the legacy static product
+        # registry, whose review window can end before this specification.
+        if mapping.filter(pl.col('spec_tick_kind').is_null()
+                | ~pl.col('spec_tick_kind').is_in(['fixed','stock_future','etf_future'])
+                | ((pl.col('spec_tick_kind') != 'fixed')
+                   & (pl.col('spec_tick_kind') != pl.col('asset_class')))).height:
+            raise ValueError('dated bulk tick kind and asset class disagree')
+    else:
+        mapping = expected.select('product', 'contract', 'physical_contract', 'asset_class').unique()
     if (expected.select(keys).is_duplicated().any() or mapping.select('product', 'contract').is_duplicated().any()
             or mapping.select('product', 'asset_class').unique()['product'].is_duplicated().any()
             or expected.filter((pl.col('date') != day) | pl.col('asset_class').is_null()
@@ -172,7 +340,7 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
     if not required <= set(frame.columns):
         raise ValueError('incomplete global tick schema')
     # Resolve dated sessions once per selected product, not once per tick.
-    sessions = [dict(product=p, _start=a*60, _end=b*60)
+    sessions = [] if asset_scope=='all_twd' else [dict(product=p, _start=a*60, _end=b*60)
                 for p, asset in mapping.select('product', 'asset_class').unique().iter_rows()
                 for a, b in [taifex_futures_day_session_minutes(day, product_code=p, asset_class=asset)]]
     delivery_pattern = r'^\d{6}$' if asset_scope == 'stock_only' else r'^\d{6}(?:W[1-5])?$'
@@ -184,17 +352,42 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
                     pl.col('date').str.to_datetime(time_unit='us', strict=True).alias('event_ts'))
     if raw.filter(pl.col('event_ts').is_null() | (pl.col('event_ts').dt.date() != day)).height:
         raise ValueError('selected bulk ticks lie outside receipt calendar day')
-    raw = raw.join(pl.DataFrame(sessions), on='product', how='left').with_columns(
+    if asset_scope!='all_twd':
+        raw=raw.join(pl.DataFrame(sessions), on='product', how='left')
+    raw = raw.with_columns(
         (pl.col('event_ts').dt.hour().cast(pl.Int32)*3600 + pl.col('event_ts').dt.minute().cast(pl.Int32)*60
          + pl.col('event_ts').dt.second().cast(pl.Int32)).alias('_second'))
     raw = raw.filter(pl.col('_second').is_between(pl.col('_start'), pl.col('_end')))
     if raw.filter(pl.col('price').is_null() | pl.col('volume').is_null() | (pl.col('volume') <= 0)
                   | (pl.col('volume') % 2 != 0) | (pl.col('volume') != pl.col('volume').floor())).height:
         raise ValueError('bulk outright volume must be positive even double-sided contracts')
-    decoded = decode_bulk_stock_prices(raw['price'].to_numpy(), day=day, products=raw['product'].to_numpy(),
-                                      asset_classes=raw['asset_class'].to_numpy())
+    ticks=None
+    if asset_scope=='all_twd':
+        fixed=raw['spec_tick_kind'].eq('fixed').to_numpy()
+        if raw.filter(~pl.col('spec_tick_kind').is_in(['fixed','stock_future','etf_future'])).height:
+            raise ValueError('unsupported dated bulk tick kind')
+        ticks=raw['spec_tick_size'].to_numpy().astype(np.float64,copy=True)
+        if (~fixed).any():
+            from stockagent.data.tw_price_rules import tick_size_numpy
+            ticks[~fixed]=tick_size_numpy(raw['price'].to_numpy()[~fixed],np.datetime64(day),
+                security_types=raw['spec_tick_kind'].to_numpy()[~fixed])
+    native_prices = raw['price'].to_numpy()
+    if price_representation == 'finmind_float32':
+        encoded_prices = native_prices
+    elif price_representation == 'native_decimal':
+        encoded_prices = native_prices.astype(np.float32)
+    else:
+        raise ValueError('unknown bulk source price representation')
+    decoded = decode_bulk_stock_prices(encoded_prices, day=day, products=raw['product'].to_numpy(),
+                                      asset_classes=raw['asset_class'].to_numpy(),tick_sizes=ticks)
+    if price_representation == 'native_decimal' and not np.allclose(
+            native_prices, decoded, rtol=0., atol=1e-9):
+        raise ValueError('native source price is not the identical dated legal quote')
     prints = raw.with_columns(pl.Series('price', decoded), (pl.col('volume').cast(pl.Int64)//2).alias('volume'))
-    bars, stats, events = stock_print_views(prints, day=day, source_sha256=source_sha256)
+    opening_evidence = (expected.select(*keys, 'observed_open')
+                        if 'observed_open' in expected.columns else None)
+    bars, stats, events = stock_print_views(prints, day=day, source_sha256=source_sha256,
+                                            opening_evidence=opening_evidence)
     coverage = expected.select(*keys, 'product', 'contract', 'high', 'low', 'close', 'outright_volume', 'block_volume').join(
         stats, on=keys, how='left', validate='1:1').with_columns(pl.col('tick_volume').fill_null(0))
     coverage = coverage.with_columns(((pl.col('tick_volume') == pl.col('outright_volume'))
@@ -226,6 +419,78 @@ def read_bulk_stock_tick_day(item: dict, expected: pl.DataFrame, *, asset_scope=
             or sha256_file(receipt_path) != item['receipt_sha256']):
         raise ValueError('pinned global tick changed during readback')
     return result
+
+
+def read_product_fallback_tick_day(item: dict, expected: pl.DataFrame, *, asset_scope='all_twd'):
+    """Read native product objects together while retaining each product's SHA.
+
+    A missing product can certify only an independently evidenced zero-outight
+    book; a positive official book without a receipt remains unverified. The
+    concatenation retains source order within each physical contract.
+    """
+    if item.get('source_kind') != PRODUCT_FALLBACK_SOURCE or asset_scope != 'all_twd':
+        raise ValueError('product fallback requires the all-TWD source contract')
+    manifest = Path(item['path'])
+    if sha256_file(manifest) != item['sha256']:
+        raise ValueError('product fallback inventory SHA mismatch')
+    frames, stable = [], []
+    for member in item['products']:
+        path, receipt_path = Path(member['path']), Path(member['receipt_path'])
+        before = path.stat()
+        if sha256_file(receipt_path) != member['receipt_sha256'] or sha256_file(path) != member['sha256']:
+            raise ValueError('product fallback original SHA mismatch')
+        raw = pl.read_parquet(path)
+        if (raw.height != member['rows'] or before.st_size != member['bytes']
+                or raw.schema.get('price') != pl.Float64):
+            raise ValueError('product fallback native rows, bytes or decimal representation differs')
+        if (set(raw['futures_id'].to_list()) != {member['product']}
+                or any(not str(value).startswith(item['date']) for value in raw['date'].to_list())):
+            raise ValueError('product fallback contains another product or date')
+        frames.append(raw.select('date', 'futures_id', 'contract_date', 'price', 'volume'))
+        stable.append((path, receipt_path, member, before))
+    if not frames:
+        raise ValueError('product fallback contains no native objects')
+    # Each source is ordered internally. Physical contracts do not span product
+    # identities, so concatenation cannot change any within-contract order.
+    bars, coverage, events = normalize_bulk_stock_ticks(pl.concat(frames, how='vertical_relaxed'),
+        day=date.fromisoformat(item['date']), expected=expected, source_sha256=item['sha256'],
+        asset_scope=asset_scope, price_representation='native_decimal')
+    keys = ['date', 'physical_contract']
+    product_shas = pl.DataFrame([dict(product=x['product'], source_file_sha256=x['sha256'])
+                                 for x in item['products']])
+    provenance = expected.select(*keys, 'product').join(product_shas, on='product', how='left', validate='m:1')
+    coverage = coverage.drop('source_file_sha256').join(provenance.select(*keys, 'source_file_sha256'),
+        on=keys, how='left', validate='1:1')
+    bars = bars.drop('source_file_sha256').join(provenance.select(*keys, 'source_file_sha256'),
+        on=keys, how='left', validate='m:1').select(bars.columns)
+    events = events.drop('source_sha256').join(provenance.select(
+        pl.col('date').alias('trade_date'), 'physical_contract',
+        pl.col('source_file_sha256').alias('source_sha256')),
+        on=['trade_date', 'physical_contract'], how='left', validate='m:1').select(events.columns)
+    for path, receipt_path, member, before in stable:
+        after = path.stat()
+        if ((before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                or sha256_file(receipt_path) != member['receipt_sha256']):
+            raise ValueError('product fallback native source changed during readback')
+    if sha256_file(manifest) != item['sha256']:
+        raise ValueError('product fallback inventory changed during readback')
+    # Group-by and the provenance join do not promise output order.  A stable
+    # minute order makes later FP64 window reductions reproducible when the
+    # same source is rebuilt or compared with an independent product audit.
+    bars = bars.sort('date', 'physical_contract', 'minute')
+    coverage = coverage.sort('date', 'physical_contract')
+    events = events.sort('trade_date', 'physical_contract', 'trade_ts', 'is_session_open')
+    return bars, coverage, events
+
+
+def read_pinned_tick_day(item: dict, expected: pl.DataFrame, *, asset_scope='stock_only'):
+    if item.get('source_kind') == PRODUCT_FALLBACK_SOURCE:
+        return read_product_fallback_tick_day(item, expected, asset_scope=asset_scope)
+    if item.get('source_kind') == 'taifex_recent_original_all_product_futures_tick_v1':
+        from stockagent.data.tw_futures_official_ticks import read_official_tick_day
+        return read_official_tick_day(item, expected, asset_scope=asset_scope)
+    return read_bulk_stock_tick_day(item, expected, asset_scope=asset_scope)
 
 
 def source_paths(root: Path, product: str, day: date) -> tuple[Path, Path]:

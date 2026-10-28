@@ -16,8 +16,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
+import stat
 import sys
 import tempfile
 import time
@@ -42,15 +44,19 @@ from stockagent.data_sync.legacy_artifact_archive import (
     MANUAL_TRANSFER_QUARANTINE_CONTRACT, reviewed_transfer_quarantine_root,
     MANUAL_MINUTE_DERIVED_VIEW_CONTRACT, reviewed_minute_derived_view_root,
     apply_archive_stage_prune, load_legacy_specs, plan_archive_stage_prune,
+    recover_archive_stage_quarantine,
     prepare_archive, publish_archive, verify_archive_directory, verify_cold_archive,
     C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT,
     reviewed_offline_scratch_root,
+    OPAQUE_SYMLINK_POLICY, _archive_symlinks, _opaque_symlinks_enabled,
 )
 from stockagent.data_sync.legacy_artifact_retirement import (
     plan_legacy_retirement, apply_legacy_retirement, plan_legacy_quarantine_resume,
+    LegacyQuarantineTransportPending,
 )
 from stockagent.data_sync.packed_retention import RetentionConfig
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
+from stockagent.data_sync.syncthing_scan import CANONICAL_ROOT as D_PRIMARY_ROOT
 from stockagent.data_sync.remote_legacy_return import active_configuration_references, active_configuration_references_many, metadata_tree, real
 
 COMMON_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock')
@@ -63,6 +69,7 @@ TRANSFER_QUARANTINE_ORIGIN = 'retained-transfer-quarantine-preservation-v1'
 MINUTE_DERIVED_VIEW_ORIGIN = 'retained-minute-derived-view-preservation-v1'
 D_BENCHMARK_STAGE_PROFILE = 'completed-benchmark-d-scratch-v1'
 D_OFFLINE_STAGE_PROFILE = 'completed-offline-d-scratch-v1'
+NATIVE_SSD_STAGE_PROFILE = 'completed-benchmark-native-ssd-scratch-v1'
 MINUTE_VIEW_NAMES = {
     'developing-v5': 'data_tw_minute/research_dataset_developing_v5',
     'schema2-volume-bug': 'data_tw_minute/research_dataset_schema2_volume_bug_20260807',
@@ -112,7 +119,45 @@ def reusable_publication(target: Path, spec: LegacyArchiveSpec, sync_root: Path)
     return published
 
 
-def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, repo_root):
+def require_d_recovery_stage(spec, sync_root: Path, *, require_archive=True):
+    """Bind recovery to the original guarded D stage, with no C-tree fallback."""
+    if spec.stage_root not in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
+        raise SnapshotError('D recovery mode requires an enrolled D scratch root')
+    _check_d_primary_mount(sync_root)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    if require_archive:
+        manifest = archive / 'legacy_archive_manifest.json'
+        if (archive.is_symlink() or archive.resolve(strict=False) != archive.absolute()
+                or not archive.is_dir() or manifest.is_symlink() or not manifest.is_file()):
+            raise SnapshotError('D recovery mode requires its complete exact encoded archive')
+
+
+def require_existing_fixed_d_stage(spec, sync_root: Path, target: Path, *, expected_fixed_manifest_sha256=None):
+    """Admit only an existing exact D stage and its committed cold release.
+
+    This is a resource-mode precondition, not an integrity or retirement proof.
+    Its callers must fail rather than create a new source-sized archive or
+    recovery workspace when this state disappears or changes.
+    """
+    if spec.stage_root not in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
+        raise SnapshotError('fixed-stage mode requires an enrolled D scratch root')
+    archive = spec.stage_root / spec.dataset / 'archive'
+    manifest = archive / 'legacy_archive_manifest.json'
+    if (archive.is_symlink() or archive.resolve(strict=False) != archive.absolute()
+            or not archive.is_dir() or manifest.is_symlink() or not manifest.is_file()):
+        raise SnapshotError('fixed-stage mode requires the existing exact D archive')
+    _check_d_primary_mount(sync_root)
+    published = reusable_publication(target, spec, sync_root)
+    if published is None:
+        raise SnapshotError('fixed-stage mode requires the committed publication receipt')
+    if expected_fixed_manifest_sha256 is not None and published.get('manifest_sha256') != expected_fixed_manifest_sha256:
+        raise SnapshotError('fixed-stage publication changed since the capacity preflight')
+    return published
+
+
+def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, repo_root,
+                                  fixed_d_stage_only=False, expected_fixed_manifest_sha256=None,
+                                  d_stage_recovery_only=False):
     """Resume a fixed commit, not an acceptance or a cached byte audit.
 
     The caller must still perform independent D recovery, the fresh complete
@@ -120,6 +165,11 @@ def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, rep
     A committed version with an existing stage need not repeat preparation's
     decode before those mandatory verifications.
     """
+    if fixed_d_stage_only:
+        return require_existing_fixed_d_stage(spec, sync_root, target,
+                                              expected_fixed_manifest_sha256=expected_fixed_manifest_sha256)
+    if d_stage_recovery_only:
+        require_d_recovery_stage(spec, sync_root, require_archive=False)
     published = reusable_publication(target, spec, sync_root)
     archive = spec.stage_root / spec.dataset / 'archive'
     if not (archive / 'legacy_archive_manifest.json').exists():
@@ -136,8 +186,18 @@ def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, rep
         # independently validate the fixed release and current originals.
         with phase(target, 'publish-to-D'):
             _check_d_primary_mount(sync_root)
+            def publication_progress(observation):
+                atomic_write_json(target / 'publication-progress.json', {
+                    'contract': 'manual-retirement-publication-progress-v1',
+                    'observed_at_epoch': time.time(), **observation,
+                    'acceptance': False,
+                })
+            # The canonical D retry owner drains durable scan intents. Do not
+            # hold publication behind Syncthing's potentially long current scan;
+            # independent cold recovery and convergence still gate retirement.
             published = publish_archive(spec, artifact_root, sync_root, repo_root=repo_root,
-                manual_capture=True, pack_buckets=4, publication_owner=lambda: publication_owner(target))
+                manual_capture=True, pack_buckets=4, defer_scan=sync_root == D_PRIMARY_ROOT,
+                publication_owner=lambda: publication_owner(target), publication_progress=publication_progress)
         atomic_write_json(target/'publication.json', published)
     return published
 
@@ -165,6 +225,15 @@ def phase(target: Path, name: str):
     finally:
         _PHASE_STACK.reset(token)
         value.update(finished_at_epoch=time.time(), elapsed_seconds=time.monotonic()-started)
+        history_path = target / 'phase-history.json'
+        if history_path.is_symlink():
+            raise SnapshotError('retirement phase history is redirected')
+        history = (json.loads(history_path.read_bytes()) if history_path.exists() else
+                   {'contract': 'manual-retirement-phase-history-v1', 'events': []})
+        if history.get('contract') != 'manual-retirement-phase-history-v1' or not isinstance(history.get('events'), list):
+            raise SnapshotError('retirement phase history contract differs')
+        history['events'] = (history['events'] + [{**value, 'owner_pid': os.getpid()}])[-256:]
+        atomic_write_json(history_path, history)
         # The child can finish while its publisher still verifies originals.
         # Restore only an actual parent in this process, never a stale running
         # phase left on disk by an interrupted attempt or another target.
@@ -183,7 +252,7 @@ def publication_owner(target: Path):
 
 def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | None = None,
             configuration_refs: list[str] | None = None, process_refs: list[str] | None = None,
-            repo_root: Path | None = None) -> dict:
+            repo_root: Path | None = None, preserve_symlinks: bool = False) -> dict:
     path = _safe_relative_path(relative, 'reviewed offline artifact')
     if path.parts[0] not in SCOPES or len(path.parts) < 2:
         raise SnapshotError('offline preservation requires one explicit artifact child')
@@ -199,6 +268,18 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
     if not source.is_dir():
         raise SnapshotError('offline artifact must be a real directory')
     tree = metadata_tree(source)
+    link_rows = None
+    if preserve_symlinks:
+        spec = LegacyArchiveSpec('inventory-only', relative, 7, Path('/'), 12,
+                                 capture_contract=MANUAL_WSL_CAPTURE_CONTRACT,
+                                 symlink_policy=OPAQUE_SYMLINK_POLICY)
+        _opaque_symlinks_enabled(spec)
+        link_rows = _archive_symlinks(source, spec)
+        link_paths = {row['path'] for row in link_rows}
+        observed_links = {row['path'] for row in tree['rows']
+                          if row['kind'] == 'unsupported' and stat.S_ISLNK(row['signature'][5])}
+        if link_paths != observed_links or metadata_tree(source)['fingerprint'] != tree['fingerprint']:
+            raise SnapshotError('offline link inventory changed during observation')
     repository = repo_root if repo_root is not None else artifact_root.parent
     process_scope = artifact_root/'data_tw_minute' if path.parts[0]=='data_tw_minute' else artifact_root
     refs = ((process_refs if process_refs is not None else artifact_process_references(source, process_scope))
@@ -208,7 +289,8 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
                artifact_service_references((source,), repository)[str(source)]))
     newest = max((r['signature'][3] for r in tree['rows'] if r['kind'] == 'file'), default=0)
     blockers = list(refs)
-    if any(r['kind'] == 'unsupported' or r['cross_filesystem'] for r in tree['rows']):
+    if any((r['kind'] == 'unsupported' and not (preserve_symlinks and stat.S_ISLNK(r['signature'][5])))
+           or r['cross_filesystem'] for r in tree['rows']):
         blockers.append('non-regular-or-cross-filesystem')
     if not tree['files']:
         blockers.append('empty-artifact')
@@ -219,6 +301,8 @@ def observe(artifact_root: Path, relative: str, *, service_refs: list[str] | Non
             'files': tree['files'], 'logical_bytes': tree['logical_bytes'],
             'allocated_unique_file_bytes': tree['allocated_unique_file_bytes'],
             'newest_mtime_ns': newest, 'blockers': sorted(set(blockers))}
+    if preserve_symlinks:
+        result.update(symlink_policy=OPAQUE_SYMLINK_POLICY, symlinks=link_rows)
     if path.parts[0] == 'benchmarks':
         try:
             required = standalone_benchmark_contract(path.parts[1]) if len(path.parts) == 2 else None
@@ -290,20 +374,28 @@ def uniform_device_renumber_drift(before: dict, after: dict):
 def inventory(relatives: list[str], output: Path, existing_datasets: list[str] | None = None,
               *, hot_mirror: bool = False, transfer_quarantine: bool = False,
               minute_derived_view: bool = False, guarded_d_scratch: bool = False,
-              guarded_d_offline_scratch: bool = False) -> dict:
+              guarded_d_offline_scratch: bool = False, native_ssd_scratch: bool = False,
+              preserve_symlinks: bool = False) -> dict:
+    if type(preserve_symlinks) is not bool:
+        raise SnapshotError('symlink preservation must be explicitly selected')
+    if preserve_symlinks and (hot_mirror or transfer_quarantine or minute_derived_view or existing_datasets
+            or len(relatives) != 1 or not relatives[0].startswith('benchmarks/')
+            or not reviewed_wsl_artifact_root(relatives[0])):
+        raise SnapshotError('symlink preservation requires one reviewed completed benchmark')
     if sum((hot_mirror,transfer_quarantine,minute_derived_view))>1:
         raise SnapshotError('different physical source roles cannot share an inventory')
     if (hot_mirror or transfer_quarantine or minute_derived_view) and existing_datasets:
         raise SnapshotError('historical hot mirrors require their own new exact archive identity')
-    if guarded_d_scratch and guarded_d_offline_scratch:
+    if sum((guarded_d_scratch, guarded_d_offline_scratch, native_ssd_scratch)) > 1:
         raise SnapshotError('select only one fixed temporary staging profile')
-    if guarded_d_scratch or guarded_d_offline_scratch:
+    if guarded_d_scratch or guarded_d_offline_scratch or native_ssd_scratch:
         reviewed = (lambda relative: relative.startswith('benchmarks/')
-                    and reviewed_wsl_artifact_root(relative)) if guarded_d_scratch else reviewed_offline_scratch_root
+                    and reviewed_wsl_artifact_root(relative)) if not guarded_d_offline_scratch else reviewed_offline_scratch_root
         if (hot_mirror or transfer_quarantine or minute_derived_view or existing_datasets
                 or len(relatives) != 1 or not reviewed(relatives[0])):
-            raise SnapshotError('guarded D scratch requires one new reviewed offline case')
-        _check_d_primary_mount(Path('/srv/stockagent-packed'))
+            raise SnapshotError('temporary scratch requires one new reviewed offline case')
+        if not native_ssd_scratch:
+            _check_d_primary_mount(Path('/srv/stockagent-packed'))
     retained = {}
     catalog_sha = None
     if existing_datasets:
@@ -340,13 +432,15 @@ def inventory(relatives: list[str], output: Path, existing_datasets: list[str] |
     process_refs = None if artifact_process_references_many(sources, process_scope) else []
     rows = [observe(artifact_root, relative, service_refs=service_refs[str(source)],
                     configuration_refs=configuration_refs[str(source)], process_refs=process_refs,
-                    repo_root=ROOT)
+                    repo_root=ROOT, **({'preserve_symlinks': True} if preserve_symlinks else {}))
             for relative, source in zip(relatives, sources, strict=True)]
     for row in rows:
         if row['relative_root'] in retained:
             row['existing_dataset'] = retained[row['relative_root']]
     result = {'schema_version': 1, 'contract': MANUAL_WSL_CAPTURE_CONTRACT,
               'authority_node_id': 'penguin', 'observed_at_epoch': time.time(), 'items': rows}
+    if preserve_symlinks:
+        result['symlink_policy'] = OPAQUE_SYMLINK_POLICY
     if hot_mirror or transfer_quarantine or minute_derived_view:
         result.update(source_origin=origin, artifact_root=str(artifact_root))
     if catalog_sha:
@@ -355,6 +449,8 @@ def inventory(relatives: list[str], output: Path, existing_datasets: list[str] |
         result['staging_profile'] = D_BENCHMARK_STAGE_PROFILE
     if guarded_d_offline_scratch:
         result['staging_profile'] = D_OFFLINE_STAGE_PROFILE
+    if native_ssd_scratch:
+        result['staging_profile'] = NATIVE_SSD_STAGE_PROFILE
     atomic_write_json(output, result)
     return result
 
@@ -365,7 +461,7 @@ def stage_profile(inventory: dict) -> tuple[Path, bool]:
     if profile is None:
         return C_TEMP_STAGE_ROOT, False
     rows = inventory.get('items', [])
-    if (profile not in (D_BENCHMARK_STAGE_PROFILE, D_OFFLINE_STAGE_PROFILE)
+    if (profile not in (D_BENCHMARK_STAGE_PROFILE, D_OFFLINE_STAGE_PROFILE, NATIVE_SSD_STAGE_PROFILE)
             or inventory.get('source_origin') is not None
             or inventory.get('existing_catalog_sha256') is not None
             or not isinstance(rows, list) or len(rows) != 1
@@ -379,24 +475,56 @@ def stage_profile(inventory: dict) -> tuple[Path, bool]:
         return D_OFFLINE_STAGE_ROOT, True
     if not relative.startswith('benchmarks/') or not reviewed_wsl_artifact_root(relative):
         raise SnapshotError('unsupported frozen temporary staging profile or scope')
+    if profile == NATIVE_SSD_STAGE_PROFILE:
+        # Fixed existing native SSD owner; preserve durable staging and its
+        # virtual/Windows-backing capacity gates. Never relocate a frozen D run.
+        return C_TEMP_STAGE_ROOT, True
     return D_BENCHMARK_STAGE_ROOT, True
 
 
-def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = False) -> dict:
+def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = False,
+          expected_inventory_sha256: str | None = None, fixed_d_stage_only: bool = False,
+          expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False) -> dict:
     before = inventory_path.read_bytes()
+    if d_stage_recovery_only and (fixed_d_stage_only or expected_inventory_sha256 is None):
+        raise SnapshotError('D recovery mode requires a pinned inventory and a single resource mode')
+    if ((fixed_d_stage_only and (expected_inventory_sha256 is None
+                                 or not isinstance(expected_fixed_manifest_sha256, str)
+                                 or not re.fullmatch(r'[0-9a-f]{64}', expected_fixed_manifest_sha256)))
+            or (not fixed_d_stage_only and expected_fixed_manifest_sha256 is not None)):
+        raise SnapshotError('fixed-stage mode requires exactly one pinned cold manifest SHA-256')
+    if expected_inventory_sha256 is not None and (
+            not re.fullmatch(r'[0-9a-f]{64}', expected_inventory_sha256)
+            or hashlib.sha256(before).hexdigest() != expected_inventory_sha256):
+        raise SnapshotError('offline inventory differs from the explicitly pinned SHA-256')
     receipt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (receipt_dir / 'owner.lock').open('a') as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
+        if fixed_d_stage_only:
+            return _apply(inventory_path, before, receipt_dir, fixed_d_stage_only=True,
+                          expected_fixed_manifest_sha256=expected_fixed_manifest_sha256)
+        if d_stage_recovery_only:
+            return _apply(inventory_path, before, receipt_dir, d_stage_recovery_only=True)
         return _apply(inventory_path, before, receipt_dir)
 
 
-def verify_for_retirement(spec, sync_root: Path, target: Path):
+def verify_for_retirement(spec, sync_root: Path, target: Path, *, fixed_d_stage_only=False,
+                          expected_fixed_manifest_sha256=None, d_stage_recovery_only=False):
     """Prefer exact existing encoding; otherwise retain physical admission."""
+    if fixed_d_stage_only:
+        require_existing_fixed_d_stage(spec, sync_root, target,
+                                       expected_fixed_manifest_sha256=expected_fixed_manifest_sha256)
+    if d_stage_recovery_only:
+        require_d_recovery_stage(spec, sync_root)
     resolved = resolve_latest_packed(sync_root, spec.dataset)
+    if fixed_d_stage_only and resolved.manifest_sha256 != expected_fixed_manifest_sha256:
+        raise SnapshotError('fixed-stage release changed before independent recovery')
     needed = int(resolved.manifest['source']['logical_bytes']) + 32 * 1024**3
     temporary_free = shutil.disk_usage(Path(tempfile.gettempdir())).free
     encoding = spec.stage_root / spec.dataset / 'archive'
-    reuse_encoding = encoding.is_dir()
+    # In fixed-only mode a disappeared stage must fail the existing verifier;
+    # it must never select a new source-sized C or tmpfs recovery workspace.
+    reuse_encoding = fixed_d_stage_only or d_stage_recovery_only or encoding.is_dir()
     workspace = None if temporary_free >= needed or reuse_encoding else target / 'verification-scratch'
     atomic_write_json(target / 'recovery-workspace-plan.json', {
         'dataset': spec.dataset, 'snapshot_id': resolved.manifest['snapshot_id'],
@@ -497,30 +625,55 @@ def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict)
                     verified_retained_benchmark(target, options['artifact_root'] / spec.relative_root)
                 try:
                     with phase(target, 'verify-and-retire-hot-source'):
+                        apply_options = dict(options)
+                        if (plan.get('quarantine_resume') is True
+                                and plan['full_verification'].get('contract') ==
+                                    'owned-legacy-quarantine-resume-v2'):
+                            apply_options['defer_quarantine_transport'] = True
                         return apply_legacy_retirement(spec,
                             expected_fingerprint=plan['plan_fingerprint'],
-                            owned_verified_plan=plan, **options)
+                            owned_verified_plan=plan, **apply_options)
                 except SnapshotError as error:
-                    # This EXACT canonical preflight error precedes all state,
-                    # activation and quarantine writes. Never retry an unlink
-                    # or quarantine error, nor a combined/new blocker.
-                    if (str(error) != 'legacy retirement blocked: cold-peer-not-converged'
+                    # The normal preflight precedes all mutation. Only the
+                    # distinct owned-resume outcome additionally proves its
+                    # already existing quarantine has not started unlink.
+                    # Never retry a partial unlink or a combined/new blocker.
+                    safe_resume_wait = (isinstance(error, LegacyQuarantineTransportPending)
+                                        and plan.get('quarantine_resume') is True)
+                    if ((str(error) != 'legacy retirement blocked: cold-peer-not-converged'
+                            and not safe_resume_wait)
                             or attempt == 2):
                         raise
                     atomic_write_json(target / f'transport-preflight-retry-{time.time_ns()}.json', {
-                        'state': 'retry_transport_preflight_without_mutation',
+                        'state': ('retry_owned_quarantine_transport_before_unlink' if safe_resume_wait
+                                  else 'retry_transport_preflight_without_mutation'),
                         'attempt': attempt + 1, 'error': str(error),
                         'original_verified_at_epoch': verified_at,
                         'checked_at_epoch': time.time(), 'proof_time_extended': False,
                     })
 
 
-def finish_retirement(spec, cfg, target, retired, *, source_origin=None):
+def finish_retirement(spec, cfg, target, retired, *, source_origin=None, fixed_d_stage_only=False,
+                      expected_fixed_manifest_sha256=None, d_stage_recovery_only=False):
     artifact_root, _mirror, states, _activations = source_layout(source_origin)
+    if fixed_d_stage_only and retired.get('manifest_sha256') != expected_fixed_manifest_sha256:
+        raise SnapshotError('fixed-stage retirement receipt differs from the pinned cold manifest')
     if retired.get('deleted') is not True or (artifact_root / spec.relative_root).exists():
         raise SnapshotError('retirement receipt and source absence differ')
     stage = spec.stage_root / spec.dataset
     with phase(target, 'prune-verified-encoding-stage'):
+        if not stage.exists() and not (target / 'stage-pruned.json').exists():
+            failed_plan_path = target / 'stage-prune-plan.json'
+            if failed_plan_path.is_file() and not failed_plan_path.is_symlink():
+                failed_raw = failed_plan_path.read_bytes()
+                failed_plan = json.loads(failed_raw)
+                atomic_write_json(target / f'stage-prune-failed-evidence-{time.time_ns()}.json', {
+                    'contract': 'unchanged-failed-stage-plan-evidence-v1',
+                    'original_sha256': hashlib.sha256(failed_raw).hexdigest(),
+                    'original_utf8': failed_raw.decode('utf-8'), 'checked_at_epoch': time.time()})
+                recover_archive_stage_quarantine(spec, cfg.sync_root, artifact_root=artifact_root,
+                    state_root=states, owned_failed_plan=failed_plan,
+                    journal=target / f'stage-quarantine-recovery-{time.time_ns()}.json')
         if stage.exists():
             prune = plan_archive_stage_prune(spec, cfg.sync_root, artifact_root=artifact_root, state_root=states)
             atomic_write_json(target / 'stage-prune-plan.json', prune)
@@ -528,6 +681,8 @@ def finish_retirement(spec, cfg, target, retired, *, source_origin=None):
                 state_root=states, expected_fingerprint=prune['stage_fingerprint'], owned_verified_plan=prune)
             atomic_write_json(target / 'stage-pruned.json', pruned)
         else:
+            if fixed_d_stage_only or d_stage_recovery_only:
+                raise SnapshotError('D-stage mode cannot create a replacement recovery workspace')
             prune = json.loads((target / 'stage-prune-plan.json').read_text())
             pruned = json.loads((target / 'stage-pruned.json').read_text())
             if pruned.get('pruned') is not True:
@@ -560,12 +715,27 @@ def retirement_options(cfg, artifact_root, mirror_root, states, activations):
         manual_immediate=True, manual_capture=True)
 
 
-def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
+def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage_only: bool = False,
+           expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False) -> dict:
     inv = json.loads(raw)
+    mode_options = ({'fixed_d_stage_only': True, 'expected_fixed_manifest_sha256': expected_fixed_manifest_sha256}
+                    if fixed_d_stage_only else {})
+    if d_stage_recovery_only:
+        mode_options['d_stage_recovery_only'] = True
     if (inv.get('schema_version') != 1 or inv.get('contract') != MANUAL_WSL_CAPTURE_CONTRACT
             or inv.get('authority_node_id') != 'penguin' or not inv.get('items')):
         raise SnapshotError('offline inventory contract differs')
     origin = inv.get('source_origin')
+    link_policy = inv.get('symlink_policy')
+    if link_policy is not None:
+        if (link_policy != OPAQUE_SYMLINK_POLICY or origin is not None
+                or inv.get('existing_catalog_sha256') is not None or len(inv['items']) != 1
+                or inv['items'][0].get('existing_dataset')
+                or inv['items'][0].get('symlink_policy') != link_policy
+                or not isinstance(inv['items'][0].get('symlinks'), list)):
+            raise SnapshotError('frozen symlink policy differs from its single reviewed benchmark')
+    elif any('symlinks' in row or 'symlink_policy' in row for row in inv['items']):
+        raise SnapshotError('frozen symlinks lack their explicit policy')
     artifact_root, mirror_root, states, activations = source_layout(origin)
     if origin is not None and (inv.get('artifact_root') != str(artifact_root)
                               or inv.get('existing_catalog_sha256')):
@@ -583,6 +753,9 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
     cfg = replace(cfg, required_peer_names=load_retirement_peer_names(
         ROOT / 'configs/data_sync/artifact_retirement.json', authority_node_id='penguin'))
     stage_root, durable_staging = stage_profile(inv)
+    if d_stage_recovery_only and (stage_root not in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)
+            or origin is not None or len(inv['items']) != 1 or inv['items'][0].get('existing_dataset')):
+        raise SnapshotError('D recovery mode requires one new reviewed guarded-D cohort')
     results = []
     for row in inv['items']:
         relative = row['relative_root']
@@ -593,7 +766,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             raise SnapshotError('frozen root is outside the reviewed offline scopes')
         prefix = dataset_prefix(origin)
         dataset = row.get('existing_dataset') or (prefix + hashlib.sha256(
-            (relative + row['fingerprint']).encode()).hexdigest()[:24])
+            (relative + row['fingerprint'] + ('\0' + link_policy if link_policy else '')).encode()).hexdigest()[:24])
         validate_slug(dataset, 'frozen offline dataset')
         if row.get('existing_dataset') and dataset not in existing_specs:
             raise SnapshotError('existing dataset lacks its frozen catalog binding')
@@ -617,7 +790,8 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                 raise SnapshotError('retired minute view capture requires its separate physical source role')
             capture_contract=MANUAL_MINUTE_DERIVED_VIEW_CONTRACT
         spec = LegacyArchiveSpec(dataset, relative, 7, stage_root,
-                                 12, durable_staging, 'zstd-1-adaptive-over-8m', capture_contract)
+                                 12, durable_staging, 'zstd-1-adaptive-over-8m', capture_contract, link_policy)
+        _opaque_symlinks_enabled(spec)
         if row.get('existing_dataset'):
             if dataset not in existing_specs or existing_specs[dataset].relative_root != relative:
                 raise SnapshotError('existing archive identity differs from the frozen root')
@@ -625,6 +799,8 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
         prior = target / 'acceptance.json'
         if prior.exists():
             accepted = json.loads(prior.read_text())
+            if fixed_d_stage_only and accepted.get('manifest_sha256') != expected_fixed_manifest_sha256:
+                raise SnapshotError('prior acceptance differs from the pinned cold manifest')
             if accepted.get('retired') is True and not (artifact_root / relative).exists():
                 results.append(accepted)
                 continue
@@ -642,7 +818,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             retirement_receipt = target / 'retirement.json'
             if retirement_receipt.exists() and not (artifact_root / relative).exists():
                 accepted = finish_retirement(spec, cfg, target, json.loads(retirement_receipt.read_text()),
-                                             source_origin=origin)
+                                             source_origin=origin, **mode_options)
                 results.append(accepted)
                 atomic_write_json(receipt_dir / 'progress.json', {'items':results, 'handoff_reconciled':relative})
                 continue
@@ -656,12 +832,15 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                         or retired.get('deleted') is not True):
                     raise SnapshotError('canonical retirement state and its durable receipt differ')
                 atomic_write_json(retirement_receipt, retired)
-                results.append(finish_retirement(spec, cfg, target, retired, source_origin=origin))
+                results.append(finish_retirement(spec, cfg, target, retired, source_origin=origin, **mode_options))
                 continue
+            if fixed_d_stage_only:
+                require_existing_fixed_d_stage(spec, cfg.sync_root, target,
+                    expected_fixed_manifest_sha256=expected_fixed_manifest_sha256)
             if state.get('state') == 'retiring':
                 original_plan = json.loads((target/'retirement-plan.json').read_bytes())
                 with phase(target, 'independent-D-original-recovery-for-quarantine'):
-                    proof = verify_for_retirement(spec, cfg.sync_root, target)
+                    proof = verify_for_retirement(spec, cfg.sync_root, target, **mode_options)
                     if any(proof[k] != original_plan[k] for k in ('snapshot_id','manifest_sha256')):
                         raise SnapshotError('interrupted retirement fixed D identity differs')
                 atomic_write_json(target/'quarantine-cold-recovery.json',
@@ -677,16 +856,18 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                 else:
                     raise SnapshotError('complete quarantine audit repeatedly expired before mutation')
                 atomic_write_json(retirement_receipt, retired)
-                results.append(finish_retirement(spec, cfg, target, retired, source_origin=origin))
+                results.append(finish_retirement(spec, cfg, target, retired, source_origin=origin, **mode_options))
                 continue
             if origin is not None and (mirror_root/relative).exists():
                 raise SnapshotError('historical mirror has an unexpected secondary source')
-            current = observe(artifact_root, relative, repo_root=ROOT)
+            current = observe(artifact_root, relative, repo_root=ROOT,
+                              **({'preserve_symlinks': True} if link_policy else {}))
             drift=(shared_link_observation_drift(row,current)
                    if current['fingerprint'] != row['fingerprint'] else [])
             renumber = (uniform_device_renumber_drift(row, current)
                         if current['fingerprint'] != row['fingerprint'] and drift is None else None)
-            if current['blockers'] or (current['fingerprint'] != row['fingerprint'] and drift is None and renumber is None):
+            if (current['blockers'] or (link_policy and current['symlinks'] != row['symlinks'])
+                    or (current['fingerprint'] != row['fingerprint'] and drift is None and renumber is None)):
                 raise SnapshotError('offline source changed or has current consumers: ' + str(current['blockers'][:3]))
             if drift:
                 atomic_write_json(target/'inventory-shared-link-drift.json',{
@@ -709,15 +890,17 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
                 'archives': [{'dataset': dataset, 'relative_root': relative, 'minimum_stable_days': 7,
                               'manual_capture_min_stable_hours': 12, 'durable_staging': spec.durable_staging,
                               'compression': spec.compression_profile, 'archive_only': True,
-                              'stage_root': str(spec.stage_root), 'capture_contract': spec.capture_contract}]})
+                              'stage_root': str(spec.stage_root), 'capture_contract': spec.capture_contract,
+                              **({'symlink_policy': link_policy} if link_policy else {})}]})
             # Admission, stable source hashes, every encoded byte and independent
             # decoding are still owned by the canonical archive implementation.
             # Encoding only mutates this run's private stage. Keep unrelated D
             # publishers progressing while the canonical preparation completes.
             if not row.get('existing_dataset'):
-                published = prepare_or_resume_publication(spec, artifact_root, cfg.sync_root, target, repo_root=ROOT)
+                published = prepare_or_resume_publication(spec, artifact_root, cfg.sync_root, target, repo_root=ROOT,
+                                                          **mode_options)
             with phase(target, 'independent-D-original-recovery'):
-                proof = verify_for_retirement(spec, cfg.sync_root, target)
+                proof = verify_for_retirement(spec, cfg.sync_root, target, **mode_options)
                 if not row.get('existing_dataset') and any(
                         proof[k] != published[k] for k in ('snapshot_id', 'manifest_sha256')):
                     raise SnapshotError('fixed D publication changed during independent recovery')
@@ -733,7 +916,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path) -> dict:
             else:
                 raise SnapshotError('complete retirement audit repeatedly expired before mutation')
             atomic_write_json(target / 'retirement.json', retired)
-            accepted = finish_retirement(spec, cfg, target, retired, source_origin=origin)
+            accepted = finish_retirement(spec, cfg, target, retired, source_origin=origin, **mode_options)
             results.append(accepted)
         except (OSError, ValueError, SnapshotError) as error:
             results.append({'relative_root': relative, 'retired': False, 'error': str(error)})
@@ -769,10 +952,22 @@ def main():
                         help='Freeze the separate guarded D temporary stage for one completed benchmark case')
     parser.add_argument('--guarded-d-offline-scratch', action='store_true',
                         help='Freeze the separate guarded D temporary stage for one reviewed operations case')
+    parser.add_argument('--native-ssd-scratch', action='store_true',
+                        help='Freeze the existing native SSD stage with fsync for one reviewed completed benchmark')
+    parser.add_argument('--preserve-symlinks', action='store_true',
+                        help='Freeze opaque, in-scope links for one reviewed completed benchmark')
     parser.add_argument('--inventory', type=Path, required=True)
+    parser.add_argument('--expected-inventory-sha256',
+                        help='Require this exact frozen inventory before any apply mutation')
     parser.add_argument('--receipt-dir', type=Path)
     parser.add_argument('--wait-for-owner', action='store_true',
                         help='Queue the same frozen manual scope behind its existing cleanup owner')
+    parser.add_argument('--fixed-d-stage-only', action='store_true',
+                        help='Require the existing exact D stage and fixed publication; never create a replacement workspace')
+    parser.add_argument('--d-stage-recovery-only', action='store_true',
+                        help='Prepare on guarded D and require its complete encoding for recovery; never recreate a C tree')
+    parser.add_argument('--expected-fixed-manifest-sha256',
+                        help='Pin the completed cold release used by fixed-stage capacity admission')
     parser.add_argument('--retry-rounds', type=int, default=1, choices=(1, 2, 3),
                         help='Bounded fresh retries of the identical frozen scope after a completed round')
     args = parser.parse_args()
@@ -780,7 +975,9 @@ def main():
     if socket.gethostname() != 'penguin':
         parser.error('local retirement is penguin-only')
     if args.command == 'inventory':
-        if args.wait_for_owner or args.retry_rounds != 1:
+        if (args.wait_for_owner or args.retry_rounds != 1 or args.expected_inventory_sha256 is not None
+                or args.fixed_d_stage_only or args.expected_fixed_manifest_sha256 is not None
+                or args.d_stage_recovery_only):
             parser.error('owner wait and retries apply only to the frozen cleanup')
         if args.minute_view_name and (not args.minute_derived_view or args.relative_root or args.existing_dataset):
             parser.error('minute view names require only the separate minute-derived-view role')
@@ -794,18 +991,32 @@ def main():
             options['guarded_d_scratch'] = True
         if args.guarded_d_offline_scratch:
             options['guarded_d_offline_scratch'] = True
+        if args.native_ssd_scratch:
+            options['native_ssd_scratch'] = True
+        if args.preserve_symlinks:
+            options['preserve_symlinks'] = True
         result = inventory(args.relative_root or [], args.inventory, args.existing_dataset, **options)
         print(json.dumps({'items':len(result['items']), 'blocked':sum(bool(r['blockers']) for r in result['items'])}))
         return 0
     if (args.relative_root or args.existing_dataset or args.hot_mirror or args.transfer_quarantine
             or args.minute_derived_view or args.minute_view_name or args.guarded_d_scratch
-            or args.guarded_d_offline_scratch or not args.receipt_dir):
+            or args.guarded_d_offline_scratch or args.native_ssd_scratch or args.preserve_symlinks
+            or not args.receipt_dir):
         parser.error('apply needs the fixed inventory and receipt directory')
     frozen = hashlib.sha256(args.inventory.read_bytes()).hexdigest()
     for round_index in range(args.retry_rounds):
         if hashlib.sha256(args.inventory.read_bytes()).hexdigest() != frozen:
             raise SnapshotError('frozen cleanup inventory changed between retry rounds')
-        result = apply(args.inventory, args.receipt_dir, wait_for_owner=args.wait_for_owner)
+        options = {'wait_for_owner': args.wait_for_owner}
+        if args.expected_inventory_sha256 is not None:
+            options['expected_inventory_sha256'] = args.expected_inventory_sha256
+        if args.fixed_d_stage_only:
+            options['fixed_d_stage_only'] = True
+        if args.d_stage_recovery_only:
+            options['d_stage_recovery_only'] = True
+        if args.expected_fixed_manifest_sha256 is not None:
+            options['expected_fixed_manifest_sha256'] = args.expected_fixed_manifest_sha256
+        result = apply(args.inventory, args.receipt_dir, **options)
         if result['all_selected_retired']:
             break
         if round_index + 1 < args.retry_rounds:

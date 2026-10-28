@@ -29,6 +29,8 @@ if str(REPO_ROOT) not in sys.path:
 REJECTED_CANDIDATE = REPO_ROOT / "artifacts/benchmarks/data-monitor-directory-hints-rejected-candidate-20260927.py"
 REJECTED_CANDIDATE_SHA256 = "b3967f5d0aac13033f5cf1bb0bc1f9817141cf97d8515c9d83ac6b09a9cbd600"
 
+from stockagent.live.data_monitor_record_store import cache_file, stable_record_cache_bytes  # noqa: E402
+
 
 def load_rejected_candidate() -> ModuleType:
     """Load only the exact saved local experiment, never alter production code."""
@@ -46,6 +48,8 @@ inventory = load_rejected_candidate()
 
 
 def _stable_bytes(path: Path) -> bytes:
+    if cache_file(path) != path:
+        return stable_record_cache_bytes(path)
     before = inventory._file_identity(path.stat())
     with path.open("rb") as stream:
         if inventory._file_identity(os.fstat(stream.fileno())) != before:

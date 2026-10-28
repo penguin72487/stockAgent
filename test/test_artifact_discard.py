@@ -114,6 +114,89 @@ def test_overlapping_and_duplicate_targets_rejected(tmp_path):
             policy(tmp_path, [target, other])
 
 
+def local_preparation_policy(tmp_path, relative, **changes):
+    from stockagent.data_sync.testing_disposition import PREPARATION_CONTRACT
+    body = dict(contract=PREPARATION_CONTRACT, authority_node_id="penguin", origin_node_id="penguin",
+                authorization="user discards measured temporary preparation outputs; keeps numerical receipts",
+                decision="discard_without_preservation", targets=[dict(base="preparation-benchmark",
+                    relative=relative, kind="directory", reason="benchmark")])
+    body.update(changes)
+    path = tmp_path / "local-preparation-policy.json"
+    path.write_text(json.dumps({**body, "identity_sha256": d.identity(body)}))
+    return d.load_policy(path)
+
+
+def test_local_preparation_benchmark_reuses_guarded_discard_and_keeps_source_links(setup, tmp_path):
+    _, _, args = setup
+    relative = "data_futures/preparation_sources/experiment/temporary-measurement"
+    p = local_preparation_policy(tmp_path, relative)
+    source = args["repo_root"] / relative
+    source.mkdir(parents=True)
+    (source / "original-alias").write_bytes(b"preserve the canonical original")
+    original = args["repo_root"] / "canonical-original"
+    os.link(source / "original-alias", original)
+    dry = d.discard_target(p, p["targets"][0], **args)
+    assert dry["contract"] == p["contract"] and not dry["blockers"]
+    result = d.discard_target(p, p["targets"][0], **args, apply=True,
+                              expected_plan_identity=dry["identity_sha256"])
+    assert result["deleted"] and not source.exists()
+    assert original.read_bytes() == b"preserve the canonical original"
+    assert result["reclaimed_allocated_bytes"] == 0
+    assert not d.artifact_roots(p)
+    assert not d.manifest_discarded({"metadata": {"source_relative_root": relative}}, p)
+
+
+@pytest.mark.parametrize("relative", ["data_futures", "data_futures/preparation_sources",
+    "data_futures/preparation_sources/experiment", "data_futures/raw/experiment/result",
+    "data_/preparation_sources/experiment/result", "../data_futures/preparation_sources/result",
+    "/data_futures/preparation_sources/experiment/result", "artifacts/benchmarks/experiment/result"])
+def test_local_preparation_discard_rejects_source_roots_and_other_namespaces(tmp_path, relative):
+    with pytest.raises(SnapshotError):
+        local_preparation_policy(tmp_path, relative)
+
+
+def test_local_preparation_disposition_cannot_claim_remote_origin(tmp_path):
+    with pytest.raises(SnapshotError):
+        local_preparation_policy(tmp_path, "data_futures/preparation_sources/experiment/result",
+                                 origin_node_id="vastai1T")
+
+
+@pytest.mark.parametrize("gate", ["artifact_process_references", "active_configuration_references",
+                                 "shared_inode_references"])
+def test_local_preparation_live_gates_override_exact_disposition(setup, tmp_path, monkeypatch, gate):
+    _, _, args = setup
+    relative = "data_futures/preparation_sources/experiment/result"
+    p = local_preparation_policy(tmp_path, relative)
+    source = args["repo_root"] / relative
+    source.mkdir(parents=True)
+    (source / "result").write_bytes(b"keep while referenced")
+    dry = d.discard_target(p, p["targets"][0], **args)
+    monkeypatch.setattr(d, gate, lambda *a: ["active consumer"])
+    with pytest.raises(SnapshotError, match="protection applies"):
+        d.discard_target(p, p["targets"][0], **args, apply=True,
+                         expected_plan_identity=dry["identity_sha256"])
+    assert source.exists()
+
+
+def test_pinned_preparation_source_is_protected_by_common_gate(setup, tmp_path, monkeypatch):
+    _, _, args = setup
+    relative = "data_futures/preparation_sources/experiment/result"
+    p = local_preparation_policy(tmp_path, relative)
+    source = args["repo_root"] / relative
+    source.mkdir(parents=True)
+    (source / "result").write_bytes(b"pinned prepared input")
+    manifest = tmp_path / "pinned-manifest.json"
+    manifest.write_text(json.dumps({"metadata": {"source_relative_root": relative}}))
+    monkeypatch.setattr(d, "_pinned_snapshot_ids", lambda *a: {"pinned"})
+    monkeypatch.setattr(d, "_pinned_manifest_paths", lambda *a: [manifest])
+    dry = d.discard_target(p, p["targets"][0], **args)
+    assert dry["blockers"] == ["pinned-release"]
+    with pytest.raises(SnapshotError, match="protection applies"):
+        d.discard_target(p, p["targets"][0], **args, apply=True,
+                         expected_plan_identity=dry["identity_sha256"])
+    assert source.exists()
+
+
 def test_only_matching_test_cold_manifest_is_disposed(tmp_path):
     _, p = policy(tmp_path)
     assert d.manifest_discarded({"metadata": {"source_relative_root": "smoke/trial"}}, p)

@@ -34,6 +34,143 @@ def _run(root, receipts, **kwargs):
         reference_probe=kwargs.pop("reference_probe", lambda *a, **kw: []), **kwargs)
 
 
+def _working_set(root):
+    for name in ("datasets", "raw", "receipts", "raw_receipts", "versions"):
+        (root / name).mkdir(parents=True, exist_ok=True)
+    current, receipt = _payload(root, "current")
+    old, old_receipt = _payload(root, "old", (4., None, -9.))
+    history = root / "versions/old/previous.json"
+    history.parent.mkdir()
+    (root / "receipts/old.json").rename(history)
+    latest_raw = root / "raw/latest.feather"
+    latest_raw.write_bytes(b"current raw original")
+    (root / "raw_receipts/latest.json").write_text(json.dumps({"dataset": "current",
+        "raw_path": "raw/latest.feather", "raw_sha256": hashlib.sha256(latest_raw.read_bytes()).hexdigest(),
+        "raw_bytes": latest_raw.stat().st_size}))
+    return current, receipt, old, old_receipt, latest_raw
+
+
+def test_working_set_inventory_preserves_all_payloads_without_reading_them(tmp_path, monkeypatch):
+    root = tmp_path / "finlab"
+    current, receipt, old, old_receipt, latest_raw = _working_set(root)
+    unused = root / "raw/unreferenced.feather"
+    unused.write_bytes(b"unique original must stay")
+    alias = current.with_name(f"historical-alias-{receipt['sha256'][:24]}.parquet")
+    os.link(current, alias)
+    (root / "versions/old/alias.json").write_text(json.dumps(
+        {**receipt, "parquet_path": alias.relative_to(root).as_posix()}))
+    original_read = Path.read_bytes
+    before = {p: original_read(p) for p in (current, old, latest_raw, unused, alias)}
+
+    def read_metadata_only(path):
+        if path.parent in {root / "raw", root / "datasets"}:
+            raise AssertionError("inventory read a source payload")
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read_metadata_only)
+    report = storage.inventory_working_set(root, tmp_path / "audit")
+    assert report["state"] == "inventoried" and report["metadata_complete"]
+    categories = report["categories"]
+    assert categories["current_referenced"]["files"] == 2
+    assert categories["historical_only"]["files"] == 2
+    assert categories["unreferenced_preserve"]["files"] == 1
+    assert categories["historical_only"]["unique_allocated_bytes_assigned"] == old.stat().st_blocks * 512
+    assert report["total_unique_allocated_bytes"] == sum(p.stat().st_blocks * 512 for p in before if p != alias)
+    assert report["total_logical_bytes"] == sum(p.stat().st_size for p in before)
+    assert report["source_payload_reads"] == report["source_files_deleted"] == report["provider_API_calls"] == 0
+    assert not report["deletion_authorized"] and not report["payload_SHA_reverified"]
+    assert not report["cold_recovery_verified"]
+    assert json.loads(Path(report["result_path"]).read_bytes()) == report
+    assert all(original_read(p) == value for p, value in before.items())
+    assert os.path.samefile(current, alias)
+
+
+@pytest.mark.parametrize("damage,reason", [
+    ("size", "receipt_size_differs_from_current_file"),
+    ("sha", "invalid_payload_SHA"),
+    ("conflict", "contradictory_receipt_identity"),
+    ("missing", "referenced_payload_absent_or_unsafe"),
+    ("traversal", "invalid_payload_path"),
+    ("symlink", "payload_not_unredirected_regular_file"),
+])
+def test_working_set_inventory_keeps_broken_references_incomplete(tmp_path, damage, reason):
+    root = tmp_path / "finlab"
+    current, receipt, old, old_receipt, latest_raw = _working_set(root)
+    path = root / "receipts/current.json"
+    if damage == "size":
+        receipt["parquet_size_bytes"] += 1
+    elif damage == "sha":
+        receipt["sha256"] = "invalid"
+    elif damage == "conflict":
+        (root / "versions/old/conflict.json").write_text(json.dumps({**receipt, "sha256": "a" * 64}))
+    elif damage == "missing":
+        current.unlink()
+    elif damage == "traversal":
+        receipt["parquet_path"] = "datasets/../../private"
+    elif damage == "symlink":
+        current.unlink()
+        current.symlink_to(old.name)
+    path.write_text(json.dumps(receipt))
+    report = storage.inventory_working_set(root, tmp_path / "audit")
+    assert report["state"] == "incomplete" and not report["metadata_complete"]
+    assert reason in {row["reason"] for row in report["issues"]}
+    assert not report["deletion_authorized"] and report["source_files_deleted"] == 0
+    assert old.is_file() and latest_raw.is_file()
+
+
+def test_working_set_inventory_rejects_redirected_receipt_and_concurrent_generation(tmp_path, monkeypatch):
+    root = tmp_path / "finlab"
+    current, receipt, old, old_receipt, latest_raw = _working_set(root)
+    path = root / "raw_receipts/latest.json"
+    raw = path.read_bytes()
+    path.unlink()
+    path.symlink_to(root / "receipts/current.json")
+    with pytest.raises(ValueError, match="receipt is redirected"):
+        storage.inventory_working_set(root, tmp_path / "audit")
+    path.unlink()
+    path.write_bytes(raw)
+    payload_info = storage.payload_info
+
+    def changed(path):
+        result = payload_info(path)
+        if path == current:
+            path.touch()
+        return result
+
+    monkeypatch.setattr(storage, "payload_info", changed)
+    with pytest.raises(ValueError, match="metadata changed"):
+        storage.inventory_working_set(root, tmp_path / "audit")
+
+
+def test_working_set_inventory_defers_to_existing_finlab_sync_owner(tmp_path):
+    root = tmp_path / "finlab"
+    _working_set(root)
+    lock = root / ".sync.lock"
+    with lock.open("w") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        inode = lock.stat().st_ino
+        result = storage.inventory_working_set(root, tmp_path / "audit")
+    assert result["state"] == "deferred" and result["reason"] == "native_sync_owner_busy"
+    assert lock.stat().st_ino == inode and not result["deletion_authorized"]
+
+
+@pytest.mark.parametrize("extra", [["--apply"], ["--expected-plan-fingerprint", "a" * 64]])
+def test_working_set_cli_cannot_authorize_mutation(tmp_path, extra):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["--finlab-history-root", str(tmp_path), "--finlab-working-set-inventory", *extra])
+    assert error.value.code == 2
+
+
+def test_working_set_cli_writes_bounded_summary_through_existing_entrypoint(tmp_path, capsys):
+    root = tmp_path / "finlab"
+    _working_set(root)
+    assert cli.main(["--finlab-history-root", str(root), "--finlab-working-set-inventory",
+                     "--report-dir", str(tmp_path / "audit")]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["state"] == "inventoried" and "files" not in summary
+    assert not summary["deletion_authorized"] and not summary["payload_SHA_reverified"]
+
+
 def test_original_writer_shares_only_readonly_exact_bytes_and_preserves_values(tmp_path):
     root = tmp_path / "data_finlab"
     first, receipt = _payload(root, "first")

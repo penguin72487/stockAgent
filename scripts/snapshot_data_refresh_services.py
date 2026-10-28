@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 _SHARED_IMPORT_STARTED = time.perf_counter()
 
+from stockagent import private_json  # noqa: E402
 from stockagent.live.data_monitor_dashboard import (  # noqa: E402
     _refresh_service_states,
     build_data_monitor_feature_inventory,
@@ -53,6 +54,7 @@ from stockagent.live.data_monitor_feature_pages import (  # noqa: E402
 )
 from stockagent.live.shioaji_api_dashboard import build_shioaji_public_status  # noqa: E402
 from stockagent.live.tick_inventory import build_tick_inventory  # noqa: E402
+from stockagent.live.bar_inventory import build_bar_inventory  # noqa: E402
 
 _SHARED_IMPORT_OBSERVATION = {
     "schema_version": 1,
@@ -87,6 +89,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tick-audit-seconds", type=float, default=2.,
                         help="Bound cold Tick metadata audit per snapshot (0 < seconds <= 30).")
+    parser.add_argument("--tick-audit-only", action="store_true",
+                        help="Advance only the shared Tick metadata cache; the normal snapshot owner publishes it.")
+    parser.add_argument("--bar-audit-seconds", type=float, default=2.,
+                        help="Bound incremental observation-date projection work (0 < seconds <= 30).")
+    parser.add_argument("--bar-audit-only", action="store_true",
+                        help="Advance only minute/day metadata; normal snapshot publication remains the owner.")
     return parser.parse_args()
 
 
@@ -168,6 +176,7 @@ def _write_feature_reuse_receipt(
     feature_revision: str | None = None,
     source_metadata_sha256: str | None = None,
     source_observation_root: str | None = None,
+    source_verified_at_utc: str | None = None,
     preview: dict[str, object] | None = None,
     source_pages: dict[str, list[dict[str, object]]] | None = None,
 ) -> None:
@@ -212,6 +221,8 @@ def _write_feature_reuse_receipt(
             if observation_binding is not None:
                 receipt["source_observation_root"] = source_observation_root
                 receipt["source_observation_sha256"] = observation_binding
+                if source_verified_at_utc is not None:
+                    receipt["source_verified_at_utc"] = source_verified_at_utc
             if preview is not None and valid_feature_page_preview(preview, fields=fields):
                 receipt["first_page_preview"] = preview
                 receipt["first_page_preview_sha256"] = _feature_preview_checksum(
@@ -263,6 +274,7 @@ def _current_feature_snapshot(
     dependencies = (
         REPO_ROOT / "artifacts/live/data_monitor/record_inventory_cache.json",
         REPO_ROOT / "stockagent/live/data_monitor_inventory.py",
+        REPO_ROOT / "stockagent/live/data_monitor_record_store.py",
         REPO_ROOT / "stockagent/live/data_monitor_dashboard.py",
         REPO_ROOT / "stockagent/live/data_monitor_feature_receipt.py",
         REPO_ROOT / "stockagent/live/data_monitor_feature_pages.py",
@@ -275,6 +287,11 @@ def _current_feature_snapshot(
     def dependencies_current(snapshot_mtime: int, *, revision_bound: bool) -> bool:
         if allow_stale_dependencies:
             return True
+        if not revision_bound:
+            from stockagent.live.data_monitor_record_store import cache_file
+            cache = dependencies[0]
+            if cache.exists() and cache_file(cache).stat().st_mtime_ns > snapshot_mtime:
+                return False
         return not any(
             dependency.stat().st_mtime_ns > snapshot_mtime
             for dependency in (dependencies[1:] if revision_bound else dependencies)
@@ -399,6 +416,9 @@ def _publish_feature_inventory_snapshot(
     stages: dict[str, float] = {}
     inventory_timing: dict[str, float] = {}
     projection_cache: dict[str, object] = {"state": "full_build"}
+    source_verified_at_utc = (
+        snapshot.verified_features.verified_at_utc if snapshot.verified_features is not None else None
+    )
     result = None
     if prefer_shards:
         from stockagent.live.data_monitor_feature_shards import publish_feature_shards
@@ -428,13 +448,17 @@ def _publish_feature_inventory_snapshot(
         preview, source_pages = result.preview, result.source_pages
         snapshot.payload = None
         snapshot.selected = None
+        snapshot.verified_features = None
     else:
         started = time.perf_counter()
         raw = build_feature_inventory(root, snapshot=snapshot, timing_ms=inventory_timing)
         require_coherent_feature_source(raw, expected_source_observation_root)
+        if source_verified_at_utc is None:
+            source_verified_at_utc = datetime.now(UTC).isoformat()
         source_root = raw.get("source_observation_root")
         snapshot.payload = None
         snapshot.selected = None
+        snapshot.verified_features = None
         stages["footer_projection"] = round((time.perf_counter() - started) * 1_000, 3)
         started = time.perf_counter()
         public = build_data_monitor_feature_inventory(root, monitor_status=public_status, inventory=raw)
@@ -458,10 +482,12 @@ def _publish_feature_inventory_snapshot(
     _write_feature_reuse_receipt(
         output, fields, validated_contract=True, feature_revision=feature_revision,
         source_metadata_sha256=source_metadata_sha256, source_observation_root=source_root,
+        source_verified_at_utc=source_verified_at_utc,
         preview=preview, source_pages=source_pages,
     )
     stages["receipt"] = round((time.perf_counter() - started) * 1_000, 3)
-    return {"fields": fields, "source_observation_root": source_root, "stages_ms": stages,
+    return {"fields": fields, "source_observation_root": source_root,
+            "source_verified_at_utc": source_verified_at_utc, "stages_ms": stages,
             "inventory_timing_ms": inventory_timing, "projection_cache": projection_cache}
 
 
@@ -500,6 +526,32 @@ def publish_feature_inventory_snapshot(
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _catalog_snapshot(public_status_output, *, name, builder, observed, audit_seconds, **kwargs):
+    cache_path = public_status_output.with_name(name + "_inventory_cache.json")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(cache_path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "a+b") as handle:
+        # Both maintenance and normal publication use the same cache owner.
+        # Serialize the read/build/write transaction so neither loses progress.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            previous = private_json.loads(cache_path.read_bytes())
+            if not isinstance(previous, dict):
+                previous = {}
+        except (OSError, ValueError):
+            previous = {}
+        inventory, current = builder(REPO_ROOT, previous=previous, now=observed,
+                                     audit_seconds=audit_seconds, **kwargs)
+        if current != previous:
+            _atomic_json(cache_path, current, compact=True)
+        return inventory
+
+
+def _tick_inventory_snapshot(public_status_output, *, observed, audit_seconds):
+    return _catalog_snapshot(public_status_output, name="tick", builder=build_tick_inventory,
+                             observed=observed, audit_seconds=audit_seconds)
+
+
 def main() -> int:
     started = time.perf_counter()
     cpu_started = time.process_time()
@@ -516,6 +568,22 @@ def main() -> int:
         else REPO_ROOT / args.feature_inventory_output
     )
     observed = datetime.now(UTC)
+    if getattr(args, "tick_audit_only", False):
+        inventory = _tick_inventory_snapshot(public_status_output, observed=observed,
+                                              audit_seconds=args.tick_audit_seconds)
+        print(json.dumps({"tick_audit": inventory["collection"], "revision": inventory["revision"],
+                          "elapsed_seconds": round(time.perf_counter() - started, 3)}), flush=True)
+        return 0 if inventory["collection"]["source_errors"] == 0 else 1
+    if getattr(args, "bar_audit_only", False):
+        # Maintenance only advances private date evidence. The canonical
+        # publisher supplies fresh record counts; do not rebuild its 184 MB
+        # inventory merely to discard this audit's public projection.
+        record_inventory = {"datasets": {}}
+        inventory = _catalog_snapshot(public_status_output, name="bar", builder=build_bar_inventory,
+            observed=observed, audit_seconds=args.bar_audit_seconds, record_inventory=record_inventory)
+        print(json.dumps({"bar_audit": inventory["collection"], "revision": inventory["revision"],
+                          "elapsed_seconds": round(time.perf_counter() - started, 3)}), flush=True)
+        return 0 if inventory["collection"]["source_errors"] == 0 else 1
     services = _refresh_service_states(now=observed)
     if not any(
         state.get("evidence_source") == "systemd_live"
@@ -534,7 +602,9 @@ def main() -> int:
     services_elapsed = time.perf_counter() - started
     inventory_snapshot = InventorySnapshot(REPO_ROOT)
     record_inventory = build_record_inventory(
-        REPO_ROOT, refresh=True, snapshot=inventory_snapshot
+        REPO_ROOT, refresh=True, snapshot=inventory_snapshot, incremental_store=True,
+        incremental_metadata=True, incremental_stats=True, incremental_schemas=True,
+        capture_features=True,
     )
     inventory_elapsed = time.perf_counter() - started - services_elapsed
     public_status_timing_ms: dict[str, float] = {}
@@ -550,18 +620,14 @@ def main() -> int:
         f"shioaji.{key}": value for key, value in shioaji_timing_ms.items()
     })
     tick_started = time.perf_counter()
-    tick_cache_path = public_status_output.with_name("tick_inventory_cache.json")
-    try:
-        tick_previous = json.loads(tick_cache_path.read_bytes())
-        if not isinstance(tick_previous, dict):
-            tick_previous = {}
-    except (OSError, ValueError):
-        tick_previous = {}
-    tick_inventory, tick_cache = build_tick_inventory(REPO_ROOT, previous=tick_previous, now=observed,
-                                                     audit_seconds=args.tick_audit_seconds)
-    if tick_cache != tick_previous:
-        _atomic_json(tick_cache_path, tick_cache, compact=True)
+    tick_inventory = _tick_inventory_snapshot(public_status_output, observed=observed,
+                                               audit_seconds=getattr(args, "tick_audit_seconds", 2.))
     public_status_timing_ms["tick_inventory"] = round((time.perf_counter() - tick_started) * 1_000, 3)
+    bar_started = time.perf_counter()
+    bar_inventory = _catalog_snapshot(public_status_output, name="bar", builder=build_bar_inventory,
+        observed=datetime.now(UTC), audit_seconds=getattr(args, "bar_audit_seconds", 2.),
+        record_inventory=record_inventory, inventory_snapshot=inventory_snapshot)
+    public_status_timing_ms["bar_inventory"] = round((time.perf_counter() - bar_started) * 1_000, 3)
     public_status = build_data_monitor_public_status(
         REPO_ROOT,
         now=observed,
@@ -569,6 +635,7 @@ def main() -> int:
         shioaji_status=shioaji_status,
         record_inventory=record_inventory,
         tick_inventory=tick_inventory,
+        bar_inventory=bar_inventory,
         timing_ms=public_status_timing_ms,
     )
     # This snapshot is rebuilt and read every 30 seconds.  Compact encoding
@@ -623,6 +690,8 @@ def main() -> int:
         "reuse_check": round((time.perf_counter() - feature_stage_started) * 1_000, 3),
     }
     feature_reused = feature_count is not None
+    feature_verified_during_record = inventory_snapshot.verified_features is not None
+    feature_verified_at_utc = None
     feature_source_root = inventory_source_root if feature_reused else None
     feature_inventory_timing_ms: dict[str, float] = {}
     feature_projection_cache: dict[str, object] = {"state": "whole_snapshot_reused"}
@@ -650,6 +719,7 @@ def main() -> int:
         else:
             feature_count = publication["fields"]
             feature_source_root = publication["source_observation_root"]
+            feature_verified_at_utc = publication["source_verified_at_utc"]
             feature_stages_ms.update(publication["stages_ms"])
             feature_inventory_timing_ms.update(publication["inventory_timing_ms"])
             feature_projection_cache = publication["projection_cache"]
@@ -697,6 +767,7 @@ def main() -> int:
         },
         "inventory_stages_ms": record_inventory.get("timing_ms", {}),
         "inventory_cache_encoding": record_inventory.get("cache_encoding_observation"),
+        "inventory_cache_payload_reused": record_inventory.get("cache_payload_reused"),
         "inventory_mapping_validation_types": record_inventory.get("mapping_validation_types"),
         "inventory_source_observation_root": record_inventory.get("source_observation_root"),
         "inventory_feature_revision": record_inventory.get("feature_revision"),
@@ -712,6 +783,8 @@ def main() -> int:
             "matches_record": isinstance(inventory_source_root, str)
                 and feature_source_root == inventory_source_root,
             "inventory_matches_cache": record_inventory.get("source_observation_matches_cache") is True,
+            "verified_during_record": feature_verified_during_record,
+            "verified_at_utc": feature_verified_at_utc,
         },
         "sources": len(public_status.get("sources") or ()),
         "features": feature_count,

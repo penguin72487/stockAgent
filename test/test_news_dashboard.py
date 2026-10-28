@@ -18,11 +18,256 @@ NOW = datetime(2026, 10, 8, 15, tzinfo=UTC)
 REPO = Path(__file__).resolve().parents[1]
 
 
+def local_replay_sample():
+    return {'contract_version': 1, 'current_source_contract_only': True,
+        'retry_records_are_article_counts': False, 'entries': {
+            'api_pages': {'records': 3, 'earliest_not_before_utc': NOW.isoformat(), 'path': 'PRIVATE_PATH'},
+            'metadata_batches': {'records': 0, 'earliest_not_before_utc': None},
+            'diagnostic_originals': None}, 'error': 'PRIVATE_ERROR'}
+
+
+def metadata_resource_sample():
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'records_are_article_counts': False, 'records': 2, 'above_current_bound_records': 1,
+            'current_bound_bytes': 32 << 20, 'max_observed_required_bytes': 64 << 20,
+            'path': 'PRIVATE_RESOURCE_PATH'}
+
+
+def metadata_large_sample():
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'retry_records_are_article_completion': False, 'assigned': True, 'retry_records': 2,
+            'earliest_not_before_utc': NOW.isoformat(), 'path': 'PRIVATE_LARGE_SOURCE'}
+
+
+def test_large_replay_projection_is_private_scoped_and_not_completion(tmp_path):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_large_replay'] = metadata_large_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_large_replay'] == {key: value for key, value in metadata_large_sample().items() if key != 'path'}
+    assert all(row['metadata_large_replay'] is None for row in result['providers'] if row['id'] != 'cnyes')
+    assert not result['scope']['publisher_calls_on_page_view'] and 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'current_source_contract_only': False},
+    {'retry_records_are_article_completion': True}, {'assigned': 1},
+    {'retry_records': True}, {'retry_records': -1}, {'retry_records': 2**53},
+    {'earliest_not_before_utc': None}, {'earliest_not_before_utc': 'invalid'},
+])
+def test_invalid_or_missing_large_replay_snapshot_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_large_replay'] = {**metadata_large_sample(), **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_large_replay'] is None
+    del status['cnyes_metadata_large_replay']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_large_replay'] is None
+
+
+def metadata_index_sample():
+    return {'contract_version': 1, 'current_source_contract_only': True,
+            'counts_are_article_completion': False, 'state': 'scanning', 'rows_seen': 123,
+            'registered_heads': 4, 'dirty_processed': 2, 'cursor_resets': 1,
+            'invalid_heads_observed': 1,
+            'updated_at_utc': NOW.isoformat(), 'source_fingerprint': 'PRIVATE_INDEX_SOURCE'}
+
+
+def test_metadata_index_projection_is_private_scoped_and_not_article_progress(tmp_path):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_index_progress'] = metadata_index_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_index_progress'] == {
+        key: value for key, value in metadata_index_sample().items() if key != 'source_fingerprint'}
+    assert all(row['metadata_index_progress'] is None for row in result['providers'] if row['id'] != 'cnyes')
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert not result['scope']['publisher_calls_on_page_view'] and 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'current_source_contract_only': False},
+    {'counts_are_article_completion': True}, {'state': 'done'}, {'rows_seen': -1},
+    {'registered_heads': True}, {'dirty_processed': 2**53}, {'cursor_resets': None},
+    {'invalid_heads_observed': -1},
+    {'updated_at_utc': None}, {'updated_at_utc': 'invalid'},
+])
+def test_invalid_or_missing_metadata_index_snapshot_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_index_progress'] = {**metadata_index_sample(), **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_index_progress'] is None
+    del status['cnyes_metadata_index_progress']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_index_progress'] is None
+
+
+def test_metadata_resource_projection_is_private_scoped_and_not_article_progress(tmp_path):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_resource_waits'] = metadata_resource_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_resource_waits'] == {
+        key: value for key, value in metadata_resource_sample().items() if key != 'path'}
+    assert all(row['metadata_resource_waits'] is None for row in result['providers'] if row['id'] != 'cnyes')
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert not result['scope']['publisher_calls_on_page_view'] and 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'current_source_contract_only': False},
+    {'records_are_article_counts': True}, {'records': -1}, {'records': True},
+    {'records': 2**53}, {'above_current_bound_records': 3},
+    {'above_current_bound_records': 0}, {'current_bound_bytes': 0},
+    {'max_observed_required_bytes': None}, {'max_observed_required_bytes': 1},
+])
+def test_invalid_or_missing_metadata_resource_snapshot_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['cnyes_metadata_resource_waits'] = {**metadata_resource_sample(), **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_resource_waits'] is None
+    del status['cnyes_metadata_resource_waits']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['metadata_resource_waits'] is None
+
+
+def test_local_replay_projection_is_private_scoped_and_not_article_progress(tmp_path):
+    status = _seed(tmp_path)
+    status['cnyes_local_replay_retries'] = local_replay_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    entries = source['local_replay_retries']['entries']
+    assert entries == {'api_pages': {'records': 3, 'earliest_not_before_utc': NOW.isoformat()},
+        'metadata_batches': {'records': 0, 'earliest_not_before_utc': None}, 'diagnostic_originals': None}
+    assert all(row['local_replay_retries'] is None for row in result['providers'] if row['id'] != 'cnyes')
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert not result['scope']['publisher_calls_on_page_view'] and 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('kind,value', [
+    ('contract_version', True), ('current_source_contract_only', False),
+    ('retry_records_are_article_counts', True), ('entries', {}),
+    ('api_pages', {'records': True, 'earliest_not_before_utc': NOW.isoformat()}),
+    ('api_pages', {'records': -1, 'earliest_not_before_utc': NOW.isoformat()}),
+    ('api_pages', {'records': 2**53, 'earliest_not_before_utc': NOW.isoformat()}),
+    ('api_pages', {'records': 3, 'earliest_not_before_utc': None}),
+    ('api_pages', {'records': 3, 'earliest_not_before_utc': 'invalid'}),
+    ('api_pages', {'records': 3, 'earliest_not_before_utc': '0001-01-01T00:00:00+23:59'}),
+    ('api_pages', {'records': 0, 'earliest_not_before_utc': NOW.isoformat()}),
+    ('api_pages', {'records': 0}),
+])
+def test_invalid_or_missing_local_replay_snapshot_is_unknown(tmp_path, kind, value):
+    status = _seed(tmp_path)
+    snapshot = local_replay_sample()
+    if kind == 'api_pages':
+        snapshot['entries'][kind] = value
+    else:
+        snapshot[kind] = value
+    status['cnyes_local_replay_retries'] = snapshot
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['local_replay_retries'] is None
+    del status['cnyes_local_replay_retries']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['local_replay_retries'] is None
+
+
 def disk_sample(*, free=19, required=25):
     return {'contract_version': 1, 'checked_at_utc': NOW.isoformat(), 'free_bytes': free,
         'required_free_bytes': required, 'shortfall_bytes': max(0,required-free),
         'fetch_allowed': free >= required, 'automatic_recheck_seconds': 60,
         'path': 'PRIVATE_STORAGE_PATH', 'token': 'PRIVATE_DISK_TOKEN'}
+
+
+def test_url_inbox_projection_is_bounded_private_and_separate_from_articles(tmp_path):
+    status = _seed(tmp_path)
+    status['url_metadata_inbox'] = {'contract_version': 1, 'available': True,
+        'request_files': 2, 'pending_requests': 2, 'targets_unexamined': 3,
+        'completed_unarchived': 0, 'invalid_or_unreadable': 0,
+        'url': 'PRIVATE_URL', 'token': 'PRIVATE_TOKEN'}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['url_metadata_inbox'] == {'contract_version': 1, 'request_files': 2,
+        'pending_requests': 2, 'targets_unexamined': 3, 'completed_unarchived': 0,
+        'invalid_or_unreadable': 0}
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'available': False}, {'request_files': 65},
+    {'request_files': 3}, {'pending_requests': -1}, {'targets_unexamined': True},
+    {'targets_unexamined': 1}, {'targets_unexamined': 1025},
+])
+def test_invalid_or_old_url_inbox_projection_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['url_metadata_inbox'] = {'contract_version': 1, 'available': True,
+        'request_files': 2, 'pending_requests': 2, 'targets_unexamined': 3,
+        'completed_unarchived': 0, 'invalid_or_unreadable': 0, **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    assert build_news_public_status(tmp_path, now=NOW)['url_metadata_inbox'] is None
+    del status['url_metadata_inbox']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    assert build_news_public_status(tmp_path, now=NOW)['url_metadata_inbox'] is None
+
+
+def candidate_work_sample():
+    return {'contract_version': 1, 'available': True, 'request_files': 3,
+        'pending_unadmitted': 1, 'already_registered': 1, 'invalid_or_unreadable': 1,
+        'jobs': {'ready': 2, 'reserved': 0, 'orphaned_reservation': 1, 'uncertain_outcome': 1},
+        'providers': {'cnyes': {'pending_unadmitted': 1, 'ready': 1, 'reserved': 0,
+                                'orphaned_reservation': 1, 'uncertain_outcome': 1,
+                                'url': 'PRIVATE_URL'}},
+        'unregistered': {'pending_unadmitted': 0, 'ready': 1, 'reserved': 0,
+                         'orphaned_reservation': 0, 'uncertain_outcome': 0,
+                         'body': 'PRIVATE_BODY'}, 'token': 'PRIVATE_TOKEN'}
+
+
+def test_candidate_work_projection_is_private_and_separate_from_article_progress(tmp_path):
+    status = _seed(tmp_path)
+    status['candidate_diagnostic_progress'] = candidate_work_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    work = result['candidate_diagnostic_progress']
+    assert work['request_files'] == 3 and work['pending_unadmitted'] == 1
+    assert work['jobs'] == {'ready': 2, 'reserved': 0, 'orphaned_reservation': 1, 'uncertain_outcome': 1}
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['candidate_diagnostic_work'] == work['providers']['cnyes']
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert not result['scope']['publisher_calls_on_page_view']
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'available': False}, {'request_files': 17},
+    {'request_files': 2}, {'pending_unadmitted': True}, {'invalid_or_unreadable': -1},
+    {'jobs': {'ready': 2, 'reserved': 0, 'orphaned_reservation': 0, 'uncertain_outcome': 1}},
+    {'providers': {'private_source': {'pending_unadmitted': 1, 'ready': 1, 'reserved': 0,
+                                     'orphaned_reservation': 1, 'uncertain_outcome': 1}}},
+    {'unregistered': {'pending_unadmitted': 0, 'ready': -1, 'reserved': 0,
+                      'orphaned_reservation': 0, 'uncertain_outcome': 0}},
+])
+def test_invalid_or_missing_candidate_work_remains_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['candidate_diagnostic_progress'] = {**candidate_work_sample(), **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['candidate_diagnostic_progress'] is None
+    assert next(row for row in result['providers'] if row['id'] == 'cnyes')['candidate_diagnostic_work'] is None
+    del status['candidate_diagnostic_progress']
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    assert build_news_public_status(tmp_path, now=NOW)['candidate_diagnostic_progress'] is None
 
 
 def test_disk_constraint_outlives_inventory_phase_and_clears_on_real_sample(tmp_path):
@@ -45,8 +290,52 @@ def test_disk_constraint_outlives_inventory_phase_and_clears_on_real_sample(tmp_
     assert result['worker']['disk_admission']['fetch_allowed'] and source['conditional_eta_seconds'] is not None
 
 
+def unknown_backing_sample(state='pending', *, inflight=True):
+    return {**disk_sample(), 'free_bytes': None, 'shortfall_bytes': None,
+            'backing_free_bytes': None, 'fetch_allowed': False,
+            'physical_backing_state': state, 'physical_probe_inflight': inflight}
+
+
+@pytest.mark.parametrize(('state', 'inflight'), [
+    ('pending', True), ('unavailable', False), ('unavailable', True), ('stale', True),
+])
+def test_unknown_backing_explains_wait_without_fabricating_capacity(tmp_path, state, inflight):
+    status = _seed(tmp_path)
+    status.update(activity='inventorying', disk_admission=unknown_backing_sample(state, inflight=inflight))
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id']=='cnyes')
+    assert result['health'] == 'waiting_disk' and result['worker']['source_activity'] == 'inventorying'
+    assert result['worker']['disk_admission'] is None
+    assert result['worker']['disk_verification'] == {
+        'contract_version': 1, 'state': state, 'probe_inflight': inflight,
+        'checked_at_utc': NOW.isoformat(), 'required_free_bytes': 25, 'automatic_recheck_seconds': 60}
+    assert result['acquisition']['stored_body_articles'] == 2
+    assert result['acquisition']['eligible_eta_seconds'] is None and source['conditional_eta_seconds'] is None
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('patch', [
+    {'physical_backing_state': 'invented'}, {'physical_backing_state': {}}, {'physical_probe_inflight': False},
+    {'physical_probe_inflight': 1}, {'fetch_allowed': True}, {'free_bytes': 25},
+    {'shortfall_bytes': 0}, {'backing_free_bytes': 0}, {'required_free_bytes': True},
+    {'automatic_recheck_seconds': 0}, {'contract_version': True},
+    {'checked_at_utc': (NOW-timedelta(seconds=181)).isoformat()},
+    {'checked_at_utc': (NOW+timedelta(seconds=10)).isoformat()},
+])
+def test_invalid_unknown_backing_still_cannot_restore_live_forecast(tmp_path, patch):
+    status = _seed(tmp_path)
+    status.update(activity='inventorying', disk_admission={**unknown_backing_sample(), **patch})
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['health'] == 'unavailable'
+    assert result['worker']['disk_admission'] is None and result['worker']['disk_verification'] is None
+    assert result['acquisition']['eligible_eta_seconds'] is None
+
+
 @pytest.mark.parametrize('patch', [
     {'free_bytes':True}, {'required_free_bytes':-1}, {'shortfall_bytes':0},
+    {'free_bytes':None, 'shortfall_bytes':None, 'fetch_allowed':False},
     {'fetch_allowed':True}, {'contract_version':True}, {'automatic_recheck_seconds':0},
     {'checked_at_utc':(NOW-timedelta(seconds=181)).isoformat()},
     {'checked_at_utc':(NOW+timedelta(seconds=10)).isoformat()},
@@ -58,6 +347,28 @@ def test_invalid_or_stale_disk_sample_cannot_restore_a_live_forecast(tmp_path,pa
     result = build_news_public_status(tmp_path,now=NOW)
     assert result['health']=='unavailable' and result['worker']['disk_admission'] is None
     assert next(row for row in result['providers'] if row['id']=='cnyes')['conditional_eta_seconds'] is None
+
+
+@pytest.mark.parametrize(('age', 'available'), [(89, True), (90, True), (91, False)])
+def test_backing_sample_projection_expires_at_the_owners_deadline(tmp_path, age, available):
+    status = _seed(tmp_path)
+    status.update(activity='waiting_next_due', disk_admission={**disk_sample(free=30),
+        'checked_at_utc': (NOW-timedelta(seconds=age)).isoformat(),
+        'physical_backing_state': 'available', 'physical_probe_inflight': True})
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert (result['worker']['disk_admission'] is not None) is available
+    assert result['health'] == ('waiting' if available else 'unavailable')
+    if not available:
+        assert result['acquisition']['eligible_eta_seconds'] is None
+
+
+def test_native_disk_sample_retains_the_general_heartbeat_expiry(tmp_path):
+    status = _seed(tmp_path)
+    status['disk_admission'] = {**disk_sample(free=30), 'physical_backing_state': 'not_required',
+                               'checked_at_utc': (NOW-timedelta(seconds=120)).isoformat()}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    assert build_news_public_status(tmp_path, now=NOW)['worker']['disk_admission']['fetch_allowed']
 
 
 def test_stopped_owner_is_not_reclassified_as_a_disk_wait(tmp_path):
@@ -137,6 +448,57 @@ def _seed(root: Path, *, now: datetime = NOW) -> dict:
         "secret": "PRIVATE_TOKEN",
     })
     return status
+
+
+def _discovery_error_snapshot(root: Path, *, now: datetime = NOW):
+    status = _seed(root, now=now)
+    status['discovery_errors'] = 3
+    status['discovery_error_rollup'] = {
+        'contract_version': 1, 'state': 'ready', 'scanned_rows': 400,
+        'active_errors': 3, 'providers': {
+            'cnyes': {'active_errors': 2, 'kinds': {'cnyes_news': 2}, 'reasons': {'http_404': 2},
+                      'private_url': 'PRIVATE_URL', 'raw_error': 'PRIVATE_TOKEN'},
+            'globalvoices': {'active_errors': 1, 'kinds': {'rss_fulltext': 1}, 'reasons': {'invalid_feed': 1}},
+        }, 'private_rows': ['PRIVATE_BODY'],
+    }
+    atomic_write_json(root / 'data_news_fulltext/status.json', status)
+    return status
+
+
+def test_discovery_error_rollup_is_per_provider_and_preserves_snapshot_semantics(tmp_path):
+    _discovery_error_snapshot(tmp_path)
+    result = build_news_public_status(tmp_path, now=NOW)
+    rows = {row['id']: row for row in result['providers']}
+    assert result['discovery_error_rollup'] == {'state': 'ready', 'scanned_rows': 400, 'active_errors': 3}
+    assert rows['cnyes']['discovery_errors'] == {'active_errors': 2, 'kinds': {'cnyes_news': 2}, 'reasons': {'http_404': 2}}
+    assert rows['globalvoices']['discovery_errors']['active_errors'] == 1
+    assert rows['unregistered:example.org']['discovery_errors']['active_errors'] == 0
+    assert rows['cnyes']['state'] == 'backfilling'  # A page error is not a provider-wide stop.
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('variant', ['old', 'building', 'bad_total', 'unknown_reason', 'bad_provider', 'bad_count'])
+def test_discovery_error_old_partial_or_invalid_snapshots_never_become_zero(tmp_path, variant):
+    status = _discovery_error_snapshot(tmp_path)
+    rollup = status['discovery_error_rollup']
+    if variant == 'old':
+        del status['discovery_error_rollup']
+    elif variant == 'building':
+        rollup.update(state='building', active_errors=None, providers=None)
+    elif variant == 'bad_total':
+        rollup['active_errors'] = 2
+    elif variant == 'unknown_reason':
+        rollup['providers']['cnyes']['reasons'] = {'PRIVATE_TOKEN': 2}
+    elif variant == 'bad_provider':
+        rollup['providers']['PRIVATE_TOKEN'] = rollup['providers'].pop('cnyes')
+    else:
+        rollup['providers']['cnyes']['active_errors'] = 1
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    row = next(item for item in result['providers'] if item['id'] == 'cnyes')
+    assert row['discovery_errors'] is None
+    assert result['discovery_error_rollup'] is None or result['discovery_error_rollup']['state'] == 'building'
+    assert 'PRIVATE_' not in json.dumps(result)
 
 
 def _resolution_snapshot():
@@ -688,6 +1050,9 @@ def _request_scope_status(tmp_path, *, paused=4):
             'other_missing_body_urls': 4 - paused, 'policy_paused_missing_body_urls': paused,
             'gateway_paused_missing_body_urls': 0, 'source_recovery_verified': False,
             'next_source_probe_at_utc': (NOW + timedelta(seconds=30)).isoformat() if paused else None,
+            'pending_source_rechecks': {'contract_version': 1, 'available': True,
+                'unverified_missing_body_urls': paused, 'due_missing_body_urls': 0,
+                'next_probe_at_utc': (NOW + timedelta(seconds=30)).isoformat() if paused else None},
             'private_url': 'PRIVATE_URL', 'body': 'PRIVATE_BODY'}}
     return status
 
@@ -726,6 +1091,54 @@ def test_unaffected_missing_scopes_keep_rate_and_eta_despite_unrelated_origin_pa
     assert source['conditional_eta_seconds'] == 40 and source['conditional_eta_unavailable_reason'] is None
     assert source['body_request_scope_progress']['other_missing_body_urls'] == 4
     assert source['robots_origin_policy_pause']['active_origin_count'] == 1
+
+
+def test_expired_unverified_source_never_borrows_other_lane_speed(tmp_path):
+    status = _request_scope_status(tmp_path, paused=0)
+    status['providers']['cnyes']['body_work_progress']['request_scope_progress']['pending_source_rechecks'] = {
+        'contract_version': 1, 'available': True, 'unverified_missing_body_urls': 3,
+        'due_missing_body_urls': 3, 'next_probe_at_utc': (NOW - timedelta(seconds=20)).isoformat(),
+        'origin': 'PRIVATE_ORIGIN'}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    scope = source['body_request_scope_progress']
+    assert scope['source_paused_missing_body_urls'] == 0
+    assert scope['pending_source_rechecks']['unverified_missing_body_urls'] == 3
+    assert scope['pending_source_rechecks']['due_missing_body_urls'] == 3
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_paused'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+    assert 'PRIVATE_ORIGIN' not in json.dumps(result)
+
+
+def test_legacy_scope_cannot_prove_no_unverified_source_failures(tmp_path):
+    status = _request_scope_status(tmp_path, paused=0)
+    del status['providers']['cnyes']['body_work_progress']['request_scope_progress']['pending_source_rechecks']
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['body_request_scope_progress']['pending_source_rechecks'] is None
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'available': 1}, {'unverified_missing_body_urls': True},
+    {'unverified_missing_body_urls': 5}, {'due_missing_body_urls': 4},
+    {'next_probe_at_utc': None}, {'next_probe_at_utc': 'PRIVATE_TIME'},
+    {'next_probe_at_utc': (NOW + timedelta(days=2)).isoformat()},
+    {'available': False},
+])
+def test_invalid_recheck_evidence_is_unknown_and_cannot_reenable_eta(tmp_path, patch):
+    status = _request_scope_status(tmp_path, paused=0)
+    status['providers']['cnyes']['body_work_progress']['request_scope_progress']['pending_source_rechecks'] = {
+        'contract_version': 1, 'available': True, 'unverified_missing_body_urls': 3,
+        'due_missing_body_urls': 3, 'next_probe_at_utc': (NOW - timedelta(seconds=20)).isoformat(), **patch}
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['body_request_scope_progress']['pending_source_rechecks'] is None
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
 
 
 @pytest.mark.parametrize('patch', [{'contract_version': True}, {'available': True, 'other_missing_body_urls': 1},
@@ -938,6 +1351,34 @@ def test_canonical_routes_and_immediate_snapshot_revision_invalidation(tmp_path,
         server.server_close()
 
 
+@pytest.mark.parametrize('monotonic_delta', [0.1, 2.0])
+def test_cached_news_response_cannot_extend_backing_sample_validity(tmp_path, monkeypatch, monotonic_delta):
+    current = [datetime.now(UTC)]
+    status = _seed(tmp_path, now=current[0])
+    status.update(activity='waiting_next_due', disk_admission={**disk_sample(free=30),
+        'checked_at_utc': (current[0]-timedelta(seconds=89)).isoformat(),
+        'physical_backing_state': 'available', 'physical_probe_inflight': True})
+    _save(tmp_path, status)
+    original = gateway.build_news_public_status
+    monkeypatch.setattr(gateway, 'build_news_public_status', lambda root: original(root, now=current[0]))
+    monkeypatch.setattr(gateway.time, 'time', lambda: current[0].timestamp())
+    monotonic = [1000.0]
+    monkeypatch.setattr(gateway.time, 'monotonic', lambda: monotonic[0])
+    server = _server(tmp_path)
+    try:
+        handler = SimpleNamespace(server=server)
+        first = gateway.PublicDashboardHandler._api_response(handler, '/news/api/status', '')
+        assert json.loads(first.body)['worker']['disk_admission']['fetch_allowed']
+        current[0] += timedelta(seconds=2)
+        monotonic[0] += monotonic_delta
+        expired = gateway.PublicDashboardHandler._api_response(handler, '/news/api/status', '')
+        assert expired is not first
+        projected = json.loads(expired.body)
+        assert projected['worker']['disk_admission'] is None and projected['health'] == 'unavailable'
+    finally:
+        server.server_close()
+
+
 @pytest.mark.parametrize("path", ["/news", "/news/", "/news/app.js", "/news/api/status"])
 @pytest.mark.parametrize("headers", [{}, {"X-StockAgent-Audience": "owner",
     "X-WireGuard-Role": "owner", "X-Forwarded-For": "192.168.50.100"}])
@@ -976,6 +1417,106 @@ def test_news_endpoint_is_same_origin_and_rejects_control_requests(tmp_path):
         assert response.status in {405, 501}
     finally:
         conn.close(); server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_news_browser_distinguishes_unknown_backing_from_measured_low_disk(tmp_path):
+    from playwright.sync_api import sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+    now = datetime.now(UTC)
+    status = _seed(tmp_path, now=now)
+    status.update(activity='inventorying', disk_admission={**unknown_backing_sample(), 'checked_at_utc': now.isoformat()})
+    _save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    try:
+        with sync_playwright() as runtime:
+            browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'), timeout=10000)
+            try:
+                page = browser.new_page(viewport={'width': 390, 'height': 900})
+                remote, errors = [], []
+                page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+                page.on('pageerror', lambda error: errors.append(str(error)))
+                page.goto(base + '/news/', wait_until='domcontentloaded')
+                page.locator('#news-health').get_by_text('等待磁碟空間').wait_for(timeout=10000)
+                for state, inflight, message in [
+                    ('pending', True, '正在查證實體磁碟空間'),
+                    ('unavailable', False, '實體磁碟空間查證失敗'),
+                    ('stale', True, '上次實體磁碟空間查證已過期'),
+                ]:
+                    status['disk_admission'] = {**unknown_backing_sample(state, inflight=inflight),
+                                                'checked_at_utc': now.isoformat()}
+                    _save(tmp_path, status)
+                    projected = build_news_public_status(tmp_path, now=now)
+                    page.evaluate('(data) => render(data)', projected)
+                    assert message in page.locator('#capture-next').text_content()
+                    assert '實體磁碟空間尚未確認' in page.locator('#eligible-eta-basis').text_content()
+                    assert '磁碟可用' not in page.locator('#capture-next').text_content()
+                    assert '暫無有效估時' in page.locator('#eligible-eta').text_content()
+                status['disk_admission'] = {**disk_sample(), 'checked_at_utc': now.isoformat()}
+                _save(tmp_path, status)
+                page.evaluate('(data) => render(data)', build_news_public_status(tmp_path, now=now))
+                assert '磁碟可用' in page.locator('#capture-next').text_content()
+                assert '磁碟不足' in page.locator('#eligible-eta-basis').text_content()
+                status['disk_admission'] = {**disk_sample(free=25), 'checked_at_utc': now.isoformat()}
+                _save(tmp_path, status)
+                page.evaluate('(data) => render(data)', build_news_public_status(tmp_path, now=now))
+                assert '到期 feed 優先' in page.locator('#capture-next').text_content()
+                assert not remote and not errors
+            finally:
+                browser.close()
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_news_browser_shows_discovery_errors_without_calling_publishers(tmp_path):
+    from playwright.sync_api import sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+
+    now = datetime.now(UTC)
+    status = _discovery_error_snapshot(tmp_path, now=now)
+    status['discovery_error_rollup']['providers']['cnyes']['reasons'] = {'http_404': 1, 'restricted_content': 1}
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    try:
+        with sync_playwright() as runtime:
+            browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'), timeout=10000)
+            try:
+                page = browser.new_page(viewport={'width': 390, 'height': 900})
+                remote, errors = [], []
+                page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+                page.on('pageerror', lambda error: errors.append(str(error)))
+                page.goto(base + '/news/', wait_until='domcontentloaded')
+                page.locator('#news-health').get_by_text('正在抓取').wait_for(timeout=10000)
+                page.evaluate("StockAgentAcquisition.reveal('pipelines')")
+                page.locator('#pipelines').scroll_into_view_if_needed()
+                detail = page.locator('[data-news-discovery-provider="cnyes"]')
+                try:
+                    page.locator('#pipeline-grid .pipeline-card').first.wait_for(timeout=10000)
+                except Exception as error:
+                    raise AssertionError({'page_errors': errors, 'grid': page.locator('#pipeline-grid').text_content()}) from error
+                assert detail.count() == 1, {'grid': page.locator('#pipeline-grid').text_content(), 'errors': errors}
+                assert '清點異常 2 頁' in detail.locator('summary').text_content()
+                detail.locator('summary').click()
+                assert 'HTTP 404 1 頁' in detail.text_content()
+                assert '不能只靠此原因判斷卡住' in detail.text_content()
+                assert '不代表整個來源停擺' in detail.text_content()
+                detail.locator('summary').focus()
+                page.evaluate('(data) => render(data)', build_news_public_status(tmp_path, now=now))
+                detail = page.locator('[data-news-discovery-provider="cnyes"]')
+                assert detail.get_attribute('open') is not None
+                assert page.evaluate('document.activeElement === document.querySelector(\'[data-news-discovery-provider="cnyes"] > summary\')')
+                page.locator('[data-news-filter=attention]').click()
+                assert page.locator('[data-news-discovery-provider="cnyes"]').count() == 1
+                assert 'PRIVATE_' not in page.locator('body').text_content()
+                assert not remote and not errors
+            finally:
+                browser.close()
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
 def test_news_browser_filters_pages_recovers_and_never_calls_publishers(tmp_path):
@@ -1040,6 +1581,13 @@ def test_news_browser_filters_pages_recovers_and_never_calls_publishers(tmp_path
                     page.locator("#news-health").get_by_text("更新暫停，顯示上次資料").wait_for(timeout=5000)
                     assert page.locator("#body-count").text_content() == "2"
                     assert "更新失敗" in page.locator("#eligible-eta").text_content()
+                    assert '觀測已過期' in page.locator('#pipeline-grid .pipeline-card').text_content()
+                    assert '上次記錄局部端點暫停' in page.locator('#pipeline-grid .pipeline-card').text_content()
+                    assert '其他可用端點照常排程' not in page.locator('#pipeline-grid .pipeline-card').text_content()
+                    page.locator('a[href="#acq-quota"]').click()
+                    page.wait_for_function("() => document.querySelectorAll('#traffic-rows tr').length === 11")
+                    assert '觀測已過期' in page.locator('#traffic-rows').text_content()
+                    page.locator('a[href="#acq-catalog"]').click()
                     page.unroute("**/news/api/status")
                     page.locator("#news-health").get_by_text("正在抓取").wait_for(timeout=8000)
                     assert page.locator("#source-search").input_value() == "鉅亨"

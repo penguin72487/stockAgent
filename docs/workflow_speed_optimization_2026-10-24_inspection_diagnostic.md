@@ -16,8 +16,18 @@ R142／R143 分別接續固定比較與完整原始核對診斷。
 R142 已 **8／8 次完整通過**，ABBA／BAAB 的完整 child wall 均值分別少
 **16.7566%／10.1590%**，descendant CPU 分別少 **19.5911%／4.7128%**，
 兩組原門檻均通過，六份輸出語意一致。這是固定 inspection 工作流的採用證據；
-共用 `profile=879e8457…` 尚未套用快取，完整實際 13 階段仍待驗收。
-詳見後段 R134–R157 與逐次原始收據。
+共用 `profile=ae33150c…` 曾通過 953 項資格與正式路徑 38 項測試；R164
+完整實際 13 階段與全部原始 oracles 已驗收，覆蓋增為 2,399／1,708／691。
+10/25 後續 R169 預讀與 R177 SSD 暫時重建視圖比較均通過；R182 整合資格
+**768 項通過**，R184 已安裝 `profile=5329e903…` 及兩個 CPU clock 測試模組。
+安裝後 **77 項通過**，R183 全部 13 階段及原始 oracles 已完成。最後驗證器的
+欄位錯字與舊批次 CEX count 失敗收據保留；R187 完成全部工程 CPU 原值讀回，
+R189 以本批保留原始輸入重建分母，接續完成全部驗收及獨立終結讀回。
+R188 已完成十二個 acquisition adapter 時鐘，Dune／SEC 占 adapter wall 的
+98.2294%；full owner 尚須完成原始驗收，且本輪發現執行中 private JSON source
+drift。R192 已通過固定來源與 package ownership 資格，接續細分保留資料操作。
+整體受控加速比例尚未測定，R183／R189 是最新完成原始驗收的這一批觀察。
+詳見後段 R134–R167 與逐次原始收據。
 
 R77 另已實作私有的寫出時 SHA 候選，等 R69 與 R70／R74–R76 全部終結後
 才進行語意檢查，避免競爭目前全量比較。它沿用 canonical CSV／JSONL
@@ -1203,21 +1213,728 @@ R166 保留兩種 ID 與一對一映射，consumer 以 captured registry 的資�
 核對公開 ID；測試與獨立 reader 則使用 pinned canonical producer 的 pure
 `_presence_row` 作獨立 oracle，不執行觀測到的 archived source，不讀密鑰。
 原 31 個案例保留，補 4 個 mapping 拒絕案例及 1 個 portable fixture 的私有
-benchmark 路徑拒絕案例，credential 共 36；連同原 917 項，**953 項資格仍在
-執行**。新候選 SHA=`ae33150c056f0d5d66f5c904e975b13cd97450dc0f8c0b5cbb3c2390207ab14e`。
-先行純讀取診斷已確認實際 bundle 可產生 **113 個原始 wall／CPU samples**，
-其中只有 45 predicates／90 samples 能綁定；完整封存與 fresh reader 尚待實跑。
-canonical profile 仍 `879e8457…`，全域覆蓋仍 2399／1663／736，沒有把資格
-測試或 pure read 診斷當成實際 13 階段驗收。
+benchmark 路徑拒絕案例，credential 共 36；連同原 917 項，**953 項全部通過**，
+完整 checks child 145.894485 秒 wall／65.258884 秒 descendant CPU。
+候選 SHA=`ae33150c056f0d5d66f5c904e975b13cd97450dc0f8c0b5cbb3c2390207ab14e`。
+R166 實際封存 **113 個原始 wall／CPU samples**，其中只有 45 predicates／
+90 samples 能綁定；collect child 5.642971 秒／1.419055 秒 CPU。
+首次 fresh reader 因補充 collection report 缺少 `sample_counts` 拒絕；
+`inventory_counts` 同樣尚未填入，原失敗報告與全部輸出保留。
 
-R164 已準備沿用 R123 完整 13 階段、14 輸出、6 training roots、239 explicit
+R167 另建一代報告，僅依原始 rows 重算並補上這兩個計數欄位；六份輸出、
+12 份公開證據快照與全部 native clocks 都保持原 bytes。fresh process 通過
+原 reader、45 個 public IDs、90 個綁定樣本、113 個 wall float／CPU 奈秒值
+及兩個完整 13 階段 fixture 的原核對；reader child 11.910739 秒 wall／
+2.729602 秒 descendant CPU。owner 26.670578 秒／5.161056 秒 CPU，
+succeeded／inactive／MainPID 0。沒有以測試或補充計數當作完整實際驗收。
+
+獨立 SHA 讀回後已用相同 bytes 接入 canonical profile 及兩份正式測試。
+R164 不使用私有候選環境，正式路徑 **38 tests 全部通過**；完整 checks child
+4.350600 秒 wall／3.688081 秒 descendant CPU。其後完整實際驗收已成功，
+全域覆蓋由 2399／1663／736 增為 **2399／1708／691**。新增的 45 個
+本地 credential predicates 保留 90 個可綁定 wall／CPU samples；完整實際
+credential audit 共 113 samples，其餘不是獨立來源，不重複增加覆蓋。
+
+R164 已啟動，沿用 R123 完整 13 階段、14 輸出、6 training roots、239 explicit
 receipts、43 TW native operations、完整 CEX／issuer／Dune／SEC 原始 oracles
 及 reconstruction／untouched reader 的新驗收程式；只對 profile／shared packed
 source 增加精確的新資格映射，另加入真實本地 credential receipts。
-須 R166 實際成功並接入同位元實作後才啟動，現在尚未執行或採納。
+owner=`workflow-r164-selected-full-work-20261025T035706-d5cbb492`；03:57 UTC
+啟動，04:44 UTC 完成；實查 succeeded／exit 0／inactive／MainPID 0。
+完整 owner **2847.121674 秒 wall／713.860935 秒 descendant CPU**，包含
+準備、正式測試、collector、物理重建、fresh readers 與所有原始 oracles。
+完整接受收據 SHA=`d5fad4268021535893d6f6c784cfd2940622bc6a70eee913666c3d3a7d9da0c4`；
+另行重新讀取並核對其三份原始 acceptance SHA、45 個唯一新增 IDs 與
+2399／1708／691／113 計數。沒有受控的整體加速結論。
 
 - [R161 全部 917 項及 source-capture 資格](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round161/completion.json)
 - [R162 948 項通過，實際匯入仍拒絕的原始 log](../artifacts/operations/agent-workflow/runs/workflow-r162-selected-actual-cr-20261025T033457-3911356a/run.log)
 - [R165 僅限公開 bundle 的拒絕重現](../artifacts/operations/agent-workflow/runs/workflow-r165-public-credential--20261025T033944-4e17fb2b/run.log)
 - [R166 public／catalog ID 修正及原 oracle 保留](../artifacts/benchmarks/workflow_speed_optimization_20261021/round166/qualify_public_credential_identity.py)
-- [R164 尚待執行的完整實際驗收](../artifacts/benchmarks/workflow_speed_optimization_20261021/round164/run_selected_full_workflow.py)
+- [R167 保留原輸出與 clocks 的獨立讀回](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round167/readback.json)
+- [R164 正式路徑 38 項檢查](../artifacts/benchmarks/workflow_speed_optimization_20261021/round164/maintained_checks.json)
+- [R164 完整實際驗收](../artifacts/benchmarks/workflow_speed_optimization_20261021/round164/run_selected_full_workflow.py)
+- [R164 supervisor 原始收據](../artifacts/operations/agent-workflow/runs/workflow-r164-selected-full-work-20261025T035706-d5cbb492/run.json)
+- [R164 全部 13 階段、原始 oracles 與實際 credentials 接受收據](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/selected_full_acceptance.json)
+
+目前 691 個未綁定身分已逐一對照 R146 的 736 個完整清單與本次接受的
+45 個新增 IDs；差集恰好移除全部 `credential_gate`。剩餘層級如下，層級名稱
+沿用凍結的歷史來源定義，不能當成目前健康狀態或 691 個獨立 API 工作。
+
+| 明確身分層級 | 未綁定數 |
+| --- | ---: |
+| source registry | 240 |
+| logical source | 258 |
+| registered endpoint | 1 |
+| crypto fact family | 35 |
+| physical inventory | 55 |
+| inventory partition | 4 |
+| storage group | 50 |
+| product granularity | 48 |
+
+唯一 registered endpoint 仍為 `dune-query:dune_cex_labeled_flows_daily_v1`；
+先前 credit-blocked／零 rows 收據保留，沒有查詢目前 quota 或推造 API 時鐘。
+完整現行清單由 [R164 canonical inventory](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/collection_full/inventory.json)
+保留；本次差集核對只更新範圍，不新增操作時鐘。
+
+### R168–R169：retained archives 有界原生預讀
+
+R143 的 8,649 份證據／481,280,233 bytes 診斷顯示首輪 serial stat／read
+成本高於 JSON／gzip 計算，因此新候選只改既有 `_retained_replay_inputs()`：
+沿用 `Evidence.ordered_reads()` 與同一 C++ backend，兩個 worker、每批最多
+32 個路徑／2 MiB，native raw copies 上限 10,485,765 bytes。主執行緒仍按
+原順序決定完整 SHA、size／total budget、檔案 generation、snapshot 與拒絕；
+code archives 仍同步讀取，已凍結路徑使用自己的 snapshot。
+結構、宣告容量或檔名不適合預讀時，保留原始 serial 判斷與失敗先後順序。
+
+R168 第一輪 **579 passed／3 failed**；三個新案例把既有
+`RetainedReplayContractError` 子類名稱誤寫為 `ValueError`，實際拒絕訊息相同。
+失敗收據與所有檢查保留。R169 候選實作 bytes 完全不變，只修正三個預期值；
+全部 **582 passed／0 failure／error／skip**，完整 checks child
+**54.548619 秒 wall／49.989774 秒 descendant CPU**。這批包含原十套回歸、
+正式 36＋2 項及新增 37 項，與前述 953 項重疊，不能相加當成不同案例數。
+新增案例對 Python／C++、individual／packed、完整原 bytes 與部分失敗證據、
+相同 archive、多重身分、snapshot 不變、generation retry、預算及 worker
+結束逐項核對。
+
+R169 封存 19 個 source／42 個 inputs，完整候選 SHA=
+`f0d821c7a9e6e55a8bc22298d4373283092415d9b9dbb1a7e7f4b05220ec8911`。
+owner=`workflow-r169-retained-prefetch-20261025T040641-97bb4fca` 已核對
+R164 實際 succeeded／inactive／MainPID 0 及完整接受收據；
+ABBA／BAAB 八次全量比較已完成。每次保留 issuer 16／Dune 70／SEC 84 個原始
+native samples、全 8,649 originals、全部資料列／null mask／float bits／pages、
+六份輸出完整 SHA 及 fresh reader，沒有 API 或 GPU 作業。
+採用門檻預先固定為兩組完整 wall ratio ≤0.98、descendant CPU ratio ≤1.02；
+兩組均通過事先門檻，結果如下。比較完成時 canonical profile 為 R164
+已驗收的 `ae33150c…`；後續相同預讀函式已經 R182 資格並由 R184 合入
+`5329e903…`，安裝後完整 13 階段整合驗收仍在執行。
+
+| 固定順序 | baseline → candidate 完整 wall 均值 | wall 降低 | baseline → candidate descendant CPU 均值 | CPU 變化 |
+| --- | --- | --- | --- | --- |
+| ABBA | 392.736553 → 366.638869 秒 | 6.6451% | 72.631535 → 73.661150 秒 | 增加 1.4176% |
+| BAAB | 686.506488 → 536.481005 秒 | 21.8535% | 105.421909 → 97.751239 秒 | 降低 7.2762% |
+
+全部六份輸出的 SHA／bytes 在八次試次間一致，fresh reader 每次驗證 170
+samples；每次仍讀取 8,649 originals／481,280,233 bytes。較慢的 baseline
+635.699010／737.313967 秒與最後 candidate 706.883833 秒均保留，沒有刪除或
+重跑不利樣本。該次主機與 I/O 負載有漂移，兩個順序各自比較，不混成跨日期的
+一般硬體承諾。R178 短時狀態診斷、R179 失敗 freeze 及 R180 語義測試與部分
+試次同時執行；各自原始收據與計時保留。
+
+owner succeeded／exit 0／inactive／MainPID 0，**6254.103391 秒 wall／
+756.834723 秒 descendant CPU**；包含等待 R164、資格測試、來源核對與完整
+八次試次，不能當作單次 ingestion 成本。comparison SHA=
+`0214b2c8add805cef72095d1a667ca21b863fca74199bb5a9f0c2fda54481c0a`。
+另以 fresh 程序獨立重算兩組全部原始均值、門檻、八個 child collect／reader
+收據、16 個 frozen modules 及六份輸出宣告；完整 metadata 核對
+0.528720 秒 wall／0.049612 秒 process CPU。這次核對沒有再次讀取 3.85 GB
+原始 payload，完整 payload 的獨立讀回仍由八次 fresh reader 各自證明。
+
+- [R168 原始三個失敗與完整檢查](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round168/checks.json)
+- [R169 相同候選與明確單一比較軸](../artifacts/benchmarks/workflow_speed_optimization_20261021/round169/run_retained_prefetch.py)
+- [R169 全部 582 項結果與時鐘](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round169/checks.json)
+- [R169 凍結來源、容量上限及雙順序門檻](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round169/protocol.json)
+- [R169 八次完整原值與雙順序決定](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round169/comparison.json)
+- [R169 實際終結與獨立算術／child 收據核對](../artifacts/benchmarks/workflow_speed_optimization_20261021/round169/independent_decision_readback.json)
+
+R173 另以兩個 fresh child 實際載入 R169 的 baseline／candidate capsule，
+各 16 個 project modules 全部位於封存目錄、SHA 相符，C++ cache 經原 ABI／
+module／source 身分核對且無重新編譯；真實 data root 保留。兩次完整 import
+分別為 **3.987613／5.179706 秒 wall**、**0.913267／1.158866 秒 descendant
+CPU**；owner 9.276232 秒／2.193153 秒 CPU，succeeded／inactive／MainPID 0。
+這只排除 runtime 封存或 import 問題，不取代 170 個原始樣本的完整速度比較。
+
+- [R173 封存 runtime 與 native cache 的兩個新程序檢查](../artifacts/benchmarks/workflow_speed_optimization_20261021/round173/completion.json)
+
+R164 collector 已完成全部 13 階段，**1,243.047584 秒完整 child wall／
+440.926775 秒 descendant CPU**，輸出 378,913 samples／47,520 groups／14
+檔；這是較新的 snapshot，不能與舊 snapshot 作受控加速比較。新程序
+canonical reader 全部核對通過，**247.997328 秒／51.294306 秒 CPU**。
+原版 reader 所需物理重建保留 11,044 份原 gzip、15 個 report files 與
+1,356,308,832 bytes，**381.569241 秒 wall／39.867438 秒 process CPU**。
+untouched original reader 與全部 training／TW 原始 oracles 已通過，完整
+child **714.911427 秒 wall／123.199399 秒 descendant CPU**；另外的原生
+CEX reader **83.466474 秒／19.188713 秒 CPU**，16,420 原始 rows multiset
+與重複次數相同。issuer／Dune／SEC 的 170 個原始 samples、113 個 credential
+samples 與 45 個新增身分皆通過最後核對。這些串接時鐘與完整 owner 的區間
+重疊，不能再次相加；覆蓋採前述成功驗收的 **2399／1708／691**。
+
+- [R164 collector 完整呼叫時鐘](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/collector_command.json)
+- [R164 14 輸出與全部樣本 canonical 讀回時鐘](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/canonical_readback_command.json)
+
+### R170：新 boot 的自然 release clock 可見性
+
+重新核對六個已加計時的原生 release producers。R170 封存現行 sources、
+服務與 timer 的前後狀態，查詢 10/24 04:39 UTC 至 10/25 04:13:21 UTC 的
+available journal，matching native events 為 **0**。完整 journal query
+**0.052958 秒 wall／0.045628 秒 descendant CPU**；fresh reader
+**0.368714 秒／0.346311 秒**，完整 owner **0.852694 秒／0.761289 秒**，
+succeeded／inactive／MainPID 0。這些是觀測成本，沒有量到六個 API 工作。
+
+當時 service inactive／MainPID 0，沒有 current InvocationID 或 ExecMain
+起訖時間；timer active，LastTrigger 為 10/25 03:00 CST，NextElapse 為
+10/26 07:00 CST。timer 時戳不是 `collect()` 已執行的證明，available journal
+空選集也不能證明完整歷史未執行。六個 clock gaps 保留，不從 UTC 或 parent
+耗時補值，沒有強制執行排程或新增 provider 呼叫。
+
+- [R170 明確時間窗、原 producer 與 timer 狀態](../artifacts/benchmarks/workflow_speed_optimization_20261021/round170/protocol.json)
+- [R170 可見 native events 與未知邊界](../artifacts/benchmarks/workflow_speed_optimization_20261021/round170/availability.json)
+- [R170 新程序完整讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round170/readback.json)
+- [新 boot 的 GPU 活躍驗證工作與退出後資源對照](gpu_idle_load_2026-10-23.md#1025-新-boot驗證工作高峰與退出後對照)
+
+### R177：完整重建與原版讀回的暫時視圖位置比較
+
+R164 的物理重建 381.569241 秒與原版 reader 714.911427 秒留下顯著的
+wall／CPU 差距。新候選只為一次性的舊格式驗證視圖明確選擇 root ext4／SSD；
+正式 packed observation、輸出、原始收據與所有 D guard 維持在 guarded D。
+沿用完全相同的 R38 reconstruction helper 與 untouched original reader bytes，
+不建立第二套還原實作。這是有獨立 scope 的 placement amendment，保留原始
+固定 observation；D 不可用時仍拒絕，沒有缺盤後改寫 SSD 的 fallback。
+
+完整 A/B/B/A 四次皆重建並核對 **11,044 gzip＋15 reports／1,356,308,832
+bytes**，每次另啟 fresh original reader，與 R164 原始 reader 的全部語義欄位
+比較。計時包含容量 admission、完整來源／pack SHA／ZIP CRC、重建、收據、
+fresh reader 與 parent parity；CPU 包含 controller self 與 reaped children。
+完整試次時鐘與內層 stage clocks 重疊，不再相加。每輪保留原始 bytes、generation
+fences 與所有部分結果；root reserve 8 GiB、D reserve 32 GiB、記憶體 headroom
+24 GiB，先預留各兩份完整視圖及逐檔 overhead，再逐次動態 admission。
+
+事先固定均值 wall ratio ≤0.95、CPU ratio ≤1.02；兩個 AB／BA 配對亦須分別
+wall ratio ≤0.95、CPU ratio ≤1.05。source SHA=
+`5bd7e3e2ddbff35df9c1031ee1bccdde3c7d4eb7545937391f9363be2c4a48a2`。
+已在 R169 實際 succeeded／inactive／MainPID 0 後啟動全部工作。四次均完成，
+原 owner 已 succeeded／exit 0／inactive／MainPID 0，保留較慢的最後一輪。
+
+| 次序 | 視圖位置 | 完整 wall 秒 | controller 與 reaped-child CPU 秒 |
+| --- | --- | ---: | ---: |
+| A | guarded D | 1134.104911 | 146.742372 |
+| B | root SSD | 170.353431 | 57.624858 |
+| B | root SSD | 200.876841 | 64.486953 |
+| A | guarded D | 1445.409750 | 189.658187 |
+
+baseline／candidate 均值 **1289.757330 → 185.615136 秒 wall**，降低
+**85.6085%**；CPU **168.200280 → 61.055905 秒**，降低 **63.7005%**。
+wall／CPU ratio 為 **0.143914775／0.362995268**；AB 配對為
+0.150209587／0.392694061，BA 配對為 0.138975706／0.340016711，全部事先
+門檻通過。整個 owner **6600.784711 秒 wall／464.771697 秒 descendant CPU**
+包含等待 R169、四次完整比較與來源檢查，不能當成單次重建時間。
+comparison SHA=`c2bacce43c89462b0a4e5245456f7bac11f641a4e4bea24fb4385289f3129ae7`。
+
+外部讀回首次在 interactive mount namespace 比對 generation 時拒絕：16 個
+來源只有 device number 與 owner namespace 不同（114 → 158），inode／大小／
+mtime／ctime 等相同；失敗證據保留。之後由 canonical PID 1 namespace owner
+執行同一完整 generation 檢查，沒有略過 device。另核對四份各 11,059 entries
+的完整還原明細、全部 fresh reader 結果、16 個原始 module 身分、全部比例與
+接受算術，**7.844478 秒 wall／1.071146 秒 process CPU**；該完整命令
+**8.039937 秒 wall／1.444913 秒 descendant CPU**。這次額外核對是 metadata
+與既有四次原始讀回證明，沒有再讀一輪 payload。
+
+結果範圍是完整重建與 untouched original reader；額外 training／TW／CEX 等
+原始 oracles 仍須由 R183 完整驗收，不能把此階段比例當成全 13 階段加速。
+比較期間 R182／R184 的等待輪詢與短時 R184／R185 準備作業仍保留在紀錄，
+沒有新增 provider／GPU 工作或清理。
+
+- [R177 固定來源、容量、完整成本與事先門檻](../artifacts/benchmarks/workflow_speed_optimization_20261021/round177/compare_legacy_view_placement.py)
+- [R177 四次完整比較與事先門檻決定](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round177/comparison.json)
+- [R177 首次跨 namespace 讀回的拒絕證據](../artifacts/benchmarks/workflow_speed_optimization_20261021/round177/independent_readback_attempt_1.json)
+- [R177 canonical namespace 獨立讀回來源](../artifacts/benchmarks/workflow_speed_optimization_20261021/round177/verify_accepted_placement.py)
+- [R177 完整獨立接受讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round177/independent_decision_readback.json)
+
+### R178：完整維運狀態查詢與摘要成本
+
+補測 canonical `agent_workflow.py status` 的完整現行查詢，保留全部既有
+validation、14,903 份 run receipts、171 個 tasks 與 services／Git 觀測。
+完整 command **3.674495 秒 wall／3.595947 秒 reaped-child CPU**；29,953,334
+bytes 的 JSON 再經文件所述 jq projection，**0.616007 秒／0.611520 秒 CPU**，
+摘要 50,027 bytes。另以 fresh Python child 從完整原值獨立重算 projection 與
+local／foreign inventory，**0.515433 秒／0.507540 秒 CPU**；兩份完整 payload
+的 SHA 再次獨立核對相符。這些區間串行但與 owner 的總時間重疊。
+
+owner **4.899443 秒 wall／4.814417 秒 descendant CPU**，succeeded／exit 0／
+inactive／MainPID 0。完整輸出以 0600 留在私有 benchmark；不是只依目錄名稱
+或快取計數省略舊 receipts。這是當時的動態維運快照成本，期間 R169 正在測速；
+沒有固定比較或新來源 clock bindings，也未修改 canonical launcher。後續優化
+優先處理目前數百秒的資料 I/O；本成本已納入跨工作流紀錄。
+
+- [R178 完整查詢、原 projection 與新程序核對](../artifacts/benchmarks/workflow_speed_optimization_20261021/round178/profile_agent_status.py)
+- [R178 各完整 command 原始時鐘](../artifacts/benchmarks/workflow_speed_optimization_20261021/round178/completion.json)
+- [R178 14,903 收據、171 任務與 exact projection 讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round178/readback.json)
+
+### R179–R180：補齊既有 benchmark CPU 時鐘
+
+canonical importer 的頂層白名單漏收 `descendant_cpu_seconds`，巢狀 `phases`／
+`writes` 又把 `cpu_seconds` 當成 wall；`process_seconds` 與 `cpu_sync_seconds`
+本來是 elapsed time，仍須保留 wall 語義。候選只修改 `collect_benchmark()` 的
+CPU 欄位判斷及 collection report 的版本標記，加入
+`producer_benchmark_cpu_scopes_v2`；原始數值、來源、locator 與 stage bindings
+均保留，沒有補造任何時鐘。
+
+R179 使用既有 `freeze_probe_inputs()` 封存整個 Git-visible test tree 時，其他
+工作恰好更新測試，最後一致性檢查以 `verification inputs changed during freeze`
+拒絕；沒有執行測試。完整 freeze **31.402530 秒 wall／2.742511 秒 parent CPU／
+0.011460 秒 reaped-child CPU**，失敗 owner、部分 capsule 及原始來源全部保留。
+
+R180 保持候選與測試 bytes 不變，明確列出十二個相關 maintained modules，先把
+其 exact bytes 複製至獨立 Git input workspace，再用同一 canonical helper 封存。
+來源在複製前後、封存前後與測試完成後分別核對 SHA；不修改共享 helper，也沒有
+staging 或 commit。測試直接使用 read-only capsule，另保留既有 metric-cache 與
+新增 CPU clock 測試，**576 passed／0 failures／errors／skips**。
+freeze **0.103977 秒 wall**；完整 checks call **46.454580 秒 wall／44.267981 秒
+reaped-child CPU**。這是限定測試輸入的可靠性修正，不把不同範圍的 freeze 當成
+加速比較。
+
+以真實 R169 trial 0 收據重新匯入，舊 importer 的 wall sample **398.18585805 秒**
+逐位元保留，新 importer 另收既有 **73.892907 秒 descendant CPU**；fresh child
+獨立驗證兩筆 `float.hex()`、metric、source SHA 與 locator，重現並修正巢狀 CPU
+分類問題。兩筆輸入仍是同一次既有工作，不能當成兩段獨立耗時相加。
+owner **47.613112 秒 wall／45.355883 秒 descendant CPU**，succeeded／exit 0／
+inactive／MainPID 0。候選 SHA=
+`9983f5a864240a26f85b329875f8aced7d1a28595a2d0bc609eec7f5736f97e6`，
+該獨立候選當時未安裝。後續相同 CPU 修正經 R182 與已通過的預讀合併，由 R184
+安裝為 `5329e903…`；全 13 階段的新 report-contract 驗收正在執行。未新增來源
+綁定、API 請求或 GPU 工作，R169 同時執行中的事實保留在候選 protocol。
+
+- [R179 原始失敗 owner](../artifacts/operations/agent-workflow/runs/workflow-r179-benchmark-CPU-cloc-20261025T052002-37e70d22/run.json)
+- [R180 明確輸入範圍與候選資格](../artifacts/benchmarks/workflow_speed_optimization_20261021/round180/protocol.json)
+- [R180 完整 576 項檢查與資格結果](../artifacts/benchmarks/workflow_speed_optimization_20261021/round180/completion.json)
+- [R180 真實 wall／CPU 原值獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round180/readback.json)
+
+### R182：工程命令 CPU 與已通過的預讀候選整合資格
+
+`collect_engineering_runs()` 原本只匯入完整 command wall，雖然 canonical
+`waited_command_monotonic_resources_v1` receipt 已包含 child user／system CPU。
+新候選保留原 wall row，另按原始兩個 reaped-child resource delta 相加建立
+CPU row，保留兩個原值與原 run receipt SHA；不把 collector／owner parent／
+detached workers 算進去。失敗與 cancelled outcomes 保留，CPU 可以大於
+wall；legacy／未知 contract、無效或缺失 component 不補成零。
+另加 `waited_command_reaped_child_cpu_v1` report contract，來源綁定不變。
+
+資格 owner=`workflow-r182-complete-CPU-scope-20261025T054739-50800348` 已
+succeeded／exit 0／inactive／MainPID 0。先等 R177 實際終結，再依 R169
+事先門檻的接受結果，把完全相同的 `_retained_replay_inputs()` 合入候選；
+benchmark CPU 修正仍沿用 R180。**768 passed／0 failure／error／skip**，包含 13 個
+maintained modules、既有 metric-cache、37 個預讀、16 個 benchmark CPU、
+新增 23 個工程 CPU 測試與 132 個 private JSON 測試。共用 `conftest.py` 及
+pytest 設定也封存，使用現有 helper 新增的明確 `include_files` 介面。
+
+其他工作在 `private_json.py` 加入 batch helper；本工作不修改它。資格流程會
+先比對它與 R169 frozen module 的完整 AST：唯一差異須為尚未被 collector
+呼叫的 `ledger_lines_bytes()`，所有原有 module nodes 均不變，並額外執行
+該模組的完整 132 項測試。這是明確的新來源 fingerprint，後續完整驗收必須
+記錄這個相容性修訂，不能直接沿用舊 source SHA。132 個 cases 已由 frozen
+AST 的 test 名稱與 XML 完整比對，確認與其他選定模組無同名歧義。
+
+checks call **99.552842 秒 wall／61.749557 秒 reaped-child CPU**；前置等待
+**3201.550025 秒 wall** 獨立保留。whole owner **3312.024160 秒 wall／
+67.456774 秒 descendant CPU**，包含等待，不能當成資格測試本身的速度。
+fresh child 讀回四筆原始值：benchmark wall／CPU 及 engineering wall／CPU，
+原值、兩個 CPU components、加總 float bits、metric 與 receipt SHA 均一致。
+沒有新增全域覆蓋或全流程加速結論；後續安裝狀態見 R184。
+
+- [R182 完整 CPU scopes、條件式候選整合與封存資格流程](../artifacts/benchmarks/workflow_speed_optimization_20261021/round182/qualify_cpu_scopes.py)
+- [R182 原始 supervisor 收據](../artifacts/operations/agent-workflow/runs/workflow-r182-complete-CPU-scope-20261025T054739-50800348/run.json)
+- [R182 全部 768 項資格結果](../artifacts/benchmarks/workflow_speed_optimization_20261021/round182/completion.json)
+- [R182 四筆真實 wall／CPU 原值讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round182/readback.json)
+
+### R183–R184：依實際資格結果接續安裝與完整驗收
+
+已實作後續 R183 完整驗收 controller；沿用 R164 的全量 lifecycle 與原始
+oracles，僅接入已通過的預讀、兩種 CPU ingestion contract，以及 R177 的
+事先門檻決定。SSD 僅承接明確的一次性重建視圖，packed source／正式輸出仍在
+guarded D；root reserve 8 GiB、D reserve 32 GiB、memory headroom 24 GiB。
+舊原始 reader／issuer 路徑只做明確 AST 位置修訂並限制修改數量，既有資料列、
+financial／null／float／page／SHA 檢查保留。`private_json.py` 只允許 R182
+完整資格驗證的單一來源修訂，其他原始 source guards 繼續拒絕 drift。
+
+完整工作仍須通過全部 **13 phases／14 outputs／6 training roots／239 explicit
+receipts／43 TW operations**，及原始 training／TW／CEX／issuer／Dune／SEC／
+credentials oracles。安裝後另執行 **77 項** maintained checks（36＋2＋16＋23），
+使用現有 canonical verification-input freezer，連同 conftest 與 pytest 設定封存。
+這 77 項與 R182 已通過的 768 項有重疊，不合計為不同案例數。全量結束後，另逐行
+讀取每個新工程 CPU row，核對原 receipt SHA、兩個原始 CPU components 與加總
+float bits、重複 multiplicity；保留全部 wall rows 與來源綁定分母。
+
+R184 將這條既定流程交給 canonical systemd owner 接續。具體 patch 已在獨立
+副本實際套用並核對三個目標 SHA；該試套當時未變更 canonical source，完整
+**1.720910 秒 wall／1.525490 秒 process CPU**（不含 tool child CPU，非加速比較）。
+patch SHA=`7d526943af17477e9a2261c5bd5e3a2128ae459875e45df22040efa3c2435d86`；
+profile 只改四個函式，兩個新增 public test module 的 bytes 與資格候選相同。
+完整選定 profile SHA=
+`5329e9032544bdc91557be1662336beb77fddcf7b6b824464fe289082ef684be`。
+
+owner=`workflow-r184-gated-install-full-20261025T061539-6572644e` 在 R177、
+R182 均實際 succeeded／exit 0／inactive／MainPID 0，且完整 768 項與真實
+讀回資格相符後，於 **06:43:07 UTC 實際安裝**。安裝前確認原 profile 為
+`ae33150c…`、兩個目標尚不存在，再以 `apply_patch` 套用同一份精確補丁；
+安裝 **0.090539 秒 wall**，三個實際來源 SHA 全部與資格候選相同。
+安裝後 **77 passed／0 failure／error／skip**，完整 checks child
+**14.054568 秒 wall／4.973503 秒 descendant CPU**。R183 正式輸出在 D、
+一次性重建視圖明確在 root SSD；全部 13 個收集 phase、完整重建與四個原始
+子命令均 exit 0。最後工程 CPU 驗證器因 `workflow`／`workflow_id` 欄位錯字
+失敗，R184 實際 failed／exit 1／inactive／MainPID 0；原 full child
+**2425.717468 秒 wall／769.631811 秒 descendant CPU**，包括前置等待與
+安裝的 R184 整個命令 **4069.973252 秒 wall**。後段 R187／R189 已以新 owner
+接續驗收，沒有改寫這次失敗。尚無整體加速或硬體極限結論。
+
+前置等待、安裝與完整驗收 child 各自計時。來源、容量或重疊修改任一 gate
+失敗即保留證據並停止該 cohort，不重設其他工作。安裝前獨立讀回
+**0.975637 秒 wall／0.774314 秒 process CPU** 是歷史未安裝狀態。
+安裝後另由 fresh 程序核對全部資格 archived sources、768 項 XML、132 項
+private JSON 歸屬、四筆真實讀回證明、三個安裝來源 SHA、恰好四個函式改動、
+其餘 module AST 相同、77 項 XML 及實際全量 unit；**1.429130 秒 wall／
+1.106553 秒 process CPU**。這次只核對 metadata／來源，沒有再讀 payload，
+亦不代表全量驗收完成。
+
+執行中的完整 collector 另以實際 cgroup 與 PID／start_ticks 做兩次核對：
+**45.056474 秒**內新增 **3.82 秒 process CPU、30,343,343 rchar、1,280 read
+syscalls**，確有持續工作。第一個瞬間為 `D`／`p9_client_rpc`，第二個瞬間已非
+該等待；這是非原子的 kernel counters 與瞬時等待觀察，不能換算成穩定實體
+磁碟頻寬、純 I/O 時間或完成證明。當時 R186 只等待，沒有與此 full child 並跑；
+R184 終結失敗後，R186 已正確拒絕啟動全量診斷。
+
+10/25 後續獨立保存當前 log 的完整 prefix bytes／SHA，讀回十個已完成 phase
+的 native wall／parent CPU，並核對實際 active unit 與已安裝 profile SHA。
+acquisition 為 **850.357701／123.374761 秒**，training discovery
+**14.935794／0.197942 秒**、training ingestion **25.309004／19.123849 秒**，
+benchmark discovery **35.881729／34.402876 秒**、path selection
+**45.401804／38.757642 秒**。已保留 **1,541** 份 training timing files，該邊界
+累積 **376,831** samples；後續 benchmark 與輸出仍會加入，不是最終分母。
+這些是尚未完成全部接受檢查的新觀察，沒有與 R164 構成固定輸入比較，不能
+用其差額宣告加速或退步。
+
+隨後完整 collector 已 exit 0：**1624.311265 秒 whole child wall／563.819498 秒
+descendant CPU**，13 個 phase 合計 **1621.556929 秒**，其外 **2.754335 秒**
+保留。`collection_wall_seconds=1538.233785` 與 `pre_manifest_wall_seconds=
+1621.556929` 均保留原值；排序完整成本使用 launch-through-wait 的 1624.311265，
+不能把較早寫入的欄位當成完整結束。現有 **379,271 samples／47,865 groups**，
+383,600 個 evidence source identities／1,906,029,979 原始 bytes；來源身分
+仍為 2,399／1,708／691。這些 source identities 包含不同分類與重複身分，
+不是獨立執行次數或 unique frozen payload 數。
+
+| R183 完整 collector 的已完成 phase | wall 秒 | parent process CPU 秒 | 占 whole child wall |
+| --- | ---: | ---: | ---: |
+| acquisition receipts | 850.357701 | 123.374761 | 52.3519% |
+| benchmark evidence inspection | 369.690164 | 205.582001 | 22.7598% |
+| aggregation and output serialization | 186.171280 | 41.397600 | 11.4616% |
+| final output hashes | 83.778915 | 8.847749 | 5.1578% |
+
+canonical fresh reader 另已 exit 0，**358.188775 秒 wall／70.398400 秒 descendant
+CPU**，核對 14 outputs／13 phases／11,017 unique originals／379,271 samples。
+原始 reader、training／TW／CEX／issuer／Dune／SEC／credentials 仍須全部完成，
+才能接受整合；收集階段完成或 canonical reader 通過不替代這些原始 oracles。
+
+另實作獨立 source／scope／最終收據鏈 reader。其 `prepared` owner=
+`workflow-r183-prepared-sources-r-20261025T071647-e4df853f` 已 succeeded／exit 0／
+inactive／MainPID 0，逐一核對 **4 個已安裝 canonical sources、64 個 dependencies、
+98 份原始輸入與其 archive，合計 11,443,398 archive bytes**。所有 hash 讀取前後
+descriptor／path generations 相同；實際在 PID 1 mount namespace，沒有放寬
+device／inode／mtime／ctime。566 個實際 argv 除 output root 外與 R164 完全
+相同，包含 6 個 training roots、239 explicit receipts、4 個 TW journals，
+43 個原始 TW operations 的門檻保留。14 份輸出 sizes 與收集 manifest 一致；
+這次沒有再跑完整 payload reader，亦沒有把 sizes 當成 payload SHA 驗收。
+整個命令 **11.759741 秒 wall／1.723106 秒 descendant CPU**；內層 v2 clock
+**11.013392 秒 wall／1.249957 秒 parent CPU／0.098280 秒 reaped-child CPU**。
+此讀回與現有 full owner 同時執行，屬驗證成本，不是速度比較。
+
+同一 reader 的 `complete` 模式須先核對 R184 實際 succeeded／exit 0／inactive／
+MainPID 0，再核對整合、原始 reader、完整重建、CEX／issuer／Dune／SEC／
+credentials 與全部工程 CPU component 收據鏈及 SHA。R184 最後因 verifier
+失敗，因此保留的 `complete` 模式不能照原成功 gate 執行；後段 R187／R189
+明確接續未完成驗證，原 `prepared` 收據仍只證明其原定範圍。
+
+- [R183 全部原始 oracles 與工程 CPU 原值讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/accept_qualified_workflow.py)
+- [R184 來源與資格硬門檻、精確套用及全量 child](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/install_and_accept.py)
+- [R184 具體完整補丁](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/installation.patch)
+- [R184 獨立副本實際試套與目標 SHA](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/patch_preflight_readback.json)
+- [R184 canonical supervisor 收據](../artifacts/operations/agent-workflow/runs/workflow-r184-gated-install-full-20261025T061539-6572644e/run.json)
+- [R184 外部程序核對精確補丁、未安裝狀態與三個實際 units](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/independent_preinstallation_readback.json)
+- [R184 實際安裝及三個來源 SHA](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/installation.json)
+- [R184 安裝後資格、來源與 77 項檢查獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round184/independent_installation_readback.json)
+- [R183 實際 collector 同一 PID generation 的 CPU／I/O 進展](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/independent_running_progress.json)
+- [R183 十個已完成 native phase 的 log prefix 與實際 owner 核對](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/independent_phase_progress_readback.json)
+- [R183 來源、完整 argv 與最終收據鏈的獨立 reader](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/readback_workflow_acceptance.py)
+- [R183 全部來源／輸入／參數及已完成 collector 的獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/independent_prepared_workflow_readback.json)
+- [R183 獨立讀回原始 v2 clock](../artifacts/benchmarks/workflow_speed_optimization_20261021/round183/independent_prepared_workflow_readback_clock.json)
+- [R183 獨立讀回實際 supervisor 收據](../artifacts/operations/agent-workflow/runs/workflow-r183-prepared-sources-r-20261025T071647-e4df853f/run.json)
+
+### R185：補齊完整 acquisition 階段的逐個呼叫時鐘
+
+由已接受的 R164 完整原始 clocks 重新排序，collector whole child 為
+1243.047584 秒；13 個 phase 合計與其差 **2.593531 秒**，差額保留。
+以下 CPU 是 phase 的 parent process CPU，不能與 child descendant CPU 混為一欄。
+
+| 原始 phase | wall 秒 | 占完整 collector wall | parent process CPU 秒 |
+| --- | ---: | ---: | ---: |
+| acquisition receipts | 662.861489 | 53.3255% | 85.087474 |
+| benchmark evidence inspection | 296.798002 | 23.8766% | 169.517146 |
+| aggregation and output serialization | 105.415833 | 8.4804% | 31.447067 |
+| final output hashes | 62.904952 | 5.0605% | 7.648313 |
+
+這些仍是 R164 的已完成觀察，不是 R184 全量尚未結束的整合後速度。工程命令收據
+匯入在同輪只占 1.273950 秒，因此優先釐清 acquisition 的內部呼叫。R143
+已量過 retained issuer／Dune／SEC 的 operation 成本；本次補上同一完整階段中
+其餘 adapter，並保留整合後相同工作量的再次診斷條件。
+
+新 instrumenter 不修改 canonical collector，沿用 R157 現有 monotonic／resource
+timer，在原 `collect()` 明確的階段邊界逐一核對全部 **12 次**呼叫：registered
+steps、FinMind、FinLab、兩次 economic、OpenBB、TW public、CEX feature、issuer、
+Dune、SEC、local credentials。兩次 economic 各有不同 call index；空工作與失敗
+也保留。每個呼叫記錄 wall ns、parent process CPU ns、reaped-child CPU 及原始
+sample／inventory／evidence／retained-byte 增量，不從 wall 減 CPU 推造純 I/O。
+原函式的參數、回傳與失敗維持，結束時還原所有暫時包裝。
+
+原完整 collection arguments 維持，只由外部 diagnostic entry 呼叫相同 profile；
+沿用 R183 已建好的全 13-phase lifecycle、77 項正式檢查與每個原始 oracle。
+另外保存實際 entry 修訂、來源與封存 SHA，fresh child 再核對 12 份原始 clocks、
+全部順序、phase／子呼叫分母與完整 acceptance。包含計時器 overhead，
+**不作為未插樁 baseline 的加速比較**。新的全量工作須先確認 R184 實際成功、
+安裝身分與全部原始驗收收據；目前僅完成 instrumentation 資格，尚未啟動全量。
+
+資格 owner=`workflow-r185-acquisition-timer--20261025T062446-c1131c75`
+已 succeeded／exit 0／inactive／MainPID 0。**4 passed／0 failure／error／skip**，
+涵蓋原參數與回傳 object identity、重複呼叫分開、原 exception identity／部分證據、
+順序錯誤拒絕、必定還原，以及實際選定 source AST 少一個呼叫即拒絕。
+完整 case runner **0.458214 秒 wall／0.426253 秒 parent CPU／0 child CPU**；
+整個 owner command **0.633196 秒 wall／0.583988 秒 descendant CPU**。
+該短時資格與最後一次 R177 D baseline 同時執行，實際 owner 與時鐘均保留。
+外部 fresh 程序另驗四項結果、全部七個 source SHA、終結狀態、R164 完整父層
+分母與 13 個 phase，**0.533958 秒 wall／0.016437 秒 process CPU**。這次只讀
+metadata，沒有讀 benchmark payload、增加來源綁定、API 或 GPU 工作。
+
+後續核對 R182 `actual_import_clock.json` 發現原 helper 的浮點相減問題：沒有
+新增 child CPU，卻留下 **−3.552713678800501e−15 秒**。公式先加總再連續相減
+會因捨入產生微小負值或假正值；同一 before／after 的 `10.0＋0.1−10.0−0.1`
+也能重現。舊 clock 與 R185 四項資格全部保留；這四項沒有覆蓋非零累計值的
+消去誤差，因此 **R185 不直接啟動全量**。下一個 cohort 改成 user／system
+各自相減後相加，另存原始前後 components，加入數值邊界測試，再沿用相同完整
+診斷與所有原始 oracles。canonical command producer 原本已分別記錄 component
+delta，R182 新工程 CPU ingestion 使用原 component，未受這個 helper 問題影響。
+
+- [R185 十二個呼叫的外部計時與原函式還原](../artifacts/benchmarks/workflow_speed_optimization_20261021/round185/profile_acquisition_calls.py)
+- [R185 沿用全量 lifecycle 與全部原始 oracles 的診斷 owner](../artifacts/benchmarks/workflow_speed_optimization_20261021/round185/run_acquisition_diagnostic.py)
+- [R185 四項語義結果與七個來源身分](../artifacts/benchmarks/workflow_speed_optimization_20261021/round185/instrumentation_checks.json)
+- [R185 原始測試 clock](../artifacts/benchmarks/workflow_speed_optimization_20261021/round185/instrumentation_checks_clock.json)
+- [R185 真實資格 owner 收據](../artifacts/operations/agent-workflow/runs/workflow-r185-acquisition-timer--20261025T062446-c1131c75/run.json)
+- [R185 獨立核對資格、全部 phase 與真正完整分母](../artifacts/benchmarks/workflow_speed_optimization_20261021/round185/independent_priority_and_qualification_readback.json)
+
+### R186：修正累計 CPU 消去誤差，再接續完整診斷
+
+此輪保留 R157／R185 與全部舊收據，沿用原 exclusive receipt writer，只替換
+後續診斷的 CPU interval 算術：先取 `after.ru_utime − before.ru_utime` 與
+`after.ru_stime − before.ru_stime`，再相加。每份新 clock 保留 native counters
+前後的 type／`float.hex()`、兩個原始 component deltas、wall ns 與 parent CPU ns，
+contract 為 `inclusive_parent_call_monotonic_resources_v2`。不 clamp、不四捨五入；
+無效值或任一 component 倒退就留下失敗 measurement，不補 CPU 零值。原 action
+本身已拋錯時，另存 measurement failure 並保留原 exception identity。
+
+R185 十二個 adapter 的參數、回傳、順序、部分失敗、原函式還原與完整 lifecycle
+均由原封存 source 重用。限定 AST 修訂只改新 cohort 的 output／scratch 位置、
+clock contract、資格 cases 數與描述；R183 全部原始 oracles 不刪減。來源共
+11 份，包含三份封存 R185 sources、原 R157 writer、新 component helper 與
+完整接受 controller，資格前後逐一核對 SHA。這是私有診斷修訂，沒有改動目前
+執行中的 canonical collector 或任何舊計時結果。
+
+資格 owner=`workflow-r186-component-clock-qu-20261025T065413-9718a333`
+已 succeeded／exit 0／inactive／MainPID 0，**12 passed／0 failure／error／skip**。
+四項原 adapter contract 保留，另八項涵蓋零工作假負值／假正值、大累計值的
+小 component 增量、無效值與單 component reset、CPU 大於 wall、失敗 receipt
+不補零、原 exception 保留、實際 waited child 與原值逐位元重算。case runner
+**0.581887 秒 wall／0.482149 秒 parent CPU／0.095588 秒 reaped-child CPU**；
+整個 qualification command **0.895195 秒 wall／0.888250 秒 descendant CPU**。
+另由 fresh 程序核對 12 項結果、11 份 source SHA、raw counters／component／sum
+float bits、實際終結 unit 與兩種 view 的完整 assembly，**0.305524 秒 wall／
+0.283176 秒 process CPU**。這些都是資格／診斷成本，並非效能比較。
+
+接續 owner=`workflow-r186-gated-full-acquisi-20261025T065506-f512f866` 原先只等
+R184；R184 終結 failed 後，實際 **failed／exit 1／inactive／MainPID 0**，沒有
+開始全量診斷。原始等待 v2 clock outcome=`raised`、measurement_state=`valid`，
+**1714.653275 秒 wall**，reaped-child user=`0.313948`／system=`0.879823`；
+整個命令 **1715.077828 秒 wall**。原始 counters 與失敗證據保留，沒有改成成功。
+後續 R188 明確以 R189 新接續驗收的實際成功為 prerequisite，保留 77 項檢查、
+13 phases／14 outputs、全部原始 oracles 與每個 adapter 的 component bits。
+插樁的完整時間不作未插樁 baseline 的加速比較，未新增 provider 請求或 GPU 工作。
+
+- [R186 component-first CPU interval 與原始 counters](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/component_resource_clock.py)
+- [R186 重用原十二個 adapter 的診斷入口](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/profile_acquisition_calls.py)
+- [R186 八項數值檢查與四項原 adapter contracts](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/check_acquisition_instrumentation.py)
+- [R186 原全量 lifecycle、等待與獨立 component 讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/run_acquisition_diagnostic.py)
+- [R186 十二項實際資格及全部來源 SHA](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/instrumentation_checks.json)
+- [R186 新契約的原始 clock](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/instrumentation_checks_clock.json)
+- [R186 資格、原值與完整 assembly 獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round186/independent_qualification_readback.json)
+- [R186 真實資格 owner 收據](../artifacts/operations/agent-workflow/runs/workflow-r186-component-clock-qu-20261025T065413-9718a333/run.json)
+- [R186 接續完整診斷的 canonical owner 收據](../artifacts/operations/agent-workflow/runs/workflow-r186-gated-full-acquisi-20261025T065506-f512f866/run.json)
+
+### R187／R189：接續未完成驗證，保留失敗與本批原始分母
+
+R183 的 collector、canonical reader、untouched original reader、native CEX reader
+皆實際 exit 0，完整 wall／descendant CPU 分別為 **1624.311265／563.819498**、
+**358.188775／70.398400**、**100.708945／62.016549**、**18.025321／11.774459** 秒。
+完整重建保留 **11,017 gzip originals＋15 reports**；此批來源與 R164 不同，不能
+沿用 R164 的 11,044 或以兩批時間差宣告加速。
+
+R184 最後失敗於 verifier 使用 `row['workflow']`，canonical Ledger 實際欄位為
+`workflow_id`。R187 只修正該函式的單一 subscript，反向還原後 AST 與封存版
+相同，其餘檢查保持原樣。使用實際 canonical producer 的 schema 驗證 **5 項**：
+有效／失敗紀錄、signed zero、legacy／invalid omission、重複 multiplicity，以及
+一個 ULP、component 符號、遺失重複筆、偽造 CPU 的拒絕。整個資格命令
+**1.353878 秒 wall／0.917458 秒 descendant CPU**。
+
+接著重新串流掃描全部 **379,271** 輸出 rows，**256** 筆工程 CPU 的原 receipt
+SHA、user／system／sum float bits 與 duplicate multiplicity 全數通過；保留輸入
+projection 的全部 256 個 terminal runs，未替 legacy／invalid components 補零。
+該完整 audit **110.394072 秒 wall／20.358792 秒 parent CPU**。其後獨立 reader
+硬編碼舊批次 CEX `16,420`，因此 R187 owner 仍實際 failed／exit 1／inactive／
+MainPID 0；整個失敗命令 **124.976676 秒 wall／22.115488 秒 descendant CPU**，
+失敗 log、source、clock 與已成功的 CPU audit 均保留。
+
+R189 使用原版 `collect_samples` 與 untouched Ledger，讀取四份保留的原始
+Binance／OKX CSV、summary bytes，重新得到 **9,200＋7,308 worker samples＋2 run
+samples＝16,510**，並核對每份原始 SHA、報告內容與原 CEX oracle receipt 相同。
+獨立 reader 只將舊常數改為此實際推導分母；全部原始 reader、SHA、null／float、
+43 TW operations、retained training 6,655 samples、issuer 16、SEC 33,072 rows、
+Dune 2,747,699 rows／2,766 pages、credentials 113 等原檢查保留。未重跑 collector
+或已完成工程 CPU scan，也未改寫 R184／R186／R187 的失敗狀態。
+
+R189 reconciliation owner=`r189-current-original-denominato-20261025T074022-6c4f5ff7`
+實際 **succeeded／exit 0／inactive／MainPID 0**，完整 **39.546520 秒 wall／
+8.598121 秒 descendant CPU**。再以 fresh owner 讀回全部來源／收據鏈、原始 CEX
+分母及實際 terminal，亦 **succeeded／exit 0／inactive／MainPID 0**，完整
+**15.356272 秒 wall／5.366083 秒 descendant CPU**。64 dependencies、98 原始／
+archived inputs、566 argv 與 13 phases／14 outputs 的分母仍一致；2,399／1,708／
+691 source binding 分母保持。新整合收據在 guarded D 的 `round189`，明確連回
+原始 `round183` 與 `round187` CPU audit；整合 SHA=
+`fb7ec8eaa80400478e853a33a92a92df8462f810d100e1cfae2d51fe7deea5cb`。
+
+這是接續驗收成本，不是另一輪 benchmark，也不能把失敗、等待、驗證時間忽略
+後宣告整體加速。原始 CEX loaded producer identity／完整外部 acquisition 等未知
+狀態保留；新 provider calls、GPU jobs 均為 0。
+
+- [R187 單一 verifier 修正與 canonical schema 語義檢查](../artifacts/benchmarks/workflow_speed_optimization_20261021/round187/reconcile_full_acceptance.py)
+- [R187 五項資格與精確 AST 改動證明](../artifacts/benchmarks/workflow_speed_optimization_20261021/round187/qualification.json)
+- [R187 完整 audit 後的真實失敗 owner](../artifacts/operations/agent-workflow/runs/r187-complete-unfinished-full-au-20261025T073354-c6944567/run.json)
+- [R189 原始 CEX 分母推導與全部收據鏈接續](../artifacts/benchmarks/workflow_speed_optimization_20261021/round189/reconcile_original_denominator.py)
+- [R189 新整合 acceptance 的 completion 與 SHA](../artifacts/benchmarks/workflow_speed_optimization_20261021/round189/completion.json)
+- [R189 終結成功、原始 oracle 與輸入獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round189/independent_terminal_readback.json)
+- [R189 原始 reconciliation v2 clock](../artifacts/benchmarks/workflow_speed_optimization_20261021/round189/reconciliation_clock.json)
+- [R189 reconciliation 真實 owner](../artifacts/operations/agent-workflow/runs/r189-current-original-denominato-20261025T074022-6c4f5ff7/run.json)
+- [R189 fresh 獨立讀回真實 owner](../artifacts/operations/agent-workflow/runs/r189-independent-terminal-and-fu-20261025T074134-b44a0a3e/run.json)
+
+### R188：依本批完整驗收接續十二個 acquisition adapter 診斷
+
+沿用 R185 原全量 lifecycle、R186 component-first v2 clock 與原 12 項語義契約，
+明確使用新 cohort／scratch 與 R187 唯一 verifier 欄位修正。前置 gate 改為 R189
+新接續 owner 的實際 succeeded／exit 0／inactive／MainPID 0 與獨立完整讀回，
+同時確認 R184／R186／R187 的失敗沒有被改寫。所有差異均有 AST 數量限制、
+來源 hash 與 archive，原 77 checks／13 phases／14 outputs／原始 oracles 保留。
+
+12 項資格 **全數通過**，整個命令 **1.062056 秒 wall／1.031359 秒 descendant
+CPU**；fresh metadata reader 另核對 **16 份來源身分**、raw counters／component／
+sum bits、實際 qualification terminal、兩種重建 view 的完整 assembly 與 R189
+收據鏈，**0.854131 秒 wall／0.197157 秒 parent CPU**。
+
+完整 owner=`r188-complete-twelve-adapter-dia-20261025T074403-b9cfd073` 已啟動，
+77 項 maintained checks **全數通過**，**14.811584 秒 wall／4.991067 秒 descendant
+CPU**。全部十二個 adapter 已自然 returned，原始 v2 clock 均 valid，另由 fresh
+metadata reader 逐一從原始 user／system counter hex 重建 components 與 sum bits；
+12 項全部通過，讀回 **0.001489 秒 wall／0.001488 秒 process CPU**，未讀 payload。
+
+| 完整 adapter 呼叫 | wall 秒 | parent process CPU 秒 |
+| --- | ---: | ---: |
+| registered steps | 4.990471 | 3.144351 |
+| FinMind | 0.479497 | 0.150835 |
+| FinLab | 0.851431 | 0.851532 |
+| economic 第一次 | 0.363710 | 0.347359 |
+| economic 第二次 | 0.008360 | 0.006677 |
+| OpenBB | 0.231511 | 0.004457 |
+| TW public | 1.025113 | 0.799863 |
+| CEX feature clocks | 0.958718 | 0.936773 |
+| issuer parser retained clocks | 1.916858 | 0.546591 |
+| Dune retained original／output comparison | **358.756933** | **69.036345** |
+| SEC retained original／output comparison | **251.729447** | **35.095553** |
+| local credential audits | 0.178236 | 0.030670 |
+
+十二個 sequential calls 合計 **621.490286 秒**，Dune＋SEC **610.486381 秒／
+98.2294%**；native acquisition phase **621.527070 秒 wall／110.958230 秒 parent
+CPU**，兩個範圍之差 **0.036784 秒**。全部 reaped-child CPU 均由原始 counter
+證明為 0；in-process native／prefetch threads 仍計入 process CPU，不解讀為沒工作。
+這是本批診斷範圍，不能拿 R183 的 850 秒差額當固定輸入加速比較。
+
+完整 collector 隨後實際 exit 0，**1478.697108 秒 wall／541.890262 秒 descendant
+CPU**；全部 **13 phases／14 outputs／379,264 samples／47,858 groups**。phase
+wall 合計 **1474.099752 秒**，其外 **4.597356 秒**保留。fresh metadata reader
+核對 collection／command SHA、14 份當前 output sizes，以及十二個 adapter 的
+原始 clock links，**0.420657 秒 wall／0.033139 秒 process CPU**；未另讀 bulk
+output SHA。這些樣本與 R183 不同，且原始 reader／full source guards 尚未全部
+通過，因此不是整體固定輸入加速證據。
+
+同一 collector PID 697587／start_ticks 另做 15 秒觀察：**15.000345 秒**內新增
+**1.01 秒 process CPU、4,077,491 rchar、328 read calls**，兩次 wchan 皆為
+`p9_client_rpc`，觀察期間已完成第十個 adapter。原始 stat／I/O fields 與 boot ID
+保留，這些非原子 kernel counters 不能換算成完整純 I/O 時間或穩定磁碟頻寬。
+
+07:52:44 UTC，共用 `stockagent/private_json.py` 從本輪固定的 `f664ce2e…` 更新為
+`dd7f92c4…`，新增 `_plain_string_keys` 並供 `_plain_finite_json` 使用。這項並行
+修改保留，未還原或放寬 R188 既有 source guard；本輪 all-original acceptance
+尚未通過。獨立的十二個 clock 讀回只驗證原始時鐘，不把它宣告為全量接受。
+後續 R192 改用既有固定 capsule 做操作診斷，範圍不包含採用這次 live JSON 修改。
+
+- [R188 全部 adapter 插樁與原 v2 clock 重用](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/profile_acquisition_calls.py)
+- [R188 完整 lifecycle、精確 gate 與全部原始讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/run_acquisition_diagnostic.py)
+- [R188 原十二項語義契約與數值檢查](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/check_acquisition_instrumentation.py)
+- [R188 十二項資格與十六個 source SHA](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/instrumentation_checks.json)
+- [R188 資格、component 原值與 R189 gate 的 fresh 讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/independent_qualification_readback.json)
+- [R188 qualification 原始 owner](../artifacts/operations/agent-workflow/runs/r188-twelve-adapter-diagnostic-q-20261025T074248-d6c9a2c5/run.json)
+- [R188 正式完整診斷 owner](../artifacts/operations/agent-workflow/runs/r188-complete-twelve-adapter-dia-20261025T074403-b9cfd073/run.json)
+- [R188 十二個原時鐘及 component／sum bits 的獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/independent_twelve_adapter_clock_readback.json)
+- [R188 已完成全部 collector 與十二 clock links 的獨立核對](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/independent_completed_collector_progress.json)
+- [R188 同一實際 collector generation 的兩次 native CPU／I/O 觀察](../artifacts/benchmarks/workflow_speed_optimization_20261021/round188/independent_running_progress.json)
+
+### R190–R192：重用固定完整工作集與 canonical operation timer
+
+依十二 adapter 結果，下一個疑點是 retained evidence 的 native read、SHA、gzip、
+packed snapshot read／write 成本。已有 canonical `Evidence.inspection_timings` 與
+`_InspectionTimings`，因此重用既有計時器及 R169 完整固定 capsule，不新增另一套
+profiler，不重做既有 ABBA、不更換 C++ backend 或省略原始資料。
+
+R190 與 R191 的資格檢查均正確拒絕 live checkout 的 `stockagent` modules，
+分別完整 **5.376841／11.397360 秒 wall**。原因是 guard 會插入 live ROOT；僅調整
+`sys.path` 的優先序仍不能保證 package ownership。失敗收據與實際 module 路徑／
+SHA 全部保留，這兩輪均未開始 payload 診斷。
+
+R192 在任何 guard／clock helper import 前，先從固定 capsule 載入 `stockagent`、
+`scripts`、`downloader`，核對三個 `__file__`、`__path__`；不刪除或替換既有 modules。
+後續 **16 個實際 project modules** 全部位於 capsule 且 SHA 符合其原 protocol。
+`Evidence`、`_InspectionTimings`、Dune／SEC acceptor 與已採用 retained prefetch
+函式共五個 AST 皆與 selected canonical profile 相同；實際消費的 private JSON
+`loads`／`pretty_metadata_bytes`／`_plain_metadata` AST 亦相同。這不採用 live
+ledger predicate 修改，只證明本次固定診斷的 consumed functions。
+
+資格 owner=`r192-frozen-package-owner-qualif-20261025T080611-88375e99` 實際
+**succeeded／exit 0／inactive／MainPID 0**，完整 **20.071303 秒 wall／2.421790 秒
+descendant CPU**。這是讀取來源／AST／module guard 的資格成本，不是效能試驗。
+fresh metadata reader 再核對 **10 個來源 SHA、16 個 frozen modules、三個 package
+owner、原 counter components／sum bits 與實際 qualification terminal**，
+**0.371966 秒 wall／0.038339 秒 process CPU**；沒有讀取 benchmark payload。
+
+接續 owner=`r192-gated-complete-retained-ope-20261025T080719-81b2075f` 已啟動。
+先等 R188 實際終結以避免 I/O 競爭，保留它的 succeeded／failed／exit 原值；此處
+是純粹不重疊 fence。獨立語義 prerequisite 是 R169 已通過的固定工作集，並非
+把失敗的 R188 當成功使用。完整保留 issuer／Dune／SEC **170 native samples、
+8,649 evidence identities、481,280,233 原始 bytes**，沿用原 collect／fresh reader
+函式與六份 exact output SHA，比對參照不隨 live source drift 移動。
+
+每個 Evidence 的 read／prepare 與內部 hooks 都使用現有 per-thread wall／thread
+CPU timer，含失敗次數；nested／inclusive 範圍與不同 threads 不加總成流程 wall。
+序列化、seal、fresh reader 不從整個 owner 計時排除；operation counters 的內層
+範圍另明列。等待／collect／verify 均使用已資格驗證的 component-first v2 clock。
+這輪仍是診斷，不宣告新的加速或硬體極限；沒有新 provider 或 GPU 工作。
+
+- [R190 原完整 collect／verify 與 canonical operation hook 重用](../artifacts/benchmarks/workflow_speed_optimization_20261021/round190/diagnose_retained_evidence_operations.py)
+- [R190 live module origin 拒絕的原始 owner](../artifacts/operations/agent-workflow/runs/r190-canonical-operation-timer-s-20261025T075842-7474c9ab/run.json)
+- [R191 固定來源與不重疊 gate 的明確範圍](../artifacts/benchmarks/workflow_speed_optimization_20261021/round191/diagnose_frozen_retained_operations.py)
+- [R191 package 搜尋順序仍不足的原始 owner](../artifacts/operations/agent-workflow/runs/r191-frozen-first-canonical-time-20261025T080320-7793c9a8/run.json)
+- [R192 固定 package ownership 的最小修正](../artifacts/benchmarks/workflow_speed_optimization_20261021/round192/diagnose_frozen_retained_operations.py)
+- [R192 全部 module／AST／原分母資格](../artifacts/benchmarks/workflow_speed_optimization_20261021/round192/qualification.json)
+- [R192 source／package／native counters 與實際終結獨立核對](../artifacts/benchmarks/workflow_speed_optimization_20261021/round192/independent_qualification_readback.json)
+- [R192 實際資格 owner](../artifacts/operations/agent-workflow/runs/r192-frozen-package-owner-qualif-20261025T080611-88375e99/run.json)
+- [R192 接續完整固定工作集細分診斷 owner](../artifacts/operations/agent-workflow/runs/r192-gated-complete-retained-ope-20261025T080719-81b2075f/run.json)

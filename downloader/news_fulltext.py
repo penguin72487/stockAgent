@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
 from dataclasses import asdict
 import hashlib
 import json
@@ -30,8 +31,10 @@ from downloader.news_fulltext_bulk import (cnyes_history_priority, cnyes_paginat
                                           wordpress_base, wordpress_page, wordpress_records, wordpress_url)
 from downloader.news_fulltext_policy import (CONTRACT_VERSION, NewsError, PolicyRegistry, capture_usage,
                                              cnyes_bulk_fingerprint, extract_article, normalize_url,
-                                             ETTODAY_LAYOUT_VERSIONS, POCKET_LAYOUT_VERSIONS, BASTILLE_LAYOUT_VERSIONS)
-from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK, feed_page, feed_records, feed_url
+                                             ETTODAY_LAYOUT_VERSIONS, POCKET_LAYOUT_VERSIONS, BASTILLE_LAYOUT_VERSIONS,
+                                             REQUEST_DEFERRAL_CODES)
+from downloader.news_fulltext_feed import (XML_BODY_METADATA_FALLBACK, XML_BODY_NO_USABLE_IDENTITY,
+    feed_page, feed_records, feed_url)
 from downloader.news_fulltext_queue import NewsQueue, utc_now
 
 
@@ -176,6 +179,10 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
     headers = {}
     request_url = row["url"]
     resolution_basis = "requested_public_url"
+    if source.provider == 'moneyweekly':
+        from downloader.news_fulltext_moneyweekly import moneyweekly_article_id, moneyweekly_route_version
+        if moneyweekly_route_version(source) >= 4 and moneyweekly_article_id(request_url, version=moneyweekly_route_version(source), requested=True) is None:
+            raise NewsError('unsupported_article_path')
     if source.provider == 'idn':
         from downloader.news_fulltext_idn import idn_article_id
         if idn_article_id(request_url, requested=True) is None:
@@ -241,6 +248,10 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
         from downloader.news_fulltext_mitrade import mitrade_article_id
         if mitrade_article_id(request_url) is None:
             raise NewsError('unsupported_article_path')
+    elif source.embedded_article_layout == 'nstock_finite_announcement_v1':
+        from downloader.news_fulltext_nstock import nstock_article_id
+        if nstock_article_id(request_url) is None:
+            raise NewsError('unsupported_article_path')
     validator_url = row.get('validator_url')
     if row.get("body_sha256") and validator_url:
         if row.get("etag"):
@@ -249,9 +260,23 @@ def fetch_article(http: NewsHTTP, row: dict) -> dict | None:
             headers["If-Modified-Since"] = row["last_modified"]
     started = time.monotonic()
     response = http.get(request_url, headers=headers,
-                        **({'conditional_url': validator_url} if headers else {}))
+                        **({'conditional_url': validator_url} if headers else {}),
+                        **({'follow_redirects': False} if source.embedded_article_layout == 'nstock_finite_announcement_v1' else {}))
+    if (source.embedded_article_layout == 'nstock_finite_announcement_v1'
+            and (response.url != request_url or getattr(response, 'redirects', ()))):
+        raise NewsError('article_identity_not_verified')
     if response.status != 304:
         _require_article_response(response, source)
+    if source.provider == 'moneyweekly' and response.status != 304:
+        from downloader.news_fulltext_moneyweekly import validate_moneyweekly_native_response
+        try:
+            native_resolution = validate_moneyweekly_native_response(source, request_url, response)
+        except NewsError as error:
+            from downloader.news_fulltext_diagnostics import FailureResponse
+            error.failure_response = FailureResponse(response, source.provider, source.data_fingerprint, row['url'], utc_now())
+            raise
+        if native_resolution:
+            resolution_basis = native_resolution
     if ettoday_version or source.embedded_article_layout in {'tvbs_visible_article_v1', 'tvbs_visible_article_v2'}:
         # Transport may upgrade a literal HTTP link; it cannot replace its
         # article/category/host with another currently available report.
@@ -680,9 +705,11 @@ def fetch_discovery(http: NewsHTTP, task: dict):
         compatible = task.get('parser_fingerprint') in fulltext_feed_discovery_fingerprints(source)
     if task['kind'] == 'sitemap':
         compatible = task.get('parser_fingerprint') in sitemap_discovery_fingerprints(source)
-    if task["etag"] and compatible:
+    needs_history_witness = (task['kind'] == 'cnyes_news'
+                             and task.get('_cnyes_missing_restricted_history_evidence') is True)
+    if task["etag"] and compatible and not needs_history_witness:
         headers["If-None-Match"] = task["etag"]
-    if task["last_modified"] and compatible:
+    if task["last_modified"] and compatible and not needs_history_witness:
         headers["If-Modified-Since"] = task["last_modified"]
     response = http.get(task["url"], headers=headers, **({'metadata_feed': task['url']} if metadata else {}))
     if response.status not in {200, 304}:
@@ -741,6 +768,14 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
     # A 304 confirms unchanged mixed-page metadata, not permission to accept
     # its paid bodies. Preserve the visible gap and its shorter recheck timer.
     restricted_page = response.status == 304 and task.get("error_code") == "bulk_response_contains_restricted_text"
+    if response.status == 304 and bulk and not restricted_page:
+        # A transient failure can replace the page-level error while the last
+        # successful mixed response and its item errors remain authoritative.
+        marks = ','.join('?' for _ in BULK_RESTRICTED_ITEM_ERRORS)
+        restricted_page = bool(queue.db.execute(
+            'SELECT 1 FROM bulk_item_errors WHERE request_url=? AND provider=? '
+            f'AND error_code IN ({marks}) LIMIT 1',
+            (task['url'], source.provider, *sorted(BULK_RESTRICTED_ITEM_ERRORS))).fetchone())
     rss_metadata_only = response.status == 304 and task.get('error_code') == XML_BODY_METADATA_FALLBACK
     total, pages = None, None
     if bulk and response.status == 200:
@@ -798,7 +833,14 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
             digest = hashlib.sha256(response.body).hexdigest()
             relative = "quarantine/" + digest + ".parquet"
             target = queue.root / relative
-            rss_metadata_only = bool(rss_page_info and errors and all(e['error'] == XML_BODY_METADATA_FALLBACK for e in errors))
+            # Metadata-only is a property of the XML response, not a claim
+            # that every item's identity could be parsed. Never retain the
+            # shared body merely because a different item also failed.
+            rss_metadata_only = bool(rss_page_info and any(
+                e.get('xml_body_metadata_only') is True or e['error'] == XML_BODY_METADATA_FALLBACK
+                for e in errors))
+            if rss_metadata_only and records:
+                raise NewsError('invalid_feed_metadata_only_records')
             if not restricted_page and not rss_metadata_only and not target.is_file():
                 atomic_write_parquet(target, table_from_records([{
                     "request_url": response.url, "response_sha256": digest, "raw_response_body": response.body,
@@ -814,8 +856,9 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
             from downloader.news_fulltext_metrics import bulk_body_page_classification
             page_metric = bulk_body_page_classification(records, errors, cnyes=bool(cnyes_page_info),
                                                        rss_metadata_only=rss_metadata_only)
-            metadata_only_page = page_metric in {'rss_xml_controls_metadata_only_pages',
-                                                'bulk_metadata_only_html_fallback_pages'}
+            metadata_only_page = (page_metric == 'bulk_metadata_only_html_fallback_pages'
+                                  or page_metric == 'rss_xml_controls_metadata_only_pages'
+                                  and any(e['error'] == XML_BODY_METADATA_FALLBACK and e.get('url') for e in errors))
             if page_metric:
                 queue.metrics.count(source.provider, page_metric)
             if not restricted_page and not records and not metadata_only_page and (total or rss_page_info and rss_page_info["rows"]):
@@ -824,6 +867,12 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                 # this circuit affects only the bulk adapter, not article work.
                 with queue.db:
                     queue.add_articles([{"url": url, "title": title, "date": date} for url, title, date in links])
+                if rss_metadata_only:
+                    # A single malformed XML body with no usable article URL
+                    # proves only that this page cannot advance. Preserve the
+                    # per-page retry; do not trip the provider-wide parser
+                    # circuit and strand other independently registered feeds.
+                    raise NewsError(XML_BODY_NO_USABLE_IDENTITY, retry=True, delay=3600)
                 raise NewsError("bulk_all_items_unusable", retry=True, delay=3600)
     # Queue article identities first, but do not mark this source page complete
     # until the full bodies and their acceptance receipts are durably committed.
@@ -883,8 +932,9 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
                 queue.db.execute("DELETE FROM bulk_adapter_cooldowns WHERE provider=?", (source.provider,))
         if total is not None:
             base = cnyes_scope(task["url"]) if cnyes_page_info else wordpress_base(task["url"])
-            queue.db.execute("INSERT OR REPLACE INTO bulk_api_coverage VALUES (?,?,?,?,?)",
-                             (base, source.provider, total, pages, utc_now()))
+            # Preserve the old contribution for the transactional endpoint
+            # summary. REPLACE deletes without ordinary UPDATE notifications.
+            queue.observe_bulk_coverage(base, source.provider, total, pages, utc_now())
             if cnyes_page_info:
                 queue.metrics.count(source.provider, "bulk_exact_duplicate_rows_observed", cnyes_page_info["duplicate_rows"])
                 from urllib.parse import parse_qs
@@ -955,6 +1005,20 @@ def accept_discovery(queue: NewsQueue, task: dict, response, links, records, err
 
 
 def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
+    deferred = (getattr(error, 'request_deferred', False) is True and error.retry is True
+                and error.code in REQUEST_DEFERRAL_CODES)
+    if deferred:
+        # This hop was held before it was sent. Earlier redirect or robots
+        # requests, if any, remain separately counted by NewsHTTP. Keep the
+        # prior failure burst, source outcome/check clock and any newer row
+        # deadline. The old outcome may be required to interpret a later 304;
+        # a scheduler gate is not evidence for an endpoint-wide failure.
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=max(due,?) WHERE url=?',
+                             (time.time() + max(0, error.delay), task['url']))
+        queue.metrics.count(task['provider'], 'discovery_source_gate_deferrals')
+        queue.metrics.count(task['provider'], 'discovery_deferred_' + error.code)
+        return
     attempts = task["attempts"] + 1
     # Persistent refusals remain visible and do not hammer every cycle.
     delay = max(error.delay, min(3600, 30 * 2 ** min(attempts, 7))) if error.retry else 86400
@@ -1008,19 +1072,34 @@ def fail_discovery(queue: NewsQueue, task: dict, error: NewsError):
 
 
 def refresh_disk_admission(queue, config):
-    """Publish the original admission sample; status reads never repeat statvfs."""
-    free = shutil.disk_usage(queue.root).free
+    """Use both actual backing and filesystem space; never block the owner on WSL."""
+    from downloader.news_fulltext_disk import BackingDiskSampler
+    sampler = getattr(queue, '_backing_disk_sampler', None)
+    if sampler is None:
+        sampler = queue._backing_disk_sampler = BackingDiskSampler(queue.root)
+    sample = sampler.sample(shutil.disk_usage(queue.root).free)
+    free = sample['free_bytes']
     required = math.ceil(config['min_free_disk_bytes'])  # Integer free bytes must meet the original threshold.
-    queue.disk_admission = {'contract_version': 1, 'checked_at_utc': utc_now(),
+    checked = utc_now()
+    if sample['state'] == 'available':
+        from datetime import datetime, timedelta
+        checked = (datetime.fromisoformat(checked) - timedelta(seconds=sample['backing_age_seconds'])).isoformat()
+    queue.disk_admission = {'contract_version': 1, 'checked_at_utc': checked,
         'free_bytes': free, 'required_free_bytes': required,
-        'shortfall_bytes': max(0, required-free), 'fetch_allowed': free >= required,
+        'shortfall_bytes': None if free is None else max(0, required-free),
+        'fetch_allowed': free is not None and free >= required,
+        'filesystem_free_bytes': sample['filesystem_free_bytes'],
+        'backing_free_bytes': sample['backing_free_bytes'],
+        'backing_age_seconds': sample.get('backing_age_seconds'),
+        'physical_backing_state': sample['state'],
+        'physical_probe_inflight': sample['inflight'],
         'automatic_recheck_seconds': math.ceil(max(10, config.get('service_idle_max_seconds', 60)))}
     return not queue.disk_admission['fetch_allowed']
 
 
 def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: int, max_discovery_requests: int = 64,
               executor=None, max_run_seconds: float | None = None, provider_ids: set[str] | None = None,
-              continuous_budgets: bool = False, refresh_metadata=None):
+              continuous_budgets: bool = False, refresh_metadata=None, defer_final_status: bool = False):
     if provider_ids is not None and (not provider_ids or any(
             p not in queue.registry.sources or not queue.registry.sources[p].request_enabled for p in provider_ids)):
         raise ValueError("cycle provider selection must contain authorized, configured providers")
@@ -1031,9 +1110,9 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
         http.capacity_controller = PublisherCapacity(http, config)
     queue.http_capacity_snapshot = http.capacity_snapshot
     queue.provider_cooldown_snapshot = http.cooldown_snapshot
+    queue.http_traffic_snapshot = http.traffic_snapshot
     requests_at_start = dict(http.requests_by_provider)
-    queue.schedule_recent_rechecks(config["recent_article_recheck_seconds"], config["recent_article_window_days"])
-    seed_discovery(queue)
+    initial_schedule_pending = True
     discovery_claimed, discovery_inflight = 0, set()
     article_budget_used, discovery_budget_used, budget_rollovers = 0, 0, 0
     last_maintenance = started
@@ -1042,17 +1121,29 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
     last_cached_replay = started - 10
     last_failure_replay = started - 10
     last_metadata_replay = started
-    from downloader.news_fulltext_repairs import PUMP_INTERVAL_SECONDS
+    next_discovery_error_rollup = started
+    initial_metadata_replay_pending = True
+    from downloader.news_fulltext_repairs import PUMP_INTERVAL_SECONDS, CONTINUATION_INTERVAL_SECONDS
     last_reviewed_repair = started - PUMP_INTERVAL_SECONDS
+    next_repair_continuation = started
     next_cnyes_work_backfill = started
     next_cnyes_history_backfill = started
+    cnyes_history_pending = False
     last_original_resolution = started - config['original_url_resolution_interval_seconds']
     pending_records, futures = [], {}
     pending_bytes, pending_raw_bytes, last_flush, last_status = 0, 0, time.monotonic(), 0
     active = {provider: 0 for provider, source in queue.registry.sources.items()
               if source.request_enabled and (provider_ids is None or provider in provider_ids)}
     provider_order = deque(active)
-    low_disk, last_disk_check = False, 0
+    # Sample before requeueing complete articles or seeding discovery. A
+    # blocked cycle cannot dispatch either, so repeating those writes while
+    # waiting for backing space only consumes the reserve and changes status.
+    low_disk, last_disk_check = False, started - 10
+    # A one-shot diagnostic cycle must not consume attempts on these old
+    # unsupported heads either. A bounded, resumable sweep precedes CMoney
+    # dispatch in both service and one-shot modes.
+    cmoney_namespace_done = 'cmoney' not in active
+    next_cmoney_namespace_slice = started
     pool = ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") if executor is None else nullcontext(executor)
     with pool as executor:
         while True:
@@ -1080,9 +1171,14 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 refresh_metadata()
                 last_metadata_inventory = time.monotonic()
                 now = last_metadata_inventory
-            if continuous_budgets and maintenance_due and not http.stop.is_set():
+            if now - last_disk_check >= 10:
+                low_disk = refresh_disk_admission(queue, config)
+                last_disk_check = now
+            if (not low_disk and not http.stop.is_set()
+                    and (initial_schedule_pending or continuous_budgets and maintenance_due)):
                 queue.schedule_recent_rechecks(config["recent_article_recheck_seconds"], config["recent_article_window_days"])
                 seed_discovery(queue)
+                initial_schedule_pending = False
                 last_maintenance = time.monotonic()
             bulk_rollover = False
             if not continuous_budgets and max_discovery_requests > 0 and discovery_budget_used >= max_discovery_requests:
@@ -1100,19 +1196,22 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                         break
             draining = (http.stop.is_set() or max_run_seconds is not None and now - started >= max_run_seconds
                         or not continuous_budgets and max_articles > 0 and article_budget_used >= max_articles or bulk_rollover)
-            if now - last_disk_check >= 10:
-                low_disk = refresh_disk_admission(queue, config)
-                last_disk_check = now
+            regular_repair_poll = now - last_reviewed_repair >= PUMP_INTERVAL_SECONDS
             if (continuous_budgets and not draining and not low_disk and provider_ids is None
-                    and now - last_reviewed_repair >= PUMP_INTERVAL_SECONDS):
+                    and (regular_repair_poll or getattr(queue, 'reviewed_repair_continuation_pending', False)
+                         and now >= next_repair_continuation)):
                 from downloader.news_fulltext_repairs import consume_repairs
                 with queue.metrics.measure('reviewed_repair_admission'):
-                    from downloader.news_fulltext_url_metadata import consume_urls
-                    consume_urls(queue, stop=http.stop)
+                    if regular_repair_poll:
+                        from downloader.news_fulltext_url_metadata import consume_urls
+                        consume_urls(queue, stop=http.stop)
                     consume_repairs(queue, stop=http.stop)
-                    from downloader.news_fulltext_candidate_diagnostics import pump_candidates
-                    pump_candidates(queue, stop=http.stop)
-                last_reviewed_repair = time.monotonic()
+                    if regular_repair_poll:
+                        from downloader.news_fulltext_candidate_diagnostics import pump_candidates
+                        pump_candidates(queue, stop=http.stop)
+                next_repair_continuation = time.monotonic() + CONTINUATION_INTERVAL_SECONDS
+                if regular_repair_poll:
+                    last_reviewed_repair = time.monotonic()
             if (continuous_budgets and not draining and not low_disk
                     and 'cnyes' in active and now >= next_cnyes_work_backfill):
                 from downloader.news_fulltext_cnyes_work import backfill as backfill_cnyes_work, maintenance_delay
@@ -1120,12 +1219,24 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 next_cnyes_work_backfill = time.monotonic() + maintenance_delay(result)
             if (continuous_budgets and not draining and not low_disk
                     and 'cnyes' in active and now >= next_cnyes_history_backfill):
-                from downloader.news_fulltext_cnyes_history import backfill as backfill_cnyes_history
+                from downloader.news_fulltext_cnyes_history import (
+                    backfill as backfill_cnyes_history, maintenance_delay as cnyes_history_maintenance_delay,
+                )
                 # Bound writer time, not fast metadata rows to four per second.
                 # This is local evidence maintenance; HTTP pacing and source
                 # refusal deadlines remain governed by the existing owner.
                 result = backfill_cnyes_history(queue, stop=http.stop, limit=128, max_seconds=.05)
-                next_cnyes_history_backfill = time.monotonic() + (300 if result['exhausted'] else 2)
+                cnyes_history_pending = not result['exhausted']
+                next_cnyes_history_backfill = time.monotonic() + cnyes_history_maintenance_delay(result)
+            # A bounded local slice can observe stop or consume the remaining
+            # cycle time. Do not dispatch new work using the older snapshot.
+            draining = (draining or http.stop.is_set() or max_run_seconds is not None
+                        and time.monotonic() - started >= max_run_seconds)
+            if not draining and not low_disk and not cmoney_namespace_done and now >= next_cmoney_namespace_slice:
+                with queue.metrics.measure('cmoney_note_detail_path_admission'):
+                    result = queue.backfill_cmoney_note_detail_exclusions(stop=http.stop)
+                cmoney_namespace_done = result['completed']
+                next_cmoney_namespace_slice = time.monotonic() + .1
             if (continuous_budgets and not draining and not low_disk
                     and now - last_original_resolution >= config['original_url_resolution_interval_seconds']):
                 from downloader.news_fulltext_urls import backfill_original_urls, sync_original_url_routes
@@ -1149,28 +1260,37 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                 last_failure_replay = time.monotonic()
             if (continuous_budgets and not draining and not low_disk
                     and config.get('cached_cnyes_metadata_replay_enabled', False)
-                    and 'cnyes' in active and now - last_metadata_replay >= 10):
+                    and 'cnyes' in active and now - last_metadata_replay >= (
+                        1 if getattr(queue, '_large_metadata_job', None) else 10)):
                 from downloader.news_fulltext_metadata_replay import replay_retained_cnyes_metadata
                 # Revisions are not new URL heads or HTTP attempts. The shared
                 # metrics label retained work separately from online capacity.
                 replay_retained_cnyes_metadata(queue, stop=http.stop)
                 last_metadata_replay = time.monotonic()
+                initial_metadata_replay_pending = False
             submitted_in_round = 0
             for provider in () if draining else provider_order:
+                if http.stop.is_set():
+                    break
                 source = queue.registry.sources[provider]
                 if low_disk or len(futures) >= config["workers"] or active[provider] >= http.parallelism[provider]:
+                    continue
+                # Avoid leasing a legacy excluded path while its local,
+                # resumable classification is in progress. Other providers
+                # retain their own slots and continue normally.
+                if provider == 'cmoney' and not cmoney_namespace_done:
                     continue
                 if provider_deadlines.get(provider, 0) > time.time():
                     continue
                 excluded_origins = tuple(http.blocked_robots_origins(provider))
+                excluded_hosts = http.blocked_gateway_hosts(provider)
                 task = None
                 if max_discovery_requests > 0 and (continuous_budgets or discovery_budget_used < max_discovery_requests):
                     bulk_allowed = queue.bulk_allowed(source)
                     candidates = queue.discovery_candidates(source, config['workers'] + 1,
-                        bulk_allowed=bulk_allowed, excluded_origins=excluded_origins)
+                        bulk_allowed=bulk_allowed, excluded_origins=excluded_origins, excluded_hosts=excluded_hosts)
                     task = next((dict(r) for r in candidates if r["url"] not in discovery_inflight), None)
                 row = None
-                excluded_hosts = http.blocked_gateway_hosts(provider)
                 historical_bulk = bool(task and (
                     task["kind"] == "rss_fulltext" and (feed_page(task["url"]) > 1
                         or wordpress_base(task['url']) in source.historical_fulltext_feeds)
@@ -1208,6 +1328,12 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                         if row:
                             task = None
                 if task:
+                    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+                    prepare_dispatch(queue, task)
+                    if task['kind'] == 'cnyes_news':
+                        from downloader.news_fulltext_cnyes_history import prepare_restricted_history_dispatch
+                        prepare_restricted_history_dispatch(queue, task, source,
+                            compatible_fingerprint=discovery_fingerprint(source, kind=task['kind']))
                     futures[executor.submit(fetch_discovery, http, task)] = ("discovery", task)
                     active[provider] += 1
                     discovery_inflight.add(task["url"])
@@ -1242,6 +1368,8 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                     and getattr(queue, 'native_candidate_ready_providers', None)):
                 from downloader.news_fulltext_candidate_diagnostics import claim_candidate, fetch_candidate
                 for provider in provider_order:
+                    if provider == 'cmoney' and not cmoney_namespace_done:
+                        continue
                     if (len(futures) >= config['workers'] or active[provider] >= http.parallelism[provider]
                             or provider_deadlines.get(provider, 0) > time.time()):
                         continue
@@ -1251,18 +1379,48 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                         active[provider] += 1
                         submitted_in_round += 1
             provider_order.rotate(-1)
+            if (not draining and not low_disk and not http.stop.is_set()
+                    and getattr(queue, '_discovery_error_rollup_pending', False)
+                    and time.monotonic() >= next_discovery_error_rollup):
+                # Online requests take their slots first. This is a resumable
+                # local slice; its time budget is soft for individual I/O.
+                queue.advance_discovery_error_rollup()
+                next_discovery_error_rollup = time.monotonic() + 1
+            if (not futures and initial_metadata_replay_pending and continuous_budgets and not draining and not low_disk
+                    and config.get('cached_cnyes_metadata_replay_enabled', False) and 'cnyes' in active):
+                # An idle cycle can end before the periodic ten-second tick.
+                # Give online work first dispatch, then perform one bounded
+                # local slice rather than resetting its timer on every cycle.
+                from downloader.news_fulltext_metadata_replay import replay_retained_cnyes_metadata
+                replay_retained_cnyes_metadata(queue, stop=http.stop)
+                last_metadata_replay = time.monotonic()
+                initial_metadata_replay_pending = False
             metadata_only = False
+            repair_only = False
+            namespace_only = False
+            history_only = False
             if not futures:
                 if continuous_budgets and not draining and not low_disk:
                     from downloader.news_fulltext_urls import has_original_url_work
                     metadata_only = has_original_url_work(queue)
-                if not metadata_only:
+                    repair_only = provider_ids is None and getattr(queue, 'reviewed_repair_continuation_pending', False)
+                    history_only = 'cnyes' in active and cnyes_history_pending
+                if not draining and not low_disk:
+                    namespace_only = not cmoney_namespace_done
+                if not metadata_only and not repair_only and not namespace_only and not history_only:
                     break
             # Fill every independently reserved response slot before sleeping.
             # One submission per publisher per round preserves fairness; when
             # no new job was submitted, block normally instead of CPU polling.
-            done = () if metadata_only else wait(
-                futures, timeout=0 if submitted_in_round else 1, return_when=FIRST_COMPLETED)[0]
+            wait_seconds = 0 if submitted_in_round else 1
+            if getattr(queue, 'reviewed_repair_continuation_pending', False) and not draining and not low_disk:
+                wait_seconds = min(wait_seconds, max(0, next_repair_continuation - time.monotonic()))
+            if not cmoney_namespace_done and not draining and not low_disk:
+                wait_seconds = min(wait_seconds, max(0, next_cmoney_namespace_slice - time.monotonic()))
+            if cnyes_history_pending and not draining and not low_disk:
+                wait_seconds = min(wait_seconds, max(0, next_cnyes_history_backfill - time.monotonic()))
+            done = () if metadata_only or repair_only or namespace_only or history_only else wait(
+                futures, timeout=wait_seconds, return_when=FIRST_COMPLETED)[0]
             for future in done:
                 kind, row = futures.pop(future)
                 active[row["provider"]] -= 1
@@ -1278,6 +1436,13 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                     continue
                 if kind == "discovery":
                     discovery_inflight.remove(row["url"])
+                    from downloader.news_fulltext_cnyes_index import is_index_task
+                    if is_index_task(row):
+                        from downloader.news_fulltext_bulk import cnyes_scope
+                        scope = cnyes_scope(row['url'])
+                        row['_cnyes_revision_scope_idle'] = not any(
+                            url.split('?', 1)[0] == row['url'].split('?', 1)[0]
+                            and cnyes_scope(url) == scope for url in discovery_inflight)
                     try:
                         accepted += accept_discovery(queue, row, *future.result())
                     except NewsError as error:
@@ -1301,7 +1466,7 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                     # a forged empty success. KeyboardInterrupt/SystemExit propagate.
                     queue.failed(row, NewsError("worker_" + type(error).__name__, retry=True, delay=60), config["max_attempts"])
             now = time.monotonic()
-            if pending_records and (metadata_only or len(pending_records) >= config["batch_articles"]
+            if pending_records and (metadata_only or repair_only or namespace_only or history_only or len(pending_records) >= config["batch_articles"]
                                     or pending_bytes >= config["batch_text_bytes"]
                                     or pending_raw_bytes >= config.get("batch_raw_response_bytes", 16 << 20)
                                     or now - last_flush >= config.get("batch_flush_seconds", 30)):
@@ -1314,58 +1479,126 @@ def run_cycle(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: i
                                  run_seconds=now - started, accepted_this_run=accepted, activity="draining" if draining else "running",
                                  provider_cooldowns=http.cooldown_snapshot())
                 last_status = now
-            if metadata_only:
+            if metadata_only or repair_only or namespace_only or history_only:
                 # A local metadata backlog is work even with every publisher
                 # cooling down. Keep its bounded slices moving, flush bodies
                 # above, and sleep interruptibly instead of an empty CPU loop.
-                http.stop.wait(config['original_url_resolution_interval_seconds'])
+                delay = config['original_url_resolution_interval_seconds']
+                if repair_only:
+                    delay = min(delay, max(0, next_repair_continuation - time.monotonic()))
+                if namespace_only:
+                    delay = min(delay, max(0, next_cmoney_namespace_slice - time.monotonic()))
+                if history_only:
+                    delay = min(delay, max(0, next_cnyes_history_backfill - time.monotonic()))
+                http.stop.wait(delay)
     if pending_records:
         queue.accept(pending_records)
         accepted += len(pending_records)
-    result = queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
-                          run_seconds=time.monotonic() - started, accepted_this_run=accepted,
-                          activity="waiting_disk" if low_disk else "stopped" if http.stop.is_set() else "cycle_complete",
-                          provider_cooldowns=http.cooldown_snapshot())
-    result["cycle"] = {"wall_seconds": time.monotonic() - started, "article_attempts_started": claimed,
-                       "durably_accepted_versions": accepted, "discovery_attempts_started": discovery_claimed,
-                       "http_requests": {p: count - requests_at_start.get(p, 0) for p, count in http.requests_by_provider.items()},
-                       "final_flush_records": len(pending_records), "max_run_seconds": max_run_seconds,
-                       "bulk_backlog_rollover": bulk_rollover,
-                       "continuous_budgets": continuous_budgets, "budget_rollovers": budget_rollovers}
-    result["http_counters_basis"] = "since current owner started; cycle contains separate deltas"
-    atomic_write_json(queue.root / "status.json", result, durable=False, compact=True)
-    return result
+    activity = "waiting_disk" if low_disk else "stopped" if http.stop.is_set() else "cycle_complete"
+    cycle = {"wall_seconds": time.monotonic() - started, "article_attempts_started": claimed,
+             "durably_accepted_versions": accepted, "discovery_attempts_started": discovery_claimed,
+             "http_requests": {p: count - requests_at_start.get(p, 0) for p, count in http.requests_by_provider.items()},
+             "final_flush_records": len(pending_records), "max_run_seconds": max_run_seconds,
+             "bulk_backlog_rollover": bulk_rollover,
+             "continuous_budgets": continuous_budgets, "budget_rollovers": budget_rollovers}
+    if defer_final_status:
+        # The resident owner decides whether the next state is waiting or ready
+        # before projecting the same multi-megabyte status. Accepted records and
+        # source deadlines have already been committed above.
+        return {"activity": activity, "cycle": cycle}
+    return queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
+                        run_seconds=cycle['wall_seconds'], accepted_this_run=accepted, activity=activity,
+                        provider_cooldowns=http.cooldown_snapshot(), cycle=cycle)
 
 
-def _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata):
+DISK_WAIT_HEARTBEAT_SECONDS = 60
+
+
+@contextmanager
+def _coalesce_inventory_heartbeats(queue):
+    """Let the blocked owner's heartbeat publish local inventory progress.
+
+    The inventory callback stays synchronous and keeps committing its normal
+    slices. Restore any outer state even when the callback raises or stops.
+    """
+    missing = object()
+    previous = getattr(queue, '_coalesce_inventory_heartbeats', missing)
+    queue._coalesce_inventory_heartbeats = True
+    try:
+        yield
+    finally:
+        if previous is missing:
+            del queue._coalesce_inventory_heartbeats
+        else:
+            queue._coalesce_inventory_heartbeats = previous
+
+
+def _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata, result=None):
     """Keep local inventory moving without rebuilding a blocked HTTP cycle.
 
     Disk admission keeps its configured wake; pending metadata keeps its
-    registered slice interval. Heartbeats retain the fifteen second cadence.
+    registered slice interval. A blocked owner uses a one-minute heartbeat
+    instead of rewriting the complete status every fifteen seconds.
+    The capacity wake itself is unchanged, and ordinary idle/running updates
+    keep their existing cadence.
     Neither local work nor a durable mailbox can bypass disk admission.
     """
     from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
     until = time.monotonic() + delay
-    next_status = time.monotonic() + 15
+    next_status = time.monotonic() + DISK_WAIT_HEARTBEAT_SECONDS
     next_metadata = time.monotonic() + METADATA_SLICE_INTERVAL_SECONDS
     with queue.metrics.measure('idle_wait'):
         while not http.stop.is_set() and time.monotonic() < until:
+            sampler = getattr(queue, '_backing_disk_sampler', None)
+            pending_backing = bool(sampler and getattr(queue, 'disk_admission', {}).get('physical_probe_inflight'))
+            if pending_backing and sampler.wait(0):
+                return  # Recheck this same owner as soon as the first sample finishes.
             now = time.monotonic()
             if (refresh_metadata and getattr(queue, 'metadata_inventory_pending', False)
                     and now >= next_metadata):
-                refresh_metadata()
+                with _coalesce_inventory_heartbeats(queue):
+                    refresh_metadata()
                 next_metadata = time.monotonic() + METADATA_SLICE_INTERVAL_SECONDS
                 if http.stop.is_set():
                     break
                 now = time.monotonic()
             if now >= next_status:
-                queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
-                             activity='waiting_disk', provider_cooldowns=http.cooldown_snapshot())
-                next_status = time.monotonic() + 15
+                # Preserve the last completed cycle across heartbeats, just as
+                # the ordinary idle path does. These are cycle deltas, not a
+                # claim that source requests continued while disk was blocked.
+                _publish_service_cycle(queue, http, result if result is not None else {}, 'waiting_disk')
+                next_status = time.monotonic() + DISK_WAIT_HEARTBEAT_SECONDS
             deadline = min(until, next_status)
             if refresh_metadata and getattr(queue, 'metadata_inventory_pending', False):
                 deadline = min(deadline, next_metadata)
-            mailbox.wait(max(0, deadline - time.monotonic()), enabled=False)
+            wait_seconds = max(0, deadline - time.monotonic())
+            if pending_backing:
+                sampler.wait(min(1, wait_seconds))  # No source or mailbox work while unadmitted.
+            else:
+                mailbox.wait(wait_seconds, enabled=False)
+
+
+def _publish_service_cycle(queue, http, result, activity, *, include_cycle_rate=False):
+    """Project and publish the cycle once in the owner's actual next state."""
+    cycle = result.get('cycle')
+    options = {}
+    if cycle is not None:
+        options['cycle'] = cycle
+        if include_cycle_rate:
+            options['run_seconds'] = cycle['wall_seconds']
+            options['accepted_this_run'] = cycle['durably_accepted_versions']
+    return queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
+                        activity=activity, provider_cooldowns=http.cooldown_snapshot(), **options)
+
+
+@contextmanager
+def _service_cycle_snapshots(queue):
+    """Scope inventory's last completed cycle to this resident owner only."""
+    queue._service_last_completed_cycle = None
+    try:
+        yield
+    finally:
+        del queue._service_last_completed_cycle
 
 
 def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles: int, max_discovery_requests: int,
@@ -1381,8 +1614,11 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
     # same loaded source deadlines/capacity as every later progress heartbeat.
     queue.http_capacity_snapshot = http.capacity_snapshot
     queue.provider_cooldown_snapshot = http.cooldown_snapshot
+    queue.http_traffic_snapshot = http.traffic_snapshot
     from downloader.news_fulltext_wake import OwnerMailboxWake
-    with ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") as executor, \
+    latest_cycle = None
+    with _service_cycle_snapshots(queue), \
+            ThreadPoolExecutor(max_workers=config["workers"], thread_name_prefix="news-fulltext") as executor, \
             OwnerMailboxWake(queue, http.stop) as mailbox:
         while not http.stop.is_set():
             remaining = duration_seconds - (time.monotonic() - started) if duration_seconds is not None else None
@@ -1398,35 +1634,102 @@ def run_service(queue: NewsQueue, http: NewsHTTP, config: dict, *, max_articles:
                     break
             result = run_cycle(queue, http, config, max_articles=max_articles, max_discovery_requests=max_discovery_requests,
                                executor=executor, max_run_seconds=remaining,
-                               continuous_budgets=True, refresh_metadata=refresh_metadata)
+                               continuous_budgets=True, refresh_metadata=refresh_metadata, defer_final_status=True)
+            latest_cycle = result.get('cycle')
+            if latest_cycle is not None:
+                queue._service_last_completed_cycle = {'cycle': deepcopy(latest_cycle), 'completed_at_utc': utc_now()}
             if http.stop.is_set():
                 break
-            delay = (config.get("service_idle_max_seconds", 60) if result["activity"] == "waiting_disk"
-                     else queue.next_wake_delay(http.cooldown_snapshot(), config.get("service_idle_max_seconds", 60),
-                                               request_scope_cooldowns=http.request_scope_cooldown_snapshot()))
-            # Even diagnostic work limits of zero must not spin continuously.
-            if max_articles == 0 and max_discovery_requests == 0:
-                delay = max(1, delay)
-            if result['activity'] != 'waiting_disk' and getattr(queue, 'metadata_inventory_pending', False):
-                from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
-                delay = min(delay, METADATA_SLICE_INTERVAL_SECONDS)
-            if remaining is not None:
-                delay = min(delay, max(0, duration_seconds - (time.monotonic() - started)))
+            try:
+                if result['activity'] == 'waiting_disk':
+                    delay = config.get('service_idle_max_seconds', 60)
+                else:
+                    provider_cooldowns = http.cooldown_snapshot()
+                    request_scopes = http.request_scope_cooldown_snapshot()
+                    delay = queue.next_wake_delay(provider_cooldowns, config.get('service_idle_max_seconds', 60),
+                                                  request_scope_cooldowns=request_scopes)
+                    # Suppressed ordinary work must not cause an idle spin.
+                    if max_articles == 0 and max_discovery_requests == 0:
+                        delay = max(1, delay)
+                    if getattr(queue, 'native_candidate_ready_providers', None):
+                        from downloader.news_fulltext_candidate_diagnostics import candidate_next_wake_delay
+                        delay = min(delay, candidate_next_wake_delay(queue, provider_cooldowns, request_scopes, delay))
+                    if config.get('retained_cnyes_failure_replay_enabled', False):
+                        from downloader.news_fulltext_replay import retained_failure_next_wake_delay
+                        delay = min(delay, retained_failure_next_wake_delay(queue, delay))
+                    if config.get('cached_cnyes_replay_enabled', False):
+                        from downloader.news_fulltext_replay import cached_bulk_local_retry_next_wake_delay
+                        delay = min(delay, cached_bulk_local_retry_next_wake_delay(queue, delay))
+                    if config.get('cached_cnyes_metadata_replay_enabled', False):
+                        from downloader.news_fulltext_metadata_replay import retained_metadata_next_wake_delay
+                        delay = min(delay, retained_metadata_next_wake_delay(queue, delay))
+                if result['activity'] != 'waiting_disk' and getattr(queue, 'metadata_inventory_pending', False):
+                    from downloader.news_fulltext_metadata_ingest import METADATA_SLICE_INTERVAL_SECONDS
+                    delay = min(delay, METADATA_SLICE_INTERVAL_SECONDS)
+                if result['activity'] != 'waiting_disk' and getattr(queue, 'reviewed_repair_pending', False):
+                    from downloader.news_fulltext_repairs import PUMP_INTERVAL_SECONDS
+                    delay = min(delay, PUMP_INTERVAL_SECONDS)
+                if remaining is not None:
+                    delay = min(delay, max(0, duration_seconds - (time.monotonic() - started)))
+            except Exception:
+                # The durable cycle still gets its final view if scheduling
+                # fails before the ordinary waiting transition is published.
+                _publish_service_cycle(queue, http, result, result['activity'], include_cycle_rate=True)
+                raise
             if delay and result['activity'] == 'waiting_disk':
-                _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata)
+                _publish_service_cycle(queue, http, result, 'waiting_disk', include_cycle_rate=True)
+                _wait_for_disk_capacity(queue, http, mailbox, delay, refresh_metadata, result)
                 continue
             if delay:
                 idle_until = time.monotonic() + delay
+                published = False
+                next_idle_heartbeat = 0.0
+                next_idle_rollup = 0.0
                 with queue.metrics.measure("idle_wait"):
                     while not http.stop.is_set() and idle_until > time.monotonic():
-                        if result['activity'] != 'waiting_disk' and mailbox.has_pending():
+                        try:
+                            pending_mail = result['activity'] != 'waiting_disk' and mailbox.has_pending()
+                        except Exception:
+                            if not published:
+                                _publish_service_cycle(queue, http, result, result['activity'], include_cycle_rate=True)
+                            raise
+                        if pending_mail:
                             break
-                        queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
-                                     activity="waiting_disk" if result["activity"] == "waiting_disk" else "waiting_next_due",
-                                     provider_cooldowns=http.cooldown_snapshot())
-                        if mailbox.wait(min(15, max(0, idle_until - time.monotonic())),
+                        now = time.monotonic()
+                        heartbeat_due = now >= next_idle_heartbeat
+                        if heartbeat_due:
+                            # Refresh the physical capacity at the ordinary
+                            # heartbeat, independently of cheap local slices.
+                            try:
+                                low_disk = refresh_disk_admission(queue, config)
+                            except Exception:
+                                if not published:
+                                    _publish_service_cycle(queue, http, result, result['activity'], include_cycle_rate=True)
+                                raise
+                            next_idle_heartbeat = time.monotonic() + 15
+                            if low_disk:
+                                _publish_service_cycle(queue, http, result, 'waiting_disk', include_cycle_rate=True)
+                                published = True
+                                break
+                        if (getattr(queue, '_discovery_error_rollup_pending', False)
+                                and now >= next_idle_rollup):
+                            queue.advance_discovery_error_rollup()
+                            next_idle_rollup = time.monotonic() + 1
+                        if heartbeat_due:
+                            _publish_service_cycle(queue, http, result, 'waiting_next_due')
+                            published = True
+                        next_wake = min(idle_until, next_idle_heartbeat)
+                        if getattr(queue, '_discovery_error_rollup_pending', False):
+                            next_wake = min(next_wake, next_idle_rollup)
+                        if mailbox.wait(max(0, next_wake - time.monotonic()),
                                 enabled=result['activity'] != 'waiting_disk'):
                             break
+                if not published and not http.stop.is_set():
+                    # Includes a mailbox that was already ready before the
+                    # first idle heartbeat and an expired service deadline.
+                    _publish_service_cycle(queue, http, result, result['activity'], include_cycle_rate=True)
+            else:
+                _publish_service_cycle(queue, http, result, result['activity'], include_cycle_rate=True)
     return queue.status(requests_by_provider=http.requests_by_provider, response_bytes=http.response_bytes,
                         activity="stopped" if http.stop.is_set() else "service_duration_complete",
-                        provider_cooldowns=http.cooldown_snapshot())
+                        provider_cooldowns=http.cooldown_snapshot(), cycle=latest_cycle)

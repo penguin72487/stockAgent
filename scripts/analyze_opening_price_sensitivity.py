@@ -106,6 +106,19 @@ def compare_weights(actual: list[dict], reference: list[dict], *, field="model_w
             for i in np.argsort(-np.abs(a - b), kind="stable") if changed[i]]}
 
 
+def _execution_stage_clocks(signal_complete_ms: float, verified_ms: float, *,
+                            execution_published: bool) -> dict:
+    """No execution is inapplicable, not an observed fast financial commit.
+
+    The historical field keeps its original elapsed no-work boundary for old
+    reports/consumers; only the distinct new clocks attest execution stages.
+    A reused progressive decision also has no newly published execution here.
+    """
+    return {"all_execution_pointers_published_ms": signal_complete_ms if execution_published else None,
+            "all_execution_verified_ms": verified_ms if execution_published else None,
+            "all_execution_commits_ms": verified_ms}
+
+
 def compare_complete_runs(left: dict, right: dict) -> dict:
     """All scenarios and symbols; output parity is separate from timed speed.
 
@@ -118,7 +131,8 @@ def compare_complete_runs(left: dict, right: dict) -> dict:
                 or not run.get("endpoint_parity") or not all(run["endpoint_parity"].values())):
             raise ValueError("comparison requires complete endpoint-verified runs")
     for key in ("session_date", "feature_date", "receipt_sha256", "journal_prefix",
-                "runtime_profile", "opening_reference_policy", "source_roots"):
+                "runtime_profile", "opening_reference_policy", "source_roots",
+                "observation_horizon_ms", "full_day_source_acceptance"):
         if left.get(key) != right.get(key):
             raise ValueError(f"comparison input identity differs: {key}")
     identities = bool(left.get("model_identities") and right.get("model_identities"))
@@ -218,6 +232,7 @@ def compact_signal_summary(report: dict) -> dict:
     result["input_scheduling"] = report.get("input_scheduling", "sequential")
     result["queued_refresh_policy"] = report.get("queued_refresh_policy")
     result["model_identities"] = report.get("model_identities")
+    result["clock_contract"] = report.get("clock_contract")
     for scenario in report["scenarios"]:
         markets = []
         for market in scenario["markets"]:
@@ -244,12 +259,17 @@ def compact_signal_summary(report: dict) -> dict:
                 "stages_ms": {key: value for key, value in market["stages"].items() if key.endswith("_ms")
                     and (value is None or isinstance(value, (int, float)))}})
         result["scenarios"].append({"label": scenario["label"], "after_open_ms": scenario["after_open_ms"],
+            "all_signal_calculations_complete_ms": scenario.get("all_signal_calculations_complete_ms"),
+            "all_execution_pointers_published_ms": scenario.get("all_execution_pointers_published_ms"),
+            "all_execution_verified_ms": scenario.get("all_execution_verified_ms"),
+            "scenario_complete_including_reports_ms": scenario.get("scenario_complete_including_reports_ms"),
             "all_execution_commits_ms": scenario.get("all_execution_commits_ms"),
             "all_models_elapsed_ms": scenario["all_models_elapsed_ms"], "markets": markets})
     return result
 
 
-def source_analysis(receipt: Path, journal: Path, *, cutoffs: tuple[int, ...]) -> dict:
+def source_analysis(receipt: Path, journal: Path, *, cutoffs: tuple[int, ...],
+                    observation_horizon_ms: int | None = None) -> dict:
     from scripts.audit_tw_opening_latency import opening_session_context
     from scripts.audit_tw_opening_symbol_status import journal_symbol_timeline, receipt_snapshot
     from scripts.benchmark_opening_signal_pipeline import _receipt_universe
@@ -260,9 +280,14 @@ def source_analysis(receipt: Path, journal: Path, *, cutoffs: tuple[int, ...]) -
     payload = json.loads(raw)
     gate = datetime.fromisoformat(payload["session_date"] + "T09:00:00+08:00")
     captured = datetime.fromisoformat(payload["captured_at_taipei"])
-    final_ms = int((captured - gate).total_seconds() * 1000)
+    captured_ms = final_ms = int((captured - gate).total_seconds() * 1000)
+    if observation_horizon_ms is not None:
+        if type(observation_horizon_ms) is not int or not 0 <= observation_horizon_ms <= final_ms:
+            raise ValueError("opening observation horizon must be within the retained receipt clock")
+        final_ms = observation_horizon_ms
     timeline = journal_symbol_timeline(journal, payload, _receipt_universe(payload),
-        cutoffs=tuple(sorted({0, final_ms, *cutoffs})), include_reference_rows=True)
+        cutoffs=tuple(sorted({0, final_ms, *cutoffs})), include_reference_rows=True,
+        observation_horizon_ms=observation_horizon_ms)
     names, snapshot = receipt_snapshot(payload)
     real = quote_provider.tw_session_open_observed_mask(snapshot, session_date=payload["session_date"])
     no_print = quote_provider.tw_session_no_open_print_mask(snapshot, session_date=payload["session_date"],
@@ -282,7 +307,9 @@ def source_analysis(receipt: Path, journal: Path, *, cutoffs: tuple[int, ...]) -
         "receipt": str(receipt), "receipt_sha256": hashlib.sha256(raw).hexdigest(),
         "session_applicability": context, "source_timeline": timeline,
         "completion_by_provider": completion_percentiles(timeline), "unknown_source_reasons_at_cutoffs": unknown_reasons,
-        "final_receipt": {"captured_at_taipei": payload["captured_at_taipei"], "after_open_ms": final_ms,
+        "observation_horizon_ms": observation_horizon_ms,
+        "full_day_source_acceptance": timeline["state"] == "observed" and observation_horizon_ms is None,
+        "final_receipt": {"captured_at_taipei": payload["captured_at_taipei"], "after_open_ms": captured_ms,
             "official_count": len(names), "true_open_count": int(real.sum()),
             "fresh_no_first_print_count": int((no_print & ~real).sum()),
             "unknown_count": int((~real & ~no_print).sum())},
@@ -354,9 +381,14 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
         "queued_refresh_policy": "repeat_complete_preparation_control" if repeat_prepare_control else "cache_only_provisional_facts",
         "network_requests": 0, "production_writes": False, "broker_fill_claim": False,
         "boundary": "counterfactual_model_input_sensitivity_not_live_latency_or_execution",
+        "observation_horizon_ms": analysis.get("observation_horizon_ms"),
+        "full_day_source_acceptance": analysis.get("full_day_source_acceptance", False),
         "full_price_reference_is_late_information_not_available_at_open": True}
     if progressive_execution:
         report.update(progressive_execution=True,
+            isolated_ledger_initial_clock=clock[0].isoformat(),
+            isolated_ledger_clock_contract="explicit_empty_fixture_initialization_not_observation_rewrite_v1",
+            isolated_signal_id_contract="explicit_fixture_signal_id_before_inference_v1",
             boundary="offline_original_input_clocks_with_synthetic_books_and_isolated_ledger_not_live_SLO",
             zero_fill_is_not_a_successful_entry=True)
     with tempfile.TemporaryDirectory(prefix="opening-sensitivity-") as temporary, ExitStack() as stack:
@@ -388,7 +420,6 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
         engine, specs, ledger_paths, entry_worker = None, {}, {}, None
         if progressive_execution:
             from scripts.run_tw_day_trade_simulation import _mode_specs
-            from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
             loaded, _, errors = _mode_specs(ROOT / "services/discord_bot/markets")
             if errors:
                 raise ValueError(f"execution contracts unavailable: {errors}")
@@ -401,9 +432,10 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
                 # consumer persists all scenarios/revisions in FIFO order.
                 entry_worker = stack.enter_context(ProcessPoolExecutor(
                     max_workers=1, mp_context=multiprocessing.get_context("spawn")))
-                ledger_paths = entry_worker.submit(owner._prepare_entry_worker, ledger_root, {}).result()
+                ledger_paths = entry_worker.submit(owner._prepare_entry_worker, ledger_root, {},
+                                                   created_at=clock[0]).result()
             else:
-                engine = TwDayTradeSimulationEngine(ledger_root)
+                engine = owner._new_isolated_entry_engine(ledger_root, created_at=clock[0])
                 ledger_paths = {"state": str(engine.state_path), "signals": str(engine.signals_path),
                     "orders": str(engine.orders_path), "fills": str(engine.fills_path)}
         report["execution_profiler_enabled"] = profile_execution
@@ -460,6 +492,8 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
                         if input_changed:
                             kwargs.update(write=True, defer_rich_artifacts=True,
                                 live_output_dir=root / "signals" / cfg.market,
+                                signal_id=owner._isolated_signal_id(
+                                    market=cfg.market, observed=clock[0], scenario=label),
                                 day_trade_signal_update_policy=SIGNAL_UPDATE_PROGRESSIVE,
                                 _prefetched_quote=prefetched,
                                 _previous_opening_signal=parent.summary if parent else None)
@@ -516,12 +550,15 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
                         pending_artifacts.append((result, scenario["markets"][-1]))
                         if entry_worker is not None:
                             entry_jobs[-1]["market_row"] = scenario["markets"][-1]
+                scenario["all_signal_calculations_complete_ms"] = (time.perf_counter() - started) * 1000
                 for job in entry_jobs:
                     probe, _child_relative_clock = job["future"].result()
                     job["observed"].wait()
                     job["market_row"]["execution_probe"] = probe
                     job["market_row"]["consumer_commit_from_batch_start_ms"] = job["parent_observed_ms"]
-                scenario["all_execution_commits_ms"] = (time.perf_counter() - started) * 1000
+                scenario.update(_execution_stage_clocks(
+                    scenario["all_signal_calculations_complete_ms"], (time.perf_counter() - started) * 1000,
+                    execution_published=bool(pending_artifacts)))
                 # Match the existing live critical path: rich reports must not
                 # block the next mode's execution pointer. Still finish and
                 # time every report before this full-workflow scenario ends.
@@ -529,9 +566,17 @@ def signal_analysis(analysis: dict, *, feature_date: str, runtime_profile: Path,
                     completed = time.perf_counter()
                     owner.signal_engine.finalize_live_signal_artifacts(result)
                     market["deferred_artifact_ms"] = (time.perf_counter() - completed) * 1000
-            scenario["all_models_elapsed_ms"] = (time.perf_counter() - started) * 1000
+            scenario["scenario_complete_including_reports_ms"] = (time.perf_counter() - started) * 1000
+            scenario["all_models_elapsed_ms"] = scenario["scenario_complete_including_reports_ms"]
             records.append(scenario)
             atomic_write_json(output, dict(report, status="measuring"))
+        report["clock_contract"] = {
+            "all_signal_calculations_complete_ms": "same parent monotonic clock; six-mode loop including input waits, not pure GPU",
+            "all_execution_pointers_published_ms": "new execution revisions only; all mode execution pointers published, not broker fills; otherwise null",
+            "all_execution_verified_ms": "new execution revisions only; parent IPC acknowledgement after durable publication AND complete financial readback; conservative commit upper bound; otherwise null",
+            "scenario_complete_including_reports_ms": "includes every deferred rich artifact after execution verification",
+            "legacy_all_execution_commits_ms": "historical elapsed verification/no-work boundary; equals all_execution_verified_ms only when execution was published; not raw fsync or proof of a commit",
+            "legacy_all_models_elapsed_ms": "alias of scenario_complete_including_reports_ms, not pure model time"}
         final = {row["market"]: row["weights"] for row in records[-3]["markets"]}
         baseline = {row["market"]: row["weights"] for row in records[0]["markets"]}
         for scenario in records:
@@ -569,6 +614,8 @@ def main():
     source.add_argument("--receipt", type=Path, required=True)
     source.add_argument("--journal", type=Path, required=True)
     source.add_argument("--cutoffs-ms", default="1000,5000,11000,20000,30000,60000")
+    source.add_argument("--observation-horizon-ms", type=int,
+        help="Explicit opening-only analysis window; later events remain hashed and excluded, never repaired or accepted as a full day")
     source.add_argument("--output", type=Path, required=True)
     signal = commands.add_parser("signals")
     signal.add_argument("--source-analysis", type=Path, required=True)
@@ -599,7 +646,8 @@ def main():
         parser.error("preserve existing diagnostic evidence; choose a new output path")
     if args.command == "source":
         report = source_analysis(args.receipt, args.journal,
-            cutoffs=tuple(int(value) for value in args.cutoffs_ms.split(",")))
+            cutoffs=tuple(int(value) for value in args.cutoffs_ms.split(",")),
+            observation_horizon_ms=args.observation_horizon_ms)
     elif args.command == "signals":
         try:
             report = signal_analysis(json.loads(args.source_analysis.read_text()), feature_date=args.feature_date,

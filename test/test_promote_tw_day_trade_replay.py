@@ -419,6 +419,19 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     )
 
 
+def test_v2_replay_is_not_promoted_without_independent_source_audit(tmp_path, monkeypatch):
+    candidate = _candidate(tmp_path)
+    path = candidate / "rebuild_receipt.json"
+    receipt = json.loads(path.read_text())
+    receipt["replay_contract"] = {"entry": promotion.PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT_V2}
+    path.write_text(json.dumps(receipt))
+    monkeypatch.setattr(promotion, "_verified_prior_paper_manifest", lambda *args: {})
+    monkeypatch.setattr(promotion, "_validate_0901_minute_price_signal_ledger", lambda *a, **kw: {})
+    monkeypatch.setattr(promotion, "_validate_0901_minute_price_fill_ledger", lambda *a, **kw: {})
+    with pytest.raises(promotion.ReplayValidationError, match="independent causal-reference"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+
 def test_carry_promotion_is_explicit_and_requires_full_independent_audit(tmp_path, monkeypatch):
     from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
     from stockagent.live.tw_share_replacement import ODD_LOT_BOARD_PRICE

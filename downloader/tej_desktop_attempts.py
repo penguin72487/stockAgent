@@ -170,14 +170,37 @@ def recover_unlaunched_metadata_claim(root: Path, task_id: str, prepared: Path |
                  'observed_at_utc': datetime.now(UTC).isoformat()}
         path = root / 'operator_replays' / (attempt + '-unlaunched-metadata.json')
         if path.exists():
-            raise ValueError('Prior unlaunched recovery requires reconciliation')
-        atomic_write_json(path, audit)
-        con.execute("UPDATE tasks SET state='pending',last_error_code='local_metadata_before_launch_recovered' "
-                    "WHERE task_id=? AND state='running' AND active_attempt_id IS NULL", (task_id,))
-        con.execute("UPDATE traffic SET state='failed_before_desktop_launch',completed_at_utc=? WHERE event_id=?",
-                    (audit['observed_at_utc'], traffic[0]['event_id']))
+            # The audit is durably published before the database transaction.
+            # A failed commit can therefore leave it behind with the claim still
+            # running. Reuse only the exact same proof after rechecking every
+            # prelaunch gate above; never rewrite or weaken the original audit.
+            previous = _read_private(path, root / 'operator_replays', task_id)
+            clock_keys = {'metadata_failed_at_utc', 'observed_at_utc'}
+            if (not isinstance(previous, dict) or set(previous) != set(audit)
+                    or any(type(previous[k]) is not type(v) or previous[k] != v
+                           for k, v in audit.items() if k not in clock_keys)):
+                raise ValueError('Prior unlaunched recovery proof differs')
+            try:
+                prior_failed = datetime.fromisoformat(previous['metadata_failed_at_utc'])
+                prior_observed = datetime.fromisoformat(previous['observed_at_utc'])
+            except (TypeError, ValueError) as exc:
+                raise ValueError('Prior unlaunched recovery clock invalid') from exc
+            if (prior_failed.tzinfo is None or prior_observed.tzinfo is None
+                    or not started <= prior_failed <= failed
+                    or not prior_failed <= prior_observed <= datetime.now(UTC)
+                    or (prior_failed - started).total_seconds() > 60):
+                raise ValueError('Prior unlaunched recovery clock differs')
+        else:
+            atomic_write_json(path, audit)
+        recovered_at = datetime.now(UTC).isoformat()
+        task_update = con.execute("UPDATE tasks SET state='pending',last_error_code='local_metadata_before_launch_recovered' "
+                                  "WHERE task_id=? AND state='running' AND active_attempt_id IS NULL", (task_id,))
+        traffic_update = con.execute("UPDATE traffic SET state='failed_before_desktop_launch',completed_at_utc=? "
+                                     "WHERE event_id=? AND state='running'", (recovered_at, traffic[0]['event_id']))
+        if task_update.rowcount != 1 or traffic_update.rowcount != 1:
+            raise ValueError('Unlaunched claim changed during reconciliation')
     atomic_write_json(worker_path, {'contract_version': CONTRACT_VERSION, 'state': 'prequery_retry_scheduled',
-                                   'task_id': task_id, 'observed_at_utc': audit['observed_at_utc']})
+                                   'task_id': task_id, 'observed_at_utc': recovered_at})
     return True
 
 
@@ -810,6 +833,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                            allow_unstaged_script_preparation: bool = False,
                            allow_orphaned_desktop_loss: bool = False,
                            allow_orphaned_worker_loss: bool = False,
+                           allow_retained_preview_preservation: bool = False,
                            allow_interrupted_stage_write: bool = False,
                            standing_authorization: dict | None = None) -> dict:
     """Canonical one-shot replay, with manual or bounded standing user authority.
@@ -850,6 +874,9 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
              allow_orphaned_desktop_loss, allow_orphaned_worker_loss, allow_interrupted_stage_write)
     if any(type(mode) is not bool for mode in modes) or sum(modes) > 1:
         raise ValueError('Explicit operator replay mode required')
+    if (type(allow_retained_preview_preservation) is not bool
+            or allow_retained_preview_preservation and not allow_orphaned_worker_loss):
+        raise ValueError('Retained Preview preservation requires explicit worker-loss replay')
     unstaged=any(modes)
     interrupted = None
     if allow_interrupted_stage_write:
@@ -906,6 +933,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
             or not isinstance(role_state, list) or len(role_state) != 2 or role_state[0] != 43
             or button.get('default_action') != 'Press' or payload.get('source_key_mode') not in (1, 2, 3)):
         raise ValueError('Exact idle owned query button required; unknown barrier preserved')
+    preservation = None
     if allow_orphaned_worker_loss:
         # A missing stage cannot bind an existing Preview to this attempt.
         # Never overwrite retained source values to manufacture liveness.
@@ -919,9 +947,16 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
                 or any(not isinstance(grid, dict)
                        or not isinstance(grid.get('native_shape'), list)
                        or len(grid['native_shape']) != 2
-                       or any(type(n) is not int or n < 0 for n in grid['native_shape'])
-                       or grid['native_shape'][0] > 1 for grid in grids)):
+                       or any(type(n) is not int or n < 0 for n in grid['native_shape']) for grid in grids)):
             raise ValueError('Retained or unverified Preview requires reconciliation before worker-loss replay')
+        if any(grid['native_shape'][0] > 1 for grid in grids):
+            if not allow_retained_preview_preservation:
+                raise ValueError('Retained or unverified Preview requires reconciliation before worker-loss replay')
+            from downloader.tej_unbound_preview import preserve_surviving_preview
+            try:
+                preservation = preserve_surviving_preview(root, task, request, bridge, payload)
+            except ValueError as exc:
+                raise ValueError(f'Retained Preview requires reconciliation: {exc}') from exc
         surviving_desktop_worker_loss_proof(root, task, request, prepared)
     if interrupted is not None and interrupted_stage_write_proof(root, task, request, prepared) != interrupted:
         raise ValueError('Interrupted stage evidence changed during fresh readback')
@@ -938,6 +973,7 @@ def retry_unknown_download(root: Path, task_id: str, bridge, prepared: Path, *,
              'unstaged_script_preparation_replay_explicitly_authorized':allow_unstaged_script_preparation,
              'orphaned_desktop_loss_replay_authorized':allow_orphaned_desktop_loss,
              'surviving_desktop_dead_worker_replay_authorized':allow_orphaned_worker_loss,
+             'retained_unbound_preview_preservation':preservation,
              'interrupted_stage_write_replay_proof':interrupted,
              'original_launch_diagnostic_path':str(diagnostic.relative_to(root)) if diagnostic else None,
              'original_launch_diagnostic_sha256':hashlib.sha256(diagnostic.read_bytes()).hexdigest() if diagnostic else None,

@@ -4,6 +4,9 @@ set -euo pipefail
 finlab_repo_root="${FINLAB_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 cd "$finlab_repo_root"
 source "$finlab_repo_root/scripts/runtime_env.sh"
+# Keep the existing control/ledger reserve before SDK startup, credentials or
+# source requests. Exit 75 defers this timer pass without changing quota policy.
+run_fintech_python "$finlab_repo_root/scripts/check_acquisition_capacity.py" --path "$finlab_repo_root"
 finlab_python_bin="$(resolve_fintech_python)"
 "$finlab_python_bin" -c '
 from importlib.metadata import version
@@ -126,6 +129,10 @@ for ((finlab_batch = 1; finlab_batch <= ${FINLAB_SYNC_MAX_BATCHES:-500}; finlab_
     finlab_consecutive_timeouts="$(run_fintech_python -c 'import json; from pathlib import Path; print(json.loads(Path("data_finlab/runs/latest.json").read_text()).get("consecutive_timeouts",0))')"
   else
     finlab_sync_exit=$?
+    if [[ "$finlab_sync_exit" == "75" ]]; then
+      echo "[finlab] new acquisition batch deferred by capacity admission; source progress and retries preserved"
+      exit 75
+    fi
     if [[ "$finlab_sync_exit" != "124" ]]; then
       echo "[finlab] sync exited unexpectedly code=$finlab_sync_exit" >&2
       exit "$finlab_sync_exit"
@@ -136,6 +143,10 @@ for ((finlab_batch = 1; finlab_batch <= ${FINLAB_SYNC_MAX_BATCHES:-500}; finlab_
     finlab_consecutive_timeouts=$((finlab_consecutive_timeouts + 1))
   fi
   finlab_state="$(run_fintech_python -c 'import json; from pathlib import Path; print(json.loads(Path("data_finlab/runs/latest.json").read_text())["state"])')"
+  if [[ "$finlab_state" == "priority_handoff" ]]; then
+    echo "[finlab] yielding the account to a registered day-trade source request"
+    exit 0
+  fi
   if [[ "$finlab_state" != "partial" ]]; then
     break
   fi
@@ -145,12 +156,23 @@ for ((finlab_batch = 1; finlab_batch <= ${FINLAB_SYNC_MAX_BATCHES:-500}; finlab_
   fi
 done
 
+# An intent may arrive after the final general key. Do not retain the account
+# for an optional overlay or intraday pass once that model request is visible.
+finlab_daytrade_pending="$(run_fintech_python -c 'from datetime import UTC, datetime; from pathlib import Path; from stockagent.data.finlab_gap_priority import pending_daytrade_priority; print(int(pending_daytrade_priority(Path("data_finlab"), now=datetime.now(UTC))))')"
+if [[ "$finlab_daytrade_pending" == "1" ]]; then
+  echo "[finlab] yielding the account before optional post-sync work"
+  exit 0
+fi
+
 if (( finlab_preopen )); then
   echo "[finlab] pre-open acquisition complete; heavy research build deferred until 09:10"
   exit 0
 fi
 
 finlab_refresh_research() {
+    # The same long-running owner can reach local preparation after hours of
+    # acquisition. Do not start a fresh build on an exhausted backing disk.
+    run_fintech_python "$finlab_repo_root/scripts/check_acquisition_capacity.py" --path "$finlab_repo_root" || return "$?"
     if run_fintech_python "$finlab_repo_root/scripts/build_finlab_research_overlay.py" --refresh-canonical-base; then
       :
     else

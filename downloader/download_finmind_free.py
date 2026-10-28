@@ -39,6 +39,8 @@ from downloader.finmind_corrections import free_correction_due, correction_recei
 from downloader.finmind_volume_units import (
     ORDER_BOOK_CANONICAL_FIELDS, ORDER_BOOK_DATASET, annotate_stock_share_units,
 )
+from stockagent.data_sync.cache_capacity import acquisition_dispatch_status
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 
 
 API_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -942,8 +944,38 @@ def _write_status(root: Path, *, state: str, counts: dict[str, Any], requests_us
     })
 
 
+def _capacity_pause(root: Path, *, requests_used: int = 0) -> dict[str, Any] | None:
+    """Pause dispatch without treating local capacity as a failed source row."""
+    try:
+        admission = acquisition_dispatch_status(root)
+    except CapacityDeferred as error:
+        admission = {"state": "deferred", "reason": error.details["reason"]}
+    except (OSError, ValueError) as error:
+        admission = {"state": "deferred", "reason": "capacity_unconfirmed",
+                     "error_type": type(error).__name__}
+    if admission["state"] in {"admitted", "not_enrolled"}:
+        return None
+    # Keep the last queue/receipt counts: low disk is not an empty history.
+    # A first blocked cycle must not invent an account tier or quota either.
+    previous = _read_json(root / "status.json")
+    capacity = {key: admission[key] for key in (
+        "state", "reason", "available_bytes", "required_bytes", "minimum_free_bytes",
+        "guard_kind", "error_type", "physical_free_bytes", "required_bytes_including_reserve",
+    ) if key in admission}
+    status = {**previous, "schema_version": SCHEMA_VERSION, "state": "disk_guard",
+              "observed_at_utc": _iso(_utc_now()), "requests_this_process": requests_used,
+              "active_task": None, "capacity_admission": capacity,
+              "source_status_observed_at_utc": previous.get(
+                  "source_status_observed_at_utc", previous.get("observed_at_utc"))}
+    atomic_write_json(root / "status.json", status)
+    return {"state": "disk_guard", "requests": requests_used, "retryable": True,
+            "capacity_admission": capacity}
+
+
 def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=True)
+    if (paused := _capacity_pause(root)) is not None:
+        return paused
     load_env_file(Path(__file__).resolve().parents[1] / ".env", allowed_names=("FINMIND_TOKEN",))
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     used = 0
@@ -991,6 +1023,8 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
             return {"state": "protected_opening", "requests": used, **counts}
         _write_status(root, state="running" if tasks else "current", counts=counts, requests_used=used, quota=quota, token=bool(token))
         if _master_due(root, now) and (not max_requests or used < max_requests):
+            if (paused := _capacity_pause(root, requests_used=used)) is not None:
+                return paused
             if token and backfill_budget(account, root, fixed_incremental_requests=0, now=_utc_now()).get('remaining', 1) <= 0:
                 _write_status(root, state='incremental_reserve', counts=counts, requests_used=used, quota=quota, token=bool(token))
                 return {'state': 'incremental_reserve', 'requests': used, **counts}
@@ -1016,6 +1050,8 @@ def run_once(root: Path, *, max_requests: int = 0) -> dict[str, Any]:
                 break
             if _opening_window(_utc_now(), sessions):
                 break
+            if (paused := _capacity_pause(root, requests_used=used)) is not None:
+                return paused
             dispatch_now = _utc_now()
             account = refresh_dispatch_account(account, token, root, dispatch_now)
             budget = backfill_budget(
@@ -1125,7 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
                     1800 if result["state"] == "ip_banned"
                     else 600 if result["state"] in {"rate_limited", "protected_opening", "waiting_retry"}
                     else 3600 if result["state"] == "current"
-                    else 60 if result["state"] == "incremental_reserve" else 5
+                    else 60 if result["state"] in {"incremental_reserve", "disk_guard"} else 5
                 )
                 wait_for_next_cycle(root, result, delay, snapshot_hours=(0, 14, 18))
         except KeyboardInterrupt:

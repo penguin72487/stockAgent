@@ -13,7 +13,6 @@ Restart=on-failure
 RestartSec=5
 TimeoutStopSec=90s
 UMask=0077
-CPUQuota=150%
 # Whole-catalog first baselines can inventory millions of tiny source files.
 # This is a ceiling, not a reservation; normal ACK/control activities stay small.
 MemoryHigh=6G

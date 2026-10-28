@@ -187,7 +187,10 @@ def approved(tmp_path, settings, *, urls=(URL,), raw_override=None, original_aut
     manifest = {'contract_version': 1, 'scope_kind': 'reviewed_native_diagnostic_materialization_v1',
         'provider': provider, 'data_fingerprint': source.data_fingerprint,
         'authorization_fingerprint': source.authorization_fingerprint,
-        'approved_at_utc': datetime.now(UTC).isoformat(), 'diagnostic_scope_rewording_reviewed': True,
+        # Keep the synthetic review after its observation, without placing it
+        # on the live wall-clock boundary that may step backwards mid-test.
+        'approved_at_utc': (datetime.fromisoformat(observed)+timedelta(seconds=1)).isoformat(),
+        'diagnostic_scope_rewording_reviewed': True,
         'publish': False, 'remote_training_export': False, 'observation_report': report_path.name,
         'observation_report_sha256': sha256_file(report_path), 'entries': entries}
     write_json(manifest_path, manifest)

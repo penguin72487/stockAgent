@@ -9,10 +9,15 @@ Type=oneshot
 WorkingDirectory=__REPO_ROOT__
 Environment="STOCKAGENT_BACKUP_STREAM_ENV_FILE=__BACKUP_ENV_FILE__"
 ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_backup_stream.sh cycle
+# 75 is a recorded temporary owner/capacity deferral; the timer retries it.
+SuccessExitStatus=75
 UMask=0077
 Nice=10
 CPUWeight=20
 IOWeight=20
-MemoryHigh=512M
-MemoryMax=1G
+# Receipt/inventory reconciliation exceeded 3 GiB including swapped pages on
+# 2026-10-25. The former 512 MiB soft limit forced repeated anonymous reclaim
+# despite ample host headroom. Keep a bounded working set without swap churn.
+MemoryHigh=4G
+MemoryMax=6G
 TimeoutStartSec=28800

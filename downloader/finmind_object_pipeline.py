@@ -97,7 +97,7 @@ def _derive(root, fields, decimal_context):
 
 def run_batch(connection, downloads, processors, root, current, account, budget, reservation, now,
               limiter, token, *, config, max_calls, delegated=frozenset(), datasets=None,
-              required_keys=None, heartbeat):
+              required_keys=None, capacity_sampler, heartbeat):
     from downloader import download_finmind_complement as worker
     from downloader.finmind_storage_objects import active_datasets
     from downloader.finmind_history_order import first_unfinished_dataset
@@ -131,9 +131,14 @@ def run_batch(connection, downloads, processors, root, current, account, budget,
             pause = 'protected_opening'
         if shutil.disk_usage(root).free < worker.MIN_FREE_BYTES:
             pause = 'disk_guard'
+        if capacity_sampler.sample().get('state') not in {'admitted', 'not_enrolled'}:
+            pause = 'disk_guard'
         if not pause and incremental_reservation(root.parent, stamp).get('ready_requests', 0):
             pause = 'incremental_reserve'
         while not pause:
+            if capacity_sampler.sample().get('state') not in {'admitted', 'not_enrolled'}:
+                pause = 'disk_guard'
+                break
             candidate = initial or worker._next_task(connection, stamp, delegated=delegated, advance_cursor=True)
             initial = None
             if (candidate is None or candidate.data_id or candidate.priority == 0
@@ -199,7 +204,7 @@ def run_batch(connection, downloads, processors, root, current, account, budget,
     # Failed/interrupted mandatory CPU tails are not accepted capacity samples.
     tail = connection.execute("SELECT 1 FROM tasks WHERE dataset=? AND state IN ('pending','failed','inflight') LIMIT 1",
                               (DATASET + 'SecIdAgg',)).fetchone() if parent == DATASET else None
-    if accepted and accepted == attempts and not failures and not tail:
+    if accepted and accepted == attempts and not failures and not tail and pause != 'disk_guard':
         connection.execute('INSERT INTO finmind_pipeline_samples '
                            '(dataset,requests,seconds,rows,configuration_sha256,observed_at_utc) VALUES (?,?,?,?,?,?)',
                            (parent, accepted, elapsed, retained_rows, config['configuration_sha256'], datetime.now(UTC).isoformat()))

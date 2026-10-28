@@ -1,10 +1,79 @@
 import asyncio
+import fcntl
 from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from services.discord_bot import bot as discord_bot
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending, live_tw_public_source_read_guard
+
+
+def _source_fixture(tmp_path, name):
+    base = tmp_path / name
+    source = base / "data"
+    stocks = source / "stocks"
+    stocks.mkdir(parents=True)
+    (source / "twse_daily_ohlcv.parquet").write_bytes(b"source guard marker, not a financial fixture")
+    (base / ".locks").mkdir()
+    return stocks, base / ".locks/tw-public-refresh.lock"
+
+
+def test_startup_batch_reuses_one_source_epoch_and_releases_after_all_modes(monkeypatch, tmp_path):
+    stocks, lock = _source_fixture(tmp_path, "first")
+    monkeypatch.setattr(discord_bot, "_load_experiment_config_cached", lambda _: SimpleNamespace(
+        data=SimpleNamespace(parquet_root=stocks)))
+    calls = []
+    with discord_bot._startup_warmup_source_epochs() as admit:
+        assert admit("first.yaml") is False
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as first:
+            assert first.get("scan", lambda: calls.append("scan") or (1, 2)) == (1, 2)
+        assert admit("second.yaml") is True
+        with live_tw_public_source_read_guard(stocks, share_generation=True) as second:
+            assert first is second
+            assert second.get("scan", lambda: pytest.fail("same leased source scanned twice")) == (1, 2)
+        with lock.open("a+") as writer:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert calls == ["scan"]
+    with lock.open("a+") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with live_tw_public_source_read_guard(stocks, share_generation=True) as new_epoch:
+        assert new_epoch is not first
+        assert new_epoch.get("scan", lambda: (3, 4)) == (3, 4)
+
+
+def test_startup_batch_keeps_failed_root_separate_and_retries_with_a_new_epoch(monkeypatch, tmp_path):
+    first, lock = _source_fixture(tmp_path, "busy")
+    second, _ = _source_fixture(tmp_path, "independent")
+    monkeypatch.setattr(discord_bot, "_load_experiment_config_cached", lambda name: SimpleNamespace(
+        data=SimpleNamespace(parquet_root=first if "busy" in name else second)))
+    with lock.open("a+") as writer:
+        fcntl.flock(writer, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with discord_bot._startup_warmup_source_epochs() as admit:
+            with pytest.raises(TWPublicSourceUpdatePending) as initial:
+                admit("busy.yaml")
+            fcntl.flock(writer, fcntl.LOCK_UN)
+            with pytest.raises(TWPublicSourceUpdatePending) as repeated:
+                admit("busy.yaml")
+            assert initial.value is repeated.value  # A half-batch cannot change generations.
+            assert admit("independent.yaml") is False
+    with discord_bot._startup_warmup_source_epochs() as admit:
+        assert admit("busy.yaml") is False
+
+
+@pytest.mark.parametrize("errors,expected", [
+    ([("TWPublicSourceUpdatePending", True)], 15.0),
+    ([("TWPublicSourceUpdatePending", True), ("TWPublicSourceUpdatePending", True)], 15.0),
+    ([("TWPublicSourceUpdatePending", False)], 240.0),
+    ([("TWPublicSourceUpdatePending", True), ("RuntimeError", True)], 240.0),
+    ([], 240.0),
+])
+def test_source_writer_retry_does_not_inherit_model_backoff_or_relax_other_failures(monkeypatch, errors, expected):
+    monkeypatch.setattr(discord_bot, "_env_float", lambda _key, default: default)
+    receipt = {"markets": [{"status": "ready"}, *[
+        {"status": "failed", "error_type": name, "retryable": retryable} for name, retryable in errors]]}
+    assert discord_bot._startup_warmup_receipt_retry_delay_seconds(receipt, 3) == expected
 
 
 @pytest.mark.parametrize("clock,release_allowed,warm_deferred", [

@@ -1,7 +1,8 @@
 """Dated TAIFEX rules for the existing whole-contract futures account."""
 from __future__ import annotations
 
-from dataclasses import replace
+from copy import deepcopy
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
@@ -51,6 +52,15 @@ MARGIN_FEATURE_COLUMNS = (
     "known_maintenance_to_initial_margin",
 )
 MARGIN_AMOUNT_FEATURE_COLUMNS = ("known_initial_margin_twd", *MARGIN_FEATURE_COLUMNS)
+FUTURES_RESIDUAL_SIGNAL_CONTRACT = "prior_paired_TX_simple_residual_shrunk8_rms_5_20_v1"
+FUTURES_RESIDUAL_SIGNAL_COLUMNS = (
+    "prior_tx_beta_shrunk8_signal",
+    "prior_residual_last_to_rms", "prior_residual_mean5_to_rms",
+    "prior_residual_mean20_to_rms", "prior_residual_rms_percent",
+    "prior_paired_observation_fraction5", "prior_paired_observation_fraction20",
+    "prior_paired_last_observed", "prior_tx_last_to_rms",
+    "prior_tx_mean20_to_rms",
+)
 MARGIN_AUDIT_COLUMNS = (
     "equity_before_twd", "equity_at_open_twd", "equity_after_mark_twd",
     "initial_margin_used_twd", "settlement_initial_margin_twd",
@@ -59,6 +69,55 @@ MARGIN_AUDIT_COLUMNS = (
     "opening_forced_liquidation", "unfilled_liquidation_contracts",
     "overnight_pnl_twd",
 )
+
+
+def _margin_source_stats(paths):
+    return tuple((str(path), s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        for path in paths for s in (path.stat(),))
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedMarginSource:
+    """One attachment's SHA-validated immutable tape; no global/process cache.
+
+    Retain every original source dependency and reject any intervening mutation.
+    Consumers receive cheap Polars clones and an independent manifest dictionary.
+    This avoids decoding and validating the same full tape twice per attachment.
+    """
+    path: Path
+    daily_path: Path
+    _rules: pl.DataFrame
+    _manifest: dict
+    _paths: tuple[Path, ...]
+    _stats: tuple
+
+    @classmethod
+    def load(cls, path, daily_path):
+        path, daily_path = Path(path), Path(daily_path)
+        manifest_path = path.with_name("manifest.json")
+        manifest = json.loads(manifest_path.read_text())
+        paths = [path, daily_path, manifest_path]
+        proofs = list(manifest.get("sources", []))
+        proofs += [manifest[k] for k in ("position_research_policy", "valuation_research_policy")
+                   if k in manifest]
+        for proof in proofs:
+            relative = Path(proof["path"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("unsafe futures rule receipt path")
+            paths.append(path.parent / relative)
+        paths = tuple(dict.fromkeys(paths))
+        before = _margin_source_stats(paths)
+        rules, validated = validate_margin_rule_source(path, daily_path)
+        if before != _margin_source_stats(paths) or manifest != validated:
+            raise ValueError("futures margin source changed during validation")
+        return cls(path.resolve(), daily_path.resolve(), rules, deepcopy(validated), paths, before)
+
+    def read(self, path, daily_path):
+        if Path(path).resolve() != self.path or Path(daily_path).resolve() != self.daily_path:
+            raise ValueError("validated futures margin source belongs to another release")
+        if self._stats != _margin_source_stats(self._paths):
+            raise ValueError("validated futures margin source changed during attachment")
+        return self._rules.clone(), deepcopy(self._manifest)
 
 
 def validate_margin_rule_source(path: str | Path, daily_path: str | Path):
@@ -160,13 +219,16 @@ def validate_margin_rule_source(path: str | Path, daily_path: str | Path):
         for field in ("known_at", "effective_at"):
             if rules.filter(pl.col(phase + field).str.to_datetime(time_zone="UTC") > cutoff).height:
                 raise ValueError(f"future/unannounced rules at {phase or 'opening'} clock")
+    from stockagent.data.tw_futures_price_limits import validate_price_limit_rules
+    validate_price_limit_rules(rules, manifest)
+    from stockagent.data.tw_futures_execution_terms import validate_final_cash_accounting_rules
+    validate_final_cash_accounting_rules(rules, manifest)
     numeric = ("initial", "maintenance", "settlement_initial", "settlement_maintenance",
-               "position_unit", "position_limit", "upper_limit", "lower_limit")
+               "position_unit", "position_limit")
     if rules.select(pl.any_horizontal([~pl.col(c).is_finite() | (pl.col(c) <= 0) | pl.col(c).is_null() for c in numeric]).any()).item():
         raise ValueError("futures margins, limits and units must be finite and positive")
     if rules.filter((pl.col("initial") < pl.col("maintenance"))
                     | (pl.col("settlement_initial") < pl.col("settlement_maintenance"))
-                    | (pl.col("upper_limit") <= pl.col("lower_limit"))
                     | ~pl.col("margin_kind").is_in(["fixed_twd", "notional_rate"])).height:
         raise ValueError("invalid margin hierarchy, price limits or margin units")
     if rules.filter((pl.col("margin_kind") == "notional_rate") & (
@@ -355,12 +417,23 @@ def corporate_margin_base_values(frame, rules, final_settlement_path=None, *,
         cash = cash.join(final.select(pl.col('settlement_date').alias('date'), 'product', 'contract',
                                      'final_settlement_price', 'final_settlement_value', 'settlement_method'),
                          on=['date', 'product', 'contract'], how='left', validate='m:1')
+        if 'asset_class' not in cash.columns or cash['asset_class'].null_count():
+            raise ValueError('cash settlement requires the sourced product asset class')
+        from stockagent.data.tw_futures_margin_preparation import index_futures_cash_terminal_values
+        index_values = index_futures_cash_terminal_values(
+            cash, price='final_settlement_price', multiplier='contract_multiplier')
+        cash = cash.join(index_values, on=keys, how='left', validate='1:1')
+        index_cash = pl.col('asset_class') == 'index_future'
+        if cash.filter(index_cash & pl.col('final_settlement_value').is_not_null()
+                & ((pl.col('final_settlement_value') - pl.col('_index_terminal_value_twd')).abs() > .005)).height:
+            raise ValueError('official index terminal value differs from whole-dollar settlement')
         adjusted=pl.col('product').str.contains(r'\d$')
         # Full exchange values always take precedence. Multiplying only the
         # quote by shares is permitted for standard contracts, never as an
         # implicit substitute for unknown adjusted cash/subscription rights.
-        cash=cash.with_columns(pl.coalesce('final_settlement_value',
-            pl.when(~adjusted).then(pl.col('final_settlement_price')*pl.col('contract_multiplier')))
+        cash=cash.with_columns(pl.when(index_cash).then(pl.col('_index_terminal_value_twd'))
+            .otherwise(pl.coalesce('final_settlement_value',
+                pl.when(~adjusted).then(pl.col('final_settlement_price')*pl.col('contract_multiplier'))))
             .alias('_verified_terminal_value'))
         missing=cash.filter(adjusted & pl.col('final_settlement_value').is_null())
         if missing.height and terminal_component_terms is not None:
@@ -441,21 +514,78 @@ def prior_observed_tx_beta(log_returns, observed, prior_benchmark, benchmark_obs
     return np.where((count >= 2) & (market_variance > 1e-12), estimate, 1.).astype(np.float32)
 
 
+def prior_observed_tx_residual_signals(log_returns, observed, prior_benchmark,
+                                     benchmark_observed, *, lookback):
+    """Encode already-prior observations; no regression residual is a fill.
+
+    Beta uses the existing shrinkage estimator. At each decision, its current
+    prior-only loading is applied to the observed pairs in each trailing window.
+    Missing pairs do not become zero observations; coverage is explicit. Prefix
+    sufficient statistics keep preparation O(T*S), without a [T,S,L] window or
+    [S,S] covariance. All financial reductions use float64 before feature casts.
+    """
+    beta = prior_observed_tx_beta(log_returns, observed, prior_benchmark,
+                                 benchmark_observed, lookback=lookback).astype(np.float64)
+    valid = (observed & np.isfinite(log_returns)
+             & benchmark_observed[:, None] & np.isfinite(prior_benchmark[:, None]))
+    with np.errstate(over='raise', invalid='raise'):
+        x = np.expm1(np.where(valid, log_returns, 0.).astype(np.float64))
+        y = np.where(valid, np.expm1(np.where(benchmark_observed, prior_benchmark, 0.)
+                                    .astype(np.float64))[:, None], 0.)
+    end = np.arange(1, len(x) + 1)
+    windows = tuple(dict.fromkeys((1, 5, 20, int(lookback))))
+    moments = {window: {} for window in windows}
+    # Release each full prefix before constructing the next; no lookback axis.
+    for name, values in (("count", valid), ("x", x), ("y", y),
+                         ("xx", x*x), ("xy", x*y), ("yy", y*y)):
+        prefix = np.concatenate((np.zeros((1, x.shape[1])),
+                                 np.cumsum(values, axis=0, dtype=np.float64)), axis=0)
+        for window in windows:
+            # Squared moments are needed only for the normalizing risk window.
+            if name in {"xx", "xy", "yy"} and window != int(lookback):
+                continue
+            moments[window][name] = prefix[end] - prefix[np.maximum(0, end-window)]
+    risk = moments[int(lookback)]
+    count = np.maximum(risk["count"], 1.)
+    rms = np.sqrt(np.maximum(0., risk["xx"] - 2*beta*risk["xy"] + beta*beta*risk["yy"]) / count)
+    tx_rms = np.sqrt(np.maximum(0., risk["yy"]) / count)
+
+    def normalized_mean(window, *, market=False):
+        m = moments[window]
+        numerator = m["y"] if market else m["x"] - beta*m["y"]
+        denominator = tx_rms if market else rms
+        mean = numerator / np.maximum(m["count"], 1.)
+        return np.divide(mean, denominator, out=np.zeros_like(mean), where=denominator > 1e-8)
+
+    return np.stack((beta, normalized_mean(1), normalized_mean(5), normalized_mean(20),
+        100*rms, moments[5]["count"]/5., moments[20]["count"]/20.,
+        moments[1]["count"], normalized_mean(1, market=True), normalized_mean(20, market=True)),
+        axis=-1).astype(np.float32)
+
+
 def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidation_ratio=0.25, participation=0.5,
                                 benchmark_mode="legacy_front_holding_return", include_margin_amount=False,
                                 include_account_policy_observations=False, account_policy_lookback=32,
-                                include_beta_observation=False):
+                                include_beta_observation=False, include_residual_signals=False,
+                                validated_source=None, futures_account_calendar=None):
     """Attach executor-only marks and prior-observable margin model context."""
     if benchmark_mode not in {"legacy_front_holding_return", "tx_front_rolling_1x_gross"}:
         raise ValueError(f"unsupported futures margin benchmark mode: {benchmark_mode}")
     daily = panel.stock_context_futures_portfolio_daily
     if daily is None or daily.integer_execution is None or daily.intraday_execution is not None:
         raise ValueError("margin requires the canonical carrying whole-contract sidecar")
-    if include_beta_observation and (not include_account_policy_observations
+    if futures_account_calendar is not None:
+        from stockagent.data.tw_futures_account_calendar import FuturesAccountCalendar
+        if (not isinstance(futures_account_calendar, FuturesAccountCalendar)
+                or not np.array_equal(futures_account_calendar.dates,
+                                      np.asarray(panel.dates, dtype="datetime64[D]"))):
+            raise ValueError("dual account calendar must match the margin attachment dates")
+    if (include_beta_observation or include_residual_signals) and (not include_account_policy_observations
             or benchmark_mode != 'tx_front_rolling_1x_gross'
             or daily.benchmark_observed_returns_mask is None):
         raise ValueError('beta observations require causal account observations and observed TX source returns')
-    rules, rule_manifest = validate_margin_rule_source(path, daily.source_path)
+    rules, rule_manifest = (validate_margin_rule_source(path, daily.source_path)
+        if validated_source is None else validated_source.read(path, daily.source_path))
     corporate = rule_manifest["schema_version"] >= MARGIN_CORPORATE_CONTRACT_VERSION
     multiple_limits = rule_manifest["schema_version"] >= MARGIN_MULTI_LIMIT_CONTRACT_VERSION
     separate_margin_bases = rule_manifest["schema_version"] >= MARGIN_VALUE_BASE_CONTRACT_VERSION
@@ -585,12 +715,15 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         ex[di, si, 7] = np.floor(terminal * tax + 0.5)
     ex[di, si, 0] = np.log(mark / ex[di, si, 3])
     ratio = values("carry_quantity_numerator") / values("carry_quantity_denominator") if corporate else None
+    from stockagent.data.tw_futures_price_limits import price_limit_permissions
+    opening_can_buy, opening_can_sell = price_limit_permissions(frame, opening)
+    terminal_can_buy, terminal_can_sell = price_limit_permissions(frame, closing)
     packed = np.column_stack((
         values("_im"), values("_mm"), values("_end_im"), values("_end_mm"),
         values("carry_previous_value_twd") / ratio if corporate else values("previous_settlement") * multiplier,
         values("_source_prior_im") / ratio if corporate else values("_prior_im"),
         values("_source_prior_mm") / ratio if corporate else values("_prior_mm"),
-        opening < values("upper_limit"), opening > values("lower_limit"),
+        opening_can_buy, opening_can_sell,
         [group_ids[g] for g in frame["position_group"]], values("position_unit"), values("position_limit"),
         np.full(frame.height, liquidation_ratio), terminal,
         # An official mark (or a block-trade quantity without an OPEN/CLOSE)
@@ -598,7 +731,7 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         # volume; do not convert it into a trade or an absorbing account error.
         np.where(daily.executable_mask[di, si],
                  np.floor(np.nan_to_num(values("volume"), nan=0., posinf=0., neginf=0.) * participation), 0.),
-        closing < values("upper_limit"), closing > values("lower_limit"), expiry,
+        terminal_can_buy, terminal_can_sell, expiry,
     ))
     ex[di, si, 11:MARGIN_EXECUTION_WIDTH] = packed
     if corporate:
@@ -636,20 +769,47 @@ def attach_futures_margin_rules(panel, path, *, broker_multiplier=1.0, liquidati
         # session. Do not use today's OPEN availability as a risk observation.
         prior_returns = np.zeros(daily.candidate_mask.shape, dtype=np.float32)
         prior_observed = np.zeros(daily.candidate_mask.shape, dtype=bool)
-        has_next = di + 1 < len(panel.dates)
-        prior_returns[di[has_next] + 1, si[has_next]] = values("taifex_settlement_logret_1d")[has_next]
-        prior_observed[di[has_next] + 1, si[has_next]] = frame["_risk_observed"].to_numpy()[has_next]
-        risk = prior_observed_return_risk(prior_returns, prior_observed, lookback=account_policy_lookback)
+        if futures_account_calendar is None:
+            next_di = di + 1
+            has_next = next_di < len(panel.dates)
+            policy_indices = np.arange(len(panel.dates))
+            policy_view = slice(None)
+        else:
+            from stockagent.data.tw_futures_account_calendar import next_decision_after_market_rows
+            next_di = next_decision_after_market_rows(futures_account_calendar, di)
+            has_next = next_di >= 0
+            policy_indices = futures_account_calendar.decision_indices
+            policy_view = policy_indices
+        prior_returns[next_di[has_next], si[has_next]] = values("taifex_settlement_logret_1d")[has_next]
+        prior_observed[next_di[has_next], si[has_next]] = frame["_risk_observed"].to_numpy()[has_next]
+        def expand_policy_features(feature):
+            if futures_account_calendar is None:
+                return feature
+            expanded = np.zeros((len(panel.dates), *feature.shape[1:]), dtype=feature.dtype)
+            expanded[policy_indices] = feature
+            return expanded
+        risk = expand_policy_features(prior_observed_return_risk(
+            prior_returns[policy_view], prior_observed[policy_view], lookback=account_policy_lookback))
         model_features = np.concatenate((model_features, risk), axis=-1)
-        if include_beta_observation:
+        if include_beta_observation or include_residual_signals:
             # Shift benchmark and its evidence once, matching prior_returns.
             benchmark = np.zeros(len(panel.dates), dtype=np.float32)
             benchmark_mask = np.zeros(len(panel.dates), dtype=bool)
-            benchmark[1:] = daily.benchmark_log_returns[:-1]
-            benchmark_mask[1:] = daily.benchmark_observed_returns_mask[:-1]
-            beta = prior_observed_tx_beta(prior_returns, prior_observed, benchmark, benchmark_mask,
-                                         lookback=account_policy_lookback)
-            model_features = np.concatenate((model_features, beta[..., None]), axis=-1)
+            benchmark[policy_indices[1:]] = daily.benchmark_log_returns[policy_indices[:-1]]
+            benchmark_mask[policy_indices[1:]] = daily.benchmark_observed_returns_mask[policy_indices[:-1]]
+            if include_residual_signals:
+                signals = expand_policy_features(prior_observed_tx_residual_signals(
+                    prior_returns[policy_view], prior_observed[policy_view],
+                    benchmark[policy_view], benchmark_mask[policy_view], lookback=account_policy_lookback))
+                beta = signals[..., 0]
+            else:
+                beta = expand_policy_features(prior_observed_tx_beta(
+                    prior_returns[policy_view], prior_observed[policy_view],
+                    benchmark[policy_view], benchmark_mask[policy_view], lookback=account_policy_lookback))
+            if include_beta_observation:
+                model_features = np.concatenate((model_features, beta[..., None]), axis=-1)
+            if include_residual_signals:
+                model_features = np.concatenate((model_features, signals), axis=-1)
     return replace(panel, stock_context_futures_portfolio_daily=replace(
         daily, integer_execution=ex,
         candidate_features=model_features,

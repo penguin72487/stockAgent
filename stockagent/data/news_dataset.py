@@ -24,19 +24,46 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, atomic_write_text, sha256_file
+from downloader.news_fulltext_disk import BackingDiskSampler
 from stockagent.data.news_dataset_quality import audit_news_tables
 from stockagent.data.news_dataset_storage import CopyOnWriteParts, LAYOUT, news_part_path, news_table_paths
 from stockagent.data.news_dataset_snapshots import (
     copy_snapshot, discard_new_build_work, seal_snapshot, verify_snapshot,
 )
 from stockagent.data.news_dataset_sources import (
-    checked_path, freeze_inputs, iter_body_groups, original_article_id, readonly_database,
+    HEADLINE_SCOPE_CONTRACT, checked_path, freeze_inputs, iter_body_groups, original_article_id, readonly_database,
     reuse_snapshot, source_metadata_record, url_article_id, utc_now,
 )
 
 CONTRACT_VERSION = 2
 SUPPORTED_CONTRACTS = {1, CONTRACT_VERSION}
 MIN_FREE_BYTES = 25 * 2**30
+
+
+class _NewsDatasetDiskGuard:
+    """Require a recent physical backing sample before growing corpus work.
+
+    Sampling runs outside this process, so a wedged Windows check cannot wedge
+    a builder. A failed, pending or expired sample does not admit writes.
+    """
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.sampler = BackingDiskSampler(root, probe_timeout_seconds=25)
+
+    def check(self):
+        sample = self.sampler.sample(shutil.disk_usage(self.root).free)
+        if sample["state"] in {"pending", "stale"} and sample["inflight"]:
+            # Only wait for a first/stale in-flight check. Normal progress uses
+            # the latest unexpired result and never blocks on a new sample.
+            self.sampler.wait(30)
+            sample = self.sampler.sample(shutil.disk_usage(self.root).free)
+        if sample["state"] not in {"available", "not_required"}:
+            raise RuntimeError("news dataset disk guard: backing space unconfirmed; retry after a fresh sample")
+        if sample["free_bytes"] < MIN_FREE_BYTES:
+            raise RuntimeError("news dataset disk guard: retain 25 GiB physical and filesystem free; retry after capacity recovers")
+
+
 ARTICLE_SCHEMA = pa.schema([
     ("article_id", pa.string()), ("provider", pa.string()), ("url", pa.string()),
     ("title", pa.string()), ("body", pa.string()), ("document_id", pa.string()), ("text_kind", pa.string()),
@@ -87,6 +114,7 @@ BODY_COLUMNS = {
 
 def builder_fingerprint() -> str:
     sources = [Path(__file__), Path(__file__).with_name("news_dataset_sources.py"),
+               Path(__file__).with_name("news_source_urls.py"),
                Path(__file__).with_name("news_dataset_quality.py"),
                Path(__file__).with_name("news_dataset_storage.py"),
                Path(__file__).with_name("news_dataset_snapshots.py")]
@@ -307,9 +335,10 @@ def _metadata_block(writer, snapshot, rows, origin):
     retained = set()
     for offset in range(0, len(candidates), 500):
         chunk = candidates[offset:offset + 500]
-        retained.update(r[0] for r in snapshot.execute("SELECT id FROM heads WHERE id IN (" +
-                        ",".join("?" for _ in chunk) + ") AND (body_sha256 IS NOT NULL OR "
-                        "(title IS NOT NULL AND trim(title)!=''))", chunk))
+        # Use the article IDs actually written by the selected semantic scope;
+        # a titled source head alone is not necessarily a retained article.
+        retained.update(r[0] for r in writer.db.execute("SELECT id FROM article_ids WHERE id IN (" +
+                        ",".join("?" for _ in chunk) + ")", chunk))
     for number, row in rows:
         link, stocks = source_metadata_record(row, origin["provider"])
         aid, resolved = identities.get(link, (None, None))
@@ -372,7 +401,9 @@ def _build_tables(root, source, snapshot_path, plan, *, workers, batch_rows, not
                 raise ValueError("fulltext scope is incomplete")
             after, done = writer.position("headlines")
             cursor = snapshot.execute("SELECT * FROM heads WHERE body_sha256 IS NULL AND title IS NOT NULL "
-                                      "AND trim(title)!='' AND id>? ORDER BY id", (bytes.fromhex(after) if after else b"",))
+                                      "AND trim(title)!='' AND id>? AND NOT EXISTS "
+                                      "(SELECT 1 FROM metadata_only_heads m WHERE m.id=heads.id) ORDER BY id",
+                                      (bytes.fromhex(after) if after else b"",))
             while rows := cursor.fetchmany(batch_rows):
                 records = []
                 for head in rows:
@@ -464,12 +495,16 @@ def _build_tables(root, source, snapshot_path, plan, *, workers, batch_rows, not
         writer.close()
 
 
-def verify_news_dataset(root: Path, *, deep: bool = True, verification_memory_mb: int = 2048) -> dict:
+def verify_news_dataset(root: Path, *, deep: bool = True, verification_memory_mb: int = 2048,
+                        _guard: _NewsDatasetDiskGuard | None = None) -> dict:
     """Read the committed manifest, checksum every part and inspect actual rows."""
     if verification_memory_mb < 128:
         raise ValueError("news verification memory limit must be at least 128 MB")
+    guard = _guard or _NewsDatasetDiskGuard(root)
+    guard.check()
     manifest = json.loads((root / "manifest.json").read_text())
-    return _verify_manifest(root, manifest, deep=deep, verification_memory_mb=verification_memory_mb)
+    return _verify_manifest(root, manifest, deep=deep, verification_memory_mb=verification_memory_mb,
+                            notify=lambda _stage, _completed, _total: guard.check())
 
 
 def _verify_manifest(root: Path, manifest: dict, *, deep: bool = True, notify=None,
@@ -535,9 +570,9 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
     os.chmod(output, 0o700)
     notify_callback = notify
     started = time.monotonic()
+    guard = _NewsDatasetDiskGuard(output)
     def progress(stage, completed, total):
-        if shutil.disk_usage(output).free < MIN_FREE_BYTES:
-            raise RuntimeError("news dataset disk guard: retain 25 GiB free; resume after capacity recovers")
+        guard.check()
         payload = {"stage": stage, "completed": completed, "total": total,
                    "elapsed_seconds": round(time.monotonic() - started, 3), "updated_at_utc": utc_now()}
         atomic_write_json(output / "progress.json", payload)
@@ -545,8 +580,9 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
             notify_callback(payload)
     with (output / ".build.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard.check()
         if (output / "manifest.json").is_file() and not refresh:
-            return verify_news_dataset(output, verification_memory_mb=verification_memory_mb)
+            return verify_news_dataset(output, verification_memory_mb=verification_memory_mb, _guard=guard)
         fingerprint = builder_fingerprint()
         active_path = output / ".active-build.json"
         if active_path.exists():
@@ -577,13 +613,18 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
             if sha256_file(snapshot) != plan["snapshot_sha256"]:
                 raise ValueError("frozen news input snapshot changed")
         else:
+            if (output / "manifest.json").is_file():
+                existing = json.loads((output / "manifest.json").read_text())
+                if existing.get("headline_scope_contract") != HEADLINE_SCOPE_CONTRACT:
+                    raise ValueError("news headline scope changed; build into a separate output root")
             name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
             relative = "versions/" + name
             generation = output / relative
             progress("snapshot", 0, 0)
             plan = (reuse_snapshot(source, generation, snapshot_from.resolve()) if snapshot_from is not None
                     else freeze_inputs(source, generation, progress=progress))
-            active = {"generation": relative, "builder_fingerprint": fingerprint}
+            active = {"generation": relative, "builder_fingerprint": fingerprint,
+                      "headline_scope_contract": HEADLINE_SCOPE_CONTRACT}
             if (output / "manifest.json").is_file():
                 parent_bytes = (output / "manifest.json").read_bytes()
                 parent = json.loads(parent_bytes)
@@ -657,9 +698,9 @@ def finish_pending_news_dataset(output: Path, *, verification_memory_mb: int = 2
         raise ValueError("news verification memory limit must be at least 128 MB")
     output = output.resolve()
     started = time.monotonic()
+    guard = _NewsDatasetDiskGuard(output)
     def progress(stage, completed, total):
-        if shutil.disk_usage(output).free < MIN_FREE_BYTES:
-            raise RuntimeError("news verification disk guard: retain 25 GiB free")
+        guard.check()
         payload = {"stage": stage, "completed": completed, "total": total,
                    "elapsed_seconds": round(time.monotonic() - started, 3), "updated_at_utc": utc_now()}
         atomic_write_json(output / "progress.json", payload)
@@ -667,9 +708,10 @@ def finish_pending_news_dataset(output: Path, *, verification_memory_mb: int = 2
             notify(payload)
     with (output / ".build.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard.check()
         active_path = output / ".active-build.json"
         if not active_path.exists():
-            return verify_news_dataset(output, verification_memory_mb=verification_memory_mb)
+            return verify_news_dataset(output, verification_memory_mb=verification_memory_mb, _guard=guard)
         active = json.loads(active_path.read_text())
         generation = checked_path(output, active["generation"] + "/generation.json").parent
         marker = json.loads((generation / "generation.json").read_text())

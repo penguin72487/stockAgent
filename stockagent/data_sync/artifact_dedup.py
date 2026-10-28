@@ -93,8 +93,77 @@ class DuplicateGroup:
         return sum(item.blocks * 512 for item in self.duplicates)
 
 
+class ImmutableSourceBatch:
+    """Durably finish source aliases before a caller publishes its manifest.
+
+    Payloads keep their individual fsync and full SHA checks. Directory entries
+    are synced once per directory, including ancestors, on context exit. A
+    failed or interrupted context never grants publication or source retirement.
+    The caller must publish the completion manifest only after successful exit.
+    """
+
+    def __init__(self) -> None:
+        self._state = 'new'
+        self._directories: dict[Path, tuple[int, int]] = {}
+
+    def _require_active(self) -> None:
+        if self._state != 'active':
+            raise ValueError('immutable source batch is not active')
+
+    def __enter__(self) -> ImmutableSourceBatch:
+        if self._state != 'new':
+            raise ValueError('immutable source batches cannot be reused')
+        self._state = 'active'
+        return self
+
+    def _record_directory(self, directory: Path) -> None:
+        self._require_active()
+        while True:
+            if directory.resolve() != directory:
+                raise ValueError('immutable source batch directory is redirected')
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError('immutable source batch requires ordinary directories')
+            identity = (info.st_dev, info.st_ino)
+            if directory in self._directories:
+                if self._directories[directory] != identity:
+                    raise ValueError('immutable source batch directory identity changed')
+                return
+            self._directories[directory] = identity
+            if directory.parent == directory:
+                return
+            directory = directory.parent
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        self._require_active()
+        self._state = 'synchronizing'
+        try:
+            for directory, identity in sorted(self._directories.items(),
+                    key=lambda item: (-len(item[0].parts), str(item[0]))):
+                if directory.resolve() != directory:
+                    raise ValueError('immutable source batch directory is redirected')
+                fd = os.open(directory, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+                    | getattr(os, 'O_NOFOLLOW', 0))
+                try:
+                    info = os.fstat(fd)
+                    if (not stat.S_ISDIR(info.st_mode)
+                            or (info.st_dev, info.st_ino) != identity):
+                        raise ValueError('immutable source batch directory identity changed')
+                    os.fsync(fd)
+                    after = directory.lstat()
+                    if (directory.resolve() != directory
+                            or (after.st_dev, after.st_ino) != identity):
+                        raise ValueError('immutable source batch directory changed during sync')
+                finally:
+                    os.close(fd)
+        finally:
+            self._state = 'closed'
+        return False
+
+
 def link_immutable_source(
-    source: Path, destination: Path, object_root: Path, expected_sha256: str
+    source: Path, destination: Path, object_root: Path, expected_sha256: str, *,
+    batch: ImmutableSourceBatch | None = None,
 ) -> None:
     """Copy a verified source once, then link immutable local evidence aliases.
 
@@ -103,6 +172,10 @@ def link_immutable_source(
     Existing objects and aliases are verified and never overwritten.
     """
 
+    if batch is not None:
+        if not isinstance(batch, ImmutableSourceBatch):
+            raise ValueError('explicit immutable source batch required')
+        batch._require_active()
     if (
         len(expected_sha256) != 64
         or any(c not in "0123456789abcdef" for c in expected_sha256)
@@ -133,6 +206,8 @@ def link_immutable_source(
 
     if os.path.lexists(destination):
         verify(destination)
+        if batch is not None:
+            batch._record_directory(destination.parent)
         return
     if not os.path.lexists(object_path):
         temporary = object_path.with_name(f".{expected_sha256}.{uuid.uuid4().hex}.partial")
@@ -155,7 +230,8 @@ def link_immutable_source(
                 raise ValueError("immutable source changed during copy")
             try:
                 os.link(temporary, object_path, follow_symlinks=False)
-                _fsync_directory(object_path.parent)
+                if batch is None:
+                    _fsync_directory(object_path.parent)
             except FileExistsError:
                 pass  # Another publisher won; independently verify its bytes.
         finally:
@@ -163,11 +239,16 @@ def link_immutable_source(
     verify(object_path)
     if stat.S_IMODE(object_path.stat().st_mode) & 0o222:
         raise ValueError("immutable evidence object is writable")
+    if batch is not None:
+        batch._record_directory(object_path.parent)
     try:
         os.link(object_path, destination, follow_symlinks=False)
-        _fsync_directory(destination.parent)
+        if batch is None:
+            _fsync_directory(destination.parent)
     except FileExistsError:
         verify(destination)
+    if batch is not None:
+        batch._record_directory(destination.parent)
 
 
 def _iter_files(

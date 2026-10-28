@@ -47,9 +47,14 @@ def download_taifex_attachment(
     request_interval: float,
     user_agent: str,
     cooldown_after_download: bool = False,
+    max_response_bytes: int | None = None,
 ) -> Path:
     """Download one immutable TAIFEX attachment with atomic promotion."""
 
+    if max_response_bytes is not None and (
+        type(max_response_bytes) is not int or max_response_bytes < 100
+    ):
+        raise ValueError("invalid maximum TAIFEX response size")
     if target.is_file() and target.stat().st_size > 0:
         return target
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -67,8 +72,11 @@ def download_taifex_attachment(
                 method="POST",
             )
             with request.urlopen(http_request, timeout=120) as response:
-                body = response.read()
+                body = (response.read() if max_response_bytes is None
+                        else response.read(max_response_bytes + 1))
                 disposition = str(response.headers.get("Content-Disposition") or "")
+            if max_response_bytes is not None and len(body) > max_response_bytes:
+                raise ValueError("TAIFEX response exceeds the finite priority bound")
             if len(body) < 100 or "attachment" not in disposition.casefold():
                 raise RuntimeError("TAIFEX response was not a downloadable attachment")
             with tempfile.NamedTemporaryFile(

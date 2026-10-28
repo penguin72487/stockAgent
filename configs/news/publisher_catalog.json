@@ -16,6 +16,125 @@
   },
   "providers": [
     {
+      "id": "nstock",
+      "name": "nStock／已核對公司公告",
+      "domains": ["www.nstock.tw"],
+      "enabled": true,
+      "acquisition_mode": "finite",
+      "finite_article_urls": [
+        "https://www.nstock.tw/news/article_m?id=169138",
+        "https://www.nstock.tw/news/article_m?id=455676"
+      ],
+      "finite_identity_query_keys": ["id"],
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "capacity_max_parallelism": 1,
+      "html_parser": "lxml",
+      "embedded_article_layout": "nstock_finite_announcement_v1",
+      "article_path_pattern": "^/news/article_m$",
+      "article_selectors": [":scope > .nstock-native-announcement"],
+      "exclude_selectors": [],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "feeds": [],
+      "sitemaps": [],
+      "wordpress_apis": [],
+      "fulltext_feeds": [],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-28",
+        "evidence_url": "https://www.nstock.tw/app/user-agreement",
+        "additional_evidence_urls": [
+          "https://www.nstock.tw/robots.txt",
+          "https://www.nstock.tw/news/article_m?id=169138",
+          "https://www.nstock.tw/news/article_m?id=455676"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Only the two literal public, already reviewed nStock company-announcement URLs for the user's private noncommercial research. The source-declared desk, ID, visible heading and explicit-offset second clock must match the inert literal announcement object, ticker and native key; actual robots and refusals apply. No sitemap crawling, generated IDs, login or paid access, redirect, script execution in the collector, public distribution or automatic training/export. These are nStock representations; the source's MOPS key and the matching CNYES title do not independently establish an official original or identical CNYES body. Current text does not prove the original historical version.",
+        "rights_restrictions": "The reviewed app agreement concerns nStock APP service and does not by itself prove the rights or restrictions of this public webpage. Retain source and desk attribution and publisher notices. No open license, bulk-history entitlement, redistribution, training right or legal fair-use finding is inferred."
+      },
+      "review_url": "https://www.nstock.tw/app/user-agreement",
+      "adapter_verification": "two_literal_nstock_announcements_visible_heading_clock_and_object_one_rendered_full_text_parity_20261028",
+      "note": "Canonical sole owner, actual source robots, private raw receipts and read-only progress are reused. The explicit two-URL cohort cannot discover or admit other URLs; two-second single-slot pacing is a local bound, not an official or measured speed ceiling."
+    },
+    {
+      "id": "gnn",
+      "name": "巴哈姆特 GNN／公開原生報導",
+      "domains": ["gnn.gamer.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "capacity_max_parallelism": 2,
+      "html_parser": "lxml",
+      "embedded_article_layout": "gnn_native_legacy_article_v4",
+      "article_path_pattern": "^/detail[.]php$",
+      "article_selectors": [":scope > div.GN-lbox3B"],
+      "exclude_selectors": [],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "feeds": [],
+      "sitemaps": [],
+      "wordpress_apis": [],
+      "fulltext_feeds": [],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-25",
+        "evidence_url": "https://gnn.gamer.com.tw/",
+        "additional_evidence_urls": [
+          "https://gnn.gamer.com.tw/robots.txt",
+          "https://user.gamer.com.tw/help/detail.php?sn=137"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "Requested private personal noncommercial reading of already-local literal public GNN detail.php?sn= article URLs and literal targets from existing local metadata only, through the canonical collector. Current native GNN reporter, heading, OG URL/title and explicit-offset release must agree with the NewsArticle declaration. Preserve supplier-provided prose and notices without claiming the reporter authored or owns it all. No RSS ingestion/database, site discovery, guessed archive IDs, API, login/paid access, media, redistribution, training or export. Cached official RSS FAQ137 restricts that separate service, not a grant for HTML articles; the official user-help host returned403 and is not retried or bypassed. This is not an open license, legal fair-use finding, historical-PIT witness or unlimited history grant.",
+        "rights_restrictions": "Private raw responses retain copyright and supplier notices. Reporter identity, upstream ownership and reuse rights are not independently verified. Native REP, source refusals and persistent budgets remain authoritative; no response challenge bypass or use of the separately restricted RSS service."
+      },
+      "review_url": "https://gnn.gamer.com.tw/",
+      "adapter_verification": "retained_native_reporter_OG_URL_heading_offset_clock_and_supplier_prose_table_boundary_20261025",
+      "note": "Canonical collector and known local URLs only. Native GN-lbox3B prose/tables replace unverified JSON-LD summary; neighboring stories, RSS and unfetched media remain outside the body contract. Exact native credit/Person and release clocks are required; unknown credits/embeds/hidden or ambiguous article roots remain explicit. No official numeric quota or source maximum established; the initial two-second single-slot bound is not a measured ceiling."
+    },
+    {
+      "id": "managertoday",
+      "name": "經理人／已核對私人研究原稿",
+      "domains": ["www.managertoday.com.tw"],
+      "enabled": true,
+      "acquisition_mode": "continuous",
+      "private_known_url_scope": "personal_noncommercial_originals_v1",
+      "interval_seconds": 2,
+      "parallelism": 1,
+      "capacity_max_parallelism": 2,
+      "html_parser": "lxml",
+      "embedded_article_layout": "manager_public_written_article_v5",
+      "article_path_pattern": "^/articles/view/[1-9][0-9]*$",
+      "article_selectors": [":scope > .manager-native-body"],
+      "exclude_selectors": [],
+      "title_selector": "h1",
+      "require_configured_container": true,
+      "require_author_attribution": true,
+      "feeds": [],
+      "sitemaps": [],
+      "wordpress_apis": [],
+      "fulltext_feeds": [],
+      "authorization": {
+        "kind": "personal_research",
+        "reviewed_on": "2026-10-25",
+        "evidence_url": "https://www.managertoday.com.tw/",
+        "additional_evidence_urls": [
+          "https://www.managertoday.com.tw/robots.txt",
+          "https://www.managertoday.com.tw/columnist/view/5738"
+        ],
+        "automated_access_review": "no_explicit_prohibition_identified",
+        "scope": "User-requested private personal noncommercial reading of already-local literal public Manager article URLs only. Official home/footer and native REP reviewed. v3 retains the reviewed linked writing credit, matching NewsArticle Person, data-dl_text and one literal publisher columnist profile. It also recognizes the observed plain span writing roles 採訪·撰文 or 撰文 only when all responsive copies pair with adjacent native dates and match that Person and release date; this does not invent a profile, human identity or ownership. The plain-credit form requires matching native/OG/NewsArticle headlines; a separately branded HTML SEO title is preserved verbatim. Previously reviewed paired SEO/OG titles remain supported for linked credits. Keep explicit reprints, unpaired/third-party bylines and ambiguous multiple article roots unresolved. Preserve exact release/revision declarations and any reversed declared clock order without inventing dates. No site discovery, API, member/paid/login access, identity synthesis, public redistribution or training/export. This is not an open license, legal fair-use finding, historical-PIT witness or unlimited archive grant.",
+        "rights_restrictions": "Keep publisher rights and the article's explicit partner-reprint restriction attached to private records. The native article's static inert iframe-template table declaration is retained as unrendered source text, with scripts removed; no iframe, media, JavaScript execution or rendered-visibility claim. Respect actual REP, source refusals and persistent budgets. Official account-privacy access failed; that unresolved document is not a permission grant."
+      },
+      "review_url": "https://www.managertoday.com.tw/",
+      "adapter_verification": "native_static_embedded_document_metadata_and_literal_financial_cards_v5_20261026",
+      "note": "Existing canonical collector and metadata only. v3 handles observed plain writing/date pairs and distinct SEO/OG headlines without changing accepted v1/v2 originals or replaying source refusals/deadlines. Only the sealed missing-head mailbox is eligible for explicit repair. Reversed declared revision/publication order is kept verbatim and flagged, not sorted or claimed as historical PIT. Current main.htmlview prose/tables replace unverified JSON-LD body; unsupported reprints, multiple roots and embedded layouts stay explicit. No official numeric quota established; the initial two-second single-slot bound is not a measured ceiling."
+    },
+    {
       "id": "taiwannews",
       "name": "Taiwan News 台灣英文新聞",
       "domains": [
@@ -591,8 +710,8 @@
       "article_selectors": [
         ":scope > .articleContent__body > .articleContent__content--main > .articleContent__textContent"
       ],
-      "adapter_verification": "native_canonical_BlogPosting_editor_clock_v6_six_declared_20261024",
-      "note": "Reuse twenty-two completed originals and all429 closed metadata questions. Only the six newly declared literal originals may enter independently verified supplements. No recursive discovery, guessed slugs, AI polling, public body, automatic training export, CMNews alias equivalence or historical-release guarantee. Ten-second spacing is not a measured source maximum.",
+      "adapter_verification": "native_canonical_BlogPosting_editor_clock_v8_source_bound_declarations",
+      "note": "Reuse completed originals and closed questions. Source-declared originals enter only finite acquisition supplements through the existing single writer; a matching slug alone never authorizes capture. Same-response declarations have a transactional outbox, not another HTTP client. Preserve actual source clocks, source refusals and the prior HTTP budget identity. Ten-second spacing is not an official or measured source maximum.",
       "id": "cmoneylearning",
       "name": "實習大人／已核對原文",
       "domains": [
@@ -601,8 +720,8 @@
       "acquisition_mode": "finite",
       "capacity_max_parallelism": 1,
       "allow_reviewed_supplements": true,
-      "embedded_article_layout": "cmoneylearning_visible_article_v6",
-      "article_path_pattern": "^(?:/%e6%9c%88%e9%85%8d%e6%81%afetf%e7%bc%ba%e9%bb%9e%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f%e9%99%a4%e6%81%af%e6%89%a3%e6%b7%a8%e5%80%bc%e3%80%81%e4%ba%8c%e4%bb%a3%e5%81%a5%e4%bf%9d%e9%96%80%e6%aa%bb/|/%e6%88%bf%e8%b2%b8%e8%bd%89%e8%b2%b8%e6%88%90%e6%9c%ac%e6%9c%89%e5%93%aa%e4%ba%9b%ef%bc%9f5%e5%a4%a7%e9%9a%b1%e5%bd%a2%e8%b2%bb%e7%94%a8%e8%88%87%e9%81%95%e7%b4%84%e9%87%91%e8%a9%a6%e7%ae%97%ef%bc%9a/|/00907%e9%85%8d%e6%81%af0\\-24%e5%85%83%ef%bc%8c8%e6%9c%8825%e6%97%a5%e9%99%a4%e6%81%af%e5%89%8d%e8%a9%b2%e8%b2%b7%e5%97%8e%ef%bc%9f/|/00888%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e9%a0%98%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e6%9c%80%e5%be%8c%e8%b2%b7%e9%80%b2%e6%97%a5%e6%80%8e%e9%ba%bc%e7%9c%8b/|/%e6%b3%95%e5%9c%8b%e6%9a%b4%e5%8b%95%e5%8e%9f%e5%9b%a0%e6%98%af%e4%bb%80%e9%ba%bc%ef%bc%9f%e7%94%9f%e6%b4%bb%e6%88%90%e6%9c%ac%e3%80%81%e6%95%99%e8%82%b2%e4%b8%8d%e5%b9%b3%e7%ad%89%e8%88%87%e8%b3%87/|/%e4%bf%a1%e7%94%a8%e5%8d%a1%e9%a1%8d%e5%ba%a6%e8%aa%bf%e6%95%b4%e8%a6%81%e6%ba%96%e5%82%99%e4%bb%80%e9%ba%bc%e8%b3%87%e6%96%99%ef%bc%9f%e8%b2%a1%e5%8a%9b%e8%ad%89%e6%98%8e%e3%80%81%e7%94%b3%e8%ab%8b/|/0056%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e9%99%a4%e6%81%af%e5%be%8c%e7%82%ba%e4%bd%95%e4%b8%8d%e7%ad%89%e6%96%bc/|/%e5%be%85%e6%a5%ad%e6%9c%9f%e9%96%93%e6%8e%9b%e5%b7%a5%e6%9c%83%e6%8a%95%e4%bf%9d%e5%a5%bd%e5%97%8e%ef%bc%9f%e6%af%8f%e6%9c%88%e4%bf%9d%e8%b2%bb%e6%94%af%e5%87%ba%e3%80%81%e5%8b%9e%e4%bf%9d%e9%80%80/|/00990b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e9%a0%90%e4%bc%b080%e5%85%83%ef%bc%8c%e6%9c%88%e9%85%8d%e6%81%af%e8%83%bd%e7%95%b6%e5%9b%ba%e5%ae%9a%e6%94%b6%e5%85%a5/|/00726b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e9%a0%98%ef%bc%9f%e4%b8%80%e5%bc%b5%e9%a0%90%e4%bc%b0460%e5%85%83%ef%bc%8c%e6%8a%95%e7%ad%89%e5%82%b5%e6%9c%89%e5%93%aa%e4%ba%9b%e9%a2%a8%e9%9a%aa/|/%e8%87%aa%e5%be%8b%e7%a5%9e%e7%b6%93%e5%a4%b1%e8%aa%bf%e6%9c%83%e5%a5%bd%e5%97%8e%ef%bc%9f%e6%aa%a2%e6%9f%a5%e5%85%a8%e6%ad%a3%e5%b8%b8%e5%8d%bb%e5%a4%a9%e5%a4%a9%e5%bf%83%e6%82%b8%e9%a0%ad%e6%9a%88/|/%e9%95%b7%e8%80%85%e9%98%b2%e8%b7%8c%e8%82%8c%e5%8a%9b%e9%81%8b%e5%8b%95%e6%95%99%e5%ad%b8%ef%bc%9a%e5%a4%a7%e8%85%bf%e7%84%a1%e5%8a%9b%e8%b5%b0%e8%b7%af%e7%a2%8e%e6%ad%a5%e5%bf%83%e6%85%8c%ef%bc%9f/|/%e8%81%b7%e5%a0%b4%e5%86%b7%e6%9a%b4%e5%8a%9b%e9%80%bc%e9%80%80%e4%b8%bb%e7%ae%a1%e6%95%85%e6%84%8f%e4%b8%8d%e6%8c%87%e6%b4%be%e5%b7%a5%e4%bd%9c%ef%bc%9f%e5%bf%83%e7%90%86%e5%b8%ab%e6%8f%ad%e6%9a%97/|/%e5%ad%a9%e5%ad%90%e6%b5%81%e6%84%9f%e8%a6%81%e8%ab%8b%e5%81%87%e5%97%8e%ef%bc%9f%e5%85%88%e7%9c%8b3%e5%80%8b%e8%bf%94%e6%a0%a1%e6%a2%9d%e4%bb%b6%ef%bc%8c%e6%8e%9b%e6%80%a5%e8%a8%ba%e5%be%8c%e9%9a%94/|/meta%e6%99%ba%e6%85%a7%e7%9c%bc%e9%8f%a1%e5%af%a6%e6%b8%ac%ef%bc%9a%e9%9a%b1%e8%97%8f%e8%9e%a2%e5%b9%95%e6%8a%ac%e9%a0%ad%e9%a1%af%e7%a4%ba%ef%bc%8c%e5%85%89%e5%ad%b8%e5%be%ae%e6%8a%95%e5%bd%b1/|/2026%e4%b9%9d%e5%90%88%e4%b8%80%e9%81%b8%e8%88%89%e6%8a%95%e7%a5%a811\\-28%e5%85%ad%e5%b8%b6%e4%bb%80%e9%ba%bc%ef%bc%9f%e5%bf%85%e5%82%993%e6%a8%a3%e7%89%a9%e5%93%81%e8%88%87%e6%8a%95%e7%a5%a8/|/2027%e5%b9%b4%e8%8f%9c%e9%a0%90%e8%b3%bc%e5%93%aa%e8%a3%a1%e8%b2%b7%ef%bc%9f4%e5%a4%a7%e9%80%9a%e8%b7%af%e6%94%b6%e5%96%ae%e6%99%82%e7%a8%8b%e3%80%81%e4%bd%9b%e8%b7%b3%e7%89%86%e3%80%81%e7%b1%b3/|/%e7%b5%90%e5%a9%9a%e5%85%8d%e8%81%98%e9%87%91%e5%8f%aa%e8%a6%81%e7%a7%9f%e6%88%bf%e7%8d%a8%e7%ab%8b%ef%bc%9f%e5%a9%86%e5%ae%b6%e6%80%92%e6%96%a5%e6%8a%8a%e4%ba%ba%e6%95%b4%e7%a2%97%e7%ab%af%e8%b5%b0/|/%e5%9b%9b%e9%80%b1%e5%bd%88%e6%80%a7%e5%b7%a5%e6%99%82%e8%aa%bf%e7%a7%bb%e9%9b%87%e4%b8%bb%e8%83%bd%e7%89%87%e9%9d%a2%e6%8c%87%e5%ae%9a%e5%97%8e%ef%bc%9f%e6%8e%92%e7%8f%ad%e8%a6%8f%e5%89%87%e3%80%81/|/00958b%e9%85%8d%e6%81%af%e6%80%8e%e9%ba%bc%e7%9c%8b%ef%bc%9f%e4%b8%80%e5%bc%b5%e8%83%bd%e9%a0%98%e5%a4%9a%e5%b0%91%e3%80%81%e6%9c%88%e9%85%8d%e9%8a%80%e8%a1%8c%e5%82%b5%e6%9c%89%e5%93%aa%e4%ba%9b/|/%e8%96%94%e7%90%b5%e9%a2%b1%e9%a2%a8%e4%ba%a4%e5%89%b2%e9%a0%86%e5%bb%b6%e5%88%b0%e5%93%aa%e5%a4%a9%ef%bc%9f%e5%8f%b0%e8%82%a1%e4%bc%91%e5%b8%82%e8%88%87%e5%a7%94%e8%a8%97%e5%96%ae%e8%99%95%e7%90%86/|/%e8%82%a1%e7%a5%a8%e7%8f%be%e9%87%91%e6%b8%9b%e8%b3%87%e9%80%80%e6%ac%be%e8%a6%81%e7%b9%b3%e7%a8%85%e5%97%8e%ef%bc%9f%e9%80%80%e5%9b%9e%e6%9c%ac%e9%87%91%e5%85%8d%e7%a8%85%e8%a6%8f%e5%ae%9a%e3%80%81/|/%e7%be%8e%e5%85%89%e7%bd%b7%e5%b7%a5%e6%9c%89%e8%bd%89%e5%96%ae%e8%a1%8c%e6%83%85%e5%97%8e%ef%bc%9fipp%e5%88%86%e7%b4%85%e7%88%ad%e8%ad%b0%e3%80%81%e8%a8%98%e6%86%b6%e9%ab%94%e5%a0%b1%e5%83%b9/|/%e5%a4%96%e8%b3%87%e8%b2%b7%e8%b6%85%e7%82%ba%e4%bd%95%e9%9a%94%e5%a4%a9%e5%8f%8d%e6%89%8b%e5%80%92%e8%b2%a8%ef%bc%9f%e7%9c%8b%e7%a9%bf%e5%81%87%e5%a4%96%e8%b3%87%e9%9a%94%e6%97%a5%e6%b2%96%e8%88%87/|/%e9%96%8b%e9%ab%98%e8%b5%b0%e4%bd%8e%e7%82%ba%e4%bd%95%e8%b2%b7%e9%80%b2%e5%b0%b1%e7%bf%bb%e9%bb%91%ef%bc%9f%e9%9a%94%e6%97%a5%e6%b2%96%e5%80%92%e8%b2%a8%e6%a9%9f%e5%88%b6%e3%80%81%e7%95%b6%e6%b2%96/|/%e9%87%91%e5%83%8f%e9%9b%bb%e7%8d%b2%e4%ba%9e%e9%a6%ac%e9%81%9c856%e5%85%83%e7%a7%81%e5%8b%9f%e5%85%a5%e8%82%a1%e9%82%84%e8%83%bd%e8%bf%bd%ef%bc%9f34%e9%9a%8ehdi%e6%8a%80%e8%a1%93%e8%88%87%e5%8d%83/|/%e7%be%8e%e8%82%a1%e8%b2%a1%e5%a0%b1%e8%b6%85%e9%a0%90%e6%9c%9f%e7%82%ba%e4%bd%95%e7%9b%a4%e5%be%8c%e6%9a%b4%e8%b7%8c%ef%bc%9f%e7%9c%8b%e6%87%82%e5%89%8d%e7%9e%bb%e6%8c%87%e5%bc%95%e3%80%811\\-2/|/%e7%a7%91%e6%9e%97%e7%a0%94%e7%99%bc%e8%b2%a1%e5%a0%b1%e5%89%b5%e9%ab%98%e8%82%a1%e5%83%b9%e5%8d%bb%e8%b7%8c%ef%bc%9f82\\-2%e5%84%84%e7%be%8e%e5%85%83%e8%b2%a1%e6%b8%ac%e8%90%bd%e5%b7%ae/)$",
+      "embedded_article_layout": "cmoneylearning_visible_article_v8",
+      "article_path_pattern": "^/(?:[A-Za-z0-9_-]|%[0-9A-Fa-f]{2}){1,1024}/$",
       "exclude_selectors": [],
       "title_selector": "h1.articleContent__title",
       "require_author_attribution": true,
@@ -611,14 +730,14 @@
       "wordpress_apis": [],
       "authorization": {
         "kind": "personal_research",
-        "reviewed_on": "2026-10-24",
+        "reviewed_on": "2026-10-27",
         "evidence_url": "https://www.cmoney.tw/member/tos.aspx",
         "additional_evidence_urls": [
           "https://cmoneylearning.com.tw/",
           "https://www.cmoney.tw/member/cr.aspx"
         ],
         "automated_access_review": "no_explicit_prohibition_identified",
-        "scope": "Bounded private personal research of the twenty-two completed originals and exactly six additional literal originals declared by six completed CMNews canonical observations on 2026-10-24. New originals require explicit same-response source/body/credit/clock verification and shared immutable supplemental receipts. No paid/member, third-party rights override, publication, training export, alias equivalence or whole-site scope. Not a reuse license or fair-use verdict; preserve credits, REP and actual refusals."
+        "scope": "Bounded private personal reading of the retained originals and exact public original URLs declared by currently admitted CMNews failure responses or completed native observations. Every additional literal URL requires immutable source/head-bound finite acquisition evidence and the normal original response, identity, body, author, clock, REP and refusal checks. No recursive discovery, guessed slug, paid/member, third-party rights override, publication, training export, CMNews alias equivalence or whole-site capture. Not a reuse license or fair-use verdict."
       },
       "review_url": "https://www.cmoney.tw/member/tos.aspx"
     },
@@ -750,7 +869,7 @@
       "parallelism": 1,
       "capacity_max_parallelism": 2,
       "html_parser": "lxml",
-      "embedded_article_layout": "ettoday_visible_article_v39",
+      "embedded_article_layout": "ettoday_visible_article_v41",
       "reviewed_article_subsites": [
         "house.ettoday.net"
       ],
@@ -932,7 +1051,7 @@
         ],
         "rights_restrictions": "Reasonable private noncommercial use only, not a blanket archive/reuse/training license; third-party material requires its own authorization. Unknown authors remain visible as scope exclusions, not completed articles."
       },
-      "article_path_pattern": "^/(?:ArticleData/Info|Home/ChangePage)/(?:(?i:article)|(?i:%E7%90%86%E8%B2%A1%E5%91%A8%E5%88%8A)|理財周刊)/[0-9]+/?$",
+      "article_path_pattern": "^/(?:(?:ArticleData/Info|Home/ChangePage)/(?:(?i:article)|(?i:%E7%90%86%E8%B2%A1%E5%91%A8%E5%88%8A)|理財周刊)/[0-9]+/?|Magazine/Info/(?:(?i:%E7%90%86%E8%B2%A1%E5%91%A8%E5%88%8A)|理財周刊)/[0-9]+/?|_Article)$",
       "source_not_found_paths": [
         "/Error/Error404"
       ],
@@ -1314,7 +1433,7 @@
       "interval_seconds": 10,
       "parallelism": 1,
       "article_path_pattern": "^/news/[0-9A-F]{32}$",
-      "embedded_article_layout": "knews_public_native_article_v7",
+      "embedded_article_layout": "knews_public_native_article_v10",
       "article_selectors": [
         ":scope > figure > figcaption, :scope > p.post-intro, :scope > .article-body-wrapper > .article-content-inner"
       ],
@@ -1340,7 +1459,7 @@
         "automated_access_review": "no_explicit_prohibition_identified",
         "scope": "Only literal locally known unauthenticated public /news/32-uppercase-hex URLs on www.knews.com.tw for the explicitly confirmed private personal noncommercial nonpublic research purpose. The 2026-10-24 official /terms page governs the Knews shopping/refund service; it is not a public-news download license or legal fair-use verdict. The footer reserves copyright. Neither is transferred into a publisher grant. Preserve each current visible reporter/profile, meta-author and schema Person agreement; preserve a distinct printed reporter/location without asserting aliases or ownership. Known URLs are admitted by exact canonical/OG/schema/headline/native-editor agreement, not a two-sample author whitelist. Exclude explicit third-party/reprint credits, paid/login, challenges, REP refusals and unverified bodies; keep observation clocks distinct from declared publication. No discovery, guessed IDs, subdomains, account/member service, forms, shopping, third-party media/scripts, APIs, alternate-host retry, publication, republication, training injection or remote export. The two completed retained-original captures keep their original evidence and are never re-downloaded."
       },
-      "adapter_verification": "native_captionless_figures_optional_card_id_and_literal_sparse_signatures_v7_20261024",
+      "adapter_verification": "native_ordered_multiple_reporters_literal_profiles_schema_and_meta_v10_20261026",
       "note": "Private locally known public URLs only; completed originals remain untouched. No discovery, account/member access, automatic training/export or publication. Ten seconds is initial engineering pacing, not an official or measured maximum."
     },
     {
@@ -2370,7 +2489,7 @@
       "parallelism": 1,
       "capacity_max_parallelism": 2,
       "html_parser": "lxml",
-      "embedded_article_layout": "contentplatform_native_article_v3",
+      "embedded_article_layout": "contentplatform_native_article_v8",
       "article_path_pattern": "^/articles/[1-9][0-9]*/(?:[A-Za-z0-9_-]|%[0-9A-Fa-f]{2})+/$",
       "article_selectors": [
         ":scope > .contentplatform-verified-body"
@@ -2380,16 +2499,16 @@
       "exclude_selectors": [],
       "require_configured_container": true,
       "require_author_attribution": true,
-      "adapter_verification": "literal_canonical_main_entity_native_reporter_microdata_and_complete_written_body_v1_offline_20261024",
+      "adapter_verification": "native_static_written_HTML_script_excluded_empty_inert_leaf_v8_20261026",
       "review_url": "https://www.contentplatform.info/copyright/",
       "authorization": {
         "kind": "personal_research",
-        "reviewed_on": "2026-10-24",
+        "reviewed_on": "2026-10-26",
         "evidence_url": "https://www.contentplatform.info/copyright/",
         "automated_access_review": "no_explicit_prohibition_identified",
-        "scope": "User-requested private personal noncommercial reading of already locally known public Mega News URLs, under the official copyright page's personal noncommercial downloading/copying clause recorded in the2026-10-23 primary review. Native signed reporter compilation only: exact literal canonical and mainEntityOfPage, current visible and Person-microdata author/profile, publisher, separate explicit publication/modification clocks and complete visible written body must agree. Preserve source ownership, company-source credits and source declarations; no claim that compiled releases are our original reporting or that a profile proves copyright ownership. No site discovery, guessed endpoints, raw media, paid/member content, unsigned or third-party-wire reprint, alias merge, public redistribution, automatic model training or remote export. Unknown structures remain unresolved; this is not an open license, legal fair-use finding or historical first-publication guarantee."
+        "scope": "User-requested private personal noncommercial downloading of already locally known public Mega News written articles, under the official copyright page personal noncommercial downloading/copying clause reviewed2026-10-26. Literal canonical/mainEntity, publisher, visible author and Person/profile declaration, separate explicit publication/modification clocks and complete visible written body remain verified. The publisher account and every in-body reporter/company/source credit are distinct original declarations; neither a signed-credit template nor a profile proves copyright ownership. Preserve original raw responses, values, source credits and clocks. No site discovery, guessed endpoints, raw media, paid/member content, alias merge, public redistribution, automatic model training or remote export; CNA acquisition remains deferred. This is private reading/download scope, not an open license, ownership finding or historical first-publication guarantee."
       },
-      "note": "Known local metadata only, no discovery. Keep template429527 distinct from actual article identity. Native visible name whitespace, signed credit, paragraph/table numbers and explicit clocks remain original; media/captions are excluded from written text and retained in private originals. Initial2-second single-slot pacing is a bounded seed, not an official or measured maximum."
+      "note": "Known local public articles only; official personal noncommercial download clause. Publisher byline, signed reporter and company/source credits are separate raw declarations. No discovery, article aliases, redistribution, remote training export or source-limit reset. Existing single-owner pacing remains a seed, not a measured maximum."
     }
   ]
 }

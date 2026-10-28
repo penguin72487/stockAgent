@@ -13,12 +13,15 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
 import polars as pl
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -31,7 +34,8 @@ from downloader.download_tw_public_data import (
 )
 
 
-TWSE_URL = "https://wwwc.twse.com.tw/rwd/zh/exRight/TWT49U"
+TWSE_URL = "https://www.twse.com.tw/rwd/zh/exRight/TWT49U"
+TWSE_ALTERNATE_URL = "https://wwwc.twse.com.tw/rwd/zh/exRight/TWT49U"
 TPEX_CURRENT_URL = "https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQ"
 TPEX_HISTORICAL_URL = "https://www.tpex.org.tw/www/zh-tw/bulletin/exDailyQHis"
 TPEX_MONTHLY_REPORT_URL = "https://www.tpex.org.tw/www/zh-tw/statistics/monthlyRptMkt"
@@ -42,6 +46,8 @@ TPEX_HISTORICAL_GAP_START = date(2004, 9, 3)
 TPEX_HISTORICAL_GAP_END = date(2005, 2, 13)
 TPEX_MONTHLY_REPORT_TYPES = {6: "right", 7: "dividend"}
 ODS_TABLE_NAMESPACE = "urn:oasis:names:tc:opendocument:xmlns:table:1.0"
+ANNUAL_RETRY_CACHE_CONTRACT = "official_annual_retry_cache_v1"
+ANNUAL_RETRY_CACHE_MAX_AGE_SECONDS = 300
 
 
 @dataclass(slots=True)
@@ -53,6 +59,7 @@ class FetchResult:
     raw_path: str | None
     error: str | None = None
     raw_receipt: dict[str, Any] | None = None
+    http_attempt_count: int = 0
 
 
 @dataclass(slots=True)
@@ -67,6 +74,7 @@ class MonthlyDocumentResult:
     status: str
     raw_receipts: list[dict[str, Any]]
     error: str | None = None
+    http_attempt_count: int = 0
 
 
 class MonthlyDocumentIdentityError(ValueError):
@@ -524,6 +532,89 @@ def _year_request(market: str, year: int, end_date: date) -> tuple[str, dict[str
     }
 
 
+def _annual_scope_verified(payload: Any, market: str, year: int, end_date: date) -> bool:
+    """Verify explicit official query bounds; missing bounds are not cache proof."""
+    if not isinstance(payload, dict):
+        raise ValueError("annual reference payload must be an object")
+    _, params = _year_request(market, year, end_date)
+    expected = (params["startDate"].replace("/", ""), params["endDate"].replace("/", ""))
+    if market == "twse":
+        declared = (payload.get("strDate"), payload.get("endDate"))
+    else:
+        value = str(payload.get("date") or "")
+        declared = tuple(value.split("~")) if "~" in value else (None, None)
+    if any(value is None or not str(value).strip() for value in declared):
+        return False
+    normalized = tuple(str(value).replace("/", "").replace("-", "").strip() for value in declared)
+    if normalized != expected:
+        raise ValueError(f"official annual reference bounds differ: {normalized!r} != {expected!r}")
+    return True
+
+
+def _annual_cache_path(raw_dir: Path, market: str, year: int, end_date: date) -> Path:
+    return raw_dir / ".annual-retry-cache" / f"{market}-{year}-{end_date.isoformat()}.json"
+
+
+def _validate_annual_row_scope(
+    rows: list[dict[str, Any]], market: str, year: int, end_date: date
+) -> None:
+    _, params = _year_request(market, year, end_date)
+    start = datetime.strptime(params["startDate"].replace("/", ""), "%Y%m%d").date()
+    end = datetime.strptime(params["endDate"].replace("/", ""), "%Y%m%d").date()
+    if any(not start <= row["date"] <= end for row in rows):
+        raise ValueError(f"official annual reference row outside {start}..{end}")
+
+
+def _recent_annual_retry(
+    raw_dir: Path, market: str, year: int, end_date: date, *, failure: Exception
+) -> FetchResult | None:
+    """Reuse only a recently observed, exact-query, byte-verified official success."""
+    try:
+        entry = json.loads(_annual_cache_path(raw_dir, market, year, end_date).read_text("utf-8"))
+        if (entry.get("contract") != ANNUAL_RETRY_CACHE_CONTRACT
+                or entry.get("market") != market or entry.get("year") != year
+                or entry.get("end_date") != end_date.isoformat()):
+            return None
+        observed = datetime.fromisoformat(str(entry["observed_at_utc"]).replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            return None
+        now = datetime.now(timezone.utc)
+        age = (now - observed).total_seconds()
+        if not 0 <= age <= ANNUAL_RETRY_CACHE_MAX_AGE_SECONDS:
+            return None
+        receipt = dict(entry["raw_receipt"])
+        digest = str(receipt["sha256"])
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            return None
+        path = Path(str(receipt["path"]))
+        expected = raw_dir / f"{market}_{year}-{digest}.json"
+        actual = path.resolve(strict=True)
+        if (path.is_symlink() or actual.parent != raw_dir.resolve(strict=True)
+                or actual != expected.resolve(strict=True)):
+            return None
+        source_url = str(receipt["source_url"])
+        parsed_url = urlparse(source_url)
+        domain = "twse.com.tw" if market == "twse" else "tpex.org.tw"
+        if (parsed_url.scheme != "https" or not parsed_url.hostname
+                or not (parsed_url.hostname == domain or parsed_url.hostname.endswith("." + domain))):
+            return None
+        content = path.read_bytes()
+        if len(content) != int(receipt["size"]) or hashlib.sha256(content).hexdigest() != digest:
+            return None
+        payload = json.loads(content)
+        if not _annual_scope_verified(payload, market, year, end_date):
+            return None
+        rows = _payload_rows(payload, market=market, url=source_url)
+        if not rows:
+            return None
+        _validate_annual_row_scope(rows, market, year, end_date)
+        receipt.update(observed_at_utc=observed.isoformat(), retry_cache_reused=True,
+            retry_failure_type=type(failure).__name__, retry_observed_at_utc=now.isoformat())
+        return FetchResult(market, year, source_url, rows, str(path), raw_receipt=receipt)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
 def _fetch_year(
     market: str,
     year: int,
@@ -531,31 +622,82 @@ def _fetch_year(
     args: argparse.Namespace,
 ) -> FetchResult:
     url, params = _year_request(market, year, end_date)
+    transport_attempts: list[dict[str, Any]] = []
     try:
-        response = _http_get(
-            url,
-            params=params,
-            timeout=int(args.timeout),
-            verify_ssl=True,
-            retries=int(args.retries),
-            retry_backoff=1.0,
-        )
+        routes = (url, TWSE_ALTERNATE_URL) if market == "twse" else (url,)
+        for index, route in enumerate(routes):
+            attempt_start = time.perf_counter()
+            started_at = datetime.now(timezone.utc).isoformat()
+            try:
+                response = _http_get(
+                    route,
+                    params=params,
+                    timeout=int(args.timeout),
+                    verify_ssl=True,
+                    # Try the other official host after one failed request;
+                    # the final host retains the caller's retry policy.
+                    retries=0 if index + 1 < len(routes) else int(args.retries),
+                    retry_backoff=1.0,
+                )
+            except (RequestsTimeout, RequestsConnectionError) as exc:
+                transport_attempts.append({"url": route, "started_at_utc": started_at,
+                    "elapsed_ms": round((time.perf_counter() - attempt_start) * 1000, 3),
+                    "error_type": type(exc).__name__,
+                    "http_attempt_count": int(getattr(exc, "_stockagent_response_attempts", 1))})
+                if index + 1 < len(routes):
+                    continue
+                if not args.skip_raw and getattr(args, "mode", None) == "daily":
+                    recovered = _recent_annual_retry(
+                        args.output_dir / "raw" / "tw_corporate_action_reference",
+                        market, year, end_date, failure=exc,
+                    )
+                    if recovered is not None:
+                        # Keep the original successful acquisition evidence intact;
+                        # the failed retry is a separate observation.
+                        recovered.raw_receipt["retry_transport_attempts"] = transport_attempts
+                        recovered.http_attempt_count = sum(item["http_attempt_count"] for item in transport_attempts)
+                        return recovered
+                raise
+            transport_attempts.append({"url": route, "started_at_utc": started_at,
+                "elapsed_ms": round((time.perf_counter() - attempt_start) * 1000, 3),
+                "status_code": int(getattr(response, "status_code", 200)),
+                "http_attempt_count": int(getattr(response, "_stockagent_response_attempts", 1))})
+            break
         payload = response.json()
+        scope_verified = _annual_scope_verified(payload, market, year, end_date)
         rows = _payload_rows(payload, market=market, url=response.url)
+        _validate_annual_row_scope(rows, market, year, end_date)
         raw_path: Path | None = None
         raw_receipt: dict[str, Any] | None = None
         if not args.skip_raw:
             raw_dir = args.output_dir / "raw" / "tw_corporate_action_reference"
-            raw_dir.mkdir(parents=True, exist_ok=True)
-            raw_path = raw_dir / f"{market}_{year}.json"
-            temporary = raw_path.with_suffix(".json.tmp")
-            temporary.write_bytes(response.content)
-            os.replace(temporary, raw_path)
-            raw_receipt = _content_receipt(
-                response.content,
+            # The previous successful summary can still point at the legacy
+            # year alias.  Never replace that dependency during collection:
+            # another market/year or later validation may fail, in which case
+            # the previous generation must remain independently verifiable.
+            raw_receipt = _write_immutable_raw(
+                raw_dir,
+                stem=f"{market}_{year}",
+                suffix=".json",
+                content=response.content,
                 source_url=response.url,
-                path=raw_path,
             )
+            raw_path = Path(raw_receipt["path"])
+            observed_at = datetime.now(timezone.utc).isoformat()
+            raw_receipt["observed_at_utc"] = observed_at
+            raw_receipt["retry_cache_reused"] = False
+            raw_receipt["transport_attempts"] = transport_attempts
+            if getattr(args, "mode", None) == "daily" and scope_verified and rows:
+                cache_path = _annual_cache_path(raw_dir, market, year, end_date)
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                _write_json_atomic(cache_path, {
+                    "contract": ANNUAL_RETRY_CACHE_CONTRACT,
+                    "market": market,
+                    "year": year,
+                    "end_date": end_date.isoformat(),
+                    "observed_at_utc": observed_at,
+                    "raw_receipt": raw_receipt,
+                })
         return FetchResult(
             market,
             year,
@@ -563,9 +705,11 @@ def _fetch_year(
             rows,
             str(raw_path) if raw_path else None,
             raw_receipt=raw_receipt,
+            http_attempt_count=sum(item["http_attempt_count"] for item in transport_attempts),
         )
     except Exception as exc:
-        return FetchResult(market, year, url, [], None, f"{type(exc).__name__}: {exc}")
+        return FetchResult(market, year, url, [], None, f"{type(exc).__name__}: {exc}",
+            http_attempt_count=sum(item["http_attempt_count"] for item in transport_attempts))
 
 
 def _fetch_tpex_monthly_document(
@@ -586,15 +730,21 @@ def _fetch_tpex_monthly_document(
     document_url: str | None = None
     document_id: str | None = None
     raw_receipts: list[dict[str, Any]] = []
+    http_attempt_count = 0
+
+    def get(url: str, params: dict[str, str]):
+        nonlocal http_attempt_count
+        try:
+            response = _http_get(url, params=params, timeout=int(args.timeout),
+                verify_ssl=True, retries=int(args.retries), retry_backoff=1.0)
+        except Exception as error:
+            http_attempt_count += int(getattr(error, "_stockagent_response_attempts", 1))
+            raise
+        http_attempt_count += int(getattr(response, "_stockagent_response_attempts", 1))
+        return response
+
     try:
-        query_response = _http_get(
-            TPEX_MONTHLY_REPORT_URL,
-            params=query_params,
-            timeout=int(args.timeout),
-            verify_ssl=True,
-            retries=int(args.retries),
-            retry_backoff=1.0,
-        )
+        query_response = get(TPEX_MONTHLY_REPORT_URL, query_params)
         query_url = query_response.url
         query_payload = query_response.json()
         document_id = _monthly_query_document_id(
@@ -622,14 +772,7 @@ def _fetch_tpex_monthly_document(
             )
         raw_receipts.append(query_receipt)
 
-        document_response = _http_get(
-            TPEX_MONTHLY_DOWNLOAD_URL,
-            params={"doc": document_id, "isOds": "Y"},
-            timeout=int(args.timeout),
-            verify_ssl=True,
-            retries=int(args.retries),
-            retry_backoff=1.0,
-        )
+        document_response = get(TPEX_MONTHLY_DOWNLOAD_URL, {"doc": document_id, "isOds": "Y"})
         document_url = document_response.url
         if not args.skip_raw:
             document_receipt = _write_immutable_raw(
@@ -670,6 +813,7 @@ def _fetch_tpex_monthly_document(
                 status="unusable_document",
                 raw_receipts=raw_receipts,
                 error=f"{type(exc).__name__}: {exc}",
+                http_attempt_count=http_attempt_count,
             )
         return MonthlyDocumentResult(
             year=year,
@@ -681,6 +825,7 @@ def _fetch_tpex_monthly_document(
             rows=rows,
             status="parsed",
             raw_receipts=raw_receipts,
+            http_attempt_count=http_attempt_count,
         )
     except Exception as exc:
         return MonthlyDocumentResult(
@@ -694,6 +839,7 @@ def _fetch_tpex_monthly_document(
             status="failed",
             raw_receipts=raw_receipts,
             error=f"{type(exc).__name__}: {exc}",
+            http_attempt_count=http_attempt_count,
         )
 
 
@@ -1312,8 +1458,17 @@ def main() -> None:
         and int(monthly_stats["unresolved_keys"]) == 0,
         "end_date": str(end_date),
         "request_count": len(results),
-        "total_http_request_count": len(results) + 2 * len(monthly_results),
+        "total_http_request_count": sum(result.http_attempt_count for result in results)
+        + sum(result.http_attempt_count for result in monthly_results),
+        "http_request_count_contract": "network_attempts_from_http_get_v1",
+        "logical_http_request_count": len(results) + 2 * len(monthly_results),
         "failure_count": 0,
+        "annual_retry_cache_contract": ANNUAL_RETRY_CACHE_CONTRACT,
+        "annual_retry_cache_max_age_seconds": ANNUAL_RETRY_CACHE_MAX_AGE_SECONDS,
+        "annual_retry_reused_count": sum(
+            bool(result.raw_receipt and result.raw_receipt.get("retry_cache_reused"))
+            for result in results
+        ),
         "rows": int(frame.height),
         "markets": frame.group_by("market").len().sort("market").to_dicts() if frame.height else [],
         "raw_files": [result.raw_path for result in results if result.raw_path],
@@ -1321,6 +1476,7 @@ def main() -> None:
         "source_lineage": {
             "annual_reference_endpoints": {
                 "twse": TWSE_URL,
+                "twse_alternate": TWSE_ALTERNATE_URL,
                 "tpex_historical": TPEX_HISTORICAL_URL,
                 "tpex_current": TPEX_CURRENT_URL,
             },

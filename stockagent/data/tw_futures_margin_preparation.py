@@ -28,7 +28,7 @@ from stockagent.data_sync.artifact_dedup import link_immutable_source
 TAIPEI = timezone(timedelta(hours=8))
 PRODUCTS = ("TX", "MTX")
 ROC_DATE = r"(\d{2,3})年(\d{1,2})月(\d{1,2})日"
-CORPORATE_TERMS_DERIVATION_VERSION = 2
+CORPORATE_TERMS_DERIVATION_VERSION = 10
 
 
 def stock_futures_preparation_scope(universe: pl.DataFrame) -> pl.DataFrame:
@@ -51,6 +51,23 @@ def stock_futures_preparation_scope(universe: pl.DataFrame) -> pl.DataFrame:
 
 
 FUTURES_UNIVERSE_SCOPE_CONTRACT = 'source_declared_twd_futures_no_legacy_deferrals_v1'
+FUTURES_UNIVERSE_COMPOSITE_SCOPE_CONTRACT = 'source_declared_twd_futures_scope_union_v1'
+FUTURES_UNIVERSE_SCOPES = (
+    'all_twd', 'domestic_equity', 'stock_futures', 'etf_futures', 'index_futures',
+    'domestic_index_futures', 'foreign_index_futures', 'other_twd_futures',
+    'commodity_futures', 'interest_rate_futures',
+)
+
+
+def normalize_futures_universe_scope(scope: str) -> str:
+    """Canonicalize an explicit union without changing the meaning of a scope."""
+    if not isinstance(scope, str):
+        raise ValueError('unsupported futures universe scope')
+    parts = scope.split('+')
+    if (not parts or len(parts) != len(set(parts))
+            or any(part not in FUTURES_UNIVERSE_SCOPES for part in parts)):
+        raise ValueError(f'unsupported or duplicate futures universe scope: {scope}')
+    return '+'.join(part for part in FUTURES_UNIVERSE_SCOPES if part in parts)
 
 
 def futures_preparation_universe(universe: pl.DataFrame, *, scope: str) -> pl.DataFrame:
@@ -68,12 +85,29 @@ def futures_preparation_universe(universe: pl.DataFrame, *, scope: str) -> pl.Da
     if (universe['product'].null_count() or universe['product'].is_duplicated().any()
             or universe['product'].str.strip_chars().eq('').any()):
         raise ValueError('futures universe has duplicate/null/empty product identities')
-    if scope not in {'all_twd', 'domestic_equity'}:
-        raise ValueError(f'unsupported futures universe scope: {scope}')
+    parts = normalize_futures_universe_scope(scope).split('+')
     selected = universe.filter(pl.col('settlement_currency') == 'TWD')
-    if scope == 'domestic_equity':
-        selected = selected.filter(pl.col('region').eq('domestic') & pl.col('asset_class').is_in(
-            ['stock_future', 'etf_future', 'index_future']))
+    classes = {
+        'stock_futures': ['stock_future'], 'etf_futures': ['etf_future'],
+        'index_futures': ['index_future'], 'domestic_index_futures': ['index_future'],
+        'foreign_index_futures': ['index_future'],
+        'other_twd_futures': ['commodity_future', 'interest_rate_future'],
+        'commodity_futures': ['commodity_future'],
+        'interest_rate_futures': ['interest_rate_future'],
+    }
+    if 'all_twd' not in parts:
+        mask = pl.lit(False)
+        for part in parts:
+            if part == 'domestic_equity':
+                member = pl.col('region').eq('domestic') & pl.col('asset_class').is_in(
+                    ['stock_future', 'etf_future', 'index_future'])
+            else:
+                member = pl.col('asset_class').is_in(classes[part])
+                if part in {'domestic_index_futures', 'foreign_index_futures'}:
+                    region = 'domestic' if part == 'domestic_index_futures' else 'foreign'
+                    member = member & (pl.col('region') == region)
+            mask = mask | member
+        selected = selected.filter(mask)
     if selected.is_empty():
         raise ValueError('requested futures universe is empty')
     supported = ['stock_future', 'etf_future', 'index_future',
@@ -240,6 +274,35 @@ def terminal_contract_value_twd(price, multiplier, cash=0, rights=0) -> float:
     if any(not v.is_finite() for v in parts) or min(parts[:2])<=0 or min(parts[2:])<0:
         raise ValueError('invalid terminal components')
     return float((parts[0]*parts[1]+parts[2]+parts[3]).to_integral_value(rounding=ROUND_FLOOR))
+
+
+def index_futures_cash_terminal_values(frame: pl.DataFrame, *, price: str,
+                                       multiplier: str) -> pl.DataFrame:
+    """Calculate only TWD index-futures expiry values, per physical contract.
+
+    The canonical margin account is TWD-denominated; its universe owner checks
+    the currency before compiling.  Missing operands stay missing so admission
+    can quarantine them. The reviewed exchange notice took effect on
+    2016-11-07; earlier fractional values have no reviewed rounding rule and
+    stay missing. Exact whole-dollar values need no rounding rule. Computing
+    only expiry rows keeps Decimal arithmetic off ordinary observations.
+    """
+    from decimal import Decimal
+    keys = ['date', 'physical_contract']
+    rows = frame.filter(pl.col('asset_class') == 'index_future').select(
+        *keys, price, multiplier)
+    values = []
+    for day, quoted, units in rows.select('date', price, multiplier).iter_rows():
+        try:
+            value = terminal_contract_value_twd(quoted, units)
+            if day is None or (day < date(2016, 11, 7)
+                    and Decimal(str(quoted)) * Decimal(str(units)) != Decimal(str(value))):
+                value = None
+            values.append(value)
+        except ValueError:
+            values.append(None)
+    return rows.select(*keys).with_columns(
+        pl.Series('_index_terminal_value_twd', values, dtype=pl.Float64))
 
 
 def subscription_right_value_twd(stock_close, subscription_price, entitlement_units) -> float:
@@ -437,11 +500,72 @@ def bind_equity_margin_families(days: pl.DataFrame, intervals: pl.DataFrame,
     return result.drop([c for c in result.columns if c.startswith('parent_')]+['_inherited']).sort('date','product')
 
 
+POSITION_BOUNDARY_CAP_CONTRACT = 'prior_known_cap_within_verified_absolute_relaxation_v1'
+POSITION_DIRECT_BINDINGS = ('bound_prior_publication', 'bound_prior_cap_during_relaxation')
+
+
+def _position_relaxation_predecessors(levels: pl.DataFrame) -> pl.DataFrame:
+    """Prove a known old action set remains legal across a dated relaxation.
+
+    This does not expose the new cap before publication or extend an expired
+    legal interval. The old numerical policy is a subset of both source-bound
+    absolute limits. Formula, membership, unit, revocation and lifetime changes
+    need their own proof and are deliberately excluded. Publication ambiguity
+    is bounded to the effective date and the following calendar date.
+    """
+    schema = {'position_interval_id': pl.UInt32, '_cap_prior_id': pl.UInt32}
+    required = {'event_type', 'effective_phase', 'unit', 'position_unit', 'position_limit',
+        'monthly_position_limit', 'combined_products', 'independent_contract_limit',
+        'combined_position_base_product', 'conversion_numerator', 'conversion_denominator',
+        'requires_base_limit_join', 'requires_delisting_clock', 'end_rule',
+        'notice_revoked_effective_date'}
+    if not required <= set(levels.columns):
+        return pl.DataFrame(schema=schema)
+
+    def absolute(row):
+        return (row['event_type'] == 'absolute_level' and row['effective_phase'] == 0
+            and row['unit'] == 'contracts' and row['position_unit'] == 1.
+            and row['requires_base_limit_join'] is False
+            and row['requires_delisting_clock'] is False
+            and all(row[c] is None for c in ('combined_products', 'independent_contract_limit',
+                'combined_position_base_product', 'conversion_numerator', 'conversion_denominator',
+                'end_rule', 'notice_revoked_effective_date'))
+            and all(re.fullmatch(r'[a-f0-9]{64}', s or '')
+                    for s in row['source_content_sha256s'])
+            and isinstance(row['position_limit'], (int, float))
+            and not isinstance(row['position_limit'], bool)
+            and math.isfinite(row['position_limit']) and row['position_limit'] > 0
+            and (row['monthly_position_limit'] is None or (
+                isinstance(row['monthly_position_limit'], (int, float))
+                and math.isfinite(row['monthly_position_limit'])
+                and 0 < row['monthly_position_limit'] <= row['position_limit'])))
+
+    previous, proofs = {}, []
+    for row in levels.sort('product', '_begin').iter_rows(named=True):
+        prior = previous.get(row['product'])
+        previous[row['product']] = row
+        if prior is None or not absolute(prior) or not absolute(row):
+            continue
+        if (prior['_end'] != row['_begin'] or prior['_published'] is None
+                or row['_published'] is None or prior['_published'] >= row['_begin']
+                or not 0 <= (row['_published'] - row['_begin']).days <= 1
+                or row['position_limit'] < prior['position_limit']):
+            continue
+        old_month, new_month = prior['monthly_position_limit'], row['monthly_position_limit']
+        if new_month is not None and (old_month is None or new_month < old_month):
+            continue
+        proofs.append({'position_interval_id': row['position_interval_id'],
+                       '_cap_prior_id': prior['position_interval_id']})
+    return pl.DataFrame(proofs, schema=schema)
+
+
 def bind_dated_position_limits(days: pl.DataFrame, intervals: pl.DataFrame) -> pl.DataFrame:
     """Bind explicit caps/conversion formulas at a prior-published boundary.
 
-    The result deliberately retains lifecycle-relative ends and base joins;
-    these are not interchangeable with a resolved account position limit.
+    A proven absolute relaxation can retain the prior known numerical policy
+    during a bounded publication ambiguity. Its separate audit fields retain
+    the actual legal source and clock; the new larger cap remains unavailable.
+    Lifecycle-relative ends and base joins still require their own admission.
     """
     required={'product','effective_date','valid_until_date_exclusive','known_at',
         'admission_not_before','source_content_sha256s'}
@@ -476,9 +600,34 @@ def bind_dated_position_limits(days: pl.DataFrame, intervals: pl.DataFrame) -> p
           .then(pl.lit('publication_clock_unresolved'))
           .otherwise(pl.lit('bound_prior_publication')).alias('position_binding_status'))
     fields=[c for c in intervals.columns if c not in ('product',)]
+    proof=_position_relaxation_predecessors(levels)
+    result=result.join(proof,on='position_interval_id',how='left',validate='m:1')
+    prior=levels.select(pl.col('position_interval_id').alias('_cap_prior_id'),
+        *[pl.col(c).alias('_cap_prior_'+c) for c in fields])
+    result=result.join(prior,on='_cap_prior_id',how='left',validate='m:1').with_columns(
+        ((pl.col('position_binding_status')=='publication_clock_unresolved')
+            & pl.col('_cap_prior_id').is_not_null()
+            & (pl.col('date')<=pl.col('_published'))).fill_null(False).alias('_use_prior_cap'))
+    # Keep the true effective interval and the unamended publication proof
+    # separate from the earlier-known cap used for sizing and constraints.
+    result=result.with_columns(
+        pl.when('_use_prior_cap').then(pl.lit(POSITION_BOUNDARY_CAP_CONTRACT))
+            .otherwise(None).alias('position_boundary_cap_policy'),
+        pl.when('_use_prior_cap').then(pl.col('_cap_prior_id'))
+            .otherwise(None).alias('position_cap_source_interval_id'),
+        pl.when('_use_prior_cap').then(pl.col('known_at'))
+            .otherwise(None).alias('position_boundary_legal_known_at'),
+        pl.when('_use_prior_cap').then(pl.col('source_content_sha256s'))
+            .otherwise(None).alias('position_boundary_legal_source_sha256s'),
+        pl.when('_use_prior_cap').then(pl.lit('bound_prior_cap_during_relaxation'))
+            .otherwise(pl.col('position_binding_status')).alias('position_binding_status'),
+        *[pl.when('_use_prior_cap').then(pl.col('_cap_prior_'+c)).otherwise(pl.col(c)).alias(c)
+          for c in fields if c not in ('effective_date','valid_until_date_exclusive')])
     return result.select('date','product','position_interval_id','position_binding_status',
-        *[pl.when(pl.col('position_binding_status')=='bound_prior_publication').then(pl.col(c))
-            .otherwise(None).alias(c) for c in fields]).sort('date','product')
+        *[pl.when(pl.col('position_binding_status').is_in(POSITION_DIRECT_BINDINGS)).then(pl.col(c))
+            .otherwise(None).alias(c) for c in fields],
+        'position_boundary_cap_policy','position_cap_source_interval_id',
+        'position_boundary_legal_known_at','position_boundary_legal_source_sha256s').sort('date','product')
 
 
 def bind_dated_position_combinations(days: pl.DataFrame, intervals: pl.DataFrame) -> pl.DataFrame:
@@ -511,7 +660,7 @@ def bind_dated_position_combinations(days: pl.DataFrame, intervals: pl.DataFrame
         if expanded.height==queries.height:break
         queries=expanded
     result=bind_dated_position_limits(queries,intervals).with_columns(
-        ((pl.col('position_binding_status')=='bound_prior_publication')
+        (pl.col('position_binding_status').is_in(POSITION_DIRECT_BINDINGS)
             & ~pl.col('requires_base_limit_join').fill_null(True)
             & (pl.col('position_limit')>0)).fill_null(False).alias('_resolved'),
         pl.when(pl.col('event_type')=='corporate_securities_unit_limit').then(
@@ -526,9 +675,11 @@ def bind_dated_position_combinations(days: pl.DataFrame, intervals: pl.DataFrame
         parents=result.select('date',pl.col('product').alias('combined_position_base_product'),
             *[pl.col(c).alias('_base_'+c) for c in ('position_limit','monthly_position_limit',
                 'position_unit','unit','position_root_product','position_interval_id','known_at',
-                'source_content_sha256s','requires_delisting_clock','combined_products','_resolved')])
+                'source_content_sha256s','requires_delisting_clock','combined_products','_resolved',
+                'position_boundary_cap_policy','position_cap_source_interval_id',
+                'position_boundary_legal_known_at','position_boundary_legal_source_sha256s')])
         result=result.join(parents,on=['date','combined_position_base_product'],how='left',validate='m:1')
-        usable=((pl.col('position_binding_status')=='bound_prior_publication')
+        usable=(pl.col('position_binding_status').is_in(POSITION_DIRECT_BINDINGS)
             & pl.col('requires_base_limit_join') & ~pl.col('_resolved')
             & pl.col('_base__resolved').fill_null(False)
             & (pl.col('conversion_numerator')>0) & (pl.col('conversion_denominator')>0))
@@ -552,6 +703,9 @@ def bind_dated_position_combinations(days: pl.DataFrame, intervals: pl.DataFrame
                 /pl.col('conversion_denominator')).otherwise(pl.col('position_unit')).alias('position_unit'),
             pl.when(usable).then(pl.col('_base_position_interval_id')).otherwise(
                 pl.col('position_base_interval_id')).alias('position_base_interval_id'),
+            *[pl.when(usable).then(pl.col('_base_'+c)).otherwise(pl.col(c)).alias(c)
+              for c in ('position_boundary_cap_policy','position_cap_source_interval_id',
+                  'position_boundary_legal_known_at','position_boundary_legal_source_sha256s')],
             pl.when(usable).then(pl.max_horizontal(
                 pl.col('known_at').str.to_datetime(time_zone='UTC'),
                 pl.col('_base_known_at').str.to_datetime(time_zone='UTC'))
@@ -595,6 +749,10 @@ def _inherit_dated_same_security_positions(frame: pl.DataFrame, position_columns
         shares=pl.col('_base_unit').is_in(['shares','beneficial_units'])
         unchanged=(units==standard) | ((units==float(mini)) if mini is not None else pl.lit(False))
         applicable=(applicable & (shares | (pl.col('_base_unit').eq('contracts') & unchanged))).fill_null(False)
+        # Every inherited column uses this same row predicate. Materialize it
+        # once per law so eager branches do not repeat publication parsing and
+        # family checks for each output column. with_columns preserves row order.
+        applicable=frame.select(applicable.alias('_applies')).get_column('_applies')
         inherit=[c for c in position_columns if c not in keys+['position_interval_id','position_binding_status',
             'position_unit','position_base_interval_id','known_at','source_content_sha256s','effective_date',
             'independent_contract_limit']]
@@ -602,6 +760,25 @@ def _inherit_dated_same_security_positions(frame: pl.DataFrame, position_columns
                 pl.lit(known).cast(pl.Datetime('us','UTC'))]
         if '_unit_known_at' in frame.columns:
             clocks.append(pl.col('_unit_known_at').str.to_datetime(time_zone='UTC'))
+        # Polars evaluates both sides of when/then. Parse clocks and combine
+        # source lists only for rows that can actually inherit this dated law.
+        # Gather those small results back onto the unchanged input row axis.
+        source_columns=['_base_known_at','_base_source_content_sha256s','_term_sources']
+        if '_unit_known_at' in frame.columns:source_columns.append('_unit_known_at')
+        if applicable.any():
+            updates=frame.select(source_columns).filter(applicable).select(
+                pl.max_horizontal(*clocks).dt.to_string('%Y-%m-%dT%H:%M:%S%:z').alias('known_at'),
+                pl.concat_list(pl.col('_base_source_content_sha256s'),
+                    pl.col('_term_sources').fill_null(pl.lit([],dtype=pl.List(pl.String))),
+                    pl.lit([digest])).list.unique().list.sort().alias('source_content_sha256s'))
+            selected=applicable.cast(pl.UInt32)
+            row_map=selected.cum_sum()*selected
+            inherited_clock=pl.concat([pl.Series([None],dtype=pl.String),updates['known_at']]).gather(row_map)
+            inherited_sources=pl.concat([pl.Series([None],dtype=pl.List(pl.String)),
+                updates['source_content_sha256s']]).gather(row_map)
+        else:
+            inherited_clock=pl.lit(None,dtype=pl.String)
+            inherited_sources=pl.lit(None,dtype=pl.List(pl.String))
         frame=frame.with_columns(
             *[pl.when(applicable).then(pl.col('_base_'+c)).otherwise(pl.col(c)).alias(c) for c in inherit],
             pl.when(applicable).then(None).otherwise(pl.col('position_interval_id')).alias('position_interval_id'),
@@ -612,10 +789,9 @@ def _inherit_dated_same_security_positions(frame: pl.DataFrame, position_columns
                 .alias('position_base_interval_id'),
             pl.when(applicable).then(pl.max_horizontal('_base_effective_date',pl.lit(str(beginning))))
                 .otherwise(pl.col('effective_date')).alias('effective_date'),
-            pl.when(applicable).then(pl.max_horizontal(*clocks).dt.to_string('%Y-%m-%dT%H:%M:%S%:z'))
+            pl.when(applicable).then(inherited_clock)
                 .otherwise(pl.col('known_at')).alias('known_at'),
-            pl.when(applicable).then(pl.concat_list(pl.col('_base_source_content_sha256s'),
-                pl.col('_term_sources').fill_null(pl.lit([],dtype=pl.List(pl.String))),pl.lit([digest])).list.unique().list.sort())
+            pl.when(applicable).then(inherited_sources)
                 .otherwise(pl.col('source_content_sha256s')).alias('source_content_sha256s'),
             pl.when(applicable).then(pl.lit('bound_same_security_position')).otherwise(pl.col('position_binding_status'))
                 .alias('position_binding_status'))
@@ -1554,6 +1730,117 @@ def apply_loss_reduction_halt_values(physical: pl.DataFrame, market_dates: pl.Da
     return result,values
 
 
+PHYSICAL_FINAL_MARK_CONTRACT = 'official_physical_final_mark_without_cash_or_fill_v1'
+
+
+def bind_final_day_valuation_marks(physical: pl.DataFrame) -> pl.DataFrame:
+    """Use an own official final fixing as a mark only on its reported day.
+
+    Physical delivery has a final valuation too. Its fixing supplies neither
+    a market fill nor a cash retirement of the bond obligation. Keep all raw
+    daily fields and the ordinary required-close executor policy unchanged.
+    """
+    on_final = (pl.col('date') == pl.col('official_expiry')).fill_null(False)
+    cash = on_final & (pl.col('settlement_method') == 'cash_settlement')
+    physical_final = on_final & (pl.col('settlement_method') == 'physical_delivery')
+    if physical.select(physical_final.any()).item():
+        if 'reported_date_role' not in physical.columns:
+            raise ValueError('physical final valuation requires its reported last-trading-day role')
+        if physical.filter(physical_final & (
+                (pl.col('reported_date_role') != 'last_trading_day').fill_null(True)
+                | ~pl.col('final_settlement_price').is_finite().fill_null(False)
+                | (pl.col('final_settlement_price') <= 0).fill_null(True))).height:
+            raise ValueError('physical final valuation lacks an own positive last-trading-day fixing')
+    return physical.with_columns(cash.fill_null(False).alias('cash_settlement'),
+        pl.when(cash | physical_final).then(pl.col('final_settlement_price'))
+          .otherwise(pl.col('daily_mark')).alias('valuation_price'),
+        pl.when(physical_final).then(pl.lit(PHYSICAL_FINAL_MARK_CONTRACT))
+          .otherwise(None).alias('physical_final_mark_contract'))
+
+
+CASH_EVENT_CALENDAR_CONTRACT = 'source_bound_cash_only_account_dates_v1'
+
+
+def cash_event_accounting_calendar(market_dates: pl.DataFrame, final: pl.DataFrame) -> pl.DataFrame:
+    """Keep official cash events on their own dates, including non-trading days.
+
+    This is an accounting calendar, not evidence of a market session. Only a
+    final-settlement-day cash event with a bound original can add a date.
+    Last-trading-day physical-delivery reports never create cash events.
+    """
+    dates=market_dates.select(pl.col('date').cast(pl.Date)).unique().sort('date')
+    if dates.is_empty() or dates['date'].null_count():
+        raise ValueError('cash accounting calendar requires non-null market dates')
+    schema={'date':pl.Date,'accounting_event_source_sha256s':pl.List(pl.String)}
+    events=pl.DataFrame(schema=schema)
+    fields={'settlement_method','reported_date_role','source_sha256'}
+    if fields<=set(final.columns):
+        cash=final.filter((pl.col('settlement_method')=='cash_settlement')
+            & (pl.col('reported_date_role')=='final_settlement_day')
+            & pl.col('settlement_date').is_between(dates['date'].min(),dates['date'].max()))
+        if cash.filter(pl.col('source_sha256').is_null()
+                | ~pl.col('source_sha256').str.contains(r'^[a-f0-9]{64}$')
+                | pl.col('final_settlement_price').is_null()
+                | ~pl.col('final_settlement_price').is_finite()
+                | (pl.col('final_settlement_price')<=0)).height:
+            raise ValueError('cash-only calendar event lacks a positive original fixing and SHA')
+        events=cash.group_by(pl.col('settlement_date').cast(pl.Date).alias('date')).agg(
+            pl.col('source_sha256').unique().sort().alias('accounting_event_source_sha256s'))
+    return (pl.concat([dates,events.select('date')]).unique().sort('date')
+        .join(dates.with_columns(pl.lit(True).alias('_market_date')),on='date',how='left',validate='1:1')
+        .join(events,on='date',how='left',validate='1:1')
+        .with_columns(pl.col('_market_date').is_null().alias('accounting_only_date'),
+            pl.col('accounting_event_source_sha256s').fill_null(pl.lit([],dtype=pl.List(pl.String))))
+        .drop('_market_date'))
+
+
+def official_market_day_keys(physical: pl.DataFrame, calendar: pl.DataFrame) -> pl.DataFrame:
+    """Keep accounting-only nodes out of the market-source lookup contract.
+
+    A cash posting on a closed date creates account state, not a new request
+    for an exchange trading observation. Actual market dates, including their
+    missing observations, remain in scope and must still pass source checks.
+    """
+    dates = calendar.select('date', 'accounting_only_date')
+    if dates['date'].null_count() or dates['accounting_only_date'].null_count() or dates['date'].is_duplicated().any():
+        raise ValueError('unique non-null accounting calendar required for market source lookup')
+    keys = physical.select('date', 'physical_contract').unique()
+    if keys.join(dates.select('date'), on='date', how='anti').height:
+        raise ValueError('market source lookup has a date outside its accounting calendar')
+    return keys.join(dates.filter(~pl.col('accounting_only_date')).select('date'), on='date', how='semi')
+
+
+def carry_cash_only_accounting_marks(physical: pl.DataFrame, calendar: pl.DataFrame) -> pl.DataFrame:
+    """Carry posted marks through an accounting-only date; never fill trade data.
+
+    A genuine missing mark on an actual market date remains missing. Carry
+    cannot cross that gap, and no future fixing is moved to an earlier date.
+    The original daily mark, quotes, volume and source reason stay untouched.
+    """
+    if 'accounting_only_date' in physical.columns:
+        raise ValueError('accounting-only marks were already composed')
+    result=physical.join(calendar,on='date',how='left',validate='m:1')
+    if result['accounting_only_date'].null_count():
+        raise ValueError('accounting calendar drops a physical date')
+    only=pl.col('accounting_only_date')
+    if result.filter(only & (pl.col('daily_mark').is_not_null()
+            | pl.col('outright_volume').is_not_null()
+            | pl.any_horizontal(pl.col('official_'+c).fill_null('')!='' for c in ('open','high','low','close')))).height:
+        raise ValueError('accounting-only date conflicts with observed market evidence')
+    result=result.sort('physical_instance','date')
+    # Consecutive event-only dates can carry forward, but each pass reads only
+    # its immediately preceding same-lifetime accounting node.
+    for _ in range(int(calendar['accounting_only_date'].sum())):
+        before=result['valuation_price'].null_count()
+        result=result.with_columns(
+            pl.when(only & ~pl.col('cash_settlement') & pl.col('valuation_price').is_null())
+            .then(pl.col('valuation_price').shift(1).over('physical_instance'))
+            .otherwise(pl.col('valuation_price')).alias('valuation_price'))
+        if result['valuation_price'].null_count()==before: break
+    return result.with_columns(pl.when(only).then(pl.lit(CASH_EVENT_CALENDAR_CONTRACT))
+        .otherwise(None).alias('accounting_calendar_contract'))
+
+
 def physical_lifetime_calendar(observed: pl.DataFrame, final: pl.DataFrame,
                                market_dates: pl.DataFrame,
                                corporate: pl.DataFrame | None = None,
@@ -1824,6 +2111,15 @@ def margin_table_candidates(text: str) -> list[dict]:
         codes = set(re.findall(r'^\s*([A-Z][A-Z0-9]{1,2})(?=\s|$)', prefix[0], flags=re.M))
         codes.update(re.findall(r'\(([A-Z][A-Z0-9]{1,2})\)', prefix[0]))
         codes.update(re.findall(r'(?<![A-Z0-9])(?:[A-Z][A-Z0-9][FO]|MTX|TX|TE|TF)(?![A-Z0-9])',prefix[0]))
+        # Some native PDFs print a code cell as "T X" or "T F". Join only
+        # its single header line, and require the same original to state that
+        # literal joined code in parentheses. Never join arbitrary prose or
+        # borrow a current product catalog to fill a historical label.
+        spaced = re.findall(r'^[ \t]*([A-Z](?:[ \t]+[A-Z0-9]){1,2})[ \t]+'
+                            r'(?=原始保證金|$)', prefix[0], flags=re.M)
+        if spaced:
+            explicit = set(re.findall(r'\(([A-Z][A-Z0-9]{1,2})\)', compact(text)))
+            codes.update(compact(label) for label in spaced if compact(label) in explicit)
         codes -= {'ETF', 'TWD', 'KY', 'TPK'}
         if len(codes) != 1:
             continue
@@ -2623,6 +2919,7 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
                        'contract_multiplier', 'deliverable_cash_twd',
                        'subscription_rights_at_final_settlement')
     cash_peer_amounts = defaultdict(set)
+    cash_peer_requirements = set()
     def month_key(fact):
         return tuple(fact.get(key) for key in
             ('source_content_sha256','from_product','product','effective_date'))
@@ -2632,8 +2929,19 @@ def corporate_terms_intervals(facts: list[dict], *, unit_only: bool = False) -> 
         if fact.get('cash_equity_pair_agrees'):
             cash_peer_amounts[tuple(fact.get(k) for k in cash_key_fields)].add(
                 fact.get('equity_credit_long_per_contract'))
+        same_code_post_reform = (fact.get('product') == fact.get('from_product')
+            and re.fullmatch(r'[A-Z]{2}F', fact.get('product') or '')
+            and (fact.get('effective_date') or '') >= '2011-05-03'
+            and compact(fact.get('deliverable_text') or '').startswith('不調整'))
+        if fact.get('has_equity_credit_fields') or same_code_post_reform:
+            cash_peer_requirements.add(tuple(fact.get(k) for k in cash_key_fields))
     for original in facts:
         fact=dict(original)
+        if (not unit_only and tuple(fact.get(k) for k in cash_key_fields)
+                in cash_peer_requirements):
+            # A missing row label in another extraction of these exact bytes
+            # cannot make an explicitly required cash conversion disappear.
+            fact['has_equity_credit_fields'] = True
         # OCR can lose an entire cell while another view of the exact same
         # bytes retains it. Bind only an unambiguous scope of the same event;
         # never borrow a year/month from another notice or adjusted code.
@@ -2908,14 +3216,15 @@ def corporate_retained_view_candidates(views: list[tuple[str, str]]) -> list[dic
 
 
 def corporate_grid_candidates(cells: list[list], source_text: str = '', caption: str = '',
-                              *, page_text: str = '') -> list[dict]:
+                              *, page_text: str = '',
+                              allow_stock_deliverable_multiplier: bool = False) -> list[dict]:
     """Extract a single explicit futures adjustment without guessing cash flow.
 
     Deliverable cash and an equity credit are different financial quantities.
     Multi-product, multi-security and conditional rules remain source text for
     review; neither an absent credit nor an unreadable quantity becomes zero.
     """
-    from decimal import Decimal
+    from decimal import Decimal, ROUND_DOWN, localcontext
     rows = [[compact(str(v or '')) for v in row] for row in cells]
     if not rows or any(len(row) != 2 for row in rows): return []
     rows = [['契約乘數' if key == '契約乘數不調整' else key, value] for key,value in rows]
@@ -2963,7 +3272,16 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
     multiplier = fields.get('契約乘數', '')
     # Explicit constant multipliers only. A rights-value formula is not a
     # numeric multiplier, and numeric suffixes in the product are not values.
-    quantity = re.search(r'(?:調整為|仍為)([\d,]+(?:\.\d+)?)(?:\)|。|$)', multiplier)
+    quantity = re.search(r'(?:調整為|仍為)(\d[\d,]*(?:\.\d+)?)(?:\)|。|$)', multiplier)
+    derived_multiplier = False
+    if quantity is None and not multiplier and allow_stock_deliverable_multiplier:
+        # This path is available only to an explicitly source-bound, reviewed
+        # stock-futures rule. Do not synthesize a multiplier table cell or use
+        # a neighboring standard contract's unit.
+        own = re.fullmatch(re.escape(after) + r'約定標的物調整為(\d[\d,]*(?:\.\d+)?)股標的證券[。.]?', deliverable)
+        if before.endswith('F') and after[-1].isdigit() and own:
+            quantity = own
+            derived_multiplier = True
     if quantity is None: return []
     qty = Decimal(quantity[1].replace(',', ''))
     if not qty.is_finite() or qty <= 0: return []
@@ -3007,7 +3325,7 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
         months_error = 'unresolved_contract_months'
     cash = []
     for name in ('買方權益數加項', '賣方權益數減項'):
-        found = re.findall(r'新[臺台]幣([\d,]+)元', fields.get(name, ''))
+        found = re.findall(r'新[臺台]幣(\d[\d,]*)元', fields.get(name, ''))
         cash.append(int(found[0].replace(',', '')) if len(found)==1 else None)
     cash_verified_pair = cash[0] is not None and cash[0] == cash[1]
     text = compact(source_text)
@@ -3022,6 +3340,58 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
             try:dates.add(str(roc_date(match)))
             except ValueError:date_error='invalid_source_effective_date'
         break
+    if derived_multiplier and (len(dates) != 1 or next(iter(dates)) < '2015-06-01'):
+        return []
+    # A post-reform, unchanged standard contract can state its cash dividend
+    # per share on the notice's first page while OCR loses the cash-table
+    # currency or a complete side cell.  The legal cash conversion is an exact
+    # multiplication, not a repair of OCR digits.  Restrict this derivation to
+    # an explicit unchanged deliverable/multiplier and one literal per-unit
+    # distribution in these same source bytes. Cash credits discard the
+    # sub-TWD part under the stock-futures cash-dividend rule; this does not
+    # round the source dividend or other deliverable/valuation amounts.
+    # Any readable contrary cash
+    # amount remains a conflict; option tables never supply this input.
+    cash_derivation = None
+    unchanged = (before == after and re.fullmatch(r'[A-Z]{2}F', after)
+        and deliverable.startswith('不調整') and '不調整' in multiplier
+        and len(dates) == 1 and next(iter(dates)) >= '2011-05-03')
+    distributions = set(re.findall(
+        r'每(?:股|受益權單位|單位)(?:配發|分配|發放)'
+        r'(?:現金股利|現金收益|現金|收益)?(?:新[臺台]幣)?'
+        r'(\d[\d,]*(?:\.\d+)?)元', text))
+    cash_distribution = bool(unchanged)
+    if (cash_distribution and re.search(r'現金股利|分配收益|收益分配', text)
+            and len(distributions) == 1):
+        literal = next(iter(distributions))
+        per_unit = Decimal(literal.replace(',', ''))
+        with localcontext() as context:
+            context.prec = max(context.prec, len(per_unit.as_tuple().digits)
+                               + len(qty.as_tuple().digits) + 2)
+            derived = per_unit * qty
+        if per_unit.is_finite() and per_unit >= 0:
+            amount = int(derived.to_integral_value(rounding=ROUND_DOWN))
+            # Original source-cell numbers, even with an unreadable currency
+            # prefix, may corroborate or contradict the statutory derivation.
+            side_numbers = [set(re.findall(r'(?<![\d.,])(\d[\d,]*(?:\.\d+)?)元',
+                fields.get(name, ''))) for name in ('買方權益數加項', '賣方權益數減項')]
+            compatible = all(all(Decimal(s.replace(',', '')) == amount for s in side)
+                for side in side_numbers)
+            if compatible and all(value is None or value == amount for value in cash):
+                cash_derivation = dict(contract='same_code_cash_dividend_per_unit_v2',
+                    per_unit_literal=literal, unchanged_multiplier_literal=multiplier,
+                    per_contract_exact=str(derived), per_contract_cash_twd=amount,
+                    cash_rounding='discard_below_one_twd',
+                    source_side_amount_literals=[sorted(s) for s in side_numbers],
+                    reform_effective_date='2011-05-03')
+                cash = [amount, amount]
+                cash_verified_pair = True
+            else:
+                cash_verified_pair = False
+    # Missing cash labels in a literal same-code dividend notice are missing
+    # financial data. They must not later turn into a zero cash conversion.
+    has_cash_fields = (cash_distribution or any(name in fields
+        for name in ('買方權益數加項', '賣方權益數減項')))
     # This clause freezes the contract at the announced terms. It is not a
     # condition which makes today's adjustment optional. Keep other conditions.
     frozen_pattern = r'若(?:該)?標的公司於調整生效日後\(含當日\)變更股利[,，]則本契約不予調整[。.]?'
@@ -3030,6 +3400,8 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
     conditional = any(word in condition_text for word in ('若', '倘', '順延', '變更'))
     return [dict(product=after, from_product=before, to_product=after,
         contract_multiplier=float(qty), deliverable_text=deliverable,
+        **({'contract_multiplier_origin': 'reviewed_stock_deliverable_quantity_v1'}
+           if derived_multiplier else {}),
         contract_months=explicit_months if not months_error else [], contract_months_text=months,
         contract_months_origin=months_origin,
         contract_months_footnote_reference=month_footnote[0] if month_footnote else None,
@@ -3038,7 +3410,8 @@ def corporate_grid_candidates(cells: list[list], source_text: str = '', caption:
         equity_credit_long_per_contract=cash[0] if cash_verified_pair else None,
         equity_debit_short_per_contract=cash[1] if cash_verified_pair else None,
         cash_equity_pair_agrees=cash_verified_pair,
-        has_equity_credit_fields=any(name in fields for name in ('買方權益數加項','賣方權益數減項')),
+        has_equity_credit_fields=bool(has_cash_fields),
+        equity_cash_derivation=cash_derivation,
         **corporate_deliverable_components(deliverable,float(qty)),
         includes_deliverable_cash=('現金' in deliverable or '新臺幣' in deliverable),
         requires_rights_valuation=('現金增資' in deliverable or '相當價值' in deliverable),
@@ -3123,7 +3496,9 @@ def corporate_position_legacy_word_candidates(text: str, corporate: list[dict]) 
             for fact in result]
 
 
-def corporate_native_table_candidates(pages: list[dict]) -> list[dict]:
+def corporate_native_table_candidates(
+    pages: list[dict], *, allow_stock_deliverable_multiplier: bool = False,
+) -> list[dict]:
     """Bind a split table only to its explicit next-page continuation.
 
     A multiplier on a later options or standard-contract table is never a
@@ -3192,7 +3567,8 @@ def corporate_native_table_candidates(pages: list[dict]) -> list[dict]:
                             else:cells.append([key,value])
                         segments.append([npg['page'],nti])
         for fact in corporate_grid_candidates(cells,text,table.get('caption',''),
-                page_text=page.get('ocr_text') or page['native_text']):
+                page_text=page.get('ocr_text') or page['native_text'],
+                allow_stock_deliverable_multiplier=allow_stock_deliverable_multiplier):
             result.append(dict(fact,page=page['page'],table_index=ti,table_segments=segments,
                                extraction_method=table.get('extraction_method','native_cell_grid')))
     return result
@@ -3946,7 +4322,11 @@ def corporate_text_candidates(source_text: str) -> list[dict]:
                 return ''
         start=matches[0].end()
         end=re.search(labels,body[start:])
-        return body[start:start+end.start()] if end else body[start:]
+        # Flattened retained tables keep their literal column separator after
+        # the label. It is table geometry, not part of the financial value.
+        # Keep all words and digits: only the immediate label delimiters go.
+        value = body[start:start+end.start()] if end else body[start:]
+        return value.lstrip('|:：')
     for i, match in enumerate(changes):
         old,new=(match['old'],match['new']) if match['old'] else (match['same'],match['same'])
         end=changes[i+1].start() if i+1<len(changes) else len(text)

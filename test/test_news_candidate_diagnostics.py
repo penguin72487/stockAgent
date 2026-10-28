@@ -15,7 +15,7 @@ from downloader import news_fulltext_candidate_diagnostics as diagnostic
 from downloader.artifact_io import atomic_write_bytes
 from downloader.news_fulltext import run_service
 from downloader.news_fulltext_http import Response
-from downloader.news_fulltext_policy import NewsError, PolicyRegistry
+from downloader.news_fulltext_policy import NewsError, PolicyRegistry, REQUEST_DEFERRAL_CODES
 from downloader.news_fulltext_queue import NewsQueue, verify_bodies
 from test_news_fulltext import FakeResponse, article_html, config as generic_config, http_fixture
 from test_news_videoland_original import (
@@ -79,8 +79,28 @@ def http_stub(queue, *, response=None, error=None):
 
 def admit(queue, settings):
     submitted = submit(queue, settings)
-    diagnostic.pump_candidates(queue)
-    return submitted
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        diagnostic.pump_candidates(queue)
+        if getattr(queue, 'native_candidate_schema_ready', False):
+            row = queue.db.execute('SELECT state FROM native_candidate_jobs WHERE request_id=?',
+                                   (submitted['request_id'],)).fetchone()
+            if row and row['state'] == 'ready':
+                return submitted
+        time.sleep(.005)  # An exhausted bounded pump slice is retried on a later tick.
+    raise AssertionError('candidate was not admitted within the bounded test deadline')
+
+
+def pump_until(queue, predicate):
+    """Follow bounded owner slices until the specific observable effect occurs."""
+    deadline = time.monotonic() + 10
+    while True:
+        diagnostic.pump_candidates(queue)
+        if predicate():
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError('candidate operation did not complete within the test deadline')
+        time.sleep(.005)
 
 
 def seal_request(path, data=None, *, raw=None):
@@ -100,6 +120,121 @@ def test_no_input_has_no_new_schema_or_writes(queue):
     assert not (queue.root/'reviewed_repairs').exists()
 
 
+def test_expired_admission_slice_leaves_pending_input_for_next_tick(queue, settings, monkeypatch):
+    from downloader.news_fulltext_wake import OwnerMailboxWake
+
+    submitted = submit(queue, settings)
+    mailbox = OwnerMailboxWake(queue, threading.Event())
+    original_schema = diagnostic._schema
+
+    def slow_first_schema(owner):
+        original_schema(owner)
+        time.sleep(.06)  # Exhaust the first 50 ms pump slice after schema initialization.
+
+    monkeypatch.setattr(diagnostic, '_schema', slow_first_schema)
+    diagnostic.pump_candidates(queue)
+    assert diagnostic.has_unadmitted_candidates(queue)
+    assert mailbox.has_pending()
+    assert request_path(queue, submitted).exists()
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
+    monkeypatch.setattr(diagnostic, '_schema', original_schema)
+    deadline = time.monotonic() + 3
+    while diagnostic.has_unadmitted_candidates(queue) and time.monotonic() < deadline:
+        diagnostic.pump_candidates(queue)
+        time.sleep(.005)
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    assert not mailbox.has_pending()
+    assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready'
+
+
+def test_candidate_progress_separates_unadmitted_registered_and_reserved_work(queue, settings):
+    before = head(queue)
+    total = queue.db.total_changes
+    empty = diagnostic.candidate_progress(queue)
+    assert empty['available'] and empty['request_files'] == 0 and empty['providers'] == {}
+    assert queue.db.total_changes == total and not (queue.root/'reviewed_repairs').exists()
+    submitted = submit(queue, settings, reason='PRIVATE_REASON')
+    progress = diagnostic.candidate_progress(queue)
+    assert progress['request_files'] == progress['pending_unadmitted'] == 1
+    assert progress['providers']['videoland']['pending_unadmitted'] == 1
+    assert progress['jobs'] == {'ready': 0, 'reserved': 0, 'orphaned_reservation': 0, 'uncertain_outcome': 0}
+    assert all(secret not in json.dumps(progress) for secret in ('PRIVATE_REASON', URL, submitted['request_id']))
+    assert queue.status(activity='waiting_disk', publish=False)['candidate_diagnostic_progress'] == progress
+    # Admission is deliberately time-sliced; the first slice may expire before
+    # processing a file under I/O or scheduler load.
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        diagnostic.pump_candidates(queue)
+        if diagnostic.candidate_progress(queue)['already_registered'] == 1:
+            break
+        time.sleep(.005)
+    progress = diagnostic.candidate_progress(queue)
+    assert progress['request_files'] == progress['already_registered'] == 1
+    assert progress['pending_unadmitted'] == 0 and progress['jobs']['ready'] == 1
+    assert progress['providers']['videoland']['ready'] == 1
+    job = diagnostic.claim_candidate(queue, http_stub(queue), settings, 'videoland')
+    assert diagnostic.candidate_progress(queue)['jobs'] == {'ready': 0, 'reserved': 1, 'orphaned_reservation': 0, 'uncertain_outcome': 0}
+    diagnostic.finish_candidate(queue, job, error=RuntimeError('PRIVATE_ERROR'))
+    done = diagnostic.candidate_progress(queue)
+    assert done['already_registered'] == 1 and not any(done['jobs'].values())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        diagnostic.pump_candidates(queue)
+        if diagnostic.candidate_progress(queue)['request_files'] == 0:
+            break
+        time.sleep(.005)
+    assert diagnostic.candidate_progress(queue)['request_files'] == 0
+    assert head(queue) == before
+
+
+def test_candidate_progress_deduplicates_registered_observations_without_merging_submissions(queue, settings):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    request = json.loads(path.read_bytes())
+    request['reason'] = 'A different private submission'
+    payload = diagnostic._bytes(request)
+    other = path.with_name(hashlib.sha256(payload).hexdigest()+'.json')
+    atomic_write_bytes(other, payload, mode=0o600)
+    before = diagnostic.candidate_progress(queue)
+    assert before['request_files'] == before['pending_unadmitted'] == 2
+    pump_until(queue, lambda: diagnostic.candidate_progress(queue)['already_registered'] == 2)
+    after = diagnostic.candidate_progress(queue)
+    assert after['request_files'] == after['already_registered'] == 2
+    assert after['pending_unadmitted'] == 0 and after['jobs']['ready'] == 1
+    assert after['providers']['videoland']['ready'] == 1
+
+
+def test_candidate_progress_cache_rechecks_file_identity_and_keeps_invalid_unknown(queue, settings, monkeypatch):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    original = diagnostic._load
+    calls = []
+    def counted(value):
+        calls.append(value)
+        return original(value)
+    monkeypatch.setattr(diagnostic, '_load', counted)
+    before = queue.db.total_changes
+    assert diagnostic.candidate_progress(queue)['pending_unadmitted'] == 1
+    assert diagnostic.candidate_progress(queue)['pending_unadmitted'] == 1
+    assert len(calls) == 1
+    atomic_write_bytes(path, path.read_bytes()+b' ', mode=0o600)
+    result = diagnostic.candidate_progress(queue)
+    assert result['request_files'] == result['invalid_or_unreadable'] == 1
+    assert result['pending_unadmitted'] == 0 and len(calls) == 2
+    assert queue.db.total_changes == before and path.exists()
+
+
+def test_candidate_progress_unreadable_directory_does_not_invent_zero(queue, settings):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    path.parent.chmod(0o755)
+    try:
+        assert diagnostic.candidate_progress(queue) == {'contract_version': 1, 'available': False}
+        assert path.exists()
+    finally:
+        path.parent.chmod(0o700)
+
+
 def test_live_submission_and_once_only_same_envelope_never_change_heads_or_settings(queue, settings, monkeypatch):
     before, owner = head(queue), queue.owner
     budget = list(queue.db.execute('SELECT * FROM queue_settings'))
@@ -112,7 +247,7 @@ def test_live_submission_and_once_only_same_envelope_never_change_heads_or_setti
     assert path.stat().st_mode & 0o777 == 0o600 and path.parent.stat().st_mode & 0o777 == 0o700
     assert diagnostic.has_unadmitted_candidates(queue)
     assert submit(queue, settings, reason='Different prose cannot grant another observation')['request_id'] == submitted['request_id']
-    diagnostic.pump_candidates(queue)
+    pump_until(queue, lambda: not diagnostic.has_unadmitted_candidates(queue))
     assert not diagnostic.has_unadmitted_candidates(queue)
     http = http_stub(queue)
     job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
@@ -125,7 +260,7 @@ def test_live_submission_and_once_only_same_envelope_never_change_heads_or_setti
     private = json.dumps(result, ensure_ascii=False)
     assert all(text not in private for text in (TITLE, CREDIT, PROSE, CAPTION))
     diagnostic.finish_candidate(queue, job, result=result)
-    diagnostic.pump_candidates(queue)
+    pump_until(queue, lambda: not path.exists())
     state = diagnostic.candidate_status(queue.root, submitted['request_id'])
     assert state['state'] == 'observed' and state['accepted_as_article'] is False and state['publish'] is False
     assert head(queue) == before and queue.owner == owner and list(queue.db.execute('SELECT * FROM queue_settings')) == budget
@@ -190,6 +325,237 @@ def test_refusal_deadlines_remain_ready_without_reservation_or_idle_spin(queue, 
     assert not http.calls
 
 
+def test_unsent_candidate_after_robots_gate_retries_without_losing_observation(queue, settings, tmp_path, monkeypatch):
+    submitted, before = admit(queue, settings), head(queue)
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    try:
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        original_raw = http._raw
+
+        def gate_candidate(url, *args, **kwargs):
+            if url == URL:
+                http.defer('videoland', 3)
+            return original_raw(url, *args, **kwargs)
+
+        monkeypatch.setattr(http, '_raw', gate_candidate)
+        with pytest.raises(NewsError) as blocked:
+            diagnostic.fetch_candidate(http, job)
+        assert blocked.value.request_deferred and blocked.value.initial_request_not_sent is True
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt']
+        assert http.requests_by_provider['videoland'] == 1
+        diagnostic.finish_candidate(queue, job, error=blocked.value)
+        status = diagnostic.candidate_status(queue.root, submitted['request_id'])
+        assert status['state'] == 'ready' and status['last_request_deferral']['waiting']
+        assert status['last_request_deferral']['last_gate_code'] == 'provider_cooldown'
+        assert status['last_request_deferral']['deferral_count'] == 1
+        assert request_path(queue, submitted).exists() and head(queue) == before
+        assert diagnostic.claim_candidate(queue, http, settings, 'videoland') is None
+        monkeypatch.setattr(http, '_raw', original_raw)
+        clock = time.time
+        monkeypatch.setattr(time, 'time', lambda: clock() + 4)
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        diagnostic.finish_candidate(queue, job, result=diagnostic.fetch_candidate(http, job))
+        diagnostic.pump_candidates(queue)
+        assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'observed'
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+        assert http.requests_by_provider['videoland'] == 2 and head(queue) == before
+    finally:
+        http.close()
+
+
+@pytest.mark.parametrize('code', sorted(REQUEST_DEFERRAL_CODES))
+def test_each_proven_presend_gate_keeps_candidate_ready_with_deadline(queue, settings, tmp_path, monkeypatch, code):
+    submitted = admit(queue, settings)
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    try:
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        original_check = http._check_request_gates
+
+        def hold_initial(provider, url, **kwargs):
+            if url == URL:
+                raise NewsError(code, retry=True, delay=3, request_deferred=True)
+            return original_check(provider, url, **kwargs)
+
+        monkeypatch.setattr(http, '_check_request_gates', hold_initial)
+        with pytest.raises(NewsError) as blocked:
+            diagnostic.fetch_candidate(http, job)
+        assert blocked.value.initial_request_not_sent is True
+        diagnostic.finish_candidate(queue, job, error=blocked.value)
+        status = diagnostic.candidate_status(tmp_path, submitted['request_id'])
+        assert status['state'] == 'ready' and status['last_request_deferral']['last_gate_code'] == code
+        assert 2 < diagnostic.candidate_next_wake_delay(queue, {}, {}, 60) <= 3
+        assert diagnostic.claim_candidate(queue, http, settings, 'videoland') is None
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt']
+    finally:
+        http.close()
+
+
+def test_candidate_presend_gate_survives_restart_and_wakes_for_latest_source_deadline(queue, settings, tmp_path, monkeypatch):
+    submitted, before = admit(queue, settings), head(queue)
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    try:
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        http.defer('videoland', 3)
+        with pytest.raises(NewsError) as blocked:
+            diagnostic.fetch_candidate(http, job)
+        assert blocked.value.initial_request_not_sent is True and not session.calls
+        diagnostic.finish_candidate(queue, job, error=blocked.value)
+        queue.close()
+        reopened = NewsQueue(tmp_path, http.registry)
+        try:
+            diagnostic.pump_candidates(reopened)
+            status = diagnostic.candidate_status(tmp_path, submitted['request_id'])
+            assert status['state'] == 'ready' and status['last_request_deferral']['waiting']
+            assert 2 < diagnostic.candidate_next_wake_delay(reopened, {}, {}, 60) <= 3
+            now = time.time()
+            scopes = {'videoland': {'hosts': {'news.videoland.com.tw': now+5},
+                                    'origins': {'https://news.videoland.com.tw': now+7}}}
+            assert 6 < diagnostic.candidate_next_wake_delay(reopened, {'videoland': now+6}, scopes, 60) <= 7
+            assert diagnostic.claim_candidate(reopened, http, settings, 'videoland') is None
+            clock = time.time
+            monkeypatch.setattr(time, 'time', lambda: clock() + 8)
+            assert diagnostic.candidate_next_wake_delay(reopened, {}, {}, 60) == 60  # No due=0 spin.
+            job = diagnostic.claim_candidate(reopened, http, settings, 'videoland')
+            diagnostic.finish_candidate(reopened, job, result=diagnostic.fetch_candidate(http, job))
+            diagnostic.pump_candidates(reopened)
+            status = diagnostic.candidate_status(tmp_path, submitted['request_id'])
+            assert status['state'] == 'observed' and not status['last_request_deferral']['waiting']
+            assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+            assert head(reopened) == before
+        finally:
+            reopened.close()
+    finally:
+        http.close()
+
+
+def test_candidate_deadline_wake_uses_bounded_provider_index(settings, generic_config, tmp_path):
+    settings['providers'].extend(generic_config['providers'])
+    queue = NewsQueue(tmp_path, PolicyRegistry(settings, base=tmp_path))
+    try:
+        diagnostic._schema(queue)
+        now = time.time()
+        with queue.db:
+            for provider, request_id, due in [('videoland', 'v', now + 8), ('publisher', 'p', now + 2)]:
+                target = URL if provider == 'videoland' else 'https://publisher.test/story'
+                queue.db.execute('INSERT INTO native_candidate_jobs '
+                    '(request_id,observation_key,provider,state,request_json,created_at_utc,owner_id) '
+                    "VALUES (?,?,?,'ready',?,?,?)",
+                    (request_id, request_id, provider, json.dumps({'target': {'url': target}}),
+                     '2026-01-01T00:00:00+00:00', queue.owner))
+                queue.db.execute('INSERT INTO native_candidate_wait VALUES (?,?,?,?,1)',
+                    (request_id, due, 'provider_cooldown', '2026-01-01T00:00:00+00:00'))
+        queue.native_candidate_ready_providers = {'videoland', 'publisher'}
+        assert 1 < diagnostic.candidate_next_wake_delay(queue, {}, {}, 60) <= 2
+        plan = queue.db.execute('EXPLAIN QUERY PLAN SELECT j.request_json,w.not_before_epoch '
+            'FROM native_candidate_jobs AS j LEFT JOIN native_candidate_wait AS w ON w.request_id=j.request_id '
+            "WHERE j.state='ready' AND j.provider=? ORDER BY j.created_at_utc LIMIT ?", ('videoland', 16)).fetchall()
+        details = ' '.join(row[3] for row in plan)
+        assert 'native_candidate_ready' in details and 'TEMP B-TREE' not in details
+    finally:
+        queue.close()
+
+
+def test_gate_shaped_observer_error_after_send_does_not_rearm_candidate(queue, settings, tmp_path):
+    submitted = admit(queue, settings)
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    try:
+        def fail_after_headers(stage, response):
+            if stage == 'headers' and response.url == URL:
+                error = NewsError('provider_cooldown', retry=True, delay=3, request_deferred=True)
+                error.raw_request_not_sent = True  # Even a stale annotation cannot undo an actual send.
+                raise error
+
+        http.access_observer = fail_after_headers
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        with pytest.raises(NewsError) as blocked:
+            diagnostic.fetch_candidate(http, job)
+        assert blocked.value.request_deferred and not blocked.value.initial_request_not_sent
+        diagnostic.finish_candidate(queue, job, error=blocked.value)
+        diagnostic.pump_candidates(queue)
+        assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'observed_error'
+        assert diagnostic.claim_candidate(queue, http, settings, 'videoland') is None
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+    finally:
+        http.close()
+
+
+def test_candidate_gate_after_initial_redirect_does_not_rearm_observation(queue, settings, tmp_path, monkeypatch):
+    submitted = admit(queue, settings)
+    target = URL.replace('123456789abc', '123456789abd')
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(status=302, headers={'Location': target}),
+        target: FakeResponse(description_defect_page()),
+    })
+    try:
+        job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+        original_raw = http._raw
+
+        def gate_after_first_request(url, *args, **kwargs):
+            result = original_raw(url, *args, **kwargs)
+            if url == URL:
+                http.defer('videoland', 3)
+            return result
+
+        monkeypatch.setattr(http, '_raw', gate_after_first_request)
+        with pytest.raises(NewsError) as blocked:
+            diagnostic.fetch_candidate(http, job)
+        assert blocked.value.request_deferred and not getattr(blocked.value, 'initial_request_not_sent', False)
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+        diagnostic.finish_candidate(queue, job, error=blocked.value)
+        diagnostic.pump_candidates(queue)
+        assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'observed_error'
+        clock = time.time
+        monkeypatch.setattr(time, 'time', lambda: clock() + 4)
+        assert diagnostic.claim_candidate(queue, http, settings, 'videoland') is None
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+    finally:
+        http.close()
+
+
+def test_resident_candidate_wait_wakes_after_presend_gate(settings, tmp_path, monkeypatch):
+    settings.update(service_idle_max_seconds=10)
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        before = fail_head(queue)
+        submitted = submit(queue, settings)
+        original_fetch = diagnostic.fetch_candidate
+        gated = []
+
+        def gated_once(client, job):
+            if not gated:
+                gated.append(time.monotonic())
+                client.defer('videoland', .25)
+            return original_fetch(client, job)
+
+        monkeypatch.setattr(diagnostic, 'fetch_candidate', gated_once)
+        run_service(queue, http, settings, max_articles=0, max_discovery_requests=0, duration_seconds=1.5)
+        assert diagnostic.candidate_status(tmp_path, submitted['request_id'])['state'] == 'observed'
+        assert len(gated) == 1 and [url for url, _ in session.calls] == [
+            'https://news.videoland.com.tw/robots.txt', URL]
+        assert dict(queue.db.execute('SELECT key,value FROM counters'))['native_candidate_gate_deferrals'] == 1
+        assert head(queue) == before
+    finally:
+        http.close()
+        queue.close()
+
+
 def test_restart_never_retries_a_reserved_unknown_outcome(queue, settings):
     submitted = admit(queue, settings)
     assert diagnostic.claim_candidate(queue, http_stub(queue), settings, 'videoland')
@@ -198,9 +564,16 @@ def test_restart_never_retries_a_reserved_unknown_outcome(queue, settings):
     reopened = NewsQueue(queue.root, queue.registry)
     try:
         assert reopened.owner != previous
+        before_recovery = diagnostic.candidate_progress(reopened)
+        assert before_recovery['jobs']['reserved'] == 0
+        assert before_recovery['jobs']['orphaned_reservation'] == 1
+        assert before_recovery['providers']['videoland']['orphaned_reservation'] == 1
         diagnostic.pump_candidates(reopened)
         result = diagnostic.candidate_status(reopened.root, submitted['request_id'])
         assert result['state'] == 'uncertain_outcome' and result['result_json'] is None
+        progress = diagnostic.candidate_progress(reopened)
+        assert progress['jobs']['uncertain_outcome'] == 1
+        assert progress['providers']['videoland']['uncertain_outcome'] == 1
         assert diagnostic.claim_candidate(reopened, http_stub(reopened), settings, 'videoland') is None
         assert head(reopened) == before
     finally:

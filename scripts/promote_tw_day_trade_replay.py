@@ -25,6 +25,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.data.tw_price_rules import move_price_ticks_numpy
 from stockagent.live.benchmark_history_projection import load_benchmark_projection
+from stockagent.live.paper_journal import open_paper_journal
 from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT
 from scripts.rebuild_tw_day_trade_minute_curves import (
     MINUTE_CONTRACT as MINUTE_CURVE_CONTRACT,
@@ -61,6 +62,14 @@ PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT = (
     "retrospective_prior_paper_fill_else_09_01_minute_price_"
     "full_target_no_liquidity_claim_v1"
 )
+PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT_V2 = (
+    "retrospective_prior_paper_fill_else_09_01_positive_volume_minute_price_"
+    "full_target_no_liquidity_claim_v2"
+)
+PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACTS = frozenset({
+    PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT,
+    PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT_V2,
+})
 
 
 def _verified_prior_paper_manifest(
@@ -76,7 +85,7 @@ def _verified_prior_paper_manifest(
 MINUTE_PRICE_0901_REPLAY_CONTRACTS = {
     MINUTE_VWAP_0901_REPLAY_CONTRACT,
     MINUTE_PRICE_0901_REPLAY_CONTRACT,
-    PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT,
+    *PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACTS,
     "retrospective_official_open_signal_at_09_00_observed_09_01_"
     "minute_price_volume_capped_nav_counterfactual_v3",
     "retrospective_official_open_signal_at_09_00_observed_09_01_minute_price_counterfactual_v2",
@@ -96,7 +105,7 @@ class ReplayValidationError(RuntimeError):
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -113,7 +122,8 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def _load_object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    payload = read_paper_state(path)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
     return payload
@@ -230,7 +240,7 @@ def _validate_minute_curve_coverage(
     unverified_interior_rows = 0
     unverified_interior_samples: list[str] = []
     if marks_path.is_file():
-        with marks_path.open("r", encoding="utf-8") as handle:
+        with open_paper_journal(marks_path, "r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 try:
                     row = json.loads(line)
@@ -362,7 +372,7 @@ def _validate_hybrid_signal_ledger(
         return {"best_quote_fills": 0, "synthetic_fallback_fills": 0}
     exact_count = 0
     fallback_count = 0
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -487,7 +497,7 @@ def _validate_official_open_signal_ledger(
         failures.append("official-open replay has no signals.jsonl audit ledger")
         return {"official_open_fills": 0}
     fill_count = 0
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -542,7 +552,7 @@ def _validate_official_open_fill_ledger(
         failures.append("official-open replay has no fills.jsonl audit ledger")
         return {"fill_ledger_official_open_fills": 0}
     fill_count = 0
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -644,7 +654,7 @@ def _validate_0901_minute_price_signal_ledger(
     fill_count = 0
     prior_count = 0
     absent_pairs: set[tuple[str, str]] = set()
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -788,7 +798,7 @@ def _validate_0901_minute_price_fill_ledger(
     reduction_sweep_buckets: set[tuple[str, str, str, str]] = set()
     opened_positions: set[tuple[str, str, str]] = set()
     entry_sweeps_by_session: dict[tuple[str, str], int] = {}
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -1014,6 +1024,14 @@ def _validate_rebuild(
         if isinstance(replay_contract, dict)
         else ""
     )
+    if receipt_entry_contract == PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT_V2:
+        # The v1 verifier does not independently re-check v2's causal opening
+        # reference and positive-volume source receipts. Do not silently use
+        # its weaker legacy acceptance for the new contract.
+        failures.append(
+            "v2 replay requires an independent causal-reference and "
+            "positive-volume source audit before promotion"
+        )
     modes = state.get("modes")
     if not isinstance(modes, dict):
         failures.append("state.modes is not an object")
@@ -1067,7 +1085,7 @@ def _validate_rebuild(
             continue
         session_date = str(session.get("session_date") or "")
         session_dates.append(session_date)
-        if receipt_entry_contract == PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT:
+        if receipt_entry_contract in PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACTS:
             intraday = session.get("intraday_replay") or {}
             if (intraday.get("contract")
                     != "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
@@ -1386,7 +1404,7 @@ def _validate_rebuild(
     elif receipt_entry_contract in MINUTE_PRICE_0901_REPLAY_CONTRACTS:
         prior_manifest = (
             _verified_prior_paper_manifest(candidate, receipt, failures)
-            if receipt_entry_contract == PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACT
+            if receipt_entry_contract in PRIOR_PAPER_ELSE_0901_FULL_REPLAY_CONTRACTS
             else {}
         )
         expected_minute_price_fills = (

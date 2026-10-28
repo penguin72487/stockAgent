@@ -59,9 +59,10 @@ def repaired_source(tmp_path, monkeypatch):
     return out, key
 
 
-def test_text_period_axis_is_not_mistaken_for_nonnumeric_model_quantity(tmp_path, monkeypatch):
+@pytest.mark.parametrize('release_read_cache', [False, True])
+def test_text_period_axis_is_not_mistaken_for_nonnumeric_model_quantity(tmp_path, monkeypatch, release_read_cache):
     root, key = repaired_source(tmp_path, monkeypatch)
-    manifest = verify_sources(root)
+    manifest = verify_sources(root, release_read_cache=release_read_cache)
     spec = next(s for s in manifest['feature_specs'] if s.get('dataset') == key)
     assert pl.read_parquet(root / spec['path'])['2330'].to_list() == [0., 7.]
     assert manifest['source_repairs']['filled_observations'] == 1
@@ -80,7 +81,8 @@ def test_manifest_bundle_count_without_actual_staged_fills_is_rejected(tmp_path,
         verify_sources(root)
 
 
-def test_receipt_hash_alone_cannot_cover_missing_actual_fill_writeback(tmp_path, monkeypatch):
+@pytest.mark.parametrize('release_read_cache', [False, True])
+def test_receipt_hash_alone_cannot_cover_missing_actual_fill_writeback(tmp_path, monkeypatch, release_read_cache):
     root, key = repaired_source(tmp_path, monkeypatch)
     path = root / 'source_manifest.json'
     manifest = json.loads(path.read_text())
@@ -90,7 +92,39 @@ def test_receipt_hash_alone_cannot_cover_missing_actual_fill_writeback(tmp_path,
     manifest['files'][spec['path']]['sha256'] = sha256(table_path)
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='not written'):
-        verify_sources(root)
+        verify_sources(root, release_read_cache=release_read_cache)
+
+
+def test_source_read_cache_advice_failure_does_not_weaken_verification(tmp_path, monkeypatch):
+    from scripts import prepare_tw_day_trade_mixed_frequency as owner
+    root, _ = repaired_source(tmp_path, monkeypatch)
+    reference = verify_sources(root)
+    def unsupported(*_):
+        raise OSError('filesystem does not support per-file advice')
+    monkeypatch.setattr(owner.os, 'posix_fadvise', unsupported, raising=False)
+    assert verify_sources(root, release_read_cache=True) == reference
+    target = root / next(iter(reference['files']))
+    with target.open('ab') as stream:
+        stream.write(b'changed-source')
+    with pytest.raises(ValueError, match='source hash mismatch'):
+        verify_sources(root, release_read_cache=True)
+
+
+def test_source_replaced_during_cache_release_verification_is_rejected(tmp_path, monkeypatch):
+    from scripts import prepare_tw_day_trade_mixed_frequency as owner
+    root, _ = repaired_source(tmp_path, monkeypatch)
+    manifest = json.loads((root/'source_manifest.json').read_text())
+    target = root / next(iter(manifest['files']))
+    original = owner.sha256
+    def changed_after_hash(path):
+        digest = original(path)
+        if path == target:
+            with path.open('ab') as stream:
+                stream.write(b'changed-after-hash')
+        return digest
+    monkeypatch.setattr(owner, 'sha256', changed_after_hash)
+    with pytest.raises(ValueError, match='source changed during verification'):
+        verify_sources(root, release_read_cache=True)
 
 
 def test_incremental_native_refresh_preserves_previous_release_and_verified_fills(tmp_path, monkeypatch):

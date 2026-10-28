@@ -12,6 +12,7 @@ import hashlib
 import json
 from pathlib import PurePosixPath
 import re
+import stat
 from urllib.parse import urlsplit
 
 
@@ -272,8 +273,12 @@ class FailureEvidenceFocus:
         import pyarrow.parquet as pq
         receipt_path = self.receipt_path(row[4])
         data_path = receipt_path.with_suffix('').with_suffix('.parquet')
-        if (not receipt_path.is_file() or not data_path.is_file()
-                or receipt_path.stat().st_size > 65536 or data_path.stat().st_size > 12 << 20):
+        # A vanished/unmounted file is a local availability problem.  Do not
+        # collapse it into an immutable-pair validation failure: a later mount
+        # can restore the exact same receipt and raw bytes without another GET.
+        receipt_stat, data_stat = receipt_path.stat(), data_path.stat()
+        if (not stat.S_ISREG(receipt_stat.st_mode) or not stat.S_ISREG(data_stat.st_mode)
+                or receipt_stat.st_size > 65536 or data_stat.st_size > 12 << 20):
             raise ValueError('partial_or_unbounded_focus_write')
         receipt_bytes = receipt_path.read_bytes()
         receipt = json.loads(receipt_bytes)

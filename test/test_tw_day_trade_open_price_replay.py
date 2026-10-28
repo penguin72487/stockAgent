@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -24,6 +25,26 @@ from stockagent.live.tw_day_trade_simulation import (
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_retained_0901_books_preserve_volume_and_price_provenance(tmp_path):
+    trading_date = date(2026, 10, 28)
+    source_row = {
+        "symbol": "2330", "execution_price_0901": 100.0,
+        "execution_price_0901_method": "minute_close",
+        "observed_volume_unit_0901": "shares",
+        "observed_volume_known_0901": True,
+        "tick_volume_units_0901": 1000.0,
+    }
+    proof = replay._persist_historical_entry_books(
+        state_dir=tmp_path, trading_date=trading_date, books={"2330": source_row}
+    )
+    restored, receipt = replay._load_retained_historical_entry_books(
+        historical_book_root=tmp_path / "replay_entry_books", trading_date=trading_date
+    )
+    assert receipt["source_sha256"] == proof["sha256"]
+    for key, value in source_row.items():
+        assert restored["2330"][key] == value
 
 
 @pytest.mark.parametrize("verified_open", [True, False])
@@ -452,6 +473,21 @@ def test_executor_runtime_status_reports_registered_entries_not_waiting() -> Non
     assert "session gate not verified" in unknown
 
 
+def test_reload_notification_refreshes_status_even_after_ready() -> None:
+    engine = SimpleNamespace(state={"modes": {"m": {
+        "session_date": "2026-08-13", "entry_completed_at": "2026-08-13T09:00:01+08:00",
+        "positions": {"2330": {"signed_shares": 1000}},
+    }}})
+    specs = [SimpleNamespace(market="m")]
+    observed = datetime(2026, 8, 13, 13, 0, tzinfo=TAIPEI)
+    first = live_runner._executor_reload_notification(engine, specs, observed, already_ready=False)
+    assert first.startswith("READY=1\nSTATUS=") and "open positions=1" in first
+    engine.state["modes"]["m"]["positions"]["2330"]["signed_shares"] = 0
+    later = live_runner._executor_reload_notification(engine, specs, observed, already_ready=True)
+    assert later.startswith("STATUS=") and "open positions=0" in later
+    assert "READY=1" not in later
+
+
 def test_replay_candidate_retains_complete_benchmark_history(tmp_path: Path) -> None:
     source = tmp_path / "source" / "benchmark_history.json"
     source.parent.mkdir()
@@ -573,10 +609,8 @@ def test_retained_missed_opening_price_receipt_replays_without_broker_query(
     assert set(retained) == {"2330", "0050"}
     assert retained_receipt["resolved_symbols"] == 2
     assert retained_receipt["additional_shioaji_requests"] == 0
-    assert retained_receipt["verified_no_trade_through_0901_symbols"] == [
-        "0050",
-        "2317",
-    ]
+    # A missing response is not evidence of no trade.
+    assert retained_receipt["verified_no_trade_through_0901_symbols"] == ["0050"]
     missing, missing_receipt = replay._retained_missed_opening_0901_rows(
         source_ledger_dir=source_ledger,
         symbols=["2330"],
@@ -853,8 +887,91 @@ def test_zero_volume_0901_kbar_is_no_trade_evidence_not_liquidity() -> None:
         },
     )
 
-    assert verified == {"4562", "6212"}
+    assert verified == {"4562"}
     assert replay.observed_0901_minute_volume_lots(books["4562"]) == 0.0
+
+
+def test_local_no_trade_requires_matching_unmodified_source_receipt(tmp_path: Path) -> None:
+    day = date(2026, 8, 13)
+    root = tmp_path / "minute"
+    path = root / "minute_chunks" / "4562" / "2026-08-13_2026-08-13.parquet"
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({
+        "symbol": ["4562"], "date": [day], "ts": [datetime(2026, 8, 13, 9, 1)],
+        "Open": [30.45], "Low": [30.45], "High": [30.45], "Close": [30.45],
+        "Volume": [0.0], "volume_shares": [0.0], "Amount": [0.0],
+        "volume_unit_proof": ["zero_trade"],
+    }).write_parquet(path)
+    books, _ = replay._local_0901_vwap_rows(
+        minute_roots=(root,), symbols=["4562"], trading_date=day)
+    assert books["4562"]["observed_volume_known_0901"] is True
+    assert not replay._verified_local_no_trade_through_0901(books=books, trading_date=day)
+    receipt = {
+        "schema_version": 1, "source": "shioaji_kbars_1m", "storage_frequency": "minute",
+        "symbol": "4562", "start_date": day.isoformat(), "end_date": day.isoformat(),
+        "status": "ok", "query_performed": True, "rows": 1, "returned_dates": [day.isoformat()],
+        "output_receipt": {"path": str(path), "size": path.stat().st_size,
+                           "sha256": hashlib.sha256(path.read_bytes()).hexdigest()},
+    }
+    path.with_suffix(".receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
+    assert replay._verified_local_no_trade_through_0901(books=books, trading_date=day) == {"4562"}
+    # A valid receipt for the old bytes must not authenticate changed evidence.
+    pl.DataFrame({"symbol": ["4562"], "ts": [datetime(2026, 8, 13, 9, 1)],
+                 "Volume": [1.0], "volume_shares": [1_000.0]}).write_parquet(path)
+    assert not replay._verified_local_no_trade_through_0901(books=books, trading_date=day)
+
+
+def test_0901_reference_never_uses_later_first_open_and_requires_prior_trade(tmp_path: Path) -> None:
+    twse = tmp_path / "twse.parquet"
+    tpex = tmp_path / "tpex.parquet"
+    pl.DataFrame({
+        "證券代號": ["0051", "0051", "0051", "0051"],
+        "date": ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29"],
+        "開盤價": ["90", "--", "150", "160"],
+        "收盤價": ["100", "100", "155", "165"],
+        "成交股數": ["1,000", "0", "9,000", "9,000"],
+    }).write_parquet(twse)
+    pl.DataFrame({"代號": [], "date": [], "開盤": [], "收盤": [], "成交股數": []},
+                 schema={"代號": pl.String, "date": pl.String, "開盤": pl.String,
+                         "收盤": pl.String, "成交股數": pl.String}).write_parquet(tpex)
+    prior = replay._previous_official_last_trades(
+        symbols={"0051", "00642U"}, trading_date=date(2026, 10, 28),
+        twse_path=twse, tpex_path=tpex,
+    )
+    assert prior == {"0051": {"price": 100.0, "session_date": "2026-10-26",
+                              "source": "twse_daily_ohlcv"}}
+    result, proof = replay._causal_0901_reference_map(
+        symbols={"0051", "00642U", "2330", "4562"},
+        official_daily_opens={"0051": 150.0, "00642U": 33.0, "2330": 1000.0, "4562": 90.0},
+        first_minute_opens={"2330": 1000.0, "4562": 91.0},
+        no_trade={"0051"}, prior_trades=prior,
+    )
+    assert result == {"0051": 100.0, "2330": 1000.0}
+    assert proof["reference_only_not_execution_price"] is True
+    assert proof["conflicting_source_symbols"] == ["4562"]
+    assert proof["unresolved_symbols"] == ["00642U", "4562"]
+    assert proof["prior_trade_references"]["0051"]["session_date"] == "2026-10-26"
+
+
+@pytest.mark.parametrize("volume,ohlc,expected", [
+    (0, None, True), (None, None, False), (464, None, False),
+    (-1, None, False), (0, 10, False), (float("nan"), None, False),
+])
+def test_official_no_trade_requires_explicit_zero_volume_and_empty_ohlc(volume, ohlc, expected):
+    assert replay._official_zero_volume_no_ohlc({
+        "volume_shares": volume, "open": ohlc, "max": None, "min": None, "close": None,
+    }) is expected
+
+
+@pytest.mark.parametrize("quantity", [None, -1, float("nan"), "unknown"])
+def test_unknown_opening_quantity_is_not_no_trade_evidence(quantity) -> None:
+    book = {"source": "shioaji:historical_kbar_0901_minute_close",
+            "execution_price_0901_method": "minute_close", "observed_volume_unit_0901": "shares",
+            "tick_volume_units_0901": quantity, "session_open_price_0900": None}
+    assert not replay._verified_no_trade_through_0901(
+        requested_symbols={"4562"}, books={"4562": book},
+        query_receipt={"attempted_symbols": ["4562"], "unqueried_symbols": 0, "error_counts": {}},
+    )
 
 
 def test_first_minute_open_overlay_uses_only_positive_0901_bar(
@@ -1068,6 +1185,7 @@ def test_local_0901_loader_rejects_invalid_normalized_volume_for_capacity(
     assert rows["2330"]["execution_price_0901"] == 101.0
     assert rows["2330"]["execution_price_0901_method"] == "minute_close"
     assert rows["2330"]["tick_volume_units_0901"] == 0.0
+    assert rows["2330"]["observed_volume_known_0901"] is False
     assert rows["2330"]["valuation_price_0901"] is None
     assert receipt["invalid_volume_unit_rows"] == 1
 
@@ -1322,8 +1440,9 @@ def _write_signal_candidate(
     trading_date: date,
     generated_at: datetime,
     counterfactual: bool = False,
+    signal_dir: str = "signal",
 ) -> object:
-    signal_root = root / f"{trading_date.isoformat()} 09:00:00" / "signal"
+    signal_root = root / f"{trading_date.isoformat()} 09:00:00" / signal_dir
     signal_root.mkdir(parents=True)
     input_path = root / "official_open.csv"
     input_path.write_text("symbol,price,open_price\n2330,1000,1000\n", encoding="utf-8")
@@ -1397,7 +1516,7 @@ def test_latest_valid_signal_rejects_backdated_signal_without_contract(
 def _compact_signal_candidate(tmp_path):
     day = date(2026, 8, 13)
     spec = _write_signal_candidate(tmp_path, market="mode_a", trading_date=day,
-        generated_at=datetime(2026, 8, 13, 9, 0, 2, tzinfo=TAIPEI))
+        generated_at=datetime(2026, 8, 13, 9, 0, 2, tzinfo=TAIPEI), signal_dir="compact-signal")
     spec.uses_realistic_execution = False
     summary_path = next(tmp_path.rglob("summary.json"))
     parquet = summary_path.with_name("target_weights.parquet")
@@ -1406,7 +1525,10 @@ def _compact_signal_candidate(tmp_path):
     compact.write_text(json.dumps({"schema_version": 1, "market": spec.market,
         "signal_id": "compact-signal", "rows": rows}))
     summary = json.loads(summary_path.read_text()) | {"signal_id": "compact-signal",
-        "symbol_count": len(rows), "execution_weights_path": str(compact)}
+        "symbol_count": len(rows), "execution_weights_path": str(compact),
+        "asof_date": "2026-08-13 09:00:02",
+        "signal_ready_at": "2026-08-13T09:00:02+08:00",
+        "artifact_published_at": "2026-08-13T09:00:02+08:00"}
     summary_path.write_text(json.dumps(summary))
     parquet.unlink()
     return spec, day, summary_path, compact, rows
@@ -1419,6 +1541,15 @@ def test_compact_only_signal_is_shared_with_live_and_pinned_without_recreation(t
     assert result["status"] == "accepted_sources_only"
     proof, = result["artifacts"]
     assert proof["weights_path"] == str(compact)
+    # A compact candidate is not visible to the live executor until the
+    # canonical pointer has been published.
+    assert live_runner._latest_signal(spec, datetime(2026, 8, 13, 9, 0, 3, tzinfo=TAIPEI)) is None
+    (spec.live_output_dir / "latest_signal.json").write_text(json.dumps({"schema_version": 2,
+        "market": spec.market, "signal_id": "compact-signal",
+        "signal_ready_at": "2026-08-13T09:00:02+08:00",
+        "artifact_published_at": "2026-08-13T09:00:02+08:00",
+        "summary_path": str(summary_path), "weights_path": str(summary_path.with_name("target_weights.parquet")),
+        "execution_weights_path": str(compact)}))
     live = live_runner._latest_signal(spec, datetime(2026, 8, 13, 9, 0, 3, tzinfo=TAIPEI))
     assert live is not None and live[1] == rows
     assert not summary_path.with_name("target_weights.parquet").exists()
@@ -1735,6 +1866,60 @@ def test_source_ledger_pins_each_date_mode_signal_identity(tmp_path: Path) -> No
     }
     assert provenance["signal_registrations"] == 2
     assert len(provenance["sha256"]) == 64
+
+
+def test_source_ledger_selected_market_does_not_hide_conflicts_in_scope(tmp_path: Path) -> None:
+    rows = [
+        {"event": "signal_registered", "recorded_at": "2026-10-28T09:00:00+08:00",
+         "market": "once", "signal_id": "first"},
+        {"event": "signal_registered", "recorded_at": "2026-10-28T09:00:01+08:00",
+         "market": "progressive", "signal_id": "one"},
+        {"event": "signal_registered", "recorded_at": "2026-10-28T09:00:02+08:00",
+         "market": "progressive", "signal_id": "two"},
+    ]
+    (tmp_path / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    kwargs = {"start_date": date(2026, 10, 28), "end_date": date(2026, 10, 28)}
+    ids, proof = replay._source_ledger_signal_ids(tmp_path, selected_markets={"once"}, **kwargs)
+    assert ids == {("2026-10-28", "once"): "first"}
+    assert proof["selected_markets"] == ["once"]
+    with pytest.raises(ValueError, match="conflicting source signal ids"):
+        replay._source_ledger_signal_ids(tmp_path, selected_markets={"progressive"}, **kwargs)
+    with pytest.raises(ValueError, match="conflicting source signal ids"):
+        replay._source_ledger_signal_ids(tmp_path, **kwargs)
+
+
+def test_preflight_does_not_coerce_progressive_execution_contract(tmp_path: Path, monkeypatch) -> None:
+    from stockagent.live.tw_day_trade_simulation import (
+        ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+        OPENING_PROVISIONAL_REFERENCE_POLICY,
+        SIGNAL_UPDATE_PROGRESSIVE,
+    )
+
+    spec = replay.ModeSpec(market="mode_a", label="a", initial_capital_twd=10_000_000,
+        config_path="", checkpoint_path=None, fee_schedule=None, live_output_dir=tmp_path,
+        parquet_root=tmp_path, entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+        opening_reference_policy=OPENING_PROVISIONAL_REFERENCE_POLICY,
+        signal_update_policy=SIGNAL_UPDATE_PROGRESSIVE)
+    twse, tpex = tmp_path / "twse.parquet", tmp_path / "tpex.parquet"
+    twse.touch()
+    tpex.touch()
+    monkeypatch.setattr(replay, "_mode_specs", lambda *_a, **_kw: ([spec], {}, {}))
+    monkeypatch.setattr(replay, "_validated_taiex_session_dates",
+                        lambda *_a, **_kw: ({date(2026, 10, 28)}, "calendar-hash"))
+    monkeypatch.setattr(replay, "_known_delisting_last_session_liquidations",
+                        lambda *_a, **_kw: ({}, {}))
+    seen = []
+    def preflight(specs, *_a, **_kw):
+        seen.extend(specs)
+        return {"status": "accepted_sources_only", "failures": [], "artifacts": []}
+    monkeypatch.setattr(replay, "_preflight_replay_signals", preflight)
+    monkeypatch.setattr(sys, "argv", ["replay", "--preflight-only", "--state-dir", str(tmp_path / "out"),
+        "--start-date", "2026-10-28", "--end-date", "2026-10-28",
+        "--twse-daily-ohlcv-path", str(twse), "--tpex-daily-ohlcv-path", str(tpex)])
+    replay.main()
+    assert seen == [spec]
+    assert seen[0].signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+    assert seen[0].entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
 
 
 def _applied_repair_lineage_fixture(tmp_path, *, preserve_original):

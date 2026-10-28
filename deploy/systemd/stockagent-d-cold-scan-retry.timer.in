@@ -1,5 +1,5 @@
 [Unit]
-Description=Retry pending D-primary cold-store scans without source rebuild
+Description=Retry enrolled cold-store and NAS notifications without source rebuilds
 
 [Timer]
 OnBootSec=3min

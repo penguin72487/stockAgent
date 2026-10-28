@@ -3,6 +3,7 @@ Description=Refresh official TAIFEX all-futures daily history after market close
 
 [Timer]
 OnCalendar=Mon..Fri *-*-* 16:30:00 Asia/Taipei
+OnCalendar=Mon..Fri *-*-* 18:30:00 Asia/Taipei
 Persistent=true
 Unit=stockagent-taifex-futures-daily.service
 

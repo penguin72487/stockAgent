@@ -3,6 +3,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -202,10 +203,15 @@ def test_early_cycle_return_closes_queue_without_garbage_collection(tmp_path, mo
     monkeypatch.setattr(owner, 'load_env_file', lambda *_a, **_k: None)
     monkeypatch.setenv('FINMIND_TOKEN', 'unit-test-placeholder')
     if owner is sponsor:
+        monkeypatch.setattr(sponsor, 'AcquisitionCapacitySampler', lambda _root: SimpleNamespace(
+            initial_sample=lambda: {'state': 'admitted'}, sample=lambda: {'state': 'admitted'}))
         def unavailable(*_a, **_k):
             raise ValueError('unit test unverified account')
         monkeypatch.setattr(owner, 'verified_account', unavailable)
     else:
+        monkeypatch.setattr(owner, 'AcquisitionCapacitySampler', lambda root: SimpleNamespace(
+            root=root.absolute(), initial_sample=lambda: {'state': 'admitted'},
+            sample=lambda: {'state': 'admitted'}))
         account = {'tier': 'Sponsor', 'official_requests_per_hour': 6000,
                    'observed_at_utc': NOW.isoformat(), 'provider_used_in_hour': 0}
         monkeypatch.setattr(owner, 'verified_account', lambda *_a, **_k: account)
@@ -241,6 +247,9 @@ def test_worker_empty_retry_never_publishes_old_history_as_recovered_or_zero(tmp
     monkeypatch.setattr(worker, 'load_env_file', lambda *_a, **_k: None)
     monkeypatch.setattr(worker, '_now', lambda: NOW)
     monkeypatch.setattr(worker, '_populate', lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, 'AcquisitionCapacitySampler', lambda root: SimpleNamespace(
+        root=root.absolute(), initial_sample=lambda: {'state': 'admitted'},
+        sample=lambda: {'state': 'admitted'}))
     monkeypatch.setattr(worker, 'MIN_FREE_BYTES', 0)
     monkeypatch.setattr(integrity, 'audit_completed_batch', lambda *_a, **_k: {})
     account = {'tier': 'Sponsor', 'official_requests_per_hour': 6000,

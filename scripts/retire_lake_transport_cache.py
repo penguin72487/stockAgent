@@ -10,7 +10,9 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from downloader.artifact_io import atomic_write_json
-from stockagent.control.lakehouse import acceptance, configuration, guard, retire_accepted_transport
+from stockagent.control.lakehouse import (
+    acceptance, catalog_enrollment, configuration, guard, retire_accepted_transport,
+)
 
 RETRY_SECONDS = 600
 MAX_RETRY_SECONDS = 3600
@@ -82,8 +84,31 @@ def retire_one(c, base, *, now=None):
                   delivery_kind=kind)
     atomic_write_json(status_path, {**result, 'observed_at_utc': datetime.now(timezone.utc).isoformat()})
     try:
-        proof = acceptance(c, identity)
+        # Admission authenticates the exact paired NAS restore against the
+        # original sealed producer enrollment. It need not hash the sender's
+        # whole HDD tree again: the canonical retirement below independently
+        # checks the complete transport and primary bytes before any unlink.
+        options = {}
+        if kind == 'source':
+            enrolled = ledger['deliveries'][identity]
+            if 'file_keys' in enrolled:
+                options['enrolled_source'] = enrolled
+        else:
+            enrolled = catalog_enrollment(c, identity)
+            if enrolled is not None:
+                options['enrolled_catalog'] = enrolled
+        phase_started = time.perf_counter()
+        atomic_write_json(status_path, {**result, 'phase': 'admit_paired_nas_recovery',
+                          'phase_started_at_utc': datetime.now(timezone.utc).isoformat(),
+                          'observed_at_utc': datetime.now(timezone.utc).isoformat()})
+        proof = acceptance(c, identity, **options)
+        admission_seconds = time.perf_counter() - phase_started
+        atomic_write_json(status_path, {**result, 'phase': 'verify_and_retire_transport',
+                          'nas_admission_seconds': admission_seconds,
+                          'phase_started_at_utc': datetime.now(timezone.utc).isoformat(),
+                          'observed_at_utc': datetime.now(timezone.utc).isoformat()})
         retirement = retire_accepted_transport(c, identity, proof)
+        result['nas_admission_seconds'] = admission_seconds
     except (OSError, ValueError, KeyError, TypeError) as error:
         retirement = {'state': 'retirement_deferred', 'error_type': type(error).__name__}
         if isinstance(error, OSError):

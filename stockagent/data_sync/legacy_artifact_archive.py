@@ -7,18 +7,23 @@ SHA-256 so recovery can be independently checked without a giant tarball.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import gzip
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 import hashlib
+import itertools
 import json
 import math
 import os
 import re
+import resource
 import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import zlib
@@ -30,6 +35,8 @@ from stockagent.data_sync.artifact_maintenance import artifact_process_reference
 from stockagent.data_sync.desync_snapshots import (
     SnapshotError,
     _exclusive_lock,
+    _iter_lstat_bounded,
+    _raise_walk_error,
     _safe_relative_path,
     atomic_write_json,
     sha256_file,
@@ -45,9 +52,12 @@ from stockagent.data_sync.packed_snapshots import (
     resolve_packed_snapshot_id,
     verify_packed_snapshot,
 )
+from stockagent.data_sync.packed_backup import PinnedObjectSignatures
 
 
 ARCHIVE_SCHEMA = 1
+LINK_ARCHIVE_SCHEMA = 2
+OPAQUE_SYMLINK_POLICY = "completed-benchmark-opaque-symlinks-v1"
 COPY_CHUNK = 8 * 1024 * 1024
 COMPRESS_MIN_BYTES = 8 * 1024 * 1024
 DEFAULT_COMPRESSION_PROFILE = "gzip-1-csv-over-8m"
@@ -122,6 +132,22 @@ class LegacyArchiveSpec:
     durable_staging: bool = True
     compression_profile: str = DEFAULT_COMPRESSION_PROFILE
     capture_contract: str | None = None
+    symlink_policy: str | None = None
+
+
+def _opaque_symlinks_enabled(spec: LegacyArchiveSpec | None) -> bool:
+    """An explicit format opt-in, only for manually captured benchmark cases."""
+    if spec is None or spec.symlink_policy is None:
+        return False
+    if (spec.symlink_policy != OPAQUE_SYMLINK_POLICY
+            or spec.capture_contract != MANUAL_WSL_CAPTURE_CONTRACT
+            or not spec.relative_root.startswith("benchmarks/")
+            or not reviewed_wsl_artifact_root(spec.relative_root)
+            or type(spec.manual_capture_min_stable_hours) not in (int, float)
+            or not math.isfinite(spec.manual_capture_min_stable_hours)
+            or spec.manual_capture_min_stable_hours < 12):
+        raise SnapshotError("opaque symlinks require an explicitly reviewed manual benchmark capture")
+    return True
 
 
 def legacy_process_scope(spec: LegacyArchiveSpec | None, artifact_root: Path) -> Path:
@@ -196,8 +222,10 @@ def load_legacy_specs(path: Path) -> dict[str, LegacyArchiveSpec]:
             raise SnapshotError("manual artifact preservation requires an explicit stability floor")
         if dataset in result or any(x.relative_root == relative.as_posix() for x in result.values()):
             raise SnapshotError("duplicate legacy archive dataset/root")
-        result[dataset] = LegacyArchiveSpec(dataset, relative.as_posix(), days, stage_root, manual_hours, durable_staging,
-                                          item["compression"], capture_contract)
+        spec = LegacyArchiveSpec(dataset, relative.as_posix(), days, stage_root, manual_hours, durable_staging,
+                                 item["compression"], capture_contract, item.get("symlink_policy"))
+        _opaque_symlinks_enabled(spec)
+        result[dataset] = spec
     return result
 
 
@@ -210,6 +238,86 @@ def _source_signature(info: os.stat_result) -> dict[str, int]:
         "ctime_ns": info.st_ctime_ns,
         "mode": stat.S_IMODE(info.st_mode),
     }
+
+
+def _validated_symlinks(rows: Any) -> list[dict[str, Any]]:
+    """Validate opaque link bytes without ever resolving their targets."""
+    if not isinstance(rows, list):
+        raise SnapshotError("legacy symlink inventory is invalid")
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"path", "target_b64", "source"}:
+            raise SnapshotError("legacy symlink descriptor is invalid")
+        relative = _safe_relative_path(row["path"], "legacy symlink").as_posix()
+        signature = row["source"]
+        if (row["path"] != relative or relative in seen or not isinstance(signature, dict)
+                or set(signature) != {"device", "inode", "size", "mtime_ns", "ctime_ns", "mode"}
+                or any(type(value) is not int or value < 0 for value in signature.values())
+                or signature["mode"] != 0o777 or signature["size"] > 1024 * 1024
+                or not isinstance(row["target_b64"], str)
+                or len(row["target_b64"]) != 4 * ((signature["size"] + 2) // 3)):
+            raise SnapshotError("legacy symlink descriptor is invalid")
+        try:
+            target = base64.b64decode(row["target_b64"], validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise SnapshotError("legacy symlink target encoding is invalid") from error
+        if (not target or b"\0" in target or len(target) != signature["size"]
+                or base64.b64encode(target).decode("ascii") != row["target_b64"]):
+            raise SnapshotError("legacy symlink target differs from its descriptor")
+        seen.add(relative)
+    if [row["path"] for row in rows] != sorted(seen):
+        raise SnapshotError("legacy symlink inventory is not uniquely sorted")
+    return rows
+
+
+def _assert_internal_symlink_targets(rows: list[dict[str, Any]], original_source: Path) -> None:
+    """Retire only links whose textual targets stay in the captured root.
+
+    Existing targets and dangling names are treated identically. This is a
+    lexical check, not permission to open or follow a target.
+    """
+    root = os.fsencode(str(original_source.absolute()))
+    for row in _validated_symlinks(rows):
+        target = base64.b64decode(row["target_b64"], validate=True)
+        # '..' is interpreted after resolving a preceding symlink component.
+        # A lexical commonpath check alone would therefore miss an escape.
+        if b".." in target.split(b"/"):
+            raise SnapshotError("legacy symlink target contains a parent traversal")
+        parent = os.fsencode(str(PurePosixPath(row["path"]).parent))
+        endpoint = os.path.normpath(target if target.startswith(b"/") else os.path.join(root, parent, target))
+        if os.path.commonpath((root, endpoint)) != root:
+            raise SnapshotError("legacy symlink target is outside the captured benchmark root")
+
+
+def _archive_symlinks(source: Path, spec: LegacyArchiveSpec, *,
+                      original_source: Path | None = None) -> list[dict[str, Any]]:
+    """Freeze link names, target bytes and lstat identities, without following."""
+    if not _opaque_symlinks_enabled(spec):
+        return []
+    if source.is_symlink() or not source.is_dir():
+        raise SnapshotError("legacy symlink inventory source is not a real directory")
+    device = source.stat().st_dev
+    age_limit = time.time_ns() - int(spec.manual_capture_min_stable_hours * 3_600_000_000_000)
+    rows = []
+    for parent, dirs, files in os.walk(source, followlinks=False, onerror=_raise_walk_error):
+        for name in sorted(dirs + files):
+            path = Path(parent) / name
+            before = path.lstat()
+            if not stat.S_ISLNK(before.st_mode):
+                continue
+            if before.st_dev != device or before.st_nlink != 1 or before.st_mtime_ns > age_limit:
+                raise SnapshotError("legacy symlink is unstable or crosses a filesystem")
+            target = os.readlink(os.fsencode(path))
+            after = path.lstat()
+            if not stat.S_ISLNK(after.st_mode) or _source_signature(before) != _source_signature(after):
+                raise SnapshotError("legacy symlink changed during inventory")
+            rows.append({"path": path.relative_to(source).as_posix(),
+                         "target_b64": base64.b64encode(target).decode("ascii"),
+                         "source": _source_signature(after)})
+    rows.sort(key=lambda row: row["path"])
+    _validated_symlinks(rows)
+    _assert_internal_symlink_targets(rows, original_source or source)
+    return rows
 
 
 def source_plan(
@@ -262,20 +370,26 @@ def source_plan(
     )
     age_limit = time.time_ns() - int(stability_hours * 3_600_000_000_000)
     rows: list[dict[str, Any]] = []
-    for parent, dirnames, filenames in os.walk(source, followlinks=False):
+    allow_symlinks = _opaque_symlinks_enabled(spec)
+    for parent, dirnames, filenames in os.walk(source, followlinks=False, onerror=_raise_walk_error):
         dirnames.sort()
         filenames.sort()
+        parent_path = Path(parent)
+        relative_parent = parent_path.relative_to(source).as_posix()
+        relative_prefix = "" if relative_parent == "." else relative_parent + "/"
         for name in dirnames:
-            if (Path(parent) / name).is_symlink():
+            if (parent_path / name).is_symlink() and not allow_symlinks:
                 raise SnapshotError("legacy source contains a symlink directory")
         for name in filenames:
-            path = Path(parent) / name
+            path = parent_path / name
             info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) and allow_symlinks:
+                continue
             if not stat.S_ISREG(info.st_mode):
                 raise SnapshotError(f"legacy source has non-regular file: {path}")
             if info.st_mtime_ns > age_limit:
                 raise SnapshotError(f"legacy source is not stable for {stability_hours} hours: {path}")
-            rows.append({"path": path.relative_to(source).as_posix(), "source": _source_signature(info)})
+            rows.append({"path": relative_prefix + name, "source": _source_signature(info)})
     if not rows:
         raise SnapshotError("legacy source has no files")
     return rows
@@ -559,13 +673,15 @@ def _manual_capture_usage_gate(source: Path, artifact_root: Path, *, repo_root: 
         raise SnapshotError(f"manual capture source is in use: {(references + services)[:3]}")
 
 
-def _archive_directories(source: Path) -> list[dict[str, Any]]:
+def _archive_directories(source: Path, *, allow_symlinks: bool = False) -> list[dict[str, Any]]:
     """Preserve empty directories and portable metadata, not inode identity."""
     result = []
-    for parent, dirs, _files in os.walk(source, followlinks=False):
+    for parent, dirs, _files in os.walk(source, followlinks=False, onerror=_raise_walk_error):
         for name in sorted(dirs):
             path = Path(parent) / name
             info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) and allow_symlinks:
+                continue
             if not stat.S_ISDIR(info.st_mode) or info.st_dev != source.stat().st_dev:
                 raise SnapshotError("legacy directory is linked or crosses a filesystem")
             result.append({"path": path.relative_to(source).as_posix(),
@@ -599,11 +715,24 @@ def prepare_archive(
     if references:
         raise SnapshotError(f"legacy source has process references: {references[:3]}")
     planned = source_plan(source, spec, manual_capture=manual_capture)
-    directories = _archive_directories(source)
+    allow_symlinks = _opaque_symlinks_enabled(spec)
+    directories = _archive_directories(source, allow_symlinks=allow_symlinks)
+    symlinks = _archive_symlinks(source, spec) if allow_symlinks else None
     if manual_capture:
         _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
     stage.mkdir(parents=True, exist_ok=True)
     plan_path = stage / "source_plan.json"
+    if allow_symlinks:
+        link_plan_path = stage / "symlink_plan.json"
+        if link_plan_path.exists() or link_plan_path.is_symlink():
+            if link_plan_path.is_symlink() or not link_plan_path.is_file():
+                raise SnapshotError("legacy symlink plan is redirected")
+            if json.loads(link_plan_path.read_text()) != symlinks:
+                raise SnapshotError("legacy symlinks changed since staging began")
+        else:
+            if (stage / "receipts").exists() or archive.exists():
+                raise SnapshotError("interrupted stage has no frozen symlink plan")
+            atomic_write_json(link_plan_path, symlinks)
     if plan_path.exists():
         prior = json.loads(plan_path.read_text(encoding="utf-8"))
         if prior != planned:
@@ -613,7 +742,7 @@ def prepare_archive(
     receipts = stage / "receipts"
     receipts.mkdir(exist_ok=True)
     result_rows: list[dict[str, Any]] = []
-    for item in planned:
+    def stage_item(item):
         relative = item["path"]
         source_file = source.joinpath(*PurePosixPath(relative).parts)
         signature = item["source"]
@@ -641,8 +770,7 @@ def prepare_archive(
             ):
                 # A verified interrupted stage keeps its exact representation;
                 # a new profile must not rewrite history or leave extra payloads.
-                result_rows.append(row)
-                continue
+                return row
         codec = "gzip" if relative.lower().endswith(".csv") and signature["size"] >= COMPRESS_MIN_BYTES else "raw"
         trial = None
         adaptive = spec.compression_profile != DEFAULT_COMPRESSION_PROFILE
@@ -687,25 +815,55 @@ def prepare_archive(
             atomic_write_json(receipt_path, row)
         else:
             atomic_write_json(receipt_path, row, durable=False)
-        result_rows.append(row)
+        return row
+
+    # Only reviewed, bounded D scratch uses concurrent encoding. Each job
+    # owns one unique source/receipt/payload name; final manifest order and
+    # all whole-tree source/consumer fences are unchanged. Limit submission
+    # and serialize large files so many slow small D writes can overlap
+    # without multiplying compression buffers or active large-file I/O.
+    workers = _d_stage_file_workers(spec, archive) if manual_capture and _prunable_stage(spec) else 1
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY and soft_limit - len(os.listdir('/proc/self/fd')) < 32:
+            workers = 1
+    except (OSError, ValueError, OverflowError):
+        workers = 1
+    large_file_lock = threading.Lock()
+    def guarded_stage_item(item):
+        with large_file_lock if item['source']['size'] >= 64 * 1024**2 else nullcontext():
+            return stage_item(item)
+    if workers == 1:
+        result_rows = list(map(guarded_stage_item, planned))
+    else:
+        keys = [hashlib.sha256(item['path'].encode('utf-8')).digest() for item in planned]
+        if len(set(keys)) != len(keys):
+            raise SnapshotError('legacy source paths have duplicate staging keys')
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='legacy-stage') as executor:
+            iterator = iter(planned)
+            while batch := list(itertools.islice(iterator, 32)):
+                result_rows.extend(executor.map(guarded_stage_item, batch))
     # Per-file checks alone miss an earlier file changing, or a new path
     # appearing, while a later file is being encoded. Require the whole tree
     # to remain identical before exposing the preservation manifest.
     if source_plan(source, spec, manual_capture=manual_capture) != planned:
         raise SnapshotError("legacy source changed during staging; stage retained for audit")
-    if _archive_directories(source) != directories:
+    if _archive_directories(source, allow_symlinks=allow_symlinks) != directories:
         raise SnapshotError("legacy directories changed during staging; stage retained for audit")
+    if allow_symlinks and _archive_symlinks(source, spec) != symlinks:
+        raise SnapshotError("legacy symlinks changed during staging; stage retained for audit")
     if manual_capture:
         _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
-    manifest = _capture_manifest(spec, planned, directories, result_rows, manual_capture=manual_capture)
+    manifest = _capture_manifest(spec, planned, directories, result_rows, manual_capture=manual_capture,
+                                 symlinks=symlinks)
     atomic_write_json(archive / "legacy_archive_manifest.json", manifest)
     return manifest
 
 
-def _capture_manifest(spec, planned, directories, result_rows, *, manual_capture):
+def _capture_manifest(spec, planned, directories, result_rows, *, manual_capture, symlinks=None):
     """The same preservation descriptor for new and resumed complete captures."""
     manifest = {
-        "schema_version": ARCHIVE_SCHEMA,
+        "schema_version": LINK_ARCHIVE_SCHEMA if symlinks is not None else ARCHIVE_SCHEMA,
         "dataset": spec.dataset,
         "relative_root": spec.relative_root,
         "deployable": False,
@@ -717,12 +875,20 @@ def _capture_manifest(spec, planned, directories, result_rows, *, manual_capture
         manifest["encoding_profile"] = spec.compression_profile
     if spec.capture_contract is not None:
         manifest["capture_contract"] = spec.capture_contract
+    if symlinks is not None:
+        if not _opaque_symlinks_enabled(spec):
+            raise SnapshotError("symlink manifest lacks its explicit capture policy")
+        manifest["symlink_policy"] = spec.symlink_policy
+        manifest["symlinks"] = _validated_symlinks(symlinks)
     if manual_capture:
         manifest["source_stability"] = {
             "mode": "manual-exact-capture-v1",
             "minimum_stable_hours": spec.manual_capture_min_stable_hours,
             "source_plan_sha256": hashlib.sha256(json.dumps(planned, sort_keys=True).encode()).hexdigest(),
         }
+        if symlinks is not None:
+            manifest["source_stability"]["symlink_plan_sha256"] = hashlib.sha256(
+                json.dumps(symlinks, sort_keys=True).encode()).hexdigest()
     return manifest
 
 
@@ -775,8 +941,18 @@ def recover_complete_archive_manifest(
             changed += 1
     if mappings and (len(mappings) != 1 or changed != len(planned)):
         raise SnapshotError('interrupted capture has a partial or mixed device renumber')
-    directories = _archive_directories(source)
+    allow_symlinks = _opaque_symlinks_enabled(spec)
+    directories = _archive_directories(source, allow_symlinks=allow_symlinks)
+    symlinks = None
     rows, expected = [], {'source_plan.json'}
+    if allow_symlinks:
+        link_plan = stage / 'symlink_plan.json'
+        if link_plan.is_symlink() or not link_plan.is_file() or link_plan.stat().st_size > 64 * 1024**2:
+            raise SnapshotError('interrupted capture lacks its frozen symlink plan')
+        symlinks = _validated_symlinks(json.loads(link_plan.read_text()))
+        if _archive_symlinks(source, spec) != symlinks:
+            raise SnapshotError('source symlinks changed since interrupted capture')
+        expected.add('symlink_plan.json')
     for item in planned:
         key = hashlib.sha256(item['path'].encode('utf-8')).hexdigest()
         receipt_name = 'receipts/' + key + '.json'
@@ -808,7 +984,8 @@ def recover_complete_archive_manifest(
                    or (r['kind'] == 'file' and r['signature'][6] != 1)
                    for r in before_stage['rows'])):
         raise SnapshotError('interrupted encoding contains unknown, linked or nonregular members')
-    manifest = _capture_manifest(spec, planned, directories, rows, manual_capture=manual_capture)
+    manifest = _capture_manifest(spec, planned, directories, rows, manual_capture=manual_capture,
+                                 symlinks=symlinks)
     metadata_bytes = len(json.dumps(manifest, ensure_ascii=True).encode())
     if shutil.disk_usage(stage).free < 256 * 1024**2 + 2 * metadata_bytes:
         raise SnapshotError('complete capture metadata recovery lacks its bounded write budget')
@@ -824,7 +1001,8 @@ def recover_complete_archive_manifest(
         if sha256_file(source / row['path']) != row['original_sha256']:
             raise SnapshotError('current source bytes differ from the interrupted original')
     if (source_plan(source, spec, manual_capture=manual_capture) != current
-            or _archive_directories(source) != directories
+            or _archive_directories(source, allow_symlinks=allow_symlinks) != directories
+            or (allow_symlinks and _archive_symlinks(source, spec) != symlinks)
             or metadata_tree(stage)['fingerprint'] != before_stage['fingerprint']
             or artifact_process_references(stage, legacy_process_scope(spec, artifact_root))):
         raise SnapshotError('source or encoding changed during complete manifest recovery')
@@ -836,19 +1014,124 @@ def recover_complete_archive_manifest(
     return manifest
 
 
+def _d_stage_file_workers(spec: LegacyArchiveSpec | None, archive: Path) -> int:
+    """Bound reads to an enrolled D stage or this process's prune quarantine."""
+    if spec is not None and spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
+        allowed = {
+            (spec.stage_root / spec.dataset / 'archive').absolute(),
+            (spec.stage_root / f'.{spec.dataset}.pruning-{os.getpid()}' / 'archive').absolute(),
+        }
+        if archive.absolute() in allowed:
+            return 4
+    return 1
+
+
+def _archive_directory_budget(file_workers: int) -> int:
+    """Retain common D shards without spending the process's FD reserve."""
+    if file_workers == 1:
+        return 64
+    try:
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit == resource.RLIM_INFINITY:
+            return 256
+        # The cache limit includes its root, and parallel lookups hold at most
+        # one extra duplicate per worker. On normal limits leave three quarters
+        # of the process budget for the owner and its other descriptors.
+        return max(2, min(256, int(soft_limit) // 4 - file_workers))
+    except (OSError, ValueError, OverflowError):
+        return 64
+
+
 def verify_archive_directory(
     archive: Path, source: Path | None = None, *, spec: LegacyArchiveSpec | None = None,
     manual_capture: bool = False, artifact_root: Path | None = None,
     repo_root: Path | None = None,
     progress: Callable[[dict[str, Any]], None] | None = None,
+    file_workers: int = 1,
 ) -> dict[str, Any]:
-    manifest = json.loads((archive / "legacy_archive_manifest.json").read_text(encoding="utf-8"))
+    # Reuse the bounded no-follow directory reader instead of resolving every
+    # ancestor for every encoding. Full source/encoded/decoded SHA checks stay
+    # in the original verifier; all observed directory names are fenced before
+    # its result can be returned. The manifest is fenced as a regular leaf too.
+    if type(file_workers) is not int or not 1 <= file_workers <= 4:
+        raise ValueError('legacy verification workers must be between 1 and 4')
+    if file_workers != 1 and _d_stage_file_workers(spec, archive) == 1:
+        raise SnapshotError('parallel decoding is restricted to the exact enrolled D recovery stage')
+    with PinnedObjectSignatures(archive, max_open_directories=_archive_directory_budget(file_workers),
+                                parallel_signatures=file_workers > 1) as encoded_paths:
+        raw, manifest_signature = encoded_paths.read_metadata('legacy_archive_manifest.json')
+        manifest = json.loads(raw.decode('utf-8'))
+        del raw
+        proof = _verify_archive_directory(
+            archive, source, spec=spec, manual_capture=manual_capture,
+            artifact_root=artifact_root, repo_root=repo_root, progress=progress,
+            manifest=manifest, encoded_paths=encoded_paths, file_workers=file_workers,
+        )
+        if encoded_paths.regular_file_signature('legacy_archive_manifest.json') != manifest_signature:
+            raise SnapshotError('legacy archive manifest changed during verification')
+        encoded_paths.recheck()
+        return proof
+
+
+def _archive_encoded_census(archive: Path, *, file_workers: int,
+                            progress: Callable[[dict[str, Any]], None] | None = None,
+                            expected_items: int | None = None) -> set[str]:
+    """Independently observe the whole encoded tree, never following links.
+
+    Census counts are metadata observations, not a successful byte audit. If
+    an extra file is seen, drop the denominator instead of displaying 100%.
+    """
+    if expected_items is not None and (type(expected_items) is not int or expected_items < 0):
+        raise ValueError('expected encoded census items must be a nonnegative integer')
+    observed: set[str] = set()
+    last_report = time.monotonic()
+    def report():
+        total = expected_items if expected_items is None or len(observed) <= expected_items else None
+        progress({'stage': 'scan-encoded-tree', 'completed_items': len(observed),
+                  'total_items': total, 'item_scope': 'encoded_regular_files_observed',
+                  'metadata_only': True, 'acceptance_proof': False})
+
+    if progress is not None:
+        report()
+    pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)
+    with pool as executor:
+        for parent, dirs, files in os.walk(archive, followlinks=False, onerror=_raise_walk_error):
+            paths = (Path(parent) / name for name in (*dirs, *files))
+            for path, info in _iter_lstat_bounded(paths, executor):
+                if stat.S_ISREG(info.st_mode):
+                    observed.add(path.relative_to(archive).as_posix())
+                elif not stat.S_ISDIR(info.st_mode):
+                    raise SnapshotError(f"legacy encoded tree has an unsupported entry: {path}")
+            if progress is not None and time.monotonic() - last_report >= 5:
+                report()
+                last_report = time.monotonic()
+    if progress is not None:
+        report()
+    return observed
+
+
+def _verify_archive_directory(
+    archive: Path, source: Path | None, *, spec: LegacyArchiveSpec | None,
+    manual_capture: bool, artifact_root: Path | None, repo_root: Path | None,
+    progress: Callable[[dict[str, Any]], None] | None,
+    manifest: dict[str, Any], encoded_paths: PinnedObjectSignatures, file_workers: int,
+) -> dict[str, Any]:
+    symlink_capture = _opaque_symlinks_enabled(spec)
+    expected_schema = LINK_ARCHIVE_SCHEMA if symlink_capture else ARCHIVE_SCHEMA
     if (
-        manifest.get("schema_version") != ARCHIVE_SCHEMA
+        manifest.get("schema_version") != expected_schema
         or manifest.get("deployable") is not False
         or manifest.get("completion_claim") != "not_checked"
     ):
         raise SnapshotError("invalid legacy archive manifest")
+    if symlink_capture:
+        if manifest.get("symlink_policy") != spec.symlink_policy:
+            raise SnapshotError("legacy symlink policy differs from its catalog")
+        symlinks = _validated_symlinks(manifest.get("symlinks"))
+    else:
+        if "symlinks" in manifest or "symlink_policy" in manifest:
+            raise SnapshotError("unexpected legacy symlink inventory")
+        symlinks = []
     if manifest.get("encoding_profile", DEFAULT_COMPRESSION_PROFILE) not in COMPRESSION_PROFILES:
         raise SnapshotError("unknown legacy archive encoding profile")
     if spec is not None and (
@@ -868,6 +1151,9 @@ def verify_archive_directory(
         raise SnapshotError("manual capture archive differs from allowlisted stability contract")
     if manual_capture and capture is None:
         raise SnapshotError("manual capture requires a matching captured archive")
+    if symlink_capture and (capture is None or capture.get("symlink_plan_sha256") != hashlib.sha256(
+            json.dumps(symlinks, sort_keys=True).encode()).hexdigest()):
+        raise SnapshotError("manual symlink plan digest differs from archive inventory")
     source_spec = spec or LegacyArchiveSpec(
         manifest["dataset"], manifest["relative_root"], 7, archive.parent
     )
@@ -879,7 +1165,19 @@ def verify_archive_directory(
             original_source = expected_source
     before_source = source_plan(source, source_spec, manual_capture=manual_capture,
         original_source=original_source) if source is not None else None
+    before_symlinks = None
+    if source is not None and symlink_capture:
+        logical_source = (artifact_root.resolve() / source_spec.relative_root
+                          if artifact_root is not None else source)
+        before_symlinks = _archive_symlinks(source, source_spec, original_source=logical_source)
+        def portable_link(row):
+            return {"path": row["path"], "target_b64": row["target_b64"],
+                    "source": {key: row["source"][key] for key in ("size", "mtime_ns", "mode")}}
+        if list(map(portable_link, before_symlinks)) != list(map(portable_link, symlinks)):
+            raise SnapshotError("legacy source symlinks differ from the archive")
     directories = manifest.get("directories")
+    if symlink_capture and not isinstance(directories, list):
+        raise SnapshotError("symlink archive requires its complete directory inventory")
     if directories is not None:
         if not isinstance(directories, list):
             raise SnapshotError("legacy directory inventory is invalid")
@@ -891,7 +1189,7 @@ def verify_archive_directory(
                 or type(row["mtime_ns"]) is not int or row["mtime_ns"] < 0):
                 raise SnapshotError("legacy directory descriptor is invalid")
             seen_directories.add(relative)
-        if source is not None and _archive_directories(source) != directories:
+        if source is not None and _archive_directories(source, allow_symlinks=symlink_capture) != directories:
             raise SnapshotError("legacy source directory inventory differs")
     if manual_capture and source is not None:
         if artifact_root is None:
@@ -912,27 +1210,34 @@ def verify_archive_directory(
     if progress is not None:
         progress({'stage': 'decode-originals', 'completed_items': 0, 'total_items': len(rows),
                   'completed_bytes': 0, 'total_bytes': original_bytes})
-    for index, row in enumerate(rows, start=1):
-        relative = _safe_relative_path(row["path"], "legacy archived path").as_posix()
-        encoded = _safe_relative_path(row["encoded_path"], "legacy payload path").as_posix()
-        if relative in expected_original or encoded in expected_encoded:
-            raise SnapshotError("duplicate legacy archive path")
-        expected_original.add(relative)
-        expected_encoded.add(encoded)
+
+    def checked_rows():
+        for row in rows:
+            relative = _safe_relative_path(row["path"], "legacy archived path").as_posix()
+            encoded = _safe_relative_path(row["encoded_path"], "legacy payload path").as_posix()
+            if relative in expected_original or encoded in expected_encoded:
+                raise SnapshotError("duplicate legacy archive path")
+            expected_original.add(relative)
+            expected_encoded.add(encoded)
+            yield row, relative, encoded
+
+    large_file_lock = threading.Lock()
+
+    def verify_row(checked):
+        row, relative, encoded = checked
         encoded_file = archive.joinpath(*PurePosixPath(encoded).parts)
-        if (
-            not encoded_file.is_file()
-            or encoded_file.is_symlink()
-            or archive.resolve() not in encoded_file.resolve().parents
-        ):
-            raise SnapshotError(f"legacy encoded file missing: {encoded}")
-        if encoded_file.stat().st_size != row["encoded_size"]:
+        encoded_signature = encoded_paths.regular_file_signature(encoded)
+        if encoded_signature[2] != row["encoded_size"]:
             raise SnapshotError(f"legacy encoded file differs: {encoded}")
-        encoded_digest, encoded_size, digest, size = _encoded_original_hashes(encoded_file, row["codec"])
+        with large_file_lock if row['encoded_size'] >= NATIVE_ENCODED_READ_MIN_BYTES else nullcontext():
+            encoded_digest, encoded_size, digest, size = _encoded_original_hashes(encoded_file, row["codec"])
+        if encoded_paths.regular_file_signature(encoded) != encoded_signature:
+            raise SnapshotError(f"legacy encoded file changed during verification: {encoded}")
         if encoded_size != row["encoded_size"] or encoded_digest != row["encoded_sha256"]:
             raise SnapshotError(f"legacy encoded file differs: {encoded}")
         if digest != row["original_sha256"] or size != row["source"]["size"]:
             raise SnapshotError(f"legacy decode proof differs: {relative}")
+        drift = None
         if source is not None:
             original = source.joinpath(*PurePosixPath(relative).parts)
             if original.is_symlink() or not original.is_file():
@@ -950,15 +1255,48 @@ def verify_archive_directory(
                 raise SnapshotError(f"legacy source differs: {relative}")
             changed = [key for key in ("device", "inode", "ctime_ns") if before[key] != row["source"][key]]
             if changed:
-                source_metadata_drift.append({"path": relative, "changed_observations": changed,
-                                              "current_signature": before, "exact_sha256": original_digest})
+                drift = {"path": relative, "changed_observations": changed,
+                         "current_signature": before, "exact_sha256": original_digest}
+        return size, drift
+
+    def verified_rows():
+        checked = checked_rows()
+        if file_workers == 1:
+            yield from map(verify_row, checked)
+            return
+        # The archive manifest is untrusted input. Keep outstanding checks
+        # bounded, validate unique safe paths in the owner thread, and retain
+        # the same pass-pinned directory and per-file generation checks.
+        with ThreadPoolExecutor(max_workers=file_workers) as executor:
+            while batch := list(itertools.islice(checked, 64)):
+                yield from executor.map(verify_row, batch)
+
+    for index, (size, drift) in enumerate(verified_rows(), start=1):
+        if drift is not None:
+            source_metadata_drift.append(drift)
         total += size
         if progress is not None:
             progress({'stage': 'decode-originals', 'completed_items': index, 'total_items': len(rows),
                       'completed_bytes': total, 'total_bytes': original_bytes})
-    observed = {p.relative_to(archive).as_posix() for p in archive.rglob("*") if p.is_file()}
+    # Census does bounded metadata reads only, distinct from content decoding.
+    # On the exact enrolled D archive, a small-shard measurement supported
+    # eight metadata workers; preserve the four-worker content limit.
+    census_workers = 8 if file_workers == 4 and _d_stage_file_workers(spec, archive) == 4 else file_workers
+    observed = _archive_encoded_census(archive, file_workers=census_workers,
+                                       progress=progress, expected_items=len(expected_encoded))
     if observed != expected_encoded:
         raise SnapshotError("legacy encoded tree has extra or missing files")
+    if symlink_capture:
+        link_paths = {row["path"] for row in symlinks}
+        directory_paths = {row["path"] for row in directories or []}
+        occupied = expected_original | directory_paths | link_paths
+        if (link_paths & (expected_original | directory_paths)
+                or directory_paths & expected_original
+                or ".LEGACY_RESTORED.json" in occupied
+                or any(other.startswith(link + "/") for link in link_paths for other in occupied)
+                or any(str(parent) != "." and parent.as_posix() not in directory_paths
+                       for name in occupied for parent in PurePosixPath(name).parents)):
+            raise SnapshotError("legacy symlink paths overlap other restored members")
     if source is not None:
         after_source = source_plan(source, source_spec, manual_capture=manual_capture,
                                   original_source=original_source)
@@ -967,12 +1305,17 @@ def verify_archive_directory(
             raise SnapshotError("legacy source has extra or missing files")
         if before_source != after_source:
             raise SnapshotError("legacy source changed during verification")
-        if directories is not None and _archive_directories(source) != directories:
+        if directories is not None and _archive_directories(source, allow_symlinks=symlink_capture) != directories:
             raise SnapshotError("legacy directories changed during verification")
+        if symlink_capture and _archive_symlinks(source, source_spec, original_source=logical_source) != before_symlinks:
+            raise SnapshotError("legacy symlinks changed during verification")
         if manual_capture:
             _manual_capture_usage_gate(source, artifact_root.resolve(), repo_root=repo_root, spec=spec)
-    return {"dataset": manifest["dataset"], "files": len(rows), "original_bytes": total, "manifest": manifest,
-            "source_metadata_drift": source_metadata_drift}
+    proof = {"dataset": manifest["dataset"], "files": len(rows), "original_bytes": total, "manifest": manifest,
+             "source_metadata_drift": source_metadata_drift}
+    if symlink_capture:
+        proof["symlinks"] = len(symlinks)
+    return proof
 
 
 def publish_archive(
@@ -982,6 +1325,7 @@ def publish_archive(
     batch_directory_fsync: bool = False,
     pack_buckets: int = 32,
     publication_owner=None,
+    publication_progress=None,
 ):
     if type(defer_scan) is not bool or type(batch_directory_fsync) is not bool:
         raise SnapshotError("defer_scan and batch_directory_fsync must be booleans")
@@ -989,6 +1333,8 @@ def publish_archive(
         raise SnapshotError("legacy publication pack_buckets must be an integer between 1 and 4096")
     if publication_owner is not None and not callable(publication_owner):
         raise SnapshotError('legacy publication owner must be a context factory')
+    if publication_progress is not None and not callable(publication_progress):
+        raise SnapshotError('legacy publication progress must be a callback')
     if spec.compression_profile not in COMPRESSION_PROFILES:
         raise SnapshotError('unknown legacy compression profile')
     if not spec.durable_staging and not manual_capture:
@@ -999,15 +1345,24 @@ def publish_archive(
     source, _stage, archive = _paths(spec, artifact_root.resolve())
     if not (archive / 'legacy_archive_manifest.json').exists():
         prepare_archive(spec, artifact_root, manual_capture=manual_capture, repo_root=repo_root)
+    # The enrolled D scratch already supports bounded parallel decoding in
+    # recovery/pruning. Use that same verifier for BOTH publication fences;
+    # the default single-worker argument previously serialized these passes.
+    # Other archives retain their original sequential admission.
+    file_workers = _d_stage_file_workers(spec, archive) if manual_capture else 1
     # A complete stage keeps its original observation provenance. Re-verify
     # every encoded/original byte and current source signature, rather than
     # recreating source_plan after another verified hard link was removed.
     proof = verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
-                                     artifact_root=artifact_root, repo_root=repo_root)
+                                     artifact_root=artifact_root, repo_root=repo_root,
+                                     file_workers=file_workers)
     baseline = source_plan(source, spec, manual_capture=manual_capture)
+    baseline_symlinks = _archive_symlinks(source, spec) if _opaque_symlinks_enabled(spec) else None
     def source_guard():
         if source_plan(source, spec, manual_capture=manual_capture) != baseline:
             raise SnapshotError("legacy source changed before cold commit")
+        if baseline_symlinks is not None and _archive_symlinks(source, spec) != baseline_symlinks:
+            raise SnapshotError("legacy symlinks changed before cold commit")
         if manual_capture:
             _manual_capture_usage_gate(source, artifact_root.resolve(), repo_root=repo_root, spec=spec)
     # Full C/original validation and subsequent D recovery are independent
@@ -1031,14 +1386,27 @@ def publish_archive(
             source_guard=source_guard,
             **({"defer_scan": True} if defer_scan else {}),
             **({"batch_directory_fsync": True} if batch_directory_fsync else {}),
+            **({"progress": publication_progress} if publication_progress is not None else {}),
+            # These guarded D stages are closed legacy archives, and measured
+            # small-file 9p reads benefit from bounded concurrent prefetch.
+            # The canonical pack bytes and source/recovery fences stay intact.
+            **({"pack_source_workers": 8}
+               if manual_capture and spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)
+               else {}),
             **_native_publish_options(sync_root),
         )
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive, **_native_read_options(sync_root))
     # Publication may have been slow. Never declare the hot source preserved
     # if it changed after the archive verification but before the cold commit.
     verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
-                             artifact_root=artifact_root, repo_root=repo_root)
+                             artifact_root=artifact_root, repo_root=repo_root,
+                             file_workers=file_workers)
     return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256, "source_files": proof["files"], "source_bytes": proof["original_bytes"], "cold_bytes": resolved.manifest["archive"]["stored_bytes"]}
+
+
+def _verification_filesystem(path: Path) -> str:
+    return subprocess.run(['findmnt', '-n', '-o', 'FSTYPE', '-T', str(path)],
+                          capture_output=True, text=True, check=True, timeout=10).stdout.strip()
 
 
 def verify_cold_archive(
@@ -1068,8 +1436,22 @@ def verify_cold_archive(
     admission = None
     if verification_root is None:
         scratch_parent = Path(tempfile.gettempdir())
-        if shutil.disk_usage(scratch_parent).free < needed + 32 * 1024**3:
+        required = needed + 32 * 1024**3
+        free = shutil.disk_usage(scratch_parent).free
+        if free < required:
             raise SnapshotError("verification scratch lacks bounded space plus 32 GiB reserve")
+        mount = _verification_filesystem(scratch_parent)
+        if mount == 'tmpfs':
+            # tmpfs is a memory/swap workspace, not a WSL ext4 allocation.
+            # Its free-space admission is not proof of unswapped RAM or of C
+            # backing capacity; preserve that distinction in the receipt.
+            admission = {'filesystem': mount, 'available_bytes': free, 'required_bytes': required,
+                         'physical_backing_verified': False}
+        else:
+            # WSL's virtual ext4 free space can exceed the Windows volume
+            # backing its VHDX. Check it before allocating the default tree.
+            from stockagent.data_sync.training_return import admit_workspace
+            admission = admit_workspace(scratch_parent, required)
     else:
         scratch_parent = verification_root.absolute()
         cold = sync_root.resolve()
@@ -1128,16 +1510,27 @@ def _verify_cold_using_existing_encoding(spec, sync_root, resolved, archive, *, 
     expected_manifest_sha = metadata.get("legacy_manifest_sha256")
     if sha256_file(manifest_path) != expected_manifest_sha:
         raise SnapshotError("existing recovery manifest differs from fixed cold metadata")
+    # Measured DrvFs per-file latency dominates these two enrolled D stages.
+    # Parallelism is bounded to four reads; every hash, tree scan and the
+    # independent cold reconstruction remain in this same transaction.
+    file_workers = _d_stage_file_workers(spec, archive)
     def report(step):
         return None if progress is None else lambda value: progress({"recovery_step": step, **value})
     with _verified_packed_inventory(
             sync_root, resolved, materialized_path=archive, reconstruct_all=True,
             **_native_read_options(sync_root),
-            progress=report("independent-cold-reconstruction")) as (entries, cold_proof):
-        proof = verify_archive_directory(archive, spec=spec, progress=report("decode-originals"))
+            progress=report("independent-cold-reconstruction"),
+            materialized_file_workers=file_workers) as (entries, cold_proof):
+        proof = verify_archive_directory(archive, spec=spec, progress=report("decode-originals"),
+                                         file_workers=file_workers)
         # A producer may have changed an earlier file while a later original
         # was decoding. Recheck the complete local tree, not only its manifest.
-        _verify_materialized(archive, resolved.manifest, entries)
+        if progress is None:
+            _verify_materialized(archive, resolved.manifest, entries, file_workers=file_workers)
+        else:
+            _verify_materialized(archive, resolved.manifest, entries,
+                                 progress=report("decode-originals"),
+                                 stage="verify-materialized-post-decode", file_workers=file_workers)
         if sha256_file(manifest_path) != expected_manifest_sha:
             raise SnapshotError("existing recovery manifest changed during decode")
     proof.update(snapshot_id=resolved.manifest["snapshot_id"],
@@ -1178,6 +1571,29 @@ def _prunable_stage(spec: LegacyArchiveSpec) -> bool:
             and spec.manual_capture_min_stable_hours >= 12)
 
 
+def _stage_prune_metadata_workers(spec: LegacyArchiveSpec, stage: Path) -> int:
+    """Bound D scratch metadata/receipts separately from content decoding.
+
+    Only the exact enrolled D stage (or this owner's named prune quarantine)
+    can use the measured eight-worker path. Do not spend descriptor headroom
+    on a process with a small or unobservable limit. C scratch stays serial.
+    """
+    content_workers = _d_stage_file_workers(spec, stage / 'archive')
+    if content_workers != 4 or not _prunable_stage(spec):
+        return content_workers
+    try:
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft_limit != resource.RLIM_INFINITY:
+            # Eight receipt readers need descriptors concurrently; the limit
+            # alone does not show whether another part of this owner has
+            # already spent the reserve. An unobservable count fails closed.
+            if soft_limit < 64 or soft_limit - len(os.listdir('/proc/self/fd')) < 16:
+                return content_workers
+    except (OSError, ValueError, OverflowError):
+        return content_workers
+    return 8
+
+
 def plan_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path
 ) -> dict[str, Any]:
@@ -1190,7 +1606,6 @@ def plan_archive_stage_prune(
         raise SnapshotError("stage pruning is restricted to the reviewed temporary roots")
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     from stockagent.data_sync.materialized_cache import process_references, _pinned_snapshot_ids
-    from stockagent.data_sync.artifact_retirement import _reclaimable_file_bytes
 
     _check_d_primary_mount(sync_root)
     source = artifact_root.resolve() / spec.relative_root
@@ -1208,40 +1623,52 @@ def plan_archive_stage_prune(
     if str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized")):
         raise SnapshotError("encoding stage release is pinned")
     generation = _stage_cold_generation(sync_root, spec)
+    archive = stage / "archive"
+    workers = _d_stage_file_workers(spec, archive)
+    metadata_workers = _stage_prune_metadata_workers(spec, stage)
     identity_before = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
                        "manifest_sha256": resolved.manifest_sha256}
-    stage_before = _stage_prune_fingerprint(stage, identity_before)
-    archive = stage / "archive"
-    proof = verify_archive_directory(archive, spec=spec)
+    stage_before = _stage_prune_fingerprint(stage, identity_before, file_workers=metadata_workers)
+    proof = verify_archive_directory(archive, spec=spec, file_workers=workers)
     if sha256_file(archive / "legacy_archive_manifest.json") != resolved.manifest.get("metadata", {}).get("legacy_manifest_sha256"):
         raise SnapshotError("encoding stage manifest differs from the cold release")
     inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
                            reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
-                           **_native_read_options(sync_root))
+                           materialized_file_workers=workers, **_native_read_options(sync_root))
     rows = proof["manifest"]["files"]
     if json.loads((stage / "source_plan.json").read_text()) != [
         {"path": row["path"], "source": row["source"]} for row in rows
     ]:
         raise SnapshotError("encoding stage source-plan control file differs")
     expected = {"source_plan.json", "archive/legacy_archive_manifest.json"}
-    for row in rows:
-        expected.add("archive/" + row["encoded_path"])
+    if _opaque_symlinks_enabled(spec):
+        link_plan = stage / "symlink_plan.json"
+        if (link_plan.is_symlink() or not link_plan.is_file()
+                or link_plan.stat().st_size > 64 * 1024 * 1024
+                or json.loads(link_plan.read_text()) != proof["manifest"]["symlinks"]):
+            raise SnapshotError("encoding stage symlink-plan control file differs")
+        expected.add("symlink_plan.json")
+    def check_receipt(row):
         key = hashlib.sha256(row["path"].encode()).hexdigest()
         name = "receipts/" + key + ".json"
         if json.loads((stage / name).read_text()) != row:
             raise SnapshotError("encoding stage per-file receipt differs")
+        return name
+
+    def checked_receipts():
+        if metadata_workers == 1:
+            yield from map(check_receipt, rows)
+            return
+        with ThreadPoolExecutor(max_workers=metadata_workers) as executor:
+            iterator = iter(rows)
+            while batch := list(itertools.islice(iterator, 64)):
+                yield from executor.map(check_receipt, batch)
+
+    for row, name in zip(rows, checked_receipts()):
+        expected.add("archive/" + row["encoded_path"])
         expected.add(name)
-    signatures = []
-    for parent, dirs, files in os.walk(stage, followlinks=False):
-        if any((Path(parent) / name).is_symlink() for name in dirs):
-            raise SnapshotError("encoding stage contains a symlink directory")
-        for name in files:
-            path = Path(parent) / name
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise SnapshotError("encoding stage contains a non-regular file")
-            signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(path.lstat())})
-    signatures.sort(key=lambda row: row["path"])
+    signatures, reclaimable = _stage_prune_signatures(stage, file_workers=metadata_workers, collect_allocation=True)
     observed_paths = {row["path"] for row in signatures}
     duplicates = []
     for extra in sorted(observed_paths-expected):
@@ -1271,22 +1698,49 @@ def plan_archive_stage_prune(
             "full_verification": {"contract": "owned-archive-stage-verification-v1",
                 "verified_at_epoch": time.time(), "cold_generation": generation,
                 "artifact_root": str(artifact_root.resolve()), "state_root": str(state_root.resolve())},
-            "reclaimable_allocated_file_bytes": _reclaimable_file_bytes(stage), "cold_objects_deleted": 0}
+            "reclaimable_allocated_file_bytes": reclaimable, "cold_objects_deleted": 0}
 
 
-def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any]) -> str:
+def _stage_prune_signatures(stage: Path, *, file_workers: int = 1, collect_allocation: bool = False):
+    """One fresh observation per file for both its type guard and identity.
+
+    Every caller still walks the complete tree. Nothing is cached between the
+    independent pre-verification, post-verification and quarantine fences.
+    """
+    if type(file_workers) is not int or not 1 <= file_workers <= 8:
+        raise ValueError('stage signature workers must be between 1 and 8')
     signatures = []
-    for parent, dirs, files in os.walk(stage, followlinks=False):
-        if any((Path(parent) / name).is_symlink() for name in dirs):
-            raise SnapshotError("encoding stage contains a symlink directory")
-        for name in files:
-            path = Path(parent) / name
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise SnapshotError("encoding stage contains a non-regular file")
-            signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(path.lstat())})
+    inodes: dict[tuple[int, int], list[int]] = {}
+    pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)
+    with pool as executor:
+        for parent, dirs, files in os.walk(stage, followlinks=False, onerror=_raise_walk_error):
+            directory = Path(parent)
+            for path, info in _iter_lstat_bounded((directory / name for name in dirs), executor):
+                if not stat.S_ISDIR(info.st_mode):
+                    raise SnapshotError("encoding stage contains a symlink directory or non-directory entry")
+            for path, info in _iter_lstat_bounded((directory / name for name in files), executor):
+                if not stat.S_ISREG(info.st_mode):
+                    raise SnapshotError("encoding stage contains a non-regular file")
+                signatures.append({"path": path.relative_to(stage).as_posix(), "source": _source_signature(info)})
+                if collect_allocation:
+                    # Same fresh lstat as the stage identity; do not count an
+                    # inode with names outside this exact deletion scope.
+                    key = (info.st_dev, info.st_ino)
+                    record = inodes.setdefault(key, [info.st_nlink, info.st_blocks * 512, 0])
+                    if record[:2] != [info.st_nlink, info.st_blocks * 512]:
+                        raise SnapshotError("retirement inode changed during space audit")
+                    record[2] += 1
     signatures.sort(key=lambda row: row["path"])
+    if collect_allocation:
+        reclaimable = sum(allocated for links, allocated, names in inodes.values() if links == names)
+        return signatures, reclaimable
+    return signatures
+
+
+def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any], *, file_workers: int = 1) -> str:
     identity = {"dataset": plan["dataset"], "snapshot_id": plan["snapshot_id"],
-                "manifest_sha256": plan["manifest_sha256"], "signatures": signatures}
+                "manifest_sha256": plan["manifest_sha256"],
+                "signatures": _stage_prune_signatures(stage, file_workers=file_workers)}
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
@@ -1301,6 +1755,14 @@ def apply_archive_stage_prune(
 
 
 def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint):
+    proof = plan.get("full_verification", {})
+    if not 0 <= time.time() - proof.get("verified_at_epoch", 0) <= 1500:
+        raise SnapshotError("owned encoding stage full verification expired or its generation changed")
+    _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
+
+
+def _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint):
+    """Identity gates only; this grants neither fresh proof nor deletion rights."""
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids
     _check_d_primary_mount(sync_root)
@@ -1309,7 +1771,6 @@ def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, ex
             or plan.get("stage") != str(spec.stage_root / spec.dataset)
             or plan.get("stage_fingerprint") != expected_fingerprint or plan.get("apply_ready") is not True
             or proof.get("contract") != "owned-archive-stage-verification-v1"
-            or not 0 <= time.time() - proof.get("verified_at_epoch", 0) <= 1500
             or proof.get("artifact_root") != str(artifact_root.resolve())
             or proof.get("state_root") != str(state_root.resolve())
             or proof.get("cold_generation") != _stage_cold_generation(sync_root, spec)):
@@ -1324,6 +1785,56 @@ def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, ex
             or source.exists() or source.is_symlink()
             or plan["snapshot_id"] in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))):
         raise SnapshotError("owned encoding stage retirement, source or pin gate changed")
+
+
+def recover_archive_stage_quarantine(
+    spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
+    owned_failed_plan: dict[str, Any], journal: Path,
+) -> dict[str, Any]:
+    """Return one exact interrupted quarantine for a new full audit, never unlink.
+
+    An expired plan binds only names/generations here. It is not renewed and
+    cannot authorize stage pruning. The normal full audit must run afterwards.
+    """
+    from stockagent.data_sync.materialized_cache import process_references
+    with _exclusive_lock(state_root / 'retirements' / f'{spec.dataset}.lock'):
+        plan = owned_failed_plan
+        fingerprint = plan['stage_fingerprint']
+        _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, fingerprint)
+        stage = spec.stage_root / spec.dataset
+        if stage.exists() or stage.is_symlink():
+            raise SnapshotError('stage quarantine recovery refuses to replace an existing stage')
+        candidates = [p for p in spec.stage_root.iterdir()
+                      if re.fullmatch(re.escape(f'.{spec.dataset}.pruning-') + r'[1-9][0-9]*', p.name)]
+        if len(candidates) != 1:
+            raise SnapshotError('stage quarantine recovery requires one exact owned quarantine')
+        quarantine = candidates[0]
+        owner_pid = int(quarantine.name.rsplit('-', 1)[1])
+        if (quarantine.is_symlink() or quarantine.resolve() != quarantine or not quarantine.is_dir()
+                or Path(f'/proc/{owner_pid}').exists()):
+            raise SnapshotError('stage quarantine recovery owner is active or path is redirected')
+        workers = _stage_prune_metadata_workers(spec, stage)
+        if (_stage_prune_fingerprint(quarantine, plan, file_workers=workers) != fingerprint
+                or process_references(quarantine) or process_references(stage)):
+            raise SnapshotError('stage quarantine changed or is in use; retained')
+        _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, fingerprint)
+        result = {'contract': 'owned-archive-stage-quarantine-recovery-v1',
+                  'dataset': spec.dataset, 'snapshot_id': plan['snapshot_id'],
+                  'manifest_sha256': plan['manifest_sha256'], 'stage_fingerprint': fingerprint,
+                  'failed_plan_sha256': hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest(),
+                  'quarantine': str(quarantine), 'stage': str(stage), 'state': 'restore_stage_intent',
+                  'proof_time_extended': False, 'deletion_authorized': False,
+                  'checked_at_epoch': time.time()}
+        atomic_write_json(journal, result)
+        os.rename(quarantine, stage)
+        fd = os.open(stage.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        result = {**result, 'state': 'stage_restored_requires_full_audit', 'checked_at_epoch': time.time()}
+        atomic_write_json(journal, result)
+        return result
 
 
 def _apply_archive_stage_prune(
@@ -1341,18 +1852,21 @@ def _apply_archive_stage_prune(
         stage = Path(plan["stage"])
         if stage.is_symlink() or stage.resolve() != stage or not stage.is_dir():
             raise SnapshotError("encoding stage is missing or redirected")
-        if _stage_prune_fingerprint(Path(plan["stage"]), plan) != expected_fingerprint:
+        metadata_workers = _stage_prune_metadata_workers(spec, stage)
+        if _stage_prune_fingerprint(Path(plan["stage"]), plan, file_workers=metadata_workers) != expected_fingerprint:
             raise SnapshotError("encoding stage changed after dry run")
     if plan["stage_fingerprint"] != expected_fingerprint:
         raise SnapshotError("encoding stage changed after dry run")
     stage = Path(plan["stage"])
+    workers = _d_stage_file_workers(spec, stage / 'archive')
+    metadata_workers = _stage_prune_metadata_workers(spec, stage)
     quarantine = stage.with_name(f".{spec.dataset}.pruning-{os.getpid()}")
     if quarantine.exists() or quarantine.is_symlink():
         raise SnapshotError("unfinished encoding stage quarantine requires audit")
     os.replace(stage, quarantine)
-    if _stage_prune_fingerprint(quarantine, plan) != expected_fingerprint:
+    if _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers) != expected_fingerprint:
         raise SnapshotError("encoding stage changed during rename; quarantine retained")
-    verify_archive_directory(quarantine / "archive", spec=spec)
+    verify_archive_directory(quarantine / "archive", spec=spec, file_workers=workers)
     _check_d_primary_mount(sync_root)
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     if owned_verified_plan is None:
@@ -1361,15 +1875,27 @@ def _apply_archive_stage_prune(
                                reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
                                **_native_read_options(sync_root))
     else:
-        # The same CLI owner just decoded every fixed D member outside this
-        # mutation. Retain the full post-rename encoding decode and fresh generation,
-        # source, state, pin, process and quarantine checks; never extend proof.
+        # Decode can take longer than the old proof lifetime on a small-file
+        # HDD stage. Admit with a fresh proof before mutation; if it expires
+        # during decoding, independently reconstruct the complete D release
+        # again. This is new full verification, never a timestamp extension.
+        _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
+        age = time.time() - plan['full_verification']['verified_at_epoch']
+        if age > 1500:
+            cold_proof = verify_packed_snapshot(sync_root, resolved, reconstruct_all=True,
+                                               **_native_read_options(sync_root))
+            _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
+            old_proof = plan['full_verification']
+            plan = {**plan, 'prior_full_verification': old_proof,
+                    'quarantine_cold_reconstruction': cold_proof,
+                    'full_verification': {**old_proof, 'verified_at_epoch': time.time(),
+                        'verification_reason': 'complete_D_reconstruction_after_quarantine_decode'}}
         _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
     source = artifact_root.resolve() / spec.relative_root
     if (resolved.manifest_sha256 != plan["manifest_sha256"] or process_references(quarantine)
         or process_references(stage) or source.exists() or source.is_symlink()
         or str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))
-        or _stage_prune_fingerprint(quarantine, plan) != expected_fingerprint):
+        or _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers) != expected_fingerprint):
         raise SnapshotError("encoding stage final gates changed; quarantine retained")
     shutil.rmtree(quarantine)
     return {**plan, "pruned": True, "reclaimed_allocated_file_bytes": plan["reclaimable_allocated_file_bytes"]}
@@ -1403,22 +1929,24 @@ def restore_archive(
     proof = verify_archive_directory(archive, spec=spec)
     manifest = proof["manifest"]
     selected = manifest["files"]
+    selected_symlinks = list(manifest.get("symlinks", []))
     if include_paths is not None:
         requested = {_safe_relative_path(p, "requested restore member").as_posix()
                      for p in include_paths}
         if not requested:
             raise SnapshotError("selective restore requires at least one exact member")
         selected = [row for row in selected if row["path"] in requested]
-        if {row["path"] for row in selected} != requested:
+        selected_symlinks = [row for row in selected_symlinks if row["path"] in requested]
+        if {row["path"] for row in (*selected, *selected_symlinks)} != requested:
             raise SnapshotError("selected restore members are absent from the fixed archive")
     temporary = destination.with_name(destination.name + f".partial-{os.getpid()}")
     if temporary.exists() or temporary.is_symlink():
         raise SnapshotError(f"stale restore staging path needs audit: {temporary}")
-    temporary.mkdir(parents=True, exist_ok=False)
+    temporary.mkdir(parents=True, exist_ok=False, mode=0o700 if _opaque_symlinks_enabled(spec) else 0o777)
     directories = [row for row in manifest.get("directories", [])
                    if include_paths is None or any(
                        PurePosixPath(row["path"]) in PurePosixPath(item["path"]).parents
-                       for item in selected)]
+                       for item in (*selected, *selected_symlinks))]
     for row in directories:
         temporary.joinpath(*PurePosixPath(row["path"]).parts).mkdir(parents=True, exist_ok=True)
     for row in selected:
@@ -1435,6 +1963,19 @@ def restore_archive(
             raise SnapshotError(f"restored legacy file differs: {relative}")
         target.chmod(row["source"]["mode"])
         os.utime(target, ns=(target.stat().st_atime_ns, row["source"]["mtime_ns"]))
+    # All real directories and files are already populated. Create links last,
+    # and never open their targets, even for an absolute or dangling link.
+    for row in selected_symlinks:
+        target = temporary.joinpath(*PurePosixPath(row["path"]).parts)
+        link_bytes = base64.b64decode(row["target_b64"], validate=True)
+        os.symlink(link_bytes, os.fsencode(target))
+        os.utime(target, ns=(row["source"]["mtime_ns"], row["source"]["mtime_ns"]), follow_symlinks=False)
+        info = target.lstat()
+        if (not stat.S_ISLNK(info.st_mode) or info.st_size != row["source"]["size"]
+                or stat.S_IMODE(info.st_mode) != row["source"]["mode"]
+                or info.st_mtime_ns != row["source"]["mtime_ns"]
+                or os.readlink(os.fsencode(target)) != link_bytes):
+            raise SnapshotError(f"restored legacy symlink differs: {row['path']}")
     for row in sorted(directories, key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
         target = temporary.joinpath(*PurePosixPath(row["path"]).parts)
         target.chmod(row["mode"])
@@ -1442,12 +1983,15 @@ def restore_archive(
     atomic_write_json(
         temporary / ".LEGACY_RESTORED.json",
         {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256, "deployable": False,
-         "restored_members": [row["path"] for row in selected],
+         "restored_members": [row["path"] for row in (*selected, *selected_symlinks)],
          "restore_scope": "selected_exact_members" if include_paths is not None else "complete_archive"},
     )
     if destination.exists() or destination.is_symlink():
         raise SnapshotError(f"restore destination appeared during verification: {destination}")
     os.replace(temporary, destination)
-    return {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "destination": str(destination),
-            "files": len(selected), "original_bytes": sum(row["source"]["size"] for row in selected),
-            "archive_files_verified": proof["files"], "restore_scope": "selected_exact_members" if include_paths is not None else "complete_archive"}
+    result = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"], "destination": str(destination),
+              "files": len(selected), "original_bytes": sum(row["source"]["size"] for row in selected),
+              "archive_files_verified": proof["files"], "restore_scope": "selected_exact_members" if include_paths is not None else "complete_archive"}
+    if _opaque_symlinks_enabled(spec):
+        result["symlinks"] = len(selected_symlinks)
+    return result

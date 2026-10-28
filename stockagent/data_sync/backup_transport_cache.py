@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import stat
+from types import SimpleNamespace
 
 from scripts.backup_delivery_receipt import validate_ack
 from scripts.verify_backup_delivery import regular
@@ -22,6 +23,21 @@ from stockagent.data_sync.packed_backup import PinnedObjectSignatures, safe_path
 from stockagent.runtime_identity import identity_sha256
 
 CONTRACT = "verified_reconstructible_cold_transport_cache_retirement_v1"
+
+
+def source_scope(queue, delivery):
+    """Resolve only the enrolled public/private immutable authority for GC."""
+    if delivery['dispatch']['delivery_kind'] == 'private_immutable_cold_backup':
+        from stockagent.data_sync.private_cold_backup import validate_private_root, NAMESPACE
+        root = queue.cold / '.local-state/private-history'
+        validate_private_root(root, queue.config.get('private_history_backup', {}))
+        if any(not r['relative'].startswith(NAMESPACE) for r in delivery['files']):
+            raise SnapshotError('private transport mixes another source namespace')
+        rows = [{**r, 'relative': r['relative'][len(NAMESPACE):]} for r in delivery['files']]
+        return SimpleNamespace(cold=root, state=queue.state), rows, ''
+    if delivery['dispatch']['delivery_kind'] != 'incremental_cold_objects':
+        raise SnapshotError('only machine-ACKed cold-object copies are cache candidates')
+    return queue, delivery['files'], 'cold/'
 
 
 def process_roots(transport: Path, batch: Path, *, mountinfo: str | None = None) -> tuple[Path, ...]:
@@ -83,8 +99,9 @@ def source_path(queue, row: dict, *, retain_head: bool = False, pinned=None) -> 
 
 def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool = False) -> dict:
     dispatch = delivery["dispatch"]
-    if dispatch["delivery_kind"] != "incremental_cold_objects" or not delivery.get("acceptance"):
+    if not delivery.get("acceptance"):
         raise SnapshotError("only machine-ACKed cold-object copies are cache candidates")
+    source_queue, source_rows, prefix = source_scope(queue, delivery)
     validate_ack(delivery["acceptance"], dispatch)
     key = dispatch["envelope_identity_sha256"]
     if dispatch["batch_relative"] != "batch-" + key:
@@ -100,21 +117,21 @@ def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool 
     if raw is None and not resume:
         raise SnapshotError("cold cache envelope is missing")
     files = {r["relative"]: r for r in envelope["files"]}
-    required = {"cold/" + r["relative"] for r in delivery["files"]}
+    required = {prefix + r["relative"] for r in delivery["files"]}
     if set(files) != required or set(delivery.get("transport_signatures", {})) != required:
         raise SnapshotError("cold cache lacks its full-SHA signature proof")
     source_proofs = []
-    with PinnedObjectSignatures(queue.cold) as pinned:
-        for row in delivery["files"]:
-            member = files["cold/" + row["relative"]]
+    with PinnedObjectSignatures(source_queue.cold) as pinned:
+        for recorded, row in zip(delivery['files'], source_rows, strict=True):
+            member = files[prefix + recorded["relative"]]
             if (member["sha256"], member["bytes"]) != (row["sha256"], row["bytes"]):
                 raise SnapshotError("cold cache member differs from its source journal")
-            original = source_path(queue,row,pinned=pinned)
+            original = source_path(source_queue,row,pinned=pinned)
             observed = (pinned.signature(row["relative"]) if row["relative"].startswith("objects/")
                         else signature(original) if original else None)
             if observed is not None and not row["relative"].startswith("heads/") and not same_ntfs_signature(observed,row["signature"]):
                 raise SnapshotError("original cold source changed during its pinned proof")
-            source_proofs.append({"relative":row["relative"],"sha256":row["sha256"],
+            source_proofs.append({"relative":recorded["relative"],"sha256":row["sha256"],
                 "source_signature":list(observed) if observed is not None else None,
                 "captured_head_retained_in_journal":original is None})
         pinned.recheck()
@@ -191,9 +208,10 @@ def retire(queue, ledger: dict, key: str) -> dict:
         return delivery["cache_retirement"]
     plan = build_plan(queue, delivery, root=stage if stage.exists() else batch, resume=stage.exists())
     if not stage.exists():
-        with PinnedObjectSignatures(queue.cold) as pinned:
-            for row in delivery["files"]:
-                source_path(queue,row,retain_head=True,pinned=pinned)
+        source_queue, source_rows, _prefix = source_scope(queue, delivery)
+        with PinnedObjectSignatures(source_queue.cold) as pinned:
+            for row in source_rows:
+                source_path(source_queue,row,retain_head=True,pinned=pinned)
             pinned.recheck()
         delivery["cache_retirement"] = {**plan, "state": "prepared"}
         private_json(queue.ledger_path, ledger)

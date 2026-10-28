@@ -39,6 +39,7 @@ from stockagent.data.tw_security import (
 from downloader.tw_public_contract import DAILY_CLOSE_OPTIONAL_DATASETS
 from downloader.artifact_io import atomic_write_json
 from stockagent.data.tw_public_incremental import _generation, table_content_sha256
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 
 
 OFFICIAL_SOURCE_NAME = "twse_tpex_official"
@@ -3723,5 +3724,17 @@ def _report_rows(results):
     return rows
 
 
+def _cli() -> int:
+    try:
+        main()
+    except CapacityDeferred as error:
+        # The owner must retry after capacity changes, not immediately repeat
+        # the same expensive build while the safety reservation is denied.
+        print(json.dumps({"event": "official_symbol_build_deferred",
+                          "capacity": error.details}, sort_keys=True), file=sys.stderr)
+        return 75
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(_cli())

@@ -18,6 +18,7 @@ function harness({overnight = false, latestOnly = true} = {}) {
     window: {setTimeout: (fn, ms) => { timers.set(++timerId, {fn, ms}); return timerId; }, clearTimeout: (id) => timers.delete(id)},
     setHtml: () => {}, esc: String, strategyLabel: (row) => row.label,
     renderPriceSources: () => {},
+    recoveryRequests: 0, scheduleStatusRecovery: () => { context.recoveryRequests++; },
     Dashboard: {},
     Date, Map, Set, AbortController, console,
   });
@@ -76,8 +77,8 @@ test("optional year-to-date starts at 2026-01-01 and follows new sessions withou
   }
 });
 
-test("default performance also keeps the server-clock rollover observer", () => {
-  const {context, run, timers} = harness({latestOnly: false});
+test("overnight performance keeps the server-clock rollover observer", () => {
+  const {context, run, timers} = harness({overnight: true, latestOnly: false});
   let refreshed = 0;
   context.refresh = () => { refreshed++; };
   context.sync = {generated_at_utc: "2026-10-19T00:29:59Z", session_clock: {next_rollover_at: "2026-10-19T08:30:00+08:00"}};
@@ -149,8 +150,8 @@ test("date transition clears stale rows and invalidates decoded old requests", (
   assert.equal(run("historyRequestSequence"), 1);
 });
 
-test("08:30 timer uses server clock, fresh revisions advance a stale timer", () => {
-  const {context, run, timers} = harness();
+test("overnight rollover timer uses server clock, fresh revisions advance a stale timer", () => {
+  const {context, run, timers} = harness({overnight: true});
   let refreshed = 0;
   context.refresh = () => { refreshed++; };
   context.sync = {generated_at_utc: "2026-09-09T00:29:00Z", session_clock: {next_rollover_at: "2026-09-09T08:30:00+08:00"}};
@@ -164,6 +165,16 @@ test("08:30 timer uses server clock, fresh revisions advance a stale timer", () 
   assert.equal(refreshed, 1);
   run("followLatestSession = false; scheduleSessionRollover(sync)");
   assert.equal(timers.size, 1);
+});
+
+test("day-trade session rollover waits for the ordinary minute refresh", () => {
+  const {context, run, timers} = harness();
+  let refreshed = 0;
+  context.refresh = () => { refreshed++; };
+  context.sync = {generated_at_utc: "2026-09-09T00:29:59Z", session_clock: {next_rollover_at: "2026-09-09T08:30:00+08:00"}};
+  run("scheduleSessionRollover(sync)");
+  assert.equal(timers.size, 0);
+  assert.equal(refreshed, 0);
 });
 
 test("a never-finishing history cannot delay core details and events stay deferred", async () => {
@@ -189,6 +200,83 @@ test("a never-finishing history cannot delay core details and events stay deferr
     "signals", "positions", "history",
     "signals", "positions", "events", "history",
   ]);
+});
+
+test("a failed first status recovers without a new source revision or page reload", async () => {
+  for (const overnight of [false, true]) {
+    const {context, run, data, byId, timers} = harness({overnight});
+    let requests = 0;
+    const timeout = Object.assign(new Error("Request timed out"), {name: "TimeoutError"});
+    Object.assign(context, {
+      fetchWithTimeout: async () => { requests++; return {}; },
+      Dashboard: {readJsonResponse: async () => { if (requests === 1) throw timeout; return data("2026-09-09"); }},
+      revisionOf: () => "unchanged", render: () => {},
+      loadSignals: () => {}, loadPositions: () => {}, loadEvents: () => {}, loadChartHistory: () => {},
+    });
+    run(app.slice(app.indexOf("async function refresh({"), app.indexOf("function activateTwPublicMonitor()")));
+    await run("refresh()");
+    assert.equal(requests, 1);
+    assert.equal(run("snapshot"), null);
+    assert.equal(byId("health").textContent, "UNAVAILABLE");
+    assert.match(byId("alert").textContent, /TimeoutError/);
+    assert.equal(timers.size, 1);
+    const [id, timer] = [...timers][0];
+    assert.equal(timer.ms, 250);
+    timers.delete(id); timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(requests, 2);
+    assert.equal(run("snapshot.session_date"), "2026-09-09");
+    assert.equal(run("statusRecoveryAttempts"), 0);
+    assert.equal(run("statusRecoveryTimer"), null);
+    assert.equal(timers.size, 0);
+  }
+});
+
+test("overnight recovery is bounded, hidden-aware and cannot erase retained data with an invalid snapshot", async () => {
+  const {context, run, data, timers} = harness({overnight: true});
+  context.retained = data("2026-09-09");
+  Object.assign(context, {
+    fetchWithTimeout: async () => ({}), Dashboard: {readJsonResponse: async () => ({})},
+    revisionOf: () => "unchanged", render: () => {},
+  });
+  run("snapshot = retained; signalRows = [{symbol:'2330'}]; positionRows = [{symbol:'0050'}]");
+  run(app.slice(app.indexOf("async function refresh({"), app.indexOf("function activateTwPublicMonitor()")));
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await run("refresh()");
+    assert.equal(timers.size, 1);
+    assert.equal([...timers.values()][0].ms, Math.min(250 * (2 ** attempt), 30000));
+    assert.equal(run("snapshot === retained"), true);
+    assert.equal(run("signalRows[0].symbol"), "2330");
+    assert.equal(run("positionRows[0].symbol"), "0050");
+  }
+  run("document.hidden = true; cancelStatusRecovery(); scheduleStatusRecovery()");
+  assert.equal(timers.size, 0);
+  assert.equal(run("statusRecoveryTimer"), null);
+});
+
+test("a coherent notice recovers a missing snapshot without duplicating its in-flight or pushed fetch", () => {
+  const {context, run} = harness();
+  let refreshes = 0;
+  context.refresh = () => { refreshes++; };
+  context.notice = {revision_token:"same", engine_generation:"engine", state_revision:1, content_revision:1};
+  run(app.slice(app.indexOf("function acceptServiceRevision("), app.indexOf("function acceptServiceStatus(")));
+  run("refreshInFlight = true; acceptServiceRevision(notice)");
+  assert.equal(refreshes, 0);
+  run("refreshInFlight = false; acceptServiceRevision(notice, {statusExpected:true})");
+  assert.equal(refreshes, 0);
+  assert.equal(context.recoveryRequests, 1);
+  run("acceptServiceRevision(notice)");
+  assert.equal(refreshes, 1);
+});
+
+test("an initial legacy notice without a generation cannot dereference the absent previous notice", () => {
+  const {context, run} = harness();
+  let refreshes = 0;
+  context.refresh = () => { refreshes++; };
+  context.notice = {revision_token:"legacy", state_revision:1, content_revision:1};
+  run(app.slice(app.indexOf("function acceptServiceRevision("), app.indexOf("function acceptServiceStatus(")));
+  assert.doesNotThrow(() => run("acceptServiceRevision(notice)"));
+  assert.equal(refreshes, 1);
 });
 
 test("a light status apply rearms visible revision paint without rebuilding unchanged cards", () => {
@@ -286,6 +374,7 @@ test("signal and event pages keep prior rows when an incomplete page arrives", a
     await run("loadSignals({force: true})");
     assert.equal(run("signalRows[0].symbol"), "old");
     assert.match(run("signalLoadError"), /訊號分頁範圍或筆數不完整/);
+    assert.equal(context.recoveryRequests, 1);
     page = {...page, rows: []};
     await run("loadSignals({force: true})");
     assert.equal(run("signalRows.length"), 0);
@@ -295,10 +384,34 @@ test("signal and event pages keep prior rows when an incomplete page arrives", a
     await run("loadEvents({force: true})");
     assert.equal(run("eventRows[0].symbol"), "old");
     assert.match(run("eventLoadError"), /事件分頁統計不完整/);
+    assert.equal(context.recoveryRequests, 2);
     page = {...page, order_total: 0};
     await run("loadEvents({force: true})");
     assert.equal(run("eventRows.length"), 0);
     assert.equal(run("eventRecordRevision === detailDataRevision('events')"), true);
+  }
+});
+
+test("independent view failures coalesce a bounded retry of the current selection without a new revision", () => {
+  for (const overnight of [false, true]) {
+    const {context, run, byId, timers} = harness({overnight});
+    const refreshed = [];
+    context.refresh = () => refreshed.push(run("detailRangeKey()"));
+    run(app.slice(app.indexOf("function cancelStatusRecovery()"), app.indexOf("function activateTwPublicMonitor()")));
+    run("scheduleStatusRecovery(); scheduleStatusRecovery(); scheduleStatusRecovery()");
+    assert.equal(timers.size, 1);
+    assert.equal([...timers.values()][0].ms, 250);
+    byId("detail-start-date").value = "2026-10-01";
+    byId("detail-end-date").value = "2026-10-22";
+    [...timers.values()][0].fn();
+    assert.deepEqual(refreshed, ["2026-10-01|2026-10-22"]);
+    timers.clear();
+    run("scheduleStatusRecovery()");
+    assert.equal([...timers.values()][0].ms, 500);
+    run("statusRecoveryAttempts = 100; cancelStatusRecovery(); scheduleStatusRecovery()");
+    assert.equal([...timers.values()][0].ms, 30000);
+    run("cancelStatusRecovery(); document.hidden = true; scheduleStatusRecovery()");
+    assert.equal(timers.size, 0);
   }
 });
 

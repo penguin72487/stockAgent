@@ -1,0 +1,14 @@
+# Explicit user policy: reduce work; do not throttle StockAgent with quotas.
+# Install as stockagent-.service.d/zz-unrestricted-resources.conf.
+[Service]
+CPUQuota=
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
+AllowedCPUs=
+AllowedMemoryNodes=
+IOReadBandwidthMax=
+IOWriteBandwidthMax=
+IOReadIOPSMax=
+IOWriteIOPSMax=

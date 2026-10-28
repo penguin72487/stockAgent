@@ -10,6 +10,19 @@ import pytest
 from stockagent import private_json
 
 
+def test_exact_key_type_scan_matches_legacy_without_custom_metaclass_effects():
+    class HashMustNotRun(type):
+        def __hash__(self):
+            pytest.fail("type validation must not call a user metaclass hash")
+    class CustomKey(metaclass=HashMustNotRun):
+        pass
+    class StringSubclass(str):
+        pass
+    for value in ({}, {"a": 1}, {str(i): i for i in range(10000)},
+                  {1: 2}, {None: 1}, {StringSubclass("custom"): 2}, {CustomKey(): 3}):
+        assert private_json._plain_string_keys(value) is all(type(key) is str for key in value)
+
+
 @pytest.mark.parametrize("native", [True, False])
 def test_ledger_encoder_preserves_all_finite_float_bits_and_unbounded_integers(monkeypatch, native):
     if not native:
@@ -59,6 +72,55 @@ def test_ledger_encoder_preserves_legacy_conversions_and_errors():
                         ({1: 2, "x": 1}, TypeError)):
         with pytest.raises(error):
             private_json.ledger_bytes(data)
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_ledger_batch_keeps_exact_individual_bytes_order_and_original_depth(monkeypatch, native):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+    from pathlib import Path
+    if not native:
+        monkeypatch.setattr(private_json, "_native", None)
+    nested = {"price": -0.}
+    for _ in range(63):
+        nested = [nested]
+    groups = [[], [{"名稱": "台灣", "price": -0., "tiny": 5e-324, "large": 2**128}, {}, nested],
+              [{"price": 1.2345678901234567}, {"price": float("nan")},
+               {"price": float("inf")}, {1: "legacy key"},
+               {"time": datetime(2026, 10, 25, tzinfo=timezone.utc),
+                "value": Decimal("1.20"), "path": Path("data")}, True, None, (1., -0.)]]
+    for rows in groups:
+        expected = b"".join(private_json.ledger_bytes(row) + b"\n" for row in rows)
+        assert private_json.ledger_lines_bytes(rows) == expected
+        assert private_json.ledger_lines_bytes(iter(rows)) == expected
+
+
+@pytest.mark.parametrize("bad, error", [({"x": "\ud800"}, UnicodeEncodeError),
+                                      ({1: 2, "x": 1}, TypeError)])
+def test_ledger_batch_preserves_late_record_errors(bad, error):
+    with pytest.raises(error):
+        private_json.ledger_lines_bytes([{"valid": 1.25}, bad])
+    cycle = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError):
+        private_json.ledger_lines_bytes([{"valid": 1.25}, cycle])
+
+
+def test_ledger_batch_native_failure_keeps_individual_fallback(monkeypatch):
+    if not private_json.native_available():
+        pytest.skip("optional native codec unavailable")
+    from types import SimpleNamespace
+    native = private_json._native
+    class BrokenBatch:
+        def __init__(self, **kwargs):
+            pass
+        def encode_lines(self, values):
+            raise ValueError("unsupported batch")
+    rows = [{"price": -0., "size": 2**64 + 1}]
+    expected = private_json.ledger_bytes(rows[0]) + b"\n"
+    monkeypatch.setattr(private_json, "_native", SimpleNamespace(
+        json=SimpleNamespace(Encoder=BrokenBatch, encode=native.json.encode)))
+    assert private_json.ledger_lines_bytes(rows) == expected
 
 
 @pytest.mark.parametrize("containers", [0, 1, 63, 64, 65, 130])

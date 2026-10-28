@@ -1030,6 +1030,7 @@ def test_setup_hook_syncs_only_global_commands(monkeypatch: pytest.MonkeyPatch) 
     assert sync_guilds == [None]
     assert set(started_loops) == {
         "scheduled_signal",
+        "progressive_opening_signal",
         "postclose_fast_arm",
         "postclose_fast_cache",
         "startup_inference_warmup",
@@ -1093,12 +1094,12 @@ def test_postclose_artifact_maintenance_isolated_from_discord_cgroup() -> None:
     ).read_text(encoding="utf-8")
     assert "OOMScoreAdjust=-500" in gateway
     assert "Nice=-5" in gateway
-    assert "CPUWeight=200" in gateway
-    assert "IOWeight=200" in gateway
-    assert "MemoryHigh=16G" in gateway
-    assert "MemoryMax=24G" in gateway
-    assert "MemorySwapMax=4G" in gateway
-    assert "TasksMax=2048" in gateway
+    assert "CPUWeight=10000" in gateway
+    assert "IOWeight=10000" in gateway
+    assert "MemoryHigh=infinity" in gateway
+    assert "MemoryMax=infinity" in gateway
+    assert "MemorySwapMax=infinity" in gateway
+    assert "TasksMax=infinity" in gateway
 
 
 def test_event_driven_postclose_service_never_runs_formal_history(
@@ -1262,10 +1263,12 @@ def test_final_arm_is_process_scoped_and_requires_opening_source_prewarm(
                     "status": "ready",
                     "run_id": discord_bot._BOT_RUN_ID,
                     "completed_at": "2026-08-27T08:55:00+08:00",
+                    "panel_cache_epoch": discord_bot.live_panel_cache_epoch(),
                     "live_latency": {
                         "panel_cache_hit": True,
                         "checkpoint_cache_hit": True,
                         "model_cache_hit": True,
+                        "alignment_cache_hit": True,
                     },
                     "opening_source_prewarm": {
                         "ready": True,
@@ -1353,11 +1356,14 @@ def test_base_preopen_retry_preserves_current_process_final_arm(
         status="ready",
         started_at=started_at,
         elapsed_seconds=2.0,
-        summary={"panel_date": "2026-09-23"},
+        summary={"panel_date": "2026-09-23", "preopen_session_rule_preparation": {
+            "contract": "same_session_rules_prepared_without_changing_panel_preview_v1",
+            "session_date": "2026-09-24", "symbol_count": 2300}},
     )
     row = json.loads(path.read_text(encoding="utf-8"))["markets"][cfg.market]
     assert row["status"] == "ready"
     assert row["final_arm"] == armed
+    assert row["preopen_session_rule_preparation"]["session_date"] == "2026-09-24"
 
 
 def test_day_trade_opening_quote_symbols_keep_only_alive_rows() -> None:

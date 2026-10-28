@@ -481,7 +481,7 @@ def terminal_component_fixture(tmp_path, *, future_rights=False, official=None):
     from downloader.artifact_io import sha256_file
     day=date(2012,3,21);physical='AA1:201203'
     frame=pl.DataFrame([dict(date=day,product='AA1',contract='201203',
-        physical_contract=physical,contract_multiplier=2000.)])
+        physical_contract=physical,contract_multiplier=2000.,asset_class='stock_future')])
     value=2010.+7.
     row=dict(date=day,physical_contract=physical,contract_multiplier=2000.,
         opening_contract_value_twd=value,settlement_contract_value_twd=value,
@@ -533,6 +533,45 @@ def test_exchange_full_value_stays_authoritative_over_derived_components(tmp_pat
     result=m.corporate_margin_base_values(frame,rules.with_columns(
         pl.lit(2018.).alias('terminal_contract_value_twd')),source,terminal_component_terms=terms)
     assert result['_rule_terminal_contract_value_twd'][0]==2018.
+
+
+def test_index_expiry_verifies_exchange_price_with_decimal_truncation(tmp_path):
+    from datetime import date
+    import json
+    from downloader.artifact_io import sha256_file
+    frame, rules, source, _, _ = terminal_component_fixture(tmp_path)
+    frame = frame.with_columns(pl.lit('I5F').alias('product'),
+        pl.lit('index_future').alias('asset_class'), pl.lit(50.).alias('contract_multiplier'),
+        pl.lit(date(2017, 3, 31)).alias('date'))
+    rules = rules.with_columns(pl.lit(50.).alias('contract_multiplier'), pl.lit(date(2017, 3, 31)).alias('date'),
+        pl.lit(458687.).alias('terminal_contract_value_twd'))
+    final = pl.read_parquet(source).with_columns(pl.lit('I5F').alias('product'),
+        pl.lit(9173.75).alias('final_settlement_price'), pl.lit(date(2017, 3, 31)).alias('settlement_date'))
+    final.write_parquet(source)
+    manifest_path = source.parent / 'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    manifest['outputs']['futures_final_settlement_history']['sha256'] = sha256_file(source)
+    manifest_path.write_text(json.dumps(manifest))
+    assert m.corporate_margin_base_values(frame, rules, source)['_rule_terminal_contract_value_twd'][0] == 458687.
+    with pytest.raises(ValueError, match='official product settlement'):
+        m.corporate_margin_base_values(frame, rules.with_columns(
+            pl.lit(458687.5).alias('terminal_contract_value_twd')), source)
+
+
+@pytest.mark.parametrize('sign', [1, -1])
+def test_index_expiry_whole_dollar_value_reaches_the_integer_position_ledger(sign):
+    from stockagent.backtest.tw_futures_portfolio import run_tw_futures_portfolio_integer_torch
+    x = corporate_tape()
+    x[..., 3] = x[..., m.PREVIOUS_MARK] = 450000.
+    x[..., 4] = x[..., m.TERMINAL_MARK] = 458687.
+    x[..., 2] = 1
+    x[..., 8] = 0
+    x[..., m.CASH_SETTLEMENT] = 1
+    result = run_tw_futures_portfolio_integer_torch(torch.tensor([[0.]]), x,
+        initial_capital=20000., initial_quantities=torch.tensor([sign]))
+    assert result.final_weights.item() == 0
+    assert result.final_alive
+    assert result.margin_audit_history[0, 2].item() == pytest.approx(20000. + sign * 8687.)
 
 
 def test_component_release_rejects_candidates_unreceipted_values_and_future_fixing(tmp_path):

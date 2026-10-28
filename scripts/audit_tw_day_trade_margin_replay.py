@@ -26,7 +26,8 @@ from scripts.complete_tw_day_trade_paper_entry import CONTRACT as PAPER_COMPLETI
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
     MARGIN_CARRY_CONTRACT,
-    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    REPLAY_FULL_COUNTERFACTUAL_CONTRACTS,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
 )
 from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid
@@ -151,7 +152,9 @@ def _is_verified_full_0901_price_only_entry(fill: dict, prices: dict, *, full_ta
     return bool(
         full_target and price is not None
         and fill.get("purpose") == "entry"
-        and fill.get("fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+        # Only the legacy v1 contract allowed a price-only, zero-volume fill.
+        # The v2 contract requires a real positive-volume minute observation.
+        and fill.get("fill_contract") == LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
         and fill.get("fill_at") == f"{day}T09:01:00+08:00"
         and fill.get("recorded_at") == f"{day}T09:01:00+08:00"
         and fill.get("simulation_only") is True
@@ -446,7 +449,7 @@ def audit(state_dir: Path, *, verify_sources: bool = True, completed_prefix: boo
     state, rebuild = _read_json(state_dir / "state.json"), _read_json(state_dir / "rebuild_receipt.json")
     full_target_counterfactual = (
         (rebuild.get("replay_contract") or {}).get("entry")
-        == "retrospective_prior_paper_fill_else_09_01_minute_price_full_target_no_liquidity_claim_v1"
+        in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
     )
     prior_manifest: dict[str, dict] = {}
     if full_target_counterfactual and verify_sources:

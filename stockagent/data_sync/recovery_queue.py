@@ -36,6 +36,33 @@ STATUS_FIELDS = {"contract", "producer_device_id", "receiver_device_id", "reposi
     "installed_handoff_identity_sha256", "runtime_lock_verified", "plans", "observed_at_utc",
     "complete_cycle_seconds", "full_history_backup_verified", "identity_sha256"}
 IDENTITIES = ("producer_device_id", "receiver_device_id", "repository_id")
+CONTROL_REQUEST_PROOF = "control_recovery_request_proof_v1"
+
+
+def _control_request_proof_valid(proof: dict | None, dispatch: dict, ack: dict, known: dict) -> bool:
+    """A prior full semantic check binds one ACK to an existing fixed request.
+
+    The ledger is owned and persisted by the source stream. This pass freshly
+    validates the ACK and every immutable request before considering its proof.
+    It certifies a completed request decision, never current local payload
+    health, receiver execution, or a different source/envelope/ACK generation.
+    """
+    fields = {"contract", "dispatch_identity_sha256", "acceptance_identity_sha256",
+              "request_identity_sha256", "logical_state_identity_sha256", "identity_sha256"}
+    if (not isinstance(proof, dict) or set(proof) != fields or proof["contract"] != CONTROL_REQUEST_PROOF
+            or any(not isinstance(proof[k], str) or not HASH.fullmatch(proof[k]) for k in fields - {"contract"})
+            or proof["dispatch_identity_sha256"] != dispatch["identity_sha256"]
+            or proof["acceptance_identity_sha256"] != ack["identity_sha256"]):
+        return False
+    try:
+        valid_signature(proof, CONTROL_REQUEST_PROOF, fields=fields)
+    except (TypeError, ValueError):
+        return False
+    plan = known.get(proof["request_identity_sha256"])
+    return plan is not None and any(
+        job["kind"] == "control" and job["logical_state_identity_sha256"] == proof["logical_state_identity_sha256"]
+        for job in plan["jobs"]
+    )
 
 
 def paired(plan: dict, configuration: dict) -> None:
@@ -71,8 +98,13 @@ def publish_requests(configuration: dict, transport: Path, ledger: dict) -> dict
         atomic_public(destination, initial)
         new += initial["identity_sha256"] not in known
         known[initial["identity_sha256"]] = initial
-    logical_states = {j["logical_state_identity_sha256"] for p in known.values()
-                      for j in p["jobs"] if j["kind"] == "control"}
+    logical_requests = {j["logical_state_identity_sha256"]: p["identity_sha256"] for p in known.values()
+                        for j in p["jobs"] if j["kind"] == "control"}
+    envelope_fields = ("envelope_identity_sha256", "envelope_file_sha256", "complete_files", "complete_bytes")
+    requested_controls = {
+        (job["nas_snapshot_id"], *(job[k] for k in envelope_fields))
+        for plan in known.values() for job in plan["jobs"] if job["kind"] == "control"
+    }
     errors = []
     for delivery in ledger["deliveries"].values():
         dispatch, ack = delivery["dispatch"], delivery.get("acceptance")
@@ -82,10 +114,30 @@ def publish_requests(configuration: dict, transport: Path, ledger: dict) -> dict
             validate_ack(ack, dispatch)
             if any(dispatch[k] != configuration[k] for k in IDENTITIES):
                 raise ValueError("control dispatch differs from this paired relay")
+            request_binding = (ack["snapshot_id"], *(dispatch[k] for k in envelope_fields))
+            if request_binding in requested_controls:
+                # A freshly validated immutable request already pins this exact
+                # NAS snapshot, envelope bytes and complete member set. There
+                # is no new request to derive from local payloads. This proves
+                # request idempotency only, not local transport health or a
+                # successful receiver restore. New envelopes keep full checks.
+                continue
+            if _control_request_proof_valid(delivery.get("control_recovery_request_proof"), dispatch, ack, known):
+                continue
             batch = transport / dispatch["batch_relative"]
             receipt, _, logical = verified_control(batch / "control")
             logical_id = receipt["logical_state_identity_sha256"]
-            if logical_id in logical_states:
+            if logical_id in logical_requests:
+                # A different code envelope can contain the same already
+                # requested DB state. Retain this full semantic check's exact
+                # dispatch/ACK/request binding in the existing owner ledger.
+                delivery["control_recovery_request_proof"] = signed({
+                    "contract": CONTROL_REQUEST_PROOF,
+                    "dispatch_identity_sha256": dispatch["identity_sha256"],
+                    "acceptance_identity_sha256": ack["identity_sha256"],
+                    "request_identity_sha256": logical_requests[logical_id],
+                    "logical_state_identity_sha256": logical_id,
+                })
                 continue  # A code-only change does not require another DB restore.
             # Reuse the exact closed envelope before deriving a NEW request.
             verify_dispatch_delivery(batch, dispatch)
@@ -102,7 +154,8 @@ def publish_requests(configuration: dict, transport: Path, ledger: dict) -> dict
             paired(plan, configuration)
             atomic_public(root / ("plan-" + plan["identity_sha256"] + ".json"), plan)
             known[plan["identity_sha256"]] = plan
-            logical_states.add(logical_id)
+            logical_requests[logical_id] = plan["identity_sha256"]
+            requested_controls.add(request_binding)
             new += 1
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
             errors.append({"envelope_identity_sha256": dispatch["envelope_identity_sha256"],

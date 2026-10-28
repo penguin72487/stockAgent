@@ -281,7 +281,8 @@ def test_evicted_parent_replaced_by_symlink_is_rejected(tmp_path):
             pinned.recheck()
 
 
-def test_bounded_directory_cache_remains_safe_for_shared_export_threads(tmp_path):
+@pytest.mark.parametrize('parallel_signatures', [False, True])
+def test_bounded_directory_cache_remains_safe_for_shared_export_threads(tmp_path, parallel_signatures):
     names = []
     for index in range(128):
         digest = f"{index:02x}" + "0" * 62
@@ -292,7 +293,8 @@ def test_bounded_directory_cache_remains_safe_for_shared_export_threads(tmp_path
         names.append(name)
     expected = [module.signature(tmp_path / name) for name in names]
     assert not descriptors_under(tmp_path)
-    with module.PinnedObjectSignatures(tmp_path, max_open_directories=4) as pinned:
+    with module.PinnedObjectSignatures(tmp_path, max_open_directories=4,
+                                       parallel_signatures=parallel_signatures) as pinned:
         with ThreadPoolExecutor(max_workers=8) as workers:
             for _ in range(4):
                 assert list(workers.map(pinned.signature, names)) == expected

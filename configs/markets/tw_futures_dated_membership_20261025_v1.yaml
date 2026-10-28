@@ -1,0 +1,18 @@
+# Time-varying per-decision universe; historical rows need not survive the period.
+# Reuse the admitted 2011 history and actual 30-minute observed trade windows.
+base_config: tw_futures_historical_universe_20261025_v3.yaml
+experiment_name: tw-futures-dated-membership-20261025-v1
+training:
+  optimizer_name: muon
+  optimizer_options:
+    matrix_lr_scale: 1.0
+    aux_lr_scale: 1.0
+    adjust_lr_fn: match_rms_adamw
+  financial_transformer:
+    futures_beta_notional_cap: 0.25
+trading:
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_historical_universe_20261025_v3/twd_equity/clocks/entry_window_30m/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_historical_universe_20261025_v3/twd_equity/clocks/entry_window_30m/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_futures_dated_membership_20261025_v1/twd_equity__union_beta025_0845_30m
+  resume: false

@@ -248,6 +248,7 @@ class FinLabHistoryTest(unittest.TestCase):
         service = Path("deploy/systemd/stockagent-finlab-local-refresh.service.in").read_text()
         self.assertIn('ExecStartPre=/usr/bin/bash -n "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"', service)
         self.assertIn('ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"', service)
+        self.assertIn('SuccessExitStatus=75', service)
         self.assertIn("MemoryHigh=8G", service)
         self.assertIn("MemoryMax=10G", service)
         self.assertIn("MemorySwapMax=0", service)

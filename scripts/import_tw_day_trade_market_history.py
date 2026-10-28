@@ -38,7 +38,8 @@ PUBLIC_SERVICE = "stockagent-public-dashboards.service"
 
 
 def _object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    payload = read_paper_state(path)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload
@@ -206,19 +207,21 @@ def _target_stats(
 
 
 def _append_file(source: Path, target: Path) -> None:
-    descriptor = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        with source.open("rb") as handle:
-            while chunk := handle.read(8 << 20):
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(descriptor, view)
-                    if written <= 0:
-                        raise OSError(f"short append to {target}")
-                    view = view[written:]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    from stockagent.live.paper_journal import journal_write_transaction, open_paper_journal
+    with journal_write_transaction(target, operation="append"):
+        descriptor = os.open(target, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            with open_paper_journal(source, "rb") as handle:
+                while chunk := handle.read(8 << 20):
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(descriptor, view)
+                        if written <= 0:
+                            raise OSError(f"short append to {target}")
+                        view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _copy_position_history(

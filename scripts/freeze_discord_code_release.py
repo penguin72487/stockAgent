@@ -21,16 +21,20 @@ def main():
                         help="Derive from this verified compatible release, not the entire development tree")
     parser.add_argument("--include-source", action="append", default=[],
                         help="Explicit source member to overlay from the current workspace; repeat for each reviewed file")
+    parser.add_argument("--include-root", type=Path,
+                        help="Use reviewed copies below private artifacts/operations for the explicit members")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    if args.verify and (args.base_release or args.include_source):
+    if args.verify and (args.base_release or args.include_source or args.include_root):
         parser.error("verify and source overlays are separate operations")
     if bool(args.base_release) != bool(args.include_source):
         parser.error("base-release and at least one include-source are required together")
+    if args.include_root and not args.base_release:
+        parser.error("include-root requires a verified base-release and explicit include-source members")
     if args.output.exists():
         raise FileExistsError("preserve source release preparation evidence")
     receipt = args.verify or freeze_source(ROOT, ROOT / "artifacts/operations/service_code_releases",
-        base_receipt=args.base_release, include_sources=tuple(args.include_source))
+        base_receipt=args.base_release, include_sources=tuple(args.include_source), include_root=args.include_root)
     proof = verify_frozen_source(receipt, ROOT)
     native = namespace_identity(receipt, ROOT)
     result = {"status": "prepared_not_adopted", "release": proof, "namespace_identity": native,

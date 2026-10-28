@@ -47,6 +47,8 @@ let refreshInFlight = false;
 let refreshQueued = false;
 let refreshForceQueued = false;
 let refreshPushedQueued = null;
+let statusRecoveryTimer = null;
+let statusRecoveryAttempts = 0;
 let latestServiceNotice = null;
 let lastRenderedRevision = null;
 let lastFilterRevision = null;
@@ -821,14 +823,16 @@ function renderHeader(data) {
   health.textContent = presentation.label;
   health.className = `pill ${presentation.health}`;
   $("connection-status").dataset.state = presentation.health;
-  $("freshness").textContent = `來源 ${duration(data.source_age_seconds)}前 · ${shortTime(data.source_updated_at)}`;
+  $("freshness").textContent = IS_OVERNIGHT
+    ? `來源 ${duration(data.source_age_seconds)}前 · ${shortTime(data.source_updated_at)}`
+    : `來源更新 ${shortDateTime(data.source_updated_at)}`;
   const alert = $("alert");
   const blockers = data.modes.filter((mode) => !mode.checkpoint_ready || String(mode.engine_status || "").startsWith("critical") || String(mode.engine_status || "").startsWith("blocked"));
   const catchUps = data.modes.filter((mode) => mode.today_execution_status === "starting");
   const missed = data.modes.filter((mode) => mode.today_execution_status === "missed");
   const openingWaits = pendingOpeningAttempts(data);
   const hasBenchmarkReplay = (data.benchmarks || []).some((row) => row.counterfactual_open_replay);
-  const operationalIssues = Array.isArray(data.operational_issues) ? data.operational_issues : [];
+  const operationalIssues = operationalIssuesForDisplay(data);
   const overnightHistory = data.historical_replay || {};
   const overnightHistoryDegraded = IS_OVERNIGHT && (
     overnightHistory.status === "ready_with_stale_unresolved_position"
@@ -955,6 +959,9 @@ function clearDateScopedViews() {
 }
 
 function scheduleSessionRollover(serviceSync) {
+  // The day-trade page reconciles the session on its next minute tick.
+  // Overnight retains its existing server-clock rollover observer.
+  if (!IS_OVERNIGHT) return;
   if (!followLatestSession && !followPerformanceRange) return;
   const deadline = String(serviceSync?.session_clock?.next_rollover_at || "");
   const serverNow = Date.parse(serviceSync?.generated_at_utc || "");
@@ -1029,6 +1036,10 @@ function renderModes(data) {
       ? "model_ready_waiting_engine" : String(mode.engine_status || "unknown");
     const execution = executionStatusPresentation(mode.today_execution_status);
     const fillOutcome = fillOutcomePresentation(mode.today_execution_outcome || mode.entry_fill_outcome);
+    // Absence is not zero: keep the real paper-order quantities visible and
+    // separately attributable to this exact rendered mode revision.
+    const entryCounts = [mode.entry_requested_shares, mode.entry_filled_shares, mode.entry_unfilled_shares];
+    const entryCountsKnown = entryCounts.every((value) => Number.isSafeInteger(value) && value >= 0);
     const kind = status === "active" ? "good" : status.startsWith("blocked") || status.startsWith("critical") ? "bad" : "warn";
     const offsetTicks = Number(mode.price_limit_offset_ticks || 0);
     const bracketPolicy = offsetTicks > 0
@@ -1050,6 +1061,7 @@ function renderModes(data) {
         <div><span>帳戶累積報酬（Discord 同口徑）</span><strong class="${pnlClass(accountReturnPct)}">${accountReturnPct == null ? "資料不可用" : `${accountReturnPct >= 0 ? "+" : ""}${displayPct(accountReturnPct)}`}</strong></div>
         <div><span>該日策略執行</span><strong class="${esc(execution.kind)}">${esc(execution.label)}</strong></div>
         <div><span>紙上執行結果</span><strong class="${esc(fillOutcome.kind)}">${esc(fillOutcome.label)}</strong></div>
+        <div><span>模擬目標／成交／缺口</span><strong${entryCountsKnown ? ` data-paper-entry-counts data-requested="${entryCounts[0]}" data-filled="${entryCounts[1]}" data-unfilled="${entryCounts[2]}"` : ""}>${entryCountsKnown ? `${number(entryCounts[0])}／${number(entryCounts[1])}／${number(entryCounts[2])} 股` : "等待成交資訊"}</strong></div>
         <div><span>持倉／缺價</span><strong>${number(mode.open_position_count)} / ${number(mode.stale_position_count)}</strong></div>
         ${Number(mode.indicative_valuation_position_count || 0) > 0 ? `<div><span>參考快照估值（非成交證據）</span><strong>${number(mode.indicative_valuation_position_count)} 個持倉</strong></div>` : ""}
         <div><span>已實現淨損益</span><strong class="${pnlClass(mode.cumulative_realized_net_pnl_twd)}">${summaryMoney(mode.cumulative_realized_net_pnl_twd)}</strong></div>
@@ -1065,7 +1077,6 @@ function renderModes(data) {
         ${mode.counterfactual_open_replay
           ? `<div class="wide"><span>訊號／重建時間</span><strong>${esc(replayTimingText(mode))}</strong></div>`
           : `<div><span>訊號時間</span><strong>${shortTime(mode.signal_at)}</strong></div>`}
-        <div><span>模型目標／紙上成交／目標缺口</span><strong>${number(mode.entry_requested_shares || 0)}／${number(mode.entry_filled_shares || 0)}／${number(mode.entry_unfilled_shares || 0)} 股</strong></div>
         <div><span>13:24 市價重試後殘餘</span><strong class="${Number(mode.force_exit_failures || 0) ? "negative" : ""}">${number(mode.force_exit_failures || 0)}</strong></div>
         <div><span>13:30 帳務強平</span><strong>${number(mode.terminal_flatten_count || 0)}</strong></div>
         <div><span>強平價替代值</span><strong class="${Number(mode.terminal_flatten_degraded_count || 0) ? "negative" : ""}">${number(mode.terminal_flatten_degraded_count || 0)}</strong></div>
@@ -1149,6 +1160,30 @@ function officialUniverseDescription(scope) {
     note: `上市／上櫃股票與 ETF ${number(scope.listed_count)} 檔 − 停止交易 ${number(scope.halted_count)} 檔 · 觀測 ${shortTime(scope.observed_at_taipei)}；非當日原始訊號覆蓋率`,
     kind: "good",
   };
+}
+
+function operationalIssuesForDisplay(data) {
+  const modes = Array.isArray(data.modes) ? data.modes : [];
+  const byMarket = new Map(modes.map((mode) => [mode.market, mode]));
+  const issues = (Array.isArray(data.operational_issues) ? data.operational_issues : []).map((issue) => {
+    const mode = byMarket.get(issue.market);
+    if (!mode || issue.code !== "entry_no_fill" || mode.today_execution_outcome !== "no_fill") return issue;
+    const remaining = Math.max(0, Number(mode.entry_unfilled_shares) || 0);
+    const positions = Math.max(0, Number(mode.open_position_count) || 0);
+    const pendingText = remaining ? `，尚有 ${number(remaining)} 股未成交` : "";
+    const positionsText = positions ? `；另有 ${number(positions)} 筆先前建立的未平模擬持倉` : "；目前沒有未平模擬持倉";
+    return {...issue, detail: `本次訊號尚無新增成交${pendingText}${positionsText}。`};
+  });
+  for (const mode of modes) {
+    const sourceAt = Date.parse(mode.source_signal_at || "");
+    const replayAt = Date.parse(mode.signal_at || "");
+    if (!mode.counterfactual_open_replay || !Number.isFinite(sourceAt) || !Number.isFinite(replayAt)
+        || sourceAt <= replayAt || issues.some((issue) => issue.market === mode.market && issue.code === "replay_signal_after_simulated_time")) continue;
+    issues.push({market: mode.market, code: "replay_signal_after_simulated_time", severity: "error",
+      title: `${mode.label || mode.market} 回放訊號晚於模擬時間`,
+      detail: `訊號資料時間為 ${mode.source_signal_at}，帳本模擬時間為 ${mode.signal_at}；不能視為當時已取得的訊號或即時成交，需重新核對來源並驗收回放。`});
+  }
+  return issues;
 }
 
 function pendingOpeningAttempts(data) {
@@ -1286,7 +1321,9 @@ function renderOperations(data) {
       : serviceSync.status === "engine_committed"
         ? `rev ${number(serviceSync.state_revision)} 已提交`
         : "Discord 狀態逾時";
-  const syncNote = `engine ${duration(serviceSync.engine_age_seconds)}前 · Discord ${duration(discordSync.age_seconds)}前 · 版本探測每 ${number(SERVICE_REVISION_REFRESH_MS / 1000)} 秒`;
+  const refreshNote = IS_OVERNIGHT ? `版本探測每 ${number(SERVICE_REVISION_REFRESH_MS / 1000)} 秒` : "網頁每 60 秒更新";
+  const ageContext = IS_OVERNIGHT ? "" : "本次讀取時 ";
+  const syncNote = `${ageContext}engine ${duration(serviceSync.engine_age_seconds)}前 · Discord ${duration(discordSync.age_seconds)}前 · ${refreshNote}`;
   const guardian = data.unattended_guardian || {};
   const guardianComponents = guardian.components || {};
   const guardianKind = guardian.status === "repairing"
@@ -1771,6 +1808,7 @@ async function loadChartHistory({preferCache = false} = {}) {
     if (sequence !== historyRequestSequence || (error?.name === "AbortError" && controller.signal.aborted)) return;
     historyLoadError = `歷史載入失敗：${error}`;
     if (snapshot) renderChart(snapshot);
+    scheduleStatusRecovery();
   } finally {
     if (historyAbortController === controller) {
       historyAbortController = null;
@@ -1825,11 +1863,23 @@ function measureRevisionPaint(action, rows, rootId, stillCurrent = () => true) {
     const visibleNode = [...root.querySelectorAll(`[data-public-signal-key="${key}"]`)]
       .find((node) => Dashboard.isElementVisible(node));
     if (!visibleNode) continue;
+    const countNode = rootId === "mode-cards" ? visibleNode.querySelector("[data-paper-entry-counts]") : null;
+    const values = [row.entry_requested_shares, row.entry_filled_shares, row.entry_unfilled_shares];
+    const countEvidenceIsCurrent = () => !!countNode && countNode.isConnected
+      && Dashboard.isElementVisible(countNode)
+      && values.every((value) => Number.isSafeInteger(value) && value >= 0)
+      && [countNode.dataset.requested, countNode.dataset.filled, countNode.dataset.unfilled]
+        .every((value, index) => value === String(values[index]));
+    const entryCounts = countEvidenceIsCurrent() ? {
+      entryCountsVisible: true, entryRequestedShares: values[0],
+      entryFilledShares: values[1], entryUnfilledShares: values[2],
+    } : null;
     revisionPaintObserver.applied({revision: appliedStatusRevision, action, market: row.market,
       sessionDate: row.session_date || snapshot.session_date, signalKey: key,
-      updatePhase: appliedStatusPhase,
+      updatePhase: appliedStatusPhase, entryCounts,
       viewEvidence: rootId === "mode-cards" ? "status_mode_snapshot" : "detail_signal_identity_only",
-      stillCurrent: () => stillCurrent() && visibleNode.isConnected && Dashboard.isElementVisible(visibleNode)});
+      stillCurrent: () => stillCurrent() && visibleNode.isConnected && Dashboard.isElementVisible(visibleNode)
+        && (!entryCounts || countEvidenceIsCurrent())});
   }
 }
 
@@ -2136,6 +2186,7 @@ async function loadSignals({append = false, force = false} = {}) {
     signalLoadError = `訊號明細暫時無法更新：${error}`;
     signalLoadNotice = "";
     signalDataRevision = null;
+    scheduleStatusRecovery();
   } finally {
     if (sequence === signalRequestSequence) {
       if (signalAbortController === controller) signalAbortController = null;
@@ -2193,6 +2244,7 @@ async function loadPositions({append = false, force = false} = {}) {
     if (error?.name === "AbortError" && controller.signal.aborted) return;
     positionLoadError = `持倉明細暫時無法更新：${error}`;
     positionDataRevision = null;
+    scheduleStatusRecovery();
   } finally {
     if (sequence === positionRequestSequence) {
       if (positionAbortController === controller) positionAbortController = null;
@@ -2253,6 +2305,7 @@ async function loadEvents({append = false, force = false} = {}) {
     if (error?.name === "AbortError" && controller.signal.aborted) return;
     eventLoadError = `事件明細暫時無法更新：${error}`;
     eventRecordRevision = null;
+    scheduleStatusRecovery();
   } finally {
     if (sequence === eventRequestSequence) {
       if (eventAbortController === controller) eventAbortController = null;
@@ -2271,6 +2324,7 @@ async function refresh({force = false, pushedSnapshot = null} = {}) {
     if (pushedSnapshot) refreshPushedQueued = pushedSnapshot;
     return;
   }
+  cancelStatusRecovery();
   if (force) {
     if (signalAbortController) signalAbortController.abort();
     if (positionAbortController) positionAbortController.abort();
@@ -2290,9 +2344,10 @@ async function refresh({force = false, pushedSnapshot = null} = {}) {
     if (pushedSnapshot && date && date !== nextSnapshot.session_date) { refreshQueued = true; return; }
     const sync = nextSnapshot.service_sync || {};
     if (latestServiceNotice?.engine_generation && sync.engine_generation !== latestServiceNotice.engine_generation) return;
-    if (appliedStatusRevision?.engine_generation === sync.engine_generation && (
+    if (appliedStatusRevision?.engine_generation && appliedStatusRevision.engine_generation === sync.engine_generation && (
       Number(sync.state_revision) < Number(appliedStatusRevision.state_revision) ||
       Number(sync.content_revision) < Number(appliedStatusRevision.content_revision))) return;
+    if (!Array.isArray(nextSnapshot.modes)) throw new TypeError("Invalid dashboard mode snapshot");
     const previousRange = detailRangeKey();
     snapshot = nextSnapshot;
     if (appliedStatusRevision && ["revision_token", "engine_generation", "state_revision"]
@@ -2317,6 +2372,10 @@ async function refresh({force = false, pushedSnapshot = null} = {}) {
     const heavy = revision !== lastRenderedRevision;
     lastRenderedRevision = revision;
     render({heavy});
+    // A successful compact status is not recovery of an independently failed
+    // table/history. Keep bounded backoff until those views succeed too.
+    if (!signalLoadError && !positionLoadError && !historyLoadError
+        && (!eventViewActivated || !eventLoadError)) statusRecoveryAttempts = 0;
     // First paint depends only on the compact status snapshot.  History and
     // the three detail tables are independent read-only views; loading them
     // after paint prevents a cold multi-session curve from holding the whole
@@ -2336,6 +2395,7 @@ async function refresh({force = false, pushedSnapshot = null} = {}) {
   } catch (error) {
     const alert = $("alert"); alert.classList.remove("hidden"); alert.textContent = `面板讀取失敗：${error}`;
     $("health").textContent = "UNAVAILABLE"; $("health").className = "pill critical";
+    scheduleStatusRecovery();
   } finally {
     refreshInFlight = false;
     if (!document.hidden && twPublicMonitorActivated) void loadTwPublicMonitor();
@@ -2348,6 +2408,26 @@ async function refresh({force = false, pushedSnapshot = null} = {}) {
       void refresh({force: queuedForce, pushedSnapshot: queuedSnapshot});
     }
   }
+}
+
+function cancelStatusRecovery() {
+  if (statusRecoveryTimer === null) return;
+  window.clearTimeout(statusRecoveryTimer);
+  statusRecoveryTimer = null;
+}
+
+function scheduleStatusRecovery() {
+  // One existing, coalesced recovery owner covers status and independent
+  // detail/history failures, including an unchanged engine revision. Refresh
+  // uses the CURRENT selection and reloads only invalid views; no page reload.
+  // Failure recovery is separate from the minute-based price cadence. One
+  // coalesced timer retries promptly, then backs off during prolonged faults.
+  if (document.hidden || statusRecoveryTimer !== null) return;
+  const delay = Math.min(250 * (2 ** Math.min(statusRecoveryAttempts++, 7)), 30000);
+  statusRecoveryTimer = window.setTimeout(() => {
+    statusRecoveryTimer = null;
+    void refresh();
+  }, delay);
 }
 
 function activateTwPublicMonitor() {
@@ -2402,7 +2482,7 @@ function installEventViewActivation() {
 }
 
 function acceptServiceRevision(serviceSync, {transport = "poll", statusExpected = false} = {}) {
-  if (latestServiceNotice?.engine_generation === serviceSync.engine_generation && (
+  if (latestServiceNotice?.engine_generation && latestServiceNotice.engine_generation === serviceSync.engine_generation && (
     Number(serviceSync.state_revision) < Number(latestServiceNotice.state_revision) ||
     Number(serviceSync.content_revision) < Number(latestServiceNotice.content_revision))) return;
   latestServiceNotice = serviceSync;
@@ -2417,7 +2497,14 @@ function acceptServiceRevision(serviceSync, {transport = "poll", statusExpected 
     snapshot.service_sync = serviceSync;
     renderOperations(snapshot);
   }
-  if (changed && !statusExpected) void refresh();
+  // A failed first status has no applied revision to compare. Recover from a
+  // coherent notice too, without queueing a duplicate during its first fetch.
+  const missingSnapshot = !snapshot && !refreshInFlight;
+  // A verified-status stream may advertise a new commit before its projection
+  // finishes or may lose that status frame. Keep one bounded recovery owner;
+  // an arriving pushed snapshot cancels it in refresh().
+  if ((changed || missingSnapshot) && statusExpected) scheduleStatusRecovery();
+  if ((changed || missingSnapshot) && !statusExpected) void refresh();
 }
 
 function acceptServiceStatus(nextSnapshot) {
@@ -2560,13 +2647,19 @@ function updateClock() {
   $("clock").textContent = new Date().toLocaleString("zh-TW", {timeZone:"Asia/Taipei", hour12:false});
 }
 Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});
-Dashboard.scheduleRefresh(() => {
-  void refresh();
-}, {intervalMs: PRICE_REFRESH_MS});
+if (IS_OVERNIGHT) {
+  Dashboard.scheduleRefresh(() => refresh(), {intervalMs: PRICE_REFRESH_MS});
+  Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
+} else {
+  // Prices and the general monitor retain their one-minute cadence. A new
+  // paper signal/fill is a committed event, not a reason to wait a minute.
+  Dashboard.scheduleRefresh(() => refresh(), {
+    intervalMs: PRICE_REFRESH_MS, cadenceFromLastStart: true, refreshOnVisible: "overdue",
+  });
+}
 Dashboard.subscribeRevisions("api/updates", acceptServiceRevision, refreshServiceRevision, {
   fallbackMs: SERVICE_REVISION_REFRESH_MS, onStatus: acceptServiceStatus,
 });
-Dashboard.scheduleRefresh(loadTwPublicMonitor, {intervalMs: TW_PUBLIC_STATUS_REFRESH_MS});
 installTwPublicMonitorActivation();
 installEventViewActivation();
 for (const id of ["mode-cards", "signal-body", "position-body"]) {

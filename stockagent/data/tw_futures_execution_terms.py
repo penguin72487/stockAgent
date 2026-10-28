@@ -6,15 +6,19 @@ published by :mod:`tw_futures_margin_release`.
 """
 from __future__ import annotations
 
+from datetime import date
 import numpy as np
 import polars as pl
 
-from stockagent.data.tw_futures_margin_preparation import bind_dated_corporate_terms
+from stockagent.data.tw_futures_margin_preparation import (
+    bind_dated_corporate_terms, index_futures_cash_terminal_values,
+)
 from stockagent.data.tw_price_rules import tick_size_numpy
 from stockagent.research.taifex_transaction_tax import futures_transaction_tax_rate
 
 
-EXECUTION_TERMS_COMPILER_VERSION = 8
+EXECUTION_TERMS_COMPILER_VERSION = 25
+FINAL_CASH_ACCOUNTING_CONTRACT = "official_final_day_end_v1"
 KEYS = ["date", "physical_contract"]
 QUOTE_KEYS = ["date", "product", "contract"]
 POSITION_INPUT_FIELDS = ["position_unit", "position_limit", "monthly_position_limit", "position_root_product",
@@ -43,7 +47,52 @@ SPEC_EXTENSIONS = {
     "limit_down_points": (pl.Float64, None),
     "carry_split_numerator": (pl.Int64, 1),
     "carry_split_denominator": (pl.Int64, 1),
+    "limit_stage_up_ratios": (pl.List(pl.Float64), None),
+    "limit_stage_down_ratios": (pl.List(pl.Float64), None),
+    # Foreign indices can stop trading before their official final settlement
+    # day. This is an explicit daily-account posting cutoff, never an observed
+    # price-publication timestamp or permission to spend the cash intraday.
+    "final_cash_accounting_policy": (pl.String, "expiry_event_time"),
+    "final_cash_accounting_time": (pl.String, None),
+    # An explicitly reviewed earlier cash-day law can precede the 2015
+    # foreign-index launch. The implicit legacy boundary is never backdated.
+    "final_cash_rule_effective_date": (pl.Date, None),
+    "fixed_staged_ladder_contract": (pl.String, None),
 }
+
+
+def final_cash_accounting_contract(rules: pl.DataFrame) -> str | None:
+    field = "final_cash_accounting_policy"
+    if field not in rules.columns:
+        return None
+    values = set(rules[field].drop_nulls())
+    if values - {FINAL_CASH_ACCOUNTING_CONTRACT}:
+        raise ValueError("unsupported final cash accounting policy")
+    return FINAL_CASH_ACCOUNTING_CONTRACT if values else None
+
+
+def validate_final_cash_accounting_rules(rules: pl.DataFrame, manifest: dict) -> None:
+    fields = {"final_cash_accounting_policy", "final_cash_reported_date_role"}
+    present = fields & set(rules.columns)
+    if present and (present != fields or any(rules.schema[c] != pl.String for c in fields)):
+        raise ValueError("incomplete final cash accounting provenance")
+    if present and rules.filter(pl.col("final_cash_accounting_policy").is_null()
+            != pl.col("final_cash_reported_date_role").is_null()).height:
+        raise ValueError("cash-day provenance without its accounting contract")
+    contract = final_cash_accounting_contract(rules)
+    declared = manifest.get("final_cash_accounting_contract")
+    if declared != contract:
+        raise ValueError("final cash accounting contract differs from its rows")
+    if contract is None:
+        return
+    posted = rules.filter(pl.col("final_cash_accounting_policy").is_not_null())
+    if (manifest.get("research_only") is not True
+            or "final_cash_reported_date_role" not in rules.columns
+            or posted.filter((pl.col("terminal_event") != "cash_settlement")
+                | (pl.col("final_cash_reported_date_role") != "final_settlement_day")
+                | pl.col("final_cash_reported_date_role").is_null()
+                | (pl.col("settlement_time") != "17:00:00")).height):
+        raise ValueError("daily cash posting requires the official final day and declared cutoff")
 
 
 def _positive(name):
@@ -80,39 +129,43 @@ def inventory_entry_reachability(frame: pl.DataFrame, rules: pl.DataFrame) -> pl
     if incoming.filter(pl.col("carry_from_date").is_null()
                        |(pl.col("carry_from_date")>=pl.col("date"))).height:
         raise ValueError("inventory reachability requires strictly earlier carry dates")
-    data=data.sort(KEYS).with_columns(
+    data=data.with_columns(
         (pl.col("inventory_origin_unresolved").fill_null(True)
          |pl.col("executable").fill_null(True)&(
              pl.col("volume").is_null()|~pl.col("volume").is_finite()|(pl.col("volume")>0)))
         .alias("_entry_seed"))
-    def prefix(rows):
-        return rows.sort(KEYS).with_columns(pl.col("_entry_seed").cast(pl.Int64).cum_sum()
-            .over("physical_contract").gt(0).alias("inventory_entry_reachable"))
-    data=prefix(data)
+    # A physical identity's causal prefix is determined by its earliest seed.
+    # Every carry edge points to a strictly later date, so sorting the sparse
+    # cross-identity edges gives a topological order. Propagate those earliest
+    # dates once rather than repeatedly joining/sorting the full daily panel.
+    seeds=data.group_by("physical_contract").agg(
+        pl.col("date").filter(pl.col("_entry_seed")).min().alias("_first_reachable"))
+    earliest=dict(seeds.iter_rows())
     cross=incoming.filter(pl.col("carry_from_physical_contract")!=pl.col("physical_contract"))
     missing_same=incoming.filter(pl.col("carry_from_physical_contract")==pl.col("physical_contract")).join(
         data.select(pl.col("date").alias("carry_from_date"),
                     pl.col("physical_contract").alias("carry_from_physical_contract")),
         on=["carry_from_date","carry_from_physical_contract"],how="anti")
     cross=pl.concat([cross,missing_same],how="vertical")
-    # Same-identity carry is already bounded by the causal prefix. Cross-identity
-    # events seed only their destination date, then propagate forward. Iteration
-    # handles multi-step conversions without letting future nodes seed the past.
-    for _ in range(cross.height+1):
-        sources=data.select(pl.col("date").alias("carry_from_date"),
-            pl.col("physical_contract").alias("carry_from_physical_contract"),
-            pl.col("inventory_entry_reachable").alias("_source_reachable"))
-        targets=cross.join(sources,on=["carry_from_date","carry_from_physical_contract"],
-            how="left",validate="m:1").join(data.select(*KEYS,"inventory_entry_reachable"),
-            on=KEYS,validate="1:1").filter(
-                pl.col("_source_reachable").fill_null(True)&~pl.col("inventory_entry_reachable"))
-        if targets.is_empty():
-            return data.select(*KEYS,"inventory_entry_reachable").sort(KEYS)
-        data=prefix(data.join(targets.select(KEYS).with_columns(pl.lit(True).alias("_incoming_seed")),
-            on=KEYS,how="left",validate="1:1").with_columns(
-                (pl.col("_entry_seed")|pl.col("_incoming_seed").fill_null(False)).alias("_entry_seed"))
-            .drop("_incoming_seed"))
-    raise ValueError("inventory reachability did not converge")
+    sources=data.select(pl.col("date").alias("carry_from_date"),
+        pl.col("physical_contract").alias("carry_from_physical_contract"),
+        pl.lit(True).alias("_source_present"))
+    events=cross.select(*KEYS,"carry_from_date","carry_from_physical_contract").join(
+        sources,on=["carry_from_date","carry_from_physical_contract"],
+        how="left",validate="m:1").sort(KEYS)
+    for day,destination,prior,origin,present in events.iter_rows():
+        beginning=earliest.get(origin)
+        if present is None or (beginning is not None and beginning<=prior):
+            current=earliest[destination]
+            if current is None or day<current:
+                earliest[destination]=day
+    starts=pl.DataFrame({"physical_contract":list(earliest),
+        "_first_reachable":list(earliest.values())},
+        schema={"physical_contract":data.schema["physical_contract"],
+                "_first_reachable":data.schema["date"]})
+    return data.select(KEYS).join(starts,on="physical_contract",how="left",validate="m:1").select(
+        *KEYS,(pl.col("date")>=pl.col("_first_reachable")).fill_null(False)
+        .alias("inventory_entry_reachable")).sort(KEYS)
 
 
 def bind_product_specifications(days: pl.DataFrame, specifications: pl.DataFrame) -> pl.DataFrame:
@@ -143,10 +196,36 @@ def bind_product_specifications(days: pl.DataFrame, specifications: pl.DataFrame
     for field in ("opening_time", "settlement_time", "expiry_time"):
         if specs.filter(~pl.col(field).str.contains(r"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$" )).height:
             raise ValueError("invalid dated product clock")
+    cash_policy = pl.col("final_cash_accounting_policy")
+    if specs.filter(cash_policy.is_null()
+            | ~cash_policy.is_in(["expiry_event_time", FINAL_CASH_ACCOUNTING_CONTRACT])
+            | ((cash_policy == "expiry_event_time") & pl.col("final_cash_accounting_time").is_not_null())
+            | ((cash_policy == FINAL_CASH_ACCOUNTING_CONTRACT) & (
+                (pl.col("settlement_method") != "cash_settlement")
+                | (pl.col("effective_date") < pl.coalesce(
+                    pl.col('final_cash_rule_effective_date'),pl.date(2015, 12, 21)))
+                | (pl.col("final_cash_accounting_time") != "17:00:00")
+                | pl.col("final_cash_accounting_time").is_null()
+                | (pl.col("opening_time") > pl.col("final_cash_accounting_time"))))).height:
+        raise ValueError("invalid final cash accounting policy or cutoff")
+    from stockagent.data.tw_futures_price_limits import staged_specification_validity
+    staged_valid = staged_specification_validity(specs)
+    if specs.filter(pl.col('fixed_staged_ladder_contract').is_not_null() & (
+            (pl.col('fixed_staged_ladder_contract') != 'reviewed_fixed_ladder_v3')
+            | (pl.col('limit_kind') != 'staged_ratio') | (pl.col('tick_kind') != 'fixed'))).height:
+        raise ValueError('reviewed fixed ladder requires its explicit specification contract')
+    if specs.filter((pl.col('limit_kind') == 'staged_ratio') & (
+            ~staged_valid
+            | pl.col('limit_up_ratio').is_not_null() | pl.col('limit_down_ratio').is_not_null()
+            | pl.col('limit_up_points').is_not_null() | pl.col('limit_down_points').is_not_null())).height:
+        raise ValueError('unsupported staged source specification')
+    if specs.filter((pl.col('limit_kind') != 'staged_ratio') & (
+            pl.col('limit_stage_up_ratios').is_not_null() | pl.col('limit_stage_down_ratios').is_not_null())).height:
+        raise ValueError('staged ladder requires its named limit kind')
     if specs.filter(~_positive("contract_multiplier")
             | ~pl.col("tick_kind").is_in(["fixed", "stock_future", "etf_future"])
             | ((pl.col("tick_kind") == "fixed") & ~_positive("tick_size"))
-            | ~pl.col("limit_kind").is_in(["ratio", "points"])
+            | ~pl.col("limit_kind").is_in(["ratio", "points", "staged_ratio"])
             | ((pl.col("limit_kind") == "ratio") & (~_positive("limit_down_ratio")
                 | (pl.col("limit_down_ratio") >= 1) | ~_positive("limit_up_ratio")
                 | (pl.col("limit_up_ratio") <= 1)))
@@ -213,11 +292,88 @@ def position_constraint_errors() -> tuple[pl.Expr, pl.Expr]:
     return conflict,unsupported
 
 
+def bind_required_corporate_events(f: pl.DataFrame, corporate_terms: pl.DataFrame,
+        corporate_events: pl.DataFrame | None) -> pl.DataFrame:
+    """Bind required boundaries to the source-proved physical generation.
+
+    The ordinary dated binder supplies ``corp_terms_binding_status`` and
+    ``event_effective_date``. This helper changes only the missing-event mask.
+    """
+    if corporate_events is not None:
+        required = {'product', 'contract_months', 'effective_date'}
+        if required - set(corporate_events.columns):
+            raise ValueError('corporate event requirements lack physical month/date scope')
+        expected = (corporate_events.select('product',
+            pl.col('contract_months').alias('contract'),
+            pl.col('effective_date').cast(pl.Date).alias('_expected_corporate_date'))
+            .explode('contract').drop_nulls().unique().sort('_expected_corporate_date'))
+        if 'event_family' in corporate_terms.columns:
+            reform=corporate_terms.filter((pl.col('event_family')=='cash_dividend_regime_20110503')
+                & (pl.col('effective_date').cast(pl.Date)==date(2011,5,3))).select(
+                'product','contract',pl.col('effective_date').cast(pl.Date).alias('_expected_corporate_date'))
+            expected=pl.concat([expected,reform]).unique().sort('_expected_corporate_date')
+        f = f.sort('date').join_asof(expected, left_on='date', right_on='_expected_corporate_date',
+            by=['product', 'contract'], strategy='backward', check_sortedness=False)
+    else:
+        f = f.with_columns(pl.lit(None, dtype=pl.Date).alias('_expected_corporate_date'))
+    expected_active = (pl.col('_expected_corporate_date') <= pl.col('date')).fill_null(False)
+    if (corporate_events is not None and 'from_product' in corporate_events.columns
+            and {'corporate_generation','first_observed_date'} <= set(f.columns)):
+        outgoing=(corporate_events.filter(pl.col('from_product').is_not_null()
+            & (pl.col('from_product')!=pl.col('product'))).select(
+                pl.col('from_product').alias('product'),pl.col('contract_months').alias('contract'),
+                pl.col('effective_date').cast(pl.Date).alias('_outgoing_corporate_date'))
+            .explode('contract').drop_nulls().unique().sort('_outgoing_corporate_date'))
+        f=f.sort('date').join_asof(outgoing,left_on='date',right_on='_outgoing_corporate_date',
+            by=['product','contract'],strategy='backward',check_sortedness=False)
+        reissued=((pl.col('corporate_generation')>0)
+            & (pl.col('first_observed_date')>=pl.col('_outgoing_corporate_date'))
+            & (pl.col('date')>=pl.col('first_observed_date'))
+            & (pl.col('_expected_corporate_date')<pl.col('_outgoing_corporate_date'))).fill_null(False)
+        expected_active=expected_active & ~reissued
+    return f.with_columns((expected_active & (
+        (pl.col('corp_terms_binding_status') != 'bound_prior_publication')
+        | (pl.col('event_effective_date').cast(pl.Date) != pl.col('_expected_corporate_date')))
+        .fill_null(True)).alias('_unresolved_corporate_event'))
+
+
+def rebind_corporate_requirement_flags(frame: pl.DataFrame, flags: pl.DataFrame,
+        corporate_terms: pl.DataFrame, corporate_events: pl.DataFrame) -> pl.DataFrame:
+    """Recheck the boundary mask without recomputing unchanged financial values.
+
+    The preparation owner separately verifies the exact original checkpoint,
+    source/code delta and arithmetic identity before reusing this result.
+    """
+    if frame.select(KEYS).is_duplicated().any() or flags.select(KEYS).is_duplicated().any():
+        raise ValueError('corporate recheck requires unique original physical account days')
+    query=frame.select(*KEYS,'product','contract',*[c for c in
+        ('corporate_generation','first_observed_date') if c in frame.columns])
+    if (query.height!=flags.height or query.select(KEYS).join(flags.select(KEYS),on=KEYS,how='anti').height):
+        raise ValueError('corporate recheck must retain the complete original account axis')
+    bound=bind_dated_corporate_terms(query.select(QUOTE_KEYS),corporate_terms)
+    query=query.join(bound.select(*QUOTE_KEYS,'corporate_term_id',
+        pl.col('terms_binding_status').alias('corp_terms_binding_status')),
+        on=QUOTE_KEYS,how='left',validate='1:1').join(
+            corporate_terms.with_row_index('corporate_term_id').select('corporate_term_id',
+                pl.col('effective_date').alias('event_effective_date')),
+            on='corporate_term_id',how='left',validate='m:1')
+    rebound=bind_required_corporate_events(query,corporate_terms,corporate_events).select(*KEYS,
+        pl.col('_unresolved_corporate_event').alias('missing_corporate_event_terms'))
+    names=flags.columns
+    result=flags.drop('missing_corporate_event_terms').join(rebound,on=KEYS,how='left',
+        validate='1:1',maintain_order='left')
+    reasons=[c for c,t in result.schema.items() if t==pl.Boolean and c not in ('has_blocker','is_warmup')]
+    return result.with_columns(pl.any_horizontal(pl.col(c).fill_null(True) for c in reasons)
+        .alias('has_blocker')).select(names)
+
+
 def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         positions: pl.DataFrame, corporate_terms: pl.DataFrame,
         margin_intervals: pl.DataFrame, specifications: pl.DataFrame,
         terminal_values: pl.DataFrame, *,
-        position_research_policy: dict | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+        position_research_policy: dict | None = None,
+        corporate_events: pl.DataFrame | None = None,
+        initial_references: pl.DataFrame | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Vectorized all-product compiler; return rules and explicit row blockers.
 
     Specification intervals establish historical units, clocks and price/tax
@@ -226,6 +382,14 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
     """
     if frame.select(KEYS).is_duplicated().any():
         raise ValueError("duplicate physical account day")
+    cash_rows = frame.filter(pl.col('cash_settlement').fill_null(False))
+    if cash_rows.height and ('asset_class' not in frame.columns
+            or cash_rows['asset_class'].null_count()):
+        raise ValueError('cash settlement requires the sourced product asset class')
+    if ('settlement_currency' in frame.columns
+            and frame.filter(pl.col('settlement_currency').is_null()
+                | (pl.col('settlement_currency') != 'TWD')).height):
+        raise ValueError('the execution terms compiler requires TWD settlement')
     frame = frame.drop("contract_multiplier", strict=False)
     # Provenance is validated once on the small source tables and retained in
     # their SHA-bound manifests. Expanding lists of source hashes into every
@@ -233,6 +397,23 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
     specs = bind_product_specifications(frame, specifications).drop(
         "spec_source_content_sha256s", "spec_valid_until_exclusive")
     f = frame.join(specs, on=["date", "product"], how="left", validate="m:1")
+    final_day_posting = (pl.col("cash_settlement")
+        & (pl.col("spec_final_cash_accounting_policy") == FINAL_CASH_ACCOUNTING_CONTRACT)).fill_null(False)
+    physical_final = ((pl.col("date") == pl.col("official_expiry"))
+        & (pl.col("spec_settlement_method") == "physical_delivery")).fill_null(False)
+    has_final_day_posting = f.select(final_day_posting.any()).item()
+    if has_final_day_posting:
+        if "reported_date_role" not in f.columns:
+            raise ValueError("final-day cash accounting requires the reported official date role")
+        if f.filter(final_day_posting & ((pl.col("reported_date_role") != "final_settlement_day")
+                | pl.col("reported_date_role").is_null()
+                | (pl.col("date") != pl.col("official_expiry")))).height:
+            raise ValueError("cash posting cutoff cannot relabel a last trading day as the final day")
+        f = f.with_columns(
+            pl.when(final_day_posting).then(pl.lit(FINAL_CASH_ACCOUNTING_CONTRACT))
+                .otherwise(None).alias("final_cash_accounting_policy"),
+            pl.when(final_day_posting).then(pl.col("reported_date_role"))
+                .otherwise(None).alias("final_cash_reported_date_role"))
     for source, keys in ((margins, ["date", "product"]), (positions, QUOTE_KEYS), (terminal_values, QUOTE_KEYS)):
         if source.select(keys).is_duplicated().any():
             raise ValueError("duplicate execution-term input")
@@ -259,6 +440,11 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
               "has_equity_credit_fields", "carry_quantity_numerator", "carry_quantity_denominator"]
     f = f.join(events.select("corp_corporate_term_id", *[pl.col(c).alias("event_" + c) for c in extras]),
                on="corp_corporate_term_id", how="left", validate="m:1")
+    # Candidate events establish a required financial boundary even when their
+    # amounts could not be resolved into a term interval. A standard code is
+    # not permission to ignore that boundary and credit zero cash. A narrow
+    # key/date projection avoids copying source text into the account tape.
+    f=bind_required_corporate_events(f,corporate_terms,corporate_events)
     f = f.join(terminal_values.select(*QUOTE_KEYS, "terminal_value_input_twd"),
                on=QUOTE_KEYS, how="left", validate="1:1")
     corporate = pl.col("corp_terms_binding_status").eq("bound_prior_publication").fill_null(False)
@@ -273,7 +459,8 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         pl.when(corporate).then(pl.col("corp_deliverable_cash_twd"))
           .when(~adjusted).then(0.).alias("_deliverable_cash"),
         pl.col("spec_opening_time").alias("opening_time"),
-        pl.when(pl.col("cash_settlement")).then(pl.col("spec_expiry_time"))
+        pl.when(final_day_posting).then(pl.col("spec_final_cash_accounting_time"))
+          .when(pl.col("cash_settlement") | physical_final).then(pl.col("spec_expiry_time"))
           .otherwise(pl.col("spec_settlement_time")).alias("settlement_time"),
         (corporate & (pl.col("event_effective_date").cast(pl.Date) <= pl.col("date"))
           & (pl.col("event_effective_date").cast(pl.Date) > pl.col("previous_market_date")))
@@ -309,18 +496,19 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         raise ValueError("overlapping corporate and product-wide quantity transitions")
     f = f.with_columns((pl.col("_corporate_event_today") | pl.col("_split_today")).alias("_event_today"))
     # The numeric day's closing snapshot belongs to the regular margin phase.
-    # Cash expiry can occur earlier. Its event clock does not move the later
+    # Cash expiry or a required pre-delivery close can occur earlier. Its clock
+    # does not move the later
     # legal margin boundary forward: before regular close, the admitted opening
     # phase remains in force under this two-phase source contract. Keep that
     # interval identity and its knowledge clock, including any unresolved gap.
-    early_cash = (pl.col("cash_settlement") & pl.col("specification_bound")
-        & (pl.col("spec_settlement_method") == "cash_settlement")
+    early_terminal = ((pl.col("cash_settlement") | physical_final) & pl.col("specification_bound")
+        & pl.col("spec_settlement_method").is_in(["cash_settlement", "physical_delivery"])
         & (pl.col("date") == pl.col("official_expiry"))
-        & (pl.col("spec_expiry_time") < pl.col("spec_settlement_time"))).fill_null(False)
+        & (pl.col("settlement_time") < pl.col("spec_settlement_time"))).fill_null(False)
     opening_margin_fields = [c for c in MARGIN_INPUT_FIELDS if c.startswith("opening_")]
     opening_margin_fields += [c for c in f.columns if c.startswith("opening_rule_")]
     f = f.with_columns(*[
-        pl.when(early_cash).then(pl.col(c))
+        pl.when(early_terminal).then(pl.col(c))
           .otherwise(pl.col(c.replace("opening_", "settlement_", 1)))
           .alias(c.replace("opening_", "settlement_", 1)) for c in opening_margin_fields])
     # The numeric binder deliberately leaves same-day announcements undecided.
@@ -368,14 +556,35 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         pl.when(valid_origin).then((pl.col("_prior_value") - pl.col("carry_cash_twd"))
             * pl.col("carry_quantity_denominator") / pl.col("carry_quantity_numerator"))
           .alias("known_margin_contract_value_twd"),
-    ).with_columns(
+    )
+    native_initial = pl.lit(False)
+    if initial_references is not None:
+        from stockagent.data.tw_futures_initial_reference import bind_initial_references
+        f = bind_initial_references(f, initial_references)
+        native_initial = pl.col('initial_reference_applied')
+    if cash_rows.height:
+        # TAIFEX requires the expiry value of each TWD index contract to be
+        # truncated to whole dollars.  Apply decimal arithmetic to the small
+        # expiry subset, before it reaches the shared integer-contract ledger.
+        index_values = index_futures_cash_terminal_values(
+            f.filter(pl.col('cash_settlement')), price='settlement', multiplier='contract_multiplier')
+        f = f.join(index_values, on=KEYS, how='left', validate='1:1')
+        index_cash = (pl.col('cash_settlement') & (pl.col('asset_class') == 'index_future')).fill_null(False)
+        index_value = pl.when((~corporate & (pl.col('_deliverable_cash') == 0)).fill_null(False)) \
+            .then(pl.col('_index_terminal_value_twd'))
+    else:
+        f = f.with_columns(pl.lit(None, dtype=pl.Float64).alias('_index_terminal_value_twd'))
+        index_cash = pl.lit(False)
+        index_value = pl.col('_index_terminal_value_twd')
+    f = f.with_columns(
         ((pl.col("known_margin_contract_value_twd") - pl.col("_deliverable_cash"))
          / pl.col("contract_multiplier")).alias("_reference_quote"),
         (pl.col("_source_identity").is_null() & pl.col("previous_symbol_date").is_null()
-         & ~pl.col("_event_today")).alias("is_warmup"),
+         & ~pl.col("_event_today") & ~native_initial).alias("is_warmup"),
         pl.when(pl.col("executable")).then(pl.col("open") * pl.col("contract_multiplier") + pl.col("_deliverable_cash"))
           .otherwise(pl.col("known_margin_contract_value_twd")).alias("opening_contract_value_twd"),
-        pl.when(pl.col("cash_settlement")).then(pl.when(adjusted).then(pl.col("terminal_value_input_twd"))
+        pl.when(index_cash).then(index_value)
+          .when(pl.col("cash_settlement")).then(pl.when(adjusted).then(pl.col("terminal_value_input_twd"))
             .otherwise(pl.col("settlement_contract_value_twd")))
           .otherwise(pl.when(pl.col("executable")).then(pl.col("close") * pl.col("contract_multiplier")
             + pl.col("_deliverable_cash")).otherwise(pl.col("settlement_contract_value_twd")))
@@ -442,7 +651,8 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
               .otherwise(pl.col("spec_settlement_time")) + "+08:00").alias(prefix + "effective_at"))
     f = f.with_columns(
         pl.max_horizontal(*[_utc(pl.col(c)) for c in
-            ("opening_known_at", "pos_known_at", "spec_known_at", "corp_known_at")])
+            ("opening_known_at", "pos_known_at", "spec_known_at", "corp_known_at")],
+            *([_utc(pl.col('initial_reference_market_asof'))] if initial_references is not None else []))
             .dt.to_string("%Y-%m-%dT%H:%M:%S%:z").alias("known_at"),
         pl.max_horizontal(_utc(pl.col("opening_effective_at")),
             _utc(pl.col("pos_effective_date") + "T" + pl.when(pl.col("pos_effective_phase")==0)
@@ -467,6 +677,12 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         with np.errstate(invalid="ignore", divide="ignore"):
             result = rounding(values / ticks + (1e-8 if output == "upper_limit" else -1e-8)) * ticks
         f = f.with_columns(pl.Series(output, result).fill_nan(None))
+    from stockagent.data.tw_futures_price_limits import (
+        compile_staged_price_limit_fields, STAGED_LIMIT_FIELDS)
+    staged_fields = compile_staged_price_limit_fields(f)
+    staged_prices = not staged_fields.is_empty()
+    if staged_prices:
+        f = f.join(staged_fields, on=KEYS, how='left', validate='1:1')
     for name in ("initial", "maintenance"):
         f = f.with_columns((pl.when(pl.col("settlement_margin_kind") == "notional_rate")
             .then(pl.col("settlement_" + name) * pl.col("settlement_margin_value_twd"))
@@ -481,7 +697,7 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
     f = f.with_columns(
         pl.when(incoming).then(pl.col("_source_identity")).otherwise(pl.lit("")).alias("carry_from_physical_contract"),
         pl.when(incoming).then(pl.col("previous_market_date")).alias("carry_from_date"),
-        pl.col("_prior_value").alias("carry_previous_value_twd"),
+        pl.when(native_initial).then(None).otherwise(pl.col("_prior_value")).alias("carry_previous_value_twd"),
         pl.when(pl.col("_split_today")).then(pl.col("spec_known_at"))
           .when(pl.col("_corporate_event_today")).then(pl.col("corp_known_at"))
           .otherwise(pl.col("previous_market_date").cast(pl.String) + "T23:59:59+08:00").alias("carry_known_at"),
@@ -490,7 +706,7 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         pl.when(incoming).then(pl.col("carry_quantity_numerator")).otherwise(1).alias("carry_quantity_numerator"),
         pl.when(incoming).then(pl.col("carry_quantity_denominator")).otherwise(1).alias("carry_quantity_denominator"),
     )
-    f=f.with_columns((~pl.col("is_warmup")&pl.col("_source_identity").is_null())
+    f=f.with_columns((~pl.col("is_warmup")&pl.col("_source_identity").is_null() & ~native_initial)
         .alias("inventory_origin_unresolved"))
     reachability=inventory_entry_reachability(f,f.filter(~pl.col("is_warmup")))
     f=f.join(reachability,on=KEYS,how="left",validate="1:1")
@@ -512,6 +728,7 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         "missing_position_limit": ~pl.col("pos_position_numeric_inputs_resolved") | group_conflict | unsupported_extra,
         "missing_contract_units": ~_positive("contract_multiplier"),
         "missing_adjusted_terms": adjusted & ~corporate,
+        "missing_corporate_event_terms": pl.col('_unresolved_corporate_event'),
         "unvalued_subscription_rights": (pl.col("cash_settlement")
             & pl.col("corp_subscription_rights_at_final_settlement").fill_null(False)
             & ~_positive("terminal_value_input_twd")),
@@ -529,7 +746,11 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
               - pl.col("contract_multiplier") * pl.col("carry_quantity_numerator")).abs() > 1e-8)
             | ~same_generation).fill_null(True),
         "unknown_tax_schedule": pl.col("_tax_rate").is_null(),
-        "missing_price_limits": ~_positive("upper_limit") | ~_positive("lower_limit"),
+        "missing_price_limits": (
+            pl.when(pl.col('spec_limit_kind') == 'staged_ratio')
+              .then(~_positive('price_limit_inner_upper') | ~_positive('price_limit_inner_lower'))
+              .otherwise(~_positive('upper_limit') | ~_positive('lower_limit'))
+            if staged_prices else ~_positive('upper_limit') | ~_positive('lower_limit')),
         "opening_rule_clock": (_utc(pl.col("known_at")) > _utc(_clock("date", "opening_time")))
             | (_utc(pl.col("effective_at")) > _utc(_clock("date", "opening_time"))),
         "settlement_rule_clock": (_utc(pl.col("settlement_known_at")) > _utc(_clock("date", "settlement_time")))
@@ -556,6 +777,13 @@ def compile_execution_terms(frame: pl.DataFrame, margins: pl.DataFrame,
         "carry_cash_twd", "carry_known_at", "carry_effective_at", "carry_previous_value_twd",
         "carry_previous_initial_twd", "carry_previous_maintenance_twd"]
     columns.extend(["inventory_origin_unresolved","inventory_entry_reachable"])
+    if has_final_day_posting:
+        columns.extend(["final_cash_accounting_policy", "final_cash_reported_date_role"])
+    if staged_prices:
+        columns.extend(c for c in staged_fields.columns if c not in KEYS)
+    if initial_references is not None:
+        from stockagent.data.tw_futures_initial_reference import DISCLOSURE_COLUMNS
+        columns.extend(DISCLOSURE_COLUMNS)
     if position_research_policy is not None:
         from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
         columns.extend(POSITION_RESEARCH_COLUMNS)

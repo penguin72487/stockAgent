@@ -405,6 +405,7 @@ def _default_command_runner(args: Sequence[str]) -> subprocess.CompletedProcess[
 def _read_json_with_mtime(
     path: Path, *, use_cache: bool = True,
 ) -> tuple[dict[str, Any] | None, float | None]:
+    from stockagent.live.paper_mode_snapshot import expand_paper_state
     try:
         # The file signature, not a resolved path, controls cache validity.
         # Resolving every receipt follows symlinks and repeats filesystem
@@ -435,9 +436,10 @@ def _read_json_with_mtime(
                 current.st_mtime_ns, current.st_ctime_ns,
             ) != signature:
                 return None, None
-            return (dict(payload) if isinstance(payload, dict) else None, stat.st_mtime)
+            return (expand_paper_state(dict(payload), path.parent) if isinstance(payload, dict) else None,
+                    stat.st_mtime)
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, ValueError):
         return None, None
     selected = payload if isinstance(payload, dict) else None
     try:
@@ -458,10 +460,11 @@ def _read_json_with_mtime(
             _JSON_FILE_CACHE.move_to_end(cache_key)
             while len(_JSON_FILE_CACHE) > MAX_JSON_FILE_CACHE_ENTRIES:
                 _JSON_FILE_CACHE.popitem(last=False)
-    return (
-        dict(selected) if use_cache and selected is not None else selected,
-        stat.st_mtime,
-    )
+    try:
+        result = expand_paper_state(dict(selected), path.parent) if selected is not None else None
+    except (OSError, ValueError):
+        return None, None
+    return result, stat.st_mtime
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:

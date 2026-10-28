@@ -10,27 +10,28 @@ StartLimitBurst=2
 
 [Service]
 Type=oneshot
-Slice=stockagent-heavy-data.slice
+# Day-trade input readiness is not bulk history acquisition.  Give this gate
+# its own system-slice share, below the execution and Discord services but
+# ahead of background archival and historical work.
+Slice=system.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_public_0830_check.sh"
-# The Discord scheduler and paper executor own the 09:00 latency SLO.  A full
-# source audit may use tens of GiB, so keep it best-effort under contention.
-Nice=10
-CPUWeight=25
-IOWeight=25
+# The Discord scheduler and paper executor retain the more urgent -5 nice
+# level.  Resource weights arbitrate contention rather than imposing a quota.
+Nice=0
+CPUWeight=5000
+IOWeight=5000
 MemoryAccounting=true
-# The observed strict audit peaked near 55 GiB on this 94 GiB host.  Reserve a
-# deterministic floor for the executor/Gateway instead of letting this one
-# reproducible audit consume an arbitrary percentage of all host memory.
-MemoryHigh=64G
-MemoryMax=72G
-MemorySwapMax=4G
-OOMScoreAdjust=500
-TasksMax=4096
+# Do not block required inputs with the bulk-acquisition capacity policy.
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+OOMScoreAdjust=-250
+TasksMax=infinity
 TimeoutStartSec=4h
 Restart=on-failure
 RestartSec=30s

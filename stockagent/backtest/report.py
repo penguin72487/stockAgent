@@ -327,6 +327,40 @@ def _annotate_max_drawdown_segment(
     )
 
 
+def _strategy_account_path(
+    result: BacktestResult, dates: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """Use actual account dates when futures settle without a stock decision."""
+    ledger = result.futures_account_ledger
+    if ledger is None:
+        return dates, _clean_log_returns(result.strategy_returns)
+    from stockagent.training.futures_account_artifact import validate_dated_futures_backtest
+    decision_dates = ledger.decision_dates if dates is None else dates
+    validate_dated_futures_backtest(result, decision_dates, ledger)
+    return ledger.dates, _clean_log_returns(ledger.strategy_returns)
+
+
+def _account_metric_rows(
+    result: BacktestResult, dates: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Align risk metrics to actual account days without inventing TX trades.
+
+    The separately verified benchmark has no market session on an
+    account-only node. Its already observed value is carried across that node
+    (zero return), with no new price or execution inferred.
+    """
+    ledger = result.futures_account_ledger
+    if ledger is None:
+        return None
+    account_dates, returns = _strategy_account_path(result, dates)
+    benchmark = _clean_log_returns(result.benchmark_returns).reshape(-1)
+    if benchmark.shape != ledger.decision_dates.shape:
+        raise ValueError("dated futures benchmark differs from its decision calendar")
+    aligned_benchmark = np.zeros(len(account_dates), dtype=np.float64)
+    aligned_benchmark[~ledger.account_only_mask] = benchmark
+    return account_dates, returns, aligned_benchmark, _finite_values(ledger.turnovers)
+
+
 def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
@@ -337,8 +371,13 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """
     from stockagent.backtest.futures_data_validity import reject_invalid_carry_artifact
     reject_invalid_carry_artifact(result)
-    r = _clean_log_returns(result.strategy_returns)
-    b = _clean_log_returns(result.benchmark_returns)
+    account = _account_metric_rows(result)
+    if account is None:
+        r = _clean_log_returns(result.strategy_returns)
+        b = _clean_log_returns(result.benchmark_returns)
+        turnovers = _finite_values(result.turnovers)
+    else:
+        _, r, b, turnovers = account
 
     # r and b are log returns; cumulative = exp(sum) - 1
     cum_r = _safe_expm1(float(r.sum()))
@@ -373,7 +412,7 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
         "benchmark_sortino": benchmark_sortino,
         "max_drawdown": max_dd,
         "calmar": calmar,
-        "turnover": float(_finite_values(result.turnovers).mean()) if result.turnovers.size else 0.0,
+        "turnover": float(turnovers.mean()) if turnovers.size else 0.0,
         "daily_hit_rate": float((r > 0).mean()) if r.size else 0.0,
         "excess_return_vs_benchmark": cum_r - cum_b,
         "cumulative_benchmark": cum_b,
@@ -417,6 +456,9 @@ def _aligned_dated_backtest_rows(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return the common valid dated rows used by annual and total metrics."""
     date_values = np.asarray(dates, dtype="datetime64[D]").reshape(-1)
+    account = _account_metric_rows(result, date_values)
+    if account is not None:
+        return account
     strategy_returns = _clean_log_returns(result.strategy_returns).reshape(-1)
     benchmark_returns = _clean_log_returns(result.benchmark_returns).reshape(-1)
     turnovers = _finite_values(result.turnovers).reshape(-1)
@@ -467,7 +509,6 @@ def compute_metrics_by_year(
         if period_contract is not None
         else date_values.astype("datetime64[Y]").astype(np.int64) + 1970
     )
-
     annual_metrics = {}
     periods = _periods_per_year(result)
     annualizer = math.sqrt(periods)
@@ -688,16 +729,18 @@ def plot_equity_curve(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    r = _clean_log_returns(result.strategy_returns)
-    b = _clean_log_returns(result.benchmark_returns)
+    strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
+    account = _account_metric_rows(result, np.asarray(dates))
+    benchmark_dates = np.asarray(dates) if account is None else account[0]
+    b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
-    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
+    _plot_finite_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title(
@@ -732,16 +775,18 @@ def plot_equity_curve_log(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    r = _clean_log_returns(result.strategy_returns)
-    b = _clean_log_returns(result.benchmark_returns)
+    strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
+    account = _account_metric_rows(result, np.asarray(dates))
+    benchmark_dates = np.asarray(dates) if account is None else account[0]
+    b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, np.asarray(dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
-    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
+    _plot_finite_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
     _configure_log_y_axis(ax, strategy_equity, benchmark_equity)
@@ -819,8 +864,10 @@ def plot_configured_leverage_equity_curve(
     benchmark_label: str = "Benchmark",
 ) -> None:
     """Plot equity curve from strategy returns generated by the reporting leverage multiplier."""
-    r = _clean_log_returns(result.strategy_returns)
-    b = _clean_log_returns(result.benchmark_returns)
+    strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
+    account = _account_metric_rows(result, np.asarray(dates))
+    benchmark_dates = np.asarray(dates) if account is None else account[0]
+    b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
     strategy_equity = _safe_equity_for_plot(r)
     benchmark_equity = _safe_equity_for_plot(b)
@@ -828,14 +875,14 @@ def plot_configured_leverage_equity_curve(
     fig, ax = plt.subplots(figsize=_figsize_17_6())
     _plot_finite_line(
         ax,
-        np.asarray(dates),
+        np.asarray(strategy_dates),
         strategy_equity,
         label=f"Strategy (leverage={float(leverage):.2f}x)",
         linewidth=2.2,
         alpha=0.9,
     )
-    _plot_finite_line(ax, np.asarray(dates), benchmark_equity, label=benchmark_label, linewidth=1.8, alpha=0.8)
-    _annotate_max_drawdown_segment(ax, dates, strategy_equity)
+    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=1.8, alpha=0.8)
+    _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
     ax.set_title(

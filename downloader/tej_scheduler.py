@@ -485,6 +485,7 @@ def replay_authorized_unknown(root: Path, bridge, config: dict) -> dict | None:
             allow_unstaged_interop=interop, allow_unstaged_script_preparation=script_prepare,
             allow_orphaned_desktop_loss=orphan_loss,
             allow_orphaned_worker_loss=worker_loss,
+            allow_retained_preview_preservation=worker_loss,
             allow_interrupted_stage_write=interrupted_write,
             standing_authorization=policy)
         status.update(state=result['state'], performed=True, failures=0,
@@ -740,6 +741,9 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         paused_reason = None
                         from downloader.tej_value_priority import refresh_if_due
                         refresh_if_due(root, on_refresh=lambda: publish('refreshing_priorities'))
+                        from downloader.tej_incremental import seed_wizard
+                        with closing(connect(root)) as incremental_con, incremental_con:
+                            seed_wizard(incremental_con, config, datetime.now(UTC))
                         if session_path is not None:
                             # Reload only explicitly pinned private identity,
                             # after reconciliation. Never discover or select a

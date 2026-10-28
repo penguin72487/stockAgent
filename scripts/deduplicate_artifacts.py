@@ -52,6 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--finlab-wait-owner-seconds", type=float, default=0,
                         help="bounded wait for the native FinLab writer; never terminates a download")
+    parser.add_argument("--finlab-working-set-inventory", action="store_true",
+                        help="receipt/metadata-only FinLab current/history classification; never hashes or retires payloads")
     parser.add_argument("--expected-plan-fingerprint",
                         help="require the exact dry-run plan; mandatory for FinLab --apply")
     parser.add_argument(
@@ -73,10 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.finlab_working_set_inventory and not args.finlab_history_root:
+        parser.error("--finlab-working-set-inventory requires --finlab-history-root")
     if args.finlab_history_root:
         if args.sharing_candidates_only or args.forward_capacity_bytes is not None:
             raise ValueError("FinLab source history is not a service-cache capacity policy")
-        from stockagent.data.finlab_storage import HASH, compact_history
+        from stockagent.data.finlab_storage import HASH, compact_history, inventory_working_set
+        if args.finlab_working_set_inventory:
+            if args.apply or args.expected_plan_fingerprint:
+                parser.error("FinLab working-set inventory cannot apply or authorize retirement")
+            result = inventory_working_set(args.finlab_history_root, args.report_dir,
+                                          wait_owner_seconds=args.finlab_wait_owner_seconds)
+            fields = ("contract", "state", "reason", "result_path", "receipt_files", "categories",
+                      "total_logical_bytes", "total_unique_allocated_bytes", "metadata_complete",
+                      "payload_SHA_reverified", "deletion_authorized", "source_files_deleted")
+            print(json.dumps({key: result[key] for key in fields if key in result}, ensure_ascii=False))
+            return 75 if result["state"] == "deferred" else 1 if result["state"] == "incomplete" else 0
         if args.apply and not args.expected_plan_fingerprint:
             parser.error("FinLab --apply requires --expected-plan-fingerprint from a completed audit")
         if args.expected_plan_fingerprint and not HASH.fullmatch(args.expected_plan_fingerprint):

@@ -11,6 +11,11 @@ from stockagent.live import quote_provider as provider
 from stockagent.live import shioaji_traffic_ledger as ledger
 
 
+@pytest.fixture(autouse=True)
+def _after_session_history_clock(monkeypatch):
+    monkeypatch.setattr(provider, "_defer_live_0901_history", lambda *_a, **_kw: False)
+
+
 @pytest.mark.parametrize("mode", ["ticks", "fallback", "failed", "ledger_failed", "quota", "callback"])
 def test_remote_price_receipt_attributes_full_context_and_preserves_source_rules(monkeypatch, mode):
     clock = [0.0]

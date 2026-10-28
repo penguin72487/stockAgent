@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -283,7 +284,18 @@ assert not {'torch','pandas','pyarrow','numpy','stockagent.config','requests'} &
 def test_scoped_installer_retains_the_existing_gateway_and_path_owners():
     text = Path("scripts/install_discord_bot_service.sh").read_text()
     assert "--retry-only" in text
-    assert 'unit_names=("$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME")' in text
+    branches = re.findall(r'if \[\[ "\$RETRY_ONLY" == true \]\]; then\n(.*?)\nfi', text, re.DOTALL)
+    selection = next(branch for branch in branches if "unit_names=(" in branch)
+    names = re.search(r'unit_names=\(([^\n]*)\)', selection).group(1)
+    assert set(re.findall(r'"\$([A-Z_]+)"', names)) == {
+        "RETRY_SERVICE_NAME", "RETRY_TIMER_NAME", "PRIORITY_SOURCE_SERVICE_NAME",
+        "POSTCLOSE_CACHE_SERVICE_NAME",
+    }
+    operations = next(branch for branch in branches if "systemctl daemon-reload" in branch)
+    commands = re.findall(r'systemctl (?:start|restart|stop|enable|disable) "\$([A-Z_]+)"', operations)
+    assert commands == ["RETRY_TIMER_NAME", "RETRY_TIMER_NAME"]
+    priority = Path("deploy/systemd/stockagent-tw-day-trade-priority-source.service.in").read_text()
+    assert "--preopen-source-only" in priority
     assert "gateway_restarted=false path_restarted=false" in text
 
 

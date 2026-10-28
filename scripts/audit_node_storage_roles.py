@@ -164,9 +164,40 @@ def main():
     parser.add_argument("--node-id", choices=("penguin", "vastai1T"))
     parser.add_argument("--filesystems-only", action="store_true",
                         help="bounded mount/capacity observation; no source or artifact tree scan")
+    parser.add_argument('--nas-source-scope', action='store_true',
+                        help='compare catalog/private enrollment and current receipts without a payload walk')
     parser.add_argument("--filesystem-path", action="append", type=Path,
                         help="explicit path for --filesystems-only; repeat to inspect multiple mount boundaries")
+    parser.add_argument("--monitor", action="store_true", help="publish bounded storage monitoring metadata only")
+    parser.add_argument("--watch", action="store_true", help="sample capacity each minute; census in one background worker")
+    parser.add_argument("--monitor-config", type=Path, default=ROOT / "configs/data_sync/storage_monitor.json")
     args = parser.parse_args()
+    if args.nas_source_scope:
+        if args.monitor or args.watch or args.filesystems_only or args.filesystem_path:
+            parser.error('NAS source scope is a separate metadata-only observation')
+        from stockagent.data_sync.private_cold_backup import source_scope_inventory
+        configuration = json.loads((ROOT / 'configs/data_sync/backup_stream.json').read_bytes())
+        if (resolve_node_id(Path(configuration['cold_root'])) != 'penguin'
+                or args.node_id not in (None, 'penguin')):
+            parser.error('NAS source scope must be observed in the Penguin authority namespace')
+        os.umask(0o077)
+        value = source_scope_inventory(ROOT, configuration)
+        atomic_write_json(args.output, value)
+        print(json.dumps({k: value[k] for k in ('registered_source_count', 'private_head_dataset_count',
+                                               'unregistered_data_roots', 'all_project_sources_NAS_verified')}))
+        return 0
+    if args.watch and not args.monitor:
+        parser.error("--watch requires --monitor")
+    if args.monitor:
+        if args.filesystems_only or args.filesystem_path:
+            parser.error("monitor and single filesystem audit are distinct modes")
+        from stockagent.data_sync.storage_monitor import load_config, monitor
+        config = load_config(args.monitor_config)
+        if config["observer_node_id"] == "penguin" and resolve_node_id(Path("/srv/stockagent-packed")) != "penguin":
+            parser.error("fleet observer must run in the authority mount namespace")
+        os.umask(0o077)
+        monitor(args.monitor_config, args.output, ROOT, watch=args.watch)
+        return 0
     if args.filesystem_path and not args.filesystems_only:
         parser.error("explicit filesystem paths require --filesystems-only")
     policy = json.loads(args.policy.read_text())

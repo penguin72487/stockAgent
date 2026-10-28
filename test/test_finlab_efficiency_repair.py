@@ -176,10 +176,11 @@ def test_known_hole_behind_a_committed_frontier_is_repaired_once(universe):
     assert len(calls) == 1
 
 
-def test_due_publication_pool_is_not_artificially_capped_at_sixteen(universe, monkeypatch):
+@pytest.mark.parametrize("count", [21, 80])
+def test_due_publication_pool_is_not_artificially_capped_at_sixteen(universe, monkeypatch, count):
     root, public, days = universe
     prototype = market.load_universe(public, start=days[0])[0]
-    symbols = ["2330", *[str(4300+value) for value in range(20)]]
+    symbols = ["2330", *[str(4300+value) for value in range(count-1)]]
     items = [{**prototype, "symbol": symbol} for symbol in symbols]
     monkeypatch.setattr(market, "load_universe", lambda *a, **kw: items)
     db = market._open_index(root / "intraday/market_index.sqlite3")
@@ -205,8 +206,8 @@ def test_due_publication_pool_is_not_artificially_capped_at_sixteen(universe, mo
         calls.append(key)
         return fake_range(root, key, targets, **kwargs)
 
-    result = run(universe, workers=8, limit=21, queue_depth=4, fetch=fetch)
-    assert result["successes_this_run"] == 21 and len(set(calls)) == 21
+    result = run(universe, workers=8, limit=count, queue_depth=4, fetch=fetch)
+    assert result["successes_this_run"] == count and len(set(calls)) == count
 
 
 def test_summary_reports_blocked_debt_separately_from_actionable_work(universe):
@@ -226,6 +227,68 @@ def test_summary_reports_blocked_debt_separately_from_actionable_work(universe):
     assert priority["pending_known_window_partitions"] == priority["blocked_known_window_partitions"] == 1
     assert priority["actionable_known_window_partitions"] == 0 and priority["tick_residual_allowed"]
     assert datetime.fromisoformat(priority["next_source_check_at_utc"]) > datetime.now(UTC)
+
+
+def test_tick_known_gap_precedes_exhausted_older_discovery(universe):
+    root, public, days = universe
+    # Existing minute fixture helpers are not a source of tick observations.
+    db = market._open_index(root / "intraday/market_index.sqlite3")
+    items = market.load_universe(public, start=days[0])
+    for item in items:
+        for day in days:
+            market._record(db, "tw_tick", item["symbol"], day, "verified_no_trade")
+    missing = ("2330", days[1])
+    db.execute("DELETE FROM partitions WHERE kind='tw_tick' AND symbol=? AND trade_date=?",
+               (missing[0], missing[1].isoformat()))
+    db.commit()
+    gaps = market._unchecked_known_partitions(db, items, days,
+        first_observed=days[0].isoformat(), limit=10, kind="tw_tick")
+    assert gaps == [{"symbol": missing[0], "day": missing[1].isoformat()}]
+    # A real tick error still gets its exact retry deadline; minute acceptance
+    # cannot hide it or move it to the ancient-source exploration boundary.
+    intraday.record_failed_partition(root, "tw_tick:2330", days[1], DataError("fixture provider failure"))
+    market._record(db, "tw_tick", "2330", days[1], "provider_error")
+    phases = market._coverage_phases(db, items, days, first_observed=days[0].isoformat())
+    priority = market._source_priority(db, items, days, first_observed=days[0].isoformat(),
+        phases=phases, source_root=root, quota_policy=None, kind="tw_tick")
+    assert priority["kind"] == "tw_tick"
+    assert priority["pending_known_window_partitions"] == priority["blocked_known_window_partitions"] == 1
+    assert datetime.fromisoformat(priority["next_source_check_at_utc"]) > datetime.now(UTC)
+    db.close()
+
+
+def test_ancient_retry_rows_cannot_fill_the_limit_ahead_of_due_known_publication(universe):
+    root, public, days = universe
+    run(universe, limit=9, queue_depth=4)
+    day = days[-1]
+    intraday._partition_paths(root, "tw_minute:2330", day)[0].unlink()
+    intraday.record_failed_partition(root, "tw_minute:2330", day, DataError("not_ready: fixture"))
+    attempt = intraday._partition_paths(root, "tw_minute:2330", day)[1]
+    value = json.loads(attempt.read_text())
+    before = datetime.now(UTC) - timedelta(hours=3)
+    value["attempted_at_utc"] = before.isoformat()
+    attempt.write_text(json.dumps(value))
+    db = market._open_index(root / "intraday/market_index.sqlite3")
+    market._record(db, "tw_minute", "2330", day, "partition_not_ready")
+    db.execute("UPDATE partitions SET checked_at_utc=? WHERE kind='tw_minute' AND symbol='2330' AND trade_date=?",
+               (before.isoformat(), day.isoformat()))
+    # More ineligible ancient rows than the finite retry SELECT can return.
+    # Their existence cannot hide a real current-window publication recheck.
+    db.executemany("INSERT INTO partitions VALUES ('tw_minute',?,'2003-08-01','partition_not_ready',0,0,?)",
+                   [(str(700000 + n), (before - timedelta(days=3)).isoformat()) for n in range(1000)])
+    db.commit()
+    db.close()
+    cursor_path = root / "intraday/minute_cursor.json"
+    cursor = json.loads(cursor_path.read_text())
+    cursor.update(older_probe_attempts=16, older_retry_attempts=4)
+    cursor_path.write_text(json.dumps(cursor))
+    calls = []
+    def fetch(root, key, targets, **kwargs):
+        calls.append((key, targets))
+        return fake_range(root, key, targets, **kwargs)
+    result = run(universe, limit=1, queue_depth=1, fetch=fetch)
+    assert result["successes_this_run"] == 1
+    assert calls == [("tw_minute:2330", [day])]
 
 
 def test_blocked_minute_failures_do_not_fake_completion_or_starve_residual_tick(tmp_path):

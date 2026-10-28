@@ -1,0 +1,15 @@
+# Full historical inventory, dated execution eligibility, no resurrection of old codes.
+base_config: tw_futures_residual_policy_20261024_v1.yaml
+experiment_name: tw-futures-historical-universe-20261025-v2
+data:
+  panel_start_date: '2011-01-03'
+  panel_cache_root: data_tw_index_futures/training_cache/historical_universe_20261025_v2/base_panel
+trading:
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_historical_universe_20261025_v2/twd_equity/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_historical_universe_20261025_v2/twd_equity/clocks/0845/opening_reference.parquet
+walk_forward:
+  expected_first_year: 2011
+  split_start_year: 2011
+runner:
+  output_dir: artifacts/markets/tw_futures_historical_universe_20261025_v2/twd_equity__history_0845_1m
+  resume: false

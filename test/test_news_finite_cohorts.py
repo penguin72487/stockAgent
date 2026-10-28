@@ -327,7 +327,7 @@ def test_planner_retains_every_role_not_top_k_or_fake_completion():
     assert rows["redirect"]["stage"] == 4 and rows["social"]["stage"] == 5
     assert rows["fed_board"]["priority_tier"] < rows["cnews"]["priority_tier"] < rows["gov"]["priority_tier"]
     assert rows["gov"]["research_topic"] == "public_sector_unclassified"
-    assert result["contract_version"] == 5
+    assert result["contract_version"] == 8
     assert all(r["finish_eta_utc"] is None and not r["dedicated_refresh_service"] for r in rows.values())
     assert not result["plan_is_acquisition_acceptance"] and not result["all_history_complete"]
 

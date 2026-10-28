@@ -112,9 +112,214 @@ def test_xml_controls_in_body_recover_only_metadata_and_continue_discovery(confi
         assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == 2
         assert not list(tmp_path.glob('**/*.parquet'))  # Neither changed text nor unreviewed shared raw retained.
         task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        from downloader.news_fulltext import fail_discovery
+        from downloader.news_fulltext_policy import NewsError
+        fail_discovery(queue, task, NewsError('stopping', retry=True, delay=1, request_deferred=True))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert task['error_code'] == XML_BODY_METADATA_FALLBACK
         accept_discovery(queue, task, Response(url, 304, {}, b''), [], [], [])
         assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] == XML_BODY_METADATA_FALLBACK
         assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == 2
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('valid_item', [True, False])
+def test_xml_metadata_fallback_with_unusable_identity_never_retains_unreviewed_envelope(config, tmp_path, valid_item):
+    from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK
+    http, queue = feed_fixture(config, tmp_path)
+    url = feed_url('https://publisher.test/feed/', 12)
+    # A control in the unreviewed body forces the whole page into metadata-only
+    # mode; a malformed identity must not cause its raw envelope to be retained.
+    malformed = feed_item(2, rights='All rights reserved').replace('https://publisher.test/story/2', 'not-a-url')
+    invalid_body = malformed.replace('Publisher original', 'Publisher\x08 original')
+    items = [feed_item(1), invalid_body] if valid_item else [invalid_body]
+    try:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        response = Response(url, 200, {}, rss(items))
+        records, errors = feed_records(response, http, http.registry.sources['publisher'])
+        assert not records
+        assert any(e['error'] == 'invalid_url' for e in errors)
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors
+                 if e.get('url') and e['error'] == XML_BODY_METADATA_FALLBACK]
+        if valid_item:
+            assert accept_discovery(queue, task, response, links, records, errors) == 0
+            assert queue.db.execute("SELECT count(*) FROM articles WHERE state='pending'").fetchone()[0] == 1
+            assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url('https://publisher.test/feed/', 13),)).fetchone()
+            assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] == XML_BODY_METADATA_FALLBACK
+        else:
+            # With no authorized identity, do not silently advance or mark the
+            # page successful. Keep its failure for the ordinary retry path.
+            with pytest.raises(NewsError, match='rss_xml_body_no_usable_identity'):
+                accept_discovery(queue, task, response, links, records, errors)
+            assert not queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url('https://publisher.test/feed/', 13),)).fetchone()
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == len(items)
+        assert queue.db.execute('SELECT count(*) FROM articles WHERE body_sha256 IS NOT NULL').fetchone()[0] == 0
+        assert not list(tmp_path.glob('**/*.parquet'))
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_unusable_xml_identity_does_not_pause_other_feed_pages_after_restart(config, tmp_path):
+    root = 'https://publisher.test/feed/'
+    broken_url, healthy_url = feed_url(root, 12), feed_url(root, 20)
+    config['providers'][0]['fulltext_feeds'] = [root]
+    config['providers'][0]['require_author_attribution'] = True
+    malformed = feed_item(2, rights='All rights reserved').replace('https://publisher.test/story/2', 'not-a-url')
+    broken = rss([malformed.replace('Publisher original', 'Publisher\x08 original')])
+    routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              broken_url: FakeResponse(broken, headers={'Content-Type': 'application/rss+xml'}),
+              healthy_url: FakeResponse(rss([feed_item(3)]), headers={'Content-Type': 'application/rss+xml'})}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        seed_discovery(queue)
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=? WHERE url=?', (time.time() + 7200, root))
+            queue.db.executemany("INSERT INTO discovery(url,kind,provider,priority) VALUES (?,'rss_fulltext','publisher',?)",
+                                 [(broken_url, 1), (healthy_url, 2)])
+        first = run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1)
+        broken_task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (broken_url,)).fetchone())
+        assert first['cycle']['discovery_attempts_started'] == 1
+        assert queue.bulk_allowed(http.registry.sources['publisher'])
+        assert not queue.db.execute('SELECT 1 FROM bulk_adapter_cooldowns').fetchone()
+        assert broken_task['error_code'] == 'rss_xml_body_no_usable_identity'
+        assert broken_task['attempts'] == 1 and broken_task['due'] >= time.time() + 3500
+        assert not queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url(root, 13),)).fetchone()
+        assert queue.db.execute('SELECT error_code FROM bulk_item_errors WHERE request_url=?', (broken_url,)).fetchone()[0] == 'invalid_url'
+        assert not list(tmp_path.glob('**/*.parquet'))
+        queue.close()
+        queue = NewsQueue(tmp_path, http.registry)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (broken_url,)).fetchone()) == broken_task
+        second = run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1)
+        assert second['cycle']['discovery_attempts_started'] == 1
+        assert [url for url, _ in session.calls if url in (broken_url, healthy_url)] == [broken_url, healthy_url]
+        assert queue.db.execute('SELECT body_sha256 FROM articles WHERE url=?', ('https://publisher.test/story/3',)).fetchone()[0]
+        assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url(root, 21),)).fetchone()
+        assert queue.db.execute('SELECT error_code,due FROM discovery WHERE url=?', (broken_url,)).fetchone()[:] == (
+            broken_task['error_code'], broken_task['due'])
+        assert verify_bodies(tmp_path)['accepted']
+        # In this isolated fixture only, make the recorded retry due and let
+        # the same publisher return a valid page. The ordinary owner must
+        # replace its item errors and continue that page's own pagination.
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (broken_url,))
+        session.routes[broken_url] = FakeResponse(rss([feed_item(2)]),
+                                                   headers={'Content-Type': 'application/rss+xml'})
+        third = run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1)
+        assert third['cycle']['discovery_attempts_started'] == 1
+        assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (broken_url,)).fetchone()[0] is None
+        assert not queue.db.execute('SELECT 1 FROM bulk_item_errors WHERE request_url=?', (broken_url,)).fetchone()
+        assert queue.db.execute('SELECT body_sha256 FROM articles WHERE url=?', ('https://publisher.test/story/2',)).fetchone()[0]
+        assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url(root, 13),)).fetchone()
+        verification = verify_bodies(tmp_path)
+        assert verification['accepted'] and verification['body_versions_verified'] == 2
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_unusable_xml_identity_does_not_clear_existing_adapter_circuit(config, tmp_path):
+    # An already in-flight page may fail after a different page has tripped
+    # the provider circuit. The isolated retry must preserve that circuit.
+    from downloader.news_fulltext import fail_discovery
+
+    http, queue = feed_fixture(config, tmp_path)
+    url = feed_url('https://publisher.test/feed/', 12)
+    malformed = feed_item(2).replace('https://publisher.test/story/2', 'not-a-url')
+    payload = rss([malformed.replace('Publisher original', 'Publisher\x08 original')])
+    try:
+        source = http.registry.sources['publisher']
+        cooldown = ('publisher', source.data_fingerprint, time.time() + 7200, 'bulk_all_items_unusable')
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+            queue.db.execute('INSERT INTO bulk_adapter_cooldowns VALUES (?,?,?,?)', cooldown)
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        response = Response(url, 200, {}, payload)
+        records, errors = feed_records(response, http, source)
+        with pytest.raises(NewsError, match='rss_xml_body_no_usable_identity') as failure:
+            accept_discovery(queue, task, response, [], records, errors)
+        fail_discovery(queue, task, failure.value)
+        assert tuple(queue.db.execute('SELECT * FROM bulk_adapter_cooldowns').fetchone()) == cooldown
+        assert not queue.bulk_allowed(source)
+        assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] == 'rss_xml_body_no_usable_identity'
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_mixed_xml_metadata_fetch_304_then_repaired_response(config, tmp_path):
+    from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK
+    config['providers'][0]['fulltext_feeds'] = ['https://publisher.test/feed/']
+    config['providers'][0]['require_author_attribution'] = True
+    url = feed_url('https://publisher.test/feed/', 12)
+    malformed = feed_item(2, rights='All rights reserved').replace('https://publisher.test/story/2', 'not-a-url')
+    broken = rss([feed_item(1), malformed.replace('Publisher original', 'Publisher\x08 original')])
+    routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              url: [FakeResponse(broken, headers={'Content-Type': 'application/rss+xml', 'ETag': 'broken'}),
+                    FakeResponse(status=304),
+                    FakeResponse(rss([feed_item(1), feed_item(2)]),
+                                 headers={'Content-Type': 'application/rss+xml', 'ETag': 'fixed'})]}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert accept_discovery(queue, task, *fetch_discovery(http, task)) == 0
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert task['error_code'] == XML_BODY_METADATA_FALLBACK
+        assert not list(tmp_path.glob('**/*.parquet'))
+        assert accept_discovery(queue, task, *fetch_discovery(http, task)) == 0
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert task['error_code'] == XML_BODY_METADATA_FALLBACK
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors WHERE request_url=?', (url,)).fetchone()[0] == 2
+        assert session.calls[-1][1]['headers']['If-None-Match'] == 'broken'
+        assert accept_discovery(queue, task, *fetch_discovery(http, task)) == 2
+        assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] is None
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors WHERE request_url=?', (url,)).fetchone()[0] == 0
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_invalid_xml_channel_body_without_items_is_not_a_successful_empty_feed(config, tmp_path):
+    http, queue = feed_fixture(config, tmp_path)
+    payload = rss([]).replace(b'</channel>', b'<content:encoded><![CDATA[\x08]]></content:encoded></channel>')
+    try:
+        with pytest.raises(NewsError, match='invalid_feed'):
+            feed_records(Response('https://publisher.test/feed/', 200, {}, payload), http, http.registry.sources['publisher'])
+        assert not list(tmp_path.glob('**/*.parquet'))
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_invalid_xml_mixed_foreign_identity_keeps_restriction_and_valid_fallback(config, tmp_path):
+    from downloader.news_fulltext_feed import XML_BODY_METADATA_FALLBACK
+    http, queue = feed_fixture(config, tmp_path)
+    url = feed_url('https://publisher.test/feed/', 12)
+    foreign = feed_item(2).replace('publisher.test/story/2', 'foreign.test/story/2')
+    payload = rss([feed_item(1).replace('Publisher original', 'Publisher\x08 original'), foreign])
+    try:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        response = Response(url, 200, {}, payload)
+        records, errors = feed_records(response, http, http.registry.sources['publisher'])
+        assert [e['error'] for e in errors] == [XML_BODY_METADATA_FALLBACK, 'bulk_foreign_article_url']
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors
+                 if e['error'] == XML_BODY_METADATA_FALLBACK]
+        assert accept_discovery(queue, task, response, links, records, errors) == 0
+        assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (url,)).fetchone()[0] == 'bulk_response_contains_restricted_text'
+        assert queue.db.execute('SELECT url FROM articles').fetchall()[0][0] == 'https://publisher.test/story/1'
+        assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url('https://publisher.test/feed/', 13),)).fetchone()
+        assert not list(tmp_path.glob('**/*.parquet'))
     finally:
         queue.close()
         http.close()
@@ -647,10 +852,14 @@ def test_all_rss_missing_credits_keeps_html_links_before_adapter_circuit(config,
     try:
         seed_discovery(queue)
         task = dict(queue.db.execute("SELECT * FROM discovery").fetchone())
-        with pytest.raises(NewsError, match="bulk_all_items_unusable"):
+        with pytest.raises(NewsError, match="bulk_all_items_unusable") as failure:
             accept_discovery(queue, task, *fetch_discovery(http, task))
         assert queue.db.execute("SELECT url,state,body_sha256 FROM articles").fetchone()[:] == ('https://publisher.test/story/1', 'pending', None)
         assert not list(tmp_path.glob('bodies/**/*.parquet'))
+        from downloader.news_fulltext import fail_discovery
+        fail_discovery(queue, task, failure.value)
+        assert not queue.bulk_allowed(http.registry.sources['publisher'])
+        assert queue.db.execute('SELECT error_code FROM bulk_adapter_cooldowns').fetchone()[0] == 'bulk_all_items_unusable'
     finally:
         queue.close()
         http.close()

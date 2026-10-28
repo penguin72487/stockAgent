@@ -20,27 +20,39 @@ def real(path: Path) -> Path:
 
 
 CONTRACT = "explicit-testing-artifact-discard-v1"
+PREPARATION_CONTRACT = "explicit-local-preparation-benchmark-discard-v1"
 DEFAULT_POLICY = Path(__file__).resolve().parents[2] / "configs/data_sync/testing_artifact_disposition_20261007_v2.json"
 
 
 def load_policy(path: Path) -> dict:
     value = json.loads(real(path).read_bytes())
     body = {k: v for k, v in value.items() if k != "identity_sha256"}
+    local_preparation = value.get("contract") == PREPARATION_CONTRACT
     if (set(body) != {"contract", "authority_node_id", "origin_node_id", "authorization", "decision", "targets"}
-            or value.get("contract") != CONTRACT or value.get("authority_node_id") != "penguin"
-            or value.get("origin_node_id") != "vastai1T" or value.get("decision") != "discard_without_preservation"
+            or value.get("contract") not in {CONTRACT, PREPARATION_CONTRACT}
+            or value.get("authority_node_id") != "penguin"
+            or value.get("origin_node_id") != ("penguin" if local_preparation else "vastai1T")
+            or value.get("decision") != "discard_without_preservation"
             or not isinstance(value.get("authorization"), str) or not value["authorization"].strip()
             or value.get("identity_sha256") != identity(body)
             or not isinstance(value.get("targets"), list) or not value["targets"]):
         raise SnapshotError("invalid explicit testing-artifact disposition")
     seen = set()
     for row in value["targets"]:
-        if set(row) != {"base", "relative", "kind", "reason"} or row["base"] not in {"artifact", "engineering"}:
+        allowed_bases = {"preparation-benchmark"} if local_preparation else {"artifact", "engineering"}
+        if set(row) != {"base", "relative", "kind", "reason"} or row["base"] not in allowed_bases:
             raise SnapshotError("invalid exact testing target")
         relative = _safe_relative_path(row["relative"], "testing discard target")
         if row["kind"] not in {"directory", "file"} or row["reason"] not in {"smoke-test", "benchmark", "validation-test"}:
             raise SnapshotError("unreviewed testing target type")
-        if row["base"] == "artifact":
+        if row["base"] == "preparation-benchmark":
+            # Exact, reviewed children only. This is not authorization to retire
+            # a data root, preparation namespace, or any cold publication.
+            if (len(relative.parts) < 4 or not relative.parts[0].startswith("data_")
+                    or relative.parts[0] == "data_" or relative.parts[1] != "preparation_sources"
+                    or row["reason"] not in {"benchmark", "validation-test"}):
+                raise SnapshotError("preparation discard must name an individual benchmark output")
+        elif row["base"] == "artifact":
             if len(relative.parts) < 2 or relative.parts[0] not in {"smoke", "markets", "operations", "ablations", "cache", "benchmarks"}:
                 raise SnapshotError("testing discard cannot target an artifact namespace")
         elif (len(relative.parts) < 3 or not relative.parts[0].startswith(
@@ -52,6 +64,19 @@ def load_policy(path: Path) -> dict:
             raise SnapshotError("duplicate or overlapping testing targets")
         seen.add((row["base"], relative))
     return value
+
+
+def target_path(policy: dict, target: dict, *, repo_root: Path, engineering_root: Path) -> Path:
+    """Resolve both policy kinds into the common guarded discard lifecycle."""
+    if target not in policy["targets"]:
+        raise SnapshotError("testing target is outside the exact disposition")
+    if policy["contract"] == PREPARATION_CONTRACT and target["base"] == "preparation-benchmark":
+        base = repo_root
+    elif policy["contract"] == CONTRACT and target["base"] in {"artifact", "engineering"}:
+        base = repo_root / "artifacts" if target["base"] == "artifact" else engineering_root
+    else:
+        raise SnapshotError("testing target base disagrees with its disposition")
+    return real(base / _safe_relative_path(target["relative"], "testing discard target"))
 
 
 def artifact_roots(policy: dict) -> set[str]:

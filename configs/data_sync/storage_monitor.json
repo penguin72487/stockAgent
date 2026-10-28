@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "observer_node_id": "penguin",
+  "capacity_interval_seconds": 60,
+  "classification_interval_seconds": 21600,
+  "classification_timeout_seconds": 1800,
+  "classification_depth": 3,
+  "receipt_root": "/srv/stockagent-backup-receipts-lab203",
+  "volumes": [
+    {"id": "penguin-wsl", "path": "/", "filesystem": "ext4", "roots": [
+      {"path": "{repo}", "label": "StockAgent 專案", "kind": "project"},
+      {"path": "/srv/stockagent-live", "label": "服務工作資料", "kind": "runtime"},
+      {"path": "/srv/stockagent-packed-materialized", "label": "冷庫本機還原", "kind": "materialized"},
+      {"path": "/var/lib/stockagent", "label": "系統狀態與交付暫存", "kind": "control"},
+      {"path": "/root/.cache", "label": "使用者套件／編譯快取", "kind": "cache"}
+    ], "discover_worktrees": true, "discover_project_parents": [{"path": "/srv", "prefix": "stockagent"}]},
+    {"id": "penguin-c", "path": "/mnt/c", "filesystem": "9p", "roots": []},
+    {"id": "penguin-d", "path": "/srv/stockagent-d-volume", "filesystem": "9p", "discover_prefix": "stockagent", "roots": []}
+  ],
+  "remote": {
+    "id": "vastai1T-disk",
+    "target_env": "COLD_ARTIFACT_INGRESS_SSH_TARGET",
+    "port_env": "COLD_ARTIFACT_INGRESS_SSH_PORT",
+    "identity_env": "COLD_ARTIFACT_INGRESS_IDENTITY_FILE",
+    "roots": [
+      {"path": "/root/stockAgent", "label": "StockAgent 專案", "kind": "project"},
+      {"path": "/srv/stockagent-packed", "label": "工作冷庫", "kind": "cold"},
+      {"path": "/srv/stockagent-packed-materialized", "label": "工作還原資料", "kind": "materialized"},
+      {"path": "/srv/stockagent-training-inputs", "label": "固定來源共用工作集", "kind": "materialized"},
+      {"path": "/var/lib/stockagent-training-rescue", "label": "恢復控制與在途保全", "kind": "control"},
+      {"path": "/srv/stockagent-training-rescue-engineering", "label": "恢復驗證工作集", "kind": "materialized"}
+    ]
+  }
+}

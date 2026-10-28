@@ -735,6 +735,7 @@ function tableRow(row) {
   through.append(make("span", "cell-note", `最新：${recordDate(row.record_stats?.latest_date ?? row.record_stats?.last, row.record_stats)}`));
   through.append(make("span", number(row.record_stats?.count) !== null ? "cell-note record-count" : "cell-note record-unknown", `總筆數：${recordCount(row.record_stats)}`));
   if (number(row.record_stats?.days) !== null) through.append(make("span", "cell-note", `實際有資料：${formatInteger(row.record_stats.days)} 天`));
+  if (row.record_stats?.row_unit) through.append(make("span", "cell-note", `筆數單位：${row.record_stats.row_unit}`));
   through.append(make("span", "cell-note", `檔案：${recordFiles(row.record_stats)}`));
   if (row.record_stats?.basis) {
     const basis = make("span", "cell-note record-basis", row.record_stats.basis);

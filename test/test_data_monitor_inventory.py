@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from datetime import UTC, date, datetime
 import json
 import os
@@ -21,6 +22,39 @@ from stockagent.live import data_monitor_inventory as inventory_module
 from stockagent.live import data_monitor_dashboard as dashboard_module
 
 
+def test_read_only_inventory_does_not_build_publication_stats_frame(tmp_path, monkeypatch):
+    from stockagent.live import data_monitor_inventory as module
+    calls = []
+
+    def reader(path, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(module, 'read_record_cache', reader)
+    path = tmp_path / 'record_inventory_cache.json'
+    assert module._read_json(path, compact_schemas=True) == {}
+    assert module._read_json(path, compact_schemas=True, immutable_stats=True) == {}
+    assert [call['immutable_stats'] for call in calls] == [False, True]
+    assert all(call['share_stats'] and call['compact_schemas'] for call in calls)
+
+
+@pytest.mark.parametrize('refresh', [False, True])
+def test_only_refresh_owner_requests_publication_stats_frame(tmp_path, monkeypatch, refresh):
+    from stockagent.live import data_monitor_inventory as module
+    original = module._read_json
+    calls = []
+
+    def observed(path, **kwargs):
+        if path.name == 'record_inventory_cache.json':
+            calls.append(kwargs.get('immutable_stats', False))
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(module, '_read_json', observed)
+    module.build_record_inventory(tmp_path, refresh=refresh)
+    assert calls and all(value is refresh for value in calls)
+
+
+
 def test_flat_feature_discovery_matches_path_glob_including_hidden_and_directory(
     tmp_path: Path,
 ) -> None:
@@ -36,6 +70,121 @@ def test_flat_feature_discovery_matches_path_glob_including_hidden_and_directory
     assert inventory_module._feature_paths(root, files_only=True) == inventory_module._sorted_paths(
         path for path in root.glob("*_features.parquet") if path.is_file()
     )
+
+
+@pytest.mark.parametrize("pattern", ["parts/*.parquet", "parts/*_features.parquet",
+    "parts/[AB]*.parquet", "parts/?_features.parquet", "parts/*/*.parquet"])
+def test_pattern_discovery_retains_original_glob_membership(tmp_path, pattern):
+    directory = tmp_path / "parts"
+    directory.mkdir()
+    for name in ["A_features.parquet", ".hidden.parquet", "台灣.parquet", "B_features.parquet.manifest.json",
+                 "B_features.parquet", "unfinished.parquet.tmp", "unrelated.json"]:
+        (directory / name).write_bytes(b"")
+    (directory / "directory.parquet").mkdir()
+    (directory / "nested").mkdir()
+    (directory / "nested/child.parquet").write_bytes(b"")
+    (directory / "link.parquet").symlink_to(directory / "A_features.parquet")
+    (directory / "dangling.parquet").symlink_to(directory / "missing")
+    expected = inventory_module._logical_sources(
+        path for path in tmp_path.glob(pattern + "*")
+        if path.name.endswith((".parquet", ".parquet.manifest.json")) and path.is_file())
+    assert inventory_module._pattern_sources(tmp_path, pattern) == expected
+
+
+@pytest.mark.parametrize("broken_index", [None, b"{broken"])
+def test_full_revalidation_repairs_index_without_rewriting_unchanged_cache(tmp_path, broken_index):
+    source = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(source, [date(2025, 1, 1)])
+    first = build_record_inventory(tmp_path, refresh=True)
+    cache = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
+    index = inventory_module._quick_index_path(cache)
+    before = inventory_module._cache_signature(cache), cache.read_bytes()
+    if broken_index is None:
+        index.unlink()
+    else:
+        index.write_bytes(broken_index)
+    refreshed = build_record_inventory(tmp_path, refresh=True)
+    assert refreshed["fast_index_hit"] is False
+    assert refreshed["cache_payload_reused"] is True
+    assert (inventory_module._cache_signature(cache), cache.read_bytes()) == before
+    assert refreshed["datasets"] == first["datasets"]
+    assert refreshed["source_observation_root"] == first["source_observation_root"]
+    assert build_record_inventory(tmp_path, refresh=True)["fast_index_hit"] is True
+    _write_parquet(source, [date(2025, 1, 1), date(2025, 1, 2)])
+    changed = build_record_inventory(tmp_path, refresh=True)
+    assert changed["cache_payload_reused"] is False
+    assert changed["datasets"]["yahoo:crypto"]["count"] == 2
+    assert changed["source_observation_root"] != first["source_observation_root"]
+    assert inventory_module._cache_signature(cache) != before[0]
+
+
+def test_cache_replaced_during_revalidation_cannot_be_reused(tmp_path, monkeypatch):
+    source = tmp_path / "data_yahoo/crypto/A_features.parquet"
+    _write_parquet(source, [date(2025, 1, 1)])
+    first = build_record_inventory(tmp_path, refresh=True)
+    cache = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
+    inventory_module._quick_index_path(cache).unlink()
+    aggregate = inventory_module._aggregate
+    changed = False
+    def replace_cache(*args, **kwargs):
+        nonlocal changed
+        result = aggregate(*args, **kwargs)
+        if not changed:
+            replacement = cache.with_suffix(".replacement")
+            replacement.write_bytes(b"{}")
+            os.replace(replacement, cache)
+            changed = True
+        return result
+    monkeypatch.setattr(inventory_module, "_aggregate", replace_cache)
+    refreshed = build_record_inventory(tmp_path, refresh=True)
+    assert refreshed["cache_payload_reused"] is False
+    assert json.loads(cache.read_bytes())["datasets"] == first["datasets"]
+    assert refreshed["datasets"] == first["datasets"]
+
+
+@pytest.mark.parametrize("partitioned", [False, True])
+def test_same_stat_identity_projection_is_shared_only_for_ordinary_files(tmp_path, monkeypatch, partitioned):
+    path = tmp_path / ("source.parquet.manifest.json" if partitioned else "source.parquet")
+    path.write_bytes(b"source")
+    metadata = path.stat()
+    identity = inventory_module._file_identity(metadata) + (["a" * 64] if partitioned else [])
+    calls = []
+    def observed(source, info):
+        calls.append((source, info))
+        return list(identity)
+    monkeypatch.setattr(inventory_module, "_source_file_identity", observed)
+    entry = {"size": metadata.st_size, "mtime_ns": metadata.st_mtime_ns, "file_identity": identity}
+    observation = inventory_module._SourceObservation()
+    observation.start("owner")
+    shared = observation.observe("owner", path, metadata, entry=entry)
+    assert inventory_module._entry_matches_stat(entry, metadata, path=path, observed_identity=shared)
+    assert len(calls) == (2 if partitioned else 1)
+    assert observation.matches_cache
+
+
+def test_refreshed_files_share_one_fresh_normalized_schema_without_changing_fields(tmp_path, monkeypatch):
+    for symbol in ("A", "B"):
+        _write_parquet(tmp_path / f"data_yahoo/crypto/{symbol}_features.parquet", [date(2025, 1, 1)])
+    footer = inventory_module.parquet_footer_stats
+    passes = []
+    witnessed = []
+    class FieldPairs(list):
+        def __iter__(self):
+            passes.append(1)
+            return super().__iter__()
+    def observed(path):
+        result = footer(path)
+        witnessed.append(result["schema_id"])
+        result["fields"] = FieldPairs(result["fields"])
+        return result
+    monkeypatch.setattr(inventory_module, "parquet_footer_stats", observed)
+    frame = inventory_module.InventorySnapshot(tmp_path)
+    result = build_record_inventory(tmp_path, refresh=True, snapshot=frame)
+    assert result["refreshed_files"] == 2
+    assert len(witnessed) == 2 and len(passes) == len(set(witnessed)) == 1
+    features = inventory_module.build_feature_inventory(tmp_path, snapshot=frame)
+    assert all(row["schema_state"] == "verified" and row["files_with_field"] == 2
+               for row in features["rows"])
 
 
 def test_feature_projection_resolves_repeated_dataset_metadata_once(tmp_path, monkeypatch):

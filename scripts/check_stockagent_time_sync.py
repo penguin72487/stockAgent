@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -103,40 +105,83 @@ def _powershell_path() -> str | None:
 def _sample_windows_host_offset(
     *,
     samples: int,
-    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> dict[str, Any]:
     executable = _powershell_path()
     if not executable:
         raise RuntimeError("powershell.exe is unavailable")
+    # Start PowerShell once, then sample a request/response over its pipes.
+    # Measuring process startup in every round trip biases the midpoint by
+    # hundreds of milliseconds because the timestamp is taken near the end.
+    command = (
+        "[Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); "
+        "while ($null -ne ($l = [Console]::In.ReadLine())) { "
+        "if ($l -ne 'S') { break }; "
+        "[Console]::Out.WriteLine([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); "
+        "[Console]::Out.Flush() }"
+    )
+    process = subprocess.Popen(
+        [executable, "-NoProfile", "-NonInteractive", "-Command", command],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
     rows: list[dict[str, float]] = []
-    for _ in range(max(1, int(samples))):
-        before = time.time()
-        completed = runner(
-            [
-                executable,
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        after = time.time()
-        host_seconds = float(completed.stdout.strip().splitlines()[-1]) / 1000.0
-        rows.append(
-            {
+    pending = b""
+
+    def read_line(timeout: float) -> bytes:
+        nonlocal pending
+        deadline = time.monotonic() + timeout
+        while b"\n" not in pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+                raise TimeoutError("Windows host clock response timed out")
+            chunk = os.read(process.stdout.fileno(), 128)
+            if not chunk:
+                raise RuntimeError("Windows host clock process exited")
+            pending += chunk
+            if len(pending) > 1024:
+                raise ValueError("Windows host clock response is too long")
+        line, pending = pending.split(b"\n", 1)
+        return line.strip()
+
+    try:
+        if read_line(10.0) != b"READY":
+            raise RuntimeError("Windows host clock did not acknowledge startup")
+        for _ in range(max(1, int(samples))):
+            before = time.time()
+            before_mono = time.monotonic()
+            process.stdin.write(b"S\n")
+            process.stdin.flush()
+            response = read_line(5.0)
+            after_mono = time.monotonic()
+            after = time.time()
+            elapsed = after_mono - before_mono
+            if abs((after - before) - elapsed) > 0.010:
+                raise RuntimeError("local clock changed during host clock sample")
+            host_seconds = int(response) / 1000.0
+            rows.append({
                 "offset_seconds": host_seconds - ((before + after) / 2.0),
-                "round_trip_seconds": after - before,
-            }
-        )
+                "round_trip_seconds": elapsed,
+                # Host milliseconds are truncated; include their quantization.
+                "uncertainty_seconds": elapsed / 2.0 + 0.001,
+            })
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        if process.stdin is not None:
+            process.stdin.close()
+        if process.stdout is not None:
+            process.stdout.close()
     best = min(rows, key=lambda row: row["round_trip_seconds"])
     return {
         "source": "wsl_windows_host_clock",
         "offset_seconds": best["offset_seconds"],
         "round_trip_seconds": best["round_trip_seconds"],
+        "uncertainty_seconds": best["uncertainty_seconds"],
+        "sampling_method": "persistent_request_response_v1",
         "sample_count": len(rows),
     }
 
@@ -219,8 +264,15 @@ def evaluate_time_sync(
         if _is_wsl():
             authority = _sample_windows_host_offset(samples=samples)
             offset_seconds = float(authority["offset_seconds"])
-            if abs(offset_seconds) * 1000.0 > float(max_offset_ms) and repair:
-                if abs(offset_seconds) > float(max_repair_offset_seconds):
+            uncertainty = float(authority.get(
+                "uncertainty_seconds", float(authority["round_trip_seconds"]) / 2.0 + 0.001
+            ))
+            if not math.isfinite(offset_seconds) or not math.isfinite(uncertainty) or uncertainty < 0:
+                raise ValueError("invalid WSL clock offset or uncertainty")
+            lower_bound = max(0.0, abs(offset_seconds) - uncertainty)
+            upper_bound = abs(offset_seconds) + uncertainty
+            if lower_bound * 1000.0 > float(max_offset_ms) and repair:
+                if upper_bound > float(max_repair_offset_seconds):
                     failures.append(
                         "WSL host clock offset exceeds the bounded auto-repair limit"
                     )
@@ -229,10 +281,22 @@ def evaluate_time_sync(
                     repaired = True
                     authority = _sample_windows_host_offset(samples=samples)
                     offset_seconds = float(authority["offset_seconds"])
-            if abs(offset_seconds) * 1000.0 > float(max_offset_ms):
+                    uncertainty = float(authority.get(
+                        "uncertainty_seconds", float(authority["round_trip_seconds"]) / 2.0 + 0.001
+                    ))
+                    if not math.isfinite(offset_seconds) or not math.isfinite(uncertainty) or uncertainty < 0:
+                        raise ValueError("invalid WSL clock offset or uncertainty")
+                    lower_bound = max(0.0, abs(offset_seconds) - uncertainty)
+                    upper_bound = abs(offset_seconds) + uncertainty
+            if lower_bound * 1000.0 > float(max_offset_ms):
                 failures.append(
                     f"WSL host clock offset {offset_seconds * 1000.0:.3f}ms exceeds "
                     f"{float(max_offset_ms):.3f}ms"
+                )
+            elif upper_bound * 1000.0 > float(max_offset_ms):
+                failures.append(
+                    "WSL host clock measurement uncertainty overlaps the permitted offset; "
+                    "no automatic clock adjustment was made"
                 )
         else:
             if repair and (

@@ -16,6 +16,7 @@ def policy(tmp_path, monkeypatch):
     controls.mkdir()
     monkeypatch.setattr(capacity, "CONTROL_ROOT", controls)
     monkeypatch.setattr(capacity, "_admit_backing_volume", lambda *args: {})
+    monkeypatch.setattr(capacity, "load_acquisition_verification_reserve", lambda: MIB)
     monkeypatch.setattr("stockagent.data_sync.completed_forward_capacity.os.statvfs",
                         lambda _path: SimpleNamespace(f_bavail=100 * MIB, f_frsize=1))
     return {**capacity.load_capacity_policy(), "minimum_free_bytes": MIB,
@@ -32,6 +33,99 @@ def test_census_counts_unique_inodes_and_does_not_follow_symlinks(tmp_path):
     (root / "outside").symlink_to(tmp_path)
     expected = sum(path.lstat().st_blocks * 512 for path in (root, payload, root / "outside"))
     assert capacity.allocated_tree_bytes(root, maximum_entries=10, maximum_seconds=5) == expected
+
+
+def test_acquisition_dispatch_low_capacity_defers_without_scan_or_backing_call(tmp_path, monkeypatch, policy):
+    configured = {**policy, "nodes": ["authority"], "minimum_free_bytes": 101 * MIB}
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: configured)
+    monkeypatch.setattr(capacity, "_admit_backing_volume", lambda *a: pytest.fail("queried backing before local rejection"))
+    result = capacity.acquisition_dispatch_status(tmp_path)
+    assert result["state"] == "deferred" and result["reason"] == "filesystem_reserve"
+    assert result["minimum_free_bytes"] == 101 * MIB and result["data_paths_removed"] == 0
+    assert not list(tmp_path.glob("**/*.capacity-*"))
+
+
+def test_acquisition_dispatch_rechecks_physical_backing_and_resumes_when_available(tmp_path, monkeypatch, policy):
+    configured = {**policy, "nodes": ["authority"]}
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: configured)
+    def unavailable(*args):
+        raise CapacityDeferred("physical_backing_headroom_unconfirmed")
+    monkeypatch.setattr(capacity, "_admit_backing_volume", unavailable)
+    assert capacity.acquisition_dispatch_status(tmp_path)["reason"] == "physical_backing_headroom_unconfirmed"
+    calls = []
+    monkeypatch.setattr(capacity, "_admit_backing_volume", lambda root, required: calls.append(required) or {"state": "verified"})
+    result = capacity.acquisition_dispatch_status(tmp_path, maximum_growth_bytes=2 * MIB)
+    assert result["state"] == "admitted" and calls == [3 * MIB]
+    assert result["guard_kind"] == "dispatch_preflight_not_write_reservation"
+
+
+def test_acquisition_preserves_larger_verification_headroom_on_both_volumes(tmp_path, monkeypatch, policy):
+    configured = {**policy, "nodes": ["authority"]}
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: configured)
+    monkeypatch.setattr(capacity, "load_acquisition_verification_reserve", lambda: 40 * MIB)
+    calls = []
+    monkeypatch.setattr(capacity, "_admit_backing_volume",
+                        lambda root, required: calls.append(required) or {"state": "verified"})
+    result = capacity.acquisition_dispatch_status(tmp_path, maximum_growth_bytes=2 * MIB)
+    assert result["state"] == "admitted" and result["minimum_free_bytes"] == 40 * MIB
+    assert calls == [42 * MIB]
+    # The cache policy stays separate; this floor does not change its writer ABI.
+    assert configured["minimum_free_bytes"] == MIB
+
+
+def test_invalid_acquisition_reserve_rejects_dispatch_before_backing_or_mutation(tmp_path, monkeypatch):
+    path = tmp_path / "acquisition.json"
+    path.write_text('{"schema_version":1,"contract":"acquisition_verification_headroom_v1",'
+                    '"minimum_free_bytes":1,"minimum_free_bytes":2}')
+    loader = capacity.load_acquisition_verification_reserve
+    with pytest.raises(ValueError, match="duplicate"):
+        loader(path)
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    policy = {**capacity.load_capacity_policy(), "nodes": ["authority"]}
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: policy)
+    monkeypatch.setattr(capacity, "load_acquisition_verification_reserve",
+                        lambda: loader(path))
+    monkeypatch.setattr(capacity, "_admit_backing_volume", lambda *_: pytest.fail("unsafe backing check"))
+    with pytest.raises(ValueError, match="duplicate"):
+        capacity.acquisition_dispatch_status(tmp_path)
+
+
+def test_acquisition_dispatch_does_not_enroll_other_hosts_or_redirected_workspaces(tmp_path, monkeypatch, policy):
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: {**policy, "nodes": ["authority"]})
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "other")
+    assert capacity.acquisition_dispatch_status(tmp_path)["state"] == "not_enrolled"
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    with pytest.raises(CapacityDeferred, match="redirected_acquisition_workspace"):
+        capacity.acquisition_dispatch_status(alias)
+
+
+def test_verified_backing_shortage_is_reported_as_capacity_not_unknown(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io
+    original_read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda path, *a, **kw:
+                        "microsoft" if str(path) == "/proc/sys/kernel/osrelease"
+                        else original_read_text(path, *a, **kw))
+    monkeypatch.setenv("WSL_DISTRO_NAME", "fixture")
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    policy = {**capacity.load_capacity_policy(), "minimum_free_bytes": MIB, "nodes": ["authority"]}
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: policy)
+    monkeypatch.setattr(capacity, "load_acquisition_verification_reserve", lambda: MIB)
+    monkeypatch.setattr(capacity.os, "statvfs", lambda _: SimpleNamespace(f_bavail=100 * MIB, f_frsize=1))
+    def shortage(*a, **kw):
+        raise windows_cold_io.WorkspaceCapacityDeferred("real physical free space",
+                                                       physical_free_bytes=MIB // 2, required_bytes=MIB)
+    monkeypatch.setattr(windows_cold_io, "admit_workspace", shortage)
+    result = capacity.acquisition_dispatch_status(tmp_path)
+    assert result["state"] == "deferred" and result["reason"] == "physical_backing_reserve"
+    assert result["contract"] == "acquisition_dispatch_capacity_v1"
+    assert result["physical_free_bytes"] == MIB // 2
+    assert result["required_bytes_including_reserve"] == MIB
+    assert result["data_paths_removed"] == 0
 
 
 def test_census_bound_defers_instead_of_ignoring_unknown_allocations(tmp_path):

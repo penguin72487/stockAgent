@@ -123,25 +123,36 @@ def causal_report_events(events,definitions,*,period_order=None,current_periods=
         # still clear state; no changed-value test infers a publication.
         events=events.filter(~pl.col("feature").is_in(ignored) | pl.col("value").is_finite())
     if events.is_empty() or "period" not in events.columns:return events
-    mapping=pl.DataFrame({"feature":[d["feature"] for d in definitions],
-        "_state_key":[d.get("report_group") or d["feature"] for d in definitions]})
-    table=events.join(mapping,on="feature",validate="m:1").with_columns(
+    # Sort and window only compact row coordinates. Keeping every long feature
+    # name, value and report string in each intermediate multiplied peak memory
+    # for large annual cohorts, although none is needed for version precedence.
+    names=[d["feature"] for d in definitions]
+    if len(set(names))!=len(names):
+        raise ValueError("report definitions must have unique feature names")
+    keys=sorted({d.get("report_group") or d["feature"] for d in definitions})
+    key_ids={key:index for index,key in enumerate(keys)}
+    mapping={d["feature"]:key_ids[d.get("report_group") or d["feature"]] for d in definitions}
+    table=events.with_row_index("_event_row").filter(pl.col("feature").is_in(names)).select(
+        "_event_row","date","symbol",
+        pl.col("feature").replace_strict(mapping,return_dtype=pl.UInt32).alias("_state_key"),
         pl.col("period").fill_null(pl.col("date").cast(pl.String)).alias("_subject"))
     subjects=sorted(table["_subject"].unique().to_list()) if period_order is None else None
     ranks=dict(zip(subjects,range(len(subjects)))) if subjects is not None else period_order
     table=table.with_columns(pl.col("_subject").replace_strict(ranks,return_dtype=pl.Int32).alias("_rank"))
+    table=table.drop("_subject")
     table=table.sort("date","symbol","_state_key","_rank").with_columns(
         pl.col("_rank").max().over("date","symbol","_state_key").alias("_daily_rank"))
     table=table.with_columns(pl.col("_daily_rank").cum_max().over("symbol","_state_key").alias("_latest"))
     if current_periods:
-        prior=pl.DataFrame([{"symbol":s,"_state_key":key,"_prior":rank} for (s,key),rank in current_periods.items()],
-            schema={"symbol":pl.String,"_state_key":pl.String,"_prior":pl.Int32})
+        prior=pl.DataFrame([{"symbol":s,"_state_key":key_ids[key],"_prior":rank}
+            for (s,key),rank in current_periods.items() if key in key_ids],
+            schema={"symbol":pl.String,"_state_key":pl.UInt32,"_prior":pl.Int32})
         table=table.join(prior,on=["symbol","_state_key"],how="left",validate="m:1").with_columns(
             pl.max_horizontal("_latest",pl.col("_prior").fill_null(-1)).alias("_latest"))
     if current_periods is not None:
         for s,key,rank in table.group_by("symbol","_state_key").agg(pl.col("_latest").max()).iter_rows():
-            current_periods[s,key]=rank
-    return table.filter(pl.col("_rank")==pl.col("_latest")).select(events.columns)
+            current_periods[s,keys[key]]=rank
+    return events[table.filter(pl.col("_rank")==pl.col("_latest"))["_event_row"]]
 
 
 def prepare_annual_coordinates(path, names, symbols, *, after=None):
@@ -504,7 +515,8 @@ def causal_state_blocks(dates, symbols, definitions, events, lifecycle_start, *,
 
 def prepare(source: Path, out: Path, base_config: Path, minute_root: Path | None, snapshot_id: str,
             *, max_block_bytes=128*1024**2, base_panel_cache_root: Path | None=None,
-            model_channel_policy="value_available_age_updated", runtime_cache_root: Path | None=None):
+            model_channel_policy="value_available_age_updated", runtime_cache_root: Path | None=None,
+            release_source_read_cache: bool = False):
     out = admit_output(out, "prepared")
     if model_channel_policy not in {"value_only", "value_available_age_updated"}:
         raise ValueError("unknown factorized model channel policy")
@@ -513,7 +525,9 @@ def prepare(source: Path, out: Path, base_config: Path, minute_root: Path | None
     if not context["futures_context_only"] and minute_root is None:
         raise ValueError("cash day-trade preparation requires its minute source")
     channel_count = 1 if model_channel_policy == "value_only" else 4
-    started=time.perf_counter();manifest=verify_sources(source);source_sha=sha256(source/"source_manifest.json")
+    started=time.perf_counter()
+    manifest=verify_sources(source, release_read_cache=release_source_read_cache)
+    source_sha=sha256(source/"source_manifest.json")
     if out.exists():raise FileExistsError("new ABI requires a fresh panel/output root")
     out.mkdir(parents=True);observations=out/"observations";observations.mkdir()
     annual_root=out/"annual_events";annual_root.mkdir();annual_writers={};annual_paths={}
@@ -808,6 +822,8 @@ def main():
     p.add_argument("--base-panel-cache-root",type=Path,help="Canonical cache only; original fingerprint gates still apply")
     p.add_argument("--runtime-cache-root",type=Path,help="Explicit owned cache root for temporary reconstruction; defaults remain unchanged")
     p.add_argument("--model-channel-policy",choices=("value_available_age_updated","value_only"),default="value_available_age_updated")
+    p.add_argument("--release-source-read-cache",action="store_true",
+        help="After each immutable source SHA check, advise release of its clean kernel pages; source bytes and memory admission remain unchanged")
     p.add_argument("--project-prepared-manifest",type=Path,help="Incrementally derive value-only blocks from an already verified four-channel panel")
     a=p.parse_args()
     a.output_root = admit_output(a.output_root, "prepared")
@@ -815,7 +831,7 @@ def main():
         a.base_panel_cache_root = admit_output(a.base_panel_cache_root, "cache")
     if a.project_prepared_manifest is not None:
         if a.model_channel_policy != "value_only":p.error("prepared projection requires --model-channel-policy value_only")
-        if any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root,a.runtime_cache_root)):
+        if a.release_source_read_cache or any(v is not None for v in (a.source_root,a.base_config,a.minute_root,a.snapshot_id,a.base_panel_cache_root,a.runtime_cache_root)):
             p.error("prepared projection does not download/rebuild provider or execution sources")
         from stockagent.data.factorized_panel_projection import project_factorized_values
         result=project_factorized_values(a.project_prepared_manifest,a.output_root)
@@ -824,7 +840,8 @@ def main():
             p.error("source-root, base-config and snapshot-id are required for a new source build")
         result=prepare(a.source_root,a.output_root,a.base_config,a.minute_root,a.snapshot_id,
             max_block_bytes=a.max_block_mib*1024**2,base_panel_cache_root=a.base_panel_cache_root,
-            model_channel_policy=a.model_channel_policy,runtime_cache_root=a.runtime_cache_root)
+            model_channel_policy=a.model_channel_policy,runtime_cache_root=a.runtime_cache_root,
+            release_source_read_cache=a.release_source_read_cache)
     print(json.dumps(result,ensure_ascii=False))
 
 

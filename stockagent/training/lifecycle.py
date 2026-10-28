@@ -11,12 +11,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import io
 import json
 import math
 from pathlib import Path
+import re
 import time
 from typing import Any, Iterable, Mapping, Sequence
 import zipfile
+
+import numpy as np
 
 from stockagent.training.mode_adapter import (
     TrainingModeSpec,
@@ -25,6 +29,10 @@ from stockagent.training.mode_adapter import (
 )
 from stockagent.runtime_identity import training_runtime_provenance
 from stockagent.backtest.return_metrics import RETURN_METRICS_CONTRACT_VERSION
+from stockagent.training.futures_account_artifact_contract import (
+    FUTURES_ACCOUNT_ARCHIVE_SCHEMA, FUTURES_ACCOUNT_ARTIFACT_ABI,
+    FUTURES_ACCOUNT_METRICS_ABI, FUTURES_ACCOUNT_PAYLOAD_FIELDS, FUTURES_ACCOUNT_PREFIX,
+)
 
 
 TRAINING_LIFECYCLE_SCHEMA_VERSION = 1
@@ -253,7 +261,32 @@ def validate_completed_training_artifacts(
     manifest_execution_mode: str | None = None
     manifest_metrics_version = None
     causal_account_policy = False
+    dated_futures_abi = None
+    dated_futures_metrics_abi = None
+    dated_futures_details: dict[str, Any] = {}
     if isinstance(manifest, dict):
+        mode_details = manifest.get("mode_details", {})
+        if isinstance(mode_details, dict):
+            dated_futures_abi = mode_details.get("futures_account_artifact_abi")
+            dated_futures_metrics_abi = mode_details.get("futures_account_metrics_abi")
+            if dated_futures_abi is not None and dated_futures_abi != FUTURES_ACCOUNT_ARTIFACT_ABI:
+                invalid.append(f"{layout.run_manifest_path}: unknown dated futures artifact ABI")
+            if dated_futures_abi == FUTURES_ACCOUNT_ARTIFACT_ABI:
+                dated_futures_details = {
+                    key: mode_details.get(key) for key in (
+                        "futures_account_artifact_abi", "futures_account_metrics_abi",
+                        "futures_account_source_fingerprint", "futures_execution_release_fingerprint",
+                        "risk_clock",
+                    )
+                }
+                if dated_futures_metrics_abi != FUTURES_ACCOUNT_METRICS_ABI:
+                    invalid.append(f"{layout.run_manifest_path}: dated futures metrics ABI is missing or incompatible")
+                for key in ("futures_account_source_fingerprint", "futures_execution_release_fingerprint"):
+                    value = dated_futures_details[key]
+                    if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                        invalid.append(f"{layout.run_manifest_path}: dated futures {key} must be a SHA256 fingerprint")
+                if dated_futures_details["risk_clock"] != "dated_futures_account_events_and_stock_decisions":
+                    invalid.append(f"{layout.run_manifest_path}: dated futures risk clock is missing or incompatible")
         causal_account_policy = bool(
             manifest.get("configuration", {}).get("training", {})
             .get("financial_transformer", {}).get("futures_causal_account_policy", False)
@@ -356,7 +389,16 @@ def validate_completed_training_artifacts(
         try:
             with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
-        except (OSError, zipfile.BadZipFile) as exc:
+                schema = None
+                if "artifact_schema_version.npy" in names:
+                    entry = archive.getinfo("artifact_schema_version.npy")
+                    if entry.file_size > 512:
+                        raise ValueError("oversized backtest schema scalar")
+                    value = np.load(io.BytesIO(archive.read(entry)), allow_pickle=False)
+                    if value.shape != () or not np.issubdtype(value.dtype, np.integer):
+                        raise ValueError("invalid backtest schema scalar")
+                    schema = int(value.item())
+        except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
             invalid.append(f"{path}: invalid backtest container ({type(exc).__name__})")
             return
         missing_entries = sorted(required_backtest_entries - names)
@@ -364,6 +406,17 @@ def validate_completed_training_artifacts(
             missing_entries.extend(sorted({
                 "futures_account_policy_packet.npy", "futures_account_policy_version.npy",
             } - names))
+        dated_entries = {name for name in names if name.startswith(FUTURES_ACCOUNT_PREFIX)}
+        if schema == FUTURES_ACCOUNT_ARCHIVE_SCHEMA:
+            missing_entries.extend(sorted({f"{name}.npy" for name in FUTURES_ACCOUNT_PAYLOAD_FIELDS} - names))
+            if dated_futures_abi != FUTURES_ACCOUNT_ARTIFACT_ABI:
+                invalid.append(f"{path}: dated futures run manifest ABI is missing or incompatible")
+            if dated_futures_metrics_abi != FUTURES_ACCOUNT_METRICS_ABI:
+                invalid.append(f"{path}: dated futures metrics ABI is missing or incompatible")
+            if manifest_execution_mode != "tw_stock_context_futures_portfolio":
+                invalid.append(f"{path}: dated futures archive has incompatible execution mode")
+        elif dated_entries or dated_futures_abi == FUTURES_ACCOUNT_ARTIFACT_ABI:
+            invalid.append(f"{path}: dated futures archive schema and run manifest disagree")
         if missing_entries:
             invalid.append(f"{path}: missing backtest entries {missing_entries}")
 
@@ -383,6 +436,11 @@ def validate_completed_training_artifacts(
         contract_path = layout.fold_dir(fold_id) / "mode_artifact_contract.json"
         contract = read_json(contract_path)
         if isinstance(contract, dict):
+            if dated_futures_details:
+                fold_details = contract.get("mode_details", {})
+                if (not isinstance(fold_details, dict)
+                        or any(fold_details.get(key) != value for key, value in dated_futures_details.items())):
+                    invalid.append(f"{contract_path}: dated futures source or risk contract disagrees with run manifest")
             if (causal_account_policy
                     and contract.get("mode_details", {}).get("causal_account_policy_replay_version") != 1):
                 invalid.append(f"{contract_path}: closed-loop futures policy replay contract is missing")

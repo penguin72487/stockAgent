@@ -3,6 +3,7 @@ Description=Snapshot allowlisted data-refresh and public-monitor state off reque
 
 [Service]
 Type=oneshot
+IOAccounting=true
 User=root
 Group=root
 WorkingDirectory=__REPO_ROOT__

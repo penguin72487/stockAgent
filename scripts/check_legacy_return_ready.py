@@ -6,7 +6,11 @@ import argparse
 import fcntl
 import json
 from pathlib import Path
+import sys
 import time
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 
 def readiness(state_root: Path, *, selection_path: Path | None = None) -> tuple[bool, str]:
@@ -54,10 +58,22 @@ def readiness(state_root: Path, *, selection_path: Path | None = None) -> tuple[
             # of valid directory entries in the same retained cohort.
             if "files" not in row and row["state"] == "non-directory-protected":
                 continue
+            # User-cancelled loose entries retain their original byte and
+            # signature evidence, but do not have a directory file count.
+            # They are terminal here; they never authorize a new return.
+            if "files" not in row and row["state"] == "testing-preservation-cancelled-by-user":
+                signature = row.get("signature")
+                if (row.get("recovery_claimed") is not False
+                        or type(row.get("bytes")) is not int or row["bytes"] < 0
+                        or not isinstance(signature, list) or len(signature) != 7
+                        or any(type(value) is not int for value in signature)
+                        or signature[2] != row["bytes"]):
+                    return False, "progress_items_invalid"
+                continue
             if type(row.get("files")) is not int or row["files"] < 0:
                 return False, "progress_items_invalid"
         retained = {"remote-source-retired", "source-protected", "non-directory-protected",
-                    "empty-directory-protected"}
+                    "empty-directory-protected", "testing-preservation-cancelled-by-user"}
         for row in items:
             if selected is not None and row.get("relative_root") not in selected:
                 continue

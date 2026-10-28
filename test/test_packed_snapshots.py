@@ -29,6 +29,94 @@ from stockagent.data_sync.packed_snapshots import (
 )
 
 
+def _presence_manifest(root, count):
+    references = []
+    for index in range(count):
+        path = root / f"object-{index:04d}"
+        path.write_bytes(bytes([index % 256]) * (index + 1))
+        references.append({"relpath": path.name, "bytes": index + 1})
+    return {"archive": {"inventory": references[0], "objects": references[1:]}}
+
+
+@pytest.mark.parametrize("count", [1, 127, 128, 385])
+def test_object_presence_checks_every_fixed_reference_once(tmp_path, monkeypatch, count):
+    import collections
+    import threading
+
+    manifest = _presence_manifest(tmp_path, count)
+    original = Path.stat
+    observed = collections.Counter()
+    lock = threading.Lock()
+
+    def stat_path(path, *args, **kwargs):
+        with lock:
+            observed[path.name] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_path)
+    packed_snapshots._validate_object_presence(tmp_path, manifest)
+    assert observed == {f"object-{index:04d}": 1 for index in range(count)}
+
+
+def test_parallel_object_presence_is_bounded_and_reports_first_manifest_error(tmp_path, monkeypatch):
+    import threading
+
+    manifest = _presence_manifest(tmp_path, 385)
+    original = Path.stat
+    first_started = threading.Event()
+    second_started = threading.Event()
+    lock = threading.Lock()
+    active = peak = 0
+    checked = []
+
+    def stat_path(path, *args, **kwargs):
+        nonlocal active, peak
+        index = int(path.name.removeprefix("object-"))
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            checked.append(index)
+        try:
+            if index == 0:
+                first_started.set()
+                assert second_started.wait(10), "presence checks did not overlap"
+                raise FileNotFoundError("the first reference is absent")
+            if index == 1:
+                assert first_started.wait(10)
+                second_started.set()
+                raise PermissionError("the second reference is unreadable")
+            return original(path, *args, **kwargs)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(Path, "stat", stat_path)
+    with pytest.raises(SnapshotError, match="object-0000") as error:
+        packed_snapshots._validate_object_presence(tmp_path, manifest)
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+    assert 2 <= peak <= packed_snapshots.OBJECT_PRESENCE_WORKERS
+    assert max(checked) < packed_snapshots.OBJECT_PRESENCE_BATCH_REFERENCES
+    assert active == 0  # No background metadata work escapes a failed preflight.
+
+
+@pytest.mark.parametrize("count", [2, 129])
+@pytest.mark.parametrize("defect", ["missing", "size", "traversal"])
+def test_object_presence_rejects_bad_reference_in_serial_and_parallel_scope(tmp_path, count, defect):
+    manifest = _presence_manifest(tmp_path, count)
+    item = manifest["archive"]["objects"][-1]
+    if defect == "missing":
+        (tmp_path / item["relpath"]).unlink()
+        expected = "not locally complete"
+    elif defect == "size":
+        (tmp_path / item["relpath"]).write_bytes(b"a different original")
+        expected = "size mismatch"
+    else:
+        item["relpath"] = "../outside-authority"
+        expected = "object relpath"
+    with pytest.raises(SnapshotError, match=expected):
+        packed_snapshots._validate_object_presence(tmp_path, manifest)
+
+
 @pytest.mark.parametrize('prefix', ['stockagent-completed-benchmark-scratch', 'stockagent-completed-offline-scratch'])
 @pytest.mark.parametrize('outcome', ['normal', 'checksum', 'native_error', 'replace', 'append', 'mode', 'link'])
 def test_native_materialized_full_hash_keeps_generation_and_closes_fd(tmp_path, monkeypatch, prefix, outcome):
@@ -139,6 +227,133 @@ def test_native_materialized_checksum_still_requires_full_tree_inventory(tmp_pat
     monkeypatch.setattr(native, 'hash_file', lambda p: hashlib.sha256(Path(p).read_bytes()).hexdigest())
     with pytest.raises(SnapshotError, match='fingerprint mismatch'):
         packed_snapshots._verify_materialized(tmp_path, manifest, entries)
+
+
+@pytest.mark.parametrize('damage', [None, 'checksum', 'missing', 'extra-entry'])
+def test_parallel_materialized_verification_keeps_full_proof_and_bounded_work(tmp_path, monkeypatch, damage):
+    import threading
+
+    root = tmp_path / 'retained'
+    root.mkdir()
+    entries = []
+    for index in range(75):
+        data = f'original-{index:03d}'.encode()
+        path = root / f'{index:03d}'
+        path.write_bytes(data)
+        entries.append({'path': path.name, 'kind': 'file', 'size': len(data),
+                        'sha256': hashlib.sha256(data).hexdigest()})
+    source = scan_tree(root)
+    if damage == 'checksum':
+        (root / '010').write_bytes(b'x' * entries[10]['size'])
+    elif damage == 'missing':
+        (root / '010').unlink()
+    elif damage == 'extra-entry':
+        (root / 'unexpected').write_bytes(b'x')
+
+    original_hash = packed_snapshots._materialized_file_sha256
+    lock = threading.Lock()
+    simultaneous = threading.Event()
+    active = peak = completed = yielded = max_pending = 0
+
+    def checked_hash(path, expected):
+        nonlocal active, peak, completed
+        with lock:
+            active += 1
+            peak = max(peak, active)
+            if peak >= 4:
+                simultaneous.set()
+        if not simultaneous.wait(timeout=5):
+            raise AssertionError('bounded verifier did not start four reads')
+        try:
+            return original_hash(path, expected)
+        finally:
+            with lock:
+                active -= 1
+                completed += 1
+
+    def rows():
+        nonlocal yielded, max_pending
+        for row in entries:
+            with lock:
+                yielded += 1
+                max_pending = max(max_pending, yielded - completed)
+            yield row
+
+    monkeypatch.setattr(packed_snapshots, '_materialized_file_sha256', checked_hash)
+    events = []
+    if damage:
+        with pytest.raises(SnapshotError, match='checksum mismatch|file differs|fingerprint mismatch'):
+            packed_snapshots._verify_materialized(root, {'source': source}, rows(),
+                                                  file_workers=4, progress=events.append)
+        assert not any(event.get('fingerprint_matched') for event in events)
+    else:
+        packed_snapshots._verify_materialized(root, {'source': source}, rows(),
+                                              file_workers=4, progress=events.append)
+        assert any(event.get('fingerprint_matched') for event in events)
+        assert completed == len(entries)
+    assert peak == 4
+    assert max_pending <= packed_snapshots.MATERIALIZED_VERIFY_BATCH_ROWS
+    assert all(not event['acceptance_proof'] for event in events)
+
+
+@pytest.mark.parametrize('workers', [True, 0, 5])
+def test_materialized_verification_rejects_unbounded_workers(tmp_path, workers):
+    with pytest.raises(ValueError, match='workers'):
+        packed_snapshots._verify_materialized(tmp_path, {'source': {}}, [], file_workers=workers)
+
+
+@pytest.mark.parametrize('damage', [None, 'checksum', 'extra-entry'])
+def test_materialized_progress_counts_checked_bytes_and_preserves_fail_closed(tmp_path, monkeypatch, damage):
+    from itertools import count
+    from types import SimpleNamespace
+    import stockagent.data_sync.desync_snapshots as desync
+
+    root = tmp_path / 'retained'
+    (root / 'nested').mkdir(parents=True)
+    (root / 'a').write_bytes(b'abc')
+    (root / 'nested/b').write_bytes(b'defg')
+    (root / 'link').symlink_to('a')
+    source = scan_tree(root)
+    entries = [
+        {'path': 'a', 'kind': 'file', 'size': 3, 'sha256': hashlib.sha256(b'abc').hexdigest()},
+        {'path': 'link', 'kind': 'symlink', 'target': 'a'},
+        {'path': 'nested', 'kind': 'directory'},
+        {'path': 'nested/b', 'kind': 'file', 'size': 4, 'sha256': hashlib.sha256(b'defg').hexdigest()},
+    ]
+    if damage == 'checksum':
+        (root / 'nested/b').write_bytes(b'FAIL')
+    elif damage == 'extra-entry':
+        (root / 'unexpected').write_bytes(b'x')
+    clock = count(start=0, step=6)
+    time_source = SimpleNamespace(monotonic=lambda: next(clock))
+    monkeypatch.setattr(packed_snapshots, 'time', time_source)
+    monkeypatch.setattr(desync, 'time', time_source)
+    events = []
+    if damage:
+        with pytest.raises(SnapshotError, match='checksum mismatch|fingerprint mismatch'):
+            packed_snapshots._verify_materialized(root, {'source': source}, entries, progress=events.append)
+    else:
+        packed_snapshots._verify_materialized(root, {'source': source}, entries, progress=events.append)
+
+    file_events = [e for e in events if e['stage'] == 'verify-materialized-files']
+    tree_events = [e for e in events if e['stage'] == 'verify-materialized-tree']
+    assert file_events[0]['completed_items'] == file_events[0]['completed_bytes'] == 0
+    assert all(e['total_items'] == 2 and e['total_bytes'] == 7 for e in file_events)
+    assert all(e['item_scope'] == 'regular_files_hashed' and not e['acceptance_proof'] for e in file_events)
+    assert any(e['completed_items'] == 1 and e['completed_bytes'] == 3 for e in file_events)
+    if damage == 'checksum':
+        assert max(e['completed_items'] for e in file_events) == 1
+        assert not tree_events
+    else:
+        assert file_events[-1]['completed_items'] == 2 and file_events[-1]['completed_bytes'] == 7
+        assert tree_events[0]['completed_items'] == 0
+        assert all(e['metadata_only'] and not e['acceptance_proof'] for e in tree_events)
+        if damage == 'extra-entry':
+            assert any(e['completed_items'] > 4 and e['total_items'] is None for e in tree_events)
+            assert not any(e['fingerprint_matched'] for e in tree_events)
+        else:
+            assert tree_events[-1]['completed_items'] == tree_events[-1]['total_items'] == 4
+            assert tree_events[-1]['fingerprint_matched']
 
 
 def test_full_pack_recovery_reports_member_progress_before_counting_verified_object(tmp_path, monkeypatch):

@@ -65,8 +65,9 @@ def max_candidate_source(config, registry, repo, layout):
 
 def ettoday_candidate_source(config, registry, repo, layout):
     source = registry.sources.get('ettoday')
-    if (source is None or not source.allowed or layout != 'ettoday_visible_article_v39'
-            or source.embedded_article_layout != 'ettoday_visible_article_v38'):
+    if (source is None or not source.allowed or (layout, source.embedded_article_layout) not in {
+            ('ettoday_visible_article_v39', 'ettoday_visible_article_v38'),
+            ('ettoday_visible_article_v40', 'ettoday_visible_article_v39')}):
         raise ValueError('reviewed_ettoday_v38_predecessor_candidate_required')
     return _exact_candidate(config, registry, repo, source, layout)
 
@@ -91,10 +92,40 @@ def _exact_candidate(config, registry, repo, source, layout):
 
 
 def native_candidate_source(config, registry, repo, layout):
-    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_LAYOUTS, contentplatform_original_source
-    if layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS:
+    from downloader.news_fulltext_moneyweekly_excerpt import LAYOUT as MONEYWEEKLY_EXCERPT_LAYOUT
+    from downloader.news_fulltext_moneyweekly_metadata import LAYOUT as MONEYWEEKLY_TEMPLATE_LAYOUT
+    from downloader.news_fulltext_moneyweekly import (
+        ROUTE_METADATA_LAYOUT, BODY_GEOMETRY_LAYOUT, moneyweekly_route_source, moneyweekly_body_geometry_source,
+    )
+    if layout in {ROUTE_METADATA_LAYOUT, BODY_GEOMETRY_LAYOUT, MONEYWEEKLY_TEMPLATE_LAYOUT, MONEYWEEKLY_EXCERPT_LAYOUT}:
+        source = registry.sources.get('moneyweekly')
+        if not (moneyweekly_body_geometry_source(source) if layout != ROUTE_METADATA_LAYOUT else moneyweekly_route_source(source)):
+            raise ValueError('reviewed_current_moneyweekly_route_source_required')
+        return source
+    from downloader.news_fulltext_knews import KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_MULTI_REPORTER_LAYOUT, knews_resident_source
+    if layout in {KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_MULTI_REPORTER_LAYOUT}:
+        source = registry.sources.get('knews')
+        if not knews_resident_source(source) or source.embedded_article_layout != layout:
+            raise ValueError('reviewed_current_knews_source_required')
+        return source
+    if layout in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}:
+        from downloader.news_fulltext_gnn import gnn_metadata_source
+        source = registry.sources.get('gnn')
+        if source is None or source.embedded_article_layout != layout or not gnn_metadata_source(source):
+            raise ValueError('reviewed_current_gnn_source_required')
+        return source
+    if layout in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}:
+        from downloader.news_fulltext_managertoday import manager_metadata_source
+        source = registry.sources.get('managertoday')
+        if source is None or source.embedded_article_layout != layout or not manager_metadata_source(source):
+            raise ValueError('reviewed_current_manager_source_required')
+        return source
+    from downloader.news_fulltext_contentplatform import (CONTENTPLATFORM_ORIGINAL_LAYOUTS,
+        CONTENTPLATFORM_WRITTEN_HTML_LAYOUT, contentplatform_original_source, contentplatform_known_native_source)
+    if layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS or layout == CONTENTPLATFORM_WRITTEN_HTML_LAYOUT:
         source = registry.sources.get('contentplatform')
-        if source is None or source.embedded_article_layout != layout or not contentplatform_original_source(source):
+        predicate = contentplatform_known_native_source if layout == CONTENTPLATFORM_WRITTEN_HTML_LAYOUT else contentplatform_original_source
+        if source is None or source.embedded_article_layout != layout or not predicate(source):
             raise ValueError('reviewed_current_contentplatform_source_required')
         return source
     from downloader.news_fulltext_gvm import (
@@ -180,12 +211,14 @@ def native_candidate_source(config, registry, repo, layout):
         return source
     if layout == 'videoland_visible_article_v4':
         return videoland_candidate_source(config, registry, repo, layout)
-    if layout == 'ettoday_visible_article_v39':
+    if layout in {'ettoday_visible_article_v39', 'ettoday_visible_article_v40', 'ettoday_visible_article_v41'}:
         from downloader.news_fulltext_ettoday import ettoday_resident_source
         source = registry.sources.get('ettoday')
-        if source is not None and ettoday_resident_source(source):
+        if source is not None and ettoday_resident_source(source, layout=layout):
             return source
-        return ettoday_candidate_source(config, registry, repo, layout)
+        if layout == 'ettoday_visible_article_v39':
+            return ettoday_candidate_source(config, registry, repo, layout)
+        raise ValueError('reviewed_current_ettoday_source_required')
     if layout in MAX_LAYOUT_VERSIONS:
         return max_candidate_source(config, registry, repo, layout)
     raise ValueError('reviewed_native_candidate_required')
@@ -195,7 +228,28 @@ def candidate_evidence_allowed(source, candidate, version):
     """Fixed provider/question pairs; timestamps/reasons cannot choose scope."""
     if type(version) is not int:
         return False
+    if version in {64, 65, 66, 67} or source.provider == 'moneyweekly' or candidate.provider == 'moneyweekly':
+        from downloader.news_fulltext_moneyweekly import moneyweekly_route_source, moneyweekly_body_geometry_source
+        return bool(source == candidate and (version == 64 and moneyweekly_route_source(source)
+            or version in {65, 66, 67} and moneyweekly_body_geometry_source(source)))
+    if version in {56, 57} or source.provider == 'knews' or candidate.provider == 'knews':
+        from downloader.news_fulltext_knews import KNEWS_GRID_NATIVE_LAYOUT, knews_resident_source
+        return bool(version in {56, 57} and source == candidate and knews_resident_source(source)
+            and (version != 57 or source.embedded_article_layout == KNEWS_GRID_NATIVE_LAYOUT))
+    if version in {48,49,50} or source.provider == 'gnn' or candidate.provider == 'gnn':
+        from downloader.news_fulltext_gnn import GNN_LEGACY_LAYOUT, gnn_metadata_source
+        return bool(version in {48,49,50} and source == candidate and gnn_metadata_source(source)
+            and (version != 50 or source.embedded_article_layout == GNN_LEGACY_LAYOUT))
+    if version in {46,47,58,59} or source.provider == 'managertoday' or candidate.provider == 'managertoday':
+        from downloader.news_fulltext_managertoday import manager_metadata_source
+        return bool(version in {46,47,58,59} and source == candidate and manager_metadata_source(source)
+            and (version != 58 or source.embedded_article_layout=='manager_public_written_article_v4')
+            and (version != 59 or source.embedded_article_layout=='manager_public_written_article_v5'))
     from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
+    if version == 55:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_WRITTEN_HTML_LAYOUT, contentplatform_known_native_source
+        return bool(source == candidate and contentplatform_known_native_source(source)
+            and source.embedded_article_layout == CONTENTPLATFORM_WRITTEN_HTML_LAYOUT)
     if version in CONTENTPLATFORM_EVIDENCE_VERSIONS or source.provider == 'contentplatform' or candidate.provider == 'contentplatform':
         from downloader.news_fulltext_contentplatform import contentplatform_original_source
         return bool(version in CONTENTPLATFORM_EVIDENCE_VERSIONS and source == candidate and contentplatform_original_source(source))
@@ -205,9 +259,12 @@ def candidate_evidence_allowed(source, candidate, version):
             or version == 36 and gvm_media_source(source) or version == 37 and gvm_table_source(source)
             or version == 40 and gvm_original_source(source) or version == 41 and gvm_static_editor_source(source)
             or version == 42 and gvm_presentation_source(source)))
-    if version in {27, 28, 29, 30, 31, 32, 33} or source == candidate and source.provider == 'ettoday':
+    if version in {27, 28, 29, 30, 31, 32, 33, 51, 52, 60, 61, 62, 63, 68} or source == candidate and source.provider == 'ettoday':
         from downloader.news_fulltext_ettoday import ettoday_resident_source
-        return bool(version in {27, 28, 29, 30, 31, 32, 33} and source == candidate and ettoday_resident_source(source))
+        return bool(source == candidate and (
+            version in {61, 62, 63, 68} and ettoday_resident_source(source, layout='ettoday_visible_article_v41')
+            or version == 60 and ettoday_resident_source(source, layout='ettoday_visible_article_v40')
+            or version in {27, 28, 29, 30, 31, 32, 33, 51, 52} and ettoday_resident_source(source)))
     from downloader.news_fulltext_setn import INEWS_PROVIDER, inews_boundary_source
     if source.provider == INEWS_PROVIDER or candidate.provider == INEWS_PROVIDER or version in {24, 25, 26, 38, 39}:
         return bool(source == candidate and inews_boundary_source(source) and (
@@ -231,13 +288,13 @@ def candidate_evidence_allowed(source, candidate, version):
     if version in {14, 15}:
         return False
     if source.provider == 'cmnews' or candidate.provider == 'cmnews':
-        # Two distinct fixed questions on the CURRENT registered source;
-        # neither can accept bodies or substitute capture/authorization.
-        return bool(version in {1, 19} and source == candidate and source.provider == 'cmnews'
+        # Distinct fixed questions on the CURRENT registered source;
+        # none can accept bodies or substitute capture/authorization.
+        return bool(version in {1, 19, 54} and source == candidate and source.provider == 'cmnews'
             and source.allowed and source.request_enabled and source.domains == ('cmnews.com.tw',)
             and source.embedded_article_layout == 'cmnews_visible_article_v1'
             and source.authorization.get('kind') == 'personal_research')
-    if version == 19:
+    if version in {19,54}:
         return False
     if version == 13:
         from downloader.news_fulltext_candidate_originals import globalvoices_original_source
@@ -307,21 +364,255 @@ def compare_native_candidate(payload, source, candidate, *, page_url):
     return result
 
 
-def candidate_response_metadata(response, source, candidate, *, evidence_contract_version=1, requested_url=None):
+def candidate_response_metadata(response, source, candidate, *, evidence_contract_version=1, requested_url=None,
+                                expected_conflict=None):
     """Finite result for the resident owner's request, without article retention."""
     from bs4 import BeautifulSoup
     from downloader.news_fulltext import _require_article_response
     if not candidate_evidence_allowed(source, candidate, evidence_contract_version):
         raise ValueError('reviewed_candidate_evidence_contract_required')
+    if evidence_contract_version == 68:
+        from downloader.news_fulltext_candidate_originals import (
+            ETTODAY_CONFLICT_ORIGINAL_QUESTION, private_ettoday_conflict_original_permit)
+        _require_article_response(response, source)
+        facts = dict(contract_version=1, evidence_contract_version=68, provider=source.provider,
+            question=ETTODAY_CONFLICT_ORIGINAL_QUESTION, status=response.status,
+            requested_url=requested_url, final_url=response.url, redirect_count=len(response.redirects),
+            response_bytes=len(response.body), response_sha256=hashlib.sha256(response.body).hexdigest(),
+            accepted_as_article=False, raw_or_names_or_body_retained=False,
+            current_source_not_candidate=True, body_completeness_verified=False,
+            identity_or_alias_accepted=False)
+        try:
+            facts['private_original_permit'] = private_ettoday_conflict_original_permit(
+                response, source, requested_url, expected_conflict)
+        except NewsError as failure:
+            facts['private_original_scope_error'] = failure.code
+            facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
+        return facts
+    if evidence_contract_version == 67:
+        from downloader.news_fulltext_moneyweekly_excerpt import excerpt_metadata
+        return excerpt_metadata(response, source, requested_url)
+    if evidence_contract_version == 66:
+        from downloader.news_fulltext_moneyweekly_metadata import template_metadata
+        return template_metadata(response, source, requested_url)
+    if evidence_contract_version == 65:
+        from downloader.news_fulltext_moneyweekly import moneyweekly_body_geometry
+        return moneyweekly_body_geometry(response, source, requested_url)
+    if evidence_contract_version == 64:
+        from downloader.news_fulltext_moneyweekly import moneyweekly_route_metadata
+        return moneyweekly_route_metadata(response, source, requested_url)
+    if evidence_contract_version == 63:
+        from downloader.news_fulltext_ettoday import ETTODAY_ATTRIBUTION_PREDICATES_QUESTION, ettoday_finance_attribution_predicates
+        _require_article_response(response, source)
+        predicates = ettoday_finance_attribution_predicates(response, source, requested_url)
+        return {'contract_version': 1, 'evidence_contract_version': 63, 'provider': source.provider,
+            'question': ETTODAY_ATTRIBUTION_PREDICATES_QUESTION, 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url, 'redirect_count': 0,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'public_schema_declarations_retained': True, 'raw_or_names_or_body_retained': True,
+            'raw_or_body_retained': False, 'raw_response_retained': False, 'full_body_retained': False,
+            'body_completeness_verified': False, 'identity_or_alias_accepted': False,
+            'ettoday_attribution_predicates': predicates}
+    if evidence_contract_version == 62:
+        from downloader.news_fulltext_ettoday import ETTODAY_PRELUDE_EXCERPT_QUESTION, ettoday_finance_prelude_excerpt
+        _require_article_response(response, source)
+        excerpt = ettoday_finance_prelude_excerpt(response, source, requested_url)
+        return {'contract_version': 1, 'evidence_contract_version': 62, 'provider': source.provider,
+            'question': ETTODAY_PRELUDE_EXCERPT_QUESTION, 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url, 'redirect_count': 0,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'raw_or_body_retained': True, 'raw_or_names_or_body_retained': True,
+            'diagnostic_excerpt_retained': True, 'raw_response_retained': False,
+            'full_body_retained': False, 'body_completeness_verified': False,
+            'identity_or_alias_accepted': False, 'ettoday_unclassified_prelude': excerpt}
+    if evidence_contract_version == 61:
+        from downloader.news_fulltext_ettoday import (
+            ETTODAY_CREDIT_DECLARATION_QUESTION, ettoday_finance_credit_declarations)
+        _require_article_response(response, source)
+        header = ettoday_finance_credit_declarations(response, source, requested_url)
+        retained = bool(header['native_credit_declarations'])
+        return {'contract_version': 1, 'evidence_contract_version': 61, 'provider': source.provider,
+            'question': ETTODAY_CREDIT_DECLARATION_QUESTION, 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url, 'redirect_count': 0,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'raw_or_body_retained': False, 'body_completeness_verified': False,
+            'raw_or_names_or_body_retained': retained, 'public_header_declarations_retained': retained,
+            'identity_or_alias_accepted': False, 'ettoday_native_header': header}
+    if evidence_contract_version == 60:
+        from downloader.news_fulltext_candidate_originals import (
+            ETTODAY_CAPTION_ORIGINAL_QUESTION, private_ettoday_caption_original_permit)
+        _require_article_response(response, source)
+        shape = {}
+        facts = dict(contract_version=1, evidence_contract_version=60, provider=source.provider,
+            question=ETTODAY_CAPTION_ORIGINAL_QUESTION, status=response.status,
+            requested_url=requested_url, final_url=response.url, redirect_count=len(response.redirects),
+            response_bytes=len(response.body), response_sha256=hashlib.sha256(response.body).hexdigest(),
+            accepted_as_article=False, raw_or_names_or_body_retained=False,
+            current_source_not_candidate=True, body_completeness_verified=False,
+            identity_or_alias_accepted=False, native_caption_structure=shape)
+        try:
+            facts['private_original_permit'] = private_ettoday_caption_original_permit(
+                response, source, requested_url, shape_facts=shape)
+        except NewsError as failure:
+            facts['private_original_scope_error'] = failure.code
+            facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
+        return facts
+    if evidence_contract_version in {58,59}:
+        from downloader.news_fulltext_managertoday import MANAGER_BODY_ORIGINAL_QUESTION, private_manager_body_original_permit
+        from downloader.news_fulltext_managertoday import MANAGER_MULTIPLE_ORIGINAL_QUESTION,private_manager_multiple_original_permit
+        question,permit = ((MANAGER_MULTIPLE_ORIGINAL_QUESTION,private_manager_multiple_original_permit)
+            if evidence_contract_version==59 else (MANAGER_BODY_ORIGINAL_QUESTION,private_manager_body_original_permit))
+        _require_article_response(response,source)
+        facts = dict(contract_version=1,evidence_contract_version=evidence_contract_version,provider=source.provider,
+            question=question,status=response.status,requested_url=requested_url,final_url=response.url,
+            response_bytes=len(response.body),response_sha256=hashlib.sha256(response.body).hexdigest(),
+            accepted_as_article=False,raw_or_names_or_body_retained=False,current_source_not_candidate=True,
+            body_completeness_verified=False,identity_or_alias_accepted=False)
+        try:
+            facts['private_original_permit'] = permit(response,source,requested_url)
+        except NewsError as failure:
+            facts['private_original_scope_error'] = failure.code
+            facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
+        return facts
+    if evidence_contract_version == 57:
+        from downloader.news_fulltext_knews import KNEWS_HEADER_SHAPE_QUESTION, knews_missing_header_metadata
+        _require_article_response(response, source)
+        return {'contract_version': 1, 'evidence_contract_version': 57, 'provider': source.provider,
+            'question': KNEWS_HEADER_SHAPE_QUESTION, 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'accepted_as_article': False, 'raw_or_names_or_body_retained': False,
+            'current_source_not_candidate': True, 'body_completeness_verified': False,
+            'identity_or_alias_accepted': False,
+            'native_header_structure': knews_missing_header_metadata(response, source, requested_url)}
+    if evidence_contract_version == 56:
+        from downloader.news_fulltext_knews import (
+            KNEWS_FAILURE_ORIGINAL_QUESTION, private_knews_failure_original_permit)
+        _require_article_response(response, source)
+        facts = {'contract_version': 1, 'evidence_contract_version': 56, 'provider': source.provider,
+            'question': KNEWS_FAILURE_ORIGINAL_QUESTION, 'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'accepted_as_article': False, 'raw_or_names_or_body_retained': False,
+            'current_source_not_candidate': True, 'body_completeness_verified': False,
+            'identity_or_alias_accepted': False}
+        try:
+            facts['private_original_permit'] = private_knews_failure_original_permit(response, source, requested_url)
+        except NewsError as failure:
+            facts['private_original_scope_error'] = failure.code
+            facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
+        return facts
+    if evidence_contract_version in {51, 52}:
+        from downloader.news_fulltext_candidate_originals import (
+            private_ettoday_credit_original_permit, private_ettoday_disagreement_original_permit,
+            ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION)
+        from downloader.news_fulltext_ettoday import ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+        _require_article_response(response, source)
+        relationships = {}
+        result = {'contract_version': 1, 'evidence_contract_version': evidence_contract_version, 'provider': source.provider,
+            'question': ETTODAY_SCHEMA_RELATIONSHIP_QUESTION if evidence_contract_version == 51 else ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION,
+            'status': response.status,
+            'requested_url': requested_url, 'final_url': response.url, 'redirect_count': len(response.redirects),
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'accepted_as_article': False, 'raw_or_names_or_body_retained': False,
+            'current_source_not_candidate': True, 'current_parser_replayed': False,
+            'body_completeness_verified': False, 'identity_or_alias_accepted': False,
+            'schema_relationships': relationships}
+        try:
+            if evidence_contract_version == 52:
+                result['private_original_permit'] = private_ettoday_disagreement_original_permit(
+                    response, source, requested_url, relationship_facts=relationships)
+            else:
+                private_ettoday_credit_original_permit(response, source, requested_url,
+                    _visible_credit=True, _replaced_images=True, _first_nonempty_line=True,
+                    _canonical_author_scope=True, _relationship_facts=relationships)
+        except NewsError as error:
+            result['scope_error'] = error.code
+            result['failure_location'] = extraction_failure_location(error)
+        return result
+    if evidence_contract_version == 50:
+        from downloader.news_fulltext_gnn import gnn_route_metadata
+        return gnn_route_metadata(response, source, requested_url)
+    if evidence_contract_version == 49:
+        from downloader.news_fulltext_gnn import GNN_BOUNDARY_ORIGINAL_QUESTION,private_gnn_boundary_original_permit
+        _require_article_response(response,source)
+        facts={'contract_version':1,'evidence_contract_version':49,'provider':source.provider,
+            'question':GNN_BOUNDARY_ORIGINAL_QUESTION,'response_bytes':len(response.body),
+            'response_sha256':hashlib.sha256(response.body).hexdigest(),'status':response.status,
+            'requested_url':requested_url,'final_url':response.url,'current_source_not_candidate':True,
+            'accepted_as_article':False,'raw_or_names_or_body_retained':False,
+            'body_completeness_verified':False,'identity_or_alias_accepted':False}
+        try:
+            facts['private_original_permit']=private_gnn_boundary_original_permit(response,source,requested_url)
+        except NewsError as failure:
+            facts['private_original_scope_error']=failure.code
+            facts['private_original_scope_failure_location']=extraction_failure_location(failure)
+        return facts
+    if evidence_contract_version == 48:
+        from downloader.news_fulltext_document_metadata import public_document_identity_shape
+        from downloader.news_fulltext_gnn import GNN_METADATA_QUESTION, gnn_native_metadata
+        _require_article_response(response, source)
+        soup = BeautifulSoup(response.body, source.html_parser)
+        return {'contract_version': 1, 'evidence_contract_version': 48,
+            'provider': source.provider, 'question': GNN_METADATA_QUESTION,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'status': response.status, 'requested_url': requested_url, 'final_url': response.url,
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'raw_or_body_retained': False, 'body_completeness_verified': False,
+            'raw_or_names_or_body_retained': True, 'public_header_declarations_retained': True,
+            'identity_or_alias_accepted': False,
+            'public_document_identity': public_document_identity_shape(soup),
+            'gnn_native_header': gnn_native_metadata(soup)}
+    if evidence_contract_version in {46,47}:
+        from downloader.news_fulltext_document_metadata import public_document_identity_shape
+        from downloader.news_fulltext_managertoday import MANAGER_METADATA_QUESTION, MANAGER_PLAIN_CREDIT_QUESTION, manager_native_metadata
+        _require_article_response(response, source)
+        soup = BeautifulSoup(response.body, source.html_parser)
+        return {'contract_version': 1, 'evidence_contract_version': evidence_contract_version,
+            'provider': source.provider, 'question': MANAGER_METADATA_QUESTION
+                if evidence_contract_version==46 else MANAGER_PLAIN_CREDIT_QUESTION,
+            'response_bytes': len(response.body), 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+            'status': response.status, 'requested_url': requested_url, 'final_url': response.url,
+            'current_source_not_candidate': True, 'accepted_as_article': False,
+            'raw_or_body_retained': False, 'body_completeness_verified': False,
+            'raw_or_names_or_body_retained': True, 'public_header_declarations_retained': True,
+            'identity_or_alias_accepted': False,
+            'public_document_identity': public_document_identity_shape(soup),
+            'manager_native_header': manager_native_metadata(soup,plain_credit_header=evidence_contract_version==47)}
+    if evidence_contract_version == 55:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_FAILURE_SHAPE_QUESTION, contentplatform_failure_shape
+        from downloader.news_fulltext_policy import public_article_document
+        _require_article_response(response,source)
+        if len(response.body)>8<<20:
+            raise NewsError('candidate_response_exceeds_bound')
+        if response.url != requested_url or response.redirects:
+            raise NewsError('candidate_literal_response_not_verified')
+        facts = dict(contract_version=1,evidence_contract_version=55,provider=source.provider,
+            question=CONTENTPLATFORM_FAILURE_SHAPE_QUESTION,status=response.status,
+            response_bytes=len(response.body),response_sha256=hashlib.sha256(response.body).hexdigest(),
+            requested_url=requested_url,final_url=response.url,current_source_not_candidate=True,
+            raw_or_names_or_body_retained=False,accepted_as_article=False,
+            body_completeness_verified=False,identity_or_alias_accepted=False)
+        try:
+            soup = public_article_document(response.body,source,page_url=requested_url)
+        except NewsError as error:
+            facts.update(current_native_error=error.code,failure_location=extraction_failure_location(error))
+            return facts
+        facts['native_failure_shape'] = contentplatform_failure_shape(soup,page_url=requested_url)
+        return facts
     from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_VERSIONS
     if evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS:
         from downloader.news_fulltext_candidate_originals import (
             private_contentplatform_original_permit, private_contentplatform_root_original_permit,
-            private_contentplatform_image_original_permit)
+            private_contentplatform_image_original_permit, private_contentplatform_prefix_original_permit)
         from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_QUESTIONS
         question = CONTENTPLATFORM_EVIDENCE_QUESTIONS[evidence_contract_version]
         verify = {43: private_contentplatform_original_permit, 44: private_contentplatform_root_original_permit,
-            45: private_contentplatform_image_original_permit}[evidence_contract_version]
+            45: private_contentplatform_image_original_permit,
+            53: private_contentplatform_prefix_original_permit}[evidence_contract_version]
         _require_article_response(response, source)
         facts = {'contract_version': 1, 'evidence_contract_version': evidence_contract_version,
             'provider': source.provider, 'question': question,
@@ -336,12 +627,14 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
             facts['private_original_scope_error'] = failure.code
             facts['private_original_scope_failure_location'] = extraction_failure_location(failure)
             context = getattr(failure, 'private_scope_facts', {})
-            for key in ('native_root_shape', 'native_image_credit_shape', 'native_header_failure_context'):
+            for key in ('native_root_shape', 'native_image_credit_shape', 'native_header_failure_context',
+                    'native_prefix_credit_shape'):
                 if key in context:
                     facts[key] = context[key]
         else:
             facts['private_original_permit'] = permit
-            shape_key = {44: 'native_root_shape', 45: 'native_image_credit_shape'}.get(evidence_contract_version)
+            shape_key = {44: 'native_root_shape', 45: 'native_image_credit_shape',
+                53: 'native_prefix_credit_shape'}.get(evidence_contract_version)
             if shape_key:
                 facts[shape_key] = {k: v for k, v in permit['native_permit'].items()
                     if k != 'signed_reporter_and_explicit_clocks_verified'}
@@ -723,16 +1016,28 @@ def candidate_response_metadata(response, source, candidate, *, evidence_contrac
         from downloader.news_fulltext_publishers import cmnews_identity_metadata, cmnews_visible_article
         if len(response.body) > 2 << 20:
             raise NewsError('candidate_response_exceeds_bound')
-        from downloader.news_fulltext_publishers import CMNEWS_CANONICAL_RELATION_QUESTION, cmnews_canonical_relation_metadata
-        facts.update(question=(CMNEWS_CANONICAL_RELATION_QUESTION if evidence_contract_version == 19
-                               else 'cmnews_current_identity_boundary_v1'), current_source_not_candidate=True,
+        from downloader.news_fulltext_publishers import (CMNEWS_CANONICAL_RELATION_QUESTION,
+            CMNEWS_CANONICAL_ATTRIBUTE_QUESTION, cmnews_canonical_relation_metadata,
+            cmnews_canonical_attribute_metadata)
+        facts.update(question=({19: CMNEWS_CANONICAL_RELATION_QUESTION,
+            54: CMNEWS_CANONICAL_ATTRIBUTE_QUESTION}.get(evidence_contract_version,
+                'cmnews_current_identity_boundary_v1')), current_source_not_candidate=True,
             current_parser_replayed=False, body_completeness_verified=False)
+        if evidence_contract_version == 54:
+            facts.update(evidence_contract_version=54, requested_url=requested_url, final_url=response.url,
+                identity_or_alias_accepted=False)
         try:
             document = public_article_document(response.body, source, page_url=response.url)
         except NewsError as error:
             facts.update(current_native_error=error.code, failure_location=extraction_failure_location(error))
             return facts
         facts['native_identity'] = cmnews_identity_metadata(document, page_url=response.url)
+        if evidence_contract_version == 54:
+            if response.url != requested_url:
+                facts['current_native_error'] = 'article_identity_not_verified'
+                return facts
+            facts['canonical_attribute'] = cmnews_canonical_attribute_metadata(document, page_url=requested_url)
+            return facts
         if evidence_contract_version == 19:
             # Literal declarations only. Do not replay the completed identity
             # diagnosis or turn matching UUIDs into an accepted alias/body.

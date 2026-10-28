@@ -3,6 +3,7 @@ from contextlib import closing
 from copy import deepcopy
 import json
 from pathlib import Path
+import time
 
 import pytest
 
@@ -111,6 +112,51 @@ def test_current_canonical_original_writer_still_preserves_both_responses_and_re
             assert audit(tmp_path, [SUBSITE], registry=http.registry)['accepted']
             assert [url for url, _ in session.calls] == ['https://finance.ftvnews.com.tw/robots.txt',
                 SUBSITE, 'https://www.ftvnews.com.tw/robots.txt', FTV_URL]
+    finally:
+        http.close()
+
+
+def test_subsite_response_before_canonical_gate_stays_counted_and_later_commits(tmp_path, monkeypatch):
+    http, session = transport(tmp_path)
+    try:
+        with closing(NewsQueue(tmp_path, http.registry)) as queue:
+            queue.add_articles([{'url': SUBSITE}])
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='retry',attempts=5,error_code='http_502',"
+                                 "last_checked_at_utc='2026-01-01T00:00:00+00:00' WHERE url=?", (SUBSITE,))
+            row = queue.claim_url(SUBSITE, 300)
+            original_get = http.get
+
+            def gate_after_subsite(url, **kwargs):
+                response = original_get(url, **kwargs)
+                if url == SUBSITE:
+                    http.defer('ftvnews', 3)
+                return response
+
+            monkeypatch.setattr(http, 'get', gate_after_subsite)
+            with pytest.raises(NewsError) as caught:
+                fetch_article(http, row)
+            assert caught.value.request_deferred
+            assert [url for url, _ in session.calls] == ['https://finance.ftvnews.com.tw/robots.txt', SUBSITE]
+            assert http.requests_by_provider['ftvnews'] == 2  # Earlier hops were not refunded.
+            queue.failed(row, caught.value, 6)
+            deferred = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (SUBSITE,)).fetchone())
+            assert (deferred['state'], deferred['error_code'], deferred['last_checked_at_utc'], deferred['attempts']) == (
+                'retry', 'http_502', '2026-01-01T00:00:00+00:00', 5)
+            assert deferred['body_sha256'] is None and not list(tmp_path.rglob('*.parquet'))
+            assert queue.claim_url(SUBSITE, 300) is None
+            monkeypatch.setattr(http, 'get', original_get)
+            wall_clock = time.time
+            monkeypatch.setattr(time, 'time', lambda: wall_clock() + 4)
+            resumed = queue.claim_url(SUBSITE, 300)
+            record = fetch_article(http, resumed)
+            queue.accept([record])
+            assert record['published_at_raw'] == CLOCK and TEXT in record['body']
+            assert verify_resolution_response(record) == len(record['url_resolution_response_body'])
+            assert verify_recent_batches(tmp_path, 1)['accepted']
+            assert [url for url, _ in session.calls] == ['https://finance.ftvnews.com.tw/robots.txt',
+                SUBSITE, SUBSITE, 'https://www.ftvnews.com.tw/robots.txt', FTV_URL]
+            assert http.requests_by_provider['ftvnews'] == 5
     finally:
         http.close()
 

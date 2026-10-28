@@ -91,6 +91,103 @@ def test_official_weekly_monthly_spread_legs_are_not_outright_capacity(tmp_path)
     assert proof['spread_delivery_contract_version']==2
 
 
+def test_verified_official_cache_preserves_spread_capacity_absence_and_raw_precision(tmp_path):
+    raw = tmp_path/'source.csv'
+    with raw.open('w', encoding='cp950', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段','結算價'])
+        writer.writerows([
+            ['2020/03/23','CDF','202004',4,100,101,99,100,'一般','100.123400'],
+            ['2020/03/23','CDF','202004/202005',4,1,1,1,1,'一般','-'],
+            ['2020/03/23','DDF','202004',0,'-','-','-','-','一般',99],
+        ])
+    manifest = tmp_path/'source.json'
+    atomic_write_json(manifest, dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
+    keys = pl.DataFrame(dict(date=[date(2020,3,23)]*3,
+                            physical_contract=['CDF:202004','DDF:202004','FC1:202004']))
+    expected = official_day_evidence(manifest, keys, tmp_path/'parent')
+    # Recovery may materialize the same immutable source under another path.
+    alias = tmp_path/'restored.csv'
+    alias.write_bytes(raw.read_bytes())
+    atomic_write_json(manifest, dict(receipts=[dict(path=str(alias),sha256=sha256_file(alias))]))
+    got = official_day_evidence(manifest, keys.reverse(), tmp_path/'reused',
+                                reuse_verified_cache=tmp_path/'parent')
+    assert got.equals(expected)
+    assert got['official_reason'].to_list() == ['spread_legs_only','zero_total_volume','absent_from_complete_day']
+    assert got['outright_volume'].to_list() == [0,0,0]
+    assert got['official_settlement'][0] == '100.123400'
+    proof = json.loads((tmp_path/'reused/official_evidence_manifest.json').read_text())
+    assert proof['sources'][0]['path'] == str(alias)
+    assert proof['reused_verified_evidence']['selected_rows'] == 3
+    selected = official_day_evidence(manifest, keys.head(1), tmp_path/'subset',
+                                     reuse_verified_cache=tmp_path/'parent')
+    assert selected.equals(expected.head(1))
+
+
+def test_cash_posting_date_does_not_expand_verified_market_source_cache(tmp_path):
+    from stockagent.data.tw_futures_margin_preparation import (
+        cash_event_accounting_calendar, official_market_day_keys,
+    )
+    raw = tmp_path / 'source.csv'
+    with raw.open('w', encoding='cp950', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段','結算價'])
+        writer.writerows([
+            ['2017/01/24','I5F','201701',1,8400,8400,8400,8400,'一般','8400.1234'],
+            ['2017/02/02','I5F','201702',1,8500,8500,8500,8500,'一般','8500'],
+        ])
+    manifest = tmp_path / 'source.json'
+    atomic_write_json(manifest, dict(receipts=[dict(path=str(raw), sha256=sha256_file(raw))]))
+    days = [date(2017,1,24), date(2017,1,25), date(2017,2,2)]
+    final = pl.DataFrame(dict(settlement_date=[days[1]], final_settlement_price=[8475.8],
+        settlement_method=['cash_settlement'], reported_date_role=['final_settlement_day'],
+        source_sha256=['a' * 64]))
+    calendar = cash_event_accounting_calendar(pl.DataFrame({'date': [days[0], days[2]]}), final)
+    physical = pl.DataFrame(dict(date=days, physical_contract=['I5F:201701'] * 3))
+    market = official_market_day_keys(physical, calendar)
+    expected = official_day_evidence(manifest, market, tmp_path / 'parent')
+    with pytest.raises(ValueError, match='cover every requested'):
+        official_day_evidence(manifest, physical, tmp_path / 'invalid', reuse_verified_cache=tmp_path / 'parent')
+    got = official_day_evidence(manifest, market, tmp_path / 'reused', reuse_verified_cache=tmp_path / 'parent')
+    assert got.equals(expected)
+    assert got['official_settlement'][0] == '8400.1234'
+    # A missing contract on an actual session is still looked up and retained.
+    assert got['official_reason'][1] == 'absent_from_complete_day'
+    joined = physical.join(got, on=['date', 'physical_contract'], how='left')
+    assert joined.filter(pl.col('date') == days[1])['official_volume'].item() is None
+    assert joined.filter(pl.col('date') == days[1])['official_settlement'].item() is None
+    with pytest.raises(ValueError, match='outside its accounting calendar'):
+        official_market_day_keys(physical, calendar.head(2))
+    with pytest.raises(ValueError, match='unique non-null'):
+        official_market_day_keys(physical, pl.concat([calendar, calendar.head(1)]))
+
+
+@pytest.mark.parametrize('change', ['source','payload','coverage','unknown_volume_policy'])
+def test_verified_official_cache_rejects_changed_inputs_and_incomplete_coverage(tmp_path, change):
+    raw = tmp_path/'source.csv'
+    with raw.open('w', encoding='cp950', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段'])
+        writer.writerow(['2020/03/23','CDF','202004',2,100,101,99,100,'一般'])
+    manifest = tmp_path/'source.json'
+    atomic_write_json(manifest, dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
+    keys = pl.DataFrame(dict(date=[date(2020,3,23)],physical_contract=['CDF:202004']))
+    official_day_evidence(manifest, keys, tmp_path/'parent')
+    if change == 'source':
+        with raw.open('a', encoding='cp950') as stream:
+            stream.write('2020/03/23,DDF,202004,2,100,101,99,100,一般\n')
+        atomic_write_json(manifest, dict(receipts=[dict(path=str(raw),sha256=sha256_file(raw))]))
+    elif change == 'payload':
+        (tmp_path/'parent/official_evidence.parquet').write_bytes(b'changed')
+    elif change == 'coverage':
+        keys = keys.with_columns(pl.lit('DDF:202004').alias('physical_contract'))
+    with pytest.raises(ValueError, match='official evidence cache'):
+        official_day_evidence(manifest, keys, tmp_path/'rejected',
+            allow_unreported_volume=(change == 'unknown_volume_policy'),
+            reuse_verified_cache=tmp_path/'parent')
+    assert not (tmp_path/'rejected').exists()
+
+
 def test_official_zero_spread_only_and_absence_are_independent_of_carried_prices(tmp_path):
     raw = tmp_path/'all.csv'
     columns=['交易日期','契約','到期月份(週別)','成交量','開盤價','最高價','最低價','收盤價','交易時段','結算價']

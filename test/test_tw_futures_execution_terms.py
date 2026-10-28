@@ -44,6 +44,7 @@ def inputs():
     rows = []
     for i, day in enumerate(DAYS):
         rows.append(dict(date=day, product="ABC", contract="202603", physical_contract="ABC:202603#g0",
+            asset_class="stock_future",
             previous_market_date=DAYS[i-1] if i else None, next_market_date=DAYS[i+1] if i<3 else None,
             previous_symbol_date=DAYS[i-1] if i else None, open=100.+i, close=102.+i, settlement=102.+i,
             executable=True, cash_settlement=False, official_expiry=date(2026, 3, 18)))
@@ -119,6 +120,46 @@ def test_inventory_reachability_does_not_conflate_reused_generation_or_missing_s
     assert inventory_entry_reachability(frame,rules)['inventory_entry_reachable'].to_list()==[True,False,True]
 
 
+def test_inventory_reachability_matches_chronological_graph_with_sparse_carries():
+    from datetime import timedelta
+    import math
+    import random
+    from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
+    rng=random.Random(7103)
+    nodes=[]
+    for offset in range(40):
+        day=DAYS[0]+timedelta(days=offset)
+        for identity in ['A#g0','A#g1','B','C','D','E','F','G']:
+            if rng.randrange(4)==0:
+                continue
+            prior=day-timedelta(days=1+rng.randrange(4))
+            origin=rng.choice(['','MISSING',identity,'B','C','D','G'])
+            nodes.append(dict(date=day,physical_contract=identity,
+                executable=rng.choice([False,False,False,True,None]),
+                volume=rng.choice([0.,0.,0.,0.,1.,None,float('nan')]),
+                carry_from_date=prior if origin else None,carry_from_physical_contract=origin,
+                inventory_origin_unresolved=rng.randrange(40)==0))
+    # Independent day-by-day account-state oracle, without graph relaxation,
+    # per-identity minimum dates, or future observations.
+    reached={}; ever=set(); expected=[]
+    for row in sorted(nodes,key=lambda r:(r['date'],r['physical_contract'])):
+        identity=row['physical_contract']; volume=row['volume']; origin=row['carry_from_physical_contract']
+        seed=(row['inventory_origin_unresolved'] or row['executable'] is not False
+            and (volume is None or not math.isfinite(volume) or volume>0))
+        incoming=bool(origin) and reached.get((row['carry_from_date'],origin),True)
+        value=identity in ever or seed or incoming
+        if value:
+            ever.add(identity)
+        reached[row['date'],identity]=value
+        expected.append(dict(date=row['date'],physical_contract=identity,inventory_entry_reachable=value))
+    rng.shuffle(nodes)
+    data=pl.from_dicts(nodes,infer_schema_length=None)
+    frame=data.select('date','physical_contract','executable','volume')
+    rules=data.select('date','physical_contract','carry_from_date','carry_from_physical_contract',
+        'inventory_origin_unresolved')
+    assert inventory_entry_reachability(frame,rules).equals(pl.from_dicts(expected))
+
+
 @pytest.mark.parametrize('problem',['same_day','future','duplicate','no_volume','no_origin_proof'])
 def test_inventory_reachability_rejects_bad_graph_and_keeps_unproven_capacity(problem):
     from stockagent.data.tw_futures_execution_terms import inventory_entry_reachability
@@ -169,6 +210,72 @@ def test_rate_margin_and_carry_keep_different_account_instants():
     for validate in (validate_margin_carry_rules, validate_margin_value_bases,
                      validate_margin_second_position_limit, validate_margin_grandfather_rules):
         validate(rules)
+
+
+@pytest.mark.parametrize('price,expected', [(9173.75, 458687.), (8475.8, 423790.)])
+def test_index_cash_expiry_truncates_decimal_per_contract_without_float_underflow(price, expected):
+    kwargs = inputs()
+    final = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        pl.lit('index_future').alias('asset_class'),
+        (pl.col('date') == final).alias('cash_settlement'),
+        pl.lit(final).alias('official_expiry'),
+        pl.when(pl.col('date') == final).then(price)
+          .otherwise(pl.col('settlement')).alias('settlement'))
+    kwargs['specifications'] = kwargs['specifications'].with_columns(
+        pl.lit(50.).alias('contract_multiplier'))
+    rules, flags = compile_execution_terms(**kwargs)
+    row = rules.filter(pl.col('date') == final).row(0, named=True)
+    assert row['terminal_contract_value_twd'] == expected
+    assert row['settlement_contract_value_twd'] == pytest.approx(price * 50)
+    assert not flags.filter(pl.col('date') == final)['missing_terminal_value'].item()
+    assert rules.filter(pl.col('date') == DAYS[-2])['terminal_contract_value_twd'].item() == 104. * 50.
+
+
+def test_index_expiry_does_not_backdate_reviewed_rounding_rule():
+    from stockagent.data.tw_futures_margin_preparation import index_futures_cash_terminal_values
+    frame = pl.DataFrame([
+        dict(date=date(2016, 11, 4), physical_contract='before-fraction',
+             asset_class='index_future', quote=9173.75, units=50.),
+        dict(date=date(2016, 11, 4), physical_contract='before-whole',
+             asset_class='index_future', quote=8475.8, units=50.),
+        dict(date=date(2016, 11, 7), physical_contract='after-fraction',
+             asset_class='index_future', quote=9173.75, units=50.),
+    ])
+    values = index_futures_cash_terminal_values(frame, price='quote', multiplier='units')
+    assert values['_index_terminal_value_twd'].to_list() == [None, 423790., 458687.]
+
+
+def test_expiry_missing_product_class_is_rejected_and_other_classes_are_not_truncated():
+    kwargs = inputs()
+    final = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == final).alias('cash_settlement'),
+        pl.lit(final).alias('official_expiry'),
+        pl.when(pl.col('date') == final).then(9173.75)
+          .otherwise(pl.col('settlement')).alias('settlement'))
+    kwargs['specifications'] = kwargs['specifications'].with_columns(
+        pl.lit(50.).alias('contract_multiplier'))
+    rules, _ = compile_execution_terms(**kwargs)
+    assert rules.filter(pl.col('date') == final)['terminal_contract_value_twd'].item() == 458687.5
+    kwargs['frame'] = kwargs['frame'].drop('asset_class')
+    with pytest.raises(ValueError, match='sourced product asset class'):
+        compile_execution_terms(**kwargs)
+
+
+@pytest.mark.parametrize('price', [None, 0., float('nan')])
+def test_index_expiry_with_missing_or_invalid_quote_stays_blocked(price):
+    kwargs = inputs()
+    final = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        pl.lit('index_future').alias('asset_class'),
+        (pl.col('date') == final).alias('cash_settlement'),
+        pl.lit(final).alias('official_expiry'),
+        pl.when(pl.col('date') == final).then(pl.lit(price, dtype=pl.Float64))
+          .otherwise(pl.col('settlement')).alias('settlement'))
+    rules, flags = compile_execution_terms(**kwargs)
+    assert rules.filter(pl.col('date') == final)['terminal_contract_value_twd'].item() is None
+    assert flags.filter(pl.col('date') == final)['missing_terminal_value'].item()
 
 
 @pytest.mark.parametrize('expiry_time', ['13:30:00', '13:45:00', '14:00:00'])
@@ -234,6 +341,121 @@ def test_early_cash_event_cannot_admit_a_late_opening_rule_or_unknown_specificat
     kwargs['specifications'] = kwargs['specifications'].with_columns(pl.lit(last).alias('valid_until_exclusive'))
     _, flags = compile_execution_terms(**kwargs)
     assert flags.filter(pl.col('date') == last)['missing_product_specification'].all()
+
+
+@pytest.mark.parametrize('regular_close,expected_initial,expected_clock', [
+    ('13:45:00', .2, '13:45:00'), ('18:15:00', .1, '08:45:00'),
+])
+def test_foreign_final_day_posting_is_distinct_from_expiry_and_keeps_regular_margin_phase(
+        regular_close, expected_initial, expected_clock):
+    from stockagent.data.tw_futures_execution_terms import (
+        FINAL_CASH_ACCOUNTING_CONTRACT, validate_final_cash_accounting_rules,
+    )
+    kwargs = inputs()
+    last = DAYS[-1]
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == last).alias('cash_settlement'), pl.lit(last).alias('official_expiry'),
+        pl.lit('final_settlement_day').alias('reported_date_role'))
+    kwargs['specifications'] = kwargs['specifications'].with_columns(
+        pl.lit(regular_close).alias('settlement_time'),
+        pl.lit(FINAL_CASH_ACCOUNTING_CONTRACT).alias('final_cash_accounting_policy'),
+        pl.lit('17:00:00').alias('final_cash_accounting_time'))
+    old = kwargs['margin_intervals'].row(0, named=True)
+    new = dict(old, effective_date=str(last), effective_phase=1, initial=.2, maintenance=.16,
+        known_at=f'{DAYS[-2]}T23:59:59+08:00')
+    kwargs['margin_intervals'] = pl.DataFrame([old, new])
+    target = pl.col('date') == last
+    kwargs['margins'] = kwargs['margins'].with_columns(
+        pl.when(target).then(pl.lit(1, dtype=pl.UInt32))
+            .otherwise(pl.col('settlement_margin_interval_id')).alias('settlement_margin_interval_id'),
+        pl.when(target).then(.2).otherwise(pl.col('settlement_initial')).alias('settlement_initial'),
+        pl.when(target).then(.16).otherwise(pl.col('settlement_maintenance')).alias('settlement_maintenance'))
+    rules, flags = compile_execution_terms(**kwargs)
+    row = rules.filter(target).row(0, named=True)
+    assert row['opening_time'] == '08:45:00' and row['initial'] == .1
+    assert row['settlement_time'] == '17:00:00' and row['settlement_initial'] == expected_initial
+    expected_date = last if expected_initial == .2 else date.fromisoformat(old['effective_date'])
+    assert row['settlement_effective_at'] == f'{expected_date}T{expected_clock}+08:00'
+    assert not flags.filter(target)['has_blocker'].any()
+    assert rules.filter(~target)['final_cash_accounting_policy'].null_count() == 2
+    manifest = dict(research_only=True, final_cash_accounting_contract=FINAL_CASH_ACCOUNTING_CONTRACT)
+    validate_final_cash_accounting_rules(rules, manifest)
+    for change in (
+        pl.when(target).then(pl.lit('09:30:00')).otherwise(pl.col('settlement_time')).alias('settlement_time'),
+        pl.when(target).then(pl.lit('mark_only')).otherwise(pl.col('terminal_event')).alias('terminal_event'),
+        pl.when(target).then(pl.lit('last_trading_day'))
+            .otherwise(pl.col('final_cash_reported_date_role')).alias('final_cash_reported_date_role'),
+    ):
+        with pytest.raises(ValueError):
+            validate_final_cash_accounting_rules(rules.with_columns(change), manifest)
+    with pytest.raises(ValueError):
+        validate_final_cash_accounting_rules(rules, {})
+    with pytest.raises(ValueError):
+        validate_final_cash_accounting_rules(rules, dict(manifest, research_only=False))
+
+
+@pytest.mark.parametrize('role', [None, 'last_trading_day'])
+def test_final_day_cutoff_rejects_missing_or_last_trade_date_semantics(role):
+    from stockagent.data.tw_futures_execution_terms import FINAL_CASH_ACCOUNTING_CONTRACT
+    kwargs = inputs()
+    kwargs['frame'] = kwargs['frame'].with_columns(
+        (pl.col('date') == DAYS[-1]).alias('cash_settlement'),
+        pl.lit(DAYS[-1]).alias('official_expiry'))
+    if role is not None:
+        kwargs['frame'] = kwargs['frame'].with_columns(pl.lit(role).alias('reported_date_role'))
+    kwargs['specifications'] = kwargs['specifications'].with_columns(
+        pl.lit(FINAL_CASH_ACCOUNTING_CONTRACT).alias('final_cash_accounting_policy'),
+        pl.lit('17:00:00').alias('final_cash_accounting_time'))
+    with pytest.raises(ValueError, match='reported official date role|last trading day'):
+        compile_execution_terms(**kwargs)
+
+
+def test_physical_delivery_requires_a_close_at_its_last_trade_clock_without_cash_conversion():
+    kwargs=inputs();last=DAYS[-1]
+    kwargs['frame']=kwargs['frame'].with_columns(pl.lit(last).alias('official_expiry'))
+    kwargs['specifications']=kwargs['specifications'].with_columns(
+        pl.lit('physical_delivery').alias('settlement_method'),pl.lit('12:00:00').alias('expiry_time'))
+    rules,flags=compile_execution_terms(**kwargs)
+    final=rules.filter(pl.col('date')==last).row(0,named=True)
+    assert final['terminal_event']=='market_close_required'
+    assert final['settlement_time']=='12:00:00'
+    assert final['settlement_effective_at']=='2025-12-02T08:45:00+08:00'
+    assert final['terminal_contract_value_twd']==10500.
+    assert rules.filter(pl.col('date')!=last)['settlement_time'].to_list()==['13:45:00']*2
+    assert not flags.filter(pl.col('date')==last)['settlement_rule_clock'].any()
+    assert 'final_cash_accounting_policy' not in rules.columns
+
+
+@pytest.mark.parametrize('policy,time,method', [
+    ('expiry_event_time', '17:00:00', 'cash_settlement'),
+    ('official_final_day_end_v1', None, 'cash_settlement'),
+    ('official_final_day_end_v1', '09:30:00', 'cash_settlement'),
+    ('official_final_day_end_v1', '17:00:00', 'physical_delivery'),
+    ('guessed_fixing_arrival', '17:00:00', 'cash_settlement'),
+])
+def test_final_day_cutoff_requires_its_exact_declared_policy(policy, time, method):
+    specs = pl.DataFrame([specification(settlement_method=method)]).with_columns(
+        pl.lit(policy).alias('final_cash_accounting_policy'),
+        pl.lit(time, dtype=pl.String).alias('final_cash_accounting_time'))
+    with pytest.raises(ValueError, match='final cash accounting'):
+        bind_product_specifications(pl.DataFrame({'date':[DAYS[0]], 'product':['ABC']}), specs)
+
+
+def test_early_cash_day_requires_an_explicit_dated_rule_boundary():
+    specs=pl.DataFrame([specification(settlement_method='cash_settlement')]).with_columns(
+        pl.lit(date(2008,1,28)).alias('effective_date'),
+        pl.lit('2008-01-11T23:59:59+08:00').alias('known_at'),
+        pl.lit('official_final_day_end_v1').alias('final_cash_accounting_policy'),
+        pl.lit('17:00:00').alias('final_cash_accounting_time'))
+    days=pl.DataFrame({'date':[date(2011,1,26)],'product':['ABC']})
+    with pytest.raises(ValueError,match='final cash accounting'):
+        bind_product_specifications(days,specs)
+    bound=bind_product_specifications(days,specs.with_columns(
+        pl.lit(date(2008,1,28)).alias('final_cash_rule_effective_date')))
+    assert bound['specification_bound'].item()
+    with pytest.raises(ValueError,match='final cash accounting'):
+        bind_product_specifications(days,specs.with_columns(
+            pl.lit(date(2008,1,29)).alias('final_cash_rule_effective_date')))
 
 
 def test_independent_contract_and_combined_shares_use_existing_two_ledger_slots():
@@ -454,6 +676,126 @@ def test_a_nonterminal_position_cannot_disappear_from_the_next_session():
     kwargs["frame"] = kwargs["frame"].filter(pl.col("date")!=DAYS[2])
     _, blockers = compile_execution_terms(**kwargs)
     assert blockers.filter(pl.col("date")==DAYS[1])["lost_inventory_continuation"][0]
+
+
+@pytest.mark.parametrize('term_state', ['missing', 'older', 'resolved'])
+def test_same_code_corporate_event_cannot_fall_back_to_zero_cash(term_state):
+    kwargs=inputs()
+    event_date=DAYS[2]
+    kwargs['corporate_events']=pl.DataFrame(dict(product=['ABC'],
+        contract_months=[['202603']],effective_date=[str(event_date)]))
+    if term_state!='missing':
+        kwargs['corporate_terms']=pl.DataFrame([dict(product='ABC',contract='202603',
+            effective_date=str(event_date if term_state=='resolved' else DAYS[0]),
+            valid_until_exclusive=None,from_product='ABC',contract_multiplier=100.,
+            deliverable_cash_twd=0.,fixed_subscription_rights_twd=0.,
+            subscription_rights_at_final_settlement=False,known_at=STAMP,
+            source_content_sha256s=['d'*64],effective_at=None,equity_cash_credit_twd=50.,
+            has_equity_credit_fields=True,carry_quantity_numerator=1,
+            carry_quantity_denominator=1)],schema=CORPORATE_SCHEMA)
+    rules,flags=compile_execution_terms(**kwargs)
+    failed=flags.filter(pl.col('missing_corporate_event_terms'))
+    assert failed['date'].to_list()==([] if term_state=='resolved' else DAYS[2:])
+    if term_state=='resolved':
+        row=rules.filter(pl.col('date')==event_date).row(0,named=True)
+        assert row['carry_cash_twd']==50.
+        assert row['known_margin_contract_value_twd']==10250.
+        assert rules.filter(pl.col('date')==DAYS[3])['carry_cash_twd'][0]==0.
+        assert not flags.filter(~pl.col('is_warmup'))['has_blocker'].any()
+    # A different future event date cannot alter the prefix's financial values.
+    kwargs['corporate_events']=kwargs['corporate_events'].with_columns(
+        pl.lit(str(DAYS[-1])).alias('effective_date'))
+    changed,_=compile_execution_terms(**kwargs)
+    assert rules.filter(pl.col('date')<event_date).equals(changed.filter(pl.col('date')<event_date))
+
+
+@pytest.mark.parametrize('missing_proof', [None, 'outgoing', 'generation', 'birth', 'old_birth', 'month'])
+def test_corporate_requirements_follow_explicit_physical_reissue(missing_proof):
+    kwargs=inputs()
+    birth=DAYS[2]
+    new=pl.col('date')>=birth
+    kwargs['frame']=kwargs['frame'].with_columns(
+        pl.when(new).then(pl.lit('ABC:202603#g1')).otherwise(pl.col('physical_contract')).alias('physical_contract'),
+        pl.when(new).then(1).otherwise(0).alias('corporate_generation'),
+        pl.when(new).then(pl.lit(birth)).otherwise(pl.lit(DAYS[0])).alias('first_observed_date'),
+        pl.when(pl.col('date')==birth).then(None).otherwise(pl.col('previous_symbol_date')).alias('previous_symbol_date'))
+    events=[dict(product='ABC',from_product='ABC',contract_months=['202603'],effective_date=str(DAYS[0]))]
+    if missing_proof!='outgoing':
+        events.append(dict(product='AB1',from_product='ABC',
+            contract_months=['202606' if missing_proof=='month' else '202603'],effective_date=str(birth)))
+    kwargs['corporate_events']=pl.DataFrame(events)
+    if missing_proof in ('generation','birth'):
+        kwargs['frame']=kwargs['frame'].drop('corporate_generation' if missing_proof=='generation' else 'first_observed_date')
+    elif missing_proof=='old_birth':
+        kwargs['frame']=kwargs['frame'].with_columns(pl.lit(DAYS[0]).alias('first_observed_date'))
+    rules,flags=compile_execution_terms(**kwargs)
+    row=flags.filter(pl.col('date')==DAYS[3]).row(0,named=True)
+    assert row['missing_corporate_event_terms']==(missing_proof is not None)
+    assert rules.filter(pl.col('date')==DAYS[3])['carry_cash_twd'][0]==0.
+    from stockagent.data.tw_futures_execution_terms import rebind_corporate_requirement_flags
+    from polars.testing import assert_frame_equal
+    stale=flags.with_columns(pl.lit(True).alias('missing_corporate_event_terms'))
+    refreshed=rebind_corporate_requirement_flags(kwargs['frame'],stale,
+        kwargs['corporate_terms'],kwargs['corporate_events'])
+    assert_frame_equal(refreshed,flags,check_exact=True)
+    # A genuinely new unresolved boundary still blocks this new generation.
+    kwargs['corporate_events']=pl.concat([kwargs['corporate_events'],pl.DataFrame([
+        dict(product='ABC',from_product='ABC',contract_months=['202603'],effective_date=str(DAYS[3]))])])
+    _,later=compile_execution_terms(**kwargs)
+    assert later.filter(pl.col('date')==DAYS[3])['missing_corporate_event_terms'][0]
+
+
+@pytest.mark.parametrize('family', ['cash_dividend_regime_20110503', 'unknown_reform'])
+def test_source_bound_cash_reform_supersedes_the_older_announcement(family):
+    kwargs=inputs()
+    offset=date(2011,5,1)-DAYS[0]
+    for key,table in list(kwargs.items()):
+        if not isinstance(table,pl.DataFrame):continue
+        expressions=[]
+        for name,dtype in table.schema.items():
+            if dtype==pl.Date:
+                expressions.append(pl.col(name).replace_strict({
+                    DAYS[0]:date(2011,4,29),DAYS[1]:date(2011,5,2),
+                    DAYS[2]:date(2011,5,3),DAYS[3]:date(2011,5,4)},
+                    default=pl.col(name)+pl.lit(offset)).alias(name))
+            elif dtype==pl.String:
+                expressions.append(pl.col(name).replace({STAMP:'2011-01-01T12:00:00+08:00',
+                    '2025-12-02':'2011-01-02'}).alias(name))
+        if expressions:kwargs[key]=table.with_columns(expressions)
+    old=dict(product='ABC',contract='202603',effective_date='2011-04-01',
+        valid_until_exclusive='2011-05-03',from_product='ABC',contract_multiplier=100.,
+        deliverable_cash_twd=50.,fixed_subscription_rights_twd=0.,
+        subscription_rights_at_final_settlement=False,known_at='2011-01-01T12:00:00+08:00',
+        source_content_sha256s=['d'*64],effective_at=None,equity_cash_credit_twd=0.,
+        has_equity_credit_fields=False,carry_quantity_numerator=1,carry_quantity_denominator=1,
+        event_family=None)
+    reform=dict(old,effective_date='2011-05-03',valid_until_exclusive=None,
+        effective_at='2011-05-03T08:30:00+08:00',deliverable_cash_twd=0.,
+        equity_cash_credit_twd=50.,has_equity_credit_fields=True,event_family=family)
+    kwargs['corporate_terms']=pl.DataFrame([old,reform],schema={**CORPORATE_SCHEMA,'event_family':pl.String})
+    kwargs['corporate_events']=pl.DataFrame(dict(product=['ABC'],contract_months=[['202603']],
+        effective_date=['2011-04-01']))
+    rules,flags=compile_execution_terms(**kwargs)
+    after=flags.filter(pl.col('date')>=date(2011,5,3))
+    assert after['missing_corporate_event_terms'].to_list()==[family=='unknown_reform']*2
+    assert rules.filter(pl.col('date')==date(2011,5,3))['carry_cash_twd'][0]==50.
+    assert rules.filter(pl.col('date')==date(2011,5,4))['carry_cash_twd'][0]==0.
+    from stockagent.data.tw_futures_execution_terms import rebind_corporate_requirement_flags
+    from polars.testing import assert_frame_equal
+    stale=flags.with_columns(pl.lit(True).alias('missing_corporate_event_terms'))
+    refreshed=rebind_corporate_requirement_flags(kwargs['frame'],stale,
+        kwargs['corporate_terms'],kwargs['corporate_events'])
+    assert_frame_equal(refreshed,flags,check_exact=True)
+
+
+def test_corporate_recheck_rejects_partial_or_duplicated_account_axes():
+    from stockagent.data.tw_futures_execution_terms import rebind_corporate_requirement_flags
+    kwargs=inputs();_,flags=compile_execution_terms(**kwargs)
+    events=pl.DataFrame(schema={'product':pl.String,'contract_months':pl.List(pl.String),
+        'effective_date':pl.String})
+    for altered in (flags.head(2),pl.concat([flags,flags.head(1)])):
+        with pytest.raises(ValueError,match='account'):
+            rebind_corporate_requirement_flags(kwargs['frame'],altered,kwargs['corporate_terms'],events)
 
 
 def test_cash_credit_and_adjusted_identity_are_applied_once_to_old_inventory():

@@ -1,4 +1,4 @@
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from http.client import HTTPConnection
 from pathlib import Path
 import json
@@ -172,6 +172,9 @@ def test_both_http_audiences_separate_quotes_cache_validators_and_ignore_identit
            "rows": [{"symbol": "2330", "market": "paper", "last_mark_price": 123.456789}],
            "offset": 0, "limit": 1, "returned": 1, "total": 1, "has_more": False}
     monkeypatch.setattr(gateway, 'build_dashboard_position_page', lambda **kwargs: raw)
+    # This synthetic page tests audience isolation, not the live trading
+    # engine's changing commit. Fence behavior has its own integration tests.
+    monkeypatch.setattr(gateway, 'committed_paper_read_guard', lambda _: nullcontext())
     with listener('public') as (pub, pc), listener('owner') as (own, oc):
         pub.content_token = own.content_token = lambda *args, **kwargs: 'fixed-revision'
         path = '/tw-day-trade/api/positions?limit=1'
@@ -197,6 +200,7 @@ def test_member_quotes_match_public_policy_and_cannot_validate_owner_cache(monke
            "rows": [{"symbol": "2330", "market": "paper", "last_mark_price": 123.456789}],
            "offset": 0, "limit": 1, "returned": 1, "total": 1, "has_more": False}
     monkeypatch.setattr(gateway, "build_dashboard_position_page", lambda **kwargs: raw)
+    monkeypatch.setattr(gateway, "committed_paper_read_guard", lambda _: nullcontext())
     with listener("owner") as (owner, oc), listener("member") as (member, mc), listener("public") as (public, pc):
         for server in (owner, member, public):
             server.content_token = lambda *args, **kwargs: "fixed-revision"

@@ -18,6 +18,9 @@ from test_news_body_state_partition import partition_snapshot
 def test_real_page_keeps_all_known_body_ratio_separate_from_finished_cohort(tmp_path, width, height):
     now = datetime.now(UTC)
     status = _seed(tmp_path, now=now)
+    status['url_metadata_inbox'] = {'contract_version': 1, 'available': True,
+        'request_files': 2, 'pending_requests': 2, 'targets_unexamined': 3,
+        'completed_unarchived': 0, 'invalid_or_unreadable': 0}
     source = status['providers']['cnyes']
     source.update(states={'complete': 2, 'waiting_cohort': 4}, acquisition_mode='finite',
                   finite_cohort={'urls': 2, 'stored_bodies': 2}, stored_body_urls=3)
@@ -25,6 +28,15 @@ def test_real_page_keeps_all_known_body_ratio_separate_from_finished_cohort(tmp_
     history['current_source_contract_scope_states'].update(
         inconsistent_source_snapshot=1, waiting_original_page_recheck=2,
         waiting_child_evidence=4, source_page_cap_exceeded=5)
+    history['overflow_retained_recovery'] = {'contract_version': 1, 'scan_state': 'scanning',
+        'pending_retained_pages': 17, 'local_retry_pages': 4, 'local_raw_only': True,
+        'category_gap_completion_claimed': False, 'publisher_requests': 0}
+    history['unobserved_nonzero_retained_scan'] = {'contract_version': 1, 'scan_state': 'scanning',
+        'checked_steps': 40, 'queued_candidate_pages': 17, 'local_raw_only': True,
+        'all_history_complete': False, 'publisher_requests': 0}
+    history['accepted_body_batch_scan'] = {'contract_version': 1, 'scan_state': 'scanning',
+        'scanned_batches': 120, 'indexed_candidates': 17, 'local_raw_only': True,
+        'all_history_complete': False, 'publisher_requests': 0}
     source.update(public_index_progress=index_snapshot(), history_list_progress=history)
     status.update(states={'complete': 2, 'waiting_cohort': 4, 'awaiting_authorization': 4},
                   provider_stored_body_counter_contract_version=1, articles_with_stored_body=3)
@@ -62,6 +74,9 @@ def test_real_page_keeps_all_known_body_ratio_separate_from_finished_cohort(tmp_
             page.route('**/*', route)
             page.goto('http://news-preview.test/news/', wait_until='networkidle', timeout=15000)
             expect(page.locator('#body-count')).to_have_text('3')
+            page.locator('a[href="#acq-progress"]').click(timeout=10000)
+            expect(page.locator('#url-inbox')).to_be_visible()
+            expect(page.locator('#url-inbox')).to_contain_text('3 項提交（2 個請求）尚待 owner 檢查')
             page.locator('a[href="#acq-catalog"]').click(timeout=10000)
             card = page.locator('#pipeline-grid .pipeline-card').filter(has=page.locator('.news-provider-identity small').filter(has_text='cnyes'))
             expect(card).to_have_count(1)
@@ -74,6 +89,12 @@ def test_real_page_keeps_all_known_body_ratio_separate_from_finished_cohort(tmp_
             expect(card.locator('[data-news-history-count="waiting"]')).to_have_text('9')
             expect(card.locator('[data-news-history-count="inconsistent"]')).to_have_text('1')
             expect(card.locator('[data-news-history-count="page_cap"]')).to_have_text('5')
+            expect(card.locator('[data-news-overflow-recovery]')).to_contain_text('盤點中；已排入待核驗 17 頁')
+            expect(card.locator('[data-news-overflow-recovery]')).to_contain_text('歷史清單原件待本機重試：4 頁')
+            expect(card.locator('[data-news-nonzero-local-recovery]')).to_contain_text('本輪已檢視 40 個區間或頁面步驟')
+            expect(card.locator('[data-news-nonzero-local-recovery]')).to_contain_text('發現 17 頁待核驗候選')
+            expect(card.locator('[data-news-accepted-batch-scan]')).to_contain_text('本輪已檢視 120 個批次')
+            expect(card.locator('[data-news-accepted-batch-scan]')).to_contain_text('索引 17 個原件候選')
             card.locator('[data-news-outcome-provider="cnyes"] > summary').click()
             expect(card.locator('[data-news-outcome="waiting_cohort"]')).to_have_text('4')
             expect(card).to_contain_text('原站不存在不代表所有可用替代都已找過')

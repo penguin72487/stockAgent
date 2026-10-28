@@ -197,3 +197,24 @@ def test_deletion_scan_is_retried_after_retirement_before_journal_commit(accepte
     assert result['retired_deliveries'] == 0 and not result['errors']
     assert scans == [{'folder': 'bounded-test'}]
     assert queue.load_ledger()['deliveries'][key]['cache_retirement']['deletion_scan_requested'] is True
+
+
+def test_deletion_notification_timeout_preserves_retry_without_repeating_retirement(accepted, monkeypatch):
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue, _, ledger, key = accepted
+    retire(queue, ledger, key)
+    syncthing_api(queue, monkeypatch)
+    original = api.request
+    def timeout(base, token, endpoint, parameters=None, **kwargs):
+        if endpoint == "/rest/db/scan":
+            raise TimeoutError("synthetic scan timeout after committed retirement")
+        return original(base, token, endpoint, parameters, **kwargs)
+    monkeypatch.setattr(api, "request", timeout)
+    result = queue.retire_transport_cache(ledger)
+    assert result['deferred'] and not result['errors']
+    assert result['scan_notification']['error_type'] == 'TimeoutError'
+    assert not queue.load_ledger()['deliveries'][key]['cache_retirement'].get('deletion_scan_requested')
+    monkeypatch.setattr(api, "request", original)
+    retried = queue.retire_transport_cache(queue.load_ledger())
+    assert retried['retired_deliveries'] == 0
+    assert queue.load_ledger()['deliveries'][key]['cache_retirement']['deletion_scan_requested'] is True

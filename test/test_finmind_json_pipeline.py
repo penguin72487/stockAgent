@@ -37,9 +37,11 @@ def rows(task):
 
 
 def run(runtime, **changes):
+    from types import SimpleNamespace
     root, conn = runtime
     options = {'config': {**pipeline.settings(), 'download_workers': 2}, 'max_calls': 4,
-               'heartbeat': lambda *a: None}
+               'heartbeat': lambda *a: None,
+               'capacity_sampler': SimpleNamespace(sample=lambda: {'state': 'admitted'})}
     options.update(changes)
     account = {'tier': 'SponsorPro', 'observed_at_utc': NOW.isoformat(),
                'official_requests_per_hour': 20000, 'provider_used_in_hour': 0}
@@ -82,6 +84,47 @@ def test_parallel_publication_is_bounded_and_acknowledged_after_durable_store(ru
     assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
     status = json.loads((root / 'json_pipeline_last.json').read_bytes())
     assert status['peak_publications'] == 2 and status['peak_inflight_responses'] <= 4
+
+
+def test_independent_due_datasets_overlap_and_never_calibrate_a_mixed_eta(runtime, monkeypatch):
+    root, conn = runtime
+    futures, options = 'TaiwanFuturesFinalSettlementPrice', 'TaiwanOptionFinalSettlementPrice'
+    worker._add_tasks(conn, [(futures, 'TX', 'history', 'id_history', 0),
+                            (options, 'TXO', 'history', 'id_history', 0)])
+    conn.commit()
+    simultaneous = threading.Barrier(2)
+    def fetch(sessions, limiter, root, task, *args):
+        simultaneous.wait(timeout=5)  # Serial dataset draining cannot satisfy this.
+        identity = 'option_id' if task.dataset == options else 'futures_id'
+        return ([{'date': '2026-10-07', identity: task.data_id,
+                  'contract_month': '202610', 'settlement_price': 123.456}], {})
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    result = run(runtime, max_calls=2)
+    assert result['calls'] == result['accepted_requests'] == result['nonempty_requests'] == 2
+    assert result['mixed_due_releases'] and not result['failed_tasks']
+    status = json.loads((root / 'json_pipeline_last.json').read_bytes())
+    assert status['accepted_by_dataset'] == {futures: 1, options: 1}
+    assert status['peak_inflight_responses'] == 2 and not status['batch_capacity_candidate']
+    assert conn.execute('SELECT COUNT(*) FROM finmind_json_pipeline_samples').fetchone()[0] == 0
+    assert conn.execute('SELECT COUNT(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    # Historical stages retain their existing order and have not been claimed.
+    assert conn.execute("SELECT COUNT(*) FROM tasks WHERE dataset=? AND state='pending'", (US,)).fetchone()[0] == 4
+    for dataset in (futures, options):
+        receipt = json.loads(next((root / 'receipts' / dataset).glob('*/history.json')).read_bytes())
+        assert pq.read_table(root / receipt['parquet_path'])['settlement_price'].to_pylist() == [123.456]
+
+
+@pytest.mark.parametrize('candidate_priority,current_priority,allowed', [(0, 0, True), (8, 0, False),
+                                                                       (0, 8, False), (8, 8, False)])
+def test_only_canonical_due_independent_tasks_cross_dataset_boundaries(runtime, candidate_priority, current_priority, allowed):
+    _, conn = runtime
+    current = worker.Task(US, 'AAPL', '2024-06-03', 'id_day', current_priority, 'pending')
+    candidate = worker.Task('TaiwanFuturesFinalSettlementPrice', 'TX', 'history', 'id_history', candidate_priority, 'pending')
+    assert pipeline.compatible(conn, current, candidate) is allowed
+    baseline = worker.Task('USStockPrice', 'AAPL', 'history', 'id_history', 0, 'pending')
+    assert not pipeline.compatible(conn, current, baseline)
+    derived = worker.Task('TaiwanStockTradingDailyReportSecIdAgg', '', '2026-10-07', 'derived', 0, 'pending')
+    assert not pipeline.compatible(conn, current, derived)
 
 
 def test_publication_backpressure_keeps_download_slots_and_claims(runtime, monkeypatch):
@@ -485,6 +528,25 @@ def test_due_calendar_or_disk_guard_do_not_issue_new_calls(runtime, monkeypatch)
         'ready_requests': 3, 'reserve_requests': 3, 'queue_errors': [], 'observed_at_utc': NOW.isoformat()})
     result = run(runtime)
     assert result['calls'] == 0 and result['state'] == 'incremental_reserve'
+
+
+def test_physical_capacity_drop_drains_started_json_and_stops_new_calls(runtime, monkeypatch):
+    from types import SimpleNamespace
+    admitted = {'state': 'admitted'}
+    blocked = {'state': 'deferred', 'reason': 'physical_backing_reserve'}
+    samples = iter([admitted, admitted, admitted, blocked])
+    sampler = SimpleNamespace(sample=lambda: next(samples, blocked))
+    calls = []
+    def fetch(sessions, limiter, root, task, *args):
+        calls.append(task.data_id)
+        return rows(task), {}
+    monkeypatch.setattr(pipeline, '_fetch', fetch)
+    result = run(runtime, capacity_sampler=sampler)
+    assert result['state'] == 'disk_guard' and result['accepted_requests'] == 2
+    assert len(calls) == 2
+    assert runtime[1].execute("SELECT count(*) FROM tasks WHERE dataset=? AND state='complete'", (US,)).fetchone()[0] == 2
+    assert runtime[1].execute('SELECT count(*) FROM finmind_object_prefetch_claims').fetchone()[0] == 0
+    assert runtime[1].execute('SELECT count(*) FROM finmind_json_pipeline_samples').fetchone()[0] == 0
 
 
 def test_safe_due_queries_parallelize_without_waiting_for_themselves(runtime, monkeypatch):

@@ -347,6 +347,7 @@ def _project_temporal_basis_model_config(
         "futures_notional_score_coordinates",
         "futures_margin_amount_context",
         "futures_causal_account_policy",
+        "futures_residual_signal_context",
     ):
         if not bool(projected.get(field_name, False)):
             # These futures-only branches were added after the cash-equity
@@ -359,6 +360,10 @@ def _project_temporal_basis_model_config(
         # None preserves the historical behavior: hard model-side projection is
         # active exactly when denomination-aware output is active.
         projected.pop("futures_denomination_hard_projection", None)
+    if projected.get("futures_joint_market_tokens", 4) == 4:
+        # This was a constructor constant before it became an experiment key.
+        # Preserve exact old fingerprints at four; other shapes cannot resume.
+        projected.pop("futures_joint_market_tokens", None)
     if int(projected.get("daily_context_layers", 0) or 0) == 0:
         # These controls have no parameters or forward-path effect until the
         # daily-context branch has at least one layer.  Omitting them preserves
@@ -1449,13 +1454,19 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
     if execution_mode == "tw_stock_context_futures_portfolio":
         if trading.tw_futures_portfolio_decision_time is not None:
             from downloader.artifact_io import sha256_file
-            from stockagent.data.tw_futures_decision_clock import decision_clock_contract
+            from stockagent.data.tw_futures_decision_clock import clock_contract_from_manifest
             clock_path = Path(trading.tw_futures_portfolio_entry_clock_path)
+            clock_manifest_path = clock_path.with_name("manifest.json")
+            clock_manifest = json.loads(clock_manifest_path.read_text(encoding="utf-8"))
+            clock = clock_contract_from_manifest(clock_manifest, trading.tw_futures_portfolio_decision_time)
+            entries_sha256 = sha256_file(clock_path)
+            if clock_manifest.get("entries_sha256") != entries_sha256:
+                raise ValueError("futures checkpoint clock source differs from its manifest")
             contract["futures_entry_clock"] = {
-                **decision_clock_contract(trading.tw_futures_portfolio_decision_time),
+                **clock,
                 "source_path": str(clock_path),
-                "source_sha256": sha256_file(clock_path),
-                "manifest_sha256": sha256_file(clock_path.with_name("manifest.json")),
+                "source_sha256": entries_sha256,
+                "manifest_sha256": sha256_file(clock_manifest_path),
             }
             if trading.tw_futures_portfolio_opening_reference_path is not None:
                 from stockagent.data.tw_futures_decision_clock import opening_reference_contract
@@ -1493,6 +1504,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 "surrogate": "grouped_margin_cash_solvency_recovery_v2",
                 "risk_clock": "daily_open_and_settlement_only",
             }
+            if trading.tw_futures_account_calendar_contract is not None:
+                contract["futures_margin_contract"].update(
+                    account_calendar_contract=trading.tw_futures_account_calendar_contract,
+                    risk_clock="dated_futures_account_events_and_stock_decisions",
+                    training_event_credit="preceding_action_at_batch_boundary_v1",
+                    evaluation_account="dated_events_with_contiguous_carry_v1",
+                )
             if trading.tw_futures_portfolio_valuation_research_contract is not None:
                 contract["futures_margin_contract"]["valuation_research_contract"] = trading.tw_futures_portfolio_valuation_research_contract
         if (config.training.model_name == "financial_transformer"
@@ -1754,6 +1772,18 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                         requested_prior_beta_notional_cap=config.training.financial_transformer.futures_beta_notional_cap,
                         beta_estimator='prior_simple_settlement_vs_TX_close_OLS_shrunk8_to_one_v1',
                         output_projection='orthogonal_beta_notional_cap_then_learned_margin_budget_downscale_v1')
+                if config.training.financial_transformer.futures_residual_signal_context:
+                    from stockagent.data.tw_futures_margin import (
+                        FUTURES_RESIDUAL_SIGNAL_COLUMNS, FUTURES_RESIDUAL_SIGNAL_CONTRACT,
+                    )
+                    section["candidate_feature_columns"] += list(FUTURES_RESIDUAL_SIGNAL_COLUMNS)
+                    section["residual_signal_context"] = {
+                        "contract": FUTURES_RESIDUAL_SIGNAL_CONTRACT,
+                        "beta_lookback": config.training.lookback,
+                        "clock": "observed_completed_prior_sessions_only",
+                        "normalization": "paired_prior_window_rms_float64_reductions",
+                        "accounting": "unchanged_exact_fee_net_returns_not_factor_residual_payoffs",
+                    }
     if execution_mode in {
         "tw_stock_futures_day_trade",
         "tw_stock_futures_day_trade_0900",
@@ -2548,6 +2578,34 @@ def _checkpoint_manifest(
     if _model_scope_only and include_data_content:
         raise ValueError("A model-scope manifest cannot include training data content")
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
+    dated_futures_source = None
+    calendar_contract = getattr(config.trading, "tw_futures_account_calendar_contract", None)
+    if execution_mode == "tw_stock_context_futures_portfolio":
+        daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+        has_dated_source = daily is not None and (
+            getattr(daily, "futures_account_calendar", None) is not None
+            or getattr(daily, "account_only_integer_execution", None) is not None
+        )
+        if has_dated_source and calendar_contract != "dated_futures_account_calendar_v1":
+            raise ValueError(
+                "dual futures account calendar is not yet part of the checkpoint, "
+                "training and report contract without explicit opt-in; refusing an incompatible resume or inference"
+            )
+        if calendar_contract is not None:
+            if calendar_contract != "dated_futures_account_calendar_v1" or not has_dated_source:
+                raise ValueError("dated futures account checkpoint requires its explicit calendar and event tape")
+            if (config.trading.tw_futures_portfolio_capital_basis != "initial_margin"
+                    or config.trading.tw_futures_portfolio_holding_policy != "carry"
+                    or not config.trading.tw_futures_portfolio_integer_contracts
+                    or config.trading.tw_futures_portfolio_decision_time not in {"08:45", "09:00"}
+                    or not config.trading.tw_futures_portfolio_entry_clock_path
+                    or config.training.loss_type != "log_utility"
+                    or not getattr(daily, "margin_contract_version", 0)):
+                raise ValueError("dated futures account checkpoint requires its exact margin carry log-utility contract")
+            from stockagent.training.futures_account_bridge import PreparedFuturesAccountSource
+            dated_futures_source = PreparedFuturesAccountSource.from_daily(daily, panel.dates)
+    elif calendar_contract is not None:
+        raise ValueError("dated futures account checkpoint requires stock-context futures execution")
     carry_resume_compatible_release_ids: tuple[str, ...] = ()
     effective_short_open = (
         panel.can_short_open_mask
@@ -2557,17 +2615,17 @@ def _checkpoint_manifest(
     effective_short_open_at_open = (
         panel.can_short_open_open_mask
         if panel.can_short_open_open_mask is not None
-        else np.zeros_like(panel.tradable_mask, dtype=bool)
+        else (None if _model_scope_only else np.zeros_like(panel.tradable_mask, dtype=bool))
     )
     effective_force_cover = (
         panel.force_short_cover_mask
         if panel.force_short_cover_mask is not None
-        else np.zeros_like(panel.tradable_mask, dtype=bool)
+        else (None if _model_scope_only else np.zeros_like(panel.tradable_mask, dtype=bool))
     )
     effective_force_exit = (
         panel.force_exit_mask
         if panel.force_exit_mask is not None
-        else np.zeros_like(panel.tradable_mask, dtype=bool)
+        else (None if _model_scope_only else np.zeros_like(panel.tradable_mask, dtype=bool))
     )
     schema_2_force_exit_compatible = _model_scope_only or not bool(
         np.asarray(effective_force_exit, dtype=bool).any()
@@ -2819,6 +2877,12 @@ def _checkpoint_manifest(
                 panel_arrays["stock_context_futures_integer_execution"] = (
                     _array_content_fingerprint(daily.integer_execution)
                 )
+            if dated_futures_source is not None:
+                panel_arrays["stock_context_futures_account_source"] = {
+                    "version": calendar_contract,
+                    "calendar_fingerprint": dated_futures_source.calendar.fingerprint,
+                    "source_fingerprint": dated_futures_source.fingerprint,
+                }
             if daily.intraday_execution is not None:
                 panel_arrays["stock_context_futures_intraday_execution"] = (
                     _array_content_fingerprint(daily.intraday_execution)
@@ -3012,6 +3076,8 @@ def _checkpoint_manifest(
         "feature_names": [str(name) for name in panel.feature_names],
         "preprocessing": preprocessing_contract,
     }
+    if calendar_contract is not None:
+        data_schema_contract["futures_account_calendar_contract"] = calendar_contract
     data_contract = {
         **data_schema_contract,
         "panel_arrays": panel_arrays,
@@ -3550,12 +3616,16 @@ def _validate_checkpoint_manifest(
         raise ValueError("A model-scope manifest cannot validate resume or artifacts")
 
     actual = checkpoint.get("experiment_manifest")
+    expected_calendar = expected.get("contracts", {}).get("data", {}).get(
+        "futures_account_calendar_contract")
     continuation = expected.get("contracts", {}).get("training", {}).get("fold_continuation", {})
     new_day_trade_training = any(continuation.get(name) for name in (
         "day_trade_training_annual_episodes", "day_trade_sub_lot_recovery",
         "day_trade_annual_episode_sharding",
     ))
     if actual is None:
+        if expected_calendar is not None:
+            raise RuntimeError("checkpoint lacks the dated futures account calendar contract")
         if model_scope_only:
             raise RuntimeError("A model-scope manifest requires a schema-4 checkpoint")
         if normalized_scope in {"resume", "artifact"} and new_day_trade_training:
@@ -3600,6 +3670,10 @@ def _validate_checkpoint_manifest(
             f"Checkpoint experiment_manifest must be a mapping, got {type(actual).__name__}: "
             f"{checkpoint_path}."
         )
+    actual_calendar = actual.get("contracts", {}).get("data", {}).get(
+        "futures_account_calendar_contract")
+    if actual_calendar != expected_calendar:
+        raise RuntimeError("checkpoint dated futures account calendar contract differs")
 
     try:
         actual_schema = int(actual.get("schema_version", 1))

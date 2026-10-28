@@ -1912,10 +1912,15 @@ class TradingConfig:
     tw_futures_portfolio_integer_fee_per_contract_per_side_twd: float = 40.0
     # Explicit account policy; intraday uses receipt-backed 08:46..13:30 bars.
     tw_futures_portfolio_holding_policy: str = "carry"
+    # Explicitly separates stock-decision days from receipt-backed account-only
+    # events.  Disabled configurations preserve the historical checkpoint ABI.
+    tw_futures_account_calendar_contract: str | None = None
     tw_futures_portfolio_minute_data_path: str | None = None
     # Opt-in carrying-account clock. None retains the historical daily OPEN ABI.
     tw_futures_portfolio_decision_time: str | None = None
     tw_futures_portfolio_entry_clock_path: str | None = None
+    # An order allowance only; actual post-decision prints still limit fills.
+    tw_futures_portfolio_entry_capacity_policy: str = "previous_session"
     # Model reference only: observed session OPEN, else the last known real
     # trade. This source must be pinned separately from executable entries.
     tw_futures_portfolio_opening_reference_path: str | None = None
@@ -2247,6 +2252,12 @@ class TransformerBasePortfolioModelConfig:
     futures_net_notional_cap: float | None = None
     # Optional prior-only TX-beta notional/NAV cap; exclusive with the net cap.
     futures_beta_notional_cap: float | None = None
+    # Prior-only TX factor residuals are learned input signals, never a hedge
+    # or a replacement for the exact fee-net account return.
+    futures_residual_signal_context: bool = False
+    # Learned summaries shared by stock and futures tokens. Four preserves
+    # historical checkpoints; larger experiments retain O(K*(stocks+slots)).
+    futures_joint_market_tokens: int = 4
     # Historical models quantized group actions against one fixed reference
     # capital before the recurrent integer executor quantized them again against
     # live equity. New exact-account experiments may retain denomination context
@@ -4589,6 +4600,24 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     holding_policy = trading["tw_futures_portfolio_holding_policy"]
     decision_time = trading["tw_futures_portfolio_decision_time"]
     entry_clock_path = trading["tw_futures_portfolio_entry_clock_path"]
+    account_calendar = trading["tw_futures_account_calendar_contract"]
+    if account_calendar not in (None, "dated_futures_account_calendar_v1"):
+        raise ValueError("unsupported futures account calendar contract")
+    if account_calendar is not None and (
+            trading["execution_mode"] != "tw_stock_context_futures_portfolio"
+            or holding_policy != "carry"
+            or trading["tw_futures_portfolio_capital_basis"] != "initial_margin"
+            or not trading["tw_futures_portfolio_integer_contracts"]
+            or decision_time not in {"08:45", "09:00"}
+            or not entry_clock_path
+            or training["loss_type"] != "log_utility"):
+        raise ValueError("dated futures account calendar requires receipt-bound chronological whole-contract margin log utility")
+    entry_capacity_policy = trading["tw_futures_portfolio_entry_capacity_policy"]
+    if entry_capacity_policy not in {"previous_session", "single_contract_probe"}:
+        raise ValueError("unsupported futures entry capacity policy")
+    if entry_capacity_policy == "single_contract_probe" and (
+            decision_time is None or data["tw_futures_require_prior_capacity"]):
+        raise ValueError("probe orders require a receipt-bound decision clock and prior-capacity candidates disabled")
     opening_reference_path = trading["tw_futures_portfolio_opening_reference_path"]
     if opening_reference_path is not None and (
             not isinstance(opening_reference_path, str) or not opening_reference_path.strip()
@@ -4701,6 +4730,17 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
         or training["lookback"] < 2
     ):
         raise ValueError("prior beta notional cap requires causal TX observations, lookback >= 2 and no net cap")
+    if phase_model_config["futures_residual_signal_context"] and (
+        not phase_model_config["futures_causal_account_policy"]
+        or trading["tw_futures_portfolio_benchmark_mode"] != "tx_front_rolling_1x_gross"
+        or training["lookback"] < 2
+    ):
+        raise ValueError("residual signals require causal TX account observations and lookback >= 2")
+    joint_tokens = phase_model_config["futures_joint_market_tokens"]
+    if isinstance(joint_tokens, bool) or not isinstance(joint_tokens, int) or not 1 <= joint_tokens <= 64:
+        raise ValueError("futures_joint_market_tokens must be an integer from 1 to 64")
+    if joint_tokens != 4 and trading["execution_mode"] != "tw_stock_context_futures_portfolio":
+        raise ValueError("joint futures market-token experiments require stock-context futures execution")
     step_drawdown = training["futures_training_max_drawdown"]
     if not isinstance(training["futures_training_stop_on_rejected_step"], bool):
         raise ValueError("futures_training_stop_on_rejected_step must be a boolean")

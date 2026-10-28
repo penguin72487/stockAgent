@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator
 
 
 _COPY_CHUNK_BYTES = 1 << 20
@@ -92,6 +92,23 @@ def atomic_write_bytes(
     is never overwritten or removed in that explicit-permission path.
     """
 
+    atomic_write_chunks(path, (payload,), durable=durable, mode=mode)
+
+
+def atomic_write_chunks(
+    path: str | Path,
+    chunks: Iterable[bytes],
+    *,
+    durable: bool = False,
+    mode: int | None = None,
+) -> None:
+    """Publish a complete byte stream with the same atomic/durable boundary.
+
+    Encoding failures retain the previous destination and remove only this
+    writer's temporary file. Explicit private creation still rejects an
+    existing sibling before consuming any chunk.
+    """
+
     target = Path(path)
     temporary = _temporary_path(target)
     created = False
@@ -103,7 +120,8 @@ def atomic_write_bytes(
             stream = _open_temporary_stream(temporary, mode)
         created = True
         with stream as handle:
-            handle.write(payload)
+            for chunk in chunks:
+                handle.write(chunk)
             if durable:
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -135,7 +153,18 @@ def atomic_write_json(
     ensure_ascii: bool = False,
     sort_keys: bool = False,
     compact: bool = False,
+    stream: bool = False,
 ) -> None:
+    if stream:
+        if not compact:
+            raise ValueError("streamed JSON requires compact encoding")
+
+        def chunks():
+            yield from iter_compact_json_bytes(payload, ensure_ascii=ensure_ascii, sort_keys=sort_keys)
+            yield b"\n"
+
+        atomic_write_chunks(path, chunks(), durable=durable)
+        return
     atomic_write_text(
         path,
         json.dumps(
@@ -148,6 +177,44 @@ def atomic_write_json(
         + "\n",
         durable=durable,
     )
+
+
+def iter_compact_json_bytes(
+    payload: Any, *, ensure_ascii: bool = False, sort_keys: bool = False,
+) -> Iterator[bytes]:
+    """Frame outer records; let the standard encoder own all scalar spelling.
+
+    Encoding each list member in one call retains the C encoder's complete
+    record path without materializing a catalog-sized text/bytes pair. Other
+    values, including unusual JSON mapping keys, keep the standard fallback.
+    The byte stream equals json.dumps with the same compact options.
+    """
+
+    encoder = json.JSONEncoder(ensure_ascii=ensure_ascii, sort_keys=sort_keys, separators=(",", ":"))
+
+    def values(value):
+        if type(value) in (list, tuple):
+            yield b"["
+            for index, member in enumerate(value):
+                if index:
+                    yield b","
+                yield encoder.encode(member).encode("utf-8")
+            yield b"]"
+        else:
+            yield encoder.encode(value).encode("utf-8")
+
+    if type(payload) is dict and all(type(key) is str for key in payload):
+        yield b"{"
+        keys = sorted(payload) if sort_keys else payload
+        for index, key in enumerate(keys):
+            if index:
+                yield b","
+            yield encoder.encode(key).encode("utf-8")
+            yield b":"
+            yield from values(payload[key])
+        yield b"}"
+    else:
+        yield from values(payload)
 
 
 def archive_run_reports(archive_dir: str | Path, paths: tuple[Path, ...]) -> None:

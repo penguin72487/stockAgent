@@ -1,6 +1,6 @@
 """Review observations never become source permissions or collector revisions."""
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 from pathlib import Path
 
@@ -24,6 +24,243 @@ def _ledger():
         "provider_aliases": {"unregistered:example.org": "moneydj"}}
 
 
+def test_cmoney_readmo_review_keeps_unreviewed_paths_out_of_capture():
+    from downloader.news_fulltext import fetch_article, load_config
+    from downloader.news_fulltext_policy import NewsError
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cmoney']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['readmo_known_url_heads'], scope['readmo_distinct_paths'],
+            scope['readmo_unsupported_article_path_heads'], scope['readmo_stored_body_heads'],
+            scope['readmo_heads_matching_registered_cmoney_path']) == (148, 143, 148, 0, 0)
+    assert sum(scope['unsupported_first_path_segment_counts'].values()) == scope['unsupported_url_heads'] == 987
+    assert scope['notes_detail_pending_pristine_heads'] + scope['notes_detail_unsupported_url_heads'] == scope['notes_detail_known_url_heads'] == 40512
+    assert scope['notes_detail_numeric_nid_query_heads'] == 40505
+    assert scope['notes_detail_distinct_literal_query_values'] == 40492
+    assert scope['notes_detail_stored_body_heads'] == 0
+    assert not scope['notes_detail_time_zone_and_body_completeness_verified']
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
+    _, registry, _ = load_config(configuration)
+
+    class NoHTTP:
+        def __init__(self):
+            self.registry = registry
+
+        def get(self, *args, **kwargs):
+            raise AssertionError('unsupported source path must not issue HTTP')
+
+    url = 'https://readmo.cmoney.tw/article/07955fdd-af74-4408-a70c-3ac3ef8a5fcf'
+    assert registry.match(url).provider == 'cmoney'
+    with pytest.raises(NewsError, match='unsupported_article_path'):
+        fetch_article(NoHTTP(), {'url': url})
+    notes_url = 'https://www.cmoney.tw/notes/note-detail.aspx?nid=1283287'
+    assert registry.match(notes_url).provider == 'cmoney'
+    with pytest.raises(NewsError, match='unsupported_article_path'):
+        fetch_article(NoHTTP(), {'url': notes_url})
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_nbd_review_distinguishes_personal_research_from_bulk_and_training():
+    from scripts.plan_news_sources import review_resume_plan
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[
+        'unregistered:www.nbd.com.cn'
+    ]
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['known_url_heads'], scope['awaiting_authorization_heads'],
+            scope['stored_body_heads'], scope['canonical_source_attempted_heads']) == (38, 38, 0, 0)
+    assert scope['dated_article_url_heads'] + scope['other_route_url_heads'] == scope['known_url_heads']
+    assert scope['personal_research_exception_mentioned']
+    assert not scope['metadata_dates_are_verified_source_clocks']
+    assert not scope['bulk_automatic_scope_verified']
+    assert not scope['source_robot_policy_verified']
+    assert not scope['model_training_right_verified']
+    assert not scope['source_authorization_granted']
+    assert not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': False}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['review_annotation_grants_capture_access']
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_nstock_review_distinguishes_rendered_sample_and_canonical_bodies():
+    from scripts.plan_news_sources import review_resume_plan
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['nstock']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['literal_public_announcement_urls_reviewed'],
+            scope['literal_cnyes_empty_events_with_issuer_day_subject_match']) == (2, 2)
+    assert (scope['retained_public_response_bodies_examined'],
+            scope['retained_response_full_rendered_body_parity_verified']) == (2, 1)
+    assert scope['reviewed_finite_canonical_stored_body_heads'] == 2
+    assert scope['additional_search_candidates_submitted_for_metadata'] == 4
+    assert not scope['additional_search_candidates_native_response_or_body_verified']
+    assert (scope['news_sitemap_observed_distinct_urls'],
+            scope['news_sitemap_observed_announcement_route_urls']) == (45000, 15000)
+    assert not scope['diagnostic_originals_are_canonical_stored_bodies']
+    assert not scope['official_mops_source_identity_verified']
+    assert not scope['cnyes_body_equivalence_verified']
+    assert not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': True}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['review_annotation_grants_capture_access']
+    assert json.loads(plan['remaining_review_questions_json']) == scope['remaining_questions']
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_cnyes_legacy_review_keeps_candidates_separate_from_completed_bodies():
+    from scripts.plan_news_sources import review_resume_plan
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cnyes']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert scope['legacy_missing_heads_examined'] == 32
+    assert scope['legacy_heads_with_candidates'] == 28
+    assert scope['legacy_heads_without_candidates_in_bounded_search'] == 4
+    assert scope['legacy_heads_with_multiple_candidates'] == 2
+    assert scope['distinct_canonical_candidate_heads_verified'] == 31
+    assert scope['legacy_query_free_candidates_archive_availability_examined'] == 21
+    assert scope['legacy_query_free_candidates_archive_snapshots_available'] == 1
+    assert scope['legacy_archived_body_exact_matches_verified'] == 1
+    assert scope['legacy_unmatched_archive_availability_examined'] == 2
+    assert scope['legacy_query_stripped_archive_availability_examined'] == 8
+    assert scope['legacy_query_stripped_archive_snapshots_available'] == 0
+    assert scope['legacy_exact_public_category_archive_availability_examined'] == 3
+    assert scope['legacy_exact_public_category_archive_snapshots_available'] == 0
+    assert scope['legacy_exact_older_public_category_archive_availability_examined'] == 2
+    assert scope['legacy_exact_older_public_category_archive_snapshots_available'] == 0
+    assert (scope['legacy_exact_hk_public_category_archive_availability_examined'],
+            scope['legacy_exact_hk_public_category_archive_snapshots_available']) == (2, 0)
+    assert scope['legacy_original_query_urls_not_examined_exactly'] == 1
+    assert (scope['category_gap_sample_category_pages_observed'],
+            scope['category_gap_sample_category_pages_reported']) == (30, 41)
+    assert scope['category_gap_sample_category_observed_distinct_ids'] == 900
+    assert (scope['category_gap_sample_daily_index_pages_observed'],
+            scope['category_gap_sample_daily_index_distinct_ids']) == (54, 1610)
+    assert scope['category_gap_sample_observed_category_ids_in_daily_index'] == 0
+    assert not scope['category_gap_sample_category_completeness_proven']
+    assert (scope['category_gap_sample_exact_local_url_heads'],
+            scope['category_gap_sample_exact_local_stored_body_heads']) == (900, 900)
+    assert (scope['category_gap_single_day_scope_records_examined'],
+            scope['category_gap_single_day_endpoint_day_groups']) == (814, 407)
+    assert (scope['category_gap_matching_page_recorded_hash_pairs_examined'],
+            scope['category_gap_matching_page_recorded_hash_pairs_different']) == (12210, 0)
+    assert scope['category_gap_pages_without_current_direct_observation'] == 1260
+    assert scope['category_gap_related_search_discovered_new_verified_body_heads'] == 1
+    assert (scope['category_gap_selected_pages_observed_in_missing_head_join'],
+            scope['category_gap_selected_groups_without_current_page_observations']) == (11580, 21)
+    assert (scope['category_gap_matching_missing_heads'],
+            scope['category_gap_missing_heads_with_verified_empty_api_content'],
+            scope['category_gap_missing_heads_with_verified_test_placeholder']) == (320, 319, 1)
+    assert (scope['category_gap_exact_issuer_key_heads_compared_with_finlab'],
+            scope['category_gap_exact_issuer_key_finlab_matches']) == (286, 0)
+    assert (scope['bounded_empty_heads_with_literal_43_1_title_candidate'],
+            scope['bounded_43_1_candidates_cnyes_publication_days']) == (253, 47)
+    assert not scope['mopsov_robots_allows_query_for_collector_user_agent']
+    assert not scope['official_u16_historical_availability_or_exact_event_identity_verified']
+    assert not scope['source_identity_or_alias_accepted'] and not scope['legacy_archive_formal_body_added']
+    assert scope['formal_body_added']
+    plan = review_resume_plan({'enabled': True}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['recorded_review_stage_complete'] and not plan['review_annotation_grants_capture_access']
+    assert json.loads(plan['remaining_review_questions_json']) == scope['remaining_questions']
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_iek_review_preserves_local_cohort_and_does_not_grant_capture():
+    from scripts.plan_news_sources import review_resume_plan
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[
+        'unregistered:ieknet.iek.org.tw']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['known_URL_heads'], scope['stored_body_heads'], scope['awaiting_authorization_heads']) == (52, 0, 52)
+    assert (scope['nested_route_heads'], scope['nested_route_indexed_source_examples']) == (4, 1)
+    assert not scope['source_alias_accepted']
+    assert not scope['source_authorization_granted']
+    assert not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': False}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['recorded_review_stage_complete']
+    assert not plan['review_annotation_grants_capture_access']
+    assert json.loads(plan['remaining_review_questions_json']) == scope['remaining_questions']
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_cool3c_review_preserves_named_robot_scope_without_granting_capture():
+    from scripts.plan_news_sources import review_resume_plan
+
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[
+        'unregistered:www.cool3c.com']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['known_URL_heads'], scope['stored_body_heads'], scope['awaiting_authorization_heads']) == (44, 0, 44)
+    assert 'https://www.cool3c.com/robots.txt' in review['evidence_urls']
+    assert 'GPTBot' in review['observation'] and 'ChatGPT-User' in review['observation']
+    assert not scope['source_authorization_granted']
+    assert not scope['source_alias_accepted']
+    assert not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': False}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['review_annotation_grants_capture_access']
+
+
+def test_tcpttw_review_records_permission_and_existing_heads_without_enabling_a_collector():
+    from scripts.plan_news_sources import review_resume_plan
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[
+        'unregistered:www.tcpttw.com']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'permission_required'
+    assert (scope['known_URL_heads'], scope['stored_body_heads'], scope['awaiting_authorization_heads']) == (50, 0, 50)
+    assert 'https://www.tcpttw.com/robots.txt' in review['evidence_urls']
+    assert 'not a legal fair-use verdict' in review['observation']
+    assert not scope['source_authorization_granted'] and not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': False}, review)
+    assert plan['source_review_work_state'] == 'completed_waiting_permission'
+    assert not plan['review_annotation_grants_capture_access']
+    assert json.loads(plan['remaining_review_questions_json']) == scope['remaining_questions']
+    assert not any('www.tcpttw.com' in item['domains'] for item in before[1]['providers'])
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+@pytest.mark.parametrize(('provider', 'heads'), [
+    ('unregistered:news.pchome.com.tw', 1253),
+    ('unregistered:times.hinet.net', 1072),
+])
+def test_aggregator_review_retains_work_without_granting_capture(provider, heads):
+    from scripts.plan_news_sources import review_resume_plan
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[provider]
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert scope['known_URL_heads'] == heads and scope['stored_body_heads'] == 0
+    assert not scope['source_identity_or_alias_accepted'] and not scope['formal_body_added']
+    plan = review_resume_plan({'enabled': False}, review)
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert not plan['recorded_review_stage_complete'] and not plan['review_annotation_grants_capture_access']
+    assert json.loads(plan['completed_review_questions_json']) == scope['completed_questions']
+    assert json.loads(plan['remaining_review_questions_json']) == scope['remaining_questions']
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
 def test_contentplatform_review_reuses_completed_scope_without_granting_missing_bodies():
     from scripts.plan_news_sources import review_resume_plan
 
@@ -32,22 +269,42 @@ def test_contentplatform_review_reuses_completed_scope_without_granting_missing_
     ledger=load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))
     review=ledger['contentplatform']
     assert ledger['unregistered:www.contentplatform.info']==review
-    assert review['capture_decision']=='review_incomplete'
     scope=review['current_scope_review']
-    assert (scope['known_URL_heads'],scope['stored_body_heads'])==(75,14)
-    assert sum(scope['states'].values())==75
-    assert scope['states']=={'article_identity_not_verified':5,'article_rights_or_scope_excluded':56,'complete':14}
-    assert scope['previous_complete_bodies_preserved']+scope['v2_retained_formal_body_heads']+scope['v2_owner_new_body_heads']==14
-    assert scope['body_versions_verified']==scope['current_heads_verified']==14
-    assert scope['body_batches_verified']==9
-    assert scope['old_complete_body_GETs']==scope['v2_retained_materialization_GETs']==0
-    assert scope['loaded_code_and_local_HTTPS_progress_verified']
-    assert scope['bounded_first_pass_complete'] and not scope['all_known_bodies_complete']
+    if scope.get('native_adapter_contract') == 'contentplatform_native_article_v8':
+        assert review['capture_decision'] == 'reviewed_existing_scope'
+        # The v8 receipt completes the same finite 75-URL scope. Its current
+        # counters are not the earlier v2 first-pass snapshot of fourteen.
+        assert scope['known_URL_heads'] == scope['stored_body_heads'] == scope['current_heads_verified'] == 75
+        assert scope['states'] == {'complete': 75} and scope['all_known_bodies_complete']
+        assert scope['v8_previous_complete_bodies_preserved'] == 73
+        assert scope['v8_missing_only_selected'] == scope['v8_new_bodies'] == 2
+        assert scope['v8_previous_complete_bodies_preserved'] + scope['v8_new_bodies'] == scope['stored_body_heads']
+        assert scope['old_complete_body_GETs'] == 0
+        assert scope['static_HTML_only'] and scope['dynamic_generated_body_not_claimed']
+    else:
+        assert review['capture_decision'] == 'review_incomplete'
+        assert (scope['known_URL_heads'],scope['stored_body_heads'])==(75,14)
+        assert sum(scope['states'].values())==75
+        assert scope['states']=={'article_identity_not_verified':5,'article_rights_or_scope_excluded':56,'complete':14}
+        assert scope['previous_complete_bodies_preserved']+scope['v2_retained_formal_body_heads']+scope['v2_owner_new_body_heads']==14
+        assert scope['body_versions_verified']==scope['current_heads_verified']==14
+        assert scope['body_batches_verified']==9
+        assert scope['old_complete_body_GETs']==scope['v2_retained_materialization_GETs']==0
+        assert scope['loaded_code_and_local_HTTPS_progress_verified']
+        assert scope['bounded_first_pass_complete'] and not scope['all_known_bodies_complete']
     assert not any(scope[key] for key in ('source_authorization_granted','whole_publisher_history_complete',
-        'source_maximum_verified','official_numeric_rate_limit_verified','whole_history_ETA_verified'))
+        'source_maximum_verified','whole_history_ETA_verified'))
+    if scope.get('native_adapter_contract') == 'contentplatform_native_article_v8':
+        assert scope['official_daily_quota'] is None and scope['official_rps_limit'] is None
+    else:
+        assert not scope['official_numeric_rate_limit_verified']
     state=review_resume_plan({'enabled':False},review)
-    assert state['source_review_work_state']=='partially_completed'
-    assert not state['recorded_review_stage_complete']
+    if scope.get('native_adapter_contract') == 'contentplatform_native_article_v8':
+        assert state['source_review_work_state'] == 'completed_for_recorded_scope'
+        assert state['recorded_review_stage_complete']
+    else:
+        assert state['source_review_work_state']=='partially_completed'
+        assert not state['recorded_review_stage_complete']
     assert not state['review_annotation_grants_capture_access']
     assert before==(configuration_revision(path),load_news_configuration(path))
 
@@ -374,13 +631,20 @@ def test_new_source_scope_reviews_resume_only_open_questions_without_capture(pro
         else:
             assert entry['acquisition_mode'] == 'continuous' and not entry.get('finite_article_urls')
             assert entry['private_known_url_scope'] == 'personal_noncommercial_originals_v1'
-            from downloader.news_fulltext_knews import KNEWS_V2_VERIFICATION, KNEWS_V3_VERIFICATION, KNEWS_V4_VERIFICATION, KNEWS_V5_VERIFICATION, KNEWS_V6_VERIFICATION, KNEWS_V7_VERIFICATION
+            from downloader.news_fulltext_knews import (
+                KNEWS_V2_VERIFICATION, KNEWS_V3_VERIFICATION, KNEWS_V4_VERIFICATION,
+                KNEWS_V5_VERIFICATION, KNEWS_V6_VERIFICATION, KNEWS_V7_VERIFICATION,
+                KNEWS_V8_VERIFICATION, KNEWS_V9_VERIFICATION, KNEWS_V10_VERIFICATION,
+            )
             versions = {'knews_public_native_article_v2': KNEWS_V2_VERIFICATION,
                         'knews_public_native_article_v3': KNEWS_V3_VERIFICATION,
                         'knews_public_native_article_v4': KNEWS_V4_VERIFICATION,
                         'knews_public_native_article_v5': KNEWS_V5_VERIFICATION,
                         'knews_public_native_article_v6': KNEWS_V6_VERIFICATION,
-                        'knews_public_native_article_v7': KNEWS_V7_VERIFICATION}
+                        'knews_public_native_article_v7': KNEWS_V7_VERIFICATION,
+                        'knews_public_native_article_v8': KNEWS_V8_VERIFICATION,
+                        'knews_public_native_article_v9': KNEWS_V9_VERIFICATION,
+                        'knews_public_native_article_v10': KNEWS_V10_VERIFICATION}
             assert entry['embedded_article_layout'] in versions
             assert entry['adapter_verification'] == versions[entry['embedded_article_layout']]
         assert entry['authorization']['kind'] == 'personal_research'
@@ -531,6 +795,28 @@ def test_knews_known_url_resume_keeps_completed_finite_evidence_and_open_body_wo
     review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['knews']
     scope = review['current_scope_review']
     assert review['finite_native_capture_review_20261022']['finite_scope_complete']
+    if scope['operational_scope'].startswith('knews_public_native_article_v10;'):
+        # Admissions and retained-body counts belong to their named phases;
+        # adding an old admission total to a later retained total double counts.
+        assert scope['known_URL_heads'] == scope['literal_news_URL_heads'] + scope['nonarticle_search_heads'] == 686
+        assert scope['literal_news_URL_heads'] == 679 and scope['nonarticle_search_heads'] == 7
+        assert scope['previously_unrequested_article_heads_admitted'] <= scope['literal_news_URL_heads']
+        assert scope['v10_previous_complete_bodies_preserved'] == scope['prior_completed_bodies_preserved'] == 672
+        assert scope['v10_missing_only_selected'] == scope['v10_new_bodies_with_independent_readback'] == 3
+        assert scope['new_bodies_with_completed_independent_readback'] == 3
+        assert scope['stored_body_heads'] == scope['v10_previous_complete_bodies_preserved'] + scope['v10_new_bodies_with_independent_readback'] == 675
+        assert sum(scope['states_at_observation'].values()) == scope['known_URL_heads']
+        assert scope['states_at_observation']['complete'] == scope['stored_body_heads']
+        assert scope['v10_closed_native_questions_preserved'] == 512
+        assert scope['v10_original_raw_body_credit_clock_values_preserved']
+        assert scope['prior_finite_reviews_and_completed_receipts_preserved']
+        assert not scope['all_known_articles_complete'] and not scope['all_publisher_history_complete']
+        assert not scope['publisher_license_or_fair_use_verdict']
+        state = review_resume_plan({'enabled': True}, review)
+        assert state['source_review_work_state'] == 'partially_completed'
+        assert json.loads(state['remaining_review_questions_json']) == scope['remaining_questions']
+        assert not state['review_annotation_grants_capture_access']
+        return
     assert scope['known_URL_heads'] == scope['literal_news_URL_heads'] + scope['nonarticle_search_heads'] == 685
     assert scope['previously_unrequested_article_heads_admitted'] + scope['prior_completed_bodies_preserved'] == 678
     assert scope['new_bodies_with_completed_independent_readback'] == 2
@@ -785,9 +1071,22 @@ def test_sina_mixed_operator_scope_cannot_transfer_cn_or_us_terms_to_tw_heads():
 
 
 def test_cmnews_completed_originals_do_not_turn_into_native_body_or_question_completion():
+    from stockagent.live.news_dashboard import _source_review_followup
+
     path = Path('configs/news_fulltext.json')
     before = configuration_revision(path), load_news_configuration(path)
     review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cmnews']
+    scope = review['current_scope_review']
+    assert scope['stored_body_heads'] + scope['missing_body_heads'] == scope['known_url_heads']
+    assert scope['unsupported_tag_paths'] + scope['unsupported_onlynotecontent_paths'] == scope['unsupported_article_path_heads']
+    assert scope['onlynotecontent_stored_same_slug_candidates'] == scope['unsupported_onlynotecontent_paths']
+    assert (scope['missing_identity_heads_with_prior_candidate_jobs']
+            + scope['missing_identity_heads_with_reused_failure_literal']
+            + scope['missing_identity_heads_with_new_pending_diagnostic']) == 32
+    assert scope['missing_identity_heads_with_new_pending_diagnostic'] == 2
+    assert not any(scope[key] for key in ('same_slug_is_proven_alias', 'missing_heads_are_unique_articles',
+                                          'whole_publisher_history_complete'))
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
     proof = review['unfinished_work_audit_20261022']
     assert proof['formal_body_heads'] + proof['all_native_missing_bodies'] == proof['known_URL_heads']
     assert proof['completed_literal_originals_reused_in_this_seven_head_cohort'] == 2
@@ -811,6 +1110,62 @@ def test_cmoneylearning_new_literal_bodies_preserve_completed_scope_and_native_g
     review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['cmoneylearning']
     progress = review['native_progress']
     assert review['capture_decision'] == 'reviewed_existing_scope'
+    if progress['counter_scope'] == 'v8 new-only delta from completed40; current44 source-declared originals':
+        assert progress['closed_literal_url_scope'] == progress['stored_body_heads'] == 44
+        assert progress['previous_complete_bodies_preserved'] == 40
+        assert progress['new_formal_body_heads'] == progress['source_article_capture_attempts'] == 4
+        assert progress['previous_complete_bodies_preserved'] + progress['new_formal_body_heads'] == progress['stored_body_heads']
+        assert progress['original_frozen_cohort_urls'] == 2 and progress['reviewed_supplement_urls'] == 42
+        assert progress['original_frozen_cohort_urls'] + progress['reviewed_supplement_urls'] == progress['closed_literal_url_scope']
+        assert progress['retained_raw_response_bytes'] > progress['new_body_UTF8_bytes'] > 0
+        assert progress['retained_normal_failure_locators_reused'] == progress['canonical_locator_HTTP_requests'] == 2
+        assert progress['closed_native_questions_preserved'] == 749
+        assert progress['old_complete_bodies_refetched'] == progress['remaining_missing_heads_in_this_scope'] == 0
+        assert progress['public_closed_scope_counts_verified'] == progress['stored_body_heads']
+        assert not any(progress[key] for key in ('source_clock_or_refusal_reset',
+            'CMNews_alias_equivalence_accepted', 'whole_publisher_history_complete', 'maximum_throughput_verified'))
+        root = '/cmnews_incremental_originals_20261027/'
+        assert review['engineering_acceptance'].endswith(root + 'runtime-admission.json')
+        assert review['body_readback'].endswith(root + 'independent-readback.json')
+        assert review['remaining_worklist'].endswith(root + 'handoff.json')
+        assert review['prior_scope_review_evidence']['path'].endswith(root + 'prior-review-v7.json')
+        assert len(review['prior_scope_review_evidence']['sha256']) == 64
+        assert review['semantic_verification']['overlapping_test_counts_are_not_additive']
+        entry = next(p for p in before[1]['providers'] if p['id'] == 'cmoneylearning')
+        assert entry['embedded_article_layout'] == 'cmoneylearning_visible_article_v8'
+        assert entry['acquisition_mode'] == 'finite' and entry['allow_reviewed_supplements']
+        assert entry['authorization']['kind'] == 'personal_research'
+        assert before == (configuration_revision(path), load_news_configuration(path))
+        return
+    if progress['counter_scope'] == 'v7 phase delta from completed28; explicitly labelled current40 literal originals':
+        assert progress['closed_literal_url_scope'] == progress['stored_body_heads'] == 40
+        assert progress['previous_complete_bodies_preserved'] == 28
+        assert progress['new_formal_body_heads'] == progress['source_article_capture_attempts'] == 12
+        assert progress['previous_complete_bodies_preserved'] + progress['new_formal_body_heads'] == progress['stored_body_heads']
+        assert progress['original_frozen_cohort_urls'] == 2 and progress['reviewed_supplement_urls'] == 38
+        assert progress['original_frozen_cohort_urls'] + progress['reviewed_supplement_urls'] == progress['closed_literal_url_scope']
+        assert progress['retained_raw_response_bytes'] > progress['new_body_UTF8_bytes'] > 0
+        assert progress['retained_canonical_locators_reused'] == progress['new_formal_body_heads']
+        assert progress['canonical_locator_HTTP_requests'] == progress['old_complete_bodies_refetched'] == 0
+        assert progress['closed_native_questions_preserved'] == 497 and progress['new_native_questions'] == 0
+        assert progress['remaining_missing_heads_in_this_scope'] == 0
+        assert progress['all28_CMNews_declared_originals_available']
+        assert progress['public_closed_scope_counts_verified'] == progress['stored_body_heads']
+        assert not any(progress[key] for key in ('source_clock_or_refusal_reset',
+            'CMNews_alias_equivalence_accepted', 'whole_publisher_history_complete', 'maximum_throughput_verified'))
+        prior = review['prior_scope_review_evidence']
+        assert prior['path'].endswith('/cmoneylearning_twelve_v7_20261026/prior-review-v6.json')
+        assert len(prior['sha256']) == 64
+        assert review['engineering_acceptance'].endswith('/cmoneylearning_twelve_v7_20261026/runtime-admission.json')
+        assert review['body_readback'].endswith('/cmoneylearning_twelve_v7_20261026/readback.json')
+        assert review['remaining_worklist'].endswith('/cmoneylearning_twelve_v7_20261026/completion.json')
+        assert review['semantic_verification']['overlapping_test_counts_are_not_additive']
+        entry = next(p for p in before[1]['providers'] if p['id'] == 'cmoneylearning')
+        assert entry['embedded_article_layout'] == 'cmoneylearning_visible_article_v7'
+        assert entry['acquisition_mode'] == 'finite' and entry['allow_reviewed_supplements']
+        assert entry['authorization']['kind'] == 'personal_research'
+        assert before == (configuration_revision(path), load_news_configuration(path))
+        return
     assert progress['counter_scope'] == 'v6 phase deltas plus explicitly labelled current total scope'
     assert progress['closed_literal_url_scope'] == progress['stored_body_heads'] == 28
     assert progress['previous_complete_bodies_preserved'] == 22
@@ -1712,11 +2067,39 @@ def test_ltn_official_rss_permission_does_not_enable_html_or_mislabel_abstract_a
         'https://news.ltn.com.tw/rss/business.xml', 'https://news.ltn.com.tw/rss/all.xml']
     assert 'RSS metadata/abstracts, not full articles' in review['observation']
     assert 'not blanket HTML/full-history/training permission' in review['observation']
+    scope = review['current_scope_review']
+    assert (scope['registered_rss_metadata_feeds'], scope['verified_rss_metadata_feeds'],
+            scope['rss_feeds_with_current_error'], scope['rss_article_bodies_accepted']) == (14, 13, 1, 0)
+    assert scope['rss_error_endpoint'] == 'people.xml' and scope['rss_error_code'] == 'discovery_http_404'
+    assert scope['feed_observations_are_not_unique_articles'] is True
+    assert scope['full_history_or_training_permission_verified'] is False
+    assert scope['completed_questions'] and scope['remaining_questions']
     config = load_news_configuration(Path('configs/news_fulltext.json'))
     source = next(row for row in config['providers'] if row['id'] == 'ltn')
     assert source['enabled'] is False
     assert source['authorization']['kind'] == 'awaiting_authorization'
+    assert source['metadata_feed_policy']['enabled'] is True
+    assert len(source['metadata_feed_policy']['urls']) == 14
     assert not any(source.get(key) for key in ('fulltext_feeds', 'wordpress_apis', 'cnyes_apis'))
+
+
+@pytest.mark.parametrize(('provider', 'known'), [
+    ('udn', 170995), ('wantmedia', 108664), ('money_link', 104420), ('moneydj', 48453),
+])
+def test_priority_reviews_expose_open_work_without_reenabling_source(provider, known):
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[provider]
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'permission_required'
+    assert scope['known_url_heads'] == known and scope['stored_body_heads'] == 0
+    assert scope['user_purpose'] == 'personal_noncommercial_nonpublic_research'
+    assert scope['completed_questions'] and scope['remaining_questions']
+    now = datetime.fromisoformat(scope['recorded_at_utc']) + timedelta(seconds=1)
+    assert _source_review_followup(review, review_valid=True, now=now) == 'open'
+    config = load_news_configuration(Path('configs/news_fulltext.json'))
+    source = next(row for row in config['providers'] if row['id'] == provider)
+    assert source['enabled'] is False and source['authorization']['kind'] == 'awaiting_authorization'
 
 
 def test_money_link_public_footer_review_keeps_news_and_financial_products_separate():

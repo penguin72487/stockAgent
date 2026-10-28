@@ -38,6 +38,8 @@ ROOT = REPO / "data_finmind/complement"
 ETA_MEASUREMENTS = frozenset({'finmind_full_eta_queue_indexes_v1', 'finmind_full_eta_queue_indexes_v2'})
 STORE_MEASUREMENT = 'finmind_content_addressed_store_fence_v1'
 PUBLICATION_MEASUREMENT = 'finmind_bounded_json_publication_pipeline_v1'
+PRODUCT_VERIFICATION_ACCEPTANCE = 'finmind_finite_product_query_semantics_v1'
+PROVIDER_QUERY_ACCEPTANCE = 'canonical_provider_priority_semantics_v1'
 
 
 def metadata(path, maximum=4 * 1024**2):
@@ -73,15 +75,15 @@ def preparation_stack(threads):
                             for thread in threads for frame in thread.get('frames', [])))
 
 
-def _preparation_pid():
-    group = subprocess.run(['systemctl', 'show', UNIT, '-p', 'ControlGroup', '--value'],
+def _preparation_pid(unit=UNIT, module='downloader.download_finmind_complement'):
+    group = subprocess.run(['systemctl', 'show', unit, '-p', 'ControlGroup', '--value'],
                            capture_output=True, text=True, check=True, timeout=5).stdout.strip()
     if not group.startswith('/') or group == '/':
         return None
     pids = (Path('/sys/fs/cgroup') / group.lstrip('/') / 'cgroup.procs').read_text().split()
     for value in pids:
         args = (Path('/proc') / value / 'cmdline').read_bytes().split(b'\0')
-        if b'-m' in args and args[args.index(b'-m') + 1] == b'downloader.download_finmind_complement':
+        if b'-m' in args and args[args.index(b'-m') + 1] == module.encode():
             return int(value)
     return None
 
@@ -91,6 +93,57 @@ def _stacks(pid):
                             capture_output=True, text=True, check=True, timeout=5)
     # py-spy never requests locals, bodies, tokens or HTTP URLs.
     return json.loads(result.stdout)
+
+
+def reserve_wait_stack(threads, owner):
+    """A live reserve wait may wake at any time; this is usable only frozen."""
+    main = next((row for row in threads if row.get('thread_name') == 'MainThread'), None)
+    if not main or owner not in {'complement', 'sponsor'}:
+        return False
+    frames = main.get('frames', [])
+    prohibited = {'run_batch', '_fetch', '_request_independent', '_request', '_store', '_save_result'}
+    return bool(any(f.get('name') == 'wait_for_next_cycle' and
+                    str(f.get('filename', '')).endswith('/downloader/finmind_runtime.py') for f in frames)
+                and any(str(f.get('filename', '')).endswith(f'/downloader/download_finmind_{owner}.py')
+                        for f in frames)
+                and not any(f.get('name') in prohibited for t in threads for f in t.get('frames', [])))
+
+
+@contextmanager
+def reserve_boundary(root, before, owner):
+    """Freeze the original reactive waiter and prove zero claims before stop."""
+    unit = f'stockagent-finmind-{owner}.service'
+    module = f'downloader.download_finmind_{owner}'
+    pid = _preparation_pid(unit, module)
+    if pid is None or not reserve_wait_stack(_stacks(pid), owner):
+        yield None
+        return
+    frozen = False
+    try:
+        frozen = True
+        subprocess.run(['systemctl', 'freeze', unit], check=True, timeout=5)
+        proof = None
+        status = metadata(root / 'status.json')
+        if (identity(unit) == before and _preparation_pid(unit, module) == pid
+                and reserve_wait_stack(_stacks(pid), owner)
+                and status.get('state') == 'incremental_reserve'
+                and status.get('active_task') is None
+                and idle_heartbeat(root, status, datetime.now(UTC)).get('state') == 'waiting'):
+            with closing(sqlite3.connect((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro',
+                                         uri=True, timeout=.2)) as connection:
+                claims = {'inflight_tasks': connection.execute(
+                    "SELECT count(*) FROM tasks WHERE state='inflight'").fetchone()[0]}
+                for table in ('finmind_object_prefetch_claims', 'complement_year_batch_claims'):
+                    if connection.execute('SELECT 1 FROM sqlite_master WHERE name=?', (table,)).fetchone():
+                        claims[table] = connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+            if not any(claims.values()):
+                proof = {'mode': 'frozen_drained_reserve', 'unit': unit, 'pid': pid, 'claims': claims,
+                         'last_task': status.get('last_task'),
+                         'cycle_observed_at_utc': status['observed_at_utc']}
+        yield proof
+    finally:
+        if frozen:
+            subprocess.run(['systemctl', 'thaw', unit], check=True, timeout=5)
 
 
 @contextmanager
@@ -190,8 +243,12 @@ def terminate_frozen_preparation(proof):
     disposition terminates before more user code can issue another request.
     The normal systemd restart remains responsible for starting the new owner.
     """
-    if proof.get('mode') != 'frozen_drained_preparation' or any(proof.get('claims', {'unknown': 1}).values()):
+    if (proof.get('mode') not in {'frozen_drained_preparation', 'frozen_drained_reserve'}
+            or any(proof.get('claims', {'unknown': 1}).values())):
         raise ValueError('termination_requires_frozen_drained_preparation')
+    unit = proof.get('unit', UNIT)
+    if unit not in {UNIT, 'stockagent-finmind-sponsor.service'}:
+        raise ValueError('termination_requires_original_owner')
     pid = proof['pid']
     with_pid = _pidfd_open(pid)
     try:
@@ -203,7 +260,7 @@ def terminate_frozen_preparation(proof):
         _pidfd_signal(with_pid, signal.SIGTERM)
     finally:
         os.close(with_pid)
-    subprocess.run(['systemctl', 'thaw', UNIT], check=True, timeout=5)
+    subprocess.run(['systemctl', 'thaw', unit], check=True, timeout=5)
 
 
 def _pidfd_call(name, arguments, types):
@@ -238,6 +295,18 @@ def code_matches(accepted):
     hashes = accepted.get("code_sha256", {})
     required = {str(REPO / "downloader/download_finmind_complement.py"),
                 str(REPO / "downloader/finmind_queue_indexes.py")}
+    if accepted.get('measurement_contract') == PRODUCT_VERIFICATION_ACCEPTANCE:
+        required.update(str(REPO / name) for name in (
+            'downloader/finmind_product_query_verification.py',
+            'test/test_finmind_product_query_verification.py',
+            'test/test_reload_finmind_at_idle.py', 'scripts/reload_finmind_at_idle.py'))
+    if accepted.get('measurement_contract') == PROVIDER_QUERY_ACCEPTANCE:
+        required.update(str(REPO / name) for name in (
+            'downloader/provider_priority.py', 'downloader/finmind_product_query_verification.py',
+            'downloader/finmind_json_pipeline.py', 'test/test_provider_priority.py',
+            'downloader/download_finmind_sponsor.py',
+            'test/test_finmind_product_query_verification.py',
+            'test/test_reload_finmind_at_idle.py', 'scripts/reload_finmind_at_idle.py'))
     if "whole_publication_wall_improvement_observed" in accepted:
         required.add(str(REPO / "downloader/finmind_status_aggregates.py"))
     if accepted.get('measurement_contract') == 'finmind_live_reservation_readers_local_dispatch_v1':
@@ -262,7 +331,47 @@ def code_matches(accepted):
 
 
 def accepted_local_measurement(accepted):
-    """An exact full local publication quantum, not only a fast status query."""
+    """Require the local verification appropriate to this exact change."""
+    if accepted.get('measurement_contract') in {PRODUCT_VERIFICATION_ACCEPTANCE, PROVIDER_QUERY_ACCEPTANCE}:
+        import xml.etree.ElementTree as ET
+        provider_query = accepted['measurement_contract'] == PROVIDER_QUERY_ACCEPTANCE
+        expected = 'provider_priority_semantics_accepted' if provider_query else 'finite_product_query_semantics_accepted'
+        if (accepted.get('state') != expected
+                or accepted.get('source_only_no_training_injection') is not True
+                or accepted.get('exact_output_parity') is not True
+                or any(accepted.get(key) != 0 for key in
+                       ('provider_calls', 'production_queue_mutations', 'source_writes'))):
+            return False
+        try:
+            path = Path(accepted['semantic_junit_path'])
+            if file_sha(path) != accepted['semantic_junit_sha256']:
+                return False
+            cases = ET.parse(path).getroot().findall('.//testcase')
+            required = {
+                'test_exact_verification_shape_is_not_hidden_by_dataset_delegation',
+                'test_due_refresh_precedes_the_source_check_and_scope_is_exact',
+                'test_source_check_does_not_reopen_terminal_empty_or_running_key',
+                'test_registered_verification_retains_cooldown',
+                'test_changed_plan_cannot_authorize_a_new_query',
+                'test_changed_source_pin_rejects_registration_without_task_mutation',
+                'test_finite_source_priority_preempts_due_foreign_history_without_changing_tasks',
+                'test_finite_priority_obeys_real_release_quota_and_future_reservations',
+                'test_canonical_owner_executes_one_exact_check_before_accepted_renewal',
+            }
+            if provider_query:
+                required.update({
+                    'test_finmind_exact_priority_is_idempotent_finite_and_preserves_due_refreshes',
+                    'test_finite_read_yields_only_foreign_history_reservations_and_respects_dated_releases',
+                    'test_unknown_batch_is_rejected_atomically',
+                    'test_request_registry_never_reopens_completed_or_unknown_tasks',
+                    'test_api_native_split_retains_finite_priority_and_parent_receipt',
+                    'test_sponsor_priority_uses_native_release_and_dependency_predicate',
+                })
+            passed = {case.get('name', '').split('[', 1)[0] for case in cases}
+            return bool(len(cases) >= 15 and required <= passed
+                        and all(case.find(tag) is None for case in cases for tag in ('failure','error','skipped')))
+        except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
+            return False
     if accepted.get('measurement_contract') == PUBLICATION_MEASUREMENT:
         trials = accepted.get('trials', [])
         fingerprint = accepted.get('configuration_sha256')
@@ -422,6 +531,8 @@ def _main(argv, resources):
                         help='Original queue owner; Sponsor permits only its existing nonreactive idle window')
     parser.add_argument('--allow-preparation-boundary', action='store_true',
                         help='Also permit a frozen, zero-claim preparation boundary; never interrupts an HTTP batch')
+    parser.add_argument('--allow-reserve-boundary', action='store_true',
+                        help='Also permit an exactly frozen, zero-claim incremental-reserve waiter')
     args = parser.parse_args(argv)
     root = ROOT if args.owner == 'complement' else REPO / 'data_finmind/sponsor'
     unit = UNIT if args.owner == 'complement' else 'stockagent-finmind-sponsor.service'
@@ -433,10 +544,13 @@ def _main(argv, resources):
     source_queue = Path(accepted.get('source_queue', ''))
     if args.owner == 'sponsor':
         manifest = accepted.get('source_manifest', {})
-        if (accepted.get('measurement_contract') not in ETA_MEASUREMENTS
-                or 'data/sponsor/queue.sqlite3' not in manifest.get('files', {})):
+        if accepted.get('measurement_contract') == PROVIDER_QUERY_ACCEPTANCE:
+            pass  # Exact semantic evidence and code hashes are checked below for this owner root.
+        elif (accepted.get('measurement_contract') in ETA_MEASUREMENTS
+                and 'data/sponsor/queue.sqlite3' in manifest.get('files', {})):
+            source_queue = Path(manifest.get('source', '')) / 'sponsor/queue.sqlite3'
+        else:
             raise ValueError('sponsor_queue_requires_its_full_measured_snapshot')
-        source_queue = Path(manifest.get('source', '')) / 'sponsor/queue.sqlite3'
     if (not accepted.get("exact_output_parity") or not accepted.get("code_stable")
             or not accepted_local_measurement(accepted)
             or source_queue.resolve() != (root / "queue.sqlite3").resolve()
@@ -463,6 +577,11 @@ def _main(argv, resources):
                     proof = attempt.enter_context(preparation_boundary(root, before))
                     if proof:
                         resources.enter_context(attempt.pop_all())
+            if proof is None and args.apply and args.allow_reserve_boundary:
+                with ExitStack() as attempt:
+                    proof = attempt.enter_context(reserve_boundary(root, before, args.owner))
+                    if proof:
+                        resources.enter_context(attempt.pop_all())
         except (OSError, ValueError, KeyError, sqlite3.Error, subprocess.SubprocessError):
             proof = None
         if proof or time.monotonic() >= end or not args.apply:
@@ -480,7 +599,7 @@ def _main(argv, resources):
     report["sampled_prior_files"] = samples
     # The short batch-complete sleep is non-reactive. Check the exact same
     # service generation and remaining deadline immediately before dispatch.
-    frozen = proof.get('mode') == 'frozen_drained_preparation'
+    frozen = proof.get('mode') in {'frozen_drained_preparation', 'frozen_drained_reserve'}
     if (identity(unit) != before or not code_matches(accepted)
             or not frozen and (idle_proof(root, datetime.now(UTC)) != proof
                 or datetime.fromisoformat(proof["deadline"]) - datetime.now(UTC) < timedelta(seconds=1))):

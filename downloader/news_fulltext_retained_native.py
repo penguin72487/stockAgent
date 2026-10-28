@@ -32,16 +32,23 @@ FINITE_NATIVE_REPLAY_VERSION = 3
 _FINITE_KIND = 'reviewed_finite_native_materialization_v3'
 REGISTRATION_NATIVE_REPLAY_VERSION = 4
 _REGISTRATION_KIND = 'reviewed_native_source_registration_v4'
+FAILURE_NATIVE_REPLAY_VERSION = 5
+_FAILURE_KIND = 'reviewed_canonical_failure_materialization_v5'
 _MAX_RAW = 16 << 20
 
 
 def _approval_kind(version):
     return {RETAINED_NATIVE_REPLAY_VERSION: _KIND, RESIDENT_NATIVE_REPLAY_VERSION: _RESIDENT_KIND,
         FINITE_NATIVE_REPLAY_VERSION: _FINITE_KIND,
-        REGISTRATION_NATIVE_REPLAY_VERSION: _REGISTRATION_KIND}.get(version)
+        REGISTRATION_NATIVE_REPLAY_VERSION: _REGISTRATION_KIND,
+        FAILURE_NATIVE_REPLAY_VERSION: _FAILURE_KIND}.get(version)
 
 
 def _scope_reviewed(scope, version):
+    if version == FAILURE_NATIVE_REPLAY_VERSION:
+        return (scope.get('diagnostic_scope_unchanged') is True
+            and scope.get('parser_transition_reviewed') is True
+            and scope.get('same_failed_attempt_reviewed') is True)
     if version == REGISTRATION_NATIVE_REPLAY_VERSION:
         return (scope.get('diagnostic_scope_rewording_reviewed') is True
             and scope.get('diagnostic_source_registration_reviewed') is True)
@@ -58,6 +65,48 @@ def _article_digest(value):
 
 def _resident_transition(source):
     """Exact, reviewed transitions for existing originals; never a host grant."""
+    from downloader.news_fulltext_ettoday import ETTODAY_V41_HTTP_BINDING, ettoday_resident_source
+    from downloader.news_fulltext_candidate_originals import (
+        ETTODAY_CAPTION_ORIGINAL_QUESTION, private_ettoday_caption_original_permit)
+    binding = ETTODAY_V41_HTTP_BINDING
+    if (source and ettoday_resident_source(source, layout='ettoday_visible_article_v41')
+            and (source.data_fingerprint, source.authorization_fingerprint) == binding[1:3]
+            and source.parser_repair_prior_capture_fingerprint == binding[0]
+            and (source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint) == binding[3:]):
+        return (60, 'ettoday_visible_article_v40', binding[0], ETTODAY_CAPTION_ORIGINAL_QUESTION,
+            private_ettoday_caption_original_permit, frozenset({'article_attribution_not_verified'}), None)
+    from downloader.news_fulltext_managertoday import (
+        MANAGER_V5_HTTP_BINDING, MANAGER_BODY_ORIGINAL_QUESTION, manager_metadata_source,
+        private_manager_body_original_permit,
+    )
+    binding = MANAGER_V5_HTTP_BINDING
+    if (manager_metadata_source(source) and source.embedded_article_layout=='manager_public_written_article_v5'
+            and len(binding)==5 and (source.data_fingerprint,source.authorization_fingerprint)==binding[1:3]
+            and source.parser_repair_prior_capture_fingerprint==binding[0]
+            and (source.http_capacity_source_fingerprint,source.http_capacity_authorization_fingerprint)==binding[3:]):
+        return (58,'manager_public_written_article_v4',binding[0],MANAGER_BODY_ORIGINAL_QUESTION,
+            private_manager_body_original_permit,frozenset({'body_not_found'}),None)
+    from downloader.news_fulltext_knews import (
+        KNEWS_FAILURE_ORIGINAL_QUESTION, KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT,
+        KNEWS_SPARSE_HTTP_BINDING, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_TABLE_HTTP_BINDING,
+        knews_resident_source, private_knews_failure_original_permit,
+    )
+    if (knews_resident_source(source) and source.embedded_article_layout == KNEWS_GRID_NATIVE_LAYOUT
+            and source.parser_repair_prior_capture_fingerprint == KNEWS_TABLE_HTTP_BINDING[0]
+            and source.authorization_fingerprint == KNEWS_TABLE_HTTP_BINDING[1]
+            and (source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint)
+                == KNEWS_TABLE_HTTP_BINDING[2:]):
+        return (56, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_TABLE_HTTP_BINDING[0],
+            KNEWS_FAILURE_ORIGINAL_QUESTION, private_knews_failure_original_permit,
+            frozenset({'article_identity_not_verified'}), None)
+    if (knews_resident_source(source) and source.embedded_article_layout == KNEWS_TABLE_NATIVE_LAYOUT
+            and source.parser_repair_prior_capture_fingerprint == KNEWS_SPARSE_HTTP_BINDING[0]
+            and source.authorization_fingerprint == KNEWS_SPARSE_HTTP_BINDING[1]
+            and (source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint)
+                == KNEWS_SPARSE_HTTP_BINDING[2:]):
+        return (56, KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_SPARSE_HTTP_BINDING[0],
+            KNEWS_FAILURE_ORIGINAL_QUESTION, private_knews_failure_original_permit,
+            frozenset({'article_identity_not_verified', 'article_attribution_not_verified'}), None)
     from downloader.news_fulltext_taiwannews import (
         TAIWANNEWS_INLINE_ORIGINAL_QUESTION, TAIWANNEWS_V2_LAYOUT, TAIWANNEWS_V3_HTTP_BINDING,
         private_taiwannews_inline_original_permit, taiwannews_resident_source,
@@ -176,8 +225,8 @@ def _resident_original(queue, source, item, probe, approved):
             or len(body) != item.get('response_bytes') or raw.get('request_id') != identifier
             or raw.get('provider') != source.provider or raw.get('request_url') != item['url']
             or raw.get('final_url') != probe.get('final_url')
-            or evidence == 17 and raw.get('source_document_url') != raw.get('final_url')
-            or evidence in {39, 40, 41, 42, 43} and ('source_document_url' in raw or 'transport_redirects_json' in raw
+            or evidence in {17, 60} and raw.get('source_document_url') != raw.get('final_url')
+            or evidence in {39, 40, 41, 42, 43, 56, 58} and ('source_document_url' in raw or 'transport_redirects_json' in raw
                 or raw.get('final_url') != item['url'])
             or raw.get('response_sha256') != item.get('response_sha256')
             or hashlib.sha256(body).hexdigest() != item.get('response_sha256')
@@ -192,10 +241,10 @@ def _resident_original(queue, source, item, probe, approved):
     if raw['observed_at_utc'] != item.get('captured_at_utc') or observed > approved:
         raise ValueError('reviewed resident writer observation clock invalid')
     headers = json.loads(raw['headers_json'])
-    # Evidence39/40/41/42/43 did not store hop arrays. Their checked permits reject
+    # Evidence39/40/41/42/43/56/58 did not store hop arrays. Their checked permits reject
     # every redirect and require the literal request/final URL pair.
     # Keep that provenance distinct from evidence17's recorded hop chain.
-    hops = json.loads(raw['transport_redirects_json']) if evidence == 17 else []
+    hops = json.loads(raw['transport_redirects_json']) if evidence in {17, 60} else []
     if (not isinstance(headers, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items())
             or not isinstance(hops, list) or len(hops) > 1):
         raise ValueError('reviewed resident transport evidence invalid')
@@ -224,6 +273,15 @@ def _reviewed_source_scope(source, version=RETAINED_NATIVE_REPLAY_VERSION):
     keeps its exact current native container, byline and private-reading scope;
     explicit URL/frontier, immutable approval and source checks still apply.
     """
+    if version == FAILURE_NATIVE_REPLAY_VERSION:
+        from downloader.news_fulltext_contentplatform import (
+            CONTENTPLATFORM_V5_ORIGINAL_BINDING, CONTENTPLATFORM_WRAPPED_NATIVE_LAYOUT,
+            contentplatform_known_native_source,
+        )
+        return bool(contentplatform_known_native_source(source)
+            and source.embedded_article_layout == CONTENTPLATFORM_WRAPPED_NATIVE_LAYOUT
+            and (source.data_fingerprint, source.authorization_fingerprint,
+                 source.parser_repair_prior_capture_fingerprint) == CONTENTPLATFORM_V5_ORIGINAL_BINDING)
     if version == REGISTRATION_NATIVE_REPLAY_VERSION:
         from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_BODY, CONTENTPLATFORM_TITLE
         return bool(source and source.allowed and source.provider == 'contentplatform'
@@ -296,6 +354,8 @@ def _finite_membership(queue, source, urls):
 
 
 def _original_authorization_matches(original, source, version):
+    if version == FAILURE_NATIVE_REPLAY_VERSION:
+        return original == source.authorization
     ignored = {'scope'}
     if version == FINITE_NATIVE_REPLAY_VERSION:
         # Only the reviewed addition of these same original URLs is allowed;
@@ -315,6 +375,73 @@ def _registered_original(source, url, response_sha256, original_provider, origin
     if (not _reviewed_source_scope(source, REGISTRATION_NATIVE_REPLAY_VERSION)
             or identity not in CONTENTPLATFORM_RETAINED_REGISTRATIONS):
         raise ValueError('reviewed native original registration invalid')
+
+
+def _failure_entry(source, scope, record):
+    """Bind a normal failed HTTP attempt to its later parse-completion clock.
+
+    The receive clock predates the failure commit by milliseconds. Reuse must
+    prove the single intervening attempt, rather than backdate that commit or
+    relax newer-head protection for every retained-original importer.
+    """
+    entries = scope.get('entries')
+    if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
+        raise ValueError('reviewed failure entries invalid')
+    items = [item for item in entries if isinstance(item, dict) and item.get('url') == record['requested_url']]
+    if len(items) != 1:
+        raise ValueError('reviewed failure entry missing or duplicated')
+    item = items[0]
+    before, failed = item.get('before_failed_attempt_head'), item.get('expected_missing_head')
+    fields = set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
+    changed = {'state', 'error_code', 'attempts', 'last_checked_at_utc'}
+    keys = item.get('article_keys')
+    if (not isinstance(before, dict) or set(before) != fields
+            or not isinstance(failed, dict) or set(failed) != fields
+            or failed['url'] != record['requested_url'] or failed['provider'] != source.provider
+            or failed['state'] != 'article_identity_not_verified' or failed['error_code'] != failed['state']
+            or before['state'] not in {'article_identity_not_verified', 'article_rights_or_scope_excluded'}
+            or before['error_code'] != before['state']
+            or any(failed[key] is not None for key in ('body_sha256', 'parquet_path', 'lease_owner', 'lease_until'))
+            or type(before['attempts']) is not int or type(failed['attempts']) is not int
+            or failed['attempts'] != before['attempts']+1 or failed['due'] != 0
+            or any(failed[key] != before[key] for key in fields-changed)
+            or not isinstance(keys, list) or not keys or keys != sorted(set(keys))
+            or any(not isinstance(key, str) or key not in record for key in keys)
+            or _article_digest({key: record[key] for key in keys}) != item.get('article_fields_sha256')
+            or record.get('replay_source_parquet') != item.get('diagnostic_path')
+            or record.get('original_failure_owner_id') != item.get('original_owner_id')
+            or not isinstance(item.get('original_owner_id'), str)
+            or not re.fullmatch('[0-9a-f]{32}', item['original_owner_id'])
+            or any(record.get(key) != item.get(key) for key in (
+                'response_sha256', 'body_sha256', 'authors_json', 'published_at_raw', 'modified_at_raw', 'captured_at_utc'))
+            or json.loads(record['original_diagnostic_authorization_json']) != source.authorization):
+        raise ValueError('reviewed failure same-attempt evidence invalid')
+    observed, checked = _clock(item['captured_at_utc']), _clock(failed['last_checked_at_utc'])
+    if not (_clock(before['last_checked_at_utc']) < observed <= checked
+            and 0 <= (checked-observed).total_seconds() <= 60):
+        raise ValueError('reviewed failure same-attempt clocks invalid')
+    return item
+
+
+def _canonical_failure_original(queue, source, item, raw, receipt, manifest_path, path):
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_V5_ORIGINAL_BINDING
+    if (manifest_path.parent != queue.root.resolve()
+            or not re.fullmatch(r'failure_responses/[0-9]{8}/contentplatform/[0-9]{12}-[0-9a-f]{8}\.parquet',
+                item['diagnostic_path'])
+            or path != (queue.root/item['diagnostic_path']).resolve()
+            or receipt.get('path') != item['diagnostic_path']
+            or raw.get('contract_version') != 1 or raw.get('scope_kind') != 'contentplatform_native_failure_original_v1'
+            or raw.get('data_fingerprint') != CONTENTPLATFORM_V5_ORIGINAL_BINDING[2]
+            or raw.get('error_code') != 'article_identity_not_verified'
+            or raw.get('owner_id') != item.get('original_owner_id')
+            or raw.get('response_bytes') != len(raw['raw_response_body'])
+            or raw.get('native_private_permit') != {
+                'contract_version': 1, 'literal_native_identity_verified': True,
+                'native_publisher_byline_and_explicit_clocks_verified': True,
+                'body_geometry_accepted': False, 'article_accepted': False}
+            or raw.get('raw_response_retained') is not True or raw.get('remote_training_export') is not False
+            or any(receipt.get(key) != value for key, value in raw.items() if key != 'raw_response_body')):
+        raise ValueError('reviewed canonical failure original invalid')
 
 
 def _json(path, limit):
@@ -361,6 +488,9 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
     preserving both exact policies. ABI2 reuses canonical resident originals
     only for the attested same-authorization native parser transition; it
     preserves the actual redirect, writer clock and absent auth-JSON facts.
+    ABI5 reuses a canonical failed response for an exact same-authorization
+    parser transition, proving the single failed attempt and keeping its
+    HTTP receive and later failure-commit clocks distinct.
     Other authorization changes require fresh review, not this import path.
     """
     from downloader.news_fulltext import article_response_record, extract_article_response
@@ -415,6 +545,10 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
         diagnostic_root = manifest_path.parent/directory
         if not diagnostic_root.resolve().is_relative_to(manifest_path.parent):
             raise ValueError('reviewed native diagnostic directory outside approved scope')
+    if version == FAILURE_NATIVE_REPLAY_VERSION and (
+            not explicit_directory or manifest.get('diagnostic_directory') != 'failure_responses'
+            or manifest_path.parent != queue.root.resolve()):
+        raise ValueError('reviewed failure must reuse its canonical original root')
     prepared, total_bytes, encoded_bytes, decoded_bytes = [], 0, 0, 0
     started = time.monotonic()
     for item in manifest['entries']:
@@ -456,9 +590,12 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
                 original_diagnostic_authorization_fingerprint=raw['authorization_fingerprint'],
                 original_diagnostic_authorization_basis='captured_fingerprint; original_authorization_JSON_not_stored',
                 metadata_title_raw=head.get('title'), historical_point_in_time=False)
-            if _resident_transition(source)[0] in {39, 40, 41, 42, 43}:
+            if _resident_transition(source)[0] in {39, 40, 41, 42, 43, 56}:
                 record.update(original_transport_redirects_stored=False,
                     original_transport_redirect_basis='original_private_permit_requires_no_redirect_and_literal_request_final_URL')
+            elif _resident_transition(source)[0] == 60:
+                record.update(original_transport_redirects_stored=True,
+                    original_transport_redirect_basis='original_private_permit_and_stored_empty_hop_array_require_literal_request_final_URL')
             _resident_entry(source, manifest, record)
             # The original already belongs to this canonical root. The shared
             # durable acceptance writer must reference it, not create another
@@ -527,6 +664,8 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             raise ValueError('reviewed native original authorization or HTTP clock invalid')
         if version == REGISTRATION_NATIVE_REPLAY_VERSION:
             _registered_original(source, url, raw['response_sha256'], diagnostic_provider, original_auth)
+        if version == FAILURE_NATIVE_REPLAY_VERSION:
+            _canonical_failure_original(queue, source, item, raw, receipt, manifest_path, path)
         response = Response(url, 200, {k.lower(): v for k, v in headers.items()}, body)
         parse_started = time.monotonic()
         with queue.metrics.measure('article_extraction', provider):
@@ -534,7 +673,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
         if any(article.get(key) != item.get(key) for key in (
                 'body_sha256', 'authors_json', 'published_at_raw', 'modified_at_raw')):
             raise ValueError('reviewed native approved extraction changed')
-        if version == REGISTRATION_NATIVE_REPLAY_VERSION and (
+        if version in {REGISTRATION_NATIVE_REPLAY_VERSION, FAILURE_NATIVE_REPLAY_VERSION} and (
                 sorted(article) != item.get('article_keys') or _article_digest(article) != item.get('article_fields_sha256')):
             raise ValueError('reviewed registered original approved extraction changed')
         head = queue.db.execute('SELECT * FROM articles WHERE url=? AND provider=?', (url, provider)).fetchone()
@@ -553,6 +692,17 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             metadata_title_raw=head.get('title'), historical_point_in_time=False)
         if version == REGISTRATION_NATIVE_REPLAY_VERSION:
             record['original_diagnostic_provider'] = diagnostic_provider
+        if version == FAILURE_NATIVE_REPLAY_VERSION:
+            # Reference the existing original. The source did not retain a
+            # redirect chain; do not fabricate an empty transport witness.
+            private = item['diagnostic_path']
+            record.update(replay_source_parquet=private, original_failure_owner_id=raw['owner_id'],
+                source_observation_clock_basis='original_HTTP_receive; separate_failed_parse_completion_preserved',
+                original_transport_redirects_stored=False,
+                original_transport_redirect_basis='original_stores_literal_request_and_final_URL_only')
+            _failure_entry(source, manifest, record)
+            prepared.append((url, head, record, private, None, None))
+            continue
         prepared.append((url, head, record, private, payload, receipt_bytes))
     # Store the explicit approval and originals by content hash. The ordinary
     # body receipt/recovery path references them; no second queue or writer.
@@ -564,7 +714,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
     records, skipped = [], []
     for url, head, record, private, payload, receipt_bytes in prepared:
         item = next(item for item in manifest['entries'] if item['url'] == url)
-        resident = version == RESIDENT_NATIVE_REPLAY_VERSION
+        resident = version in {RESIDENT_NATIVE_REPLAY_VERSION, FAILURE_NATIVE_REPLAY_VERSION}
         if (head['body_sha256'] or head.get('lease_owner') is not None or head.get('lease_until') is not None
                 or (not resident and head['state'] not in {'pending', 'retry', 'retry_cooldown'})
                 or resident and any(head[field] != item.get('expected_missing_head', {}).get(field)
@@ -577,7 +727,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             except ValueError:
                 skipped.append(url)
                 continue
-            if latest > _clock(record['source_observed_at_utc']):
+            if latest > _clock(record['source_observed_at_utc']) and version != FAILURE_NATIVE_REPLAY_VERSION:
                 skipped.append(url)
                 continue
         if payload is not None:
@@ -609,6 +759,7 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
 
 def _resident_entry(source, scope, record):
     expected_error = _resident_transition(source)[-2]
+    expected_errors = {expected_error} if isinstance(expected_error, str) else expected_error
     entries = scope.get('entries')
     if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
         raise ValueError('reviewed resident approval entries invalid')
@@ -623,7 +774,7 @@ def _resident_entry(source, scope, record):
             or _article_digest({key: record[key] for key in keys}) != item.get('article_fields_sha256')
             or not isinstance(before, dict) or set(before) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
             or before['url'] != record['requested_url'] or before['provider'] != source.provider
-            or before['state'] != expected_error or before['error_code'] != expected_error
+            or before['state'] not in expected_errors or before['error_code'] != before['state']
             or before['body_sha256'] is not None or before['lease_owner'] is not None or before['lease_until'] is not None
             or record.get('original_diagnostic_authorization_json') is not None
             or record.get('original_diagnostic_authorization_fingerprint') != source.authorization_fingerprint
@@ -635,27 +786,28 @@ def _resident_entry(source, scope, record):
 
 
 def reviewed_native_missing_head_allowed(queue, record, expected):
-    """Only a fully approved local v2 repair can fence a terminal title error.
+    """Only an approved original can fence its exact terminal parser error.
 
     Refusals, leases, future deadlines and every other source remain governed
     by the ordinary exact claim. This does not reset any failure in advance.
     """
     from downloader.news_fulltext_queue import source_path
-    if (record.get('reviewed_native_replay_contract_version') != RESIDENT_NATIVE_REPLAY_VERSION
+    version = record.get('reviewed_native_replay_contract_version')
+    if (version not in {RESIDENT_NATIVE_REPLAY_VERSION, FAILURE_NATIVE_REPLAY_VERSION}
             or record.get('acquisition_transport') != 'retained_raw_reparse'):
         return False
     source = queue.registry.require(record['requested_url'])
     scope, payload = _json(source_path(queue.root, record['reviewed_native_approval_path']), 65536)
     if (hashlib.sha256(payload).hexdigest() != record['reviewed_native_scope_sha256']
-            or scope.get('contract_version') != RESIDENT_NATIVE_REPLAY_VERSION or scope.get('scope_kind') != _RESIDENT_KIND
+            or scope.get('contract_version') != version or scope.get('scope_kind') != _approval_kind(version)
             or scope.get('provider') != source.provider or scope.get('data_fingerprint') != source.data_fingerprint
             or scope.get('authorization_fingerprint') != source.authorization_fingerprint
             or record.get('data_fingerprint') != source.data_fingerprint
             or record.get('authorization_fingerprint') != source.authorization_fingerprint
             or scope.get('publish') is not False or scope.get('remote_training_export') is not False
-            or not _scope_reviewed(scope, RESIDENT_NATIVE_REPLAY_VERSION)):
+            or not _scope_reviewed(scope, version) or not _reviewed_source_scope(source, version)):
         raise ValueError('reviewed resident missing-head approval invalid')
-    entry = _resident_entry(source, scope, record)
+    entry = (_failure_entry if version == FAILURE_NATIVE_REPLAY_VERSION else _resident_entry)(source, scope, record)
     return expected == entry['expected_missing_head']
 
 
@@ -698,8 +850,8 @@ def reviewed_native_head_matches(queue, record):
             record.get('original_diagnostic_provider'), json.loads(record['original_diagnostic_authorization_json']))
         if len(entry) != 1 or entry[0].get('original_provider') != record.get('original_diagnostic_provider'):
             raise ValueError('reviewed native registered provider changed')
-    if version == RESIDENT_NATIVE_REPLAY_VERSION:
-        item = _resident_entry(source, scope, record)
+    if version in {RESIDENT_NATIVE_REPLAY_VERSION, FAILURE_NATIVE_REPLAY_VERSION}:
+        item = (_failure_entry if version == FAILURE_NATIVE_REPLAY_VERSION else _resident_entry)(source, scope, record)
         before = item['expected_missing_head']
         changed = {'state', 'attempts', 'lease_owner', 'lease_until'}
         if (expected['attempts'] != before['attempts']+1

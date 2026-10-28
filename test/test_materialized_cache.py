@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import json
+import os
 import time
 from pathlib import Path
 
@@ -22,6 +24,14 @@ from stockagent.data_sync.packed_snapshots import (
 
 DAY_NS = 86_400 * 1_000_000_000
 BASE_NS = time.time_ns()
+
+
+@pytest.fixture(autouse=True)
+def fresh_test_clock(monkeypatch):
+    # A long suite can collect this module more than the allowed HLC skew
+    # before executing it. Each test needs its own clock, while production's
+    # future-head rejection and the test's relative lease ages stay intact.
+    monkeypatch.setitem(globals(), "BASE_NS", time.time_ns())
 
 
 def _release(tmp_path: Path, *, content: str = "first") -> tuple[Path, str]:
@@ -59,6 +69,106 @@ def test_use_creates_verified_hot_lease_and_stable_link(tmp_path: Path) -> None:
         (hot_root / ".cache-state" / "leases" / "prices" / f"{snapshot_id}.json")
         .read_text(encoding="utf-8")
     )["state"] == "hot"
+
+
+@pytest.mark.parametrize("collision", ["file", "directory", "other_link", "dangling_link", "parent_link"])
+def test_recovery_preserves_existing_names_before_any_materialization(tmp_path, monkeypatch, collision):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root, alias = tmp_path / "hot", tmp_path / "legacy/raw"
+    alias.parent.mkdir()
+    if collision == "file":
+        alias.write_text("unique source")
+    elif collision == "directory":
+        alias.mkdir()
+    elif collision == "parent_link":
+        alias.parent.rmdir()
+        (tmp_path / "redirected").mkdir()
+        alias.parent.symlink_to(tmp_path / "redirected")
+    else:
+        target = tmp_path / "other"
+        if collision == "other_link":
+            target.mkdir()
+        alias.symlink_to(target)
+    monkeypatch.setattr(materialized_cache_module, "fetch_packed_snapshot",
+                        lambda *_: pytest.fail("collision must precede source reads"))
+    with pytest.raises(SnapshotError, match="existing cache link|redirected parent"):
+        use_materialized_snapshot(sync_root, hot_root, "prices", snapshot_id=snapshot_id,
+            links=[alias], preserve_existing_links=True)
+    if collision == "file":
+        assert alias.read_text() == "unique source"
+    elif collision in {"other_link", "dangling_link"}:
+        assert alias.readlink() == target
+    assert not (hot_root / "prices" / snapshot_id).exists()
+
+
+def test_recovery_link_race_cannot_replace_competing_name(tmp_path, monkeypatch):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot_root, alias = tmp_path / "hot", tmp_path / "original"
+    original = materialized_cache_module.fetch_packed_snapshot
+    def competing_fetch(*args):
+        target = original(*args)
+        alias.symlink_to(tmp_path / "competitor")
+        return target
+    monkeypatch.setattr(materialized_cache_module, "fetch_packed_snapshot", competing_fetch)
+    with pytest.raises(SnapshotError, match="existing cache link"):
+        use_materialized_snapshot(sync_root, hot_root, "prices", snapshot_id=snapshot_id,
+            links=[alias], preserve_existing_links=True)
+    assert alias.readlink() == tmp_path / "competitor"
+    assert not (hot_root / ".cache-state/leases/prices" / f"{snapshot_id}.json").exists()
+    assert (hot_root / "prices" / snapshot_id / "prices.csv").read_text() == "first"
+
+
+def test_subtree_alias_uses_one_release_and_same_lease_and_gc(tmp_path, monkeypatch):
+    source, cold, hot = tmp_path / "raw", tmp_path / "cold", tmp_path / "hot"
+    (source / "repair/inputs").mkdir(parents=True)
+    (source / "repair/inputs/values.csv").write_text("-2,0,3\n")
+    initialize_packed_layout(cold, node_id="node-a")
+    release = publish_packed_snapshot(cold, "financial", source, pack_buckets=2)
+    aliases = {tmp_path / "original/delta": "repair/inputs"}
+    arguments = dict(snapshot_id=release.manifest["snapshot_id"], subtree_links=aliases,
+                     preserve_existing_links=True)
+    first = use_materialized_snapshot(cold, hot, "financial", now_ns=BASE_NS, **arguments)
+    target = Path(first["target"])
+    alias = next(iter(aliases))
+    member = alias / "values.csv"
+    identity = member.stat()
+    assert member.read_bytes() == b"-2,0,3\n"
+    assert first["schema_version"] == 2
+    assert first["link_subtrees"] == {str(alias): "repair/inputs"}
+    assert member.samefile(target / "repair/inputs/values.csv")
+    second = use_materialized_snapshot(cold, hot, "financial", now_ns=BASE_NS + DAY_NS,
+                                      verify_existing=True, **arguments)
+    assert second["verification"] == "full" and member.stat().st_ino == identity.st_ino
+    assert second["expires_ns"] == BASE_NS + 8 * DAY_NS
+    monkeypatch.setattr(materialized_cache_module, "process_references", lambda *_: [])
+    result = evict_materialized_snapshots(cold, hot, now_ns=BASE_NS + 9 * DAY_NS)
+    assert result["evicted"] == 1
+    assert not alias.is_symlink() and not target.exists()
+    assert release.manifest_path.exists()  # Only the replaceable hot view retires.
+
+
+@pytest.mark.parametrize("subtree", ["../outside", "/absolute", ".", "a//b", "a\\b", "prices.csv", "missing"])
+def test_invalid_subtree_alias_never_publishes_a_lease(tmp_path, subtree):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot, alias = tmp_path / "hot", tmp_path / "original"
+    with pytest.raises(SnapshotError):
+        use_materialized_snapshot(sync_root, hot, "prices", snapshot_id=snapshot_id,
+            subtree_links={alias: subtree}, preserve_existing_links=True)
+    assert not alias.is_symlink()
+    assert not (hot / ".cache-state/leases/prices" / f"{snapshot_id}.json").exists()
+
+
+def test_malformed_subtree_lease_cannot_admit_eviction(tmp_path, monkeypatch):
+    sync_root, snapshot_id = _release(tmp_path)
+    hot = tmp_path / "hot"
+    lease = use_materialized_snapshot(sync_root, hot, "prices", snapshot_id=snapshot_id, now_ns=BASE_NS)
+    lease.update(schema_version=2, link_subtrees={str(tmp_path / "foreign"): "../outside"})
+    path = hot / ".cache-state/leases/prices" / f"{snapshot_id}.json"
+    path.write_text(json.dumps(lease))
+    monkeypatch.setattr(materialized_cache_module, "process_references", lambda *_: [])
+    with pytest.raises(SnapshotError):
+        evict_materialized_snapshots(sync_root, hot, now_ns=BASE_NS + 8 * DAY_NS)
+    assert Path(lease["target"]).is_dir()
 
 
 def test_expired_gc_requires_exact_cold_reconstruction_not_just_object_presence(tmp_path):
@@ -568,3 +678,61 @@ def test_status_reports_an_existing_unmanaged_materialization(
     assert hot["materialized_count"] == 1
     assert hot["materializations"][0]["snapshot_id"] == snapshot_id
     assert hot["materializations"][0]["managed"] is False
+
+
+def _reference_process(tmp_path, monkeypatch, *, maps_text, cwd='/elsewhere', exe='/program', alias=None):
+    process = tmp_path / 'proc/123'
+    (process / 'fd').mkdir(parents=True)
+    (process / 'cwd').symlink_to(cwd)
+    (process / 'root').symlink_to('/')
+    (process / 'exe').symlink_to(exe)
+    if alias is not None:
+        (process / 'fd/7').symlink_to(alias)
+    (process / 'maps').write_text(maps_text)
+    monkeypatch.setattr(materialized_cache_module, '_process_directories', lambda: [process])
+    return process
+
+
+@pytest.mark.parametrize('limit', [1, 3, 20, 1000])
+def test_reference_evidence_order_limits_deleted_names_and_inode_alias(tmp_path, monkeypatch, limit):
+    source = tmp_path / 'source'
+    source.mkdir()
+    original, alias = source / 'original', tmp_path / 'alias'
+    original.write_bytes(b'protected original')
+    os.link(original, alias)
+    info = original.stat()
+    child, spaced = source / 'raw', tmp_path / 'spaced name'
+    inode_line = f'000-fff r--p 0 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {info.st_ino} {alias}'
+    text = '\n'.join((inode_line, f'000-fff r--p 0 00:00 0 {spaced}',
+        f'arbitrary legacy map text {child}/file extra', f'000-fff r--p 0 00:00 0 {source}/deleted (deleted)'))
+    _reference_process(tmp_path, monkeypatch, maps_text=text, cwd=child,
+        exe=str(child / 'deleted-program') + ' (deleted)', alias=alias)
+    expected = [f'pid=123:cwd:{child}', 'pid=123:root:/',
+        f'pid=123:exe:{child}/deleted-program (deleted)', f'pid=123:fd=7:{alias}',
+        f'pid=123:maps-inode:{info.st_dev}:{info.st_ino}', f'pid=123:maps:{source}',
+        f'pid=123:maps:{child}', f'pid=123:maps:{spaced}']
+    targets = [spaced, child, source, Path('/'), *(source / f'unrelated-{i}' for i in range(80))]
+    assert materialized_cache_module.process_references_many(
+        targets, inode_keys={(info.st_dev, info.st_ino)}, limit=limit) == expected[:limit]
+
+
+def test_reference_negative_checks_preserve_sibling_boundary_and_inode_only_mode(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    _reference_process(tmp_path, monkeypatch, maps_text=f'000-fff r--p 0 00:00 0 {source}-other/file',
+        cwd=str(source) + '-other', exe=str(source) + '-other/program')
+    assert materialized_cache_module.process_references_many(
+        [source, *(source / f'raw/{i}' for i in range(80))]) == []
+    assert materialized_cache_module.process_references_many([], inode_keys={(99, 100)}) == []
+
+
+@pytest.mark.parametrize('code', [errno.EACCES, errno.EPERM])
+def test_reference_visibility_failure_never_becomes_negative_evidence(tmp_path, monkeypatch, code):
+    process = _reference_process(tmp_path, monkeypatch, maps_text='')
+    original = os.readlink
+    def denied(path, *args, **kwargs):
+        if Path(path) == process / 'cwd':
+            raise PermissionError(code, 'live process visibility denied')
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(os, 'readlink', denied)
+    with pytest.raises(SnapshotError, match='incomplete process-reference scan'):
+        materialized_cache_module.process_references_many([tmp_path / 'source'])

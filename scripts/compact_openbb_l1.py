@@ -56,8 +56,16 @@ from scripts.openbb_l1_task_contract_index import (
     bind_task_contract_index,
     verified_task_contract_index,
 )
-from scripts.openbb_l1_status_counts import member_endpoint_counts
+from scripts.openbb_l1_status_counts import (
+    member_endpoint_counts, install_member_count_proof, baseline_member_count_proof,
+)
 from scripts.openbb_l1_footer_io import FooterOpener
+from scripts.openbb_l1_metadata_proof import MetadataProofCache
+from scripts.openbb_l1_view_publication_proof import ViewPublicationProof
+from scripts.openbb_l1_source_snapshot import source_rows as snapshot_source_rows
+from scripts.openbb_l1_unassigned_index import (
+    install_unassigned_index, baseline_unassigned_index, unassigned_rows,
+)
 from scripts.openbb_l1_view_schema import (
     PhysicalSchemaIdentityCache,
     SCHEMA_IDENTITY_REVISION,
@@ -209,8 +217,8 @@ class ViewSourceProof:
     physical_identity: str | None
 
 
-def _view_file_signature(path: Path) -> tuple[int, int, int, int, int]:
-    info = path.stat()
+def _view_file_signature(path: Path | str) -> tuple[int, int, int, int, int]:
+    info = os.stat(path)
     if not stat.S_ISREG(info.st_mode):
         raise RuntimeError(f"L1 view source is not a regular file: {path}")
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -308,9 +316,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Compact the final batch even when it is smaller than the minimum.",
     )
     parser.add_argument(
-        "--threads", type=int, default=max(1, min(4, os.cpu_count() or 1))
+        "--threads", type=int, default=max(1, len(os.sched_getaffinity(0))
+                                           if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1)
     )
-    parser.add_argument("--memory-limit", default="4GB")
+    parser.add_argument("--memory-limit", default="-1")
     parser.add_argument("--row-group-size", type=int, default=122_880)
     parser.add_argument(
         "--archive-idle-only",
@@ -338,6 +347,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force the full source comparison and refresh the journal baseline.",
     )
+    parser.add_argument(
+        "--incremental-metadata-audit", action="store_true",
+        help="Reuse complete footer proofs only while file/manifest/runtime identities match; expired evidence reopens the footer.",
+    )
+    parser.add_argument(
+        "--force-full-metadata-audit", action="store_true",
+        help="Reopen every derivative footer and refresh the metadata proof baseline.",
+    )
+    parser.add_argument('--incremental-member-counts', action='store_true',
+                        help='Maintain exact endpoint member counts with same-transaction SQLite triggers.')
+    parser.add_argument('--incremental-unassigned-index', action='store_true',
+                        help='Maintain the exact successful-unassigned task workset with same-transaction SQLite triggers.')
+    parser.add_argument('--incremental-view-publication', action='store_true',
+                        help='Reuse a fully validated catalog only while its exact file, publisher and reader identities match; all current source fences remain.')
+    parser.add_argument('--force-full-view-publication', action='store_true',
+                        help='Read the complete persisted catalog and SQL again and refresh its publication proof.')
+    parser.add_argument('--memory-source-audit', action='store_true',
+                        help='For a full source comparison, copy a coherent SQLite snapshot into invocation-local memory when capacity permits, run the exact SQL, then release it. Insufficient capacity keeps the original query.')
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
         "--schema-grouped-sec-views", action="store_true",
@@ -361,6 +388,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--min-files-per-segment cannot exceed --max-files-per-segment")
     if args.force_full_source_audit and not args.incremental_source_audit:
         parser.error("--force-full-source-audit requires --incremental-source-audit")
+    if args.force_full_metadata_audit and not args.incremental_metadata_audit:
+        parser.error("--force-full-metadata-audit requires --incremental-metadata-audit")
+    if args.force_full_view_publication and not args.incremental_view_publication:
+        parser.error('--force-full-view-publication requires --incremental-view-publication')
     if args.incremental_source_audit and args.endpoint:
         parser.error(
             "--incremental-source-audit requires the full endpoint universe; "
@@ -745,6 +776,9 @@ def _mark_stale_segments(
     view_proofs: dict[str, ViewSourceProof] | None = None,
     metadata_audit: dict[str, object] | None = None,
     task_lookup_audit: dict[str, object] | None = None,
+    metadata_proofs: MetadataProofCache | None = None,
+    memory_source_audit: bool = False,
+    source_snapshot_audit: dict | None = None,
 ) -> tuple[set[str], int]:
     stage_started = time.monotonic()
     # Source members store absolute paths while the archive normally records
@@ -787,6 +821,12 @@ def _mark_stale_segments(
         nonlocal task_index
         canonical_sql = _stale_source_contract_sql(clause, member_first=member_first)
         try:
+            if memory_source_audit and changed_task_ids is None:
+                return snapshot_source_rows(
+                    connection, bind_task_contract_index(canonical_sql, task_index), parameters,
+                    resolver=_lexical_absolute_path,
+                    audit=source_snapshot_audit if source_snapshot_audit is not None else {},
+                )
             return connection.execute(
                 bind_task_contract_index(canonical_sql, task_index), parameters,
             ).fetchall()
@@ -843,25 +883,28 @@ def _mark_stale_segments(
     # change. Checking one path per segment is bounded by the segment count.
     stage_started = time.monotonic()
     known = {str(row["segment_id"]): row for row in rows}
-    # Only repeated physical reflection is memoized, within this one attempt.
-    # Each file still opens its own footer and validates rows/bytes/current
-    # Arrow schema and both signatures. No file validity crosses invocations.
+    # Native physical reflection remains invocation-local. Optional durable
+    # metadata proofs separately require a fresh file/manifest identity match.
     physical_cache = PhysicalSchemaIdentityCache() if view_proofs is not None else None
     footer_open_attempts = 0
     footer_opener = FooterOpener()
     for row in connection.execute(
         f"""
-        SELECT segment_id, endpoint, output_path, output_rows, output_bytes,
-               schema_fingerprint
+        SELECT s.segment_id, s.endpoint, s.output_path, s.output_rows, s.output_bytes,
+               s.schema_fingerprint{metadata_proofs.columns if metadata_proofs else ''}
         FROM {SEGMENT_TABLE} AS s
-        WHERE status='success'{filter_clause}
+        {metadata_proofs.join if metadata_proofs else ''}
+        WHERE s.status='success'{filter_clause}
         """,
         filter_parameters,
     ):
         if str(row["segment_id"]) in known:
             continue
-        path = Path(str(row["output_path"]))
+        # The overwhelmingly common proof hit needs only two fresh stat calls.
+        # Materialize a Path only when an actual footer/error path needs it.
+        path = str(row["output_path"])
         derivative_error: str | None = None
+        parquet_file = None
         try:
             # Opening the Parquet metadata already checks path existence. Avoid
             # an extra stat for every healthy segment; classify absent or
@@ -870,9 +913,22 @@ def _mark_stale_segments(
                 view_proofs is not None and row["endpoint"] == SCHEMA_GROUPED_ENDPOINT
             )
             before = _view_file_signature(path) if collect_proof else None
+            if metadata_proofs is not None:
+                before = before if before is not None else _view_file_signature(path)
+                cached = metadata_proofs.reuse(row, before, physical_required=collect_proof)
+                if cached is not None:
+                    if _view_file_signature(path) != before:
+                        raise RuntimeError(f"L1 derivative changed during metadata proof reuse: {path}")
+                    if collect_proof:
+                        proof = ViewSourceProof(str(row['segment_id']), _lexical_absolute_path(path),
+                                                before, int(row['output_rows']),
+                                                str(row['schema_fingerprint']), cached[0])
+                        view_proofs[proof.path] = proof
+                    continue
+            path = Path(path)
             footer_open_attempts += 1
             parquet_file = footer_opener(str(path))
-            if before is not None:
+            if collect_proof:
                 # The proof validates rows, bytes and the manifest Arrow hash
                 # from this same open footer. Do not serialize its Arrow schema
                 # again in the ordinary audit or physical identity builder.
@@ -895,16 +951,25 @@ def _mark_stale_segments(
                 != row["schema_fingerprint"]
             ):
                 derivative_error = "L1 output schema fingerprint changed"
+            if metadata_proofs is not None and derivative_error is None:
+                if before[2] != int(row['output_bytes']) or _view_file_signature(path) != before:
+                    raise RuntimeError(f"L1 derivative changed during metadata audit: {path}")
+                metadata_proofs.record(row, before, physical_checked=collect_proof,
+                                       physical_identity=proof.physical_identity if collect_proof else None)
         except MemoryError:
             # Resource exhaustion is not evidence of corrupt/missing data.
             # Abort before stale-state mutations or derivative quarantine.
             raise
         except Exception as exc:
+            path = Path(path)
             derivative_error = (
                 "L1 output file is missing"
                 if not path.is_file()
                 else f"L1 output is unreadable: {type(exc).__name__}: {exc}"
             )
+        finally:
+            if metadata_proofs is not None and parquet_file is not None:
+                parquet_file.close()
         if derivative_error is not None:
             known[str(row["segment_id"])] = {
                 "segment_id": row["segment_id"],
@@ -913,12 +978,15 @@ def _mark_stale_segments(
                 "stale_reason": derivative_error,
             }
 
+    if metadata_proofs is not None:
+        metadata_proofs.finish(known)
     if metadata_audit is not None:
         metadata_audit.update(
             policy=DERIVATIVE_METADATA_AUDIT_POLICY,
             footer_open_attempts=footer_open_attempts,
             footer_io=footer_opener.snapshot(),
             physical_cache=None if physical_cache is None else physical_cache.snapshot(),
+            incremental_proofs=None if metadata_proofs is None else metadata_proofs.snapshot(),
         )
     if timing is not None:
         timing["stale_derivative_metadata_scan"] = round(
@@ -989,6 +1057,7 @@ def _load_unassigned_shards(
     limit: int,
     show_progress: bool,
     timing: dict[str, float] | None = None,
+    incremental_index: bool = False,
 ) -> list[TaskShard]:
     plan_token = _active_plan_token(connection)
     token_clause = "" if plan_token is None else " AND t.plan_token=?"
@@ -1007,6 +1076,10 @@ def _load_unassigned_shards(
         LIMIT ?
         """
     rows: list[sqlite3.Row] | None = None
+    if incremental_index:
+        rows = unassigned_rows(connection, plan_token, filter_clause, filter_parameters, limit)
+        if timing is not None:
+            timing['unassigned_source_incremental_index'] = round(time.monotonic()-query_started,3)
     # The active-plan index yields endpoints in order, but not task IDs.  When
     # the first unassigned endpoint fills this batch, sorting just that
     # endpoint is identical to the global ORDER BY and avoids sorting every
@@ -1017,7 +1090,9 @@ def _load_unassigned_shards(
         str(row[1]) for row in connection.execute("PRAGMA index_list(tasks)")
     }
     active_plan_index = "idx_tasks_active_plan" in task_indexes
-    if (
+    if rows is not None:
+        pass
+    elif (
         plan_token is not None
         and not filters
         and 0 < limit <= 32_768
@@ -1506,24 +1581,25 @@ def _schema_group_reader_policy(database: duckdb.DuckDBPyConnection) -> dict[str
 def _schema_grouped_view(
     database: duckdb.DuckDBPyConnection, paths: Sequence[Path], output_dir: Path,
     proofs: Mapping[str, ViewSourceProof],
-) -> tuple[str, str, dict[str, object]] | None:
+    *, reuse_signature: str | None = None,
+) -> tuple[str | None, str, dict[str, object]] | None:
     """Prove groups from this run's footer audit; never use Arrow-only groups."""
     groups: dict[str, list[Path]] = {}
     ordered_proofs: list[ViewSourceProof] = []
     canonical_parent = _segment_output(output_dir, SCHEMA_GROUPED_ENDPOINT, "").parent
     parent_is_canonical = canonical_parent.resolve() == canonical_parent
+    if not parent_is_canonical or any("=" in part for part in canonical_parent.parts):
+        return None
+    prefix = os.fspath(canonical_parent) + os.sep
     for path in paths:
         proof = proofs.get(str(path))
         if proof is None or proof.physical_identity is None:
             return None
-        expected = _segment_output(output_dir, SCHEMA_GROUPED_ENDPOINT, proof.segment_id)
         if (
             proof.path != str(path)
             or not re.fullmatch(r"[0-9a-f]{24}(?:-r[1-9][0-9]*)?", proof.segment_id)
-            or path != expected
-            or not parent_is_canonical
+            or os.fspath(path) != prefix + f"segment-{proof.segment_id}.parquet"
             or path.is_symlink()
-            or any("=" in part for part in path.parts)
         ):
             # Only canonical writer output is eligible. Hive partitions, aliases
             # and arbitrary external Parquet retain the original reader path.
@@ -1532,23 +1608,30 @@ def _schema_grouped_view(
         ordered_proofs.append(proof)
     if not groups or len(groups) > MAX_QUERY_VIEW_SCHEMA_VARIANTS:
         return None
-    representatives = [members[0] for members in groups.values()]
-    query = " UNION ALL BY NAME ".join(
-        f"({_parquet_view_query(members, grouped=True)})" for members in groups.values()
-    )
-    # Compare against DuckDB's true multi-file union, not an Arrow type guess.
-    # Both DESCRIBEs are metadata-only; no row materialization is needed.
-    expected_schema = database.execute(
-        "DESCRIBE " + _parquet_view_query(representatives)
-    ).fetchall()
-    actual_schema = database.execute("DESCRIBE " + query).fetchall()
-    if actual_schema != expected_schema:
-        return None
     policy = _schema_group_reader_policy(database)
     signature = hashlib.sha256(json.dumps(
-        {"policy": policy, "sources": [asdict(proof) for proof in ordered_proofs]},
+        # This frozen record contains only immutable scalars and one tuple.
+        # A recursive dataclasses.asdict/deepcopy adds no isolation or proof.
+        {"policy": policy, "sources": [
+            {name: getattr(proof, name) for name in ViewSourceProof.__dataclass_fields__}
+            for proof in ordered_proofs]},
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
+    # A catalog whose persisted SQL was verified already witnessed both
+    # DESCRIBEs for these exact source receipts and this reader policy. Any
+    # source, physical schema or engine change takes the original bind path.
+    query = None
+    if signature != reuse_signature:
+        representatives = [members[0] for members in groups.values()]
+        query = " UNION ALL BY NAME ".join(
+            f"({_parquet_view_query(members, grouped=True)})" for members in groups.values()
+        )
+        expected_schema = database.execute(
+            "DESCRIBE " + _parquet_view_query(representatives)
+        ).fetchall()
+        actual_schema = database.execute("DESCRIBE " + query).fetchall()
+        if actual_schema != expected_schema:
+            return None
     return query, signature, policy
 
 
@@ -1631,6 +1714,136 @@ def _reusable_view_catalog(
         database.close()
 
 
+def _reuse_unchanged_views(
+    path: Path, *, config, previous, previous_identity, statistics, grouped,
+    deferred, schema_grouped_sec_views: bool, view_proofs, fenced_sources,
+    witnessed_rows=None,
+) -> tuple[dict[str, float], dict[str, str]] | None:
+    """Retain the published inode only after proving the complete publication.
+
+    The catalog is not a TTL: all source existence checks, current metadata
+    totals, ordered paths, physical receipts, reader policy and persisted SQL
+    signatures still participate. A mismatch uses the atomic full publisher.
+    """
+    if _view_file_signature(path) != previous_identity:
+        raise RuntimeError('L1 view catalog changed during signature validation')
+    database = (duckdb.connect(str(path), read_only=True, config=dict(config))
+                if witnessed_rows is None else duckdb.connect(':memory:', config=dict(config)))
+    seconds, actions = {}, {}
+    policy = None
+    try:
+        try:
+            rows = (database.execute('SELECT * FROM l1_catalog').fetchall()
+                    if witnessed_rows is None else witnessed_rows)
+        except duckdb.OutOfMemoryException:
+            raise
+        except duckdb.Error:
+            return None
+        old_rows = {row[0]: row for row in rows}
+        if len(old_rows) != len(rows) or old_rows.keys() != statistics.keys():
+            return None
+        # Reject changed aggregates before doing expensive source work. Row
+        # order/shape is part of the existing canonical catalog contract.
+        for endpoint, totals in statistics.items():
+            row = old_rows[endpoint]
+            reason = deferred.get(endpoint)
+            head = (endpoint, None if reason is not None else _view_name(endpoint),
+                    'deferred' if reason is not None else 'published', reason,
+                    *(int(totals[key] or 0) for key in (
+                        'schema_variants', 'segment_count', 'source_files', 'rows',
+                        'input_bytes', 'output_bytes')), str(totals['updated_at'] or ''))
+            if len(row) != 13 or row[:11] != head:
+                return None
+        for endpoint in statistics:
+            started = time.monotonic()
+            if endpoint in deferred:
+                actions[endpoint] = 'deferred'
+            else:
+                paths = grouped.get(endpoint, [])
+                if not paths or any(not member.is_file() for member in paths):
+                    return None
+                signature = _view_input_signature(paths)
+                groups = None
+                if schema_grouped_sec_views and endpoint == SCHEMA_GROUPED_ENDPOINT:
+                    groups = _schema_grouped_view(
+                        database, paths, path.parent, view_proofs,
+                        reuse_signature=previous[endpoint][2],
+                    )
+                    if groups is not None:
+                        _, signature, policy = groups
+                if previous[endpoint][:3] != ('published', _view_name(endpoint), signature):
+                    return None
+                actions[endpoint] = ('reused_verified_schema_groups' if groups is not None
+                                     else 'reused_verified_paths')
+            seconds[endpoint] = round(time.monotonic() - started, 3)
+    finally:
+        try:
+            if policy is not None and _schema_group_reader_policy(database) != policy:
+                raise RuntimeError('L1 grouped-view reader policy changed during publication')
+        finally:
+            database.close()
+    # Validate the same final boundary as the full publisher, including SQL
+    # tampering, before retaining its bytes. No writable DuckDB is opened.
+    if witnessed_rows is None and _reusable_view_catalog(path, config=config) != previous:
+        raise RuntimeError('persisted L1 view catalog failed signature validation')
+    _verify_view_sources(fenced_sources)
+    if _view_file_signature(path) != previous_identity:
+        raise RuntimeError('L1 view catalog changed during unchanged publication')
+    return seconds, actions
+
+
+def _catalog_from_witness(rows):
+    """Same public row/signature contract as complete persisted validation."""
+    catalog = {}
+    for row in rows:
+        if len(row) != 13:
+            return None
+        endpoint, name, state = row[:3]
+        signature, sql_signature = row[11:]
+        if type(endpoint) is not str or endpoint in catalog or state not in {'published', 'deferred'}:
+            return None
+        if state == 'published':
+            try:
+                expected_name = _view_name(endpoint)
+            except ValueError:
+                return None
+            if name != expected_name or any(
+                type(value) is not str or len(value) != 64
+                or any(c not in '0123456789abcdef' for c in value)
+                for value in (signature, sql_signature)
+            ):
+                return None
+        elif name is not None or signature is not None or sql_signature is not None:
+            return None
+        catalog[endpoint] = (state, name or '', signature, sql_signature)
+    return catalog
+
+
+def _record_view_publication_proof(witness, path, *, config):
+    before = _view_file_signature(path)
+    catalog = _reusable_view_catalog(path, config=config)
+    if catalog is None:
+        raise RuntimeError('cannot prove an unvalidated persisted L1 catalog')
+    database = duckdb.connect(str(path), read_only=True, config=dict(config))
+    try:
+        rows = database.execute('SELECT * FROM l1_catalog').fetchall()
+    finally:
+        database.close()
+    if _catalog_from_witness(rows) != catalog or _view_file_signature(path) != before:
+        raise RuntimeError('L1 view catalog changed during complete publication proof')
+    witness.record(rows, expected_identity=before)
+
+
+def _view_publication_contract(config, schema_grouped_sec_views):
+    # Pin implementations as well as ABI revisions: an old proof cannot vouch
+    # for a new publisher, schema identity implementation or DuckDB runtime.
+    return dict(duckdb=duckdb.__version__, config=dict(config),
+                schema_grouped_sec_views=schema_grouped_sec_views,
+                sources={name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                         for name in ('compact_openbb_l1.py', 'openbb_l1_view_schema.py',
+                                      'openbb_l1_view_publication_proof.py')})
+
+
 def _publish_views(
     connection: sqlite3.Connection,
     database_path: Path,
@@ -1639,6 +1852,9 @@ def _publish_views(
     memory_limit: str,
     schema_grouped_sec_views: bool = False,
     view_proofs: Mapping[str, ViewSourceProof] | None = None,
+    incremental_view_publication: bool = False,
+    force_full_view_publication: bool = False,
+    publication_proof_audit: dict | None = None,
 ) -> tuple[int, dict[str, str], dict[str, float], dict[str, str]]:
     endpoint_statistics = {
         str(row["endpoint"]): row
@@ -1681,7 +1897,17 @@ def _publish_views(
     # These connections are independent of the segment compactor. Apply the
     # same budget before opening either catalog, including on reuse-only runs.
     database_config = {"threads": threads, "memory_limit": memory_limit}
-    previous = _reusable_view_catalog(database_path, config=database_config)
+    witness = (ViewPublicationProof(connection, database_path,
+               _view_publication_contract(database_config, schema_grouped_sec_views))
+               if incremental_view_publication else None)
+    previous_identity = _view_file_signature(database_path) if database_path.is_file() else None
+    witnessed = witness.read() if witness is not None and not force_full_view_publication else None
+    previous = _catalog_from_witness(witnessed[1]) if witnessed is not None else None
+    witnessed_rows = witnessed[1] if previous is not None else None
+    if witnessed_rows is None:
+        previous = _reusable_view_catalog(database_path, config=database_config)
+    elif tuple(witnessed[0]) != previous_identity:
+        raise RuntimeError('L1 view catalog changed while reading its publication proof')
     endpoint_seconds: dict[str, float] = {}
     endpoint_actions: dict[str, str] = {}
     rebuilt_views: dict[str, str] = {}
@@ -1695,6 +1921,31 @@ def _publish_views(
                 proof.file_signature if proof is not None else _view_file_signature(path)
             )
         _verify_view_sources(fenced_sources)
+    if previous is not None:
+        unchanged = _reuse_unchanged_views(
+            database_path, config=database_config, previous=previous,
+            previous_identity=previous_identity, statistics=endpoint_statistics,
+            grouped=grouped, deferred=deferred, schema_grouped_sec_views=schema_grouped_sec_views,
+            view_proofs=view_proofs or {}, fenced_sources=fenced_sources,
+            witnessed_rows=witnessed_rows,
+        )
+        if unchanged is not None:
+            if witness is not None:
+                if witnessed_rows is None:
+                    _record_view_publication_proof(witness, database_path, config=database_config)
+                else:
+                    if witness.read() is None:
+                        raise RuntimeError('L1 view catalog publication proof changed during reuse')
+                    witness.observation['state'] = 'reused_complete_publication'
+                if publication_proof_audit is not None:
+                    publication_proof_audit.update(witness.observation)
+            return len(grouped), deferred, *unchanged
+        if witnessed_rows is not None:
+            # A changed publication returns to actual persisted SQL validation
+            # before copying anything, even when the old generation was valid.
+            previous = _reusable_view_catalog(database_path, config=database_config)
+            if _view_file_signature(database_path) != previous_identity:
+                raise RuntimeError('L1 view catalog changed before publication rebuild')
     try:
         if previous is not None:
             shutil.copy2(database_path, temporary)
@@ -1736,7 +1987,8 @@ def _publish_views(
                     schema_groups = None
                     if schema_grouped_sec_views and endpoint == SCHEMA_GROUPED_ENDPOINT:
                         schema_groups = _schema_grouped_view(
-                            database, paths, database_path.parent, view_proofs or {}
+                            database, paths, database_path.parent, view_proofs or {},
+                            reuse_signature=(previous or {}).get(endpoint, (None, None, None))[2],
                         )
                         if schema_groups is not None:
                             query, view_signature, reader_policy = schema_groups
@@ -1824,6 +2076,10 @@ def _publish_views(
         os.replace(temporary, database_path)
     finally:
         temporary.unlink(missing_ok=True)
+    if witness is not None:
+        _record_view_publication_proof(witness, database_path, config=database_config)
+        if publication_proof_audit is not None:
+            publication_proof_audit.update(witness.observation)
     return len(grouped), deferred, endpoint_seconds, endpoint_actions
 
 
@@ -1875,6 +2131,7 @@ def _write_status(
     started_at_utc: str | None = None,
     failed_segments: int = 0,
     deferred_failed_segments: int = 0,
+    incremental_member_counts: bool = False,
 ) -> dict[str, object]:
     timings = dict(stage_seconds or {})
     status_started = time.monotonic()
@@ -1919,6 +2176,7 @@ def _write_status(
     member_count_audit: dict[str, object] = {}
     member_counts = member_endpoint_counts(
         connection, member_filter, member_parameters, audit=member_count_audit,
+        incremental=incremental_member_counts,
     )
     timings["status_member_count"] = round(time.monotonic() - status_started, 3)
     status_started = time.monotonic()
@@ -2399,6 +2657,16 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 )
                 return 0 if failed == 0 else 2
 
+            # Install before the source-journal schema watermark is captured.
+            metadata_proofs = (MetadataProofCache(
+                manifest,
+                contract=f'{DERIVATIVE_METADATA_AUDIT_POLICY}:{SCHEMA_IDENTITY_REVISION}',
+                force_full=args.force_full_metadata_audit,
+            ) if args.incremental_metadata_audit else None)
+            if args.incremental_member_counts:
+                install_member_count_proof(manifest)
+            if args.incremental_unassigned_index:
+                install_unassigned_index(manifest)
             if args.incremental_source_audit:
                 attempt.phase("source_journal_prepare")
                 journal_started = time.monotonic()
@@ -2411,6 +2679,14 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 stage_seconds["source_journal_prepare"] = round(
                     time.monotonic() - journal_started, 3
                 )
+            if args.incremental_member_counts:
+                count_started = time.monotonic()
+                attempt.payload['member_count_bootstrapped'] = baseline_member_count_proof(manifest)
+                stage_seconds['member_count_proof_prepare'] = round(time.monotonic() - count_started, 3)
+            if args.incremental_unassigned_index:
+                pending_started = time.monotonic()
+                attempt.payload['unassigned_index_bootstrapped'] = baseline_unassigned_index(manifest)
+                stage_seconds['unassigned_index_prepare'] = round(time.monotonic()-pending_started,3)
             stage_resources["before_stale_contract_audit"] = _stage_resources()
             attempt.phase("stale_contract_audit")
             stage_started = time.monotonic()
@@ -2418,6 +2694,8 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
             attempt.payload["derivative_metadata_audit"] = derivative_metadata_audit
             task_lookup_audit: dict[str, object] = {}
             attempt.payload["source_task_lookup"] = task_lookup_audit
+            source_snapshot_audit = {}
+            attempt.payload['source_sql_snapshot'] = source_snapshot_audit
             stale_endpoints, stale_segments = _mark_stale_segments(
                 manifest,
                 args.endpoint,
@@ -2430,6 +2708,9 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 view_proofs=view_proofs,
                 metadata_audit=derivative_metadata_audit,
                 task_lookup_audit=task_lookup_audit,
+                metadata_proofs=metadata_proofs,
+                memory_source_audit=args.memory_source_audit,
+                source_snapshot_audit=source_snapshot_audit,
             )
             stage_seconds["stale_contract_audit"] = round(time.monotonic() - stage_started, 3)
             attempt.payload["stale_segments"] = stale_segments
@@ -2449,6 +2730,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 limit=args.max_source_files,
                 show_progress=not args.no_progress,
                 timing=stage_seconds,
+                incremental_index=args.incremental_unassigned_index,
             )
             stage_seconds["unassigned_source_load"] = round(time.monotonic() - stage_started, 3)
             stage_resources["after_unassigned_source_load"] = _stage_resources()
@@ -2601,6 +2883,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
             attempt.phase("query_view_publish")
             attempt.payload["publication_stage"] = "query_publish_started"
             stage_started = time.monotonic()
+            view_publication_proof = {}
             (
                 view_count,
                 deferred_query_views,
@@ -2613,7 +2896,11 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 memory_limit=args.memory_limit,
                 schema_grouped_sec_views=args.schema_grouped_sec_views,
                 view_proofs=view_proofs,
+                incremental_view_publication=args.incremental_view_publication,
+                force_full_view_publication=args.force_full_view_publication,
+                publication_proof_audit=view_publication_proof,
             )
+            attempt.payload['view_publication_proof'] = view_publication_proof
             attempt.payload["publication_stage"] = "query_published"
             stage_seconds["query_view_publish"] = round(time.monotonic() - stage_started, 3)
             stage_resources["after_query_view_publish"] = _stage_resources()
@@ -2644,6 +2931,7 @@ def _run_compaction(args: argparse.Namespace, attempt: _CompactionAttempt) -> in
                 },
                 schema_grouped_sec_views=args.schema_grouped_sec_views,
                 derivative_metadata_audit=derivative_metadata_audit,
+                incremental_member_counts=args.incremental_member_counts,
                 source_audit=(
                     {
                         "mode": journal_plan.mode,

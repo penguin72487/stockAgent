@@ -10,8 +10,181 @@ from stockagent.data.tw_futures_margin_preparation import (
     corporate_grid_candidates,
     corporate_identity_boundaries,
     corporate_retained_view_candidates,
+    corporate_text_candidates,
     corporate_terms_intervals,
 )
+
+
+def test_reviewed_stock_unit_uses_only_its_own_explicit_deliverable():
+    cells = [
+        ['契約代號', 'PKF調整為PK1'],
+        ['約定標的物', 'PK1約定標的物調整為1,880股標的證券'],
+        ['調整契約月份', '115年10月、11月、12月、116年3月及6月到期契約'],
+        ['買方權益數加項', '每口買方未沖銷部位調整買方權益數加項新臺幣1,200元'],
+        ['賣方權益數減項', '每口賣方未沖銷部位調整賣方權益數減項新臺幣1,200元'],
+    ]
+    text = '調整生效日：115年10月19日。'
+    assert corporate_grid_candidates(cells, text) == []
+    fact, = corporate_grid_candidates(cells, text, allow_stock_deliverable_multiplier=True)
+    assert fact['contract_multiplier'] == fact['deliverable_security_quantity'] == 1880
+    assert fact['contract_multiplier_origin'] == 'reviewed_stock_deliverable_quantity_v1'
+    assert fact['contract_months'] == ['202610', '202611', '202612', '202703', '202706']
+    assert fact['equity_credit_long_per_contract'] == fact['equity_debit_short_per_contract'] == 1200
+    wrong = deepcopy(cells)
+    wrong[1][1] = 'PK2約定標的物調整為1,880股標的證券'
+    assert corporate_grid_candidates(wrong, text, allow_stock_deliverable_multiplier=True) == []
+    assert corporate_grid_candidates(cells, '調整生效日：104年5月31日。',
+                                     allow_stock_deliverable_multiplier=True) == []
+    contradictory = cells + [['契約乘數', 'PK1契約乘數調整為2,000']]
+    bad, = corporate_grid_candidates(contradictory, text, allow_stock_deliverable_multiplier=True)
+    assert bad['contract_multiplier'] == 2000
+    assert bad['deliverable_components_resolved'] is False
+
+
+def test_stock_unit_rule_requires_exact_scoped_original_before_extraction():
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_stock_deliverable_multiplier_rule
+
+    assert reviewed_stock_deliverable_multiplier_rule(None, None, {}) is None
+    with pytest.raises(ValueError, match='scope mismatch'):
+        reviewed_stock_deliverable_multiplier_rule(None, None, {
+            'published_date': '2026-10-01',
+            'stock_deliverable_multiplier_rule': {'source_url': 'different source'},
+        })
+
+
+def test_stock_unit_rule_image_relocation_requires_matching_receipt_and_bytes(tmp_path):
+    from hashlib import sha256
+    from types import SimpleNamespace
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_stock_deliverable_rule_image
+
+    bundle = tmp_path / 'bundle'
+    bundle.mkdir()
+    image = bundle / 'page.png'
+    image.write_bytes(b'reviewed original page')
+    digest = sha256(image.read_bytes()).hexdigest()
+    source = dict(kind='visual_stock_deliverable_multiplier_rule_page', url='official',
+                  sha256=digest, path='page.png')
+    archive = SimpleNamespace(bundle=bundle, sources={'page': source})
+    item = dict(image_path='old/location.png', image_sha256=digest)
+    relocated = tmp_path / 'relocated' / 'review.json'
+    assert reviewed_stock_deliverable_rule_image(archive, relocated, item, 'official') == image
+    with pytest.raises(ValueError, match='lacks one bound page receipt'):
+        reviewed_stock_deliverable_rule_image(archive, relocated, item, 'other source')
+    image.write_bytes(b'modified page')
+    with pytest.raises(ValueError, match='image mismatch'):
+        reviewed_stock_deliverable_rule_image(archive, relocated, item, 'official')
+
+
+@pytest.mark.parametrize('separator', ['', '|', '：', ':', '|：'])
+@pytest.mark.parametrize('cash', [None, 16000, 18000])
+def test_flattened_same_code_cash_keeps_label_delimiters_out_of_values(separator, cash):
+    # The futures cash cells can be lost while the same original's first page
+    # retains the dividend. The options cash below is deliberately different.
+    text = ('每股配發8元現金股利。一、契約調整：調整生效日：108年6月24日。'
+        '調整契約月份：108年7月、8月、9月、12月及109年3月到期契約。'
+        f'契約代號{separator}不調整（仍為CDF）'
+        f'約定標的物{separator}不調整（仍為2,000股標的證券）'
+        f'契約乘數{separator}不調整（仍為2,000）')
+    if cash is not None:
+        text += f'買方權益數加項新臺幣{cash:,}元賣方權益數減項新臺幣{cash:,}元'
+    text += '二、選擇權調整：契約代號CDO調整為CDA約定標的物調整為2,000股標的證券及現金新臺幣99,999元'
+    facts = corporate_text_candidates(text)
+    assert len(facts) == 1
+    fact = facts[0]
+    assert fact['deliverable_text'] == '不調整(仍為2,000股標的證券)'
+    assert fact['contract_multiplier'] == 2000.
+    assert fact['contract_months'] == ['201907', '201908', '201909', '201912', '202003']
+    assert fact['has_equity_credit_fields']
+    if cash == 18000:
+        assert not fact['cash_equity_pair_agrees']
+        assert fact['equity_cash_derivation'] is None
+    else:
+        assert fact['cash_equity_pair_agrees']
+        assert fact['equity_credit_long_per_contract'] == 16000
+        assert fact['equity_cash_derivation']['per_unit_literal'] == '8'
+
+
+@pytest.mark.parametrize('dividend,expected,exact', [
+    ('5.5243', 11048, '11048.6000'),
+    ('2.44484149', 4889, '4889.68298000'),
+    ('0.81062600', 1621, '1621.25200000'),
+    ('0.0004', 0, '0.8000'),
+    ('4.999999999999999999999999999999', 9999,
+     '9999.999999999999999999999999998000'),
+])
+@pytest.mark.parametrize('cash_cell', ['missing', 'agrees', 'conflicts', 'decimal_ocr'])
+def test_cash_dividend_discards_sub_twd_only_with_consistent_original_cells(
+        dividend, expected, exact, cash_cell):
+    cells = [['調整生效日', '100年7月21日'],
+        ['調整契約月份', '100年8月、9月、12月及101年3月到期契約'],
+        ['契約代號', '不調整（仍為DLF）'],
+        ['約定標的物', '不調整（仍為2,000股標的證券）'],
+        ['契約乘數', '不調整（仍為2,000）']]
+    if cash_cell != 'missing':
+        value = str(expected if cash_cell == 'agrees' else expected + 1)
+        if cash_cell == 'decimal_ocr':
+            value = str(expected) + '.75'
+        cells += [[name, f'新臺幣{value}元'] for name in
+                  ('買方權益數加項', '賣方權益數減項')]
+    original = deepcopy(cells)
+    text = f'中華電分派現金股利，每股配發現金股利{dividend}元。'
+    fact = corporate_grid_candidates(cells, text)[0]
+    assert cells == original
+    if cash_cell in ('conflicts', 'decimal_ocr'):
+        assert not fact['cash_equity_pair_agrees']
+        assert fact['equity_cash_derivation'] is None
+        assert fact['equity_credit_long_per_contract'] is None
+    else:
+        assert fact['cash_equity_pair_agrees']
+        assert fact['equity_credit_long_per_contract'] == expected
+        assert fact['equity_debit_short_per_contract'] == expected
+        proof = fact['equity_cash_derivation']
+        assert proof['per_unit_literal'] == dividend
+        assert proof['per_contract_exact'] == exact
+        assert proof['per_contract_cash_twd'] == expected
+        assert proof['cash_rounding'] == 'discard_below_one_twd'
+
+
+def test_cash_dividend_rounding_does_not_round_other_deliverable_cash():
+    components = corporate_deliverable_components(
+        '調整為2,000股標的證券及現金新臺幣721.99元', 2000.)
+    assert components['deliverable_cash_twd'] == 721.99
+
+
+@pytest.mark.parametrize('problem', [None, 'no_review', 'wrong_issue', 'wrong_index',
+    'wrong_notice', 'no_image', 'uninspected_cover', 'foreign_extraction', 'missing_index',
+    'issue_after_index', 'different_literal_issue'])
+def test_inspected_delayed_index_clock_preserves_later_publication_and_rejects_unbound(problem):
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_corporate_publication_clock
+    text = ('發文日期：中華民國105年9月13日。'
+            '發文字號：台期交字第10502014370號。')
+    review = dict(published_date='2016-09-21', issued_date='2016-09-13',
+        pages=[dict(page=1, image_path='issuing.png', image_sha256='a'*64, native_text=text)],
+        visually_reviewed_pages=[1], publication_clock_review=dict(
+            kind='inspected_issue_with_later_index_v1', issued_date='2016-09-13',
+            index_published_date='2016-09-21', notice_number='10502014370'))
+    notice = dict(published_date='2016-09-21')
+    if problem == 'no_review': review.pop('publication_clock_review')
+    if problem == 'wrong_issue': review['publication_clock_review']['issued_date'] = '2016-09-14'
+    if problem == 'wrong_index': review['publication_clock_review']['index_published_date'] = '2016-09-20'
+    if problem == 'wrong_notice': review['publication_clock_review']['notice_number'] = '10502014371'
+    if problem == 'no_image': review['pages'][0].pop('image_sha256')
+    if problem == 'uninspected_cover': review['visually_reviewed_pages'] = []
+    if problem == 'foreign_extraction': review['publication_evidence'] = {'manifest':'different.json'}
+    if problem == 'missing_index': notice = None
+    if problem == 'issue_after_index':
+        review['published_date'] = review['publication_clock_review']['index_published_date'] = '2016-09-12'
+        notice['published_date'] = '2016-09-12'
+    if problem == 'different_literal_issue': text = text.replace('13日', '14日')
+    if problem:
+        with pytest.raises(ValueError): reviewed_corporate_publication_clock(review, text, notice)
+    else:
+        original = deepcopy(review)
+        result = reviewed_corporate_publication_clock(review, text, notice)
+        assert review == original
+        assert result['index_publication_verified'] is True
+        assert 'known_at' not in result
+        assert review['published_date'] == '2016-09-21'
 
 
 def _fact(**changes):
@@ -300,6 +473,128 @@ def test_corrected_code_pair_requires_one_actual_inspected_replacement(change):
     reviewed, correction = _reviewed_code_correction()
     with pytest.raises(ValueError):
         reviewed_corporate_code_pair_corrections({'corrected_ocr_code_pairs': [correction | change]}, [reviewed])
+
+
+def _reviewed_event_correction():
+    import json
+    correction = dict(from_product='PTF', product='PTF', effective_date='2015-08-01',
+        contract_months=['201509','201603'], corrected_from_product='AAF', corrected_product='AA1',
+        corrected_effective_date='2015-08-06', corrected_contract_months=['201509'])
+    reviewed = _fact(extraction='source_bound_visual_corporate_cells', visual_review_sha256='c'*64,
+        reviewed_event_scope_corrections=json.dumps([correction]))
+    return reviewed, correction
+
+
+def test_exact_event_correction_retires_only_the_named_original_scope():
+    from scripts.build_tw_futures_margin_event_candidates import replace_reviewed_corporate_facts
+    reviewed, correction = _reviewed_event_correction()
+    wrong = _fact(**{key:correction[key] for key in
+        ('from_product','product','effective_date','contract_months')})
+    others = [wrong | {'source_content_sha256':'b'*64},
+              wrong | {'effective_date':'2015-08-02'},
+              wrong | {'contract_months':['201509']},
+              wrong | {'contract_months':['201509','201603','201606']},
+              wrong | {'product':'BBF'}, wrong | {'from_product':'BBF'}]
+    before = deepcopy([wrong,*others]); original_review = deepcopy(reviewed)
+    assert replace_reviewed_corporate_facts([wrong,*others],[reviewed]) == [*others,reviewed]
+    assert [wrong,*others] == before and reviewed == original_review
+    assert replace_reviewed_corporate_facts([*others,reviewed],[reviewed]) == [*others,reviewed]
+
+
+def test_partial_corporate_review_preserves_same_product_other_dates_and_months():
+    from scripts.build_tw_futures_margin_event_candidates import replace_reviewed_corporate_facts
+    reviewed = _fact(extraction='source_bound_visual_corporate_cells')
+    noisy = _fact(contract_multiplier=2.)
+    siblings = [_fact(effective_date='2015-08-07'), _fact(contract_months=['201512']),
+                _fact(contract_months=['201509','201512']), _fact(from_product='BBF')]
+    assert replace_reviewed_corporate_facts([noisy,*siblings],[reviewed]) == [*siblings,reviewed]
+
+
+@pytest.mark.parametrize('change',[
+    {'corrected_product':'BB1'}, {'corrected_effective_date':'2015-08-07'},
+    {'corrected_contract_months':['201512']}, {'contract_months':[]},
+    {'contract_months':['201513']}, {'corrected_contract_months':['201509','201509']},
+    {'product':'PT'}, {'extra':'unbound'},
+])
+def test_event_scope_correction_needs_one_actual_inspected_target(change):
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_corporate_event_scope_corrections
+    reviewed, correction = _reviewed_event_correction()
+    with pytest.raises(ValueError):
+        reviewed_corporate_event_scope_corrections(
+            {'corrected_ocr_event_scopes':[correction | change]},[reviewed])
+
+
+@pytest.mark.parametrize('change',[
+    {'extraction':'ocr'}, {'visual_review_sha256':None},
+    {'source_content_sha256':'bad'}, {'issue_date_bound':False},
+])
+def test_event_scope_retirement_requires_bound_review_provenance(change):
+    from scripts.build_tw_futures_margin_event_candidates import replace_reviewed_corporate_facts
+    reviewed, _ = _reviewed_event_correction()
+    with pytest.raises(ValueError,match='source-bound inspected cells'):
+        replace_reviewed_corporate_facts([],[reviewed | change])
+
+
+def _reviewed_extraction_correction():
+    import json
+    from scripts.build_tw_futures_margin_event_candidates import corporate_extraction_view_identity
+    wrong = _fact(contract_months=[], contract_multiplier=2., deliverable_security_quantity=2.)
+    correction = dict(old_view=corporate_extraction_view_identity(wrong),
+        corrected_from_product='AAF', corrected_product='AA1',
+        corrected_effective_date='2015-08-06', corrected_contract_months=['201509'])
+    reviewed = _fact(extraction='source_bound_visual_corporate_cells', visual_review_sha256='c'*64,
+        reviewed_extraction_view_corrections=json.dumps([correction]))
+    return wrong, reviewed, correction
+
+
+def test_exact_incomplete_extraction_retirement_preserves_other_financial_views_and_events():
+    from scripts.build_tw_futures_margin_event_candidates import replace_reviewed_corporate_facts
+    wrong, reviewed, _ = _reviewed_extraction_correction()
+    siblings = [wrong | {'contract_multiplier':3.}, wrong | {'source_content_sha256':'b'*64},
+        wrong | {'effective_date':'2015-08-07'}, wrong | {'contract_months':['201512']},
+        wrong | {'product':'AA2'}, wrong | {'equity_credit_long_per_contract':100.}]
+    before = deepcopy([wrong,*siblings]); review_before = deepcopy(reviewed)
+    fixed = replace_reviewed_corporate_facts([wrong,*siblings],[reviewed])
+    assert fixed == [*siblings,reviewed]
+    assert replace_reviewed_corporate_facts(fixed,[reviewed]) == fixed
+    assert [wrong,*siblings] == before and reviewed == review_before
+
+
+@pytest.mark.parametrize('change',[
+    {'corrected_product':'BB1'}, {'corrected_effective_date':None},
+    {'corrected_contract_months':[]}, {'corrected_contract_months':['201513']},
+    {'corrected_contract_months':['201509','201509']}, {'extra':'unbound'},
+    {'old_view':{}},
+])
+def test_exact_extraction_retirement_requires_complete_old_view_and_one_literal_target(change):
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_corporate_extraction_view_corrections
+    _, reviewed, correction = _reviewed_extraction_correction()
+    with pytest.raises(ValueError):
+        reviewed_corporate_extraction_view_corrections(dict(content_sha256='a'*64,
+            corrected_ocr_extraction_views=[correction | change]),[reviewed])
+
+
+@pytest.mark.parametrize('change',[
+    {'extraction':'ocr'}, {'visual_review_sha256':None},
+    {'source_content_sha256':'bad'}, {'issue_date_bound':False},
+])
+def test_exact_extraction_retirement_requires_inspected_original_provenance(change):
+    from scripts.build_tw_futures_margin_event_candidates import replace_reviewed_corporate_facts
+    _, reviewed, _ = _reviewed_extraction_correction()
+    with pytest.raises(ValueError,match='source-bound inspected cells'):
+        replace_reviewed_corporate_facts([],[reviewed | change])
+
+
+def test_extraction_retirement_can_name_null_old_date_without_widening_other_dates():
+    import json
+    from scripts.build_tw_futures_margin_event_candidates import (
+        corporate_extraction_view_identity, replace_reviewed_corporate_facts)
+    wrong, reviewed, correction = _reviewed_extraction_correction()
+    wrong['effective_date'] = None
+    correction['old_view'] = corporate_extraction_view_identity(wrong)
+    reviewed['reviewed_extraction_view_corrections'] = json.dumps([correction])
+    other = wrong | {'effective_date':'2015-08-07'}
+    assert replace_reviewed_corporate_facts([wrong,other],[reviewed]) == [other,reviewed]
 
 
 def test_incremental_input_identity_ignores_duplicate_views_but_detects_financial_and_clock_changes(tmp_path):

@@ -1,0 +1,20 @@
+[Unit]
+Description=Refresh the selected day-trade model's due FinLab inputs
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+Slice=system.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_daytrade_priority.sh" sync
+SuccessExitStatus=75
+Nice=-3
+CPUWeight=5000
+IOWeight=5000
+OOMScoreAdjust=-250
+TimeoutStartSec=4h

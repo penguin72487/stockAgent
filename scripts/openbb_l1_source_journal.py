@@ -99,6 +99,10 @@ def _install_journal(connection: sqlite3.Connection) -> None:
     if update_columns != TRACKED_TASK_COLUMNS:
         raise RuntimeError("OpenBB L1 source journal tracked-column contract changed")
     with connection:
+        # A connection context alone does not start a DDL transaction. Capture
+        # coverage must appear atomically, with one durable commit on install.
+        if not connection.in_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             f"CREATE TABLE IF NOT EXISTS {JOURNAL_TABLE} "
             "(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL)"

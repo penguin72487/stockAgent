@@ -31,13 +31,18 @@ from stockagent.data.tw_futures_margin_preparation import (
     bind_equity_margin_families, bind_equity_position_families,
     bind_physical_position_inputs, bind_adjusted_terminal_values, equity_contract_families,
     stock_futures_preparation_scope,
-    futures_preparation_universe, FUTURES_UNIVERSE_SCOPE_CONTRACT,
+    futures_preparation_universe, normalize_futures_universe_scope,
+    FUTURES_UNIVERSE_SCOPE_CONTRACT, FUTURES_UNIVERSE_COMPOSITE_SCOPE_CONTRACT,
+    FUTURES_UNIVERSE_SCOPES,
+    cash_event_accounting_calendar, carry_cash_only_accounting_marks, official_market_day_keys,
+    bind_final_day_valuation_marks,
 )
 from stockagent.data.tw_futures_margin_release import (
     read_bound_output, materialize_margin_market_rows, margin_execution_dependency_rows,
-    select_complete_margin_components, publish_all_twd_margin_release,
+    select_complete_margin_components, publish_all_twd_margin_release, load_dated_product_specifications,
 )
 from stockagent.data.tw_futures_execution_terms import compile_execution_terms, EXECUTION_TERMS_COMPILER_VERSION
+from stockagent.data.tw_futures_initial_reference import read_initial_reference_source
 from stockagent.data.tw_futures_margin import (
     validate_margin_carry_rules, validate_margin_value_bases,
     validate_margin_second_position_limit, validate_margin_grandfather_rules,
@@ -96,7 +101,9 @@ def repair_release_metadata(source: Path, output: Path) -> dict:
 
 def _compile_accounting(source, universe, *, output, end, slots, save, log,
                         rule_source=None, scope_products=None, portfolio_lifetimes=None,
-                        information_halt_reviews=(), valuation_research_policy=None):
+                        information_halt_reviews=(), valuation_research_policy=None,
+                        official_evidence_cache=None, official_spread_research_policy=None,
+                        holiday_account_dates_source=None):
     """Canonical financial calculation, separately fingerprinted for reuse."""
     full_universe = universe
     products = universe["product"].to_list()
@@ -124,29 +131,44 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
     units_intervals, _ = read_bound_output(rule_source / "corporate_unit_intervals.parquet")
     margin_levels, _ = read_bound_output(rule_source / "margin_level_intervals.parquet")
     position_levels, _ = read_bound_output(rule_source / "position_level_intervals.parquet")
-    specifications, _ = read_bound_output(source / "specifications/specifications.parquet")
+    specifications = load_dated_product_specifications(source, rule_source)
     policy = json.loads((source / "position_research_policy.json").read_text())
     final_path = source / "final/futures_final_settlement_history.parquet"
-    final = load_preparation_final_settlements(final_path).filter(pl.col("product").is_in(products))
+    final = load_preparation_final_settlements(final_path)
+    # Full-universe dates preserve the same accounting calendar in a scoped
+    # replay. Cash values are still confined to their official event nodes.
+    account_calendar = cash_event_accounting_calendar(calendar,
+        final.filter(pl.col("product").is_in(full_universe['product'])))
+    if holiday_account_dates_source is not None:
+        from stockagent.data.tw_futures_holiday_account_dates import supplement_holiday_account_calendar
+        account_calendar = supplement_holiday_account_calendar(account_calendar, holiday_account_dates_source)
+    calendar = account_calendar.select('date')
+    save('accounting_event_calendar', account_calendar)
     underlying = load_same_security_final_fixing_rule(source / "underlying_final_rule/review.json")
-    derived = derive_adjusted_final_fixings(observed, final, terms, universe, **underlying)
-    final = pl.concat([final.with_columns(pl.lit("official_product_final").alias("final_fixing_origin")),
+    # A scoped replay still resolves contract families against the complete
+    # catalogue, and may need its standard sibling's official fixing. This
+    # must not add that sibling's market rows to the requested output.
+    derived = derive_adjusted_final_fixings(observed, final, terms, full_universe, **underlying)
+    final = pl.concat([final.filter(pl.col("product").is_in(products)).with_columns(
+                           pl.lit("official_product_final").alias("final_fixing_origin")),
                        derived], how="diagonal_relaxed")
     physical, lives = physical_lifetime_calendar(observed, final, calendar, corporate=cf,
         delisting_rule=load_adjusted_zero_oi_rule(source / "adjusted_lifecycle_rule/review.json"))
+    # The expanded physical calendar owns its values. Do not retain the full
+    # observed tape throughout the much wider execution-term compilation.
+    del observed
     save("physical_lifetimes", lives)
     log("physical_calendar", rows=physical.height, lives=lives.height, products=universe.height)
     receipt = json.loads((source / "official_daily/manifest.json").read_text())
     portable = dict(receipt, receipts=[dict(r, path=str(source / r["path"])) for r in receipt["receipts"]])
     atomic_write_json(output / "official_daily_manifest.json", portable)
     evidence = official_day_evidence(output / "official_daily_manifest.json",
-        physical.select("date", "physical_contract"), output / "official_daily", allow_unreported_volume=True)
+        official_market_day_keys(physical, account_calendar), output / "official_daily", allow_unreported_volume=True,
+        reuse_verified_cache=official_evidence_cache, spread_research_policy=official_spread_research_policy)
     physical = physical.join(evidence, on=["date", "physical_contract"], how="left", validate="1:1").with_columns(
         pl.col("official_settlement").str.replace_all(",", "").cast(pl.Float64, strict=False).alias("daily_mark"))
-    cash = ((pl.col("date") == pl.col("official_expiry"))
-        & (pl.col("settlement_method") == "cash_settlement")).fill_null(False)
-    physical = physical.with_columns(cash.alias("cash_settlement"),
-        pl.when(cash).then(pl.col("final_settlement_price")).otherwise(pl.col("daily_mark")).alias("valuation_price"))
+    del evidence
+    physical = bind_final_day_valuation_marks(physical)
     legal_values = []
     for review in sorted((source / "halt").glob("*/review.json")):
         physical, values = apply_loss_reduction_halt_values(physical, calendar, load_loss_reduction_halt_review(review))
@@ -167,6 +189,7 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
             corporate_candidates=cf, final_settlements=final)
         save("research_valuation_rows", valuation_values)
         log("research_valuations_applied", rows=valuation_values.height)
+    physical = carry_cash_only_accounting_marks(physical, account_calendar)
     save("physical_daily_marks", physical)
     parent_lives = None
     if scope_products is not None:
@@ -176,24 +199,27 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
         parent_lives = pl.concat([portfolio_lifetimes.filter(~pl.col("product").is_in(products)).select(own_lives.columns),
                                  own_lives], how="vertical")
         save("portfolio_slot_lifetimes", parent_lives)
-    frame, _ = materialize_margin_market_rows(physical, raw, universe, slot_count=slots, market_dates=calendar,
+    frame, _ = materialize_margin_market_rows(physical, raw, universe, slot_count=slots, market_dates=account_calendar,
         portfolio_lifetimes=parent_lives, portfolio_universe=full_universe if parent_lives is not None else None)
+    del raw
     days = frame.select("date", "product", "contract").unique()
     units = bind_dated_corporate_terms(days.filter(pl.col("product").str.contains(r"\d$")),
                                      units_intervals, unit_only=True)
     margin_law = json.loads((source / "margin_family.json").read_text())
-    margins = bind_equity_margin_families(days.select("date", "product").unique(), margin_levels, universe,
+    margins = bind_equity_margin_families(days.select("date", "product").unique(), margin_levels, full_universe,
         rule_effective_date=date.fromisoformat(margin_law["effective_date"]),
         rule_known_at=margin_law["known_at"], rule_source_sha256=margin_law["source_content_sha256"])
     laws = json.loads((source / "position_family/review.json").read_text())["rules"]
-    product_positions = bind_equity_position_families(days, position_levels, universe, units, laws)
-    positions = bind_physical_position_inputs(days, product_positions, units, universe, laws,
+    product_positions = bind_equity_position_families(days, position_levels, full_universe, units, laws)
+    positions = bind_physical_position_inputs(days, product_positions, units, full_universe, laws,
                                               corporate_unit_intervals=units_intervals)
     rights, _ = read_bound_output(source / "terminal/terminal_subscription_values.parquet")
-    terminal = bind_adjusted_terminal_values(physical.filter(cash & pl.col("product").str.contains(r"\d$")).select(
+    terminal = bind_adjusted_terminal_values(physical.filter(pl.col('cash_settlement') & pl.col("product").str.contains(r"\d$")).select(
         "date", "product", "contract", "final_settlement_price", "final_settlement_value").unique(), terms, rights)
+    del physical
     rules, flags = compile_execution_terms(frame, margins, positions, terms, margin_levels, specifications, terminal,
-                                           position_research_policy=policy)
+                                           position_research_policy=policy, corporate_events=cf,
+                                           initial_references=read_initial_reference_source(rule_source))
     if valuation_research_policy is not None:
         from stockagent.data.tw_futures_valuation_research import (
             attach_research_valuation_provenance, apply_research_terminal_cash_conversions)
@@ -215,6 +241,8 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
 
 def _calculation_identity():
     files = ["stockagent/data/tw_futures_execution_terms.py",
+             "stockagent/data/tw_futures_price_limits.py",
+             "stockagent/data/tw_futures_initial_reference.py",
              "stockagent/data/tw_futures_margin_preparation.py",
              "stockagent/data/tw_futures_position_research.py",
              "stockagent/data/tw_stock_futures_repair.py",
@@ -222,7 +250,8 @@ def _calculation_identity():
              "scripts/prepare_tw_futures_physical_history.py"]
     return dict(files={f:sha256_file(ROOT / f) for f in files},
         functions={f.__name__:hashlib.sha256(inspect.getsource(f).encode()).hexdigest()
-            for f in [_compile_accounting, materialize_margin_market_rows, margin_execution_dependency_rows]})
+            for f in [_compile_accounting, materialize_margin_market_rows, margin_execution_dependency_rows,
+                      load_dated_product_specifications]})
 
 
 def _context_prefix_tools(contract):
@@ -256,9 +285,11 @@ def _verify_valuation_research_extension(previous: dict, current: dict, policy: 
         raise ValueError('valuation research migration lacks its unchanged canonical financial baseline')
     candidate = ast.parse(inspect.getsource(_compile_accounting))
     function = candidate.body[0]
-    if function.args.kwonlyargs[-1].arg != 'valuation_research_policy':
+    positions = [i for i, argument in enumerate(function.args.kwonlyargs)
+                 if argument.arg == 'valuation_research_policy']
+    if len(positions) != 1 or not isinstance(function.args.kw_defaults[positions[0]], ast.Constant) or function.args.kw_defaults[positions[0]].value is not None:
         raise ValueError('valuation research hook has an unexpected signature')
-    function.args.kwonlyargs.pop(); function.args.kw_defaults.pop()
+    function.args.kwonlyargs.pop(positions[0]); function.args.kw_defaults.pop(positions[0])
     kept, removed = [], []
     for node in function.body:
         if isinstance(node, ast.If) and ast.dump(node.test) == ast.dump(
@@ -330,6 +361,9 @@ def rule_product_inputs(delta: Path) -> dict:
     corporate, _ = read_bound_output(delta / 'corporate_event_candidates.parquet')
     boundaries, transfers = corporate_identity_boundaries(corporate)
     frames.update(corporate_boundaries=boundaries, corporate_transfers=transfers)
+    initial_references = read_initial_reference_source(delta)
+    if initial_references is not None:
+        frames['initial_reference_operands'] = initial_references
     terminal = json.loads((delta / 'manifest.json').read_text()).get('terminal_source_delta')
     if terminal is not None:
         frames['terminal_operands'] = read_bound_output(delta / terminal['path'] / 'terminal_overlay_rows.parquet')[0]
@@ -814,9 +848,12 @@ def _repair_margin_accounting(source, previous_source, output, universe, cached,
     rights,_=read_bound_output(source/"terminal/terminal_subscription_values.parquet")
     terminal=bind_adjusted_terminal_values(physical.filter(pl.col("cash_settlement")&pl.col("product").str.contains(r"\d$")).select(
         "date","product","contract","final_settlement_price","final_settlement_value").unique(),terms,rights)
-    specifications,_=read_bound_output(source/"specifications/specifications.parquet")
+    specifications=load_dated_product_specifications(source)
     policy=json.loads((source/"position_research_policy.json").read_text())
-    rules,flags=compile_execution_terms(frame,margins,positions,terms,levels,specifications,terminal,position_research_policy=policy)
+    corporate_events=read('corporate_event_candidates')
+    rules,flags=compile_execution_terms(frame,margins,positions,terms,levels,specifications,terminal,
+        position_research_policy=policy,corporate_events=corporate_events,
+        initial_references=read_initial_reference_source(source / 'rules'))
     dependencies=margin_execution_dependency_rows(frame,margins,positions,bind_dated_corporate_terms(days,terms),terminal)
     keys=["date","physical_contract"]
     flags=flags.join(dependencies.select(*keys,"missing_valuation","intermediate_calendar_gap","unresolved_lifetime"),
@@ -911,6 +948,8 @@ def _integrated_rule_inputs(source: Path, delta: Path, policy_path: Path | None)
         if not path.is_relative_to(delta.resolve()) or sha256_file(path) != item['sha256']:
             raise ValueError('integrated rule source SHA/path mismatch')
     rule_product_inputs(delta)
+    if proof.get('product_specification_delta') is not None:
+        load_dated_product_specifications(source, delta)
     accounting_source, terminal = _accounting_terminal_source(source, delta)
     accounting_source, loss, _ = _loss_reduction_halt_delta(source, delta, accounting_source)
     information, information_proof, _ = _information_halt_delta(source, delta)
@@ -919,7 +958,8 @@ def _integrated_rule_inputs(source: Path, delta: Path, policy_path: Path | None)
         information_halt_source_overlay=information_proof)
     policy, originals = None, []
     if policy_path is not None:
-        from stockagent.data.tw_futures_valuation_research import validate_valuation_research_policy
+        from stockagent.data.tw_futures_valuation_research import (
+            validate_composed_terminal_scope, validate_valuation_research_policy)
         policy = validate_valuation_research_policy(json.loads(policy_path.read_text()))
         if (policy['source_manifest_sha256'] != source_sha
                 or policy['rule_delta_manifest_sha256'] != identity['rule_delta_manifest_sha256']
@@ -940,6 +980,7 @@ def _integrated_rule_inputs(source: Path, delta: Path, policy_path: Path | None)
                 or {json.dumps(r,sort_keys=True) for r in policy['continuation_transfers']}
                    != {json.dumps(r,sort_keys=True) for item in originals for r in item['document']['continuation_transfers']}):
             raise ValueError('integrated policy expands its accepted research scope')
+        validate_composed_terminal_scope(policy, [item['document'] for item in originals])
         identity.update(valuation_research_policy_sha256=sha256_file(policy_path),
             valuation_research_implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_valuation_research.py'))
     return accounting_source, information, policy, originals, identity
@@ -962,16 +1003,333 @@ def _selected_empty_context_keys(selected, empty, suppressed):
     return empty.filter(pl.col('physical_contract').is_in(sorted(context_ids))).select(keys)
 
 
+def _verified_parent_accounting(parent: Path, inputs: dict, cache_files: dict,
+                                *, adding_valuation: bool = False):
+    """Verify complete pre-selection caches and the allowed input delta."""
+    parent = parent.resolve()
+    checkpoint = parent / 'accounting_checkpoint.json'
+    checkpoint_sha = sha256_file(checkpoint)
+    retained = json.loads(checkpoint.read_text())
+
+    def economic(values, *, requested=False):
+        result = {k: v for k, v in values.items() if k != 'context_only_prefix'}
+        if adding_valuation:
+            integration = dict(result.get('integrated_source_inputs', {}))
+            names = {'valuation_research_policy_sha256', 'valuation_research_implementation_sha256'}
+            if requested and not names <= integration.keys():
+                raise ValueError('valuation reuse requires its exact source-bound policy identity')
+            if not requested and names & integration.keys():
+                raise ValueError('valuation reuse requires an original unmodified strict parent')
+            result['integrated_source_inputs'] = {k: v for k, v in integration.items() if k not in names}
+        return result
+
+    if economic(retained['inputs']) != economic(inputs, requested=True):
+        raise ValueError('parent accounting changes source, calculation, horizon, slots or universe')
+    paths = {key: parent / name for key, name in cache_files.items()}
+    for key, path in paths.items():
+        if (not path.resolve().is_relative_to(parent)
+                or sha256_file(path) != retained['outputs'][cache_files[key]]):
+            raise ValueError('parent original accounting cache SHA/path mismatch')
+    return parent, checkpoint_sha, retained, paths
+
+
+def reuse_parent_accounting(parent: Path, output: Path, inputs: dict, cache_files: dict) -> dict:
+    """Reselect membership from exact original calculations without recompiling.
+
+    Only the proved-empty-prefix policy may differ. The original complete
+    frame/rules/flags are reused, never the already selected or suppressed
+    release. This permits a broader order policy to recompute reachability
+    instead of inheriting the previous policy's invalid empty-inventory proof.
+    """
+    from stockagent.data_sync.artifact_dedup import link_immutable_source
+    parent, checkpoint_sha, retained, paths = _verified_parent_accounting(parent, inputs, cache_files)
+    checkpoint = parent / 'accounting_checkpoint.json'
+    if parent == output.resolve():
+        raise ValueError('parent accounting requires a separate fresh output')
+    frames = {key: pl.read_parquet(path) for key, path in paths.items()}
+    if (sha256_file(checkpoint) != checkpoint_sha
+            or any(sha256_file(path) != retained['outputs'][cache_files[key]] for key, path in paths.items())):
+        raise ValueError('parent original accounting changed during readback')
+    for key, path in paths.items():
+        link_immutable_source(path, output / cache_files[key], output / '.accounting_objects',
+                              retained['outputs'][cache_files[key]])
+    atomic_write_json(output / 'accounting_checkpoint.json', dict(inputs=inputs, outputs=retained['outputs']))
+    atomic_write_json(output / 'parent_accounting_reuse.json', dict(
+        contract='verified_original_accounting_new_prefix_selection_v1',
+        parent=str(parent), parent_checkpoint_sha256=checkpoint_sha,
+        source_calculations_unchanged=True, prefix_reachability_recomputed=True,
+        previous_prefix=retained['inputs'].get('context_only_prefix'),
+        current_prefix=inputs.get('context_only_prefix'), reused_outputs=retained['outputs']))
+    return frames
+
+
+def reuse_parent_corporate_requirements(parent, output, inputs, cache_files, *,
+        baseline_receipt, rule_source):
+    """Recheck one proven mask delta; retain every original financial operand."""
+    from copy import deepcopy
+    from stockagent.runtime_identity import verify_source_release
+    from stockagent.data_sync.artifact_dedup import link_immutable_source
+    from stockagent.data.tw_futures_execution_terms import rebind_corporate_requirement_flags
+    receipt=Path(baseline_receipt).resolve();baseline=receipt.parent/'build-source'
+    identity=verify_source_release(receipt,baseline)
+    original=json.loads((Path(parent)/'accounting_checkpoint.json').read_text())
+    old=original['inputs']['calculation'];current=inputs['calculation']
+    allowed={'stockagent/data/tw_futures_execution_terms.py',
+             'stockagent/data/tw_futures_margin_preparation.py'}
+    if (old['functions']!=current['functions'] or old['files'].keys()!=current['files'].keys()
+            or any(sha256_file(baseline/name)!=digest for name,digest in old['files'].items())
+            or any(old['files'][name]!=current['files'][name] for name in old['files'] if name not in allowed)):
+        raise ValueError('corporate recheck changes unrelated financial calculation inputs')
+
+    # Remove only the declared helper delta. All remaining module code must
+    # equal the checksum-verified parent, including every numeric operation.
+    preparation='stockagent/data/tw_futures_margin_preparation.py'
+    a=ast.parse((baseline/preparation).read_text());b=ast.parse((ROOT/preparation).read_text())
+    for tree in (a,b):
+        tree.body=[n for n in tree.body if not (isinstance(n,ast.FunctionDef)
+            and n.name=='_inherit_dated_same_security_positions')]
+    if ast.dump(a)!=ast.dump(b):raise ValueError('corporate recheck changes a used preparation helper')
+    execution='stockagent/data/tw_futures_execution_terms.py'
+    a=ast.parse((baseline/execution).read_text());b=ast.parse((ROOT/execution).read_text())
+    old_compiler=next(n for n in a.body if isinstance(n,ast.FunctionDef) and n.name=='compile_execution_terms')
+    new_compiler=next(n for n in b.body if isinstance(n,ast.FunctionDef) and n.name=='compile_execution_terms')
+    start=next(i for i,n in enumerate(old_compiler.body) if isinstance(n,ast.If)
+        and ast.unparse(n.test)=='corporate_events is not None')
+    end=next(i for i,n in enumerate(old_compiler.body[start:],start) if isinstance(n,ast.Assign)
+        and any(isinstance(v,ast.Name) and v.id=='terminal_values' for v in ast.walk(n)))
+    calls=[i for i,n in enumerate(new_compiler.body) if isinstance(n,ast.Assign)
+        and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name)
+        and n.value.func.id=='bind_required_corporate_events']
+    if len(calls)!=1:raise ValueError('corporate mask delta lacks its one canonical call')
+    new_compiler.body[calls[0]:calls[0]+1]=deepcopy(old_compiler.body[start:end])
+    old_version=next(n for n in a.body if isinstance(n,ast.Assign)
+        and any(isinstance(t,ast.Name) and t.id=='EXECUTION_TERMS_COMPILER_VERSION' for t in n.targets))
+    b.body=[n for n in b.body if not (isinstance(n,ast.FunctionDef) and n.name in
+        {'bind_required_corporate_events','rebind_corporate_requirement_flags'})
+        and not (isinstance(n,ast.ImportFrom) and n.module=='datetime'
+            and [(x.name,x.asname) for x in n.names]==[('date',None)])]
+    for i,n in enumerate(b.body):
+        if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name)
+                and t.id=='EXECUTION_TERMS_COMPILER_VERSION' for t in n.targets):b.body[i]=deepcopy(old_version)
+    if ast.dump(a)!=ast.dump(b):raise ValueError('corporate recheck changes financial arithmetic outside its mask')
+    compare=deepcopy(inputs);compare['calculation']=old
+    parent,checkpoint_sha,retained,paths=_verified_parent_accounting(parent,compare,cache_files)
+    if parent==output.resolve():raise ValueError('corporate recheck requires a fresh output generation')
+    frames={key:pl.read_parquet(path) for key,path in paths.items()}
+    corporate,_=read_bound_output(rule_source/'corporate_event_candidates.parquet')
+    terms,_=read_bound_output(rule_source/'corporate_terms_intervals.parquet')
+    original_flags=frames['flags']
+    flags=rebind_corporate_requirement_flags(frames['frame'],original_flags,terms,corporate)
+    changed=original_flags.select('date','physical_contract',
+        pl.col('missing_corporate_event_terms').alias('previous_missing_corporate_event_terms')).join(
+        flags.select('date','physical_contract','missing_corporate_event_terms'),
+        on=['date','physical_contract'],how='inner',validate='1:1').filter(
+            pl.col('previous_missing_corporate_event_terms')!=pl.col('missing_corporate_event_terms'))
+    if (sha256_file(parent/'accounting_checkpoint.json')!=checkpoint_sha
+            or any(sha256_file(path)!=retained['outputs'][cache_files[key]] for key,path in paths.items())):
+        raise ValueError('original financial checkpoint changed during corporate recheck')
+    outputs={}
+    for key,path in paths.items():
+        target=output/cache_files[key]
+        if key=='flags':atomic_write_parquet(target,flags)
+        else:link_immutable_source(path,target,output/'.accounting_objects',retained['outputs'][cache_files[key]])
+        outputs[cache_files[key]]=sha256_file(target)
+    atomic_write_parquet(output/'corporate_requirement_changes.parquet',changed)
+    atomic_write_json(output/'corporate_requirement_recheck.json',dict(
+        contract='verified_original_financial_values_corporate_mask_recheck_v1',
+        parent=str(parent),parent_checkpoint_sha256=checkpoint_sha,baseline_source=identity,
+        old_calculation=old,new_calculation=current,changed_account_rows=changed.height,
+        financial_arithmetic_ast_equal=True,financial_values_byte_identical=True,
+        reused_financial_outputs={name:outputs[name] for key,name in cache_files.items() if key!='flags'},
+        fresh_prefix_and_component_admission_required=True))
+    atomic_write_json(output/'accounting_checkpoint.json',dict(inputs=inputs,outputs=outputs))
+    frames['flags']=flags
+    return frames
+
+
+def _valuation_affected_scope(universe, corporate, policy):
+    """Close the changed financial owners over families and actual transfers."""
+    from stockagent.data.tw_futures_margin_preparation import corporate_identity_boundaries
+    products = set(universe['product'])
+    affected = set(policy['products'])
+    if not affected or not affected <= products:
+        raise ValueError('valuation policy exceeds the exact parent universe')
+    families = equity_contract_families(universe).to_dicts()
+    _, edges = corporate_identity_boundaries(corporate)
+    pairs = list(edges.select('product', 'corporate_transfer_target').unique().iter_rows())
+    while True:
+        standards = {r['standard_product'] for r in families if r['product'] in affected}
+        extra = {r['product'] for r in families if r['standard_product'] in standards}
+        extra.update(p for a, b in pairs if a in affected or b in affected for p in (a, b) if p in products)
+        if extra <= affected:
+            return sorted(affected)
+        affected.update(extra)
+
+
+def _strict_parent_valuation_disclosure(original, own):
+    """Declare unchanged strict rows as unestimated when composing schemas.
+
+    Called only after the strict parent's source/calculation identity passed.
+    A null flag from diagonal concatenation is not an explicit disclosure.
+    Existing parent disclosure columns or incomplete new schemas are rejected.
+    """
+    from stockagent.data.tw_futures_valuation_research import VALUATION_RESEARCH_COLUMNS
+    fields = set(VALUATION_RESEARCH_COLUMNS)
+    if not fields.intersection(own.columns):
+        return original
+    if not fields <= set(own.columns) or fields.intersection(original.columns):
+        raise ValueError('valuation composition requires a complete new schema and a strict parent')
+    return original.with_columns(*[pl.lit(False if dtype == pl.Boolean else None, dtype=dtype).alias(name)
+        for name, dtype in VALUATION_RESEARCH_COLUMNS.items()])
+
+
+def _publication_asset_scope(frame, rules, flags, scope):
+    """Project whole product families for a declared consumer, never an account gap."""
+    if scope is None:
+        return frame, rules, flags
+    from stockagent.data.tw_futures_decision_clock import clock_asset_classes
+    classes = clock_asset_classes(scope)
+    wanted = frame.select('asset_class','product').filter(
+        pl.col('asset_class').is_in(classes))['product'].unique()
+    selected = rules.filter(pl.col('product').is_in(wanted))
+    outside = rules.filter(~pl.col('product').is_in(wanted)).select('date', 'physical_contract')
+    incoming = selected.filter(pl.col('carry_from_physical_contract') != '').select(
+        pl.col('carry_from_date').alias('date'), pl.col('carry_from_physical_contract').alias('physical_contract'))
+    outgoing = rules.filter(~pl.col('product').is_in(wanted)
+        & (pl.col('carry_from_physical_contract') != '')).select(
+        pl.col('carry_from_date').alias('date'), pl.col('carry_from_physical_contract').alias('physical_contract'))
+    if (incoming.join(outside, on=['date', 'physical_contract'], how='semi').height
+            or outgoing.join(selected.select('date', 'physical_contract'),
+                             on=['date', 'physical_contract'], how='semi').height):
+        raise ValueError('publication asset scope cuts an inventory transfer')
+    return (frame.filter(pl.col('product').is_in(wanted)), selected,
+            flags.filter(pl.col('product').is_in(wanted)))
+
+
+def reuse_parent_with_valuation(parent, output, inputs, cache_files, *, source,
+                               universe, rule_delta, information_reviews, policy, log):
+    """Recompile changed research values only; retain all other original rows.
+
+    Model slots are assigned once from the composed lifetimes. Financial
+    arithmetic, eligibility, transfer edges and prefix admission still belong
+    to the canonical compiler and validators.
+    """
+    # Changing only the empty-inventory proof does not change an already
+    # disclosed valuation policy. Reuse the original, pre-selection operands
+    # through the same complete identity/SHA gate as strict accounting; do not
+    # recompile them as if this were a new valuation extension.
+    parent_inputs = json.loads((Path(parent) / 'accounting_checkpoint.json').read_text())['inputs']
+    retained_integration = parent_inputs.get('integrated_source_inputs', {})
+    requested_integration = inputs.get('integrated_source_inputs', {})
+    valuation_keys = ('valuation_research_policy_sha256', 'valuation_research_implementation_sha256')
+    if all(requested_integration.get(key) and requested_integration[key] == retained_integration.get(key)
+           for key in valuation_keys):
+        cached = reuse_parent_accounting(parent, output, inputs, cache_files)
+        log('verified_unchanged_valuation_parent_reselected', rows=cached['rules'].height,
+            financial_recompilations=0)
+        return cached
+    from stockagent.data.tw_futures_portfolio_daily import _fixed_portfolio_slot_map
+    parent, checkpoint_sha, retained, paths = _verified_parent_accounting(
+        parent, inputs, cache_files, adding_valuation=True)
+    if parent == output.resolve():
+        raise ValueError('valuation composition requires a fresh output')
+    corporate, _ = read_bound_output(rule_delta / 'corporate_event_candidates.parquet')
+    affected = _valuation_affected_scope(universe, corporate, policy)
+    parent_lives = pl.scan_parquet(paths['frame']).group_by('product', 'contract', 'physical_instance').agg(
+        pl.col('date').min().alias('first_observed_date'),
+        pl.col('date').max().alias('last_observed_date')).collect()
+    part = output / 'valuation_recompile'
+    part.mkdir()
+
+    def save(name, frame):
+        atomic_write_parquet(part / (name + '.parquet'), frame)
+
+    log('affected_valuation_compile', products=len(affected), parent_products=universe.height)
+    compiled = _compile_accounting(source, universe, output=part,
+        end=date.fromisoformat(inputs['end']), slots=inputs['slots'], save=save, log=log,
+        rule_source=rule_delta, scope_products=affected, portfolio_lifetimes=parent_lives,
+        information_halt_reviews=information_reviews, valuation_research_policy=policy)
+    # Merge one channel at a time rather than keeping a second full parent in RAM.
+    cached, reused = {}, {}
+    for key, own in zip(('frame', 'rules', 'flags', 'dependencies'), compiled):
+        original = pl.scan_parquet(paths[key]).filter(~pl.col('product').is_in(affected)).collect()
+        if key in ('frame', 'rules'):
+            original = _strict_parent_valuation_disclosure(original, own)
+        reused[key] = original.height
+        cached[key] = pl.concat([original, own], how='diagonal_relaxed')
+        if cached[key].select('date', 'physical_contract').is_duplicated().any():
+            raise ValueError('valuation composition duplicates an original coordinate')
+    frame = cached['frame']
+    lives = frame.group_by('product', 'contract', 'physical_instance').agg(
+        pl.col('date').min().alias('first_observed_date'),
+        pl.col('date').max().alias('last_observed_date'))
+    calendar = pl.scan_parquet(paths['frame']).select('date').unique().collect()['date'].to_list()
+    slot_map = _fixed_portfolio_slot_map(lives, calendar, fixed_slot_count=inputs['slots'])
+    cached['frame'] = frame.drop('portfolio_slot', 'symbol').join(slot_map,
+        on=['product', 'contract', 'physical_instance'], validate='m:1')
+    cached['dependencies'] = cached['dependencies'].drop('symbol').join(
+        cached['frame'].select('date', 'physical_contract', 'symbol'),
+        on=['date', 'physical_contract'], validate='1:1')
+    if cached['frame'].select('date', 'symbol').is_duplicated().any():
+        raise ValueError('composed research history collides in a model slot')
+    if (sha256_file(parent / 'accounting_checkpoint.json') != checkpoint_sha
+            or any(sha256_file(path) != retained['outputs'][cache_files[key]] for key, path in paths.items())):
+        raise ValueError('parent accounting changed during affected valuation composition')
+    for key, name in cache_files.items():
+        atomic_write_parquet(output / name, cached[key])
+    atomic_write_json(output / 'accounting_checkpoint.json', dict(inputs=inputs,
+        outputs={name: sha256_file(output / name) for name in cache_files.values()}))
+    atomic_write_json(output / 'parent_valuation_reuse.json', dict(
+        contract='verified_original_accounting_affected_valuation_composition_v1',
+        parent=str(parent), parent_checkpoint_sha256=checkpoint_sha,
+        affected_products=affected, unaffected_reused_rows=reused,
+        changed_rows={key: own.height for key, own in zip(cache_files, compiled)},
+        full_financial_rebuilds=0, model_slots_reassigned=True,
+        financial_values_inferred=True, source_market_values_fabricated=False))
+    log('affected_valuation_composed', products=len(affected), rows=cached['rules'].height,
+        unaffected_rule_rows=reused['rules'])
+    return cached
+
+
 def build(source: Path, output: Path, *, start: date, end: date, slots: int = 2816,
           diagnostic_products: list[str] | None = None, reuse_accounting: bool = False,
           previous_sources: Path | None = None, omit_empty_account_prefixes: bool = False,
           empty_prefix_max_volume_participation: float | None = None,
           replay_accounting: Path | None = None, rule_delta: Path | None = None,
           valuation_research_policy: Path | None = None, stock_futures_only: bool = False,
-          universe_scope: str | None = None) -> dict:
+          universe_scope: str | None = None, parent_accounting: Path | None = None,
+          publication_asset_scope: str | None = None, accounting_only: bool = False,
+          prepare_only: bool = False, allow_component_history_before_start: bool = False,
+          recheck_corporate_requirements_from: Path | None = None,
+          official_evidence_cache: Path | None = None,
+          official_spread_research_policy: Path | None = None,
+          holiday_account_dates_source: Path | None = None,
+          holiday_account_workspace: Path | None = None) -> dict:
     begun = time.monotonic()
+    if accounting_only and prepare_only:
+        raise ValueError('accounting-only and prepare-only are separate preparation boundaries')
+    if holiday_account_dates_source is not None and (not accounting_only or reuse_accounting
+            or parent_accounting is not None or previous_sources is not None or replay_accounting is not None):
+        raise ValueError('holiday account dates require a fresh, unpublished accounting-only build')
+    if holiday_account_workspace is not None and holiday_account_dates_source is None:
+        raise ValueError('holiday account workspace requires an explicit holiday account source')
+    if official_evidence_cache is not None and (reuse_accounting or parent_accounting is not None
+            or previous_sources is not None or replay_accounting is not None or diagnostic_products):
+        raise ValueError('official evidence cache requires a fresh ordinary or integrated accounting build')
+    if official_spread_research_policy is not None and official_evidence_cache is None:
+        raise ValueError('spread research reconciliation requires the verified original official cache')
+    if parent_accounting is not None and (reuse_accounting or previous_sources is not None or replay_accounting is not None):
+        raise ValueError('parent accounting selection requires its own fresh output')
+    if recheck_corporate_requirements_from is not None and (parent_accounting is None
+            or not accounting_only or rule_delta is None):
+        raise ValueError('corporate recheck requires explicit parent, rule sources and a fresh accounting-only phase')
     if type(stock_futures_only) is not bool:
         raise ValueError('stock-futures scope must be an explicit boolean')
+    if universe_scope is not None:
+        universe_scope = normalize_futures_universe_scope(universe_scope)
+    if publication_asset_scope is not None:
+        from stockagent.data.tw_futures_decision_clock import clock_asset_classes
+        clock_asset_classes(publication_asset_scope)
     if universe_scope is not None and (stock_futures_only or replay_accounting is not None
             or previous_sources is not None or diagnostic_products):
         raise ValueError('explicit universe scope requires its own ordinary/integrated-source build')
@@ -980,6 +1338,13 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         raise FileExistsError("build output exists; use --reuse-accounting for its exact compiled checkpoint")
     if (output / "build_acceptance.json").exists():
         raise FileExistsError("completed releases are immutable; use the accepted build")
+    holiday_source = None
+    if holiday_account_dates_source is not None:
+        from stockagent.data.tw_futures_holiday_account_dates import load_holiday_account_dates
+        # A frozen code release is not the mutable data workspace. Bind the
+        # source to the caller's workspace rather than the code bundle root.
+        workspace = holiday_account_workspace if holiday_account_workspace is not None else Path.cwd()
+        holiday_source = load_holiday_account_dates(holiday_account_dates_source, workspace=workspace)
     source = source.resolve()
     manifest = json.loads((source / "source_manifest.json").read_text())
     if manifest.get("status") != "source_evidence_complete_training_scope_pending":
@@ -1033,10 +1398,23 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     products = universe["product"].to_list()
     inputs = dict(source_manifest_sha256=sha256_file(source / "source_manifest.json"),
         end=str(end), slots=slots, products=products, calculation=_calculation_identity())
+    if holiday_source is not None:
+        from stockagent.data.tw_futures_holiday_account_dates import HOLIDAY_ACCOUNT_DATES_ABI
+        inputs['holiday_account_dates_research'] = dict(contract=HOLIDAY_ACCOUNT_DATES_ABI,
+            source_fingerprint=holiday_source.fingerprint,
+            implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_holiday_account_dates.py'),
+            valuation_complete=False, publication_allowed=False)
+    if official_spread_research_policy is not None:
+        from stockagent.data.tw_futures_spread_reconciliation import CONTRACT
+        inputs['official_spread_research_reconciliation'] = dict(contract=CONTRACT,
+            policy_sha256=sha256_file(official_spread_research_policy),
+            implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_spread_reconciliation.py'))
     if stock_futures_only:
         inputs['asset_class_scope'] = 'stock_future'
     if universe_scope is not None:
-        inputs['product_universe'] = dict(contract=FUTURES_UNIVERSE_SCOPE_CONTRACT,
+        scope_contract = (FUTURES_UNIVERSE_COMPOSITE_SCOPE_CONTRACT if '+' in universe_scope
+                          else FUTURES_UNIVERSE_SCOPE_CONTRACT)
+        inputs['product_universe'] = dict(contract=scope_contract,
             scope=universe_scope, source_catalog_sha256=sha256_file(source / 'universe/products.csv'),
             legacy_deferred_sha256=sha256_file(source / 'deferred_54_products.csv'),
             legacy_deferrals_applied=False)
@@ -1093,6 +1471,21 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             raise ValueError('composed research history collides in a model slot')
         atomic_write_json(output/'research_accounting_composition.json',inputs)
         log('accepted_affected_replay_reused',products=universe.height,rows=rules.height)
+    elif parent_accounting is not None:
+        if recheck_corporate_requirements_from is not None:
+            cached=reuse_parent_corporate_requirements(parent_accounting,output,inputs,cache_files,
+                baseline_receipt=recheck_corporate_requirements_from,rule_source=rule_delta)
+            log('verified_corporate_requirements_rechecked',rows=cached['rules'].height,
+                financial_recompilations=0)
+        elif valuation_policy is None:
+            cached = reuse_parent_accounting(parent_accounting, output, inputs, cache_files)
+            log('verified_parent_accounting_reselected', rows=cached['rules'].height, financial_recompilations=0)
+        else:
+            cached = reuse_parent_with_valuation(parent_accounting, output, inputs, cache_files,
+                source=accounting_source, universe=universe, rule_delta=rule_delta,
+                information_reviews=information_reviews, policy=valuation_policy, log=log)
+        frame, rules, flags, dependencies = (cached[k] for k in ['frame', 'rules', 'flags', 'dependencies'])
+        del cached
     elif reuse_accounting:
         retained = json.loads(checkpoint.read_text())
         if retained["inputs"] != inputs and previous_sources is None:
@@ -1113,14 +1506,31 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             atomic_write_json(output/"margin_accounting_repair.json",repair)
             atomic_write_json(checkpoint,dict(inputs=inputs,outputs={name:sha256_file(output/name) for name in cache_files.values()}))
         frame, rules, flags, dependencies = (cached[k] for k in ["frame", "rules", "flags", "dependencies"])
+        del cached
         log("verified_accounting_reused", rows=rules.height)
     else:
         frame, rules, flags, dependencies = _compile_accounting(accounting_source, universe, output=output,
             end=end, slots=slots, save=save, log=log, rule_source=rule_delta,
-            information_halt_reviews=information_reviews, valuation_research_policy=valuation_policy)
+            information_halt_reviews=information_reviews, valuation_research_policy=valuation_policy,
+            official_evidence_cache=official_evidence_cache,
+            official_spread_research_policy=official_spread_research_policy,
+            **({'holiday_account_dates_source': holiday_source} if holiday_source is not None else {}))
         save("frame", frame); save("execution_dependencies", dependencies)
+        if holiday_source is not None:
+            holiday_source.verify()
+            if inputs['holiday_account_dates_research']['implementation_sha256'] != sha256_file(
+                    ROOT/'stockagent/data/tw_futures_holiday_account_dates.py'):
+                raise ValueError('holiday account date implementation changed during accounting build')
         atomic_write_json(checkpoint, dict(inputs=inputs,
             outputs={name:sha256_file(output/name) for name in cache_files.values()}))
+    if accounting_only:
+        result = dict(status=('holiday_account_dates_research_checkpoint_not_published' if holiday_source
+                              else 'original_accounting_checkpoint_ready_not_published'),
+            checkpoint_sha256=sha256_file(checkpoint), publication_asset_scope=publication_asset_scope,
+            financial_release_accepted=False, elapsed_s=time.monotonic()-begun,
+            **(dict(holiday_valuation_complete=False, training_admitted=False) if holiday_source else {}))
+        atomic_write_json(output/'accounting_stage.json', result)
+        return result
     context_proof = None
     if omit_empty_account_prefixes:
         rules, flags, empty, suppressed = omit_prefix(frame, rules, flags, **prefix_options)
@@ -1140,14 +1550,21 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     active = flags.filter(~pl.col("is_warmup"))
     keys = ["date", "physical_contract"]
     log("complete_universe_accounting", rows=rules.height, blocked=int(active["has_blocker"].sum()))
-    selected, chosen, coverage = select_complete_margin_components(frame, rules, flags, start=start, end=end)
+    frame, rules, flags = _publication_asset_scope(
+        frame, rules, flags, publication_asset_scope)
+    selected, chosen, coverage = select_complete_margin_components(
+        frame, rules, flags, start=start, end=end,
+        allow_component_history_before_start=allow_component_history_before_start)
     if omit_empty_account_prefixes:
         # Preserve the prefix proof for selected components and their empty
         # origins, without admitting unrelated warmup-only history before the
         # requested stock-context calendar (notably early CPF).
         context_keys = _selected_empty_context_keys(selected,empty,suppressed)
-        selected, chosen, coverage = select_complete_margin_components(frame,rules,flags,start=start,end=end,
-            context_only_keys=context_keys)
+        del selected, chosen, coverage
+        selected, chosen, coverage = select_complete_margin_components(
+            frame, rules, flags, start=start, end=end,
+            context_only_keys=context_keys,
+            allow_component_history_before_start=allow_component_history_before_start)
     save("lifetime_scope", coverage)
     save("blocked_financial_days", active.filter(pl.col("has_blocker")))
     counts = coverage.group_by("product").agg(pl.len().alias("lifetimes"),
@@ -1168,12 +1585,17 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     atomic_write_parquet(material / "continuous_daily.parquet", selected)
     atomic_write_parquet(material / "execution_dependencies.parquet",
         dependencies.join(selected.select(keys), on=keys, how="semi"))
+    from stockagent.data.tw_futures_margin_release import PRIOR_EXCHANGE_LIQUIDITY_CONTRACT
+    liquidity_contract = (PRIOR_EXCHANGE_LIQUIDITY_CONTRACT
+        if "previous_exchange_session_date" in selected.columns else None)
     atomic_write_json(material / "manifest.json", dict(dataset="taifex_all_twd_margin_materialization",
+        **({"prior_exchange_liquidity_contract": liquidity_contract} if liquidity_contract else {}),
         contract_version=futures_slot_layout_version(slots),
         feature_contract_version=TAIFEX_FUTURES_PORTFOLIO_FEATURE_CONTRACT_VERSION,
         fixed_model_output_slots=slots,
         requested_products=chosen_products, products=len(chosen_products), rows=selected.height,
         scope_kind="user_authorized_retrospective_complete_inventory_components",
+        publication_asset_scope=publication_asset_scope,
         full_twd_universe_training_ready=False,
         source_evidence_sha256=sha256_file(source / "source_manifest.json"),
         zero_print_products=selected.group_by("product").agg(pl.col("executable").any().alias("prints"))
@@ -1211,6 +1633,9 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         sources.append(dict(path=str(path.relative_to(admitted)), sha256=sha256_file(path), kind="scoped_source_evidence"))
     valuation_proof = None
     if valuation_research_policy is not None:
+        from stockagent.data.tw_futures_valuation_research import (
+            TERMINAL_SCOPE_FIELD, terminal_cash_conversion_instances,
+            validate_composed_terminal_scope, validate_research_terminal_authorization)
         valuation_path = admitted / 'sources/valuation_research_policy.json'
         combined_policy = dict(replay_policies[0]['document'])
         combined_policy.update(products=sorted(set(p for item in replay_policies for p in item['document']['products'])),
@@ -1220,6 +1645,12 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             **(dict(accepted_replay_manifest_sha256=sha256_file(replay_accounting/'manifest.json'))
                if replay_accounting is not None else
                dict(integrated_policy_sha256=sha256_file(valuation_research_policy))))
+        terminal_instances = sorted(set().union(*(
+            terminal_cash_conversion_instances(item['document']) for item in replay_policies)))
+        combined_policy.update(terminal_cash_conversion_authorized=bool(terminal_instances),
+            **{TERMINAL_SCOPE_FIELD: terminal_instances})
+        validate_composed_terminal_scope(combined_policy, [item['document'] for item in replay_policies])
+        validate_research_terminal_authorization(chosen, combined_policy)
         combined_policy['accepted_policy_inputs'] = []
         for item in replay_policies:
             original_path = admitted/'sources/valuation_policy_inputs'/(item['sha256']+'.json')
@@ -1247,6 +1678,10 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         validate_prefix(selected, chosen,
             dict(context_only_prefix=context_proof, sources=sources), admitted)
     review = dict(status="complete_inventory_components_financially_validated", research_only=True,
+        allow_component_history_before_start=allow_component_history_before_start,
+        component_selection_contract=('complete_verified_components_intersect_requested_horizon_v2'
+            if allow_component_history_before_start else 'complete_components_born_in_requested_horizon_v1'),
+        publication_asset_scope=publication_asset_scope,
         requested_products=products, selected_products=chosen_products,
         lifetime_scope_sha256=sha256_file(output / "lifetime_scope.parquet"),
         source_evidence_sha256=sha256_file(source / "source_manifest.json"),
@@ -1257,6 +1692,10 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     atomic_write_json(admitted / "sources/admission_review.json", review)
     sources.append(dict(path="sources/admission_review.json", sha256=sha256_file(admitted / "sources/admission_review.json"), kind="scope_admission"))
     atomic_write_parquet(admitted / "rules.parquet", chosen)
+    from stockagent.data.tw_futures_price_limits import price_limit_release_contract
+    staged_price_permissions = price_limit_release_contract(chosen)
+    from stockagent.data.tw_futures_execution_terms import final_cash_accounting_contract
+    cash_accounting = final_cash_accounting_contract(chosen)
     atomic_write_json(admitted / "manifest.json", dict(dataset="taifex_futures_margin_execution_terms", schema_version=8 if valuation_proof else 7,
         compiler_version=EXECUTION_TERMS_COMPILER_VERSION, status="complete", point_in_time_verified=False,
         research_only=True, financial_point_in_time_verified=valuation_proof is None, official_position_history_complete=False,
@@ -1271,7 +1710,17 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
         **(dict(valuation_research_contract='frozen_contract_value_research_v1',
             valuation_research_policy=valuation_proof,valuation_research_policy_sha256=valuation_proof['sha256'])
             if valuation_proof else {}),
-        **({'context_only_prefix':context_proof} if context_proof is not None else {})))
+        **({'context_only_prefix':context_proof} if context_proof is not None else {}),
+        **(dict(price_limit_permission_contract=staged_price_permissions) if staged_price_permissions else {}),
+        **(dict(final_cash_accounting_contract=cash_accounting) if cash_accounting else {})))
+    if prepare_only:
+        result = dict(status='selected_materialization_ready_not_published',
+            materialization_manifest_sha256=sha256_file(material/'manifest.json'),
+            execution_terms_manifest_sha256=sha256_file(admitted/'manifest.json'),
+            publication_asset_scope=publication_asset_scope, financial_release_accepted=False,
+            elapsed_s=time.monotonic()-begun)
+        atomic_write_json(output/'preparation_stage.json',result)
+        return result
     release = publish_all_twd_margin_release(materialization=material, execution_terms=admitted / "rules.parquet",
         final_settlement=final_path, output=output / "release")
     summary = dict(release, **review, created_at_utc=datetime.now(UTC).isoformat(),
@@ -1299,10 +1748,31 @@ if __name__ == "__main__":
     parser.add_argument("--slots", type=int, default=2816)
     parser.add_argument('--stock-futures-only', action='store_true',
                         help='Compile only source-declared stock futures, retaining adjusted contract families')
-    parser.add_argument('--universe-scope', choices=['all_twd', 'domestic_equity'],
-                        help='New source-declared scope; retain legacy-deferred products for dated admission')
+    parser.add_argument('--universe-scope', type=normalize_futures_universe_scope,
+                        help='Source-declared scope, or + union of scopes; retain legacy-deferred products '
+                             'for dated admission. Choices: ' + ', '.join(FUTURES_UNIVERSE_SCOPES))
+    parser.add_argument('--publication-asset-scope', choices=['stock_only', 'twd_equity', 'all_twd'],
+                        help='Publish complete inventory components for this consumer; retain the full accounting cache')
+    parser.add_argument('--accounting-only', action='store_true',
+                        help='Stop at the original accounting checkpoint; no publication or training admission')
+    parser.add_argument('--prepare-only', action='store_true',
+                        help='Stop after selected terms/materialization; publish in a fresh bounded process')
+    parser.add_argument('--allow-component-history-before-start', action='store_true',
+                        help='Retain fully verified ancestry for components intersecting the requested horizon')
     parser.add_argument("--previous-sources", type=Path, help="Verified previous source for a margin-only incremental repair")
     parser.add_argument("--reuse-accounting", action="store_true")
+    parser.add_argument('--reuse-parent-accounting', type=Path,
+                        help='Reuse exact original financial calculations; recompute the selected prefix proof')
+    parser.add_argument('--reuse-official-evidence-cache', type=Path,
+                        help='Verify identical raw archives and subset a complete canonical daily-evidence cache')
+    parser.add_argument('--official-spread-research-policy', type=Path,
+                        help='Explicit source-bound non-PIT duplicate-spread-label reconciliation')
+    parser.add_argument('--holiday-account-dates-source', type=Path,
+                        help='Source-bound date-only research candidate for a fresh accounting-only build')
+    parser.add_argument('--holiday-account-workspace', type=Path,
+                        help='Workspace containing pinned holiday inputs; defaults to the current directory')
+    parser.add_argument('--recheck-corporate-requirements-from',type=Path,
+                        help='Exact baseline code receipt for an arithmetic-identical corporate-mask recheck')
     parser.add_argument("--repair-release-metadata", action="store_true")
     parser.add_argument("--diagnostic-product", action="append", default=[])
     parser.add_argument('--rule-delta', type=Path, help='Pending source-bound rules for connected-product replay only')
@@ -1326,6 +1796,18 @@ if __name__ == "__main__":
     parser.add_argument('--empty-prefix-max-volume-participation', type=float,
                         help='Whole-contract prefix ABI; reject runtime participation above this explicit bound')
     args = parser.parse_args()
+    if args.holiday_account_workspace is not None and args.holiday_account_dates_source is None:
+        parser.error('--holiday-account-workspace requires --holiday-account-dates-source')
+    if args.holiday_account_dates_source is not None and (not args.accounting_only
+            or args.reuse_accounting or args.reuse_parent_accounting or args.previous_sources
+            or args.publish_replay or args.rule_delta or args.repair_release_metadata):
+        parser.error('holiday dates require a fresh, unpublished accounting-only build')
+    if args.recheck_corporate_requirements_from is not None and (args.reuse_parent_accounting is None
+            or not args.integrate_rule_delta or not args.accounting_only):
+        parser.error('corporate recheck requires parent accounting, integrated rules and accounting-only phase')
+    if args.reuse_parent_accounting is not None and (args.rule_delta or args.publish_replay
+            or args.reuse_accounting or args.previous_sources or args.repair_release_metadata):
+        parser.error('parent accounting requires a fresh ordinary/integrated build')
     if args.universe_scope and (args.stock_futures_only or args.rule_delta or args.publish_replay
             or args.repair_release_metadata or args.diagnostic_product or args.previous_sources):
         parser.error('explicit universe scope requires a fresh ordinary or integrated-source build')
@@ -1339,6 +1821,11 @@ if __name__ == "__main__":
     if not (args.rule_delta or args.integrate_rule_delta) and (args.prior_affected_replay or args.prior_rule_input_receipt_sha256
                                or args.context_only_prefix_policy or args.valuation_research_policy):
         parser.error('incremental replay arguments require --rule-delta')
+    if args.reuse_official_evidence_cache is not None and (
+            args.rule_delta or args.publish_replay or args.repair_release_metadata):
+        parser.error('official evidence cache is only supported by a fresh ordinary/integrated build')
+    if args.official_spread_research_policy is not None and args.reuse_official_evidence_cache is None:
+        parser.error('spread research reconciliation requires --reuse-official-evidence-cache')
     if args.integrate_rule_delta:
         if (args.rule_delta or args.publish_replay or args.prior_affected_replay
                 or args.prior_rule_input_receipt_sha256 or args.context_only_prefix_policy
@@ -1349,7 +1836,15 @@ if __name__ == "__main__":
             reuse_accounting=args.reuse_accounting,omit_empty_account_prefixes=True,
             empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
             rule_delta=args.integrate_rule_delta,valuation_research_policy=args.valuation_research_policy,
-            stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope)
+            stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope,
+            parent_accounting=args.reuse_parent_accounting, publication_asset_scope=args.publication_asset_scope,
+            accounting_only=args.accounting_only, prepare_only=args.prepare_only,
+            allow_component_history_before_start=args.allow_component_history_before_start,
+            recheck_corporate_requirements_from=args.recheck_corporate_requirements_from,
+            official_evidence_cache=args.reuse_official_evidence_cache,
+            official_spread_research_policy=args.official_spread_research_policy,
+            holiday_account_dates_source=args.holiday_account_dates_source,
+            holiday_account_workspace=args.holiday_account_workspace)
     elif args.publish_replay:
         if (not args.rule_delta or not args.valuation_research_policy or not args.omit_empty_account_prefixes
                 or args.reuse_accounting or args.previous_sources or args.repair_release_metadata
@@ -1358,7 +1853,9 @@ if __name__ == "__main__":
         build(args.sources,args.output,start=args.start,end=args.end,slots=args.slots,
             omit_empty_account_prefixes=True,empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
             replay_accounting=args.publish_replay,rule_delta=args.rule_delta,
-            valuation_research_policy=args.valuation_research_policy)
+            valuation_research_policy=args.valuation_research_policy, publication_asset_scope=args.publication_asset_scope,
+            accounting_only=args.accounting_only, prepare_only=args.prepare_only,
+            allow_component_history_before_start=args.allow_component_history_before_start)
     elif args.rule_delta:
         if not all((args.gap_worklist, args.parent_slot_lifetimes, args.parent_slot_receipt)):
             parser.error('affected replay requires the blocker worklist and bound complete parent slot metadata')
@@ -1380,4 +1877,11 @@ if __name__ == "__main__":
               diagnostic_products=args.diagnostic_product, reuse_accounting=args.reuse_accounting,
               previous_sources=args.previous_sources, omit_empty_account_prefixes=args.omit_empty_account_prefixes,
               empty_prefix_max_volume_participation=args.empty_prefix_max_volume_participation,
-              stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope)
+              stock_futures_only=args.stock_futures_only, universe_scope=args.universe_scope,
+              parent_accounting=args.reuse_parent_accounting, publication_asset_scope=args.publication_asset_scope,
+              accounting_only=args.accounting_only, prepare_only=args.prepare_only,
+              allow_component_history_before_start=args.allow_component_history_before_start,
+              official_evidence_cache=args.reuse_official_evidence_cache,
+              official_spread_research_policy=args.official_spread_research_policy,
+              holiday_account_dates_source=args.holiday_account_dates_source,
+              holiday_account_workspace=args.holiday_account_workspace)

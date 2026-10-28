@@ -38,6 +38,11 @@ def _claim(conn, year):
 
 
 def _runtime(monkeypatch):
+    # Dispatch tests control capacity locally; real host backing space must not
+    # turn a mocked source request into an unrelated disk-guard rejection.
+    monkeypatch.setattr(c, 'AcquisitionCapacitySampler', lambda root: SimpleNamespace(
+        root=root.absolute(), initial_sample=lambda: {'state': 'admitted'},
+        sample=lambda: {'state': 'admitted'}))
     monkeypatch.setenv("FINMIND_TOKEN", "test-placeholder")
     monkeypatch.setattr(c, "_now", lambda: NOW)
     monkeypatch.setattr(c, "load_env_file", lambda *_a, **_kw: None)
@@ -61,6 +66,33 @@ def test_revision_refresh_batches_due_completed_and_empty_years_across_priority_
         assert conn.execute("SELECT COUNT(*) FROM tasks WHERE state='inflight'").fetchone() == (25,)
         c._release_bulk_years(conn, batch)
         assert conn.execute("SELECT state FROM tasks WHERE partition='2013'").fetchone() == ("observed_empty",)
+
+
+def test_overlapping_priority_readers_use_one_full_legal_range_request(tmp_path, monkeypatch):
+    from downloader.provider_priority import CONTRACT, register, inspect
+    _runtime(monkeypatch)
+    years = list(range(2001, 2026))
+    with c._db(tmp_path / 'queue.sqlite3') as conn:
+        _years(conn, years)
+    common = {'contract': CONTRACT, 'provider': 'finmind', 'created_at_utc': NOW.isoformat(),
+              'expires_at_utc': (NOW + timedelta(hours=2)).isoformat()}
+    items = [dict(dataset=DATASET, data_id='', partition=str(year)) for year in years]
+    first = register(tmp_path, {**common, 'reason': 'first reader', 'items': items[:18]}, now=NOW)
+    second = register(tmp_path, {**common, 'reason': 'overlapping reader', 'items': items[10:]}, now=NOW)
+    calls = []
+    def fetch(*args, **kwargs):
+        calls.append(args[-1])
+        return [{'date': f'{year}-12-31', 'value': year} for year in years]
+    monkeypatch.setattr(c, '_fetch_rows', fetch)
+    c.run_once(tmp_path, max_requests=2)
+    assert calls == [{'dataset': DATASET, 'start_date': '2001-01-01', 'end_date': '2025-12-31'}]
+    for result in (first, second):
+        status = inspect(tmp_path, result['request_id'], now=NOW)
+        assert all(item['state'] == 'complete' for item in status['items'])
+    receipts = [json.loads(p.read_text()) for p in (tmp_path / 'receipts' / DATASET / 'all').glob('*.json')]
+    assert len(receipts) == len(years)
+    assert len({receipt['request']['request_id'] for receipt in receipts}) == 1
+    assert all(receipt['request']['request_count'] == 1 for receipt in receipts)
 
 
 def test_not_due_holes_remain_byte_identical_and_do_not_enter_receipts(tmp_path):

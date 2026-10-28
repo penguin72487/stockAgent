@@ -3,6 +3,11 @@
   "workbench.editor.limit.value": 80,
   "workbench.editor.limit.perEditorGroup": false,
   "workbench.editor.limit.excludeDirty": true,
+  "files.exclude": {
+    "artifacts/**": true,
+    "artifacts_*/**": true,
+    "data_*/**": true
+  },
   "files.watcherExclude": {
     "**/artifacts/**": true,
     "**/artifacts_*/**": true,

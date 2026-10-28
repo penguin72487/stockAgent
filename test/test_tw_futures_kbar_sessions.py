@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 
 import polars as pl
@@ -43,7 +43,10 @@ def test_legacy_stock_and_domestic_index_completion_keep_1345_boundary():
 
 
 def test_selected_completed_kbar_subset_does_not_require_unreviewed_query_end_rules():
-    receipt=dict(_completion(14),end='2026-10-20',finished_at_utc='2026-10-21T00:00:00Z')
+    from stockagent.data.tw_price_rules import TAIFEX_STOCK_FUTURES_HISTORY_VERIFIED_THROUGH
+    unreviewed = date.fromisoformat(str(TAIFEX_STOCK_FUTURES_HISTORY_VERIFIED_THROUGH)) + timedelta(days=1)
+    receipt = dict(_completion(14), end=str(unreviewed),
+                   finished_at_utc=f'{unreviewed + timedelta(days=1)}T00:00:00Z')
     validate_kbar_completion(receipt,product='DDF',through=DAY)
     with pytest.raises(ValueError,match='outside verified'):
         validate_kbar_completion(receipt,product='DDF')

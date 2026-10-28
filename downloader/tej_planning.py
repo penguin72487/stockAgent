@@ -407,6 +407,8 @@ def repartition_selector_pending(con, root, row) -> bool:
             (identifier,row['table_id'],'download',row['phase'],row['priority'],
              json.dumps(compact_request(part,definition),ensure_ascii=False,separators=(',',':')),
              expected,SOURCE_SCOPE_CONTRACT,expected,row['safe_prequery_retries'],row['next_attempt_at_utc']))
+    from downloader.provider_priority import inherit
+    inherit(con, row['task_id'], [identifier for identifier, _, _ in children])
     if retry is not None and retry['task_id']==row['task_id']:
         con.execute('UPDATE desktop_retry_windows SET task_id=? WHERE table_id=?',(children[0][0],row['table_id']))
     return True  # Caller commits the queue; durable intent is not a download receipt.
@@ -530,6 +532,8 @@ def repartition_missing_companies(con, root, task: dict, verified: dict, members
                  json.dumps(compact_request(part,definition),ensure_ascii=False,separators=(',',':')),
                  count,SOURCE_SCOPE_CONTRACT,count,task['safe_prequery_retries'],due if missing else None,
                  COMPANY_MEMBERSHIP_DEFERRED if missing else None))
+        from downloader.provider_priority import inherit
+        inherit(con, task['task_id'], [identifier for identifier, _, _, _ in children])
     else:
         con.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=?,last_error_code=? WHERE task_id=?",
                     (due,COMPANY_MEMBERSHIP_DEFERRED,task['task_id']))

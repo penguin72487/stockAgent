@@ -1306,6 +1306,94 @@ def test_position_binding_never_revives_ended_limits_or_exposes_same_day_notice(
     assert r['position_limit'].to_list()==[None,2000,None]
 
 
+def _position_relaxation_fixture():
+    from stockagent.data.tw_futures_margin_preparation import position_candidate_intervals
+    shared=dict(product='TX',effective_phase='product_regular_open',unit='contracts',
+        event_type='absolute_level',issue_date_bound=True,source_url='official',
+        natural_person_limit=2000)
+    rows,issues=position_candidate_intervals([
+        dict(shared,effective_date='2020-01-01',known_at='2019-12-20T23:59:59+08:00',
+             source_content_sha256='a'*64),
+        dict(shared,effective_date='2020-01-06',known_at='2020-01-06T23:59:59+08:00',
+             source_content_sha256='b'*64,natural_person_limit=4000),
+        dict(shared,product='MTX',effective_date='2020-01-01',
+             known_at='2019-12-20T23:59:59+08:00',source_content_sha256='c'*64,
+             event_type='combined_position_formula',natural_person_limit=None,
+             combined_position_base_product='TX',combined_position_ratio='1/4')])
+    assert not issues
+    return pl.DataFrame(rows,infer_schema_length=None,schema_overrides={
+        'known_at':pl.String,'admission_not_before':pl.String,'monthly_position_limit':pl.Float64,
+        'combined_products':pl.List(pl.String),'independent_contract_limit':pl.Float64,
+        'notice_revoked_effective_date':pl.String,'end_rule':pl.String})
+
+
+@pytest.mark.parametrize('new_cap',[2000.,4000.])
+@pytest.mark.parametrize('publication_delay',[0,1])
+def test_position_relaxation_uses_only_prior_known_cap_and_retains_true_clocks(new_cap,publication_delay):
+    from datetime import datetime, timedelta, timezone
+    from stockagent.data.tw_futures_margin_preparation import (
+        POSITION_BOUNDARY_CAP_CONTRACT,bind_dated_position_combinations)
+    intervals=_position_relaxation_fixture().with_columns(
+        pl.when(pl.col('effective_date')=='2020-01-06').then(pl.lit(new_cap))
+            .otherwise(pl.col('position_limit')).alias('position_limit'),
+        pl.when(pl.col('effective_date')=='2020-01-06')
+            .then(pl.lit(f'2020-01-0{6+publication_delay}T23:59:59+08:00'))
+            .otherwise(pl.col('known_at')).alias('known_at'))
+    original=intervals.clone()
+    q=pl.DataFrame(dict(product=['TX','MTX','TX'],
+        date=[date(2020,1,6),date(2020,1,6),date(2020,1,8)]))
+    r=bind_dated_position_combinations(q,intervals).sort('date','product')
+    for product in ('TX','MTX'):
+        row=r.filter((pl.col('date')==date(2020,1,6)) & (pl.col('product')==product)).row(0,named=True)
+        assert row['position_limit']==2000
+        assert row['position_unit']==(1 if product=='TX' else .25)
+        assert row['position_numeric_inputs_resolved'] is True
+        assert datetime.fromisoformat(row['known_at'])<datetime(2020,1,6,tzinfo=timezone(timedelta(hours=8)))
+        assert row['position_boundary_legal_known_at']==f'2020-01-0{6+publication_delay}T23:59:59+08:00'
+        assert row['position_boundary_legal_source_sha256s']==['b'*64]
+        assert row['position_boundary_cap_policy']==POSITION_BOUNDARY_CAP_CONTRACT
+        assert row['position_cap_source_interval_id'] is not None
+        assert 'b'*64 not in row['source_content_sha256s']
+    later=r.filter(pl.col('date')==date(2020,1,8)).row(0,named=True)
+    assert later['position_limit']==new_cap
+    assert later['position_binding_status']=='bound_prior_publication'
+    assert later['position_boundary_cap_policy'] is None
+    assert intervals.equals(original)
+
+
+@pytest.mark.parametrize('failure',[
+    'lower_cap','new_monthly_cap','lower_monthly_cap','different_unit','different_multiplier',
+    'combined_members','independent_limit','formula','delisting','ended_gap','revoked',
+    'prior_not_known','publication_too_late','different_phase','nonfinite_cap','invalid_source'])
+def test_position_relaxation_does_not_admit_tightening_or_unproved_boundaries(failure):
+    from stockagent.data.tw_futures_margin_preparation import bind_dated_position_limits
+    rows=_position_relaxation_fixture().to_dicts()
+    old=next(r for r in rows if r['product']=='TX' and r['effective_date']=='2020-01-01')
+    new=next(r for r in rows if r['product']=='TX' and r['effective_date']=='2020-01-06')
+    if failure=='lower_cap':new['position_limit']=1000.
+    elif failure=='new_monthly_cap':new['monthly_position_limit']=1000.
+    elif failure=='lower_monthly_cap':old['monthly_position_limit']=1500.;new['monthly_position_limit']=1000.
+    elif failure=='different_unit':new['unit']='shares'
+    elif failure=='different_multiplier':new['position_unit']=2.
+    elif failure=='combined_members':new['combined_products']=['TX','MTX']
+    elif failure=='independent_limit':new['independent_contract_limit']=100.
+    elif failure=='formula':new['requires_base_limit_join']=True
+    elif failure=='delisting':old['requires_delisting_clock']=True
+    elif failure=='ended_gap':old['valid_until_date_exclusive']='2020-01-05'
+    elif failure=='revoked':old['notice_revoked_effective_date']='2020-01-06'
+    elif failure=='prior_not_known':old['known_at']='2020-01-06T23:59:59+08:00'
+    elif failure=='publication_too_late':new['known_at']='2020-01-08T23:59:59+08:00'
+    elif failure=='different_phase':new['effective_phase']=1
+    elif failure=='nonfinite_cap':new['position_limit']=float('inf')
+    elif failure=='invalid_source':new['source_content_sha256s']=['unbound']
+    intervals=pl.DataFrame(rows,schema=_position_relaxation_fixture().schema)
+    q=pl.DataFrame(dict(product=['TX'],date=[date(2020,1,6)]))
+    r=bind_dated_position_limits(q,intervals).row(0,named=True)
+    assert r['position_binding_status']=='publication_clock_unresolved'
+    assert r['position_limit'] is None
+    assert r['position_boundary_cap_policy'] is None
+
+
 def test_dated_combination_binds_unobserved_parent_without_reviving_its_gap():
     from stockagent.data.tw_futures_margin_preparation import (
         bind_dated_position_combinations,position_candidate_intervals)

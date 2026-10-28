@@ -131,6 +131,27 @@ def test_scheduler_refreshes_after_each_completed_variant_and_before_next_worker
     assert events == ['plots']  # Refresh skipped completed results once, without retraining.
 
 
+def test_scheduler_retains_actual_launch_error_for_each_failed_case(tmp_path, monkeypatch, capsys):
+    spec = _absolute_scheduler_spec(tmp_path)
+    output = tmp_path / 'output'
+
+    def fail_to_launch(*args, **kwargs):
+        raise PermissionError(13, 'Permission denied', '/sealed/runner.sh')
+
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', fail_to_launch)
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--runner', '/bin/true', '--max-folds', '1',
+        '--auto-resume'])
+    with pytest.raises(SystemExit) as failure:
+        ablation_module.main()
+    assert failure.value.code == 1
+    assert 'PermissionError: [Errno 13]' in capsys.readouterr().out
+    for name in ('learning_rate__first', 'learning_rate__second'):
+        log = (output/name/'ablation_worker.log').read_text()
+        assert 'PermissionError: [Errno 13] Permission denied' in log
+        assert '/sealed/runner.sh' in log
+
+
 def test_shared_plots_only_never_builds_configs_or_rewrites_training_summary(tmp_path, monkeypatch):
     spec = _absolute_scheduler_spec(tmp_path)
     output = tmp_path / 'output'
@@ -1152,9 +1173,98 @@ def test_failure_kind_distinguishes_cuda_infrastructure_from_oom() -> None:
     )
 
 
-def test_scheduler_does_not_retry_source_integrity_failure(
+def test_stalled_oom_recovery_requires_current_attempt_log_and_failed_lifecycle(tmp_path, monkeypatch):
+    import json
+
+    log = tmp_path / 'ablation_worker.log'
+    stale = 'CUDA out of memory in an earlier attempt\n'
+    log.write_text(stale)
+    progress = tmp_path / 'progress.json'
+    progress.write_text(json.dumps({'state':'failed', 'failure':{
+        'type':'OutOfMemoryError', 'message':'CUDA out of memory'}}))
+    class Running:
+        def poll(self):
+            return None
+    job = ablation_module._ActiveRun(order=1, run={'name':'fixture','output_dir':tmp_path},
+        command=[], process=Running(), started=0, log_handle=None, log_path=log,
+        log_start_offset=len(stale.encode()), attempt=2, consecutive_no_progress_failures=0,
+        progress_before=(0,0,0))
+    stopped = []
+    monkeypatch.setattr(ablation_module, '_terminate_process_tree', lambda p: stopped.append(p))
+    ablation_module._recover_stalled_reported_oom(job, 0)
+    ablation_module._recover_stalled_reported_oom(job, 31)
+    assert stopped == []  # The OOM text predates this attempt.
+    with log.open('a') as handle:
+        handle.write('CUDA out of memory in current attempt\n')
+    progress.write_text(json.dumps({'state':'running','failure':None}))
+    ablation_module._recover_stalled_reported_oom(job, 32)
+    ablation_module._recover_stalled_reported_oom(job, 63)
+    assert stopped == []  # A current error string is not a terminal lifecycle.
+
+
+def test_scheduler_retries_after_reported_oom_with_stuck_runner(tmp_path, monkeypatch):
+    import json
+
+    spec = _absolute_scheduler_spec(tmp_path)
+    payload = yaml.safe_load(spec.read_text())
+    payload['runtime'] = {'capacity_retry': {'max_retries':1, 'minimum_train_batch':16}}
+    payload['postprocess_plots'] = []
+    payload['matrix']['dimensions'][0]['values'] = payload['matrix']['dimensions'][0]['values'][:1]
+    spec.write_text(yaml.safe_dump(payload))
+    base = Path(payload['base_config'])
+    base_payload = yaml.safe_load(base.read_text())
+    base_payload['training'].update(batch_size_train=64, batch_size_eval=8,
+                                    eval_auto_chunk_rows_cap=8, financial_transformer={})
+    base.write_text(yaml.safe_dump(base_payload))
+    runner = tmp_path / 'stuck-runner.sh'
+    runner.write_text('''#!/usr/bin/env bash
+set -eu
+out="$(dirname "$2")/training"
+if [[ "$2" == *attempt-00/config.yaml ]]; then
+  printf '%s\\n' '{"state":"failed","failure":{"type":"OutOfMemoryError","message":"CUDA out of memory"}}' > "$out/progress.json"
+  printf '%s\\n' 'torch.OutOfMemoryError: CUDA out of memory'
+  sleep 60 &
+  wait
+else
+  mkdir -p "$out/fold_01"
+  printf '%s\\n' '{}' > "$out/fold_01/fold_complete.json"
+fi
+''')
+    runner.chmod(0o755)
+    original_terminate = ablation_module._terminate_process_tree
+    monkeypatch.setattr(ablation_module, '_terminate_process_tree',
+                        lambda process: original_terminate(process, grace_s=0.1))
+    monkeypatch.setattr(ablation_module, '_OOM_FAILURE_GRACE_SECONDS', 0.1)
+    monkeypatch.setattr(ablation_module, '_CAPACITY_OBSERVE_INTERVAL_SECONDS', 0.1)
+    output = tmp_path/'output'
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--runner', str(runner), '--max-folds', '1'])
+    ablation_module.main()
+    selection = json.loads((output/'_capacity/learning_rate__first/selection.json').read_text())
+    assert len(selection['attempts']) == 2
+    assert selection['attempts'][1]['capacity_changes']['training.batch_size_train'] == [64,32]
+    assert not selection['attempts'][1]['optimizer_resume_from_previous_attempt']
+    assert (output/'learning_rate__first/fold_01/fold_complete.json').is_file()
+    assert json.loads((output/'summary.json').read_text())[0]['status'] == 'succeeded'
+
+
+@pytest.mark.parametrize(("failure_log", "kind"), [
+    ("SyntaxError: invalid decimal literal\n", "source_integrity_failure"),
+    ("[rank1]: ValueError: stock context omits 185 all-TWD futures sessions; "
+     "first=2010-04-23 last=2026-02-12\nChildFailedError\n", "futures_account_calendar_mismatch"),
+    ("[rank0]: ValueError: stock context omits 6 in-horizon all-TWD account dates; "
+     "missing_cash_only_accounting_dates=6\nChildFailedError\n", "futures_account_calendar_mismatch"),
+    ("[rank0]: ValueError: futures broker holiday account calendar 2011-01-28 to 2011-02-08 "
+     "requires source-bound 2011/2012 processing and valuation review\nChildFailedError\n",
+     "futures_account_calendar_mismatch"),
+    ("[rank0]: ValueError: holiday nonterminal valuations require complete source-bound "
+     "account review\nChildFailedError\n", "futures_account_calendar_mismatch"),
+])
+def test_scheduler_does_not_retry_deterministic_source_or_calendar_failure(
     tmp_path: Path,
     monkeypatch,
+    failure_log: str,
+    kind: str,
 ) -> None:
     spec = tmp_path / "source_failure.yaml"
     spec.write_text(
@@ -1185,7 +1295,7 @@ matrix:
             type(self).attempts += 1
             self.pid = type(self).next_pid
             self.returncode = None
-            kwargs["stdout"].write("SyntaxError: invalid decimal literal\n")
+            kwargs["stdout"].write(failure_log)
             kwargs["stdout"].flush()
 
         def poll(self):
@@ -1221,7 +1331,12 @@ matrix:
     summary = yaml.safe_load(
         (output_root / "summary.json").read_text(encoding="utf-8")
     )
-    assert summary[0]["failure_kind"] == "source_integrity_failure"
+    assert summary[0]["failure_kind"] == kind
+
+
+def test_calendar_failure_classification_requires_the_actual_dated_error() -> None:
+    assert _failure_kind(1, "ChildFailedError\nstock context omits unknown dates") == "distributed_worker_failure"
+    assert _failure_kind(1, "ChildFailedError\nstock context omits 3 other dates") == "distributed_worker_failure"
 
 
 def test_pinned_panel_cache_resolves_snapshot_receipt_and_checks_identity(

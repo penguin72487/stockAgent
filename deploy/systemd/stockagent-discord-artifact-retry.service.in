@@ -12,13 +12,18 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 StateDirectory=stockagent-discord-artifact-retry
 Environment="STOCKAGENT_ARTIFACT_RETRY_STATE_PATH=/var/lib/stockagent-discord-artifact-retry/latest.json"
+# Only the bounded source-only worker may run during preopen; ordinary
+# historical inference keeps its original protected-runway admission.
+Environment="STOCKAGENT_PREOPEN_PRIORITY_SOURCE=1"
 # The controller enforces each owner's own runway: latest-close 13m, history
 # 123m. Never put model inference here or let the 2h history gate mask a close.
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --request-due-work
 TimeoutStartSec=30s
-Nice=15
-CPUWeight=10
-IOWeight=10
+# This lightweight controller wakes the source-only preopen owner; delaying
+# the controller under load can otherwise prevent the higher-priority repair.
+Nice=-5
+CPUWeight=10000
+IOWeight=10000
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

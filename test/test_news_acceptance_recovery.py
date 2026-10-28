@@ -5,6 +5,7 @@ import shutil
 import pytest
 
 from downloader.artifact_io import atomic_write_json
+from downloader import news_fulltext_queue as queue_module
 from downloader.news_fulltext import fetch_article
 from downloader.news_fulltext_queue import NewsQueue
 from downloader.news_fulltext_queue import sorted_acceptance_receipt_paths
@@ -68,11 +69,11 @@ def test_committed_receipts_are_still_parsed_but_use_one_covering_lookup(config,
     queue, http = accepted_queue(config, tmp_path)
     try:
         reads, statements = [], []
-        original_read = type(tmp_path).read_bytes
+        original_read = queue_module.read_acceptance_receipt_input
         def read(path, *args, **kwargs):
             reads.append(path)
             return original_read(path, *args, **kwargs)
-        monkeypatch.setattr(type(tmp_path), 'read_bytes', read)
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', read)
         before = queue.db.total_changes
         queue.db.set_trace_callback(statements.append)
         queue.recover_acceptance()

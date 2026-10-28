@@ -1,6 +1,7 @@
 """Receipt-only close refresh; no substitution for a missing projection date."""
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -27,6 +28,16 @@ def stale(tmp_path, monkeypatch):
                 "paper_inference": {"status": "verified", "raw_source_publication": False,
                                     "contract": "factorized_paper_projection_lag1_v1",
                                     "decision_session": "2020-03-03"}}
+    public = tmp_path / "data_tw_public"
+    public.mkdir()
+    calendar = {}
+    for name in ("twse_api_holidayschedule_holidayschedule.parquet",
+                 "twse_taiex_ohlc.parquet", "twse_taiex_ohlc.summary.json"):
+        content = name.encode()
+        (public / name).write_bytes(content)
+        calendar[name] = hashlib.sha256(content).hexdigest()
+    manifest["paper_inference"]["source_identity"] = {
+        "decision_calendar": {"input_sha256": calendar}}
     path.write_text(json.dumps(manifest))
     cfg = LiveMarketConfig(market="factorized", label="factorized", config_path="", completed_session_command=(
         "scripts/update_tw_day_trade_factorized_live.py", "--phase", "completed"))
@@ -106,6 +117,48 @@ def test_current_projection_has_no_refresh_request(stale):
     assert runner._stale_factorized_projection_request() is None
 
 
+@pytest.mark.parametrize("name", ["twse_api_holidayschedule_holidayschedule.parquet",
+                                 "twse_taiex_ohlc.parquet", "twse_taiex_ohlc.summary.json"])
+def test_calendar_revision_requests_recovery_without_a_new_completed_close(stale, monkeypatch, name):
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(runner, "_load_discord_bot", lambda: pytest.fail("no model import in hint"))
+    (runner.ROOT / "data_tw_public" / name).write_bytes(b"verified-calendar-revision")
+
+    hint = runner._stale_factorized_projection_request()
+
+    assert hint["reason"] == "decision_calendar_inputs_changed"
+    assert hint["expected_completed_session"] == hint["projection_end"] == "2020-03-03"
+    assert hint["current_calendar_sha256"][name] == hashlib.sha256(b"verified-calendar-revision").hexdigest()
+    assert hint["advisory_only"] is True and hint["model_executed"] is False
+
+
+def test_calendar_metadata_touch_does_not_force_a_rebuild(stale):
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    path.write_text(json.dumps(manifest))
+    (runner.ROOT / "data_tw_public/twse_taiex_ohlc.parquet").touch()
+    assert runner._stale_factorized_projection_request() is None
+
+
+def test_legacy_missing_calendar_proof_requests_producer_verification(stale):
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    manifest["paper_inference"].pop("source_identity")
+    path.write_text(json.dumps(manifest))
+    assert runner._stale_factorized_projection_request()["reason"] == "decision_calendar_proof_missing"
+
+
+def test_malformed_calendar_proof_is_not_an_accepted_refresh_hint(stale):
+    _cfg, _completed, path, manifest = stale
+    manifest["dates"].append("2020-03-03")
+    manifest["paper_inference"]["source_identity"]["decision_calendar"]["input_sha256"] = {"../../other": "x"}
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="decision-calendar input proof"):
+        runner._stale_factorized_projection_request()
+
+
 def test_missing_projection_is_a_source_recovery_request_not_a_silent_idle(stale):
     _cfg, _completed, path, _manifest = stale
     path.unlink()
@@ -120,7 +173,7 @@ def test_current_tail_still_requests_the_selected_formal_history_scope(stale, mo
 
     _cfg, _completed, path, manifest = stale
     manifest["dates"].append("2020-03-03")
-    manifest["paper_inference"]["source_identity"] = {"start_date": "2020-03-02"}
+    manifest["paper_inference"]["source_identity"]["start_date"] = "2020-03-02"
     path.write_text(json.dumps(manifest))
     monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(
         data=SimpleNamespace(panel_start_date="2014-01-06")))
@@ -137,7 +190,7 @@ def test_requested_non_session_start_does_not_cause_endless_refresh(stale, monke
 
     _cfg, _completed, path, manifest = stale
     manifest["dates"].append("2020-03-03")
-    manifest["paper_inference"]["source_identity"] = {"start_date": "2020-03-01"}
+    manifest["paper_inference"]["source_identity"]["start_date"] = "2020-03-01"
     path.write_text(json.dumps(manifest))
     monkeypatch.setattr(config_module, "load_config", lambda _: SimpleNamespace(
         data=SimpleNamespace(panel_start_date="2020-03-01")))

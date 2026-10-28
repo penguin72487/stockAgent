@@ -7,11 +7,16 @@ import argparse
 import csv
 import json
 import os
+import sys
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from stockagent.live.paper_journal import open_paper_journal
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 CAPACITY_REASONS = {
@@ -23,7 +28,7 @@ CAPACITY_REASONS = {
 
 
 def _rows(path: Path):
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         size = path.stat().st_size
         while handle.tell() < size:
             line = handle.readline()

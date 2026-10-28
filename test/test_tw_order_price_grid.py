@@ -23,6 +23,36 @@ def test_stock_and_etf_price_buckets_are_not_interchangeable():
     np.testing.assert_array_equal(tick_size_numpy(prices, security_types="etf"), [.01]*3 + [.05]*7)
 
 
+def test_compact_product_metadata_broadcasts_across_prices_and_rule_dates():
+    prices = np.broadcast_to([10., 50., 100., 1000., 1001., 2500.], (2, 9, 6))
+    kinds = np.array(["stock", "emerging_stock", "etf", "reit", "etn", "warrant",
+                      "convertible_bond", "stock_future", "etf_future"])[:, None]
+    dates = np.array(["2026-07-03", "2026-07-06"], dtype="datetime64[D]")[:, None, None]
+    stock = [.05, .1, .5, 5., 5., 5.]
+    etf = [.01, .05, .05, .05, .05, .05]
+    before = np.array([stock, stock, etf, etf, etf, [.1, .5, 1., 5., 5., 5.],
+                       [.05, .05, .05, 5., 5., 5.], stock, etf])
+    after = before.copy()
+    after[7, 3:5] = 1.
+    np.testing.assert_array_equal(tick_size_numpy(prices, dates, security_types=kinds),
+                                  np.stack([before, after]))
+    on_grid = price_on_tick_grid_numpy(prices, dates, security_types=kinds)
+    assert not on_grid[0, 7, 4] and on_grid[1, 7, 4]
+    assert not on_grid[:, 0, 4].any() and on_grid[:, 2, 4].all()
+    np.testing.assert_array_equal(kinds[:, 0], ["stock", "emerging_stock", "etf", "reit", "etn",
+                                               "warrant", "convertible_bond", "stock_future", "etf_future"])
+
+
+def test_product_validation_preserves_empty_and_invalid_broadcast_contracts():
+    empty = tick_size_numpy(np.empty((3, 0)), np.datetime64("2026-07-06"),
+                            security_types=np.array(["unknown"] * 3)[:, None])
+    assert empty.shape == (3, 0)
+    with pytest.raises(ValueError, match="unsupported TW"):
+        tick_size_numpy(np.full((3, 2), np.nan), security_types=np.array(["unknown"] * 3)[:, None])
+    with pytest.raises(ValueError, match="broadcast"):
+        tick_size_numpy(np.ones((3, 2)), security_types=np.array(["stock"] * 3))
+
+
 def test_stock_futures_2026_change_is_dated_and_does_not_rewrite_cash_stock():
     prices = np.array([999., 1000., 1001., 2499., 2500.])
     before = np.datetime64("2026-07-03")

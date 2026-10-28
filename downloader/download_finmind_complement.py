@@ -20,22 +20,25 @@ import multiprocessing
 import os
 from pathlib import Path
 import re
+import signal
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from downloader.finmind_runtime import idle_heartbeat, wait_for_next_cycle, retryable_queue_error, optimize_queue
 from downloader.finmind_queue_indexes import (dispatch_indexes, ensure_status_index, ensure_release_reserve_index,
                                              ensure_us_publication_index, ensure_periodic_index,
                                              ensure_eta_read_indexes, periodic_index, PERIODIC_PREDICATE)
 from downloader.finmind_status_aggregates import StatusConnection, task_status_aggregates
-from typing import Any
+from typing import Any, Callable
 
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
 from urllib3.exceptions import ReadTimeoutError
+from stockagent.data_sync.acquisition_capacity_sampler import AcquisitionCapacitySampler
 
 from downloader.artifact_io import (atomic_write_bytes, atomic_write_json, atomic_write_parquet,
                                     durable_replace, table_from_records)
@@ -90,7 +93,7 @@ BULK_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 BULK_MAX_RESPONSE_ROWS = 1_000_000
 STATUS_INTERVAL_SECONDS = 20
 GOLD_TIMESTAMP_CONTRACT_VERSION = 1
-DISPATCH_CONTRACT_VERSION = 11  # Continuous refill must not starve recent full-history renewals.
+DISPATCH_CONTRACT_VERSION = 12  # Backing-volume admission also protects continuous refill.
 # One shared-quota probe plus hash-verified local replay establishes the upper
 # bound at inclusive midnight, not at the end of that calendar day.
 GOLD_RANGE_PROOF = "artifacts/data_quality/finmind_gold_range_20260927T030804094218Z.json"
@@ -577,14 +580,18 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                background_only: bool = False,
                datasets: tuple[str, ...] | None = None,
                advance_cursor: bool = False,
-               required_keys: tuple[tuple[str, str, str], ...] | None = None) -> Task | None:
+               required_keys: tuple[tuple[str, str, str], ...] | None = None,
+               source_verification_priority: bool = False,
+               finite_query_priority: bool = False) -> Task | None:
+    from downloader import finmind_product_query_verification as product_verification
     retry_filter, retry_args = retry_cohorts.admission_clause(connection, now)
     if required_keys is not None:
         # Bounded accounting repairs use this same owner, storage and quota
         # lane. Completed/empty, inflight, blocked and cooling keys are not
         # reset or replaced, and there is no fallback to unrelated history.
         for dataset, data_id, partition in required_keys:
-            if dataset in delegated or (datasets is not None and dataset not in datasets):
+            if ((dataset in delegated and not product_verification.permits(connection, (dataset, data_id, partition)))
+                    or (datasets is not None and dataset not in datasets)):
                 continue
             row = connection.execute(
                 'SELECT dataset,data_id,partition,kind,priority,state FROM tasks '
@@ -596,6 +603,18 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                     and (not background_only or row[4] > 0):
                 return Task(*row)
         return None
+    if source_verification_priority and not incremental_only and datasets is None:
+        verified = product_verification.next_task(connection, now, retry_filter, retry_args)
+        if verified is not None:
+            return Task(*verified)
+    if not incremental_only and datasets is None:
+        from downloader.provider_priority import finmind_candidate
+        requested = finmind_candidate(connection, now, delegated=delegated,
+                                      retry_filter=retry_filter, retry_args=retry_args,
+                                      background_only=background_only,
+                                      preempt_foreign_history=finite_query_priority)
+        if requested is not None:
+            return Task(*requested)
     # A finite, operator-requested backfill shares this worker and its quota.
     # Never bypass the caller's incremental-only reserve or terminal failures.
     if not incremental_only and datasets is None and connection.execute(
@@ -608,6 +627,12 @@ def _next_task(connection: sqlite3.Connection, now: datetime,
                 "(state IN ('pending','complete','observed_empty','failed') "
                 "AND next_attempt_at_utc<=?))" + excluded_due + retry_filter + " LIMIT 1",
                 (_iso(now), *sorted(delegated), *retry_args)).fetchone():
+            # A registered source-quality comparison requests a different
+            # query shape; a healthy whole-market owner cannot complete it.
+            # It remains finite and below due refreshes and the same quota.
+            verified = product_verification.next_task(connection, now, retry_filter, retry_args)
+            if verified is not None:
+                return Task(*verified)
             excluded_priority = (' AND t.dataset NOT IN (' + ','.join('?' for _ in delegated) + ')'
                                  if delegated else '')
             row = connection.execute(
@@ -1201,6 +1226,25 @@ def _response_json(response: requests.Response, max_response_bytes: int | None) 
     return json.loads(body)
 
 
+def _client_error(status: int, message: str, limiter: SharedRateLimiter) -> SourceError:
+    """HTTP status and JSON status use the same evidence-based classification."""
+    message = message.lower()
+    if "ip banned" in message:
+        limiter.defer(1800)
+        return SourceError("ip_banned", retry_after=1800)
+    if status == 401 or "tokenillegal" in message or "invalid token" in message:
+        return SourceError("invalid_token", retry_after=0)
+    if "level" in message and ("update" in message or "sponsor" in message):
+        return SourceError("not_entitled", retry_after=0)
+    if "too many" in message or "rate limit" in message:
+        limiter.defer(3600)
+        return SourceError("rate_limited", retry_after=3600)
+    # An unclassified gateway/HTTP denial does not establish a plan
+    # restriction. Keep the ordinary bounded, one-hour retry instead of
+    # permanently holding this dataset and all of its future increments.
+    return SourceError("http_403", retry_after=3600) if status == 403 else SourceError("provider_bad_request", retry_after=0)
+
+
 def _response_rows(response: requests.Response, limiter: SharedRateLimiter,
                    *, max_response_bytes: int | None) -> list[dict[str, Any]]:
     if response.status_code in {402, 429}:
@@ -1212,28 +1256,12 @@ def _response_rows(response: requests.Response, limiter: SharedRateLimiter,
         raise SourceError("rate_limited", retry_after=retry)
     if response.status_code == 401:
         raise SourceError("invalid_token", retry_after=0)
-    if response.status_code == 403:
+    if response.status_code in {400, 403}:
         try:
             message = str(_response_json(response, max_response_bytes).get("msg", "")).lower()
         except (ValueError, AttributeError):
             message = ""
-        if "ip banned" in message:
-            limiter.defer(1800)
-            raise SourceError("ip_banned", retry_after=1800)
-        raise SourceError("not_entitled", retry_after=0)
-    if response.status_code == 400:
-        try:
-            message = str(_response_json(response, max_response_bytes).get("msg", "")).lower()
-        except (ValueError, AttributeError):
-            message = ""
-        if "tokenillegal" in message or "invalid token" in message:
-            raise SourceError("invalid_token", retry_after=0)
-        if "level" in message and ("update" in message or "sponsor" in message):
-            raise SourceError("not_entitled", retry_after=0)
-        if "too many" in message or "rate limit" in message:
-            limiter.defer(3600)
-            raise SourceError("rate_limited", retry_after=3600)
-        raise SourceError("provider_bad_request", retry_after=0)
+        raise _client_error(response.status_code, message, limiter)
     if 400 <= response.status_code < 500:
         raise SourceError("provider_bad_request", retry_after=0)
     if response.status_code != 200:
@@ -1245,16 +1273,8 @@ def _response_rows(response: requests.Response, limiter: SharedRateLimiter,
     if isinstance(payload, dict) and payload.get("status") in {402, 429}:
         limiter.defer(3600)
         raise SourceError("rate_limited", retry_after=3600)
-    if isinstance(payload, dict) and payload.get("status") == 400:
-        message = str(payload.get("msg", "")).lower()
-        if "tokenillegal" in message or "invalid token" in message:
-            raise SourceError("invalid_token", retry_after=0)
-        if "level" in message and ("update" in message or "sponsor" in message):
-            raise SourceError("not_entitled", retry_after=0)
-        raise SourceError("provider_bad_request", retry_after=0)
-    if isinstance(payload, dict) and payload.get("status") == 403 and "ip banned" in str(payload.get("msg", "")).lower():
-        limiter.defer(1800)
-        raise SourceError("ip_banned", retry_after=1800)
+    if isinstance(payload, dict) and payload.get("status") in {400, 401, 403, 404}:
+        raise _client_error(payload['status'], str(payload.get("msg", "")), limiter)
     if not isinstance(payload, dict) or payload.get("status") != 200 or payload.get("msg") != "success":
         raise SourceError("provider_rejected", retry_after=3600)
     rows = payload.get("data")
@@ -1891,11 +1911,65 @@ def _status(connection: sqlite3.Connection, root: Path, *, state: str,
     return result
 
 
+def _capacity_pause(root: Path, admission: dict[str, Any]) -> dict[str, Any]:
+    """Report a blocked dispatch without changing the last source observation."""
+    previous = _read_metadata(root / 'status.json')
+    result = {**previous, 'schema_version': 1, 'state': 'disk_guard',
+              'observed_at_utc': _iso(_now()), 'active_task': None,
+              'dispatch_contract_version': DISPATCH_CONTRACT_VERSION,
+              'capacity_admission': admission,
+              'source_status_observed_at_utc': previous.get(
+                  'source_status_observed_at_utc', previous.get('observed_at_utc'))}
+    atomic_write_json(root / 'status.json', result)
+    return result
+
+
+def _interrupt_on_sigterm(_signum: int, _frame: Any) -> None:
+    """Let owner contexts drain and close their pools during service shutdown."""
+    raise KeyboardInterrupt
+
+
+def _validate_registered_finite_keys(connection: sqlite3.Connection, root: Path, request_id: str,
+                                     keys: tuple[tuple[str, str, str], ...], now: datetime) -> None:
+    """Require the exact native keys and a live, intact priority receipt."""
+    from downloader.provider_priority import task_key
+    if not re.fullmatch(r'[0-9a-f]{64}', request_id):
+        raise ValueError('finite priority request id must be a SHA256')
+    path = root / 'priority_queries' / (request_id + '.json')
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('finite priority receipt is missing')
+    raw = path.read_bytes()
+    receipt = json.loads(raw)
+    plan = receipt.get('plan', {})
+    if (receipt.get('request_id') != request_id or plan.get('provider') != 'finmind'
+            or hashlib.sha256(json.dumps(plan, sort_keys=True, ensure_ascii=False).encode()).hexdigest() != request_id):
+        raise ValueError('finite priority receipt identity mismatch')
+    expected = {task_key({'dataset': k[0], 'data_id': k[1], 'partition': k[2]}) for k in keys}
+    registered = {task_key(item) for item in plan.get('items', [])}
+    if not expected or not expected.issubset(registered) or path.read_bytes() != raw:
+        raise ValueError('finite priority selection is outside the intact request')
+    if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='provider_query_intents'").fetchone():
+        raise ValueError('finite priority intents are missing')
+    placeholders = ','.join('?' for _ in expected)
+    active = {row[0] for row in connection.execute(
+        'SELECT task_key FROM provider_query_intents WHERE request_id=? AND created_at_utc<=? '
+        f'AND expires_at_utc>? AND task_key IN ({placeholders})',
+        (request_id, _iso(now), _iso(now), *sorted(expected)))}
+    if active != expected:
+        raise ValueError('finite priority keys are unregistered or expired')
+
+
 def run_once(root: Path, *, max_requests: int = 0,
              datasets: tuple[str, ...] | None = None,
              required_keys: tuple[tuple[str, str, str], ...] | None = None,
-             keep_prepared_on_priority_wait: bool = False) -> dict[str, Any]:
+             keep_prepared_on_priority_wait: bool = False,
+             capacity_sampler: AcquisitionCapacitySampler | None = None,
+             finite_option_priority: bool = False,
+             finite_option_validate: Callable[[], None] | None = None,
+             finite_priority_request_id: str | None = None) -> dict[str, Any]:
     cycle_started = time.monotonic()
+    if finite_option_priority != (finite_option_validate is not None):
+        raise ValueError('finite option priority requires a per-dispatch plan validator')
     if required_keys is not None:
         required_keys = tuple(dict.fromkeys(required_keys))
         if (not 0 < len(required_keys) <= 64
@@ -1906,7 +1980,24 @@ def run_once(root: Path, *, max_requests: int = 0,
         unknown = set(datasets) - set(ALL_DATASETS)
         if not datasets or unknown:
             raise ValueError(f"datasets must select existing Complement sources; unknown={sorted(unknown)}")
+    if finite_option_priority:
+        from downloader.finmind_option_finite_priority import MAX_OPTION_KEYS
+        if (datasets is not None or not required_keys or len(required_keys) > MAX_OPTION_KEYS
+                or any(key[0] != 'TaiwanOptionDaily' for key in required_keys)
+                or not 0 < max_requests <= len(required_keys)):
+            raise ValueError('finite option priority requires bounded exact option-product keys')
+    if finite_priority_request_id is not None and (
+            finite_option_priority or datasets is not None or not required_keys
+            or not 0 < max_requests <= len(required_keys)):
+        raise ValueError('registered priority requires bounded exact keys and no capacity exception')
     root.mkdir(parents=True, exist_ok=True)
+    if capacity_sampler is not None and capacity_sampler.root != root.absolute():
+        raise ValueError('capacity sampler belongs to a different workspace')
+    capacity = capacity_sampler if capacity_sampler is not None else AcquisitionCapacitySampler(root)
+    admission = (capacity.initial_sample(timeout_seconds=29)
+                 if finite_option_priority or finite_priority_request_id is not None else capacity.initial_sample())
+    if admission.get('state') not in {'admitted', 'not_enrolled'}:
+        return _capacity_pause(root, admission)
     load_env_file(Path(__file__).resolve().parents[1] / ".env", allowed_names=("FINMIND_TOKEN",))
     token = os.environ.get("FINMIND_TOKEN", "").strip()
     if not token:
@@ -1923,6 +2014,8 @@ def run_once(root: Path, *, max_requests: int = 0,
             ProcessPoolExecutor(max_workers=pipeline_config['derivation_workers'],
                 mp_context=multiprocessing.get_context('spawn'), initializer=object_pipeline.initialize_cpu,
                 initargs=(pipeline_config['arrow_threads'],)) as processors:
+        if finite_priority_request_id is not None:
+            _validate_registered_finite_keys(connection, root, finite_priority_request_id, required_keys, _now())
         try:
             account = verified_account(session, token, root.parent)
             limiter = rate_limiter(account)
@@ -1945,10 +2038,18 @@ def run_once(root: Path, *, max_requests: int = 0,
         connection.commit()
         atomic_write_json(root / 'correction_status.json', {'observed_at_utc': _iso(_now()), **correction_summary})
         delegated = _sponsor_delegated(root, _now()) if account["tier"] in {"Sponsor", "SponsorPro"} else frozenset()
+        admission = (capacity.initial_sample(timeout_seconds=29)
+                     if finite_option_priority or finite_priority_request_id is not None else capacity.initial_sample())
+        if admission.get('state') not in {'admitted', 'not_enrolled'}:
+            return _capacity_pause(root, admission)
         _status(connection, root, state="running", delegated=delegated)
         last_status_at = time.monotonic()
         while not max_requests or completed < max_requests:
             now = _now()
+            if finite_option_validate is not None:
+                finite_option_validate()
+            if finite_priority_request_id is not None:
+                _validate_registered_finite_keys(connection, root, finite_priority_request_id, required_keys, now)
             previous_tier = account.get('tier')
             previous_quota = account.get('official_requests_per_hour')
             account = refresh_dispatch_account(account, token, root.parent, now)
@@ -1961,18 +2062,43 @@ def run_once(root: Path, *, max_requests: int = 0,
             local = now.astimezone(TAIPEI)
             if shutil.disk_usage(root).free < MIN_FREE_BYTES:
                 return _status(connection, root, state="disk_guard", last=last, delegated=delegated)
+            admission = capacity.sample()
+            if admission.get('state') not in {'admitted', 'not_enrolled'}:
+                _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                return _capacity_pause(root, admission)
             if protected_stock_opening(now):
                 return _status(connection, root, state="protected_opening", last=last, delegated=delegated)
             reservation = incremental_reservation(root.parent, now)
+            if required_keys is None and datasets is None:
+                from downloader import finmind_product_query_verification as product_verification
+                from downloader.provider_priority import finmind_reservation
+                reservation = finmind_reservation(connection, reservation, now, delegated)
+            elif finite_option_priority or finite_priority_request_id is not None:
+                from downloader.finmind_product_query_verification import prioritize_source_checks
+                # The per-dispatch validator above has already checked the
+                # registered finite plan and these exact owner keys. Apply the
+                # same dispatch-only yield as the normal priority lane: dated
+                # releases, future reservations and quota remain protected.
+                reservation = prioritize_source_checks(
+                    connection, reservation, now, delegated, finite_query_ready=True)
             budget = backfill_budget(
                 account, root.parent, fixed_incremental_requests=reservation['reserve_requests'],
                 in_flight=0, now=now, prioritize_due=True, reservation_plan=reservation,
             )
             if budget.get('remaining', 1) <= 0:
                 return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+            allow_requested = budget['allowed']
+            if finite_option_priority and not allow_requested:
+                from downloader.finmind_option_finite_priority import capacity_deferred_priority_allowed
+                # Ordinary work is unable to pass its measured physical
+                # preflight. Preserve its full quota reservation and task
+                # state, but admit only the verified small finite request.
+                allow_requested = capacity_deferred_priority_allowed(admission, budget, reservation)
             task = _next_task(connection, now, delegated=delegated,
-                              incremental_only=not budget["allowed"], datasets=datasets, advance_cursor=True,
-                              required_keys=required_keys)
+                              incremental_only=not allow_requested, datasets=datasets, advance_cursor=True,
+                              required_keys=required_keys,
+                              source_verification_priority=reservation.get('source_verification_priority', False),
+                              finite_query_priority=reservation.get('finite_query_priority', False))
             if (task is None and budget['allowed'] and required_keys is None
                     and _refill_current_history(connection, root, now, delegated=delegated, datasets=datasets)):
                 task = _next_task(connection, now, delegated=delegated, datasets=datasets, advance_cursor=True)
@@ -2013,10 +2139,18 @@ def run_once(root: Path, *, max_requests: int = 0,
                 _status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
             other_started = time.monotonic()
+            dispatch_keys = required_keys
+            if required_keys is None and datasets is None and product_verification.permits(
+                    connection, (task.dataset, task.data_id, task.partition)):
+                # The requested query is one exact source check. Parallel
+                # history pools use their original reservation, so retain the
+                # canonical serial handler rather than expanding the scope.
+                dispatch_keys = ((task.dataset, task.data_id, task.partition),)
             parallel = object_pipeline.run_batch(
                 connection, downloads, processors, root, task, account, budget, reservation, now, limiter, token,
                 config=pipeline_config, max_calls=max_requests-completed if max_requests else pipeline_config['max_batch_requests'],
-                delegated=delegated, datasets=datasets, required_keys=required_keys,
+                delegated=delegated, datasets=datasets, required_keys=dispatch_keys,
+                capacity_sampler=capacity,
                 heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
                                                          last=result or last, delegated=delegated))
             if parallel is not None:
@@ -2026,6 +2160,11 @@ def run_once(root: Path, *, max_requests: int = 0,
                 connection.commit()
                 if parallel['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'local_cpu_worker_interrupted'}:
                     cycle_costs.calibration_invalid = True
+                    if parallel['state'] == 'disk_guard':
+                        admission = capacity.sample()
+                        if admission.get('state') not in {'admitted', 'not_enrolled'}:
+                            _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                            return _capacity_pause(root, admission)
                     return _status(connection, root, state=parallel['state'], last=last, delegated=delegated)
                 _status(connection, root, state='running', last=last, delegated=delegated)
                 last_status_at = time.monotonic()
@@ -2034,7 +2173,8 @@ def run_once(root: Path, *, max_requests: int = 0,
             parallel_json = json_pipeline.run_batch(
                 connection, json_downloads, json_sessions, root, task, account, budget, reservation, now, limiter, token,
                 config=json_config, max_calls=max_requests-completed if max_requests else json_config['max_batch_requests'],
-                delegated=delegated, datasets=datasets, required_keys=required_keys,
+                delegated=delegated, datasets=datasets, required_keys=dispatch_keys,
+                capacity_sampler=capacity,
                 heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
                                                          last=result or last, delegated=delegated))
             if parallel_json is not None:
@@ -2045,6 +2185,12 @@ def run_once(root: Path, *, max_requests: int = 0,
                 reconcile_worker_corrections(connection, root, 'complement', _now())
                 connection.commit()
                 if parallel_json['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'} | json_pipeline.LOCAL_PREFLIGHT_ERRORS:
+                    if parallel_json['state'] == 'disk_guard':
+                        cycle_costs.calibration_invalid = True
+                        admission = capacity.sample()
+                        if admission.get('state') not in {'admitted', 'not_enrolled'}:
+                            _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                            return _capacity_pause(root, admission)
                     return _status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
                 if parallel_json['state'] == 'incremental_reserve' and not parallel_json['calls']:
                     return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
@@ -2058,7 +2204,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 # Exact-key repair must not claim neighbouring year tasks or
                 # expand its provider query into an unrelated history batch.
                 bulk = (_claim_bulk_years(connection, task, now, allow_history=budget["allowed"])
-                        if required_keys is None else None)
+                        if dispatch_keys is None else None)
                 if bulk is not None:
                     rows = _fetch_rows(session, limiter, root.parent, task.dataset, token, bulk.params(),
                                        max_response_bytes=BULK_MAX_RESPONSE_BYTES)
@@ -2089,6 +2235,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                         if context or retry_cohorts.full_probe_required(connection, task):
                             # Correction notices require their complete historical scope.
                             history_metadata = request_plan({}, now, local.date())
+                            history_metadata['baseline_sha256'] = baseline.get('sha256')
                             if not context:
                                 history_metadata['full_refetch_reason'] = 'unexpected_empty_history_retry'
                         incoming = _fetch_rows(
@@ -2109,6 +2256,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                             raise SourceError('empty_response_without_valid_baseline', retry_after=300)
                         if history_metadata['query_shape'] == 'per_id_incremental_overlap' and adjusted_history_changed(old_rows, incoming):
                             history_metadata = request_plan({}, now, local.date())
+                            history_metadata['baseline_sha256'] = baseline.get('sha256')
                             incoming = _fetch_rows(session, limiter, root.parent, task.dataset, token,
                                                    {"dataset": task.dataset, "data_id": task.data_id,
                                                     "start_date": history_metadata['request_start_date'],
@@ -2118,7 +2266,9 @@ def run_once(root: Path, *, max_requests: int = 0,
                                 raise SourceError("response_row_limit")
                             history_metadata.update(request_count=2, full_refetch_reason='adjusted_history_changed')
                             completed += 1
-                        rows = retain_observation(merge_response(old_rows, incoming, task.data_id, history_metadata), incoming)
+                        rows = retain_observation(merge_response(
+                            old_rows, incoming, task.data_id, history_metadata,
+                            authoritative_replace=bool(context)), incoming)
                         history_metadata["response_rows"] = len(incoming)
                         if baseline_error:
                             history_metadata['baseline_recovery'] = baseline_error
@@ -2198,12 +2348,16 @@ def run_once(root: Path, *, max_requests: int = 0,
         return _status(connection, root, state="batch_complete", last=last, delegated=delegated)
 
 
-def _retry_blocked(root: Path) -> int:
+def _retry_blocked(root: Path, datasets: tuple[str, ...] | None = None) -> int:
     """Explicit operator action after fixing credentials or request parameters."""
+    if datasets is not None and (not datasets or any(dataset not in ALL_DATASETS for dataset in datasets)):
+        raise ValueError("retry_blocked_requires_registered_datasets")
     with closing(_db(root / "queue.sqlite3")) as connection, connection:
+        scope = " AND dataset IN (" + ",".join("?" for _ in datasets) + ")" if datasets is not None else ""
         cursor = connection.execute(
             "UPDATE tasks SET state='pending', next_attempt_at_utc=NULL, error_code=NULL "
-            "WHERE state IN ('not_entitled','invalid_request') AND kind!='year'"
+            "WHERE state IN ('not_entitled','invalid_request') AND kind!='year'" + scope,
+            datasets or (),
         )
         connection.commit()
         return cursor.rowcount
@@ -2219,6 +2373,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task-key", nargs=3, action="append",
                         metavar=("DATASET", "DATA_ID", "PARTITION"),
                         help="Dispatch only these existing finite keys under the worker lock; repeat up to 64 times")
+    parser.add_argument('--option-finite-priority-verification', type=Path,
+                        help='Pinned option product verification for finite priority capacity admission')
+    parser.add_argument('--option-finite-priority-plan', type=Path,
+                        help='Registered active FinMind priority plan for the same product checks')
+    parser.add_argument('--finite-priority-request-id',
+                        help='Registered priority request for these exact task keys; normal capacity rules apply')
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--retry-blocked", action="store_true",
                         help="after correcting token/parameters, explicitly requeue blocked per-ID tasks")
@@ -2237,6 +2397,14 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("--task-key requires 1 to 64 keys from registered datasets")
         if args.loop or args.retry_blocked or args.dataset:
             parser.error("--task-key is a finite run and cannot be combined with --loop, --retry-blocked or --dataset")
+    finite_option_priority = bool(args.option_finite_priority_verification or args.option_finite_priority_plan)
+    if finite_option_priority and (not args.option_finite_priority_verification or not args.option_finite_priority_plan
+                                   or not required_keys or args.loop or args.retry_blocked or args.reopen_exhausted):
+        parser.error('finite option capacity requires both plans and explicit finite task keys')
+    if args.finite_priority_request_id is not None and (
+            finite_option_priority or not required_keys or args.loop or args.retry_blocked or args.reopen_exhausted
+            or not 0 < args.max_requests <= len(required_keys)):
+        parser.error('registered finite priority requires bounded explicit task keys and normal capacity')
     root = args.root.resolve()
     # Only this dedicated CLI owns these pools. Object CPU workers retain
     # their separately configured pools; raw source semantics do not change.
@@ -2250,7 +2418,10 @@ def main(argv: list[str] | None = None) -> int:
         except BlockingIOError:
             print("FinMind complement worker already running", file=sys.stderr)
             return 2
+        old_term_handler = None
         try:
+            if threading.current_thread() is threading.main_thread():
+                old_term_handler = signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
             if args.reopen_exhausted:
                 with closing(_db(root / 'queue.sqlite3')) as connection, connection:
                     changed = retry_policy.reopen(connection, tuple(args.dataset), _now())
@@ -2258,13 +2429,31 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({'reopened_exhausted_tasks': changed, 'provider_calls': 0}), flush=True)
                 return 0
             if args.retry_blocked:
-                print(json.dumps({"requeued_blocked_tasks": _retry_blocked(root)}), flush=True)
+                print(json.dumps({"requeued_blocked_tasks": _retry_blocked(
+                    root, tuple(args.dataset) if args.dataset is not None else None)}), flush=True)
+            if finite_option_priority:
+                from downloader.finmind_option_finite_priority import capacity_probe, validate_owner_request
+                verification = args.option_finite_priority_verification.absolute()
+                priority = args.option_finite_priority_plan.absolute()
+                validate_owner_request(root, verification, priority, required_keys, args.max_requests)
+                capacity = AcquisitionCapacitySampler(
+                    root, probe=lambda path: capacity_probe(path, verification, priority, required_keys, args.max_requests))
+                finite_option_validate = lambda: validate_owner_request(
+                    root, verification, priority, required_keys, args.max_requests)
+            else:
+                capacity = AcquisitionCapacitySampler(root) if args.loop or args.finite_priority_request_id else None
+                finite_option_validate = None
             while True:
                 try:
                     result = run_once(root, max_requests=args.max_requests,
                                       datasets=tuple(args.dataset) if args.dataset is not None else None,
                                       required_keys=required_keys,
-                                      **({'keep_prepared_on_priority_wait': True} if args.loop else {}))
+                                      **({'keep_prepared_on_priority_wait': True, 'capacity_sampler': capacity}
+                                         if args.loop else {'capacity_sampler': capacity, 'finite_option_priority': True,
+                                                            'finite_option_validate': finite_option_validate}
+                                         if finite_option_priority else {'capacity_sampler': capacity,
+                                            'finite_priority_request_id': args.finite_priority_request_id}
+                                         if args.finite_priority_request_id else {}))
                 except sqlite3.OperationalError as error:
                     if not args.loop or not retryable_queue_error(error):
                         raise
@@ -2278,7 +2467,8 @@ def main(argv: list[str] | None = None) -> int:
                     return 0
                 if result["state"] == "invalid_token":
                     return 0  # Requires token replacement and an explicit restart.
-                delay = (3600 if result["state"] in {"current_queue", "disk_guard"}
+                delay = (3600 if result["state"] == "current_queue"
+                         else 60 if result["state"] == "disk_guard"
                          else 1800 if result["state"] == "ip_banned"
                          else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
                          else 60 if result["state"] in {"incremental_reserve", "waiting_history_retry"}
@@ -2288,6 +2478,8 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             return 130
         finally:
+            if old_term_handler is not None:
+                signal.signal(signal.SIGTERM, old_term_handler)
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 

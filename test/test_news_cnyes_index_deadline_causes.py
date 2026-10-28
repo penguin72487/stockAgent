@@ -25,6 +25,25 @@ def journal(queue):
         "WHERE key LIKE 'cnyes_index_deadline_reconciliation_v1:%'")]
 
 
+@pytest.mark.parametrize('existing_circuit', [False, True])
+@pytest.mark.parametrize('gate', ['stopping', 'provider_pacing_cooldown', 'robots_origin_policy_cooldown'])
+def test_deferred_index_request_does_not_create_or_extend_shared_endpoint_circuit(queue, existing_circuit, gate):
+    task = register(queue)
+    if existing_circuit:
+        source = queue.registry.sources['cnyes']
+        with queue.db:
+            queue.db.execute('INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?)',
+                ('cnyes', source.cnyes_index_api, source.cnyes_index_data_fingerprint,
+                 time.time() + 900, 'http_429', task['url']))
+    before = [tuple(r) for r in queue.db.execute('SELECT * FROM bulk_endpoint_cooldowns')]
+    fail_discovery(queue, task, NewsError(gate, retry=True, delay=3, request_deferred=True))
+    after = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+    assert after['attempts'] == task['attempts']
+    assert after['last_checked_at_utc'] == task['last_checked_at_utc']
+    assert [tuple(r) for r in queue.db.execute('SELECT * FROM bulk_endpoint_cooldowns')] == before
+    assert not journal(queue)
+
+
 def legacy(queue):
     metadata = register(queue)
     transport = register(queue, day=DAY+1)

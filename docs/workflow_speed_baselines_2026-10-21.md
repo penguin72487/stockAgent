@@ -3,6 +3,36 @@
 同日後續的六模式、大型歷史、瀏覽器、D 磁碟與同值優化實測見
 [工作流補測與優化](workflow_speed_optimization_2026-10-21.md)。本文件保留前次基線觀察。
 
+**10/25 更新：**固定 inspection 工作流的八次 A/B/B/A＋B/A/A/B 已通過，
+兩組完整 child wall 均值分別降低 16.7566%／10.1590%，CPU 分別降低
+19.5911%／4.7128%。相同 bytes 的正向 metric cache 已接入 canonical collector；
+953 項資格與正式路徑 38 項檢查通過，R164 另完成全部 13 階段、14 輸出、
+物理重建及原始 reader／training／TW／CEX／issuer／Dune／SEC／credentials
+核對。新觀察保留 378,913 samples／47,520 groups；來源身分為
+**2,399／1,708 有階段時鐘／691 未綁定**。完整驗收 owner 2847.121674 秒 wall／
+713.860935 秒 descendant CPU；這個新快照沒有受控的全流程加速比例。
+詳細範圍、失敗與接受收據見 [持續優化與成本診斷](workflow_speed_optimization_2026-10-24_inspection_diagnostic.md)。
+現行 [完整觀察](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/collection_full/collection.json)、
+[原始速度 rows](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/collection_full/speed_samples.jsonl)、
+[彙總 CSV](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/collection_full/speed_summary.csv)
+及 [完整接受收據](/srv/stockagent-d-volume/.stockagent-workflow-speed-20261021/artifacts/benchmarks/round164/selected_full_acceptance.json)
+各自保留；下方 10/21 數字仍屬原基線。R169 retained-input 預讀八輪比較已通過，
+兩個固定順序完整 wall 分別降低 6.6451%／21.8535%，CPU 分別增加 1.4176%／
+降低 7.2762%；範圍是完整 170 原始樣本的 ingestion＋fresh reader。R177 SSD
+暫時重建視圖完整 ABBA 亦已通過：該階段 wall 均值降低 **85.6085%**、CPU
+降低 **63.7005%**，四次均保留完整重建與原始 reader，不能外推成全流程比例。
+R182 **768 項資格通過**後，R184 已實際安裝整合預讀與 CPU clock 修正的
+`5329e903…`。安裝後 **77 項檢查通過**，R183 全部 13 階段與原始 oracles
+均完成；最後獨立驗證器先後因欄位名稱與沿用舊批次 CEX 筆數失敗，失敗收據
+保留。R187 已完整掃描 379,271 筆並驗證 256 筆工程 CPU，R189 再以四份保留
+原始輸入與原版 parser 重建本批 CEX 分母 **16,510**，接續完成全部驗收與獨立
+終結讀回。R188 已完成十二個 acquisition adapter 時鐘讀回，Dune／SEC 占此
+adapter wall 的 **98.2294%**；本輪 full owner 尚須完成原始驗收，且已發現執行中
+共用 private JSON source drift。R192 已核對固定 capsule 的 package ownership、
+16 modules 與 canonical timer，等待前輪自然終結後細分完整保留資料操作成本。
+前置等待、原全量命令與驗收接續成本各自保留，尚無整體受控加速比例、
+所有工作流測完或已達計算極限的結論。
+
 本次建立跨工作流的入口清單、速度樣本、原始收據及讀回驗證。產物位於
 `artifacts/benchmarks/workflow_speed_20261021/`，主索引為 `collection_v3/collection.json`。
 入口盤點、既有紀錄、當日實測與未測範圍各自保留。這是加速分析的基線；

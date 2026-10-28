@@ -22,7 +22,9 @@ from stockagent.data_sync.desync_snapshots import (
     ResolvedSnapshot,
     SnapshotError,
     _exclusive_lock,
+    _fsync_directory,
     _paths_overlap,
+    _safe_relative_path,
     _utc_iso_from_ns,
     atomic_write_json,
     scan_tree,
@@ -40,6 +42,7 @@ from stockagent.data_sync.packed_snapshots import (
 
 
 CACHE_LEASE_SCHEMA_VERSION = 1
+SUBTREE_CACHE_LEASE_SCHEMA_VERSION = 2
 DEFAULT_CACHE_TTL_DAYS = 7.0
 _STATE_DIRECTORY = ".cache-state"
 
@@ -140,7 +143,36 @@ def _equivalent_ready_snapshot(
     return None
 
 
-def _atomic_symlink(link: Path, target: Path) -> None:
+def _preserved_link_path(path: Path) -> Path:
+    """Keep the final alias readable while rejecting redirected parents."""
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if ".." in path.parts or any(parent.is_symlink() for parent in path.parents):
+        raise SnapshotError("preserved cache link has a redirected parent")
+    return path
+
+
+def _check_preserved_link(link: Path, target: Path) -> None:
+    link = _preserved_link_path(link)
+    if os.path.lexists(link) and (not link.is_symlink() or os.readlink(link) != str(target)):
+        raise SnapshotError(f"refusing to replace an existing cache link: {link}")
+
+
+def _atomic_symlink(link: Path, target: Path, *, replace_existing: bool = True) -> None:
+    if not replace_existing:
+        link = _preserved_link_path(link)
+        _check_preserved_link(link, target)
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            link.symlink_to(target)
+        except FileExistsError:
+            # Another actor may have created a name after preflight. Never use
+            # replace/rename in recovery mode, including for a dangling link.
+            _check_preserved_link(link, target)
+        _fsync_directory(link.parent)
+        _check_preserved_link(link, target)
+        return
     link = _absolute_link_path(link)
     target = target.resolve()
     link.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +193,39 @@ def _link_points_to(link: Path, target: Path) -> bool:
         return link.resolve(strict=False) == target.resolve(strict=False)
     except OSError:
         return False
+
+
+def materialized_link_targets(
+    materialized_root: Path, dataset: str, snapshot_id: str, *,
+    links: Iterable[Path] = (), subtree_links: Mapping[Path, str] | None = None,
+    preserve_existing_links: bool = False,
+) -> dict[Path, Path]:
+    """Plan aliases to a fixed full release, including original raw subtrees.
+
+    This does not read source payloads or create directories. Recovery uses it
+    for an early collision check; ``use`` repeats that check under its lock.
+    """
+    dataset = validate_slug(dataset, "dataset")
+    snapshot_id = validate_slug(snapshot_id, "snapshot_id")
+    target = _target_path(materialized_root, dataset, snapshot_id)
+    result = {materialized_root / "current" / dataset: target}
+    normalize = _preserved_link_path if preserve_existing_links else _absolute_link_path
+    for path in links:
+        result[normalize(Path(path))] = target
+    for path, relative in (subtree_links or {}).items():
+        subtree = _safe_relative_path(relative, "cache link subtree")
+        if (not isinstance(relative, str) or subtree.as_posix() != relative
+                or subtree.as_posix() in {"", "."} or "\\" in relative):
+            raise SnapshotError("cache subtree link must name a non-root directory")
+        link = normalize(Path(path))
+        child = target.joinpath(*subtree.parts)
+        if link in result and result[link] != child:
+            raise SnapshotError("cache link has conflicting subtree targets")
+        result[link] = child
+    for link in result:
+        if link == target or link in target.parents or target in link.parents:
+            raise SnapshotError(f"cache link must be outside its target: {link}")
+    return result
 
 
 def _quarantine_corrupt_materialization(
@@ -199,6 +264,8 @@ def use_materialized_snapshot(
     snapshot_id: str | None = None,
     ttl_days: float = DEFAULT_CACHE_TTL_DAYS,
     links: Iterable[Path] = (),
+    subtree_links: Mapping[Path, str] | None = None,
+    preserve_existing_links: bool = False,
     verify_existing: bool = False,
     now_ns: int | None = None,
 ) -> dict[str, Any]:
@@ -206,6 +273,8 @@ def use_materialized_snapshot(
 
     if not math.isfinite(ttl_days) or ttl_days <= 0:
         raise SnapshotError("cache ttl_days must be positive")
+    if type(preserve_existing_links) is not bool:
+        raise SnapshotError("preserve_existing_links must be boolean")
     sync_root = sync_root.resolve()
     materialized_root = materialized_root.resolve()
     if _paths_overlap(sync_root, materialized_root):
@@ -230,10 +299,27 @@ def use_materialized_snapshot(
         str(resolved.manifest["snapshot_id"]), "snapshot_id"
     )
     target = _target_path(materialized_root, dataset, snapshot_id)
-    default_link = materialized_root / "current" / dataset
-    requested_links = [default_link, *links]
+    requested_links = materialized_link_targets(
+        materialized_root, dataset, snapshot_id, links=links, subtree_links=subtree_links,
+        preserve_existing_links=preserve_existing_links,
+    )
 
     with _exclusive_lock(_lock_path(materialized_root, dataset)):
+        if preserve_existing_links:
+            for link, linked_target in requested_links.items():
+                _check_preserved_link(link, linked_target)
+        lease_path = _lease_path(materialized_root, dataset, snapshot_id)
+        previous_links: list[str] = []
+        previous_subtrees: dict[str, str] = {}
+        if lease_path.exists():
+            try:
+                previous = _read_json(lease_path)
+                _validated_lease_identity(materialized_root, previous)
+                previous_links = [str(item) for item in previous.get("link_paths", [])]
+                previous_subtrees = dict(previous.get("link_subtrees", {}))
+            except SnapshotError:
+                if preserve_existing_links:
+                    raise
         ready_reused = _ready_matches(materialized_root, resolved)
         recovered_corruption: dict[str, str] | None = None
         if verify_existing and ready_reused:
@@ -256,27 +342,27 @@ def use_materialized_snapshot(
             verification = "full"
 
         installed_links: list[str] = []
-        for raw_link in requested_links:
-            link = _absolute_link_path(Path(raw_link))
-            if link == target or target in link.parents:
-                raise SnapshotError(f"cache link must be outside its target: {link}")
-            _atomic_symlink(link, target)
+        for raw_link, linked_target in requested_links.items():
+            link = (_preserved_link_path(Path(raw_link)) if preserve_existing_links
+                    else _absolute_link_path(Path(raw_link)))
+            if linked_target != target and (not linked_target.is_dir() or any(
+                    part.is_symlink() for part in (linked_target, *linked_target.parents)
+                    if part == target or target in part.parents)):
+                raise SnapshotError("cache subtree alias must address a verified regular directory")
+            if preserve_existing_links:
+                _atomic_symlink(link, linked_target, replace_existing=False)
+            else:
+                _atomic_symlink(link, linked_target)
             installed_links.append(str(link))
 
-        lease_path = _lease_path(materialized_root, dataset, snapshot_id)
-        previous_links: list[str] = []
-        if lease_path.exists():
-            try:
-                previous = _read_json(lease_path)
-                previous_links = [
-                    str(item) for item in previous.get("link_paths", [])
-                ]
-            except SnapshotError:
-                previous_links = []
         all_links = sorted(set(previous_links + installed_links))
+        all_subtrees = {**{k: v for k, v in previous_subtrees.items() if k not in installed_links}, **{
+            str(link): linked_target.relative_to(target).as_posix()
+            for link, linked_target in requested_links.items() if linked_target != target}}
         expires_ns = current_ns + int(ttl_days * 86_400 * 1_000_000_000)
         lease = {
-            "schema_version": CACHE_LEASE_SCHEMA_VERSION,
+            "schema_version": (SUBTREE_CACHE_LEASE_SCHEMA_VERSION if all_subtrees
+                               else CACHE_LEASE_SCHEMA_VERSION),
             "state": "hot",
             "dataset": dataset,
             "snapshot_id": snapshot_id,
@@ -300,6 +386,8 @@ def use_materialized_snapshot(
             ),
             "verification": verification,
         }
+        if all_subtrees:
+            lease["link_subtrees"] = all_subtrees
         if recovered_corruption is not None:
             lease["recovered_corrupt_materialization"] = recovered_corruption
         atomic_write_json(lease_path, lease)
@@ -365,6 +453,20 @@ def process_references(target: Path, *, limit: int = 20) -> list[str]:
     return process_references_many((target,), limit=limit)
 
 
+def _reference_path_frontier(targets):
+    """Minimal textual prefixes for negative checks; retain original evidence.
+
+    A descendant match implies its selected ancestor match. The final positive
+    maps loop still uses every original target in its original order. Keep the
+    exact existing separator and deleted-name semantics, including root paths.
+    """
+    roots = []
+    for name in sorted(str(target) for target in targets):
+        if not roots or not name.startswith(roots[-1] + os.sep):
+            roots.append(name)
+    return set(roots), tuple(name + os.sep for name in roots), tuple(" " + name for name in roots)
+
+
 def process_references_many(targets: Iterable[Path], *, limit: int = 20,
                             inode_keys: set[tuple[int, int]] | None = None,
                             include_current_process: bool = False) -> list[str]:
@@ -380,6 +482,11 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
     inode_keys = set(inode_keys or ())
     if not targets and not inode_keys:
         return []
+    frontier, prefixes, map_suffixes = _reference_path_frontier(targets)
+    def matches_path(value):
+        cleaned = value.removesuffix(" (deleted)")
+        return cleaned in frontier or cleaned.startswith(prefixes)
+
     references: list[str] = []
     own_pid = os.getpid()
     for process in _process_directories():
@@ -395,7 +502,7 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
             except OSError as error:
                 _reference_read_error(process / name, error)
                 continue
-            if any(_path_is_under(value, target) for target in targets):
+            if matches_path(value):
                 references.append(f"pid={pid}:{name}:{value}")
                 if len(references) >= limit:
                     return references
@@ -410,7 +517,7 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
             except OSError as error:
                 _reference_read_error(descriptor, error)
                 continue
-            matches = any(_path_is_under(value, target) for target in targets)
+            matches = matches_path(value)
             if inode_keys and not matches:
                 try:
                     info = descriptor.stat()
@@ -441,6 +548,9 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
                     references.append(f"pid={pid}:maps-inode:{key[0]}:{key[1]}")
                     if len(references) >= limit:
                         return references
+        if not (any(prefix + os.sep in maps for prefix in map_suffixes)
+                or any(line.endswith(map_suffixes) for line in map_lines)):
+            continue
         for target in targets:
             target_text = str(target)
             if f" {target_text}/" in maps or any(
@@ -646,7 +756,8 @@ def prune_partial_materialization(
 def _validated_lease_identity(
     materialized_root: Path, lease: Mapping[str, Any]
 ) -> tuple[str, str, Path, Path]:
-    if int(lease.get("schema_version", -1)) != CACHE_LEASE_SCHEMA_VERSION:
+    schema = lease.get("schema_version")
+    if type(schema) is not int or schema not in {CACHE_LEASE_SCHEMA_VERSION, SUBTREE_CACHE_LEASE_SCHEMA_VERSION}:
         raise SnapshotError("unsupported materialized cache lease schema")
     dataset = validate_slug(str(lease.get("dataset", "")), "lease dataset")
     snapshot_id = validate_slug(
@@ -658,6 +769,18 @@ def _validated_lease_identity(
         raise SnapshotError(
             f"cache lease target escapes its dataset root: {recorded}"
         )
+    subtrees = lease.get("link_subtrees", {})
+    if (not isinstance(subtrees, dict) or (schema == CACHE_LEASE_SCHEMA_VERSION and subtrees)
+            or (schema == SUBTREE_CACHE_LEASE_SCHEMA_VERSION and not subtrees)):
+        raise SnapshotError("invalid materialized cache subtree lease")
+    for link, subtree in subtrees.items():
+        relative = _safe_relative_path(subtree, "lease link subtree")
+        if (not isinstance(subtree, str) or relative.as_posix() != subtree
+                or relative.as_posix() in {"", "."} or "\\" in subtree or not isinstance(link, str)
+                or link not in lease.get("link_paths", []) or not Path(link).is_absolute()
+                or ".." in Path(link).parts or Path(link) == expected
+                or Path(link) in expected.parents or expected in Path(link).parents):
+            raise SnapshotError("invalid registered cache subtree link")
     ready_path = _ready_path(materialized_root, dataset, snapshot_id)
     return dataset, snapshot_id, expected, ready_path
 
@@ -666,7 +789,8 @@ def _unlink_registered_links(lease: Mapping[str, Any], target: Path) -> list[str
     removed: list[str] = []
     for value in lease.get("link_paths", []):
         link = _absolute_link_path(Path(str(value)))
-        if _link_points_to(link, target):
+        linked_target = target / lease.get("link_subtrees", {}).get(str(value), "")
+        if _link_points_to(link, linked_target):
             link.unlink()
             removed.append(str(link))
     return removed

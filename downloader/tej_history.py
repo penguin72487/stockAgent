@@ -33,7 +33,7 @@ MAX_CELLS = 400_000
 NORMALIZATION_CONTRACT = "explicit_field_units_v2_exact_power10_with_scale_guard"
 PHASE_LABELS = {"P1": "候選新增特徵", "P2": "補歷史／口徑缺口", "P3": "多源校驗候選"}
 METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_reviewed_dns_v2"
-BATCH_SCHEDULER_CONTRACT = "phase_preserving_interleave_coalesced_company_retry_v2"
+BATCH_SCHEDULER_CONTRACT = "phase_preserving_incremental_finite_query_v4"
 # Exact, independently reviewed TEJ notices. A notice never proves a query was
 # unsent: callers still need their original finished negative/metadata proof.
 # The native bridge checks this allowlist again against fresh owned controls.
@@ -536,6 +536,14 @@ def discovery_tasks(root: Path, task: dict, payload: dict, output: Path) -> int:
             period = normalize_period(label)
         if period < request["start"][:len(period)] or period > request["end"][:len(period)]:
             raise ValueError("Vendor returned dates outside requested search interval")
+    if request.get('incremental_cycle'):
+        # The initial history axes/plan remain the authoritative baseline.
+        # A tail discovery must not overwrite their totals or next ordinal.
+        from downloader.tej_incremental import install_wizard_plan
+        with closing(connect(root)) as con, con:
+            config = json.loads(con.execute("SELECT value FROM meta WHERE key='config'").fetchone()[0])
+            definition = dict(con.execute('SELECT * FROM tables WHERE table_id=?', (task['table_id'],)).fetchone())
+            return install_wizard_plan(con, definition, request, payload, config)
     with closing(connect(root)) as con:
         planning=con.execute("SELECT value FROM meta WHERE key='preview_planning_contract'").fetchone()
     if planning:
@@ -2006,6 +2014,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'desktop_input_contract':DESKTOP_INPUT_CONTRACT,
               'download_burst':config.get('download_burst_between_discoveries',4),
               'download_table_locality_burst':config.get('download_table_locality_burst',1),
+              'finite_query_after_incremental_attempts':config.get('finite_query_after_incremental_attempts'),
               'local_planning_batch_size':config.get('local_planning_batch_size',1),
               'auto_key3_replanning':config.get('auto_key3_replanning',False),
               'auto_snapshot_replanning':config.get('auto_snapshot_replanning',False),
@@ -2034,6 +2043,9 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
     if (policy['prequery_failure_isolation'] and
             policy['prequery_recovery_contract'] != 'exact_unsent_table_retry_window_v1'):
         raise ValueError('Explicit proved-unsent retry contract required')
+    finite_after = policy['finite_query_after_incremental_attempts']
+    if finite_after is not None and (type(finite_after) is not int or not 1 <= finite_after <= 100):
+        raise ValueError('Finite query rotation must be disabled or bounded to 1..100 attempts')
     from downloader.tej_planning import SELECTOR_CONTRACT
     if policy['query_selector_contract'] not in (None, SELECTOR_CONTRACT):
         raise ValueError('Unreviewed source selector geometry contract')
@@ -2067,6 +2079,46 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
         if table_id is not None:
             return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,task_id LIMIT 1",(selected,table_id,now,now)).fetchone()
         return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,table_id,task_id LIMIT 1",(selected,now,now)).fetchone()
+    from downloader.provider_priority import queued_candidate
+    extra, args = '', (now, now)
+    if kind is not None:
+        extra += ' AND tasks.kind=?'
+        args += (kind,)
+    if table_id is not None:
+        extra += ' AND tasks.table_id=?'
+        args += (table_id,)
+    requested = queued_candidate(con, now, provider='tej', where="tasks.state='pending' "
+        "AND (tasks.next_attempt_at_utc IS NULL OR tasks.next_attempt_at_utc<=?)" + isolation + extra, args=args)
+    from downloader.tej_incremental import PRIORITY as incremental_priority
+    finite_after = policy.get('finite_query_after_incremental_attempts')
+    if finite_after is not None:
+        streak = con.execute("SELECT value FROM meta WHERE key='scheduler_incremental_attempt_streak'").fetchone()
+        if streak and int(streak[0]) >= finite_after:
+            # Reserve one turn for a bounded finite request after actual
+            # incremental claims. Apply exactly the same due, table, kind,
+            # quarantine and retry filters as the native selector.
+            finite_requested = queued_candidate(con, now, provider='tej', where="tasks.state='pending' "
+                "AND tasks.priority>? AND (tasks.next_attempt_at_utc IS NULL OR tasks.next_attempt_at_utc<=?)"
+                + isolation + extra, args=(incremental_priority, *args))
+            if finite_requested is not None:
+                return finite_requested
+            if kind in (None, 'download'):
+                native_extra, native_args = '', (now, now)
+                if table_id is not None:
+                    native_extra = ' AND tasks.table_id=?'
+                    native_args += (table_id,)
+                native = con.execute("SELECT * FROM tasks WHERE state='pending' AND kind='download' "
+                    "AND priority BETWEEN -99 AND -1 AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"
+                    + isolation + native_extra + " ORDER BY priority,table_id,task_id LIMIT 1", native_args).fetchone()
+                if native is not None:
+                    return native
+    if requested is not None:
+        # Due incremental work precedes an interactive read; native retry
+        # isolation above still applies to both lanes.
+        best = [row for selected in ([kind] if kind else ['discover', 'download'])
+                if (row := candidate(selected)) is not None]
+        if not best or min(row['priority'] for row in best) > incremental_priority:
+            return requested
     if kind is not None:
         return candidate(kind)
     discovery,download = candidate('discover'),candidate('download')
@@ -2094,6 +2146,15 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
         if rotated is not None:
             return rotated
     return download
+
+
+def _record_incremental_priority_claim(con: sqlite3.Connection, task: dict) -> None:
+    """Record a committed native claim, never a speculative/local-only selection."""
+    from downloader.tej_incremental import PRIORITY as incremental_priority
+    old = con.execute("SELECT value FROM meta WHERE key='scheduler_incremental_attempt_streak'").fetchone()
+    streak = min(100, int(old[0]) + 1) if task['priority'] == incremental_priority and old else (
+        1 if task['priority'] == incremental_priority else 0)
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_incremental_attempt_streak',?)", (str(streak),))
 
 
 def _prepare_ready_task(con, root: Path, now: str, kind: str | None, policy: dict,
@@ -2158,10 +2219,12 @@ def mark_metadata_busy(root: Path) -> None:
 
 
 def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str | None=None,
-            retry_authorization_id: str | None=None) -> str:
+            retry_authorization_id: str | None=None,
+            finite_discovery_request_id: str | None=None) -> str:
     """Keep source evidence authoritative through bounded metadata contention."""
     try:
-        return _run_one(root,bridge,kind=kind,table_id=table_id,retry_authorization_id=retry_authorization_id)
+        return _run_one(root,bridge,kind=kind,table_id=table_id,retry_authorization_id=retry_authorization_id,
+                        finite_discovery_request_id=finite_discovery_request_id)
     except sqlite3.OperationalError as exc:
         from downloader.tej_desktop_attempts import metadata_busy
         if not metadata_busy(exc):
@@ -2173,11 +2236,20 @@ def run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str |
 
 
 def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str | None=None,
-             retry_authorization_id: str | None=None) -> str:
+             retry_authorization_id: str | None=None,
+             finite_discovery_request_id: str | None=None) -> str:
     if kind not in {None, "discover", "download"}:
         raise ValueError("Unknown acquisition task kind")
     if table_id is not None and (kind!='download' or not re.fullmatch(r'[0-9a-f]{24}',table_id)):
         raise ValueError('Targeted acceptance requires one exact registered table and download-only mode')
+    if finite_discovery_request_id is not None:
+        if (not re.fullmatch(r'[0-9a-f]{64}', finite_discovery_request_id)
+                or kind is not None or table_id is not None or retry_authorization_id is not None):
+            raise ValueError('Finite discovery requires one priority request and the global native selector')
+        from downloader.provider_priority import inspect
+        priority = inspect(root, finite_discovery_request_id)
+        if priority['provider'] != 'tej' or not priority['priority_active']:
+            return 'finite_priority_not_ready'
     now = datetime.now(UTC).isoformat()
     with closing(connect(root)) as con, con:
         config = json.loads(con.execute("SELECT value FROM meta WHERE key='config'").fetchone()[0])
@@ -2233,8 +2305,23 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
         if kind!='discover' and con.execute("SELECT 1 FROM meta WHERE key='preview_planning_contract'").fetchone():
             from downloader.tej_planning import refill_ready_plans
             refill_ready_plans(con)
+        if kind != 'discover':
+            from downloader.tej_incremental import refill_wizard
+            refill_wizard(con)
         if replay is None:
-            row, local_result = _prepare_ready_task(con, root, now, kind, policy, table_id)
+            if finite_discovery_request_id is not None:
+                # Preserve the GLOBAL scheduler choice, including due releases,
+                # finite rotation and all source isolation. Never claim a data
+                # download or a different request while maintenance is paused.
+                row = _ready_task(con, now, None, policy)
+                if (row is None or row['kind'] != 'discover' or not con.execute(
+                        "SELECT 1 FROM provider_query_intents WHERE request_id=? AND task_key=? "
+                        "AND created_at_utc<=? AND expires_at_utc>?",
+                        (finite_discovery_request_id, row['task_id'], now, now)).fetchone()):
+                    return 'finite_priority_not_ready'
+                local_result = None  # Discovery has no download repartition step.
+            else:
+                row, local_result = _prepare_ready_task(con, root, now, kind, policy, table_id)
             if local_result is not None:
                 return local_result
         if not row:
@@ -2254,6 +2341,8 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
             con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_table_consecutive_downloads',?)",(str(streak),))
             con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_last_download_table',?)",(task['table_id'],))
         con.execute("UPDATE tasks SET state='running',attempted_at_utc=? WHERE task_id=?", (now, task["task_id"]))
+        if replay is None and policy.get('finite_query_after_incremental_attempts') is not None:
+            _record_incremental_priority_claim(con, task)
         event = uuid.uuid4().hex
         con.execute("INSERT INTO traffic VALUES (?,?,?,NULL,'running')", (event, task["kind"], now))
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": "running",

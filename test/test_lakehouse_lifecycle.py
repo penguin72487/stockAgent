@@ -52,6 +52,8 @@ def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(mon
                      "stockagent/data_sync/packing_checkpoint.py",
                      "stockagent/data_sync/packed_backup.py",
                      "stockagent/data_sync/desync_snapshots.py",
+                     "stockagent/data_sync/closed_source.py",
+                     "stockagent/data_sync/retained_source.py",
                      "configs/training_rescue.json"):
         assert relative in seen
         changed[relative] = "b" * 64
@@ -637,6 +639,58 @@ def test_batched_primary_recovery_verification_preserves_sha_and_stability_gates
         with pytest.raises(ValueError,match='cannot reconstruct'):
             cache.validate_sources({'cold_root':str(tmp_path)},'a'*64,m)
     assert batches==[[source]] and source.exists()
+
+
+@pytest.mark.parametrize('damage', [None, 'sha', 'during-hash', 'recorded-source'])
+def test_parallel_primary_verification_preserves_exact_proofs_and_all_failure_gates(tmp_path, monkeypatch, damage):
+    import threading
+    identity = 'a' * 64
+    lake = tmp_path / 'lake'
+    root = lake / 'releases' / ('lake-' + identity)
+    root.mkdir(parents=True)
+    files = {}
+    for index in range(40):
+        raw = f'original observation {index}'.encode()
+        path = root / f'f{index}'
+        path.write_bytes(raw)
+        files[path.name] = {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
+    manifest = {'context': {'kind': 'ducklake_catalog_and_data'}, 'files': files}
+    c = {'lake_root': str(lake)}
+    serial = cache.validate_sources(c, identity, manifest, file_workers=1)
+    original_digest = cache.digest
+    barrier = threading.Barrier(4)
+    threads = set()
+    def parallel_digest(path):
+        threads.add(threading.get_ident())
+        if path.name in {'f0', 'f1', 'f2', 'f3'}:
+            barrier.wait(timeout=5)
+        value = original_digest(path)
+        if path.name == 'f8':
+            if damage == 'sha':
+                return 'f' * 64
+            if damage == 'during-hash':
+                path.write_bytes(b'changed original')
+        return value
+    monkeypatch.setattr(cache, 'digest', parallel_digest)
+    if damage == 'recorded-source':
+        (root / 'f8').write_bytes(b'changed original')
+        with pytest.raises(ValueError, match='changed since'):
+            cache.validate_sources(c, identity, manifest, recorded=serial, file_workers=4)
+        assert not threads
+    elif damage:
+        with pytest.raises(ValueError, match='cannot reconstruct'):
+            cache.validate_sources(c, identity, manifest, file_workers=4)
+    else:
+        assert cache.validate_sources(c, identity, manifest, file_workers=4) == serial
+        assert len(threads) == 4
+        assert cache.validate_sources(c, identity, manifest, recorded=serial, file_workers=4) == serial
+    assert len(list(root.iterdir())) == 40
+
+
+@pytest.mark.parametrize('count,limit,expected', [(31,1024,1), (32,1024,4), (50,63,1)])
+def test_primary_verification_preserves_descriptor_reserve(monkeypatch, count, limit, expected):
+    monkeypatch.setattr(cache.resource, 'getrlimit', lambda _: (limit,limit))
+    assert cache._source_read_workers(count) == expected
 
 
 def test_source_ack_is_durable_without_waiting_for_transport_gc(delivery, monkeypatch):

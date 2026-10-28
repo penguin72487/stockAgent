@@ -26,7 +26,7 @@ from downloader.common import RateLimitWaitCancelled
 from downloader.artifact_io import atomic_write_json
 
 CONFIG = Path(__file__).resolve().parents[1] / 'configs/finmind_json_pipeline.json'
-CONTRACT_VERSION = 16  # Bounded independent publication needs new whole-cycle capacity.
+CONTRACT_VERSION = 18  # Finite external reads share the canonical reservation/dispatch boundary.
 LOCAL_PREFLIGHT_ERRORS = frozenset({'local_traffic_busy', 'local_traffic_unavailable'})
 
 
@@ -201,6 +201,18 @@ def supported(connection, task):
             or task.kind in {'id_history', 'year'})
 
 
+def compatible(connection, current, candidate):
+    """Overlap independent due releases without reordering history stages.
+
+    The canonical selector still picks every task. Its baseline, object and
+    derivation handlers remain outside this pool. Only priority-zero work may
+    cross a dataset boundary; background history retains the existing grouping.
+    """
+    return (candidate is not None and supported(connection, candidate)
+            and (candidate.dataset == current.dataset
+                 or current.priority == candidate.priority == 0))
+
+
 class _CancellableLimiter:
     def __init__(self, limiter, stop):
         self.limiter, self.stop = limiter, stop
@@ -220,7 +232,7 @@ def _fetch(sessions, limiter, root, task, token, today):
 
 def run_batch(connection, executor, sessions, root, current, account, budget, reservation, now,
               limiter, token, *, config, max_calls, delegated=frozenset(), datasets=None,
-              required_keys=None, heartbeat):
+              required_keys=None, capacity_sampler, heartbeat):
     from downloader import download_finmind_complement as worker
     from downloader.finmind_object_pipeline import _claim, _release
     from downloader.finmind_account import backfill_budget, refresh_dispatch_account, pacing_interval
@@ -248,6 +260,8 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
     publishing = set()
     peak_inflight = peak_publications = 0
     attempts = accepted = nonempty = rows_total = failures = cancelled = preflight_holds = 0
+    accepted_by_dataset = {}
+    attempted_datasets = set()
     failure_codes = {}
     stop = threading.Event()
     cancellable = _CancellableLimiter(limiter, stop)
@@ -259,9 +273,14 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
         account = refresh_dispatch_account(account, token, root.parent, stamp)
         limiter.interval_seconds = pacing_interval(account)
         plan = incremental_reservation(root.parent, stamp)
+        if not due and datasets is None:
+            from downloader.provider_priority import finmind_reservation
+            plan = finmind_reservation(connection, plan, stamp, delegated)
         if protected_stock_opening(stamp):
             pause = 'protected_opening'
         elif shutil.disk_usage(root).free < worker.MIN_FREE_BYTES:
+            pause = 'disk_guard'
+        elif capacity_sampler.sample().get('state') not in {'admitted', 'not_enrolled'}:
             pause = 'disk_guard'
         elif (not due and plan.get('ready_requests', 0)) or plan.get('queue_errors'):
             pause = 'incremental_reserve'
@@ -275,8 +294,13 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
         else:
             available = 0
         while not pause and available > 0 and attempts < limit and len(jobs) < workers:
+            if capacity_sampler.sample().get('state') not in {'admitted', 'not_enrolled'}:
+                pause = 'disk_guard'
+                break
             candidate = initial or worker._next_task(connection, stamp, delegated=delegated,
-                                                      datasets=datasets, incremental_only=due)
+                datasets=datasets, incremental_only=due,
+                source_verification_priority=plan.get('source_verification_priority', False),
+                finite_query_priority=plan.get('finite_query_priority', False))
             initial = None
             if not due and candidate is None and worker._refill_current_history(connection, root, stamp,
                                                                     delegated=delegated, datasets=datasets):
@@ -284,7 +308,7 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                                                datasets=datasets)
             # The canonical selector is still the authority for preemptions,
             # nine-stage ordering, repair and cooled/terminal states.
-            if candidate is None or candidate.dataset != current.dataset or not supported(connection, candidate):
+            if not compatible(connection, current, candidate):
                 break
             _claim(connection, candidate, advance_cursor=True)
             try:
@@ -293,6 +317,7 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                 jobs[future] = candidate
                 peak_inflight = max(peak_inflight, len(jobs))
                 attempts += 1
+                attempted_datasets.add(candidate.dataset)
                 available -= 1
             except BaseException:
                 _release(connection, candidate)
@@ -333,6 +358,7 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                     # commit, strictly after the complete durable receipt.
                     worker._save_result(connection, task, receipt, worker._now(), commit=False)
                     accepted += 1
+                    accepted_by_dataset[task.dataset] = accepted_by_dataset.get(task.dataset, 0) + 1
                     nonempty += int(receipt['rows'] > 0)
                     rows_total += receipt['rows']
                     last = {'dataset': task.dataset, 'data_id': task.data_id, 'partition': task.partition,
@@ -367,12 +393,16 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
             heartbeat(next(iter(jobs.values()), None), last)
             next_heartbeat = time.monotonic() + worker.STATUS_INTERVAL_SECONDS
     elapsed = time.monotonic() - started
-    calibratable = accepted == attempts and accepted >= 2 and not failures and not cancelled
+    mixed = len(attempted_datasets) > 1
+    calibratable = (accepted == attempts and accepted >= 2 and not failures and not cancelled
+                    and not mixed and pause != 'disk_guard')
     # A batch without an ETA sample still needs observable real outcomes. Do
     # not turn cancellation, failure or an incomplete cycle into capacity.
     atomic_write_json(root / 'json_pipeline_last.json', {
         'contract_version': CONTRACT_VERSION, 'observed_at_utc': datetime.now(UTC).isoformat(),
         'configuration_sha256': config['configuration_sha256'], 'dataset': current.dataset,
+        'attempted_datasets': sorted(attempted_datasets), 'accepted_by_dataset': accepted_by_dataset,
+        'mixed_due_releases': mixed,
         'download_workers': workers, 'claimed_attempts': attempts, 'cancelled_before_request': cancelled,
         'publication_workers': publication_workers, 'peak_publications': peak_publications,
         'peak_inflight_responses': peak_inflight,
@@ -389,7 +419,8 @@ def run_batch(connection, executor, sessions, root, current, account, budget, re
                            config['configuration_sha256'], datetime.now(UTC).isoformat()))
         connection.commit()
     return {'calls': attempts - cancelled - preflight_holds, 'last': last, 'state': pause, 'seconds': elapsed,
-            'accepted_requests': accepted, 'nonempty_requests': nonempty, 'failed_tasks': failures}
+            'accepted_requests': accepted, 'nonempty_requests': nonempty, 'failed_tasks': failures,
+            'mixed_due_releases': mixed}
 
 
 def measured_rates(connection, dataset, now=None):

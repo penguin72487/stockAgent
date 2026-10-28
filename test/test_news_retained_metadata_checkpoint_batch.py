@@ -176,3 +176,88 @@ def test_empty_cohort_adds_no_fake_checkpoint_or_body_counters(cfg, tmp_path):
         assert result['heads_checked'] == result['repaired_versions'] == result['http_requests'] == commits == 0
         counts = queue.metrics.snapshot()['providers']['cnyes']['counts']
         assert counts.get('retained_metadata_checkpoint_rows', 0) == counts.get('retained_metadata_checkpoint_transactions', 0) == 0
+
+
+def test_chart_upgrade_inherits_only_unchanged_prior_heads_and_retries_body_failures(cfg, tmp_path):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        original = native_heads(queue, 7)
+        source = queue.registry.sources['cnyes']
+        keys = sorted(original)
+        states = [('current_metadata_complete', None), ('not_mobile_html_candidate', None),
+                  ('failed_validation', 'article_identity_not_verified'),
+                  ('failed_validation', 'body_not_found'), ('current_metadata_complete', None),
+                  ('deferred', None), ('failed_validation', 'retained_metadata_batch_head_not_unique')]
+        with queue.db:
+            queue.db.execute('DELETE FROM retained_metadata_replays WHERE source_fingerprint=?', (source.data_fingerprint,))
+            queue.db.execute('DELETE FROM queue_settings WHERE key=?',
+                             ('cnyes_mobile_metadata_cohort_v1:' + source.data_fingerprint,))
+            for key, (state, error) in zip(keys, states):
+                head = original[key]
+                digest = 'different-old-head' if key == keys[4] else head['body_sha256']
+                queue.db.execute('INSERT INTO retained_metadata_replays VALUES (?,?,?,?,?,?,?)',
+                    (source.parser_repair_prior_capture_fingerprint, key, head['parquet_path'], digest,
+                     state, error, 'previous-check'))
+        _ensure_cohort(queue, source)
+        rows = queue.db.execute('SELECT article_id,state,error_code,checked_at_utc FROM retained_metadata_replays '
+                                'WHERE source_fingerprint=? ORDER BY article_id', (source.data_fingerprint,)).fetchall()
+        assert [(row['state'], row['error_code'], row['checked_at_utc']) for row in rows] == [
+            ('current_metadata_complete', None, 'previous-check'),
+            ('not_mobile_html_candidate', None, 'previous-check'),
+            ('failed_validation', 'article_identity_not_verified', 'previous-check'),
+            ('pending', None, None), ('pending', None, None), ('pending', None, None),
+            ('pending', None, None)]
+        marker = json.loads(queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
+                            ('cnyes_mobile_metadata_cohort_v1:' + source.data_fingerprint,)).fetchone()[0])
+        assert marker['unchanged_prior_checkpoints'] == 3
+        assert {row['id']: dict(row) for row in queue.db.execute('SELECT * FROM articles')} == original
+        assert queue.db.execute('SELECT count(*) FROM retained_metadata_replays WHERE source_fingerprint=?',
+                                (source.parser_repair_prior_capture_fingerprint,)).fetchone()[0] == 7
+
+
+def test_chart_only_upgrade_does_not_reactivate_the_unchanged_host_namespace(cfg, tmp_path, monkeypatch):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        original = native_heads(queue, 2)
+        source = queue.registry.sources['cnyes']
+        with queue.db:
+            queue.db.execute("UPDATE queue_settings SET value=? WHERE key='source_capture_fingerprint:cnyes'",
+                             (source.parser_repair_prior_capture_fingerprint,))
+            old_identity = json.loads(queue.db.execute(
+                "SELECT value FROM queue_settings WHERE key='source_parser_repair_fingerprint:cnyes'").fetchone()[0])
+            old_identity['data_fingerprint'] = source.parser_repair_prior_capture_fingerprint
+            queue.db.execute("UPDATE queue_settings SET value=? WHERE key='source_parser_repair_fingerprint:cnyes'",
+                             (json.dumps(old_identity, sort_keys=True),))
+            queue.db.execute("UPDATE queue_settings SET value='previous-policy' WHERE key='policy_fingerprint'")
+        def unexpected(*_args, **_kwargs):
+            pytest.fail('unchanged cnyes namespace was scanned')
+        monkeypatch.setattr(queue, '_activate_authorized_metadata', unexpected)
+        queue.reconcile_policy()
+        assert {row['id']: dict(row) for row in queue.db.execute('SELECT * FROM articles')} == original
+        assert queue.db.execute("SELECT value FROM queue_settings WHERE key='source_capture_fingerprint:cnyes'").fetchone()[0] == source.data_fingerprint
+
+
+@pytest.mark.parametrize('mismatch', ['prior_capture', 'allowed', 'parser_proof'])
+def test_chart_upgrade_reconciles_namespace_when_previous_policy_is_not_proved(cfg, tmp_path, monkeypatch, mismatch):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        native_heads(queue, 1)
+        source = queue.registry.sources['cnyes']
+        with queue.db:
+            prior = 'a' * 64 if mismatch == 'prior_capture' else source.parser_repair_prior_capture_fingerprint
+            queue.db.execute("UPDATE queue_settings SET value=? WHERE key='source_capture_fingerprint:cnyes'", (prior,))
+            identity = json.loads(queue.db.execute(
+                "SELECT value FROM queue_settings WHERE key='source_parser_repair_fingerprint:cnyes'").fetchone()[0])
+            identity['data_fingerprint'] = prior
+            if mismatch == 'parser_proof':
+                identity['parser_fingerprint'] = 'b' * 64
+            queue.db.execute("UPDATE queue_settings SET value=? WHERE key='source_parser_repair_fingerprint:cnyes'",
+                             (json.dumps(identity, sort_keys=True),))
+            if mismatch == 'allowed':
+                queue.db.execute("UPDATE queue_settings SET value='0' WHERE key='source_capture_allowed:cnyes'")
+            queue.db.execute("UPDATE queue_settings SET value='previous-policy' WHERE key='policy_fingerprint'")
+        calls = []
+        original = queue._activate_authorized_metadata
+        def spy(host, policy):
+            calls.append((host, policy.provider))
+            return original(host, policy)
+        monkeypatch.setattr(queue, '_activate_authorized_metadata', spy)
+        queue.reconcile_policy()
+        assert ('m.cnyes.com', 'cnyes') in calls

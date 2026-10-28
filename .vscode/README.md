@@ -1,15 +1,31 @@
 # 遠端編輯效能
 
 `settings.json` 將專案根目錄的 `data_*`、`artifacts`、`artifacts_*`
-以及 Python 快取、虛擬環境排除於 VS Code 遞迴監看與預設全文搜尋。
+排除於 VS Code 檔案探索、遞迴監看與預設全文搜尋；Python 快取與虛擬環境
+另排除於監看及預設全文搜尋。
 根目錄限定的規則會保留 `configs/data_sync`、程式碼、測試與文件的監看。
 VS Code 原有的 Git 等預設排除規則仍由設定合併保留。
 
 這些設定不刪除檔案，也不修改下載、訓練、Git 或 Syncthing 的行為。
-資料與訓練輸出仍可從檔案總管手動開啟；排除目錄的背景更新可能需要
-按檔案總管的重新整理。需要搜尋輸出或資料時，在搜尋面板關閉
+資料與訓練輸出仍可用 `File: Open File` 指定路徑開啟；檔案總管會隱藏
+`files.exclude` 所匹配的內容。需要搜尋輸出或資料時，在搜尋面板關閉
 「Use Exclude Settings and Ignore Files」，並指定狹窄的搜尋路徑。
 移除對應設定項目即可恢復原來的監看與搜尋範圍。
+
+## 2026-10-27：npm 套件探索仍在掃描資料樹
+
+當日 VS Code 的 npm 背景探索執行 `rg --files --no-ignore --follow`，
+在整個工作區尋找 `**/package.json`；取樣時約佔 353% CPU，已執行約 223 秒。
+該輪之後自行結束。既有 `search.exclude` 無法排除這條 API 路徑，
+此版 npm 擴充套件的 `npm.exclude` 也在完整探索後才過濾。
+
+新增根目錄限定的 `files.exclude`，讓 VS Code `workspace.findFiles` 在遍歷前
+跳過資料與產物樹。執行中的 extension host 已讀回三個規則與原有預設排除；
+同一 npm 探索 API 約 0.95 秒找出根目錄套件和工作區內的插件套件。
+這是新探索的實測，沒有把先前自然結束的程序當成受控前後對照。
+本次未改動 CPU、I/O、記憶體或工作的並行上限，也未停用 npm 自動探索。
+完整負載、API 讀回與儲存改善的證據見
+[CPU／磁碟報告](../docs/cpu_disk_load_2026-10-25.md)。
 
 ## 2026-09-08 遠端主機觀察
 

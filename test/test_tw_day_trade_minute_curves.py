@@ -27,6 +27,7 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     MinutePriceStore,
     _benchmark_minute_row,
     _is_terminal_carry_cost,
+    _ImmutableMinuteInventory,
     _ticks_to_minute_frame,
     fetch_missing_kbars,
     missing_accepted_endpoints,
@@ -36,6 +37,34 @@ from scripts.rebuild_tw_day_trade_minute_curves import (
     validate_existing_strategy_marks,
     verified_manual_no_trade_pairs,
 )
+
+
+def test_zero_volume_price_only_curve_exception_is_legacy_v1_only():
+    from stockagent.live.tw_day_trade_simulation import (
+        LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+        REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    )
+    fill = {
+        "position_id": "p", "symbol": "2330", "quantity": 1000,
+        "purpose": "entry", "clock": "2026-10-28T09:01:00+08:00",
+        "session_date": "2026-10-28", "fill_at": "2026-10-28T09:01:00+08:00",
+        "simulation_only": True, "simulation_replay": True,
+        "counterfactual_0901_price_fill": True, "synthetic_fill": False,
+        "entry_price_method": "minute_close", "entry_price_source": "source",
+        "price": 100.0,
+    }
+    legacy = _ImmutableMinuteInventory(
+        {"p": {"symbol": "2330"}},
+        [fill | {"fill_contract": LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL}],
+        market="mode",
+    )
+    current = _ImmutableMinuteInventory(
+        {"p": {"symbol": "2330"}},
+        [fill | {"fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL}],
+        market="mode",
+    )
+    assert legacy.full_0901_price_entries == {"p"}
+    assert current.full_0901_price_entries == set()
 
 
 def test_maintenance_preflight_import_does_not_load_training_runtime() -> None:
@@ -1346,7 +1375,7 @@ def test_opening_revaluation_uses_same_close_and_fees_as_following_minute(tmp_pa
                                          "synthetic_fill", "entry_price_source"])
 def test_full_0901_price_carry_is_explicit_and_never_a_fresh_trade(tmp_path, invalid_field):
     from copy import deepcopy
-    from stockagent.live.tw_day_trade_simulation import REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+    from stockagent.live.tw_day_trade_simulation import LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
 
     day, market = "2026-08-13", "tw_day_trade"
     position = _position()
@@ -1361,7 +1390,7 @@ def test_full_0901_price_carry_is_explicit_and_never_a_fresh_trade(tmp_path, inv
              "symbol": "2330", "purpose": "entry", "quantity": 1000, "price": 101.0,
              "fee_and_tax_twd": 30.0, "fill_at": f"{day}T09:01:00+08:00",
              "recorded_at": "2026-10-21T15:00:00+08:00",
-             "fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+             "fill_contract": LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
              "simulation_only": True, "simulation_replay": True,
              "counterfactual_0901_price_fill": True, "synthetic_fill": False,
              "entry_price_method": "minute_close", "entry_price_source": "retained_0901_source_close"}

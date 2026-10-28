@@ -1,4 +1,6 @@
 from dataclasses import replace
+import hashlib
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +9,7 @@ import pytest
 from stockagent.backtest import report
 from stockagent.backtest.simulator import BacktestResult
 from stockagent.config import load_config
+from stockagent.data.tw_futures_decision_clock import clock_dataset, decision_clock_contract
 from stockagent.training import trainer
 
 
@@ -38,6 +41,102 @@ def test_verified_margin_tx_roll_reports_its_actual_benchmark():
     contract = trainer._mode_artifact_contract_for_config(config)
     assert details["benchmark_name"] == "TX front-month rolling buy-and-hold, 1x gross"
     assert contract["benchmark_contract"] == "tx_front_month_rolling_buy_hold_1x_gross_same_contract_close_v1"
+
+
+@pytest.mark.parametrize(
+    ("decision_time", "scope", "minutes", "quarantine", "label"),
+    [
+        ("08:45", "stock_only", 1, False, "post_decision_minute_vwap_label_527"),
+        ("09:00", "twd_equity", 30, True, "post_decision_30min_vwap_end_label_571"),
+        ("08:45", "all_twd", 300, True, "post_decision_300min_vwap_end_label_826"),
+    ],
+)
+def test_margin_reporting_reads_actual_entry_scope_and_window(
+    tmp_path, decision_time, scope, minutes, quarantine, label,
+):
+    config = load_config("configs/markets/tw_futures_v8_margin.yaml")
+    config = replace(config, trading=replace(
+        config.trading, tw_futures_portfolio_decision_time=decision_time,
+        tw_futures_portfolio_entry_clock_path=str(tmp_path / "entries.parquet"),
+        tw_futures_portfolio_opening_reference_path=None,
+    ))
+    options = {"window_minutes": minutes, "quarantine_unknown": quarantine}
+    clock = decision_clock_contract(decision_time, asset_scope=scope, **options)
+    manifest = {"clock": clock, "dataset": clock_dataset(scope, **options), "status": "complete"}
+    raw = json.dumps(manifest).encode()
+    (tmp_path / "manifest.json").write_bytes(raw)
+    contract = trainer._mode_artifact_contract_for_config(config)
+    assert contract["decision_clock"] == f"{decision_time}_completed_prior_session_features"
+    assert contract["execution_clock"] == label
+    assert contract["mode_details"]["entry_clock_reporting_contract_version"] == 2
+    assert contract["mode_details"]["entry_clock"] == clock
+    assert contract["mode_details"]["entry_clock_manifest_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_margin_reporting_never_invents_an_absent_entry_source(tmp_path):
+    config = load_config("configs/markets/tw_futures_v8_margin.yaml")
+    config = replace(config, trading=replace(
+        config.trading, tw_futures_portfolio_decision_time="09:00",
+        tw_futures_portfolio_entry_clock_path=str(tmp_path / "entries.parquet"),
+        tw_futures_portfolio_opening_reference_path=None,
+    ))
+    contract = trainer._mode_artifact_contract_for_config(config)
+    assert contract["execution_clock"] == "post_decision_window_vwap_source_metadata_unavailable"
+    assert contract["mode_details"]["entry_clock"] == {"decision_time": "09:00"}
+    assert contract["mode_details"]["entry_clock_manifest_sha256"] is None
+
+
+@pytest.mark.parametrize("damage", ["wrong_time", "wrong_dataset", "incomplete", "wrong_clock", "not_object"])
+def test_margin_reporting_rejects_unverified_clock_manifest(tmp_path, damage):
+    config = load_config("configs/markets/tw_futures_v8_margin.yaml")
+    config = replace(config, trading=replace(
+        config.trading, tw_futures_portfolio_decision_time="09:00",
+        tw_futures_portfolio_entry_clock_path=str(tmp_path / "entries.parquet"),
+        tw_futures_portfolio_opening_reference_path=None,
+    ))
+    options = {"window_minutes": 30, "quarantine_unknown": True}
+    clock = decision_clock_contract("09:00", asset_scope="all_twd", **options)
+    manifest = {"clock": clock, "dataset": clock_dataset("all_twd", **options), "status": "complete"}
+    if damage == "wrong_time":
+        clock["decision_time"] = "08:45"
+    elif damage == "wrong_dataset":
+        manifest["dataset"] = "different_source"
+    elif damage == "incomplete":
+        manifest["status"] = "incomplete"
+    elif damage == "wrong_clock":
+        clock["window_end_minute"] += 1
+    else:
+        manifest = []
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="futures report entry clock manifest"):
+        trainer._mode_artifact_contract_for_config(config)
+
+
+@pytest.mark.parametrize("scope,minutes,quarantine", [
+    ("stock_only", 1, False), ("twd_equity", 30, True), ("all_twd", 300, True),
+])
+def test_checkpoint_records_actual_clock_and_binds_its_entry_bytes(tmp_path, scope, minutes, quarantine):
+    from stockagent.training.checkpoint_contract import _trading_checkpoint_contract
+
+    config = load_config("configs/markets/tw_futures_v8_margin.yaml")
+    entry = tmp_path / "entries.parquet"
+    entry.write_bytes(b"observed source bytes")
+    config = replace(config, trading=replace(
+        config.trading, tw_futures_portfolio_decision_time="08:45",
+        tw_futures_portfolio_entry_clock_path=str(entry),
+        tw_futures_portfolio_opening_reference_path=None,
+    ))
+    options = {"window_minutes": minutes, "quarantine_unknown": quarantine}
+    clock = decision_clock_contract("08:45", asset_scope=scope, **options)
+    manifest = {"clock": clock, "dataset": clock_dataset(scope, **options), "status": "complete",
+                "entries_sha256": hashlib.sha256(entry.read_bytes()).hexdigest()}
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    checkpoint_clock = _trading_checkpoint_contract(config)["futures_entry_clock"]
+    assert all(checkpoint_clock[key] == value for key, value in clock.items())
+    assert checkpoint_clock["source_sha256"] == manifest["entries_sha256"]
+    entry.write_bytes(b"changed source bytes")
+    with pytest.raises(ValueError, match="source differs from its manifest"):
+        _trading_checkpoint_contract(config)
 
 
 def _contracts(*, margin=False):

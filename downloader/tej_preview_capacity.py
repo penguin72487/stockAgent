@@ -104,9 +104,26 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
         definition = dict(con.execute('SELECT * FROM tables WHERE table_id=?',(task['table_id'],)).fetchone())
         request = expand_request(json.loads(task['request_json']),definition,task['table_id'])
         proof = validate_capacity_response(root,task,request,payload,output)
-        plan_row = con.execute('SELECT * FROM download_plans WHERE table_id=?',(task['table_id'],)).fetchone()
-        if plan_row is None or plan_row['contract'] != CONTRACT:
-            raise ValueError('Existing canonical lazy plan required')
+        cycle = request.get('incremental_cycle')
+        if cycle is not None:
+            from downloader.tej_incremental import CONTRACT as INCREMENTAL_CONTRACT
+            if (not isinstance(cycle, str) or not cycle
+                    or request.get('incremental_contract') != INCREMENTAL_CONTRACT):
+                raise ValueError('Exact registered incremental cycle required')
+            plan_row = con.execute('SELECT * FROM tej_incremental_cycles WHERE cycle_id=? AND table_id=?',
+                                   (cycle, task['table_id'])).fetchone()
+            lineage = con.execute('SELECT cycle_id,ordinal FROM tej_incremental_tasks WHERE task_id=?',
+                                  (task_id,)).fetchone()
+            if (plan_row is None or plan_row['state'] not in ('downloading', 'checked')
+                    or plan_row['plan_json'] is None or lineage is None or lineage['cycle_id'] != cycle
+                    or lineage['ordinal'] != request.get('incremental_ordinal')):
+                raise ValueError('Incremental overflow does not match its registered cycle and ordinal')
+        else:
+            if request.get('incremental_contract') is not None:
+                raise ValueError('Incremental contract requires its registered cycle')
+            plan_row = con.execute('SELECT * FROM download_plans WHERE table_id=?',(task['table_id'],)).fetchone()
+            if plan_row is None or plan_row['contract'] != CONTRACT:
+                raise ValueError('Existing canonical lazy plan required')
         former_row = dict(plan_row)
         former = json.loads(plan_row['plan_json'])
         next_request(former,0)  # Validate immutable original fingerprint.
@@ -138,14 +155,23 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
                 or request['max_rows']!=former['request']['max_rows']
                 or request['max_cells']!=former['request']['max_cells']):
             raise ValueError('Overflow is outside the exact original plan/capacity')
-        pending = list(con.execute("SELECT * FROM tasks WHERE table_id=? AND kind='download' AND "
-                                   "state='pending' AND scope_contract=?",(task['table_id'],SOURCE_SCOPE_CONTRACT)))
+        if cycle is None:
+            scope_sql = "table_id=? AND json_extract(request_json,'$.incremental_cycle') IS NULL"
+            scope_args = (task['table_id'],)
+        else:
+            scope_sql = ("table_id=? AND task_id IN (SELECT task_id FROM tej_incremental_tasks "
+                         "WHERE cycle_id=?) AND json_extract(request_json,'$.incremental_cycle')=?")
+            scope_args = (task['table_id'], cycle, cycle)
+        pending = list(con.execute("SELECT * FROM tasks WHERE " + scope_sql +
+                                   " AND kind='download' AND state='pending' AND scope_contract=?",
+                                   (*scope_args, SOURCE_SCOPE_CONTRACT)))
         pending_requests = [expand_request(json.loads(r['request_json']),definition,task['table_id']) for r in pending]
         if any(req.get('field_partition',{}).get('plan_fingerprint')!=former['fingerprint']
                or stable_id([task['table_id'],req])!=row['task_id'] for row,req in zip(pending,pending_requests)):
             raise ValueError('Pending native scope outside the exact original plan')
-        completed = list(con.execute("SELECT * FROM tasks WHERE table_id=? AND kind='download' AND "
-                                     "state='complete' AND scope_contract=?",(task['table_id'],SOURCE_SCOPE_CONTRACT)))
+        completed = list(con.execute("SELECT * FROM tasks WHERE " + scope_sql +
+                                     " AND kind='download' AND state='complete' AND scope_contract=?",
+                                     (*scope_args, SOURCE_SCOPE_CONTRACT)))
         if task['actual_rows'] is not None or task['receipt_path'] is not None or task['completed_at_utc'] is not None:
             raise ValueError('Capacity response cannot supersede adopted source observations')
         pairs = len(request['company_labels'])*len(request['date_labels'])
@@ -205,6 +231,8 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
                  'evidence':proof,'original_plan_backup':str(backup_path.relative_to(root)),
                  'original_plan_backup_sha256':_digest(backup_path),
                  'old_plan_fingerprint':former['fingerprint'],'new_plan_fingerprint':plan['fingerprint'],
+                 'plan_owner':'incremental_cycle' if cycle is not None else 'history',
+                 'incremental_cycle':cycle,
                  'completed_work_rows_preserved':plan['completed_work_rows'],
                  'inherited_empty_key_layout_coverage':inherited_empty_proofs,
                  'original_outcome':'proved_overflow_not_complete_not_claimed_unsent',
@@ -214,8 +242,16 @@ def replan_capacity(root: Path, task_id: str, payload: dict, output: Path,
         if not review:
             con.executemany("UPDATE tasks SET state=? WHERE task_id=? AND state='pending'",
                             [(SUPERSEDED,r['task_id']) for r in pending])
-            con.execute('UPDATE download_plans SET plan_json=?,next_query=0,total_queries=? WHERE table_id=?',
-                        (json.dumps(plan,ensure_ascii=False,separators=(',',':')),plan['total_queries'],task['table_id']))
+            encoded = json.dumps(plan,ensure_ascii=False,separators=(',',':'))
+            if cycle is None:
+                changed = con.execute('UPDATE download_plans SET plan_json=?,next_query=0,total_queries=? WHERE table_id=?',
+                                      (encoded,plan['total_queries'],task['table_id'])).rowcount
+            else:
+                changed = con.execute("UPDATE tej_incremental_cycles SET plan_json=?,next_query=0,total_queries=? "
+                                      "WHERE cycle_id=? AND table_id=? AND state='downloading'",
+                                      (encoded,plan['total_queries'],cycle,task['table_id'])).rowcount
+            if changed != 1:
+                raise ValueError('The exact source plan changed during capacity recovery')
         con.execute('UPDATE tasks SET state=?,last_error_code=?,output_path=? WHERE task_id=?',
                     ('blocked' if review else SUPERSEDED,REVIEW_STATE if review else OUTCOME,
                      str(output.resolve().relative_to(root.resolve())),task_id))

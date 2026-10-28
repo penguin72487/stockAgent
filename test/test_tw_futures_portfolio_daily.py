@@ -15,6 +15,7 @@ from stockagent.backtest.tw_futures_portfolio import (
 )
 from stockagent.config import load_config
 from stockagent.data.tw_futures_portfolio_daily import (
+    FuturesPortfolioSlotCapacityExceeded,
     _fixed_portfolio_slot_map,
     _validate_supported_outright_quotes,
     build_continuous_daily,
@@ -85,6 +86,18 @@ def test_reissued_product_month_keeps_separate_quarantined_instance_slots():
         _fixed_portfolio_slot_map(meta.drop('physical_instance'),dates)
     with pytest.raises(ValueError,match='duplicate futures lifetime identity'):
         _fixed_portfolio_slot_map(pl.concat([meta,meta.head(1)]),dates)
+
+
+def test_daily_builder_defers_fixed_layout_overflow_without_retry_loop(monkeypatch, capsys):
+    from scripts import build_taifex_futures_portfolio_daily as builder
+
+    def overflow(**_kwargs):
+        raise FuturesPortfolioSlotCapacityExceeded("fixed portfolio slot capacity exceeded")
+
+    monkeypatch.setattr(builder, "build_dataset", overflow)
+    monkeypatch.setattr("sys.argv", ["build_taifex_futures_portfolio_daily.py"])
+    assert builder.main() == 75
+    assert "fixed portfolio slot capacity exceeded" in capsys.readouterr().err
 
 
 def test_portfolio_build_rejects_dated_stock_future_off_grid_quotes() -> None:

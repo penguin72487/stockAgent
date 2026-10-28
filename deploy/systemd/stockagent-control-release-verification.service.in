@@ -12,7 +12,6 @@ ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_control_release_queue.sh cycle
 Slice=stockagent-control.slice
 Nice=10
 CPUWeight=20
-CPUQuota=100%
 MemoryHigh=512M
 MemoryMax=768M
 TasksMax=32

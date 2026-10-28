@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import closing
+from copy import deepcopy
 import codecs
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -18,10 +19,12 @@ import io
 from itertools import islice
 import json
 import locale
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 import time
 from urllib.parse import urlsplit
 import uuid
@@ -30,6 +33,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file, table_from_records
+from downloader.news_fulltext_metadata_index import initialize_metadata_index, register_accepted_metadata_head
 from downloader.news_fulltext_metrics import (
     NewsMetrics, CNYES_NATIVE_BODY_FAILURE_STAGES, ETTODAY_ATTRIBUTION_FAILURE_STAGES,
     ARTICLE_RESPONSE_ENVELOPE_CONTRACT_VERSION,
@@ -48,6 +52,8 @@ from downloader.news_fulltext_status import (
     summarize_bulk_window_gaps, DISCOVERY_SUMMARY_CONTRACT_VERSION,
     discovery_summary, initialize_discovery_summary,
     ARTICLE_BODY_STATE_COUNTER_CONTRACT_VERSION, initialize_article_body_states,
+    bulk_coverage_rows, initialize_bulk_coverage_summary, cnyes_local_replay_retries,
+    cnyes_metadata_resource_waits, cnyes_metadata_index_progress, cnyes_metadata_large_replay,
 )
 from downloader.news_fulltext_metadata_ingest import METADATA_INGEST_CONTRACT_VERSION
 
@@ -61,6 +67,7 @@ CNYES_WINDOW_DISPATCH_CONTRACT_VERSION = 3
 STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION = 1
 FAILURE_OBSERVATION_CONTRACT_VERSION = 2
 DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION = 1
+DISCOVERY_REQUEST_DEFERRAL_CONTRACT_VERSION = 1
 DISCOVERY_STATUS_PROJECTION_CONTRACT_VERSION = 1
 DISCOVERY_READINESS_PROBE_CONTRACT_VERSION = 2
 DISCOVERY_PARSER_CONTRACT_INDEX_SQL = (
@@ -79,8 +86,14 @@ CNYES_UNKNOWN_IDENTITY_RECHECK_CONTRACT_VERSION = 1
 CNYES_UNKNOWN_BODY_RECHECK_SECONDS = 300
 CNYES_RETAINED_VALIDATION_RECHECK_CONTRACT_VERSION = 1
 ARTICLE_PATH_ADMISSION_CONTRACT_VERSION = 1
+PRISTINE_METADATA_FIELDS_SQL = (
+    "attempts=0 AND due=0 AND body_sha256 IS NULL AND coalesce(body_bytes,0)=0 "
+    "AND parquet_path IS NULL AND captured_at_utc IS NULL AND last_checked_at_utc IS NULL "
+    "AND authorization_fingerprint IS NULL AND etag IS NULL AND last_modified IS NULL "
+    "AND validator_url IS NULL AND lease_owner IS NULL AND lease_until IS NULL"
+)
 ACCEPTANCE_RECEIPT_DECODE_VERSION = 2
-ACCEPTANCE_RECEIPT_INPUT_VERSION = 1
+ACCEPTANCE_RECEIPT_INPUT_VERSION = 2
 PARSER_REPAIR_IDENTITY_CONTRACT_VERSION = 1
 ABANDONED_WORK_RECOVERY_SQL = (
     "UPDATE articles SET state='retry',due=0,lease_owner=NULL,lease_until=NULL,"
@@ -282,7 +295,8 @@ def ettoday_literal_value_parser_repair(source, previous_capture):
 def native_body_only_layout(source):
     from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS
     return bool(source and (
-        source.provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v6'
+        source.provider == 'gnn' and source.embedded_article_layout in {'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}
+        or source.provider == 'ettoday' and source.embedded_article_layout == 'ettoday_visible_article_v6'
         or source.provider == 'cmnews' and source.embedded_article_layout == 'cmnews_visible_article_v1'
         or source.provider == 'setn_inews_scope'
             and INEWS_LAYOUT_VERSIONS.get(source.embedded_article_layout, 0) >= 2
@@ -542,7 +556,12 @@ def read_acceptance_receipt_input(path: Path):
     do not newly admit BOM/UTF-16/invalid UTF-8 through JSON's byte sniffing.
     Every receipt, including committed ones, is still fully decoded below.
     """
-    return acceptance_receipt_input_from_bytes(path.read_bytes())
+    # FileIO.readall retains complete-input/EOF semantics without allocating
+    # a BufferedReader for each tiny receipt. Keep Path.open and its context
+    # so custom paths and read/close errors retain their original boundaries.
+    with path.open('rb', buffering=0) as stream:
+        raw = stream.read()
+    return acceptance_receipt_input_from_bytes(raw)
 
 
 def acceptance_receipt_input_from_bytes(raw):
@@ -596,6 +615,21 @@ def source_path(root: Path, relative: str) -> Path:
     return candidate
 
 
+def replay_source_path(root: Path, relative: str) -> Path:
+    """Distinguish a transient local read failure from an invalid source path.
+
+    Only bounded replay callers use this. Other readers retain the historical
+    ``source_path`` error contract. Containment and regular-file checks remain
+    mandatory; a missing or inaccessible file raises its original OSError.
+    """
+    candidate = (root / relative).resolve()
+    if not candidate.is_relative_to(root.resolve()):
+        raise ValueError('invalid source artifact path')
+    if not stat.S_ISREG(candidate.stat().st_mode):
+        raise ValueError('invalid source artifact file')
+    return candidate
+
+
 def summarize_discovery_status(db, now):
     """Exact transaction-derived counts; one shared clock, no source scan."""
     return discovery_summary(db, now)
@@ -604,21 +638,7 @@ def summarize_discovery_status(db, now):
 def summarize_bulk_coverage(db, registry):
     """Read-only endpoint projection; SQLite retains the full scope graph."""
     endpoints = []
-    for row in db.execute("""
-        WITH coverage AS (
-            SELECT c.*,
-                   CASE WHEN instr(c.base_url,'?')=0 THEN c.base_url
-                        ELSE substr(c.base_url,1,instr(c.base_url,'?')-1) END AS endpoint,
-                   coalesce(json_array_length(s.child_urls_json),0)>0 AS superseded
-            FROM bulk_api_coverage c LEFT JOIN bulk_window_splits s ON s.scope_url=c.base_url
-        )
-        SELECT provider,endpoint AS base_url,count(*) AS coverage_scopes,
-               sum(superseded) AS superseded_scopes,sum(NOT superseded) AS leaf_scopes,
-               sum(CASE WHEN NOT superseded THEN total_articles ELSE 0 END) AS total_articles,
-               sum(CASE WHEN NOT superseded THEN total_pages ELSE 0 END) AS total_pages,
-               max(observed_at_utc) AS observed_at_utc
-        FROM coverage GROUP BY provider,endpoint ORDER BY provider,endpoint
-    """):
+    for row in bulk_coverage_rows(db):
         item = dict(row)
         source = registry.sources.get(item["provider"])
         item["enabled"] = bool(source and source.allowed and item["leaf_scopes"]
@@ -647,6 +667,11 @@ class NewsQueue:
             lifecycle.started(self.owner)
         self.metrics.owner_id = self.owner
         self.db = sqlite3.connect(root / "queue.sqlite3")
+        # Discovery stores URLs rather than the article table's normalized
+        # host. Register the HTTP-equivalent parser once; it is used only
+        # while an evidenced exact-host circuit is active.
+        from downloader.news_fulltext_host_circuit import discovery_request_host
+        self.db.create_function('news_discovery_request_host', 1, discovery_request_host, deterministic=True)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
@@ -765,6 +790,8 @@ class NewsQueue:
         if contract and contract[0] != CONTRACT_VERSION:
             self.close()
             raise ValueError("incompatible news fulltext queue; use a versioned root")
+        if self.registry.sources.get('cnyes') and self.registry.sources['cnyes'].allowed:
+            initialize_metadata_index(self.db)
         if not contract:
             self.db.execute("INSERT INTO contract VALUES (?)", (CONTRACT_VERSION,))
         if "metadata_order_day" not in {row[1] for row in self.db.execute("PRAGMA table_info(articles)")}:
@@ -822,6 +849,8 @@ class NewsQueue:
                         (str(ARTICLE_DISPATCH_CONTRACT_VERSION),))
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_request_deferral_contract_version',?)",
                         (str(REQUEST_DEFERRAL_CONTRACT_VERSION),))
+        self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('discovery_request_deferral_contract_version',?)",
+                        (str(DISCOVERY_REQUEST_DEFERRAL_CONTRACT_VERSION),))
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_recheck_day_contract_version',?)",
                         (str(ARTICLE_RECHECK_DAY_CONTRACT_VERSION),))
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_path_admission_contract_version',?)",
@@ -862,10 +891,21 @@ class NewsQueue:
             initialize_bulk_error_count(self.db)
         with self.metrics.measure('discovery_summary_initialization'):
             initialize_discovery_summary(self.db)
+        from downloader.news_fulltext_discovery_errors import initialize_discovery_errors
+        with self.metrics.measure('discovery_error_rollup_initialization'):
+            initialize_discovery_errors(self.db)
+        self._discovery_error_rollup_pending = True
+        self._discovery_error_rollup_needs_integrity_check = False
+        with self.metrics.measure('bulk_coverage_summary_initialization'):
+            initialize_bulk_coverage_summary(self.db)
         # Only after acquiring exclusive ownership can abandoned work be requeued.
         with self.metrics.measure('abandoned_work_recovery'):
             self.db.execute(ABANDONED_WORK_RECOVERY_SQL)
             self.db.commit()
+        # A durable CNYES receipt can be replayed before the full history
+        # migration. Its raw-reference index must exist in that transaction.
+        from downloader.news_fulltext_cnyes_history import initialize_accepted_batch_candidates
+        initialize_accepted_batch_candidates(self)
         if self.lifecycle is not None:
             self.lifecycle.phase('acceptance_recovery', receipts_decoded=0)
         self.recover_acceptance()
@@ -897,6 +937,10 @@ class NewsQueue:
             self.lifecycle.phase('awaiting_first_snapshot')
 
     def close(self):
+        large_job = getattr(self, '_large_metadata_job', None)
+        if large_job is not None:
+            large_job['job'].close()
+            self._large_metadata_job = None
         from downloader.news_fulltext_metadata_ingest import close_readers
         close_readers(self)
         entries = getattr(self, '_cached_cnyes_inventory_entries', None)
@@ -993,7 +1037,7 @@ class NewsQueue:
         frozen_sources = {r[0] for r in self.db.execute("SELECT provider FROM finite_cohorts")}
         for row in rows:
             try:
-                url = normalize_url(row.get("url"))
+                url, host, path = normalize_url(row.get("url"), include_host_path=True)
             except NewsError:
                 invalid += 1
                 continue
@@ -1001,7 +1045,6 @@ class NewsQueue:
             if key in aggregated:
                 aggregated[key]["associations"] += 1
                 continue
-            host = urlsplit(url).hostname
             if host not in host_policy:
                 host_policy[host] = self.registry.match(url)
             source = host_policy[host]
@@ -1009,7 +1052,7 @@ class NewsQueue:
             # membership can hide non-article metadata as unreviewed work.
             # Upserts below retain all existing states, deadlines and heads.
             path_excluded = bool(source and source.allowed and source.article_path_pattern
-                                 and not re.search(source.article_path_pattern, urlsplit(url).path))
+                                 and not re.search(source.article_path_pattern, path))
             aggregated[key] = {"key": key, "url": url, "host": host,
                                "provider": source.provider if source else "unregistered:" + host,
                                "state": ("unsupported_article_path" if path_excluded else
@@ -1306,6 +1349,127 @@ class NewsQueue:
                 'accepted_as_bodies': False}, sort_keys=True)))
             self.metrics.count('cnyes', 'pinned_native_v16_declaration_rechecks', len(selected))
 
+    def _activate_pristine_path_exclusions(self, host, source):
+        """Admit locally excluded metadata when a reviewed path becomes eligible.
+
+        Real source outcomes, clocks, leases and prior attempts are not reset.
+        Finite sources retain their exact reviewed URL selection.
+        """
+        selected = frozenset(source.finite_article_urls)
+        pattern = re.compile(source.article_path_pattern) if source.article_path_pattern else None
+        rows = self.db.execute("SELECT id,url FROM articles WHERE host=? "
+                               "AND state='unsupported_article_path' AND error_code='unsupported_article_path' "
+                               "AND " + PRISTINE_METADATA_FIELDS_SQL, (host,)).fetchall()
+        included = [(key,) for key, url in rows
+                    if (not pattern or pattern.search(urlsplit(url).path))
+                    and (not selected or url in selected)]
+        self.db.executemany("UPDATE articles SET state='pending',error_code=NULL "
+                            "WHERE id=? AND state='unsupported_article_path' "
+                            "AND error_code='unsupported_article_path' AND "
+                            + PRISTINE_METADATA_FIELDS_SQL, included)
+
+    def migrate_readmo_pristine_namespace(self):
+        """Reclassify this exact legacy host using the current ingress rule once.
+
+        Older metadata predates the common path gate. Only never-requested,
+        unleased rows are changed; no source result or retry is fabricated.
+        """
+        host = 'readmo.cmoney.tw'
+        source = self.registry.match('https://' + host + '/')
+        expected = r'^/(forum/article/[0-9]+|notes/note[.]aspx)'
+        if (source is None or not source.allowed or source.provider != 'cmoney'
+                or source.domains != ('cmoney.tw',) or source.article_path_pattern != expected):
+            return
+        marker = 'readmo_pristine_path_admission_v1'
+        if self.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (marker,)).fetchone():
+            return
+        with self.db:
+            rows = self.db.execute("SELECT id,url FROM articles WHERE host=? AND provider=? "
+                                   "AND state='pending' AND error_code IS NULL AND "
+                                   + PRISTINE_METADATA_FIELDS_SQL, (host, source.provider)).fetchall()
+            excluded = sorted((key, url) for key, url in rows
+                              if not re.search(source.article_path_pattern, urlsplit(url).path))
+            self.db.executemany("UPDATE articles SET state='unsupported_article_path', "
+                                "error_code='unsupported_article_path' WHERE id=? AND state='pending' "
+                                "AND error_code IS NULL AND " + PRISTINE_METADATA_FIELDS_SQL,
+                                ((key,) for key, _ in excluded))
+            self.db.execute('INSERT INTO queue_settings VALUES (?,?)', (marker, json.dumps({
+                'contract_version': 1, 'source_data_fingerprint': source.data_fingerprint,
+                'host': host, 'excluded_heads': len(excluded),
+                'urls_sha256': hashlib.sha256(''.join(url + '\n' for _, url in excluded).encode()).hexdigest(),
+                'recorded_at_utc': utc_now(), 'source_requests': 0,
+                'source_outcomes_or_stored_bodies_reset': False}, sort_keys=True)))
+        self.metrics.count(source.provider, 'pristine_path_exclusions_migrated', len(excluded))
+
+    def backfill_cmoney_note_detail_exclusions(self, *, limit=512, stop=None):
+        """Reconcile legacy note-detail heads without consuming an HTTP attempt.
+
+        New metadata already applies the same path gate. Old pending heads are
+        visited in URL-index order in bounded, atomic slices after disk admission.
+        Keep the cursor with the mutations so a restart never resets a source
+        outcome, lease, accepted body, retry deadline or publication metadata.
+        """
+        if type(limit) is not int or not 1 <= limit <= 2048:
+            raise ValueError('bounded_path_exclusion_slice_required')
+        source = self.registry.match('https://www.cmoney.tw/notes/note-detail.aspx?nid=1')
+        expected = r'^/(forum/article/[0-9]+|notes/note[.]aspx)'
+        if (source is None or not source.allowed or not source.request_enabled
+                or source.provider != 'cmoney' or source.domains != ('cmoney.tw',)
+                or source.article_path_pattern != expected or source.acquisition_mode == 'finite'
+                or source.finite_article_urls):
+            return {'completed': True, 'classified': 0, 'publisher_requests': 0}
+        if stop is not None and stop.is_set():
+            return {'completed': False, 'classified': 0, 'publisher_requests': 0}
+
+        prefixes = ('https://www.cmoney.tw/notes/note-detail.aspx?',
+                    'http://www.cmoney.tw/notes/note-detail.aspx?')
+        marker = 'cmoney_note_detail_pristine_path_v1:' + source.data_fingerprint
+        initial = {'contract_version': 1, 'phase': 0, 'last_url': '', 'classified': 0}
+
+        def valid(value):
+            if (not isinstance(value, dict) or set(value) != set(initial)
+                    or type(value['contract_version']) is not int or value['contract_version'] != 1
+                    or type(value['phase']) is not int or not 0 <= value['phase'] <= len(prefixes)
+                    or type(value['classified']) is not int or value['classified'] < 0
+                    or not isinstance(value['last_url'], str) or len(value['last_url']) > 16384):
+                return False
+            if value['phase'] == len(prefixes):
+                return not value['last_url']
+            return not value['last_url'] or value['last_url'].startswith(prefixes[value['phase']])
+
+        from downloader.news_fulltext_urls import _read_checkpoint
+        with self.db:
+            progress = _read_checkpoint(self, marker, initial, valid, manage_transaction=False)
+            phase = progress['phase']
+            if phase == len(prefixes):
+                return {'completed': True, 'classified': 0, 'publisher_requests': 0}
+            prefix = prefixes[phase]
+            after = progress['last_url']
+            operator = '>' if after else '>='
+            # articles.url is UNIQUE in the canonical schema. Explicitly use
+            # its range index rather than repeatedly scanning all pending rows.
+            rows = self.db.execute(
+                'SELECT id,url FROM articles INDEXED BY sqlite_autoindex_articles_2 '
+                'WHERE url' + operator + '? AND url<? AND provider=? AND host=? '
+                "AND state='pending' AND error_code IS NULL AND " + PRISTINE_METADATA_FIELDS_SQL
+                + ' ORDER BY url LIMIT ?',
+                (after or prefix, prefix + '\U0010ffff', source.provider, 'www.cmoney.tw', limit)).fetchall()
+            if stop is not None and stop.is_set():
+                return {'completed': False, 'classified': 0, 'publisher_requests': 0}
+            changed = self.db.executemany(
+                "UPDATE articles SET state='unsupported_article_path',error_code='unsupported_article_path' "
+                "WHERE id=? AND state='pending' AND error_code IS NULL AND " + PRISTINE_METADATA_FIELDS_SQL,
+                ((row['id'],) for row in rows)).rowcount
+            next_phase = phase + 1 if len(rows) < limit else phase
+            next_after = '' if next_phase != phase else rows[-1]['url']
+            progress = {'contract_version': 1, 'phase': next_phase, 'last_url': next_after,
+                        'classified': progress['classified'] + changed}
+            self.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
+                            (marker, json.dumps(progress, sort_keys=True)))
+        if changed:
+            self.metrics.count('cmoney', 'pristine_note_detail_path_exclusions', changed)
+        return {'completed': next_phase == len(prefixes), 'classified': changed, 'publisher_requests': 0}
+
     def _activate_authorized_metadata(self, host, source):
         """Apply the same namespace gate as new metadata, before dispatch.
 
@@ -1315,6 +1479,7 @@ class NewsQueue:
         Literal finite selections still grant no same-host bulk admission.
         The caller owns the policy-reconciliation transaction.
         """
+        self._activate_pristine_path_exclusions(host, source)
         selection = source.finite_article_urls
         if not source.article_path_pattern:
             clause = (' AND url IN (' + ','.join('?' for _ in selection) + ')') if selection else ''
@@ -1344,6 +1509,7 @@ class NewsQueue:
 
     def reconcile_policy(self):
         self.migrate_cnyes_window_dispatch()
+        self.migrate_readmo_pristine_namespace()
         # Policy/expiry is evaluated by the registry on every owner start.
         # Unchanged policy does not justify rescanning millions of URL rows.
         fingerprint = hashlib.sha256(json.dumps([
@@ -1444,6 +1610,19 @@ class NewsQueue:
                     source, prior_sources.get('source_capture_fingerprint:' + source.provider),
                     prior_parsers.get('source_parser_repair_fingerprint:' + source.provider)))
                 target = source.provider if source else "unregistered:" + host
+                # The outer-chart comparison changes the capture ABI but not
+                # namespace admission, rights, scheduling or parser retry
+                # policy. Its reconstructed predecessor pins every other
+                # setting, so avoid a full host admission scan on that exact
+                # upgrade. A changed authorization/scope still takes the
+                # normal reconciliation path.
+                chart_only_upgrade = bool(source and source.provider == 'cnyes'
+                    and prior_sources.get('source_capture_fingerprint:cnyes')
+                        == source.parser_repair_prior_capture_fingerprint
+                    and not parser_changed
+                    and prior_allowed.get('source_capture_allowed:cnyes') == str(int(source.allowed)))
+                if provider == target and chart_only_upgrade:
+                    continue
                 if (provider == target and source and not capture_changed
                         and prior_allowed.get("source_capture_allowed:" + source.provider) == str(int(source.allowed))):
                     continue  # A different provider's configuration is not a frontier change here.
@@ -1461,12 +1640,17 @@ class NewsQueue:
                     if not ((source.provider == 'stockfeel'
                             and source.embedded_article_layout in {'stockfeel_visible_original_v2', 'stockfeel_visible_original_v3', 'stockfeel_visible_original_v4', 'stockfeel_visible_original_v5', 'stockfeel_visible_original_v6', 'stockfeel_visible_original_v7'})
                             or (source.provider == 'taiwannews'
-                                and source.embedded_article_layout in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'})):
+                                and source.embedded_article_layout in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'})
+                            or (source.provider == 'managertoday'
+                                and source.embedded_article_layout in {'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'})
+                            or (source.provider == 'gnn' and source.embedded_article_layout in {'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'})):
                         # Role separation grants no new access/authorization.
                         # Only an explicitly witnessed missing-head repair may
                         # enter the shared mailbox, never every old failure.
                         self._activate_authorized_metadata(host, source)
                     if (parser_changed and source.provider not in {'cnyes', 'moneyweekly'}
+                            and not (source.provider == 'managertoday'
+                                and source.embedded_article_layout in {'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'})
                             # Moneyweekly short-prose repairs use the explicit
                             # missing-head mailbox and reviewed retained original.
                             # A new byline/parser must not reset unrelated failed
@@ -1489,7 +1673,7 @@ class NewsQueue:
                             and not (source.provider == 'gvm'
                                      and source.embedded_article_layout in {'gvm_public_native_article_v2', 'gvm_public_native_article_v3', 'gvm_public_native_article_v4', 'gvm_public_native_article_v5', 'gvm_public_native_article_v6', 'gvm_public_native_article_v7', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10', 'gvm_public_native_article_v11'})
                             and not (source.provider == 'knews'
-                                     and source.embedded_article_layout in {'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7'})
+                                     and source.embedded_article_layout in {'knews_public_native_article_v2', 'knews_public_native_article_v3', 'knews_public_native_article_v4', 'knews_public_native_article_v5', 'knews_public_native_article_v6', 'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'})
                             and not (source.provider in _NATIVE_TEXT_REPAIR_SPECS
                                      and source.embedded_article_layout in _NATIVE_TEXT_REPAIR_SPECS[source.provider][0])
                             and not (source.provider == 'pocket'
@@ -3641,6 +3825,14 @@ class NewsQueue:
         return max((row[1] for row in jobs if row[2] is not None and not (
             row[2] == 'discovery_http_422' and int(parse_qs(urlsplit(row[0]).query).get('page', ['1'])[0]) > 30)), default=0)
 
+    def observe_bulk_coverage(self, base_url, provider, total_articles, total_pages, observed_at_utc):
+        """Preserve the source clock and update counts in the caller's transaction."""
+        self.db.execute('''INSERT INTO bulk_api_coverage VALUES (?,?,?,?,?)
+            ON CONFLICT(base_url) DO UPDATE SET provider=excluded.provider,
+                total_articles=excluded.total_articles,total_pages=excluded.total_pages,
+                observed_at_utc=excluded.observed_at_utc''',
+            (base_url, provider, total_articles, total_pages, observed_at_utc))
+
     def partition_cnyes_window(self, url, pages, source, *, existing_jobs=None):
         """Schedule exact source-date children, not a history-completeness proof.
 
@@ -3990,7 +4182,7 @@ class NewsQueue:
         return self._bind_saved_validators(dict(row))
 
     @staticmethod
-    def discovery_dispatch_filter(source, bulk_allowed=True, *, include_circuits=True):
+    def discovery_dispatch_filter(source, bulk_allowed=True, *, include_circuits=True, now=None):
         """Removed endpoints remain evidence, never an implicitly enabled job.
 
         Filter before LIMIT: skipping old jobs after selection could otherwise
@@ -4024,8 +4216,42 @@ class NewsQueue:
                            "AND circuit.endpoint=? AND circuit.data_fingerprint IN ("
                            + ','.join('?' for _ in versions) + ") AND circuit.not_before>?"
                            + scope_guard + "))")
-                parameters.extend((ENDPOINT,source.provider,ENDPOINT,*versions,time.time()))
+                parameters.extend((ENDPOINT,source.provider,ENDPOINT,*versions,
+                                   time.time() if now is None else now))
                 parameters.extend(scope_parameters)
+                # A verified smaller source list may retire only its old page
+                # pointers. Keep their jobs/errors and suppress those exact
+                # URLs until a later first page advertises them again.
+                result += (" AND (kind!='index' OR NOT EXISTS (SELECT 1 FROM cnyes_index_revision_retired AS retired "
+                           "WHERE retired.url=discovery.url AND retired.index_fingerprint=? "
+                           "AND retired.authorization_fingerprint=? AND retired.active=1))")
+                parameters.extend((source.cnyes_index_data_fingerprint, source.authorization_fingerprint))
+                # A page response may not be usable in every revision phase.
+                # Filter before LIMIT and wake calculation: a due old page
+                # must not spin while the new first-page anchor is waiting.
+                scope_expr = ("(? || '?endAt=' || substr(discovery.url,instr(discovery.url,'&endAt=')+7) "
+                              "|| '&limit=30&startAt=' || substr(discovery.url,instr(discovery.url,'&startAt=')+9, "
+                              "instr(discovery.url,'&endAt=')-instr(discovery.url,'&startAt=')-9))")
+                page_expr = ("CAST(substr(discovery.url,instr(discovery.url,'&page=')+6,"
+                             "instr(discovery.url,'&startAt=')-instr(discovery.url,'&page=')-6) AS INTEGER)")
+                valid_anchor = ("typeof(revision.anchor_total)='integer' AND revision.anchor_total>=0 "
+                    "AND typeof(revision.anchor_pages)='integer' AND revision.anchor_pages BETWEEN 1 AND 100000 "
+                    "AND typeof(revision.anchor_ids_sha256)='text' AND length(revision.anchor_ids_sha256)=64 "
+                    "AND revision.anchor_ids_sha256 NOT GLOB '*[^a-f0-9]*' "
+                    "AND typeof(revision.anchor_response_sha256)='text' AND length(revision.anchor_response_sha256)=64 "
+                    "AND revision.anchor_response_sha256 NOT GLOB '*[^a-f0-9]*'")
+                result += (" AND (kind!='index' OR substr(url,1,instr(url||'?','?')-1)!=? OR NOT EXISTS "
+                           "(SELECT 1 FROM cnyes_index_revision_rounds AS revision WHERE revision.scope_url="
+                           + scope_expr + " AND revision.index_fingerprint=? AND revision.authorization_fingerprint=? "
+                           "AND CASE WHEN typeof(revision.round_id)!='text' OR length(revision.round_id)!=64 "
+                           "OR revision.round_id GLOB '*[^a-f0-9]*' OR typeof(revision.recheck_id)!='text' "
+                           "OR length(revision.recheck_id)!=64 OR revision.recheck_id GLOB '*[^a-f0-9]*' THEN 1 "
+                           "WHEN revision.phase='anchor' THEN " + page_expr + "!=1 "
+                           "WHEN revision.phase='verify' AND " + valid_anchor + " THEN " + page_expr + "!=1 "
+                           "WHEN revision.phase='pages' AND " + valid_anchor + " THEN (" + page_expr + "<2 OR " + page_expr
+                           + ">revision.anchor_pages) ELSE 1 END))")
+                parameters.extend((ENDPOINT, ENDPOINT, source.cnyes_index_data_fingerprint,
+                                   source.authorization_fingerprint))
             else:
                 result += " AND (kind!='index' OR substr(url,1,instr(url||'?','?')-1)!=?)"
                 parameters.append(ENDPOINT)
@@ -4033,11 +4259,12 @@ class NewsQueue:
             result += (" AND (kind!='cnyes_news' OR NOT EXISTS (SELECT 1 FROM bulk_endpoint_cooldowns AS circuit "
                        "WHERE circuit.provider=? AND circuit.endpoint=substr(discovery.url,1,instr(discovery.url||'?','?')-1) "
                        "AND circuit.data_fingerprint=? AND circuit.not_before>?))")
-            parameters.extend((source.provider, source.data_fingerprint, time.time()))
+            parameters.extend((source.provider, source.data_fingerprint,
+                               time.time() if now is None else now))
         return result, parameters
 
     @staticmethod
-    def discovery_candidates_query(source, limit, *, bulk_allowed=True, excluded_origins=()):
+    def discovery_candidates_query(source, limit, *, bulk_allowed=True, excluded_origins=(), excluded_hosts=()):
         """Apply origin filters only to the outer row before its bounded LIMIT.
 
         Endpoint cooldowns contain correlated WHEREs and literal question
@@ -4052,16 +4279,20 @@ class NewsQueue:
         statement, binds = host_filtered_query(
             'SELECT * FROM discovery' + index_hint +
             ' WHERE provider=? AND due<=? AND superseded_by_windows_json IS NULL',
-            (source.provider, time.time()), (), excluded_origins=excluded_origins)
+            (source.provider, time.time()), excluded_hosts, excluded_origins=excluded_origins, discovery_url=True)
         dispatch_filter, parameters = NewsQueue.discovery_dispatch_filter(source, bulk_allowed)
         statement += (" AND " + dispatch_filter + " ORDER BY kind='feed' DESC,"
                       "kind IN ('wordpress_posts','cnyes_news','rss_fulltext') DESC,priority,due,url LIMIT ?")
         return statement, (*binds, *parameters, limit)
 
-    def discovery_candidates(self, source, limit, *, bulk_allowed=True, excluded_origins=()):
+    def discovery_candidates(self, source, limit, *, bulk_allowed=True, excluded_origins=(), excluded_hosts=()):
         statement, binds = self.discovery_candidates_query(source, limit, bulk_allowed=bulk_allowed,
-                                                           excluded_origins=excluded_origins)
+                                                           excluded_origins=excluded_origins, excluded_hosts=excluded_hosts)
         with self.metrics.measure('discovery_dispatch', source.provider):
+            cache = getattr(self, '_cnyes_revision_empty_selection', None)
+            if cache is not None and cache.hit(source, limit, bulk_allowed, excluded_origins, excluded_hosts):
+                self.metrics.count(source.provider, 'discovery_revision_empty_cache_hits')
+                return []
             readiness_rows = len(self.db.execute(DISCOVERY_READINESS_PROBE_SQL, binds[:2]).fetchall())
             if not readiness_rows:
                 self.metrics.count(source.provider, 'discovery_idle_index_skips')
@@ -4072,7 +4303,46 @@ class NewsQueue:
             statement = discovery_selection_sql(statement, readiness_rows)
             self.metrics.count(source.provider, 'discovery_sparse_due_index_selections'
                 if readiness_rows <= DISCOVERY_DUE_LOOKAHEAD_ROWS else 'discovery_dense_priority_index_selections')
-            return self.db.execute(statement, binds).fetchall()
+            rows = self.db.execute(statement, binds).fetchall()
+            if not rows and source.provider == 'cnyes':
+                from downloader.news_fulltext_cnyes_dispatch_cache import maybe_record
+                maybe_record(self, source, limit, bulk_allowed, excluded_origins, excluded_hosts)
+            return rows
+
+    def discovery_cooldown_deadline(self, source, bulk_allowed, now, excluded_origins=(), excluded_hosts=()):
+        """Conservatively wake when a current discovery gate can change.
+
+        This scans the provider's small cooldown tables, not its discovery
+        frontier. A deadline is only a reason to re-evaluate the canonical
+        dispatch/permission filters; it never clears a gate or sends a request.
+        A stale circuit without a job may cause one harmless early wake, not a
+        repeating spin, because only future deadlines are included.
+        """
+        if not source.allowed or source.acquisition_mode == 'finite' or source.known_url_only:
+            return None
+        deadlines = []
+        if (not bulk_allowed and not source.cnyes_apis
+                and (source.wordpress_apis or source.fulltext_feeds)):
+            row = self.db.execute(
+                'SELECT not_before FROM bulk_adapter_cooldowns '
+                'WHERE provider=? AND data_fingerprint=? AND not_before>?',
+                (source.provider, source.data_fingerprint, now)).fetchone()
+            if row and type(row[0]) in (int, float) and math.isfinite(row[0]):
+                deadlines.append(row[0])
+        if source.cnyes_apis or (source.provider == 'cnyes' and source.cnyes_index_api):
+            from downloader.news_fulltext_cnyes_index import ENDPOINT, compatible_fingerprints
+            index_versions = set(compatible_fingerprints(source)) if source.provider == 'cnyes' and source.cnyes_index_api else set()
+            api_endpoints = frozenset(source.cnyes_apis) if bulk_allowed else frozenset()
+            for endpoint, fingerprint, deadline in self.db.execute(
+                    'SELECT endpoint,data_fingerprint,not_before FROM bulk_endpoint_cooldowns '
+                    'WHERE provider=? AND not_before>?', (source.provider, now)):
+                index_gate = endpoint == ENDPOINT and fingerprint in index_versions
+                api_gate = endpoint in api_endpoints and fingerprint == source.data_fingerprint
+                if ((index_gate or api_gate) and type(deadline) in (int, float) and math.isfinite(deadline)
+                        and urlsplit(endpoint).hostname not in excluded_hosts
+                        and not any(endpoint.startswith(origin + '/') for origin in excluded_origins)):
+                    deadlines.append(deadline)
+        return min(deadlines) if deadlines else None
 
     def next_wake_delay(self, provider_cooldowns: dict, maximum: float = 60, *, request_scope_cooldowns=None) -> float:
         """Index lookups, not a full pending/frontier scan or busy polling."""
@@ -4096,13 +4366,22 @@ class NewsQueue:
                     earliest.append(row[0])
             bulk_allowed = self.bulk_allowed(source, now)
             # An unusable bulk adapter must not hold HTML/RSS behind its timer.
-            dispatch_filter, parameters = self.discovery_dispatch_filter(source, bulk_allowed)
-            statement, binds = host_filtered_query(
-                'SELECT min(due) FROM discovery WHERE provider=? AND superseded_by_windows_json IS NULL',
-                (provider,), (), excluded_origins=tuple(origins))
-            row = self.db.execute(statement + ' AND ' + dispatch_filter, (*binds, *parameters)).fetchone()
-            if row and row[0] is not None:
-                earliest.append(row[0])
+            cache = getattr(self, '_cnyes_revision_empty_selection', None)
+            cache_deadline = (cache.wake_deadline(source, bulk_allowed, tuple(origins), tuple(hosts))
+                              if cache is not None else None)
+            if cache_deadline is not None:
+                earliest.append(cache_deadline)
+            else:
+                dispatch_filter, parameters = self.discovery_dispatch_filter(source, bulk_allowed, now=now)
+                statement, binds = host_filtered_query(
+                    'SELECT min(due) FROM discovery WHERE provider=? AND superseded_by_windows_json IS NULL',
+                    (provider,), tuple(hosts), excluded_origins=tuple(origins), discovery_url=True)
+                row = self.db.execute(statement + ' AND ' + dispatch_filter, (*binds, *parameters)).fetchone()
+                if row and row[0] is not None:
+                    earliest.append(row[0])
+                cooldown_deadline = self.discovery_cooldown_deadline(source, bulk_allowed, now, tuple(origins), tuple(hosts))
+                if cooldown_deadline is not None:
+                    earliest.append(cooldown_deadline)
             if earliest:
                 deadlines.append(max(min(earliest), provider_cooldowns.get(provider, 0)))
         return min(maximum, max(0.0, min(deadlines) - now)) if deadlines else maximum
@@ -4166,9 +4445,31 @@ class NewsQueue:
                                     "AND coalesce(last_checked_at_utc,captured_at_utc)<?", (source.provider, start_day, cutoff))
 
     def failed(self, row: dict, error: NewsError, max_attempts: int):
-        attempts = row["attempts"] + 1
         deferred = (getattr(error, 'request_deferred', False) is True and error.retry is True
                     and error.code in REQUEST_DEFERRAL_CODES)
+        if deferred:
+            # This hop was never sent. Preserve the last article outcome and
+            # check clock, and return ordinary work to its original fairness
+            # lane. A directly requested completed/terminal head still needs
+            # a retry lane so its explicit refresh cannot be silently dropped.
+            # Earlier redirect or robots requests remain in HTTP telemetry.
+            state = row['state'] if row['state'] in {'pending', 'retry', 'retry_cooldown'} else 'retry'
+            with self.db:
+                self.db.execute('UPDATE articles SET state=?,due=max(due,?),attempts=?,'
+                                'lease_owner=NULL,lease_until=NULL WHERE id=?',
+                                (state, time.time() + max(0, error.delay), row['attempts'], row['id']))
+                # Preserve the existing dispatch-outcome counters for readers
+                # of old snapshots; this additional counter identifies gates
+                # observed under this version, not all historical deferrals.
+                self.counter('article_attempts_finished', 1)
+                self.counter('article_failures', 1)
+                self.counter('article_gate_deferrals', 1)
+            self.metrics.count(row['provider'], 'frontier_attempts_failed')
+            self.metrics.count(row['provider'], 'frontier_error_' + error.code)
+            self.metrics.count(row['provider'], 'frontier_source_gate_deferrals')
+            self.metrics.count(row['provider'], 'frontier_deferred_' + error.code)
+            return
+        attempts = row["attempts"] + 1
         unknown_body = (error.code == 'body_not_found' and self.unknown_cnyes_body_recheck_allowed(
             self.registry.sources.get(row['provider']), row))
         unknown_identity = (error.code == 'article_identity_not_verified' and self.unknown_cnyes_body_recheck_allowed(
@@ -4176,31 +4477,27 @@ class NewsQueue:
         retained_validation = (error.code in {'body_not_found', 'article_identity_not_verified'}
             and self.cnyes_retained_validation_recheck_allowed(self.registry.sources.get(row['provider']), row))
         recoverable = error.retry or unknown_body or unknown_identity or retained_validation
-        retry = recoverable and (deferred or attempts < max_attempts)
+        retry = recoverable and attempts < max_attempts
         # Bound immediate retries, not the lifetime of a recoverable network
         # failure. Exhausted bursts cool down for an hour, then start a new
         # bounded burst. Permanent source/rights outcomes are not reset.
         cooldown = recoverable and not retry
         state = "retry" if retry else "retry_cooldown" if cooldown else error.code
         delay = max(error.delay, CNYES_UNKNOWN_BODY_RECHECK_SECONDS if unknown_body or unknown_identity or retained_validation else 0,
-                    0 if deferred else 3600 if cooldown else min(900, 15 * 2 ** min(attempts, 6)))
-        # Preserve the pre-claim failure burst when a verified source gate or
-        # graceful stop postpones this request. Never reset old errors/deadlines
-        # at startup, refund real HTTP requests, or weaken provider-level policy.
+                    3600 if cooldown else min(900, 15 * 2 ** min(attempts, 6)))
         with self.db:
             self.db.execute("UPDATE articles SET state=?,error_code=?,due=?,last_checked_at_utc=?,"
-                            "attempts=CASE WHEN ? THEN ? WHEN ? THEN 0 ELSE attempts END,"
+                            "attempts=CASE WHEN ? THEN 0 ELSE attempts END,"
                             "lease_owner=NULL,lease_until=NULL WHERE id=?",
                             (state, error.code, time.time() + delay if recoverable else 0, utc_now(),
-                             deferred, row['attempts'], cooldown,
-                             row["id"]))
+                             cooldown, row["id"]))
             self.counter("article_attempts_finished", 1)
             self.counter("article_failures", 1)
+            if row['provider'] == 'cmnews' and error.code == 'article_identity_not_verified':
+                from downloader.news_fulltext_original_declarations import record_failure
+                record_failure(self, row, error)
         self.metrics.count(row["provider"], "frontier_attempts_failed")
         self.metrics.count(row["provider"], "frontier_error_" + error.code)
-        if deferred:
-            self.metrics.count(row['provider'], 'frontier_source_gate_deferrals')
-            self.metrics.count(row['provider'], 'frontier_deferred_' + error.code)
         if (row['provider'] == 'ftvnews' and error.code == 'article_rights_or_scope_excluded'
                 and getattr(error, 'ftv_native_scope_witness', None) == 'standalone_visible_CNA_credit_v1'):
             self.metrics.count('ftvnews', 'native_standalone_CNA_credit_exclusions_v1')
@@ -4428,6 +4725,7 @@ class NewsQueue:
                 and all(head[key] == expected[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS if key not in restart_fields))
 
     def _accept_records(self, records: list[dict], relative: str, receipt_relative: str):
+        from downloader.news_fulltext_retained_native import FAILURE_NATIVE_REPLAY_VERSION
         metadata_heads, http_attempts = 0, 0
         with self.db:
             for record in records:
@@ -4454,18 +4752,27 @@ class NewsQueue:
                                      bytes.fromhex(record['article_id'])))
                     metadata_heads += 1
                     continue
-                self.db.execute("""UPDATE articles SET state='complete',error_code=NULL,captured_at_utc=?,last_checked_at_utc=?,body_bytes=?,
+                updated = self.db.execute("""UPDATE articles SET state='complete',error_code=NULL,captured_at_utc=?,last_checked_at_utc=?,body_bytes=?,
                     body_sha256=?,parquet_path=?,etag=?,last_modified=?,authorization_fingerprint=?,validator_url=?,
                     metadata_order_day=CASE WHEN coalesce(metadata_order_day,'')='' THEN ? ELSE metadata_order_day END,
                     lease_owner=NULL,lease_until=NULL WHERE id=?""",
                     (record["captured_at_utc"], (json.loads(record['retained_failure_head_json'])['last_checked_at_utc']
-                        if record.get('retained_failure_head_json') is not None else record["captured_at_utc"]), record["body_bytes"], record["body_sha256"], relative,
+                        if record.get('retained_failure_head_json') is not None else
+                        json.loads(record['reviewed_native_head_json'])['last_checked_at_utc']
+                        if record.get('reviewed_native_replay_contract_version') == FAILURE_NATIVE_REPLAY_VERSION else record["captured_at_utc"]), record["body_bytes"], record["body_sha256"], relative,
                      record.get("etag"), record.get("last_modified"), record["authorization_fingerprint"],
                      record.get('source_request_url') if record.get('etag') or record.get('last_modified') else None,
                      accepted_publication_sort_day(record.get('published_at_raw')),
                      bytes.fromhex(record["article_id"])))
+                if updated.rowcount and record.get('provider') == 'cnyes':
+                    # The checkpoint and accepted source head commit together.
+                    # This never sends a request or changes the source clock.
+                    register_accepted_metadata_head(self.db, self.registry.sources.get('cnyes'),
+                                                    record, relative, now=utc_now)
                 http_attempts += 1
             self.db.execute("INSERT INTO accepted_batches VALUES (?,?)", (relative, receipt_relative))
+            from downloader.news_fulltext_cnyes_history import register_accepted_body_batch
+            register_accepted_body_batch(self, records, relative, receipt_relative)
             self.counter("article_attempts_finished", http_attempts)
             self.counter("accepted_versions", len(records))
             if metadata_heads:
@@ -4602,13 +4909,61 @@ class NewsQueue:
             raise ValueError("news_acceptance_recovery_rows_mismatch")
         self._accept_records(table.to_pylist(), relative, receipt_relative)
 
-    def status(self, *, requests_by_provider: dict | None = None, response_bytes: int = 0,
+    def advance_discovery_error_rollup(self):
+        """Do one low-priority local slice; a dashboard failure cannot stop capture."""
+        from downloader.news_fulltext_discovery_errors import (advance_discovery_errors,
+            initialize_discovery_errors, reset_discovery_errors)
+        try:
+            if self._discovery_error_rollup_needs_integrity_check:
+                if self.db.in_transaction:
+                    return
+                initialize_discovery_errors(self.db)
+                self._discovery_error_rollup_needs_integrity_check = False
+            expected = self.db.execute('SELECT active_errors FROM discovery_static_counts WHERE singleton=1').fetchone()
+            if expected is None:
+                self._discovery_error_rollup_pending = True
+                return
+            with self.metrics.measure('discovery_error_rollup_slice'):
+                result = advance_discovery_errors(self.db, expected_active_errors=expected[0])
+                if result['state'] == 'unavailable':
+                    reset_discovery_errors(self.db)
+            self._discovery_error_rollup_pending = result['state'] != 'ready'
+        except (sqlite3.Error, OSError, ValueError):
+            self._discovery_error_rollup_pending = True
+            if not self.db.in_transaction:
+                try:
+                    initialize_discovery_errors(self.db)
+                except (sqlite3.Error, OSError, ValueError, RuntimeError):
+                    pass  # The status remains unknown; capture keeps its own failure policy.
+
+    def status(self, *, requests_by_provider: dict | None = None, response_bytes: int | None = None,
                run_seconds: float = 0, accepted_this_run: int = 0, activity: str = "idle",
-               provider_cooldowns: dict | None = None) -> dict:
+               provider_cooldowns: dict | None = None, publish: bool = True,
+               cycle: dict | None = None) -> dict:
         from downloader.news_fulltext_urls import original_source_inventory, original_url_progress
+        from downloader.news_fulltext_url_metadata import inbox_progress as url_metadata_inbox_progress
+        from downloader.news_fulltext_candidate_diagnostics import candidate_progress
         from downloader.news_fulltext_cohorts import NONBODY_SCOPE_PROGRESS_QUERY_VERSION
         from downloader.news_fulltext_cnyes_work import CONTRACT_VERSION as work_version, LOOKUP_DISCOVERY_VERSION
+        # A metadata slice can publish between service heartbeats. Retain only
+        # this owner's previously completed cycle, explicitly labeled as such;
+        # its historical counts do not imply ongoing downloads or throughput.
+        inventory_cycle = (getattr(self, '_service_last_completed_cycle', None)
+                           if activity == 'inventorying' and cycle is None else None)
+        if inventory_cycle is not None:
+            cycle = deepcopy(inventory_cycle['cycle'])
+        # Inventory status uses the same live owner counters as collection.
+        # Omitted fields mean "sample current traffic", not "reset to zero";
+        # explicit {} / 0 still override, and a new owner starts at zero.
+        traffic = getattr(self, 'http_traffic_snapshot', None)
+        if callable(traffic) and (requests_by_provider is None or response_bytes is None):
+            current_requests, current_bytes = traffic()
+            if requests_by_provider is None:
+                requests_by_provider = current_requests
+            if response_bytes is None:
+                response_bytes = current_bytes
         requests_by_provider = dict(requests_by_provider or {})
+        response_bytes = 0 if response_bytes is None else response_bytes
         if provider_cooldowns is None and hasattr(self, 'provider_cooldown_snapshot'):
             provider_cooldowns = self.provider_cooldown_snapshot()
         provider_cooldowns = dict(provider_cooldowns or {})
@@ -4674,6 +5029,16 @@ class NewsQueue:
                                            "FROM metadata_ingest_progress WHERE state='pending'").fetchone()
         origin_versions = self.db.execute("SELECT count(*) FROM origins").fetchone()[0]
         counters = dict(self.db.execute("SELECT key,value FROM counters"))
+        with self.metrics.measure('status_cnyes_local_replay_retries'):
+            local_replay_retries = cnyes_local_replay_retries(
+                self.db, self.registry.sources.get('cnyes'), getattr(self, 'failure_diagnostic_focus', None))
+        with self.metrics.measure('status_cnyes_metadata_resource_waits'):
+            metadata_resource_waits = cnyes_metadata_resource_waits(self.db, self.registry.sources.get('cnyes'))
+        with self.metrics.measure('status_cnyes_metadata_large_replay'):
+            metadata_large_replay = cnyes_metadata_large_replay(
+                self.db, self.registry.sources.get('cnyes'), getattr(self, '_large_metadata_job', None))
+        with self.metrics.measure('status_cnyes_metadata_index_progress'):
+            metadata_index_progress = cnyes_metadata_index_progress(self.db, self.registry.sources.get('cnyes'))
         with self.metrics.measure('status_metrics_snapshot'):
             performance = self.metrics.snapshot()
         elapsed = performance["owner_elapsed_seconds"]
@@ -4682,12 +5047,15 @@ class NewsQueue:
             providers['cnyes']['body_work_progress'] = cnyes_work_progress(self.db)
             from downloader.news_fulltext_cnyes_history import progress as cnyes_history_progress
             providers['cnyes']['history_list_progress'] = cnyes_history_progress(self.db, self.registry.sources.get('cnyes'))
-            from downloader.news_fulltext_cnyes_index import progress as cnyes_index_progress
+            from downloader.news_fulltext_cnyes_index import PublicIndexRowsCache, progress as cnyes_index_progress
+            index_rows_cache = getattr(self, '_cnyes_public_index_rows_cache', None)
+            if index_rows_cache is None:
+                index_rows_cache = self._cnyes_public_index_rows_cache = PublicIndexRowsCache()
             index_clock = datetime.fromisoformat(performance['snapshot_at_utc']).timestamp()
             with self.metrics.measure('status_cnyes_public_index_projection'):
                 providers['cnyes']['public_index_progress'] = cnyes_index_progress(
                     self.db, self.registry.sources.get('cnyes'), owner_start_epoch=index_clock - elapsed,
-                    now_epoch=index_clock, activity=activity)
+                    now_epoch=index_clock, activity=activity, rows_cache=index_rows_cache)
         for provider, item in providers.items():
             observed = performance["providers"].get(provider, {}).get("counts", {}).get("durably_accepted_new_url_heads", 0)
             owner_rate = observed / elapsed if observed >= 10 and elapsed >= 60 else None
@@ -4722,6 +5090,10 @@ class NewsQueue:
                     registered_bulk_pages += count
         with self.metrics.measure('status_discovery_projection'):
             discovery_pending, discovery_errors, discovery_superseded, discovery_archived_errors, all_bulk_pages = summarize_discovery_status(self.db, time.time())
+            from downloader.news_fulltext_discovery_errors import discovery_errors as discovery_error_progress
+            discovery_error_rollup = discovery_error_progress(self.db, expected_active_errors=discovery_errors)
+            self._discovery_error_rollup_pending = discovery_error_rollup['state'] != 'ready'
+            self._discovery_error_rollup_needs_integrity_check = discovery_error_rollup['state'] == 'unavailable'
         from downloader.news_fulltext_diagnostics import FAILURE_DIAGNOSTIC_BUDGET_CONTRACT_VERSION
         from downloader.news_fulltext_bulk import CNYES_WINDOW_PARTITION_CONTRACT_VERSION, CNYES_QUERY_DAY_OFFSET_SECONDS
         from downloader.news_fulltext_cnyes_index import (
@@ -4734,16 +5106,22 @@ class NewsQueue:
         with self.metrics.measure('status_http_capacity_snapshot'):
             capacity = self.http_capacity_snapshot() if hasattr(self, 'http_capacity_snapshot') else None
         if 'cnyes' in providers:
+            from downloader.news_fulltext_cnyes_index import source_gate_progress
+            providers['cnyes']['public_index_progress']['source_gate'] = source_gate_progress(
+                self.db, self.registry.sources.get('cnyes'),
+                (capacity or {}).get('providers', {}).get('cnyes'), now_epoch=time.time())
             from downloader.news_fulltext_cnyes_work import request_scope_progress
             item = providers['cnyes']
             with self.metrics.measure('status_cnyes_request_scope_progress'):
                 scope_work = request_scope_progress(self.db, item['body_work_progress'],
                     (capacity or {}).get('providers', {}).get('cnyes'), now_epoch=time.time())
             item['body_work_progress']['request_scope_progress'] = scope_work
+            rechecks = scope_work['pending_source_rechecks']
             if (item['body_work_progress']['active_missing_body_urls']
-                    and (not scope_work['available'] or scope_work['source_paused_missing_body_urls'])):
+                    and (not scope_work['available'] or scope_work['source_paused_missing_body_urls']
+                         or not rechecks['available'] or rechecks['unverified_missing_body_urls'])):
                 # This estimate covers every queued missing URL, not just the
-                # healthy desktop/API lane. A probe deadline is not recovery.
+                # healthy desktop/API lane. Expiry permits a real probe only.
                 item['remaining_eligible_estimate_seconds'] = None
                 eta = None
         result = {
@@ -4773,6 +5151,7 @@ class NewsQueue:
             "article_response_envelope_contract_version": ARTICLE_RESPONSE_ENVELOPE_CONTRACT_VERSION,
             "stored_body_retry_fairness_contract_version": STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION,
             "discovery_failure_observation_contract_version": DISCOVERY_FAILURE_OBSERVATION_CONTRACT_VERSION,
+            "discovery_request_deferral_contract_version": DISCOVERY_REQUEST_DEFERRAL_CONTRACT_VERSION,
             "discovery_status_projection_contract_version": DISCOVERY_STATUS_PROJECTION_CONTRACT_VERSION,
             "discovery_summary_contract_version": DISCOVERY_SUMMARY_CONTRACT_VERSION,
             "discovery_readiness_probe_contract_version": DISCOVERY_READINESS_PROBE_CONTRACT_VERSION,
@@ -4795,10 +5174,17 @@ class NewsQueue:
                                    "complete_receipts_only_in_metadata_totals": True},
             "metadata_partition_versions_retained": origin_versions,
             "metadata_association_basis": "latest accepted version per source receipt; original stock associations retained",
+            "url_metadata_inbox": url_metadata_inbox_progress(self),
+            "candidate_diagnostic_progress": candidate_progress(self),
+            "cnyes_local_replay_retries": local_replay_retries,
+            "cnyes_metadata_resource_waits": metadata_resource_waits,
+            "cnyes_metadata_large_replay": metadata_large_replay,
+            "cnyes_metadata_index_progress": metadata_index_progress,
             "original_url_resolution": original_url_progress(self),
             "metadata_partition_errors": self.db.execute("SELECT count(*) FROM origin_errors").fetchone()[0],
             "discovery_pending": discovery_pending,
             "discovery_errors": discovery_errors,
+            "discovery_error_rollup": discovery_error_rollup,
             "discovery_superseded": discovery_superseded,
             "discovery_archived_errors": discovery_archived_errors,
             "bulk_api_observed_articles": sum(item["total_articles"] for item in bulk_endpoints),
@@ -4835,11 +5221,27 @@ class NewsQueue:
             "performance": performance,
             "http_capacity": capacity,
         }
+        if cycle is not None:
+            result['cycle'] = cycle
+            result['http_counters_basis'] = 'since current owner started; cycle contains separate deltas'
+            if inventory_cycle is not None:
+                result['cycle_snapshot_role'] = 'last_completed_before_inventory'
+                result['cycle_completed_at_utc'] = inventory_cycle['completed_at_utc']
+        if publish:
+            self.publish_status(result)
+        return result
+
+    def publish_status(self, result: dict) -> None:
+        """Publish a complete view, then acknowledge that exact snapshot.
+
+        Cycle finalization adds its deltas before this call. The ordinary
+        status() path keeps its existing immediate publication semantics.
+        Neither projection nor a failed write acknowledges a new heartbeat.
+        """
         with self.metrics.measure('status_json_publication'):
             atomic_write_json(self.root / "status.json", result, durable=False, compact=True)
         if getattr(self, 'lifecycle', None) is not None:
             self.lifecycle.snapshot_written()
-        return result
 
 
 def verify_bodies(root: Path) -> dict:

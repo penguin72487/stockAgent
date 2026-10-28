@@ -1,0 +1,15 @@
+# Full audited TWD-settled source scope; a historical code is not a guaranteed fill.
+# Exact unknown executions remain source-bound with zero order capacity.
+base_config: tw_futures_residual_signals_20261027_v1.yaml
+experiment_name: tw-futures-all-twd-recovery-20261027-v1
+data:
+  panel_cache_root: data_tw_index_futures/training_cache/all_twd_recovery_20261027_v1/base_panel
+trading:
+  tw_futures_portfolio_data_path: data_tw_index_futures/training_prepared/tw_futures_universe765_20261027_v1/financial_all_twd_v8/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: data_tw_index_futures/training_prepared/tw_futures_universe765_20261027_v1/financial_all_twd_v8/release/rules/rules.parquet
+  tw_futures_portfolio_valuation_research_contract: frozen_contract_value_research_v1
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_universe765_20261027_v1/execution_all_twd_v8q/all_twd/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_universe765_20261027_v1/execution_all_twd_v8q/all_twd/clocks/0845/opening_reference.parquet
+runner:
+  output_dir: artifacts/markets/tw_futures_all_twd_recovery_20261027_v1/all_twd__clock0845__1m__previous_session
+  resume: false

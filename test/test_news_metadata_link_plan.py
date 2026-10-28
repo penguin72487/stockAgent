@@ -17,7 +17,7 @@ def inventory(*, known=0, stored=0, links=38, role='government_origin', enabled=
 def test_metadata_only_source_has_real_pending_review_not_zero_work(links, stage, small):
     result = plan_sources(inventory(links=links))
     row = result['sources'][0]
-    assert result['contract_version'] == 5 and result['all_source_keys_planned']
+    assert result['contract_version'] == 8 and result['all_source_keys_planned']
     assert row['strategy'] == 'review_then_route_existing_literal_original_links'
     assert row['stage'] == stage
     assert row['literal_metadata_links'] == links and row['unqueued_literal_link_work']
@@ -36,7 +36,9 @@ def test_literal_associations_do_not_inflate_existing_frontier_or_body_counts():
     assert row['strategy'] == 'reuse_active_canonical_collector'
     assert row['known_urls'] == 10 and row['stored_bodies'] == 3 and row['missing_body_urls'] == 7
     assert row['minimum_html_article_requests_if_no_bulk'] == 7
-    assert not row['unqueued_literal_link_work']
+    assert row['unqueued_literal_link_work'] is None
+    assert not row['literal_target_coverage_verified']
+    assert result['unknown_literal_target_coverage_source_keys'] == 1
     assert result['literal_metadata_links'] == 20000
     assert result['known_urls'] == 10 and result['stored_bodies'] == 3
 
@@ -64,3 +66,56 @@ def test_missing_legacy_original_counts_stay_unknown_without_invented_work():
 def test_invalid_alias_counts_are_rejected(links):
     with pytest.raises(ValueError, match='invalid original metadata link counts'):
         plan_sources(inventory(links=links))
+
+
+def coverage(*, unqueued=1):
+    return {'contract_version': 1, 'alias_associations': 20000,
+            'distinct_target_urls': 3, 'queued_target_urls': 3 - unqueued,
+            'stored_body_target_urls': 1, 'unqueued_target_urls': unqueued}
+
+
+@pytest.mark.parametrize('unqueued', [0, 1])
+def test_complete_existing_heads_do_not_hide_verified_unqueued_targets(unqueued):
+    from test_news_implementation_order import POLICY
+    value = inventory(known=10, stored=10, links=20000, enabled=True)
+    value['providers']['unregistered:official.test']['original_metadata']['target_url_coverage'] = coverage(unqueued=unqueued)
+    result = plan_sources(value, work_order={**POLICY, 'focus_provider': 'unregistered:official.test'})
+    row = result['sources'][0]
+    assert row['literal_target_coverage_verified']
+    assert row['distinct_target_urls'] == 3 and row['unqueued_target_urls'] == unqueued
+    assert row['unqueued_literal_link_work'] is bool(unqueued)
+    assert row['implementation_state'] == ('review_literal_original_links' if unqueued else 'maintenance_only')
+    assert row['known_urls'] == row['stored_bodies'] == 10
+    assert result['unqueued_literal_link_source_keys'] == unqueued
+    assert not result['unknown_literal_target_coverage_source_keys']
+
+
+def test_complete_existing_heads_with_unmeasured_overlap_remain_pending_verification():
+    from test_news_implementation_order import POLICY
+    result = plan_sources(inventory(known=10, stored=10, links=20000, enabled=True),
+                          work_order={**POLICY, 'focus_provider': 'unregistered:official.test'})
+    row = result['sources'][0]
+    assert row['unqueued_literal_link_work'] is None
+    assert row['implementation_state'] == 'verify_literal_target_coverage'
+    assert row['provider'] in result['implementation_order']
+    assert result['unknown_literal_target_coverage_source_keys'] == 1
+    assert result['unqueued_literal_link_source_keys'] == 0
+
+
+@pytest.mark.parametrize('change', [
+    {'contract_version': True}, {'alias_associations': 19999}, {'distinct_target_urls': 20001},
+    {'queued_target_urls': 4}, {'stored_body_target_urls': 3}, {'unqueued_target_urls': 0},
+    {'distinct_target_urls': True}, {'unqueued_target_urls': -1},
+])
+def test_invalid_exact_coverage_cannot_mark_literal_work_complete(change):
+    value = inventory(known=10, stored=3, links=20000)
+    value['providers']['unregistered:official.test']['original_metadata']['target_url_coverage'] = coverage() | change
+    with pytest.raises(ValueError, match='literal target coverage counts'):
+        plan_sources(value)
+
+
+def test_explicit_null_coverage_is_not_a_successful_or_absent_observation():
+    value = inventory()
+    value['providers']['unregistered:official.test']['original_metadata']['target_url_coverage'] = None
+    with pytest.raises(ValueError, match='literal target coverage counts'):
+        plan_sources(value)

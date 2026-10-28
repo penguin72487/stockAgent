@@ -29,6 +29,7 @@ FILES = (
     "stockagent/__init__.py", "stockagent/runtime_identity.py", "stockagent/data_sync/__init__.py",
     "stockagent/data_sync/offhost_backup.py", "stockagent/data_sync/packed_backup.py",
     "stockagent/data_sync/packed_snapshots.py", "stockagent/data_sync/desync_snapshots.py",
+    "stockagent/data_sync/packed_metadata.py",
     "stockagent/data_sync/backup_auxiliary.py", "stockagent/data_sync/backup_recovery.py",
     "stockagent/control/__init__.py", "stockagent/control/backup.py", "stockagent/control/recovery.py",
     "downloader/__init__.py", "downloader/artifact_io.py", "configs/data_sync/backup_receipts.json",
@@ -50,12 +51,68 @@ PIPELINE_FILES = (
     "scripts/run_lab203_backup_pipeline.sh", "scripts/benchmark_lab203_backup_pipeline.py",
     "scripts/install_lab203_backup_pipeline.py", "docs/lab203_parallel_backup_2026-10-04.md",
 )
+STORAGE_OBSERVER_NAME = "storage-observer-20261025-v1"
+STORAGE_OBSERVER_FILES = (
+    "scripts/__init__.py", "scripts/verify_backup_delivery.py", "scripts/backup_delivery_receipt.py", "scripts/runtime_env.sh",
+    "scripts/lab203_storage_monitor.py", "stockagent/__init__.py", "stockagent/data_sync/__init__.py",
+    "stockagent/data_sync/desync_snapshots.py", "stockagent/data_sync/packed_snapshots.py",
+    "stockagent/data_sync/packed_metadata.py", "stockagent/data_sync/packed_backup.py", "stockagent/data_sync/nas_target.py",
+    "stockagent/data_sync/storage_monitor.py",
+)
+STORAGE_RELAY_NAME = "storage-relay-20261026-v1"
+STORAGE_RELAY_FILES = (*STORAGE_OBSERVER_FILES,
+    "AGENTS.md", "docs/agents/storage.md", "docs/agents/runtime.md", "docs/agents/git.md",
+    "docs/lab203_relay_storage_handoff_2026-10-25.md", "docs/storage_roles_and_tiers_2026-10-25.md",
+    ".agents/skills/stockagent-storage-operations/SKILL.md",
+    ".agents/skills/stockagent-storage-operations/agents/openai.yaml",
+    ".agents/skills/stockagent-storage-operations/references/operations.md",
+    ".agents/skills/stockagent-storage-operations/references/recovery-and-retirement.md",
+    ".agents/skills/stockagent-storage-operations/references/training-data.md",
+)
+STORAGE_RESCUE_NAME = "storage-relay-20261026-v2"
+STORAGE_RESCUE_FILES = (*STORAGE_RELAY_FILES,
+    "docs/lab203_private_rescue_nas_handoff_2026-10-26.md",
+)
+STORAGE_OFFLINE_NAME = "storage-relay-20261026-v3"
+STORAGE_OFFLINE_FILES = (*STORAGE_RESCUE_FILES,
+    "scripts/verify_training_rescue.py", "stockagent/training_rescue_worker.py",
+    "stockagent/training_rescue_bootstrap.py", "stockagent/runtime_identity.py",
+)
+STORAGE_REVISED_NAME = "storage-relay-20261027-v4"
+STORAGE_REVISED_FILES = (*STORAGE_OFFLINE_FILES,
+    "stockagent/training_rescue_recipes.py",
+    "docs/lab203_revised_recovery_handoff_2026-10-27.md",
+)
+STORAGE_BOOTSTRAP_NAME = "storage-relay-20261027-v5"
+STORAGE_BOOTSTRAP_FILES = (*STORAGE_REVISED_FILES,
+    "docs/lab203_bootstrap_binding_handoff_2026-10-27.md",
+)
+STORAGE_INCREMENTAL_NAME = "storage-relay-20261027-v6"
+STORAGE_INCREMENTAL_FILES = (*STORAGE_BOOTSTRAP_FILES,
+    "stockagent/training_rescue_backup.py",
+    "docs/lab203_incremental_private_backup_handoff_2026-10-27.md",
+)
+STORAGE_CANONICAL_NAME = "storage-relay-20261027-v7"
+STORAGE_CANONICAL_FILES = STORAGE_INCREMENTAL_FILES
+STORAGE_RUNTIME_NAME = "storage-relay-20261028-v1"
+STORAGE_RUNTIME_FILES = (*STORAGE_CANONICAL_FILES,
+    "scripts/diagnose_training_rescue_runtime.py",
+    "docs/lab203_original_runtime_supplement_2026-10-28.md",
+)
+NEWS_PRIVATE_NAME = "news-private-backup-20261028-v1"
+NEWS_PRIVATE_FILES = (
+    "scripts/__init__.py", "scripts/verify_backup_delivery.py", "scripts/backup_delivery_receipt.py",
+    "configs/data_sync/news_private_backup.json", "docs/news_private_backup_2026-10-28.md",
+)
+# Explicit source-only packages grew with the complete recovery verifier and
+# runbook. This bound admits those bytes, never raw data or private controls.
+MAX_CONTROL_HANDOFF_BYTES = 2 * 1024**2
 
 
 def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
                     wait_for_owner: bool = False, publish_recovery_tasks: bool = False,
                     physical_transport_alias: Path | None = None) -> dict:
-    if name not in {"continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
+    if name not in {NEWS_PRIVATE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
                     "continuous-backup-20261004-v4", "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                     "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9",
                     "continuous-backup-20261004-v10"}:
@@ -85,11 +142,22 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
     with (queue.state / lock_name).open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
         queue.storage_guard()
-        files = (*FILES, *PIPELINE_FILES) if name.endswith(("-v8","-v9","-v10")) else FILES
+        files = (NEWS_PRIVATE_FILES if name == NEWS_PRIVATE_NAME else
+                 STORAGE_RUNTIME_FILES if name == STORAGE_RUNTIME_NAME else
+                 STORAGE_CANONICAL_FILES if name == STORAGE_CANONICAL_NAME else
+                 STORAGE_INCREMENTAL_FILES if name == STORAGE_INCREMENTAL_NAME else
+                 STORAGE_BOOTSTRAP_FILES if name == STORAGE_BOOTSTRAP_NAME else
+                 STORAGE_REVISED_FILES if name == STORAGE_REVISED_NAME else
+                 STORAGE_OFFLINE_FILES if name == STORAGE_OFFLINE_NAME else
+                 STORAGE_RESCUE_FILES if name == STORAGE_RESCUE_NAME else
+                 STORAGE_RELAY_FILES if name == STORAGE_RELAY_NAME else
+                 STORAGE_OBSERVER_FILES if name == STORAGE_OBSERVER_NAME else
+                 (*FILES, *PIPELINE_FILES) if name.endswith(("-v8","-v9","-v10")) else FILES)
         identities = {name: stable_source_sha256(source_root, name) for name in files}
         payload_bytes=sum((source_root/name).stat().st_size for name in files)
-        if control_only and (payload_bytes > 1024**2 or shutil.disk_usage(alias).free < queue.config["reserve_bytes"]+2*1024**2):
-            raise ValueError("immutable control handoff exceeds its one MiB budget or disk reserve")
+        if control_only and (payload_bytes > MAX_CONTROL_HANDOFF_BYTES
+                             or shutil.disk_usage(alias).free < queue.config["reserve_bytes"] + 2 * MAX_CONTROL_HANDOFF_BYTES):
+            raise ValueError("immutable control handoff exceeds its two MiB budget or disk reserve")
         staging_parent = outside_staging if control_only else queue.transport / ".staging"
         staging = staging_parent / ("handoff-" + uuid.uuid4().hex)
         staging.mkdir(mode=0o700, parents=True)
@@ -172,7 +240,7 @@ def main() -> None:
     parser.add_argument("--publish-recovery-requests", action="store_true")
     parser.add_argument("--physical-transport-alias",type=Path,
         help="Publish only a bounded immutable control package independently of the long data owner")
-    parser.add_argument("--name", choices=("continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
+    parser.add_argument("--name", choices=(NEWS_PRIVATE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
                                          "continuous-backup-20261004-v3", "continuous-backup-20261004-v4",
                                          "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                                          "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9", "continuous-backup-20261004-v10"),
@@ -185,7 +253,24 @@ def main() -> None:
                              publish_recovery_tasks=args.publish_recovery_requests,
                              physical_transport_alias=args.physical_transport_alias)
     private_json(args.output, result)
-    queue.scan_transport(queue.load_ledger())
+    # An independent control package must not load or rescan pending data
+    # deliveries. The tools notification is enough; their existing owner keeps
+    # responsibility for data-batch transport and its source ledger.
+    if args.physical_transport_alias:
+        # Syncthing may already be busy with a data scan. Publication is durable;
+        # a notification timeout must not keep a tiny control operation waiting
+        # for the data owner's (potentially fifteen-minute) timeout.
+        queue.config = {**queue.config, "scan_timeout_seconds": 5}
+        try:
+            notification = queue.scan_transport({"deliveries": {}})
+            result["transport_notification"] = notification or {"state": "transport_scan_not_configured"}
+        except OSError as error:
+            result["transport_notification"] = {"state": "deferred_to_existing_transport",
+                                                 "error_type": type(error).__name__}
+        private_json(args.output, result)
+    else:
+        result["transport_notification"] = queue.notify_transport(wait_for_owner=args.wait_for_owner)
+        private_json(args.output, result)
     print(json.dumps(result, ensure_ascii=False))
 
 

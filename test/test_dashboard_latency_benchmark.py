@@ -3,6 +3,32 @@ import pytest
 from scripts.benchmark_dashboard_latency import capture_measurement, http_sample, measure_http, summarize, timing_summary, warm_samples
 
 
+@pytest.mark.parametrize("name", ["profile_opening_attempt_tail", "profile_opening_attempt_append"])
+def test_opening_profiles_preserve_mode_denominator_in_immutable_checkpoint(tmp_path, monkeypatch, name):
+    import json
+    from scripts import benchmark_dashboard_latency as benchmark
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    from stockagent.live.paper_mode_snapshot import ModeSnapshotWriter
+
+    value = {"modes": {f"mode_{i}": {} for i in range(6)}}
+    manifest = ModeSnapshotWriter(tmp_path).prepare(value)
+    (tmp_path / "state.json").write_text(json.dumps(manifest))
+    (tmp_path / "opening_signal_latency.jsonl").write_text(json.dumps({
+        "source": "discord_scheduled_signal", "status": "failed", "market": "mode_0",
+        "session_date": "2026-10-22", "error_type": "TimeoutError",
+    }) + "\n")
+    original, observed = dashboard._opening_signal_latency_summary, []
+
+    def summary(rows, **kwargs):
+        observed.append(kwargs["expected_markets"])
+        return original(rows, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_opening_signal_latency_summary", summary)
+    report = getattr(benchmark, name)(tmp_path, 1)
+    assert report["complete_summary_parity"] and report["source_unchanged"]
+    assert observed and all(markets == sorted(value["modes"]) for markets in observed)
+
+
 @pytest.mark.parametrize("trailing_newline", (False, True))
 def test_verified_append_profile_preserves_complete_summary_and_original_source(tmp_path, trailing_newline):
     import json
@@ -177,6 +203,9 @@ def test_scheduled_browser_is_persistent_and_isolated_from_trading_owners():
     installer = Path("scripts/install_discord_bot_service.sh").read_text()
     assert "--scheduled --cdp-port 9241" in service
     assert "ProtectSystem=strict" in service and "KillMode=control-group" in service
+    assert "PrivateTmp=true" in service
+    assert "RuntimeDirectory=stockagent-tw-opening-browser" in service
+    assert 'Environment="TMPDIR=/run/stockagent-tw-opening-browser"' in service
     assert "ReadWritePaths=@REPO_ROOT@/artifacts/operations" in service
     assert "Requires=" not in service and "PartOf=" not in service
     assert "08:58:30 Asia/Taipei" in timer and "Persistent=true" in timer

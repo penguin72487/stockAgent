@@ -230,6 +230,11 @@ def _download_command(*, live_root: Path, trading_date: date) -> list[str]:
         "--datasets",
         "twse_day_trade_eligibility",
         "tpex_day_trade_eligibility",
+        # Publication admission concerns THIS exact rule date, not a replay
+        # of the historical calendar. Preserve/merge older raw rule rows;
+        # cancelled historical sessions must not block today's official list.
+        "--start-date",
+        trading_date.isoformat(),
         "--end-date",
         trading_date.isoformat(),
         "--same-session-rule-date",

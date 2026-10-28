@@ -1521,6 +1521,9 @@ class BacktestResult:
     minute_nav: np.ndarray | None = None
     final_futures_carry_state: np.ndarray | None = None
     futures_carry_state_history: np.ndarray | None = None
+    # A separately pinned, dated futures account ledger; legacy archives and
+    # transforms must not silently discard this axis.
+    futures_account_ledger: object | None = None
 
 
 @dataclass(slots=True)
@@ -1584,8 +1587,22 @@ class BacktestResultTensor:
     shares_history: torch.Tensor | None = None
     final_futures_carry_state: torch.Tensor | None = None
     futures_carry_state_history: torch.Tensor | None = None
+    # A dual-calendar result retains the original dated account ledger here.
+    # The ordinary NumPy/artifact contract cannot yet persist that extra axis.
+    futures_account_calendar_result: object | None = None
 
-    def to_numpy(self) -> BacktestResult:
+    def to_numpy(self, *, futures_account_context: object | None = None) -> BacktestResult:
+        dated_futures_ledger = None
+        if self.futures_account_calendar_result is not None:
+            if futures_account_context is None:
+                raise ValueError("dual futures account results require a dated account-ledger artifact writer")
+            from stockagent.training.futures_account_artifact import (
+                futures_account_artifact_from_payload, futures_account_artifact_payload,
+            )
+            payload = futures_account_artifact_payload(self.futures_account_calendar_result, futures_account_context)
+            dated_futures_ledger = futures_account_artifact_from_payload(payload, futures_account_context)
+        elif futures_account_context is not None:
+            raise ValueError("a dated futures source context cannot label a legacy result")
         # NumPy has no native bfloat16 dtype. Cast at the torch boundary rather
         # than after .numpy(), because the latter raises before astype can run.
         # Physical accounting remains float64 through report conversion.
@@ -1622,6 +1639,7 @@ class BacktestResultTensor:
             futures_contract_quantities_history=(None if self.futures_contract_quantities_history is None else self.futures_contract_quantities_history.detach().cpu().numpy()),
             final_futures_carry_state=optional_float(self.final_futures_carry_state),
             futures_carry_state_history=optional_float(self.futures_carry_state_history),
+            futures_account_ledger=dated_futures_ledger,
             futures_residual_contract_quantities_history=(None if self.futures_residual_contract_quantities_history is None else self.futures_residual_contract_quantities_history.detach().cpu().numpy()),
             strategy_returns=as_float(self.strategy_returns),
             benchmark_returns=as_float(self.benchmark_returns),
@@ -3334,9 +3352,15 @@ def run_backtest_torch(
     day_trade_carry_require_minute_nav_grad: bool = True,
     day_trade_replay_log_returns: Tensor | None = None,
     crypto_announced_exit_unlimited_volume: bool = False,
+    futures_account_calendar: object | None = None,
+    account_only_execution: torch.Tensor | None = None,
 ) -> BacktestResultTensor:
     """Simulate daily portfolio execution from model weights in torch."""
     mode = normalize_execution_mode(execution_mode)
+    if (futures_account_calendar is None) != (account_only_execution is None):
+        raise ValueError("dual futures account execution requires both calendar and event tape")
+    if futures_account_calendar is not None and mode != "tw_stock_context_futures_portfolio":
+        raise ValueError("dual futures account execution requires the stock-context futures mode")
     from stockagent.models.futures_account_policy import is_futures_account_policy_packet
     account_policy = None
     if is_futures_account_policy_packet(weights):
@@ -3579,6 +3603,73 @@ def run_backtest_torch(
                 raise ValueError(
                     "integer stock-context futures requires max_turnover_ratio=0"
                 )
+            if futures_account_calendar is not None:
+                if int(execution.size(-1)) not in MARGIN_EXECUTION_WIDTHS or futures_portfolio_training_surrogate_only:
+                    raise ValueError("dual futures accounts require the exact whole-contract margin ledger")
+                from stockagent.backtest.tw_futures_account_calendar import run_futures_account_calendar_torch
+                from stockagent.data.tw_futures_account_calendar import (
+                    FuturesAccountCalendar, aggregate_account_log_returns_to_decisions,
+                )
+                if not isinstance(futures_account_calendar, FuturesAccountCalendar):
+                    raise ValueError("dual futures accounts require a validated account calendar")
+                if not isinstance(account_only_execution, torch.Tensor):
+                    raise ValueError("dual futures account event tape must be a tensor")
+                event_execution = account_only_execution.to(device=weights.device, dtype=execution.dtype)
+                event_advance = (None if state_advance_mask is None else
+                    torch.ones(len(futures_account_calendar.account_only_indices),
+                               device=weights.device, dtype=torch.bool))
+                dual = run_futures_account_calendar_torch(
+                    futures_account_calendar,
+                    account_policy if account_policy is not None else prepped_weights,
+                    execution, event_execution, initial_capital=float(day_trade_execution_initial_capital),
+                    decision_state_advance=(None if state_advance_mask is None else
+                                            state_advance_mask.to(device=weights.device, dtype=torch.bool)),
+                    account_state_advance=event_advance,
+                    initial_quantities=initial_weights, initial_equity_scale=initial_equity_scale,
+                    initial_alive=initial_alive, return_weights_history=return_weights_history,
+                    return_turnovers=return_turnovers, return_margin_audit=return_futures_margin_audit,
+                    recoverable_backward=futures_portfolio_recoverable_backward,
+                )
+                result = dual.account_ledger
+                index = torch.as_tensor(futures_account_calendar.decision_indices,
+                                        device=weights.device, dtype=torch.long)
+                def decision_rows(value):
+                    if value is None or value.shape[0] == 0:
+                        return value
+                    if value.shape[0] != len(futures_account_calendar.dates):
+                        raise ValueError("dual futures account ledger history has an unexpected date axis")
+                    return value.index_select(0, index)
+                quantities = decision_rows(result.contract_quantities_history)
+                history = (quantities.to(dtype=torch.float32) if quantities is not None
+                           else result.weights_history.new_empty((0, weights.size(1))))
+                default = (None if result.default_history is None else
+                    aggregate_account_log_returns_to_decisions(
+                        futures_account_calendar, result.default_history.to(torch.int64)).bool())
+                # Ruin is absorbing, so at most one account node has a nonzero
+                # default reason. Preserve it in the following decision period.
+                reasons = (None if result.default_reason_history is None else
+                    aggregate_account_log_returns_to_decisions(
+                        futures_account_calendar, result.default_reason_history))
+                return BacktestResultTensor(
+                    strategy_returns=dual.decision_log_returns,
+                    benchmark_returns=benchmark_returns.to(device=weights.device, dtype=torch.float32),
+                    turnovers=aggregate_account_log_returns_to_decisions(futures_account_calendar, result.turnovers),
+                    weights_history=history,
+                    requested_weights_history=(
+                        decision_rows(result.requested_weights_history) if account_policy is not None
+                        else prepped_weights if return_weights_history else None),
+                    futures_account_policy_packet=(account_policy.detach()
+                        if account_policy is not None and return_weights_history else None),
+                    final_weights=result.final_weights, final_alive=result.final_alive,
+                    equity_scale_history=decision_rows(result.equity_scale_history),
+                    final_equity_scale=result.final_equity_scale,
+                    settlement_default=default, default_reason_history=reasons,
+                    futures_margin_audit=decision_rows(result.margin_audit_history),
+                    futures_contract_quantities_history=(quantities if result.margin_audit_history is not None else None),
+                    futures_residual_contract_quantities_history=decision_rows(result.residual_contract_quantities_history),
+                    execution_mode=mode, settlement_ledger_unit="contract_quantity",
+                    futures_account_calendar_result=dual,
+                )
             if futures_portfolio_training_surrogate_only:
                 result = run_tw_futures_portfolio_integer_surrogate_torch(
                     prepped_weights,
@@ -3652,6 +3743,8 @@ def run_backtest_torch(
                     else "contract_quantity"
                 ),
             )
+        if futures_account_calendar is not None:
+            raise ValueError("dual futures accounts require the exact margin execution tape")
         holding_returns = execution[..., 0]
         executable = execution[..., 1] > 0.5
         must_liquidate = execution[..., 2] > 0.5

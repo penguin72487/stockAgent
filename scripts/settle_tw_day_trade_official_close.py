@@ -147,7 +147,8 @@ def last_traded_price(raw_root: Path, day: date, symbol: str, current):
 
 
 def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=(), markets=()):
-    state = json.loads((root / "state.json").read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(root / "state.json")
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
         raise ValueError("not an exclusively paper ledger")
     prices, sources = official_closes(raw_root, day, pin_sources=True)
@@ -297,12 +298,14 @@ def reconcile_candidate(root: Path, plan, *, recorded_at: datetime):
 
 def rewrite_endpoints(root: Path, day: str, markets: set[str]):
     """Change only the authorized close endpoints; preserve all interior bytes."""
-    state = json.loads((root / "state.json").read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    from stockagent.live.paper_journal import journal_write_transaction, open_paper_journal
+    state = read_paper_state(root / "state.json")
     path = root / "marks.jsonl"
     if not path.exists():
         return {"updated": 0, "missing": sorted(markets)}
     last, count = {}, {}
-    with path.open() as stream:
+    with open_paper_journal(path, "r") as stream:
         for line in stream:
             if day not in line:
                 continue
@@ -312,7 +315,7 @@ def rewrite_endpoints(root: Path, day: str, markets: set[str]):
                 if str(row.get("minute", ""))[11:16] == "13:30":
                     last[row["market"]] = row
     temporary = path.with_suffix(".close-settlement.tmp")
-    with path.open() as source, temporary.open("w") as dest:
+    with open_paper_journal(path, "r") as source, temporary.open("w") as dest:
         for line in source:
             if day in line:
                 row = json.loads(line)
@@ -331,19 +334,21 @@ def rewrite_endpoints(root: Path, day: str, markets: set[str]):
             dest.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
         dest.flush()
         os.fsync(dest.fileno())
-    os.replace(temporary, path)
+    with journal_write_transaction(path, operation="replace"):
+        os.replace(temporary, path)
     return {"updated": len(last), "missing": sorted(markets - last.keys()),
             "unique_minute_points": {market: len(minutes) for market,minutes in count.items()},
             "interior_minutes_unchanged": True, "prior_dates_unchanged": True}
 
 
 def apply_plan(live: Path, plan, *, recorded_at: datetime):
+    from stockagent.live.paper_mode_snapshot import read_paper_state
     if not plan["entries"]:
         return {"status": "no_priced_residuals", "remaining_count": len(plan["blocked"])}
     with ExitStack() as stack:
         stack.enter_context(_acquire_engine_lock(live))
         stack.enter_context(minute_curve_write_lock(live))
-        if book_fingerprint(json.loads((live / "state.json").read_text())) != plan["book_fingerprint"]:
+        if book_fingerprint(read_paper_state(live / "state.json")) != plan["book_fingerprint"]:
             raise ValueError("live book changed; replan required")
         for source in plan["sources"]:
             if _sha256(Path(source["path"])) != source["sha256"]:
@@ -364,7 +369,7 @@ def apply_plan(live: Path, plan, *, recorded_at: datetime):
         for name, proof in before.items():
             if _prefix_hash(candidate/name, proof["size"]) != proof["sha256"]:
                 raise ValueError(f"original ledger prefix changed: {name}")
-        after = json.loads((candidate / "state.json").read_text())
+        after = read_paper_state(candidate / "state.json")
         if result["remaining_count"] != len(plan["blocked"]):
             raise ValueError("unexpected residual count")
         for entry in plan["entries"]:

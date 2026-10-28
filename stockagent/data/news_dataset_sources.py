@@ -46,6 +46,28 @@ HEAD_FIELDS = (
     "last_seen_utc", "captured_at_utc", "body_sha256", "parquet_path", "state",
 )
 
+HEADLINE_SCOPE_CONTRACT = "cnyes_market_route_metadata_only_v1"
+
+
+def headline_metadata_only_reason(url: str) -> str | None:
+    """Keep unverified market-page references as metadata, not news text.
+
+    A literal Google envelope may point at the same market route. Decode only
+    with the shared, strict local resolver: no network request, guessed URL,
+    source-identity assertion or change to the acquisition queue is involved.
+    """
+    if not isinstance(url, str):
+        return None
+    if url.startswith(("http://www.cnyes.com/twstock/", "https://www.cnyes.com/twstock/")):
+        return "cnyes_market_route"
+    if url.startswith(("http://news.google.com/", "https://news.google.com/")):
+        from stockagent.data.news_source_urls import resolve_google_literal_url
+        result = resolve_google_literal_url(url)
+        if (result.outcome == "literal_original" and result.original_url.startswith(
+                ("http://www.cnyes.com/twstock/", "https://www.cnyes.com/twstock/"))):
+            return "literal_google_cnyes_market_route"
+    return None
+
 
 def freeze_inputs(source: Path, destination: Path, *, progress=None) -> dict:
     """Copy only source heads/references, not raw bodies, in one coherent read.
@@ -70,6 +92,7 @@ def freeze_inputs(source: Path, destination: Path, *, progress=None) -> dict:
             parquet_path TEXT, state TEXT NOT NULL
         ) WITHOUT ROWID;
         CREATE TABLE batches(path TEXT PRIMARY KEY, receipt_path TEXT NOT NULL) WITHOUT ROWID;
+        CREATE TABLE metadata_only_heads(id BLOB PRIMARY KEY, reason TEXT NOT NULL) WITHOUT ROWID;
         CREATE TABLE metadata_inputs(
             origin_id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
             parquet_path TEXT NOT NULL, sha256 TEXT NOT NULL, rows INTEGER NOT NULL,
@@ -90,6 +113,13 @@ def freeze_inputs(source: Path, destination: Path, *, progress=None) -> dict:
             cursor = original.execute("SELECT " + ",".join(HEAD_FIELDS) + " FROM articles NOT INDEXED")
             while rows := cursor.fetchmany(16384):
                 snapshot.executemany("INSERT INTO heads VALUES (?,?,?,?,?,?,?,?,?,?,?)", (tuple(r) for r in rows))
+                metadata_only = []
+                for row in rows:
+                    if row["body_sha256"] is None and row["title"] and row["title"].strip():
+                        reason = headline_metadata_only_reason(row["url"])
+                        if reason:
+                            metadata_only.append((row["id"], reason))
+                snapshot.executemany("INSERT INTO metadata_only_heads VALUES (?,?)", metadata_only)
                 snapshot.commit()
                 copied += len(rows)
                 if progress:
@@ -119,7 +149,9 @@ def freeze_inputs(source: Path, destination: Path, *, progress=None) -> dict:
         counts = {
             "known_urls": copied, "fulltext_articles": body_count,
             "headline_articles": snapshot.execute("SELECT count(*) FROM heads WHERE body_sha256 IS NULL "
-                                                  "AND title IS NOT NULL AND trim(title)!=''").fetchone()[0],
+                                                  "AND title IS NOT NULL AND trim(title)!='' "
+                                                  "AND NOT EXISTS (SELECT 1 FROM metadata_only_heads m WHERE m.id=heads.id)").fetchone()[0],
+            "metadata_only_market_heads": snapshot.execute("SELECT count(*) FROM metadata_only_heads").fetchone()[0],
             "metadata_rows": snapshot.execute("SELECT coalesce(sum(rows),0) FROM metadata_inputs").fetchone()[0],
             "metadata_partitions": snapshot.execute("SELECT count(*) FROM metadata_inputs").fetchone()[0],
             "rss_items": snapshot.execute("SELECT coalesce(sum(rows),0) FROM feed_inputs").fetchone()[0],
@@ -129,6 +161,7 @@ def freeze_inputs(source: Path, destination: Path, *, progress=None) -> dict:
         with target.open("rb") as stream:
             os.fsync(stream.fileno())
         result = {"captured_at_utc": captured, "source_root": str(source.resolve()),
+                  "headline_scope_contract": HEADLINE_SCOPE_CONTRACT,
                   "snapshot_path": target.name, "snapshot_sha256": sha256_file(target), "counts": counts,
                   "production_queue_writes": False, "publisher_requests": 0}
         atomic_write_json(destination / "snapshot.json", result)
@@ -163,6 +196,8 @@ def reuse_snapshot(source: Path, destination: Path, frozen: Path) -> dict:
     plan = json.loads((frozen / "snapshot.json").read_text())
     if plan["source_root"] != str(source.resolve()):
         raise ValueError("reused news snapshot source/checksum mismatch")
+    if plan.get("headline_scope_contract") != HEADLINE_SCOPE_CONTRACT:
+        raise ValueError("reused news snapshot has an incompatible headline scope; freeze a new source snapshot")
     destination.mkdir(parents=True, exist_ok=False, mode=0o700)
     target = destination / "snapshot.sqlite3"
     if "snapshot_storage" in plan:

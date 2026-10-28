@@ -1,4 +1,5 @@
 """Publication and failure semantics shared by downloader artifact writers."""
+import json
 import os
 from pathlib import Path
 import stat
@@ -8,6 +9,77 @@ import pyarrow.parquet as pq
 import pytest
 
 from downloader import artifact_io
+
+
+@pytest.mark.parametrize("sort_keys", [False, True])
+@pytest.mark.parametrize("ensure_ascii", [False, True])
+def test_streamed_compact_json_matches_standard_bytes_and_preserves_values(sort_keys, ensure_ascii):
+    groups = [None, True, -0.0, 2**128, "台灣\n\\\"", [], {},
+              {"z": [{"large": 2**128, "negative_zero": -0.0, "nullable": None}, (1, 2)],
+               "a": {"price": 1.2345678901234567, "clock": "2026-10-27T21:00:00+08:00"}},
+              {3: "number key", None: "null key"}]
+    for value in groups:
+        try:
+            expected = json.dumps(value, ensure_ascii=ensure_ascii, sort_keys=sort_keys,
+                                  separators=(",", ":")).encode("utf-8")
+        except TypeError:
+            with pytest.raises(TypeError):
+                b"".join(artifact_io.iter_compact_json_bytes(value, ensure_ascii=ensure_ascii, sort_keys=sort_keys))
+        else:
+            assert b"".join(artifact_io.iter_compact_json_bytes(
+                value, ensure_ascii=ensure_ascii, sort_keys=sort_keys)) == expected
+
+
+@pytest.mark.parametrize("bad, error", [(b"invalid JSON bytes", TypeError), ("\ud800", UnicodeEncodeError)])
+def test_streamed_json_late_encoding_failure_keeps_original_and_cleans_owned_temporary(tmp_path, monkeypatch, bad, error):
+    target = tmp_path / "catalog.json"
+    target.write_bytes(b"previous complete generation")
+    events = []
+    monkeypatch.setattr(artifact_io.os, "replace", lambda *_: events.append("replace"))
+    with pytest.raises(error):
+        artifact_io.atomic_write_json(target, {"rows": [{"valid": 1}, {"bad": bad}]}, compact=True, stream=True)
+    assert not events
+    assert target.read_bytes() == b"previous complete generation"
+    assert not artifact_io._temporary_path(target).exists()
+
+
+def test_streamed_json_rejects_cycles_and_unsupported_pretty_mode_before_publication(tmp_path):
+    target = tmp_path / "catalog.json"
+    target.write_bytes(b"previous")
+    cycle = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError, match="Circular"):
+        artifact_io.atomic_write_json(target, {"late": cycle}, compact=True, stream=True)
+    with pytest.raises(ValueError, match="requires compact"):
+        artifact_io.atomic_write_json(target, {"valid": 1}, stream=True)
+    assert target.read_bytes() == b"previous"
+    assert not artifact_io._temporary_path(target).exists()
+
+
+def test_streamed_private_json_is_complete_private_and_durable_at_replace(tmp_path, monkeypatch):
+    from stockagent.data_sync.offhost_backup import private_json
+
+    target = tmp_path / "ledger.json"
+    value = {"rows": [{"id": number, "value": -0.0, "null": None} for number in range(2000)]}
+    replace, synchronize = os.replace, os.fsync
+    events = []
+
+    def sync(fd):
+        events.append("directory_sync" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file_sync")
+        synchronize(fd)
+
+    def publish(source, destination):
+        source = Path(source)
+        assert source.stat().st_mode & 0o777 == 0o600
+        assert source.read_bytes() == json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        events.append("replace")
+        replace(source, destination)
+
+    monkeypatch.setattr(artifact_io.os, "fsync", sync)
+    monkeypatch.setattr(artifact_io.os, "replace", publish)
+    private_json(target, value, compact=True)
+    assert json.loads(target.read_bytes()) == value
+    assert events == ["file_sync", "replace", "directory_sync"]
 
 
 @pytest.mark.parametrize("mode", [None, 0o600])

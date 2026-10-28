@@ -21,6 +21,8 @@ import polars as pl
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+if str(SCRIPT_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR.parent))
 
 from artifact_io import (  # noqa: E402
     atomic_write_bytes as _atomic_bytes,
@@ -40,6 +42,12 @@ from http_transport import (  # noqa: E402
     ResilientHttpTransport,
 )
 from openbb_credentials import load_openbb_environment  # noqa: E402
+from stockagent.data_sync.retained_source import (  # noqa: E402
+    RetainedRawSource, collector_owner, load_retained_source,
+)
+from downloader.fred_projection import (  # noqa: E402
+    ClosedProjection, build_manifest as build_projection_manifest, normalizer_identity,
+)
 
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
@@ -77,6 +85,7 @@ class FredWindowResult:
     point_in_time_gap: str | None
     retrieved_at_utc: str | None
     error: str | None = None
+    raw_locator: dict[str, object] | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -317,12 +326,15 @@ def _read_cached_window(
     end_date: str,
     recheck_days: int,
     now: datetime,
+    retained_raw: RetainedRawSource | None = None,
+    projection: ClosedProjection | None = None,
 ) -> FredWindowResult | None:
     if window.realtime_end >= end_date or recheck_days <= 0:
         return None
     receipt_path = _window_receipt_path(output_dir, window)
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_raw = receipt_path.read_bytes()
+        receipt = json.loads(receipt_raw)
         if (
             receipt.get("status") not in {"complete", "complete_with_point_in_time_gap"}
             or receipt.get("series_id") != window.series_id
@@ -344,7 +356,22 @@ def _read_cached_window(
         if relative_raw.is_absolute() or ".." in relative_raw.parts:
             return None
         raw_path = output_dir / relative_raw
-        payload = gzip.decompress(raw_path.read_bytes())
+        raw_locator = None
+        projected = projection.lookup(window, receipt_raw, retained_raw=retained_raw) if projection else None
+        if projected is not None:
+            return FredWindowResult(window=window, status='cached_verified', rows=projected['rows'],
+                raw_path=str(raw_path), raw_sha256=projected['raw_sha256'],
+                point_in_time_gap=projected['point_in_time_gap'], retrieved_at_utc=projected['retrieved_at_utc'],
+                raw_locator=(retained_raw.locator(relative_raw.as_posix())
+                    if not raw_path.exists() and retained_raw is not None else None))
+        try:
+            compressed = raw_path.read_bytes()
+        except FileNotFoundError:
+            compressed = retained_raw.get(relative_raw.as_posix()) if retained_raw is not None else None
+            if compressed is None:
+                return None
+            raw_locator = retained_raw.locator(relative_raw.as_posix())
+        payload = gzip.decompress(compressed)
         expected_sha = str(receipt["raw_sha256"])
         if sha256_bytes(payload) != expected_sha:
             return None
@@ -368,6 +395,7 @@ def _read_cached_window(
         TypeError,
         json.JSONDecodeError,
         gzip.BadGzipFile,
+        EOFError,
     ):
         return None
     document = json.loads(payload)
@@ -379,6 +407,7 @@ def _read_cached_window(
         raw_sha256=expected_sha,
         point_in_time_gap=str(document.get("point_in_time_gap") or "").strip() or None,
         retrieved_at_utc=content_first_observed.astimezone(timezone.utc).isoformat(),
+        raw_locator=raw_locator,
     )
 
 
@@ -391,6 +420,7 @@ def _fetch_window(
     observation_end: str,
     max_retries: int,
     transport: ResilientHttpTransport,
+    retained_raw: RetainedRawSource | None = None,
 ) -> FredWindowResult:
     retrieved = datetime.now(timezone.utc)
     receipt_path = _window_receipt_path(output_dir, window)
@@ -413,13 +443,29 @@ def _fetch_window(
         )
         raw_path = output_dir / relative_raw
         same_content = False
+        raw_locator = None
+        encoded = gzip.compress(payload, mtime=0)
         if raw_path.is_file():
             try:
                 same_content = gzip.decompress(raw_path.read_bytes()) == payload
-            except (OSError, gzip.BadGzipFile):
+            except (OSError, gzip.BadGzipFile, EOFError):
                 same_content = False
+        elif retained_raw is not None:
+            if retained_raw.matches_encoded(relative_raw.as_posix(), encoded):
+                # Fresh API bytes exactly match the fixed encoded original.
+                # Its binding is not a fresh cold-recovery proof; publication
+                # still verifies every retained original before commitment.
+                same_content = True
+                raw_locator = retained_raw.locator(relative_raw.as_posix())
+            else:
+                compressed = retained_raw.get(relative_raw.as_posix())
+                if compressed is not None:
+                    same_content = gzip.decompress(compressed) == payload
+                    if not same_content:
+                        raise ValueError('fixed retained FRED raw differs from its content-addressed payload')
+                    raw_locator = retained_raw.locator(relative_raw.as_posix())
         if not same_content:
-            _atomic_bytes(raw_path, gzip.compress(payload, mtime=0))
+            _atomic_bytes(raw_path, encoded)
         content_first_observed_at = retrieved
         if same_content:
             try:
@@ -463,6 +509,7 @@ def _fetch_window(
             "point_in_time_gap": gap,
             "content_first_observed_at_utc": content_first_observed_at.isoformat(),
             "completed_at_utc": retrieved.isoformat(),
+            **({'raw_storage': raw_locator} if raw_locator is not None else {}),
         }
         _atomic_json(receipt_path, receipt)
         return FredWindowResult(
@@ -473,6 +520,7 @@ def _fetch_window(
             raw_sha256=raw_sha256,
             point_in_time_gap=gap,
             retrieved_at_utc=content_first_observed_at.isoformat(),
+            raw_locator=raw_locator,
         )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -502,6 +550,16 @@ def _fetch_window(
 
 def main() -> None:
     args = parse_args()
+    with collector_owner(Path(args.output_dir), 'fred-crypto-macro'):
+        # A malformed binding fails before credentials/provider calls; never
+        # turn a missing/corrupt cold authority into thousands of API refetches.
+        retained_raw = load_retained_source(Path(args.output_dir), 'fred-crypto-macro',
+            read_originals=False, defer_originals=True)
+        _run_collection(args, retained_raw=retained_raw)
+
+
+def _run_collection(args: argparse.Namespace, *, retained_raw: RetainedRawSource | None = None,
+                    reuse_closed_projection: bool = True) -> None:
     started = datetime.now(timezone.utc)
     output_dir = Path(args.output_dir)
     api_key = _configured_api_key(Path(args.env_file))
@@ -560,6 +618,11 @@ def main() -> None:
     )
     results: list[FredWindowResult] = []
     pending: list[FredWindow] = []
+    identity = normalizer_identity((parse_initial_release_rows, _empty_initial_release_frame,
+        _realtime_windows, _read_cached_window, _fetch_window, _run_collection),
+        parameters={'schema_version': SCHEMA_VERSION, 'request_contract_version': REQUEST_CONTRACT_VERSION})
+    projection = (ClosedProjection.load(output_dir, identity=identity, schema=_empty_initial_release_frame().schema)
+        if reuse_closed_projection and not args.refresh else None)
     now = datetime.now(timezone.utc)
     for window in windows:
         cached = (
@@ -572,6 +635,8 @@ def main() -> None:
                 end_date=end_date,
                 recheck_days=max(0, int(args.historical_recheck_days)),
                 now=now,
+                retained_raw=retained_raw,
+                projection=projection,
             )
         )
         if cached is None:
@@ -591,6 +656,7 @@ def main() -> None:
                 observation_end=end_date,
                 max_retries=args.max_retries,
                 transport=transport,
+                retained_raw=retained_raw,
             ): window
             for window in pending
         }
@@ -644,6 +710,10 @@ def main() -> None:
                 ),
                 "raw_paths": [item.raw_path for item in selected if item.raw_path],
                 "raw_sha256": [item.raw_sha256 for item in selected if item.raw_sha256],
+                "raw_locations": [
+                    {'raw_path': item.raw_path, 'storage': item.raw_locator or {'backend': 'workspace'}}
+                    for item in selected if item.raw_path
+                ],
                 "point_in_time_gap_windows": gaps,
                 "failed_windows": [
                     {
@@ -657,6 +727,10 @@ def main() -> None:
             }
         )
     output_path = output_dir / "observations.parquet"
+    if retained_raw is not None:
+        retained_raw.check_generation()
+    if projection is not None:
+        projection.check_generation()
     if failed:
         summary = {
             "schema_version": SCHEMA_VERSION,
@@ -693,6 +767,8 @@ def main() -> None:
         .sort(["series_id", "observation_date", "realtime_start"])
     )
     _atomic_parquet(output_path, frame)
+    projection_manifest = (build_projection_manifest(output_dir, results, frame, identity=identity,
+        end_date=end_date, retained_raw=retained_raw) if reuse_closed_projection else None)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "state": "complete",
@@ -712,6 +788,8 @@ def main() -> None:
         "window_count": len(results),
         "cached_windows": sum(item.status == "cached_verified" for item in results),
         "fetched_windows": sum(item.status != "cached_verified" for item in results),
+        "closed_projection_reused_windows": projection.reused_windows if projection else 0,
+        **({'closed_projection': projection_manifest} if projection_manifest is not None else {}),
         "rate_limit": {
             "requests_per_second": provider_rate_limit("fred_api").requests_per_second,
             "basis": provider_rate_limit("fred_api").basis,

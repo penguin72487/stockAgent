@@ -3,6 +3,7 @@
 These tests do not claim a new Vast GPU, WAN throughput or cross-GPU bit parity.
 """
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ import numpy as np
 import pytest
 import torch
 
-from stockagent.training_rescue import Rescue, RescueError, SSH, ControlSSH, load_policy
+from stockagent.training_rescue import Rescue, RescueError, SourceIdentityChanged, SSH, ControlSSH, load_policy
 from stockagent.training_rescue_worker import (
     CONTRACT, absolute, atomic_json, checkpoint_summary, control, digest,
     extract_tar, file_hash, freeze_runtime, inspect_run, relative,
@@ -89,6 +90,8 @@ class LocalSource:
     def __init__(self, spec, remote_state):
         self.spec = spec
         self.remote_state = remote_state / spec["run_id"]
+    def node_identity(self):
+        return {"boot_id": "fixture", "instance_id": "123"}
     def adapter(self, action, *args, **kwargs):
         if action == "health":
             return {"state": "nvml_visible_not_compute_acceptance", "devices": [{"index": 0}],
@@ -112,6 +115,62 @@ def enroll_fixture(rescue, spec, monkeypatch):
     monkeypatch.setattr("stockagent.training_rescue.REMOTE_STATE", str(remote_state))
     monkeypatch.setattr(rescue, "source", lambda _: LocalSource(spec, remote_state))
     return LocalSource(spec, remote_state)
+
+
+@pytest.mark.parametrize('identity_drift', [None, 'before', 'after'])
+def test_bootstrap_preserves_same_source_and_does_not_claim_input_rebuild(rescue, formal, monkeypatch, tmp_path, identity_drift):
+    spec = formal[0]
+    prefix = tmp_path / 'fixed-runtime'
+    prefix.mkdir()
+    (prefix / 'payload.bin').write_bytes(b'closed runtime member')
+    archive = tmp_path / 'runtime.tar.gz'
+    freeze_runtime(prefix, archive)
+    config = Path(spec['config_file'])
+    spec.update(runtime_prefix=str(prefix), runtime_capsule_path=str(archive),
+        bootstrap_files=[{'source_path': str(config), 'target_path': str(config),
+                          'role': 'training_config', 'bytes': config.stat().st_size,
+                          'sha256': file_hash(config)}])
+    enroll_fixture(rescue, spec, monkeypatch)
+    state = rescue.journal(spec['run_id'])
+    state['source_identity'] = {'boot_id': 'fixture', 'instance_id': '123'}
+    rescue.record(spec['run_id'], state)
+    actions = []
+    class BootstrapSource(LocalSource):
+        identity_checks = 0
+        def node_identity(self):
+            self.identity_checks += 1
+            if identity_drift == 'before' or (identity_drift == 'after' and self.identity_checks > 1):
+                return {'boot_id': 'replaced', 'instance_id': '999'}
+            return super().node_identity()
+        def adapter(self, action, *args, **kwargs):
+            actions.append(action)
+            if action == 'verify-runtime':
+                return verify_runtime_capsule(Path(args[args.index('--path') + 1]),
+                    Path(args[args.index('--proof') + 1]))
+            if action == 'metadata':
+                path = Path(args[args.index('--path') + 1])
+                return {'source_path': str(path), 'bytes': path.stat().st_size, 'sha256': file_hash(path)}
+            return super().adapter(action, *args, **kwargs)
+        def run(self, argv, **kwargs):
+            # Execute the real byte reader, replacing only the SSH boundary.
+            assert argv[0] == 'python3' and argv[2] == 'read'
+            return subprocess.check_output([sys.executable, str(WORKER), *argv[2:]])
+    source = BootstrapSource(spec, rescue.state / 'remote-fixture')
+    monkeypatch.setattr(rescue, 'source', lambda _: source)
+    if identity_drift:
+        with pytest.raises(SourceIdentityChanged):
+            rescue.seal_bootstrap(spec['run_id'])
+        assert not rescue.journal(spec['run_id']).get('bootstrap')
+        assert bool(actions) is (identity_drift == 'after')
+        return
+    report = rescue.seal_bootstrap(spec['run_id'])
+    assert report['state'] == 'bootstrap_preserved'
+    assert report['bootstrap_report_contract'] == 'fixed_source_runtime_preservation_v2'
+    assert report['source_inputs_rebuilt_on_remote'] is False
+    saved = json.loads((rescue.cold / 'bootstrap' / spec['run_id'] / (report['bootstrap_id'] + '.json')).read_bytes())
+    for row in [*saved['files'], saved['runtime_archive'], saved['runtime_archive_proof']]:
+        assert file_hash(rescue.object_path(row['sha256'])) == row['sha256']
+    assert actions == ['verify-runtime', 'metadata']
 
 
 def test_full_canonical_optimizer_rng_resume_after_cold_reconstruction(rescue, formal, monkeypatch, tmp_path):
@@ -167,6 +226,99 @@ def test_corrupt_incoming_cannot_publish_head(rescue):
     assert not list(rescue.cold.glob("commits/*/*"))
 
 
+@pytest.mark.parametrize("prefix_bytes", [0, 17, 128])
+def test_interrupted_immutable_transfer_resumes_exact_prefix(rescue, tmp_path, prefix_bytes):
+    from stockagent.training_rescue import SSHOperationError
+
+    source_root = tmp_path / "closed-source"
+    source_root.mkdir()
+    payload = bytes(range(128))
+    member = source_root / "capsule.bin"
+    member.write_bytes(payload)
+    row = {"relative": member.name, "sha256": file_hash(member), "bytes": len(payload)}
+
+    class InterruptedSource:
+        def __init__(self):
+            self.requests = []
+        def open_read(self, root, request, *, python, errors):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return subprocess.Popen([sys.executable, "-c",
+                    "import sys;sys.stdout.buffer.write(bytes.fromhex(sys.argv[1]));"
+                    "sys.stdout.buffer.flush();sys.stderr.write('fixture network reset');sys.exit(255)",
+                    payload[:prefix_bytes].hex()], stdout=subprocess.PIPE, stderr=errors)
+            return subprocess.Popen([sys.executable, str(WORKER), "read", "--path", str(root),
+                                     "--row", json.dumps(request)], stdout=subprocess.PIPE, stderr=errors)
+
+    source = InterruptedSource()
+    with pytest.raises(SSHOperationError) as failure:
+        rescue.pull(source, source_root, row)
+    assert failure.value.returncode == 255 and "fixture network reset" in failure.value.private_stderr.decode()
+    assert "network reset" not in str(failure.value)
+    partials = list(rescue.cold.rglob("*.partial.*"))
+    assert len(partials) == 1 and partials[0].read_bytes() == payload[:prefix_bytes]
+    intent = rescue.cold / "incoming" / (row["sha256"] + ".json")
+    assert json.loads(intent.read_bytes())["state"] == "retained_for_retry"
+    assert intent.stat().st_mode & 0o077 == 0
+    result = rescue.pull(source, source_root, row)
+    assert result["D_readback_verified"] is True and result["resumed_bytes"] == prefix_bytes
+    assert result["transferred_bytes"] == len(payload) - prefix_bytes
+    assert source.requests[1]["resume_offset"] == prefix_bytes
+    assert source.requests[1]["prefix_sha256"] == hashlib.sha256(payload[:prefix_bytes]).hexdigest()
+    assert rescue.object_path(row["sha256"]).read_bytes() == payload
+    assert not partials[0].exists() and member.read_bytes() == payload
+
+
+def test_legacy_partial_adoption_verifies_source_prefix_before_append(rescue, tmp_path):
+    from stockagent.training_rescue import SSHOperationError
+
+    source_root = tmp_path / "closed-source"
+    source_root.mkdir()
+    member = source_root / "capsule.bin"
+    member.write_bytes(b"sealed original payload")
+    row = {"relative": member.name, "sha256": file_hash(member), "bytes": member.stat().st_size}
+    partial = rescue.object_path(row["sha256"]).with_suffix(".partial." + "1" * 32)
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"corrupt")
+    source = LocalSource({"run_id": "fixture"}, tmp_path)
+    with pytest.raises(SSHOperationError) as failure:
+        rescue.pull(source, source_root, row, retained_partial=partial)
+    assert b"retained D prefix differs" in failure.value.private_stderr
+    assert partial.read_bytes() == b"corrupt" and not rescue.object_path(row["sha256"]).exists()
+    assert member.read_bytes() == b"sealed original payload"
+
+
+def test_busy_legacy_partial_cannot_be_adopted(rescue, tmp_path, monkeypatch):
+    sha = "f" * 64
+    partial = rescue.object_path(sha).with_suffix(".partial." + "2" * 32)
+    partial.parent.mkdir(parents=True)
+    partial.write_bytes(b"retained")
+    monkeypatch.setattr("stockagent.data_sync.materialized_cache.process_references_many", lambda *a, **kw: ["busy"])
+    with pytest.raises(RescueError, match="process references"):
+        rescue.pull(None, tmp_path, {"sha256": sha, "bytes": 100}, retained_partial=partial)
+    assert partial.read_bytes() == b"retained" and not (rescue.cold / "incoming").exists()
+
+
+@pytest.mark.parametrize("offset,prefix", [(True, None), (-1, None), (4, "a" * 64), (1, None), (0, "bad")])
+def test_worker_rejects_invalid_resume_identity_before_any_output(tmp_path, offset, prefix):
+    member = tmp_path / "member.bin"
+    member.write_bytes(b"abc")
+    row = {"relative": member.name, "sha256": file_hash(member), "bytes": 3,
+           "resume_offset": offset, "prefix_sha256": prefix}
+    process = subprocess.run([sys.executable, str(WORKER), "read", "--path", str(tmp_path),
+                              "--row", json.dumps(row)], capture_output=True)
+    assert process.returncode != 0 and process.stdout == b""
+    assert b"invalid immutable transfer offset" in process.stderr
+
+
+def test_transfer_owner_lock_excludes_simultaneous_append(rescue):
+    row = {"sha256": "a" * 64, "bytes": 3}
+    with rescue.object_lock(row["sha256"]):
+        with pytest.raises(BlockingIOError):
+            rescue.put_stream(io.BytesIO(b"bad"), row)
+    assert not rescue.object_path(row["sha256"]).exists()
+
+
 def test_corrupt_existing_object_blocks_recovery(rescue, formal, monkeypatch):
     spec = formal[0]; enroll_fixture(rescue, spec, monkeypatch)
     rescue.capture("formal")
@@ -208,6 +360,66 @@ def test_existing_ack_does_not_hide_cold_corruption(rescue, formal, monkeypatch)
     obj.write_bytes(b"corrupt")
     with pytest.raises(RescueError, match="corrupt"):
         rescue.capture("formal")
+
+
+def test_context_reuse_batches_every_fresh_native_sha_and_deduplicates_payload(rescue, monkeypatch):
+    from stockagent.data_sync import windows_cold_io as native
+    rows = []
+    for i in range(34):
+        content = f"exact immutable member {i}".encode()
+        sha = __import__("hashlib").sha256(content).hexdigest()
+        path = rescue.object_path(sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        rows.append({"relative": f"context/{i}.json", "sha256": sha, "bytes": len(content)})
+    rows.append({**rows[0], "relative": "another-logical-name.json"})
+    calls = []
+    def fresh_hash(paths):
+        calls.append(list(paths))
+        return {path: file_hash(path) for path in paths}
+    monkeypatch.setattr(native, "windows_path", lambda path: "D:\\exact-member")
+    monkeypatch.setattr(native, "hash_many", fresh_hash)
+    monkeypatch.setattr(rescue, "pull", lambda *a, **k: pytest.fail("existing native object retransferred"))
+    rescue.pull_context(None, Path("/unused-source"), rows)
+    assert [len(paths) for paths in calls] == [16, 16, 2]
+    assert {path for paths in calls for path in paths} == {rescue.object_path(row["sha256"]) for row in rows}
+    calls.clear()
+    rescue.pull_context(None, Path("/unused-source"), rows)
+    assert [len(paths) for paths in calls] == [16, 16, 2]  # No ACK/TTL bypass.
+
+
+@pytest.mark.parametrize("damage", ["corrupt_sha", "wrong_size", "symlink"])
+def test_native_context_reuse_corruption_cannot_be_acknowledged(rescue, monkeypatch, damage):
+    from stockagent.data_sync import windows_cold_io as native
+    content = b"original member"
+    sha = __import__("hashlib").sha256(content).hexdigest()
+    path = rescue.object_path(sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    if damage == "wrong_size":
+        path.write_bytes(content + b"extra")
+    elif damage == "symlink":
+        path.unlink(); path.symlink_to(path.parent / "absent")
+    monkeypatch.setattr(native, "windows_path", lambda path: "D:\\exact-member")
+    monkeypatch.setattr(native, "hash_many", lambda paths: {p: "f" * 64 for p in paths})
+    monkeypatch.setattr(rescue, "pull", lambda *a, **k: pytest.fail("damaged object retransferred or overwritten"))
+    with pytest.raises(RescueError, match="corrupt"):
+        rescue.pull_context(None, Path("/unused-source"), [{"relative": "one.json", "sha256": sha, "bytes": len(content)}])
+
+
+@pytest.mark.parametrize("damage", ["repeated_name", "contradictory_size", "oversized", "bool_size"])
+def test_context_reuse_rejects_malformed_inventory_before_payload_io(rescue, monkeypatch, damage):
+    row = {"relative": "one.json", "sha256": "a" * 64, "bytes": 12}
+    rows = [row, dict(row)]
+    if damage == "contradictory_size":
+        rows[1].update(relative="another.json", bytes=13)
+    elif damage == "oversized":
+        rows = [{**row, "bytes": 5 * 1024**3}]
+    elif damage == "bool_size":
+        rows = [{**row, "bytes": True}]
+    monkeypatch.setattr(rescue, "pull", lambda *a, **k: pytest.fail("invalid context started payload I/O"))
+    with pytest.raises(RescueError):
+        rescue.pull_context(None, Path("/unused-source"), rows)
 
 
 def test_checkpoint_curve_lag_fails_closed(formal):
@@ -270,6 +482,37 @@ def test_config_drift_is_not_an_acknowledged_recovery_point(formal):
         inspect_run(spec)
 
 
+def test_standalone_adapter_uses_enrolled_source_without_installed_package(formal, tmp_path):
+    spec = dict(formal[0], source_root=str(REPO))
+    worker = tmp_path / "standalone/worker.py"
+    worker.parent.mkdir()
+    worker.write_bytes(WORKER.read_bytes())
+    spec_path = tmp_path / "selected-run.json"
+    spec_path.write_text(json.dumps(spec))
+    env = {**os.environ, "PYTHONPATH": "", "PYTHONDONTWRITEBYTECODE": "1"}
+    result = subprocess.run([sys.executable, str(worker), "inspect", "--spec", str(spec_path)],
+                            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    proof = json.loads(result.stdout)
+    assert proof["checkpoints"]["train_2024/checkpoint_last.pt"]["full_optimizer_state"] is True
+
+
+def test_pinned_loader_must_not_fall_back_to_control_checkout(formal, tmp_path):
+    spec = dict(formal[0], source_root=str(tmp_path / "missing-source"), source_release={"verified": True})
+    with pytest.raises(ValueError, match="loader source is unavailable"):
+        inspect_run(spec)
+
+
+def test_preimported_loader_from_other_checkout_is_rejected(formal, tmp_path):
+    source = tmp_path / "other-frozen-source"
+    loader = source / "stockagent/training/runtime.py"
+    loader.parent.mkdir(parents=True)
+    loader.write_text("raise AssertionError('do not replace an already imported package')\n")
+    spec = dict(formal[0], source_root=str(source))
+    with pytest.raises(ValueError, match="different source"):
+        inspect_run(spec)
+
+
 @pytest.mark.parametrize("bad", ["../secret", "/etc/passwd", "a/../../secret", "a\\b", "a//b", "."])
 def test_member_path_traversal_rejected(bad):
     with pytest.raises(ValueError):
@@ -312,6 +555,236 @@ def test_ssh_loss_retains_previous_verified_checkpoint(rescue, formal, monkeypat
     assert rescue.journal("formal")["state"] == "awaiting_user_confirmation"
 
 
+def test_source_failures_back_off_without_blocking_other_runs_or_leaking_stderr(rescue, formal, monkeypatch):
+    from stockagent.training_rescue import SSHOperationError
+    spec = formal[0]; enroll_fixture(rescue, spec, monkeypatch)
+    rescue.capture("formal")
+    previous = rescue.journal("formal")["latest"]
+    calls = []
+    def lost(_):
+        calls.append(True)
+        raise SSHOperationError(255, b"private-host private-key secret-diagnostic")
+    monkeypatch.setattr(rescue, "source", lost)
+    first = rescue.cycle()
+    second = rescue.cycle()
+    assert len(calls) == 1 and second["runs"][0]["state"] == "waiting_source_retry"
+    state = rescue.journal("formal")
+    assert state["latest"] == previous
+    assert 0 < state["last_failure"]["retry_after_epoch"] - state["last_failure"]["at"] <= 301
+    diagnostic = rescue.path("formal") / "last-failure.private.json"
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert "secret-diagnostic" in diagnostic.read_text()
+    assert "private-host" not in json.dumps(first) + json.dumps(rescue.status())
+
+
+def test_changed_source_identity_blocks_missing_adapter_and_preserves_checkpoint(rescue, formal, monkeypatch):
+    spec = formal[0]
+    source = enroll_fixture(rescue, spec, monkeypatch)
+    rescue.capture("formal")
+    state = rescue.journal("formal")
+    previous = state["latest"]
+    state["source_identity"] = source.node_identity()
+    rescue.record("formal", state)
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "other", "instance_id": "456"})
+    def absent(*args, **kwargs):
+        pytest.fail("changed source must never call the old run's adapter")
+    monkeypatch.setattr(source, "adapter", absent)
+    monkeypatch.setattr(rescue, "source", lambda _: source)
+    result = rescue.cycle()
+    current = rescue.journal("formal")
+    assert current["latest"] == previous
+    assert current["source_identity"] == state["source_identity"]
+    assert current["last_failure"]["reason"] == "source_identity_changed_requires_reenrollment"
+    assert result["runs"][0]["training_started"] is False
+
+
+def source_identity_fault(rescue, formal, monkeypatch):
+    """Capture a real CPU checkpoint, then observe a different source node."""
+    spec = formal[0]
+    source = enroll_fixture(rescue, spec, monkeypatch)
+    rescue.capture(spec["run_id"])
+    state = rescue.journal(spec["run_id"])
+    state["source_identity"] = source.node_identity()
+    rescue.record(spec["run_id"], state)
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "other", "instance_id": "456"})
+    calls = []
+    def transport(_):
+        calls.append(True)
+        return source
+    monkeypatch.setattr(rescue, "source", transport)
+    rescue.cycle()
+    assert len(calls) == 1
+    return source, calls, state["latest"]
+
+
+def test_wrong_source_waits_for_enrollment_without_ssh_or_journal_churn(rescue, formal, monkeypatch):
+    source, calls, latest = source_identity_fault(rescue, formal, monkeypatch)
+    state = rescue.journal("formal")
+    assert state["last_failure"]["automatic_retry"] is False
+    assert "retry_after_epoch" not in state["last_failure"]
+    path = rescue.path("formal") / "state.json"
+    original, before = path.read_bytes(), path.stat()
+    for _ in range(3):
+        result = rescue.cycle()["runs"][0]
+        assert result["state"] == "waiting_source_reenrollment"
+        assert result["source_contacted"] is False and result["automatic_retry"] is False
+    assert len(calls) == 1 and rescue.journal("formal")["latest"] == latest
+    after = path.stat()
+    assert path.read_bytes() == original
+    assert (before.st_ino, before.st_mtime_ns, before.st_ctime_ns) == (after.st_ino, after.st_mtime_ns, after.st_ctime_ns)
+    status = rescue.status()["runs"][0]
+    assert status["source_polling"]["state"] == "waiting_source_reenrollment"
+    assert "source_poll_gate" not in status and "spec_sha256" not in status["last_failure"]
+
+
+@pytest.mark.parametrize("field", ["spec_sha256", "source_identity", "generation"])
+def test_source_poll_gate_never_blocks_a_different_enrollment(rescue, formal, monkeypatch, field):
+    source, calls, latest = source_identity_fault(rescue, formal, monkeypatch)
+    state = rescue.journal("formal")
+    state["source_poll_gate"][field] = 999 if field == "generation" else "different"
+    rescue.record("formal", state)
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "fixture", "instance_id": "123"})
+    result = rescue.cycle()
+    assert len(calls) == 2  # The already checked transport is reused by capture.
+    assert result["runs"][0]["state"] == "unchanged_committed_recovery_point"
+    current = rescue.journal("formal")
+    assert "source_poll_gate" not in current and "last_failure" not in current
+    assert current["latest"] == latest
+
+
+def test_legacy_wrong_source_failure_gets_one_fresh_check_before_gate(rescue, formal, monkeypatch):
+    source, calls, latest = source_identity_fault(rescue, formal, monkeypatch)
+    state = rescue.journal("formal")
+    state.pop("source_poll_gate")
+    state["last_failure"] = {"type": "SourceIdentityChanged", "reason": "source_identity_changed_requires_reenrollment",
+                             "consecutive_failures": 10, "retry_after_epoch": 0}
+    rescue.record("formal", state)
+    rescue.cycle()
+    rescue.cycle()
+    assert len(calls) == 2 and rescue.journal("formal")["latest"] == latest
+    assert rescue.status()["runs"][0]["source_polling"]["automatic_retry"] is False
+
+
+def test_blocked_source_does_not_block_other_checkpoint_capture(rescue, formal, monkeypatch):
+    _, _, latest = source_identity_fault(rescue, formal, monkeypatch)
+    healthy = {**formal[0], "run_id": "zhealthy"}
+    source = enroll_fixture(rescue, healthy, monkeypatch)
+    calls = []
+    def transport(spec):
+        calls.append(spec["run_id"])
+        assert spec["run_id"] == "zhealthy", "blocked run must never contact its alias"
+        return source
+    monkeypatch.setattr(rescue, "source", transport)
+    result = rescue.cycle()
+    assert calls == ["zhealthy"]
+    assert result["runs"][0]["state"] == "waiting_source_reenrollment"
+    assert rescue.journal("zhealthy")["latest"]["checkpoints"]["train_2024/checkpoint_last.pt"]["epoch"] == 3
+    assert rescue.journal("formal")["latest"] == latest
+
+
+def test_target_lease_is_not_suppressed_by_old_source_gate(rescue, formal, monkeypatch):
+    _, _, latest = source_identity_fault(rescue, formal, monkeypatch)
+    state = rescue.journal("formal")
+    state.update(state="recovering", active_target={"plan_id": "a" * 64})
+    rescue.record("formal", state)
+    actions = []
+    monkeypatch.setattr(rescue, "renew_target", lambda *a: actions.append("renew"))
+    monkeypatch.setattr(rescue, "watch_target", lambda *a: actions.append("watch") or {"state": "watched"})
+    result = rescue.cycle()
+    assert actions == ["renew", "watch"] and result["runs"] == [{"state": "watched"}]
+    assert rescue.journal("formal")["latest"] == latest
+    monkeypatch.setattr(rescue, "execution_spec", lambda _: formal[0])
+    assert rescue.status()["runs"][0]["source_polling"]["state"] == "target_owned"
+    state["state"] = "awaiting_user_confirmation"
+    rescue.record("formal", state)
+    rescue.cycle()
+    assert actions == ["renew", "watch"]
+    assert rescue.status()["runs"][0]["source_polling"] == {
+        "state": "waiting_target_confirmation", "automatic_retry": False, "reason": None}
+
+
+def test_explicit_registration_clears_gate_only_for_original_node(rescue, formal, monkeypatch, tmp_path):
+    config = tmp_path / "source.ssh-config"
+    config.write_text("fixture-only SSH profile\n")
+    config.chmod(0o600)
+    formal[0]["source_ssh"] = {"config": str(config), "alias": "fixture"}
+    source, _, latest = source_identity_fault(rescue, formal, monkeypatch)
+    monkeypatch.setattr(source, "install_adapter", lambda: None, raising=False)
+    monkeypatch.setattr(source, "upload", lambda *a: None, raising=False)
+    with pytest.raises(SourceIdentityChanged):
+        rescue.register(formal[0])
+    assert "source_poll_gate" in rescue.journal("formal")
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "fixture", "instance_id": "123"})
+    rescue.register(formal[0])
+    state = rescue.journal("formal")
+    assert "source_poll_gate" not in state and "last_failure" not in state
+    assert state["latest"] == latest
+
+
+def test_manual_capture_preserves_gate_if_existing_D_checkpoint_is_corrupt(rescue, formal, monkeypatch):
+    source, _, latest = source_identity_fault(rescue, formal, monkeypatch)
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "fixture", "instance_id": "123"})
+    commit = json.loads((rescue.cold / "commits/formal" / (latest["commit_id"] + ".json")).read_bytes())
+    row = next(row for row in commit["inventory"]["files"] if row["relative"].endswith("checkpoint_last.pt"))
+    path = rescue.object_path(row["sha256"])
+    path.write_bytes(b"!" * row["bytes"])
+    with pytest.raises(RescueError, match="corrupt"):
+        rescue.capture("formal")
+    state = rescue.journal("formal")
+    assert "source_poll_gate" in state and state["latest"] == latest
+
+
+def test_explicit_registration_keeps_gate_on_health_identity_race(rescue, formal, monkeypatch, tmp_path):
+    config = tmp_path / "source.ssh-config"
+    config.write_text("fixture-only SSH profile\n")
+    config.chmod(0o600)
+    formal[0]["source_ssh"] = {"config": str(config), "alias": "fixture"}
+    source, _, latest = source_identity_fault(rescue, formal, monkeypatch)
+    monkeypatch.setattr(source, "node_identity", lambda: {"boot_id": "fixture", "instance_id": "123"})
+    monkeypatch.setattr(source, "install_adapter", lambda: None, raising=False)
+    monkeypatch.setattr(source, "upload", lambda *a: None, raising=False)
+    monkeypatch.setattr(source, "adapter", lambda *a, **kw: {"node_identity": {"boot_id": "raced", "instance_id": "789"}})
+    with pytest.raises(SourceIdentityChanged):
+        rescue.register(formal[0])
+    state = rescue.journal("formal")
+    assert "source_poll_gate" in state and state["latest"] == latest
+    assert state["source_identity"] == {"boot_id": "fixture", "instance_id": "123"}
+
+
+@pytest.mark.parametrize("value", [None, {}, {"boot_id": "bad", "instance_id": "123"},
+    {"boot_id": "910a0cff-52d2-4043-a020-ca8a7fa8f0a4", "instance_id": 123},
+    {"boot_id": "910a0cff-52d2-4043-a020-ca8a7fa8f0a4", "instance_id": "123", "unexpected": True}])
+def test_ssh_identity_rejects_malformed_control_response(monkeypatch, value):
+    ssh = SSH(["ssh"], "fixture")
+    monkeypatch.setattr(ssh, "json", lambda *a, **kw: value)
+    with pytest.raises(RescueError, match="identity response"):
+        ssh.node_identity()
+
+
+def test_ssh_identity_is_read_only_and_matches_worker(monkeypatch):
+    from stockagent.training_rescue_worker import node_identity
+    ssh = SSH(["ssh"], "fixture")
+    def local(argv, **kwargs):
+        assert argv[:2] == ["python3", "-c"] and kwargs == {"timeout": 20}
+        return json.loads(subprocess.check_output([sys.executable, *argv[1:]]))
+    monkeypatch.setattr(ssh, "json", local)
+    assert ssh.node_identity() == node_identity()
+
+
+def test_explicit_capture_rejects_changed_source_before_sealing(rescue, formal, monkeypatch):
+    spec = formal[0]
+    source = enroll_fixture(rescue, spec, monkeypatch)
+    state = rescue.journal("formal")
+    state["source_identity"] = {"boot_id": "original", "instance_id": "old"}
+    rescue.record("formal", state)
+    def absent(*a, **kw):
+        pytest.fail("changed source must not seal a recovery context")
+    monkeypatch.setattr(source, "adapter", absent)
+    with pytest.raises(RescueError, match="explicit re-enrollment"):
+        rescue.capture("formal", transport=source)
+    assert not rescue.journal("formal").get("latest")
+
+
 def test_temporary_key_only_exports_public_and_expires(rescue, monkeypatch):
     record = rescue.issue_key(hours=1)
     assert record["public_key"].startswith("ssh-ed25519 ")
@@ -324,17 +797,83 @@ def test_temporary_key_only_exports_public_and_expires(rescue, monkeypatch):
         rescue.key(record["key_id"])
 
 
+def bootstrap_metadata_fixture(owner, spec):
+    """Legacy preservation control for approval-only tests, not runtime proof."""
+    body = {"contract": CONTRACT, "spec_sha256": digest(spec), "files": spec.get("bootstrap_files", [])}
+    identity = digest(body)
+    atomic_json(owner.cold / "bootstrap" / spec["run_id"] / (identity + ".json"), body)
+    return {"id": identity}
+
+
 def make_plan(rescue, formal, monkeypatch):
-    spec = formal[0]; enroll_fixture(rescue, spec, monkeypatch)
+    spec = formal[0]
+    # These tests cover approval/fencing metadata, not real packed restoration.
+    # A non-empty fixed source and matching proof are required at this boundary.
+    spec["data_sources"] = [{"dataset": "fixture-source", "snapshot_id": "fixture-release",
+        "manifest_sha256": "a" * 64, "materialized_root": str(Path(spec["source_root"]) / "inputs")}]
+    enroll_fixture(rescue, spec, monkeypatch)
     rescue.capture("formal")
-    state = rescue.journal("formal"); state["bootstrap"] = {"id": "c" * 64}
+    state = rescue.journal("formal"); state["bootstrap"] = bootstrap_metadata_fixture(rescue, spec)
     state["source_identity"] = {"boot_id": "fixture", "instance_id": "123"}
+    state["input_verification"] = {"spec_sha256": digest(spec), "level": "all_original_file_SHA_decoded"}
     rescue.record("formal", state)
     key = rescue.issue_key(hours=1)
     public = " ".join(key["public_key"].split()[:2])
     planned = rescue.plan("formal", host="192.0.2.1", port=40032, user="root", key_id=key["key_id"],
                          host_key_line="[192.0.2.1]:40032 " + public)
     return planned, key
+
+
+@pytest.mark.parametrize('missing', ['bindings', 'verification', 'stale_spec', 'wrong_level'])
+def test_incomplete_input_binding_blocks_status_plan_and_approved_plan(rescue, formal, monkeypatch, missing):
+    planned, _ = make_plan(rescue, formal, monkeypatch)
+    spec = formal[0]
+    state = rescue.journal('formal')
+    assert rescue.status()['runs'][0]['recovery_prepared'] is True
+    if missing == 'bindings':
+        spec['data_sources'] = []
+        # Even a proof stamped with this empty spec cannot certify any inputs.
+        state['input_verification']['spec_sha256'] = digest(spec)
+        atomic_json(rescue.path('formal') / 'spec.json', spec)
+    elif missing == 'verification':
+        state.pop('input_verification')
+    elif missing == 'stale_spec':
+        state['input_verification']['spec_sha256'] = '0' * 64
+    else:
+        state['input_verification']['level'] = 'metadata_only'
+    rescue.record('formal', state)
+    value = rescue.status()['runs'][0]
+    assert value['pinned_sources_readback_verified'] is False
+    assert value['recovery_prepared'] is False
+    assert value['recovery_preparation_contract'] == 'pinned_sources_and_runtime_v2'
+    assert value['checkpoint_epochs'] == {'train_2024/checkpoint_last.pt': 3}
+    key = rescue.issue_key(hours=1)
+    with pytest.raises(RescueError, match='non-empty pinned cold source'):
+        rescue.plan('formal', host='192.0.2.1', port=40032, user='root', key_id=key['key_id'],
+                    host_key_line='[192.0.2.1]:40032 ' + ' '.join(key['public_key'].split()[:2]))
+    assert rescue.key(key['key_id'])[0]['bound_plan'] is None
+    # Recheck old approved plans too, before touching any destination or fence.
+    monkeypatch.setattr(rescue, 'target_ssh', lambda *_: pytest.fail('no destination contact'))
+    with pytest.raises(RescueError, match='spec no longer matches|source verification no longer matches'):
+        rescue.recover(planned['plan_id'], confirm=planned['plan_id'],
+                       old_node_stopped_receipt=Path('/not-read-for-unbound-inputs'))
+    assert rescue.journal('formal')['generation'] == 1
+
+
+def test_empty_source_verification_cannot_create_recovery_readiness(rescue, formal, monkeypatch):
+    spec = formal[0]
+    enroll_fixture(rescue, spec, monkeypatch)
+    rescue.capture('formal')
+    state = rescue.journal('formal')
+    state['bootstrap'] = {'id': 'c' * 64}
+    rescue.record('formal', state)
+    with pytest.raises(RescueError, match='no pinned cold source bindings'):
+        rescue.verify_sources('formal')
+    assert not rescue.journal('formal').get('input_verification')
+    assert not (rescue.cold / 'source-verification').exists()
+    assert rescue.status()['runs'][0]['recovery_prepared'] is False
+    with pytest.raises(RescueError, match='cannot restore unbound training inputs'):
+        rescue.restore_inputs(None, spec, Path('/unused-inputs'))
 
 
 def test_user_confirmation_required_before_contact(rescue, formal, monkeypatch):
@@ -389,6 +928,36 @@ def test_runtime_capsule_restore_is_exact_and_no_overwrite(tmp_path):
     (prefix / "bin/fixture").write_bytes(b"changed")
     with pytest.raises(ValueError, match="restored runtime member"):
         restore_runtime(capsule, capsule.with_suffix(".gz.json"), prefix)
+
+
+@pytest.mark.parametrize("legacy_proof", [False, True])
+def test_runtime_capsule_preserves_literal_symlink_spelling_and_reads_v1_proof(tmp_path, legacy_proof):
+    prefix = tmp_path / "runtime"
+    (prefix / "bin").mkdir(parents=True)
+    (prefix / "bin/payload").write_bytes(b"closed executable")
+    (prefix / "bin/alias").symlink_to("./payload")
+    capsule = tmp_path / "capsule.tar.gz"
+    freeze_runtime(prefix, capsule)
+    proof_path = capsule.with_suffix(".gz.json")
+    proof = json.loads(proof_path.read_bytes())
+    assert proof["link_target_encoding"] == "raw_readlink_v2"
+    link = next(row for row in proof["files"] if row["kind"] == "symlink")
+    assert link["target"] == "./payload"
+    if legacy_proof:
+        proof.pop("link_target_encoding")
+        link["target"] = "payload"
+        atomic_json(proof_path, proof)
+    assert verify_runtime_capsule(prefix, proof_path)["state"] == "source_runtime_still_matches_closed_capsule"
+    if not legacy_proof:
+        (prefix / "bin/alias").unlink()
+        (prefix / "bin/alias").symlink_to("payload")
+        with pytest.raises(ValueError, match="link changed"):
+            verify_runtime_capsule(prefix, proof_path)
+        (prefix / "bin/alias").unlink()
+        (prefix / "bin/alias").symlink_to("./payload")
+    prefix.rename(tmp_path / "lost-runtime")
+    assert restore_runtime(capsule, proof_path, prefix)["state"] == "runtime_exact_bytes_restored"
+    assert os.readlink(prefix / "bin/alias") == "./payload"
 
 
 def test_runtime_external_link_not_archived(tmp_path):
@@ -465,6 +1034,11 @@ def test_ssh_uses_strict_known_hosts_no_agent_or_controlmaster(tmp_path):
     assert "StrictHostKeyChecking=yes" in joined and "ForwardAgent=no" in joined
     assert "ControlMaster=no" in joined and "-F /dev/null" in joined
     assert "StrictHostKeyChecking=no" not in joined
+    config = tmp_path / "profile.conf"
+    config.write_text("Host origin\n  ControlMaster auto\n  ControlPath /run/absent-owner/%C\n")
+    config.chmod(0o600)
+    profile = " ".join(SSH.profile(config, "origin").base)
+    assert "ControlMaster=no" in profile and "ControlPath=none" in profile and "ControlPersist=no" in profile
 
 
 def test_cli_help_never_looks_for_a_new_host():

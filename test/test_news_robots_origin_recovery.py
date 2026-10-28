@@ -3,6 +3,7 @@ from contextlib import closing
 from copy import deepcopy
 import hashlib
 import json
+import threading
 import time
 from types import SimpleNamespace
 
@@ -85,6 +86,11 @@ def test_rep_address_negative_cache_survives_restart_and_requires_real_policy(co
         BAD + '/robots.txt': FakeResponse(b'User-agent: *\nDisallow: /\n')})
     http.address_check = public_address_check
     with closing(http):
+        # The scheduler and status must see the durable pause immediately,
+        # before leasing an article or making another policy request.
+        assert http.blocked_robots_origins('publisher') == {BAD: clock.value + 30}
+        assert http.request_scope_cooldown_snapshot()['publisher']['origins'] == {BAD: clock.value + 30}
+        assert not session.calls
         with pytest.raises(NewsError, match='robots_origin_policy_cooldown'):
             http.get(BAD + '/article')
         assert len(lookups) == 1 and not session.calls
@@ -102,6 +108,336 @@ def test_rep_address_negative_cache_survives_restart_and_requires_real_policy(co
         assert [url for url, _ in session.calls] == [BAD + '/robots.txt']
         assert not http.blocked_robots_origins('publisher')
         assert 'policy_retry' not in json.loads(cache_path(tmp_path).read_bytes())
+
+
+def test_expired_rep_failure_survives_restart_for_status_until_real_recheck(config, tmp_path, monkeypatch):
+    clock = clock_fixture(monkeypatch)
+    http, session = http_fixture(config, tmp_path, {BAD + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http), pytest.raises(NewsError, match='http_502'):
+        http.get(BAD + '/article')
+    deadline = clock.value + 30
+    clock.value = deadline + 1
+    http, session = http_fixture(config, tmp_path, {
+        BAD + '/robots.txt': FakeResponse(ALLOW), BAD + '/article': FakeResponse(b'body')})
+    with closing(http):
+        before = http.capacity_snapshot()['providers']['publisher']
+        assert not before['temporarily_paused_robots_origins']
+        assert before['unverified_robots_origins'] == {BAD: deadline}
+        assert before['unverified_robots_origins_overflow'] is False
+        assert not session.calls
+        assert http.get(BAD + '/article').body == b'body'
+        after = http.capacity_snapshot()['providers']['publisher']
+        assert not after['unverified_robots_origins']
+        assert [url for url, _ in session.calls] == [BAD + '/robots.txt', BAD + '/article']
+
+
+@pytest.mark.parametrize('variant', ['expired', 'wrong_file', 'bad_retry', 'foreign_origin', 'disabled'])
+def test_restart_ignores_nonapplicable_negative_policy_state(config, tmp_path, monkeypatch, variant):
+    clock = clock_fixture(monkeypatch)
+    http, _ = http_fixture(config, tmp_path, {BAD + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http), pytest.raises(NewsError, match='http_502'):
+        http.get(BAD + '/article')
+    checkpoint_path = cache_path(tmp_path)
+    checkpoint = json.loads(checkpoint_path.read_bytes())
+    if variant == 'expired':
+        clock.value += 31
+    elif variant == 'wrong_file':
+        checkpoint['origin'] = GOOD
+        atomic_write_json(checkpoint_path, checkpoint)
+    elif variant == 'bad_retry':
+        checkpoint['policy_retry']['not_before_epoch'] = float('inf')
+        atomic_write_json(checkpoint_path, checkpoint)
+    elif variant == 'foreign_origin':
+        checkpoint_path.unlink()
+        checkpoint['origin'] = 'https://elsewhere.test'
+        atomic_write_json(cache_path(tmp_path, checkpoint['origin']), checkpoint)
+    else:
+        config['providers'][0]['enabled'] = False
+    http, session = http_fixture(config, tmp_path, {})
+    with closing(http):
+        assert not http.blocked_robots_origins('publisher')
+        assert not session.calls
+
+
+def test_restart_bounds_restored_origins_with_existing_provider_fallback(config, tmp_path, monkeypatch):
+    clock_fixture(monkeypatch)
+    http, _ = http_fixture(config, tmp_path, {BAD + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http), pytest.raises(NewsError, match='http_502'):
+        http.get(BAD + '/article')
+    checkpoint = json.loads(cache_path(tmp_path).read_bytes())
+    for index in range(32):
+        origin = f'https://bad{index}.publisher.test'
+        atomic_write_json(cache_path(tmp_path, origin), {**checkpoint, 'origin': origin})
+    http, session = http_fixture(config, tmp_path, {})
+    with closing(http):
+        assert len(http.blocked_robots_origins('publisher')) == 32
+        control = http.capacity_snapshot()['providers']['publisher']
+        assert len(control['unverified_robots_origins']) == 32
+        assert control['unverified_robots_origins_overflow'] is True
+        assert http.provider_not_before['publisher'] > time.time()
+        assert not session.calls
+
+
+def expired_overflow_fixture(config, tmp_path, monkeypatch, count=33):
+    clock = clock_fixture(monkeypatch)
+    http, _ = http_fixture(config, tmp_path, {BAD + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http), pytest.raises(NewsError, match='http_502'):
+        http.get(BAD + '/article')
+    checkpoint = json.loads(cache_path(tmp_path).read_bytes())
+    origins = [BAD] + [f'https://bad{index}.publisher.test' for index in range(count - 1)]
+    for origin in origins[1:]:
+        atomic_write_json(cache_path(tmp_path, origin), {**checkpoint, 'origin': origin})
+    clock.value += 31
+    return clock, origins
+
+
+def wait_for_recheck_scan(http):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        http.capacity_snapshot()
+        with http.lock:
+            done = ('publisher' not in http.robots_recheck_rescan_needed
+                    and not http.robots_recheck_scan_lock.locked())
+        if done:
+            return http.capacity_snapshot()['providers']['publisher']
+        time.sleep(0.01)
+    raise AssertionError('status-only recheck scan did not converge')
+
+
+@pytest.mark.parametrize('recover_tracked', [True, False])
+def test_overflow_reconciles_after_actual_recovery_without_restart(config, tmp_path, monkeypatch, recover_tracked):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    routes = {origin + '/robots.txt': FakeResponse(ALLOW) for origin in origins}
+    http, session = http_fixture(config, tmp_path, routes)
+    with closing(http):
+        before = http.capacity_snapshot()['providers']['publisher']
+        assert before['unverified_robots_origins_overflow'] is True
+        tracked = set(before['unverified_robots_origins'])
+        origin = next(iter(tracked if recover_tracked else set(origins) - tracked))
+        http._robots(origin + '/article')
+        calls = len(session.calls)
+        after = wait_for_recheck_scan(http)
+        assert after['unverified_robots_origins_overflow'] is False
+        assert set(after['unverified_robots_origins']) == set(origins) - {origin}
+        assert not after['temporarily_paused_robots_origins']
+        assert len(session.calls) == calls == 1  # The status repair sends no requests.
+        assert 'policy_retry' not in json.loads(cache_path(tmp_path, origin).read_bytes())
+
+
+def test_overflow_stays_unknown_until_all_untracked_failures_fit(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch, count=35)
+    http, session = http_fixture(config, tmp_path, {origin + '/robots.txt': FakeResponse(ALLOW) for origin in origins})
+    with closing(http):
+        for index, origin in enumerate(origins[:3], start=1):
+            http._robots(origin + '/article')
+            control = wait_for_recheck_scan(http)
+            assert control['unverified_robots_origins_overflow'] is (index < 3)
+            assert len(control['unverified_robots_origins']) == 32
+        assert set(control['unverified_robots_origins']) == set(origins[3:])
+        assert len(session.calls) == 3
+
+
+def test_overflow_rescan_does_not_lose_concurrent_uncommitted_failure(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    new_origin = 'https://new.publisher.test'
+    routes = {origins[0] + '/robots.txt': FakeResponse(ALLOW),
+              origins[1] + '/robots.txt': FakeResponse(ALLOW),
+              new_origin + '/robots.txt': UnreadErrorResponse(status=502)}
+    http, _ = http_fixture(config, tmp_path, routes)
+    started, release, failures = threading.Event(), threading.Event(), []
+
+    def delayed_checkpoint(path, *args, **kwargs):
+        if path == cache_path(tmp_path, new_origin):
+            started.set()
+            assert release.wait(10)
+        return atomic_write_json(path, *args, **kwargs)
+
+    def fail_new_origin():
+        try:
+            http.get(new_origin + '/article')
+        except NewsError as error:
+            failures.append(error.code)
+
+    monkeypatch.setattr('downloader.news_fulltext_http.atomic_write_json', delayed_checkpoint)
+    worker = threading.Thread(target=fail_new_origin)
+    with closing(http):
+        try:
+            worker.start()
+            assert started.wait(10)
+            http._robots(origins[0] + '/article')
+            assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+        finally:
+            release.set()
+            worker.join(10)
+        assert not worker.is_alive() and failures == ['http_502']
+        assert wait_for_recheck_scan(http)['unverified_robots_origins_overflow'] is True
+        http._robots(origins[1] + '/article')
+        final = wait_for_recheck_scan(http)
+        assert final['unverified_robots_origins_overflow'] is False
+        assert set(final['unverified_robots_origins']) == (set(origins[2:]) | {new_origin})
+
+
+def test_capacity_fallback_still_persists_the_new_failed_origin(config, tmp_path, monkeypatch):
+    clock = clock_fixture(monkeypatch)
+    http, _ = http_fixture(config, tmp_path, {BAD + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http), pytest.raises(NewsError, match='http_502'):
+        http.get(BAD + '/article')
+    checkpoint = json.loads(cache_path(tmp_path).read_bytes())
+    for index in range(31):
+        origin = f'https://bad{index}.publisher.test'
+        atomic_write_json(cache_path(tmp_path, origin), {**checkpoint, 'origin': origin})
+    new_origin = 'https://new.publisher.test'
+    http, _ = http_fixture(config, tmp_path, {new_origin + '/robots.txt': UnreadErrorResponse(status=502)})
+    with closing(http):
+        assert len(http.blocked_robots_origins('publisher')) == 32
+        with pytest.raises(NewsError, match='robots_origin_policy_capacity_exhausted'):
+            http.get(new_origin + '/article')
+        assert http.provider_not_before['publisher'] > clock.value
+        stored = json.loads(cache_path(tmp_path, new_origin).read_bytes())
+        assert stored['origin'] == new_origin and stored['policy_retry']['error_code'] == 'http_502'
+        assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+
+
+def test_overflow_scan_does_not_block_status_or_healthy_origin(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    http, session = http_fixture(config, tmp_path, {
+        origins[0] + '/robots.txt': FakeResponse(ALLOW), GOOD + '/robots.txt': FakeResponse(ALLOW)})
+    http._robots(origins[0] + '/article')
+    started, release = threading.Event(), threading.Event()
+    original = type(tmp_path).read_bytes
+
+    def delayed_read(path):
+        if path == cache_path(tmp_path, origins[1]) and not release.is_set():
+            started.set()
+            assert release.wait(10)
+        return original(path)
+
+    monkeypatch.setattr(type(tmp_path), 'read_bytes', delayed_read)
+    with closing(http):
+        try:
+            assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+            assert started.wait(10)
+            # The blocked reader owns no HTTP or scheduler lock.
+            assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+            http._robots(GOOD + '/article')
+        finally:
+            release.set()
+        result = wait_for_recheck_scan(http)
+        assert result['unverified_robots_origins_overflow'] is False
+        assert set(result['unverified_robots_origins']) == set(origins[1:])
+        assert len(session.calls) == 2  # Recovery and healthy policy checks only.
+
+
+def test_failed_checkpoint_blocks_rescan_until_same_origin_recovered(config, tmp_path, monkeypatch):
+    clock, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    new_origin = 'https://new.publisher.test'
+    http, _ = http_fixture(config, tmp_path, {
+        new_origin + '/robots.txt': [UnreadErrorResponse(status=502), FakeResponse(ALLOW)],
+        origins[0] + '/robots.txt': FakeResponse(ALLOW)})
+    reject_once = [True]
+
+    def failed_write(path, *args, **kwargs):
+        if path == cache_path(tmp_path, new_origin) and reject_once[0]:
+            reject_once[0] = False
+            raise OSError('temporary storage failure')
+        return atomic_write_json(path, *args, **kwargs)
+
+    monkeypatch.setattr('downloader.news_fulltext_http.atomic_write_json', failed_write)
+    with closing(http):
+        with pytest.raises(NewsError, match='robots_policy_checkpoint_failure'):
+            http._robots(new_origin + '/article')
+        clock.value += 301
+        http._robots(origins[0] + '/article')
+        assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+        assert new_origin in http.robots_recheck_unpersisted['publisher']
+        http._robots(new_origin + '/article')
+        result = wait_for_recheck_scan(http)
+        assert result['unverified_robots_origins_overflow'] is False
+        assert set(result['unverified_robots_origins']) == set(origins[1:])
+
+
+def test_overflow_scan_limit_keeps_unknown_and_a_later_recovery_retries(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    http, session = http_fixture(config, tmp_path, {
+        origins[0] + '/robots.txt': FakeResponse(ALLOW), origins[1] + '/robots.txt': FakeResponse(ALLOW)})
+    with closing(http):
+        monkeypatch.setattr('downloader.news_fulltext_http.MAX_ROBOTS_RECHECK_SCAN_FILES', 1)
+        http._robots(origins[0] + '/article')
+        http.capacity_snapshot()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with http.lock:
+                failed = http.robots_recheck_rescan_not_before.get('publisher', 0) > time.monotonic()
+            if failed and not http.robots_recheck_scan_lock.locked():
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError('bounded scan did not record its retry deadline')
+        control = http.capacity_snapshot()['providers']['publisher']
+        assert control['unverified_robots_origins_overflow'] is True
+        assert not http.robots_recheck_scan_lock.locked()
+        monkeypatch.setattr('downloader.news_fulltext_http.MAX_ROBOTS_RECHECK_SCAN_FILES', 65536)
+        http._robots(origins[1] + '/article')
+        result = wait_for_recheck_scan(http)
+        assert result['unverified_robots_origins_overflow'] is False
+        assert set(result['unverified_robots_origins']) == set(origins[2:])
+        assert len(session.calls) == 2
+
+
+def test_overflow_scan_retries_if_checkpoint_changes_in_place(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    http, session = http_fixture(config, tmp_path, {origins[0] + '/robots.txt': FakeResponse(ALLOW)})
+    with closing(http):
+        http._robots(origins[0] + '/article')
+        target = cache_path(tmp_path, origins[1])
+        read_bytes = type(tmp_path).read_bytes
+        mutated = threading.Event()
+
+        def concurrent_write(path):
+            payload = read_bytes(path)
+            if path == target and not mutated.is_set():
+                path.write_bytes(payload + b' ')
+                mutated.set()
+            return payload
+
+        monkeypatch.setattr(type(tmp_path), 'read_bytes', concurrent_write)
+        assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+        assert mutated.wait(10)
+        deadline = time.monotonic() + 10
+        while http.robots_recheck_scan_lock.locked() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not http.robots_recheck_scan_lock.locked()
+        assert 'publisher' in http.robots_policy_rechecks_overflow
+        assert 'publisher' in http.robots_recheck_rescan_needed
+        result = wait_for_recheck_scan(http)
+        assert result['unverified_robots_origins_overflow'] is False
+        assert set(result['unverified_robots_origins']) == set(origins[1:])
+        assert len(session.calls) == 1
+
+
+def test_corrupt_checkpoint_origin_cannot_clear_overflow(config, tmp_path, monkeypatch):
+    _, origins = expired_overflow_fixture(config, tmp_path, monkeypatch)
+    http, session = http_fixture(config, tmp_path, {
+        origins[0] + '/robots.txt': FakeResponse(ALLOW), origins[1] + '/robots.txt': FakeResponse(ALLOW)})
+    with closing(http):
+        target = cache_path(tmp_path, origins[2])
+        original = target.read_bytes()
+        corrupt = json.loads(original)
+        corrupt['origin'] = 'https://other.publisher.test'
+        target.write_text(json.dumps(corrupt))
+        http._robots(origins[0] + '/article')
+        assert http.capacity_snapshot()['providers']['publisher']['unverified_robots_origins_overflow'] is True
+        deadline = time.monotonic() + 10
+        while not http.robots_recheck_rescan_not_before.get('publisher') and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert http.robots_recheck_rescan_not_before.get('publisher')
+        assert 'publisher' in http.robots_policy_rechecks_overflow
+        target.write_bytes(original)
+        http._robots(origins[1] + '/article')
+        result = wait_for_recheck_scan(http)
+        assert result['unverified_robots_origins_overflow'] is False
+        assert set(result['unverified_robots_origins']) == set(origins[2:])
+        assert len(session.calls) == 2
 
 
 def test_non_public_rep_redirect_is_never_requested_and_keeps_initial_scope(config, tmp_path, monkeypatch):

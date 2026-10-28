@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.finlab_wide_volume_units import volume_unit_contract  # noqa: E402
+from scripts.check_acquisition_capacity import check_dispatch  # noqa: E402
 from scripts.finlab_arrow_history import (  # noqa: E402
     STREAMING_KEYS, FinlabResourceDeferred, capture_empty_evidence, prepare_arrow,
 )
@@ -51,6 +52,7 @@ from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     source_check_due,
     process_owner,
     last_acquisition_success,
+    utc_time,
 )
 
 
@@ -373,6 +375,17 @@ def _atomic_json(path: Path, payload: dict) -> None:
         handle.flush()
         os.fsync(handle.fileno())
     durable_replace(temp, path)
+
+
+def record_provider_catalog(output_root: Path, available: list[str], curated: dict, *, now: datetime) -> list[str]:
+    """Record the actual SDK discovery with its clock; it is not entitlement evidence."""
+    missing = sorted(set(curated) - set(available))
+    _atomic_json(output_root / "catalog" / "discovery.json", {
+        "observed_at_utc": now.isoformat(), "provider_catalog_count": len(available),
+        "keys": available, "curated_missing_from_sdk_catalog": missing,
+        "entitlement": "not_checked", "history_coverage": "not_checked",
+    })
+    return missing
 
 
 def serialize_provider_frame(frame):
@@ -1037,6 +1050,7 @@ def sync_catalog(
     *, limit: int, refresh_days: int, min_quota_remaining_mb: float,
     retry_unavailable: bool, attempt_id: str | None = None,
     key_timeout_seconds: int = 0, maximum_consecutive_timeouts: int = 2,
+    priority_datasets: frozenset[str] | None = None,
 ) -> dict:
     if type(key_timeout_seconds) is not int or not 0 <= key_timeout_seconds <= 3600:
         raise ValueError("invalid FinLab key timeout")
@@ -1051,6 +1065,14 @@ def sync_catalog(
         available, curated, output_root, now=now,
         refresh_days=refresh_days, retry_unavailable=retry_unavailable,
     )
+    if priority_datasets is not None:
+        # This mode is only for explicit, unexpired requests already admitted
+        # by the canonical priority registry. The full catalogue is still used
+        # for the global status above and below; do not label a subset complete.
+        from stockagent.data.finlab_gap_priority import pending_gap_requests
+
+        active_priority = pending_gap_requests(output_root, now=now, available=available)
+        pending = [key for key in pending if key in priority_datasets and key in active_priority]
     summary = {
         "started_at_utc": now.isoformat(), "catalog_keys": len(available),
         "pending_before": len(pending), "attempted": 0, "downloaded": 0,
@@ -1065,15 +1087,49 @@ def sync_catalog(
         "processing_engine": "bounded_general_sdk_batch_v1", "key_limit": limit,
         "key_timeout_seconds": key_timeout_seconds, "sdk_frame_releases": 0,
         "consecutive_timeouts": 0,
+        "selection_scope": "explicit_active_priority" if priority_datasets is not None else "catalog",
     }
     quota_deferred_state = None
+    last_priority_capacity_check = time.monotonic()
+    priority_registry_identity = object()
     try:
         for key in pending:
             # Limit actual attempts, not scanned keys: a quota-blocked history
             # prefix must not starve SDK refreshes later in the same plan.
             if summary["attempted"] >= limit:
                 break
-            if key_timeout_seconds:
+            if priority_datasets is None:
+                # Registering an urgent model request does not take the SDK
+                # lock. Observe its atomic plan and sealed proof at each safe
+                # key boundary, then release the account instead of starting
+                # another history call or local research pass.
+                def identity(path: Path):
+                    try:
+                        stat = path.stat()
+                        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                    except FileNotFoundError:
+                        return None
+                current = (identity(output_root / "gap_priority_requests.json"),
+                           identity(output_root / "priority_queries"))
+                if current != priority_registry_identity:
+                    priority_registry_identity = current
+                    from stockagent.data.finlab_gap_priority import pending_daytrade_priority
+                    if pending_daytrade_priority(output_root, now=datetime.now(UTC), available=available):
+                        summary["state"] = "priority_handoff"
+                        break
+            if priority_datasets is not None:
+                # The account-scoped pass can run for hours. Recheck the
+                # actual guest and backing volume between keys so competing
+                # writers cannot silently consume the control reserve.
+                if time.monotonic() - last_priority_capacity_check >= 60:
+                    last_priority_capacity_check = time.monotonic()
+                    if check_dispatch(output_root, report_admitted=False, priority=True):
+                        summary["state"] = "capacity_deferred"
+                        break
+                expiry = utc_time(active_priority[key].get("expires_at_utc"))
+                if expiry is None or datetime.now(UTC) >= expiry:
+                    continue
+            if key_timeout_seconds and priority_datasets is None:
                 # A reusable group can straddle reset/opening. Check at every
                 # key, not only when Bash launched its first process.
                 from scripts.check_outside_tw_opening_resource_window import evaluate
@@ -1175,6 +1231,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("catalog", "discover", "fetch", "audit-local", "audit-volume-units", "sync", "record-timeout", "pending"))
     parser.add_argument("--dataset", action="append", default=[], help="Exact FinLab key; repeatable")
+    parser.add_argument("--priority-only", action="store_true",
+                        help="Sync only exact, still-active priority requests; allow these through the opening window")
     parser.add_argument("--all-candidates", action="store_true", help="Fetch all curated candidates")
     parser.add_argument("--missing-candidates", action="store_true", help="Fetch curated candidates without a local data/receipt pair, excluding known VIP-only keys")
     parser.add_argument("--retry-unavailable", action="store_true", help="Retry known VIP-only keys after an entitlement change")
@@ -1190,6 +1248,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="Per-dataset watchdog when reusing a bounded SDK process")
     parser.add_argument("--maximum-consecutive-timeouts", type=int, default=2)
     args = parser.parse_args(argv)
+    if args.priority_only and (args.action != "sync" or not args.dataset):
+        parser.error("--priority-only requires sync and at least one exact --dataset")
     catalog = load_catalog()
     candidates = {item["key"]: item for item in catalog["datasets"]}
     if args.action == "catalog":
@@ -1228,24 +1288,26 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(status, ensure_ascii=False, sort_keys=True), flush=True)
         return 0 if status["state"] != "discovery_unverified" else 2
+    # The frozen Bash owner may have been running for hours. Each new bounded
+    # Python group rechecks actual backing capacity before catalog/SDK calls.
+    # A global refusal is not a per-dataset failure or retry attempt.
+    capacity_exit = check_dispatch(args.output_root, report_admitted=False, priority=args.priority_only)
+    if capacity_exit:
+        return capacity_exit
     available = (sync_provider_catalog(args.output_root, now=datetime.now(UTC))
                  if args.action == "sync" else provider_catalog())
     if args.action == "discover":
-        missing = sorted(set(candidates) - set(available))
-        payload = {
-            "observed_at_utc": datetime.now(UTC).isoformat(),
-            "provider_catalog_count": len(available),
-            "keys": available,
-            "curated_missing_from_sdk_catalog": missing,
-            "entitlement": "not_checked",
-            "history_coverage": "not_checked",
-        }
-        _atomic_json(args.output_root / "catalog" / "discovery.json", payload)
+        missing = record_provider_catalog(args.output_root, available, candidates, now=datetime.now(UTC))
         print(f"provider_catalog_count={len(available)}; curated_missing={len(missing)}")
         return 0 if not missing else 2
     if args.action == "sync":
         if args.limit < 0 or args.refresh_days < 1 or args.min_quota_remaining_mb < 0:
             parser.error("sync limit/quota must be nonnegative and refresh-days must be positive")
+        if args.priority_only:
+            unknown = sorted(set(args.dataset) - set(available))
+            if unknown:
+                print(f"Unknown SDK dataset keys: {unknown}", file=sys.stderr)
+                return 2
         try:
             summary = sync_catalog(
                 available, candidates, args.output_root, limit=args.limit or 8,
@@ -1255,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id=args.attempt_id,
                 key_timeout_seconds=args.key_timeout_seconds,
                 maximum_consecutive_timeouts=args.maximum_consecutive_timeouts,
+                priority_datasets=frozenset(args.dataset) if args.priority_only else None,
             )
         except RuntimeError as exc:
             print(f"FinLab sync unavailable: {type(exc).__name__}", file=sys.stderr)

@@ -249,23 +249,7 @@ def _scan_pending(
         raise SnapshotError(
             "D-primary mount failed before Syncthing scan: " + mounted.stderr.strip()
         )
-    config = next((path for path in CONFIGS if path.is_file()), None)
-    if config is None:
-        raise SnapshotError("Syncthing configuration is missing")
-    root = ET.parse(config).getroot()
-    folder = next(
-        (row for row in root.findall("folder") if row.get("id") == FOLDER_ID), None
-    )
-    if folder is None or Path(str(folder.get("path"))).resolve() != CANONICAL_ROOT:
-        raise SnapshotError("Syncthing folder is not the canonical D cold root")
-    if folder.get("paused") == "true":
-        raise SnapshotError("Syncthing cold folder is paused")
-    key = root.findtext("./gui/apikey")
-    address = root.findtext("./gui/address") or "127.0.0.1:8384"
-    if not key:
-        raise SnapshotError("Syncthing API key is missing")
-    _, _, port = address.rpartition(":")
-    base = f"http://127.0.0.1:{port or '8384'}"
+    base, key = _local_scan_endpoint()
     groups = _scan_request_groups(
         dataset, new_object_paths, full_objects_scan=full_objects_scan,
         batch_object_paths=batch_object_paths,
@@ -293,3 +277,57 @@ def _scan_pending(
             ) from exc
         except (OSError, TimeoutError) as exc:
             raise SnapshotError(f"Syncthing scan failed for {label}: {exc}") from exc
+
+
+def _local_scan_endpoint() -> tuple[str, str]:
+    """Resolve the existing local API without exposing its private key."""
+    config = next((path for path in CONFIGS if path.is_file()), None)
+    if config is None:
+        raise SnapshotError("Syncthing configuration is missing")
+    root = ET.parse(config).getroot()
+    folder = next(
+        (row for row in root.findall("folder") if row.get("id") == FOLDER_ID), None
+    )
+    if folder is None or Path(str(folder.get("path"))).resolve() != CANONICAL_ROOT:
+        raise SnapshotError("Syncthing folder is not the canonical D cold root")
+    if folder.get("paused") == "true":
+        raise SnapshotError("Syncthing cold folder is paused")
+    key = root.findtext("./gui/apikey")
+    address = root.findtext("./gui/address") or "127.0.0.1:8384"
+    if not key:
+        raise SnapshotError("Syncthing API key is missing")
+    _, _, port = address.rpartition(":")
+    return f"http://127.0.0.1:{port or '8384'}", key
+
+
+def scan_folder_state() -> str:
+    """One bounded observation for the existing periodic retry, never an ACK.
+
+    The status endpoint is queried only when that retry has pending work, not
+    by each publisher or a high-frequency monitoring loop. A failed/malformed
+    observation must not clear intent or start another scan speculatively.
+    """
+    base, key = _local_scan_endpoint()
+    query = urllib.parse.urlencode({"folder": FOLDER_ID})
+    request = urllib.request.Request(
+        base + "/rest/db/status?" + query, headers={"X-API-Key": key}, method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status != 200:
+                raise SnapshotError(f"Syncthing scan state failed: HTTP {response.status}")
+            raw = response.read(65537)
+        if len(raw) > 65536:
+            raise SnapshotError("Syncthing scan state response is oversized")
+        payload = json.loads(raw)
+        state = payload.get("state") if isinstance(payload, dict) else None
+        if not isinstance(state, str) or not state or len(state) > 64 or any(
+            letter not in "abcdefghijklmnopqrstuvwxyz-" for letter in state
+        ):
+            raise SnapshotError("Syncthing scan state response is invalid")
+        return state
+    except urllib.error.HTTPError as exc:
+        reason = _http_error_reason(exc)
+        raise SnapshotError(f"Syncthing scan state failed: HTTP {exc.code} ({reason})") from exc
+    except (OSError, TimeoutError, ValueError) as exc:
+        raise SnapshotError(f"Syncthing scan state unavailable: {type(exc).__name__}") from exc

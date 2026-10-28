@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -27,4 +28,20 @@ def read_execution_weight_rows(
             or not isinstance(rows, list)
             or not all(isinstance(row, dict) for row in rows)):
         raise ValueError(f"execution weights identity/schema mismatch: {path}")
+    # Every consumer must see one unambiguous finite target per symbol.  Do
+    # not coerce missing values or booleans to zero: that can silently remove
+    # or reverse a paper position while still looking like a valid artifact.
+    seen: set[str] = set()
+    for row in rows:
+        symbol, weight = row.get("symbol"), row.get("target_weight")
+        if (not isinstance(symbol, str) or not symbol or len(symbol) > 32
+                or symbol in seen or type(weight) not in (int, float)):
+            raise ValueError(f"invalid execution target row: {path}")
+        try:
+            finite = math.isfinite(weight)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError(f"invalid execution target row: {path}")
+        seen.add(symbol)
     return [dict(row) for row in rows]

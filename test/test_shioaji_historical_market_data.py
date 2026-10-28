@@ -12,11 +12,14 @@ from downloader.download_shioaji_historical_market_data import (
     SOURCE,
     HistoryContract,
     _atomic_write_json,
+    _history_contract,
     _kbar_frame,
     _kbar_paths,
     _tick_paths,
     _valid_receipt,
+    _write_inventory,
     build_tasks,
+    load_inventory,
     observed_tick_dates,
     select_latest_option_infos,
 )
@@ -86,6 +89,68 @@ def test_select_latest_weekly_and_monthly_keeps_every_strike_and_right() -> None
 
     assert {item.dict()["code"] for item in weekly} == {"W1C", "W1P"}
     assert {item.dict()["code"] for item in monthly} == {"M1C", "M1P"}
+
+
+def test_native_last_trade_date_is_not_clipped_to_completed_session_or_delivery(tmp_path: Path) -> None:
+    values = {"code": "I5FI9", "root": "I5F", "security_type": "FUT",
+        "begin_date": date(2019, 1, 1), "last_trading_date": date(2026, 9, 24),
+        "delivery_date": date(2026, 9, 25), "delivery_month": "202609"}
+    info = SimpleNamespace(dict=lambda: values)
+    row = _history_contract(info, collection="exact_futures", completed_session=date(2026, 9, 23))
+    assert row is not None
+    assert row.begin_date == date(2020, 3, 22)
+    assert row.source_begin_date == date(2019, 1, 1)
+    assert row.end_date == date(2026, 9, 23)
+    assert row.last_trading_date == date(2026, 9, 24)
+    assert row.delivery_date == date(2026, 9, 25)
+    manifest = _write_inventory(tmp_path, [row], completed_session=date(2026, 9, 23))
+    current = pl.read_parquet(tmp_path / "inventory/current_contracts.parquet")
+    assert manifest["schema_version"] == 2
+    assert current.item(0, "last_trading_date") == date(2026, 9, 24)
+    assert current.item(0, "source_begin_date") == date(2019, 1, 1)
+    assert current.item(0, "last_observed_at_utc") == manifest["generated_at_utc"]
+    assert load_inventory(tmp_path, current_only=True)[0].last_trading_date == date(2026, 9, 24)
+
+
+def test_old_inventory_never_invents_native_lifecycle_dates(tmp_path: Path) -> None:
+    old = _row(collection="latest_monthly_option", priority=1, code="OLD")
+    current = _row(collection="latest_weekly_option", priority=0, code="NEW")
+    _write_inventory(tmp_path, [old], completed_session=date(2026, 8, 28))
+    directory = tmp_path / "inventory"
+    # Simulate a v1 retained inventory without the newly recorded fields.
+    path = directory / "contracts.parquet"
+    pl.read_parquet(path).drop("source_begin_date", "last_trading_date").write_parquet(path)
+    assert load_inventory(tmp_path)[0].last_trading_date is None
+    _write_inventory(tmp_path, [current], completed_session=date(2026, 8, 28))
+    rows = {row.code: row for row in load_inventory(tmp_path)}
+    assert set(rows) == {"OLD", "NEW"}
+    assert rows["OLD"].last_trading_date is None
+    assert rows["OLD"].source_begin_date is None
+    assert rows["NEW"].last_trading_date is None
+    assert rows["OLD"].active_selection is False
+
+
+def test_new_contract_is_catalogued_without_querying_uncompleted_history(tmp_path: Path) -> None:
+    values = {"code": "PK1K6", "root": "PK1", "security_type": "FUT",
+        "begin_date": date(2026, 10, 26), "last_trading_date": date(2026, 11, 18),
+        "delivery_date": date(2026, 11, 18), "delivery_month": "202611"}
+    row = _history_contract(SimpleNamespace(dict=lambda: values), collection="exact_futures",
+                            completed_session=date(2026, 10, 22))
+    assert row is not None
+    assert row.begin_date == date(2026, 10, 26) and row.end_date == date(2026, 10, 22)
+    assert build_tasks(tmp_path, [row], chunk_days=29) == []
+    manifest = _write_inventory(tmp_path, [row], completed_session=date(2026, 10, 22))
+    current = pl.read_parquet(tmp_path / "inventory/current_contracts.parquet")
+    assert manifest["current_contracts_without_completed_history"] == 1
+    assert current.item(0, "active_selection") is True
+    assert current.item(0, "has_completed_history") is False
+    assert current.item(0, "source_begin_date") == date(2026, 10, 26)
+    assert load_inventory(tmp_path, current_only=True)[0] == row
+
+    # Source metadata with an impossible lifetime is still rejected.
+    values["last_trading_date"] = date(2026, 10, 25)
+    assert _history_contract(SimpleNamespace(dict=lambda: values), collection="exact_futures",
+                             completed_session=date(2026, 10, 22)) is None
 
 
 def test_fop_kbars_exclude_next_trading_date_partial_night_session() -> None:
@@ -288,6 +353,9 @@ def test_summary_actual_tick_days_are_a_union_not_contract_days(tmp_path, monkey
     assert bucket["tick_data_days"] == 1 and bucket["tick_symbols_with_data"] == 2
     assert result["tick_data_days"] == 1
     assert bucket["tick_first_data_date"] == bucket["tick_last_data_date"] == "2026-08-28"
+    assert bucket["kbar_data_days"] == 2 and bucket["kbar_symbols_with_data"] == 2
+    assert bucket["kbar_first_data_date"] == "2026-08-27"
+    assert bucket["kbar_last_data_date"] == "2026-08-28"
 
 
 def test_summary_only_uses_original_writer_lock_and_never_logs_in(tmp_path, monkeypatch):

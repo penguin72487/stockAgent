@@ -143,12 +143,18 @@ class PinnedObjectSignatures:
     FD limit with SQLite, Temporal and concurrent migration activities.
     """
 
-    def __init__(self, root: Path, *, max_open_directories: int = 64):
+    def __init__(self, root: Path, *, max_open_directories: int = 64,
+                 parallel_signatures: bool = False):
         if type(max_open_directories) is not int or max_open_directories < 2:
             raise ValueError("directory descriptor budget must be at least two")
+        if type(parallel_signatures) is not bool:
+            raise ValueError("parallel signatures must be a boolean")
         self.root = root
         self._limit = max_open_directories
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._parallel_signatures = parallel_signatures
+        self._inflight_signatures = 0
         self._flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         root_fd = os.open(root, self._flags)
         try:
@@ -165,13 +171,43 @@ class PinnedObjectSignatures:
 
     def signature(self, relative: str) -> tuple[int, ...]:
         object_descriptor(relative)
-        # Export workers share this scanner. A different worker must not evict
-        # a directory between obtaining its descriptor and using it.
+        return self.regular_file_signature(relative)
+
+    def regular_file_signature(self, relative: str) -> tuple[int, ...]:
+        """Observe a regular member under the same bounded directory pins.
+
+        Archive encodings use safe relative names rather than CAS object names.
+        Their caller still owns content/size validation and must call recheck
+        before trusting the pass. The CAS signature entrypoint keeps its stricter
+        object_descriptor admission.
+        """
+        # A cached descriptor may be evicted by another worker.  In the
+        # explicitly parallel mode duplicate it while holding the cache lock,
+        # then allow slow filesystem metadata calls to overlap.  Recheck and
+        # close wait for all such calls before accepting or discarding pins.
+        if self._parallel_signatures:
+            with self._condition:
+                parts, parent_fd = self._parent(relative)
+                pinned_fd = os.dup(parent_fd)
+                self._inflight_signatures += 1
+            try:
+                info = os.stat(parts[-1], dir_fd=pinned_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode):
+                    raise SnapshotError(f"not a regular backup file: {relative}")
+                return signature_from_stat(info)
+            finally:
+                try:
+                    os.close(pinned_fd)
+                finally:
+                    with self._condition:
+                        self._inflight_signatures -= 1
+                        self._condition.notify_all()
+        # Existing readers retain serialized descriptor and lookup behavior.
         with self._lock:
             parts, parent_fd = self._parent(relative)
             info = os.stat(parts[-1], dir_fd=parent_fd, follow_symlinks=False)
             if not stat.S_ISREG(info.st_mode):
-                raise SnapshotError(f"not a regular backup object: {relative}")
+                raise SnapshotError(f"not a regular backup file: {relative}")
             return signature_from_stat(info)
 
     def _parent(self, relative: str) -> tuple[tuple[str, ...], int]:
@@ -244,7 +280,9 @@ class PinnedObjectSignatures:
             return raw, observed
 
     def recheck(self) -> None:
-        with self._lock:
+        with self._condition:
+            while self._inflight_signatures:
+                self._condition.wait()
             if not self._directories:
                 raise ValueError("directory reader is closed")
             for parts, identity in self._identities.items():
@@ -254,7 +292,9 @@ class PinnedObjectSignatures:
                     raise SnapshotError(f"backup object directory changed during scan: {path}")
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
+            while self._inflight_signatures:
+                self._condition.wait()
             error = None
             while self._directories:
                 _, (fd, _identity) = self._directories.popitem()

@@ -143,6 +143,16 @@ def test_capture_session_mirrors_zero_future_and_book_grains_are_distinct(tmp_pa
     assert rows[0]["count"] is None and rows[0]["known_count"] == 5
 
 
+def test_index_ticks_are_quotes_rather_than_executions(tmp_path):
+    write_json(tmp_path / "data_tw_shioaji_history/summary.json", {"by_collection": {
+        "indices": {"tick_rows": 9, "tick_data_days": 2, "tick_first_data_date": "2026-10-21",
+                    "tick_last_data_date": "2026-10-22", "tick_symbols_with_data": 1}}})
+    row = next(row for row in ticks._historical(tmp_path, ticks._Sources({}))
+               if row["id"] == "shioaji-history:indices")
+    assert row["kind"] == "index" and "非成交" in row["kind_label"]
+    assert row["count"] == 9 and row["days"] == 2
+
+
 def test_source_cache_reuses_identity_but_invalidates_wal_and_rejects_bad_metadata(tmp_path):
     path, wal = tmp_path / "index", tmp_path / "index-wal"
     path.write_bytes(b"index")
@@ -247,3 +257,61 @@ def test_date_projection_avoids_quote_price_key_and_migrates_cached_rows():
         assert projected["earliest_date"] == "2018-12-07"
         assert projected["latest_date"] == "2026-10-06"
         assert "first" not in projected and "last" not in projected
+
+
+def test_tick_only_audit_reuses_owner_cache_without_rebuilding_other_monitors(tmp_path, monkeypatch, capsys):
+    from scripts import snapshot_data_refresh_services as producer
+    from types import SimpleNamespace
+    output = tmp_path / "monitor/public_status.json"
+    args = SimpleNamespace(output=tmp_path / "services.json", public_status_output=output,
+                           feature_inventory_output=tmp_path / "features.json", tick_audit_seconds=.1,
+                           tick_audit_only=True)
+    monkeypatch.setattr(producer, "parse_args", lambda: args)
+    monkeypatch.setattr(producer, "REPO_ROOT", tmp_path)
+    def forbidden(**kwargs):
+        raise AssertionError("Tick-only audit cannot rebuild unrelated status or features")
+    monkeypatch.setattr(producer, "_refresh_service_states", forbidden)
+    assert producer.main() == 1  # Missing databases stay explicit errors.
+    result = json.loads(capsys.readouterr().out)
+    assert result["tick_audit"]["provider_calls"] == 0
+    assert output.with_name("tick_inventory_cache.json").is_file()
+    assert not output.exists() and not args.output.exists() and not args.feature_inventory_output.exists()
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_catalog_transaction_preserves_unknown_fields_and_exact_numbers(tmp_path, monkeypatch, native):
+    import struct
+    from scripts import snapshot_data_refresh_services as producer
+    output = tmp_path / "public_status.json"
+    cache = output.with_name("bar_inventory_cache.json")
+    previous = {"version": 1, "cycle": 3, "extension": {
+        "large": 2**128, "signed_zero": -0.0, "small": 5e-324,
+        "text": "台灣𝄞", "null": None, "flag": True,
+    }}
+    cache.write_text(json.dumps(previous), encoding="utf-8")
+    if not native:
+        monkeypatch.setattr(producer.private_json, "_native", None)
+    def build(root, *, previous, now, audit_seconds):
+        assert previous["extension"]["large"] == 2**128
+        assert type(previous["extension"]["large"]) is int
+        assert struct.pack("!d", previous["extension"]["signed_zero"]) == struct.pack("!d", -0.0)
+        assert struct.pack("!d", previous["extension"]["small"]) == struct.pack("!d", 5e-324)
+        current = {**previous, "cycle": previous["cycle"] + 1}
+        return {"revision": "original-builder"}, current
+    result = producer._catalog_snapshot(output, name="bar", builder=build,
+        observed=datetime.now(UTC), audit_seconds=2.)
+    assert result == {"revision": "original-builder"}
+    expected = {**previous, "cycle": 4}
+    assert cache.read_text() == json.dumps(expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+@pytest.mark.parametrize("raw", [b"{broken", b"null", b"[]"])
+def test_catalog_transaction_keeps_legacy_unreadable_cache_rebuild(tmp_path, raw):
+    from scripts import snapshot_data_refresh_services as producer
+    output = tmp_path / "public_status.json"
+    output.with_name("bar_inventory_cache.json").write_bytes(raw)
+    def build(root, *, previous, now, audit_seconds):
+        assert previous == {}
+        return {"rebuilt": True}, {"version": 1}
+    assert producer._catalog_snapshot(output, name="bar", builder=build,
+        observed=datetime.now(UTC), audit_seconds=2.) == {"rebuilt": True}

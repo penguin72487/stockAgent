@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -16,6 +17,55 @@ from test_cnyes_news_bulk import cfg, registry_http, payload, response
 
 
 CAPTURED = '2026-10-08T00:00:00+00:00'
+
+
+def test_local_replay_status_is_scoped_read_only_and_unknown_before_schema(cfg, tmp_path):
+    from downloader.news_fulltext_metadata_replay import _ensure_cohort
+    from downloader.news_fulltext_replay import ensure_replay_schema, _ensure_retained_failure_retry_schema
+    from downloader.news_fulltext_status import cnyes_local_replay_retries
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    source = registry.sources['cnyes']
+    try:
+        entries = queue.status(publish=False)['cnyes_local_replay_retries']['entries']
+        assert entries == {'api_pages': None, 'metadata_batches': None, 'diagnostic_originals': None}
+        ensure_replay_schema(queue)
+        _ensure_cohort(queue, source)
+        _ensure_retained_failure_retry_schema(queue)
+        queue.failure_diagnostic_focus = SimpleNamespace(id='current-cohort', progress=lambda: {})
+        empty = queue.status(publish=False)['cnyes_local_replay_retries']['entries']
+        assert all(row == {'records': 0, 'earliest_not_before_utc': None} for row in empty.values())
+        with queue.db:
+            for fingerprint, digest, due in [(cnyes_bulk_fingerprint(source), 'a', 1800000120),
+                                             ('old-contract', 'b', 1)]:
+                queue.db.execute('INSERT INTO cached_bulk_local_retries VALUES (?,?,?,?,?,?)',
+                    (fingerprint, digest, due, 1, CAPTURED, 'PRIVATE_ERROR'))
+            for fingerprint, path, due in [(source.data_fingerprint, 'PRIVATE_PATH_A', 1800000040),
+                                            ('old-contract', 'PRIVATE_PATH_B', 1)]:
+                queue.db.execute('INSERT INTO retained_metadata_local_retries VALUES (?,?,?,?,?,?)',
+                    (fingerprint, path, due, 1, CAPTURED, 'PRIVATE_ERROR'))
+            for cohort, path, due in [('current-cohort', 'PRIVATE_RECEIPT_A', 1800000060),
+                                      ('old-cohort', 'PRIVATE_RECEIPT_B', 1)]:
+                queue.db.execute('INSERT INTO retained_failure_local_retries VALUES (?,?,?,?,?,?,?,?,?)',
+                    (path, source.parser_repair_fingerprint, cohort, b'url', 1, due, 1, CAPTURED, 'PRIVATE_ERROR'))
+        changes = queue.db.total_changes
+        snapshot = queue.status(publish=False)['cnyes_local_replay_retries']
+        entries = snapshot['entries']
+        assert [entries[key]['records'] for key in ('api_pages', 'metadata_batches', 'diagnostic_originals')] == [1, 1, 1]
+        assert entries['api_pages']['earliest_not_before_utc'] == '2027-01-15T08:02:00+00:00'
+        assert entries['metadata_batches']['earliest_not_before_utc'] == '2027-01-15T08:00:40+00:00'
+        assert entries['diagnostic_originals']['earliest_not_before_utc'] == '2027-01-15T08:01:00+00:00'
+        assert queue.db.total_changes == changes and not (tmp_path/'status.json').exists()
+        assert 'PRIVATE_' not in json.dumps(snapshot)
+        assert cnyes_local_replay_retries(queue.db, source, None)['entries']['diagnostic_originals'] is None
+        with queue.db:
+            queue.db.execute('UPDATE retained_metadata_local_retries SET not_before_epoch=? WHERE source_fingerprint=?',
+                             ('invalid', source.data_fingerprint))
+        broken = cnyes_local_replay_retries(queue.db, source, queue.failure_diagnostic_focus)['entries']
+        assert broken['metadata_batches'] is None and broken['api_pages']['records'] == 1
+    finally:
+        queue.close()
 
 
 def retained(queue, data=None, *, clock=CAPTURED, patch=None):
@@ -33,6 +83,20 @@ def retained(queue, data=None, *, clock=CAPTURED, patch=None):
                'article_count': len(data['items']['data']) if data else 1, 'accepted_body_count': 0, 'publish': False}
     atomic_write_json(Path(str(path) + '.receipt.json'), receipt)
     return path
+
+
+def inventory_fixture_pages(queue, expected):
+    """Let the bounded inventory resume if one slice runs out under load."""
+    from downloader.news_fulltext_replay import _inventory
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        _inventory(queue, queue.registry.sources['cnyes'])
+        count = queue.db.execute('SELECT count(*) FROM cached_bulk_replays').fetchone()[0]
+        if count >= expected:
+            return
+        time.sleep(.005)
+    raise AssertionError('cached fixture inventory did not finish within the test deadline')
 
 
 def test_cached_recovery_preserves_source_time_and_has_no_http_or_duplicate_head(cfg, tmp_path):
@@ -160,6 +224,182 @@ def test_storage_failure_keeps_replay_pending_and_recovers_once(cfg, tmp_path, m
         assert verify_bodies(tmp_path)['accepted']
     finally:
         queue.close()
+
+
+@pytest.mark.parametrize('unavailable_part', ['envelope', 'receipt'])
+def test_cached_local_source_outage_is_retryable_across_restart(cfg, tmp_path, unavailable_part):
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        path = retained(queue)
+        inventory_fixture_pages(queue, 1)
+        target = path if unavailable_part == 'envelope' else Path(str(path) + '.receipt.json')
+        original = target.read_bytes()
+        target.unlink()
+        result = replay_cached_cnyes(queue)
+        assert result['local_io_deferrals'] == 1 and result['pages_checked'] == 0
+        assert result['http_requests'] == 0
+        assert queue.db.execute('SELECT state,error_code FROM cached_bulk_replays').fetchone()[:] == ('pending', None)
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+        assert queue.db.execute('SELECT local_attempts FROM cached_bulk_local_retries').fetchone()[0] == 1
+        target.write_bytes(original)
+    finally:
+        queue.close()
+
+    restarted = NewsQueue(tmp_path, registry)
+    try:
+        assert replay_cached_cnyes(restarted)['pages_checked'] == 0
+        with restarted.db:
+            restarted.db.execute('UPDATE cached_bulk_local_retries SET not_before_epoch=0')
+        recovered = replay_cached_cnyes(restarted)
+        assert recovered['accepted_heads'] == 1 and recovered['http_requests'] == 0
+        assert restarted.db.execute('SELECT count(*) FROM cached_bulk_local_retries').fetchone()[0] == 0
+        assert restarted.db.execute('SELECT captured_at_utc FROM articles').fetchone()[0] == CAPTURED
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        restarted.close()
+
+
+def test_cached_local_outage_backs_off_without_hot_loop(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        retained(queue)
+        inventory_fixture_pages(queue, 1)
+        clock = [time.time()]
+        monkeypatch.setattr(time, 'time', lambda: clock[0])
+
+        def unavailable(*_args):
+            raise OSError('synthetic local outage')
+
+        monkeypatch.setattr(replay, 'replay_source_path', unavailable)
+        for attempt, delay in enumerate((1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300), 1):
+            assert replay_cached_cnyes(queue)['local_io_deferrals'] == 1
+            row = queue.db.execute('SELECT local_attempts,not_before_epoch FROM cached_bulk_local_retries').fetchone()
+            assert row[:] == (attempt, clock[0] + delay)
+            assert replay.cached_bulk_local_retry_next_wake_delay(queue, 500) == delay
+            assert replay_cached_cnyes(queue)['local_io_deferrals'] == 0
+            clock[0] += delay
+        assert queue.db.execute('SELECT state,error_code FROM cached_bulk_replays').fetchone()[:] == ('pending', None)
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+    finally:
+        queue.close()
+
+
+def test_unavailable_cached_page_does_not_starve_another(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        unavailable = retained(queue)
+        available = retained(queue, payload(ids=(2,), content='第二則來源完整正文。' * 12))
+        inventory_fixture_pages(queue, 2)
+        with queue.db:
+            queue.db.execute('UPDATE cached_bulk_replays SET priority=0 WHERE response_sha256=?', (unavailable.stem,))
+            queue.db.execute('UPDATE cached_bulk_replays SET priority=1 WHERE response_sha256=?', (available.stem,))
+        now = time.time()
+        monkeypatch.setattr(time, 'time', lambda: now)
+        original_path = replay.replay_source_path
+
+        def fail_one(root, relative):
+            if relative == str(unavailable.relative_to(root)):
+                raise OSError('synthetic per-page outage')
+            return original_path(root, relative)
+
+        monkeypatch.setattr(replay, 'replay_source_path', fail_one)
+        assert replay_cached_cnyes(queue, maximum_pages=1)['local_io_deferrals'] == 1
+        next_result = replay_cached_cnyes(queue, maximum_pages=1)
+        assert next_result['accepted_heads'] == 1 and next_result['http_requests'] == 0
+        assert queue.db.execute('SELECT state FROM cached_bulk_replays WHERE response_sha256=?',
+                                (unavailable.stem,)).fetchone()[0] == 'pending'
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+
+
+def test_cached_retry_wakes_only_when_deferred_head_is_eligible(cfg, tmp_path):
+    from downloader import news_fulltext_replay as replay
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        path = retained(queue)
+        inventory_fixture_pages(queue, 1)
+        queue.add_articles([{'url': 'https://news.cnyes.com/news/id/1'}])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='retry',due=?", (time.time() + 120,))
+        assert replay_cached_cnyes(queue)['accepted_heads'] == 0
+        with queue.db:
+            queue.db.execute('INSERT INTO cached_bulk_local_retries VALUES (?,?,?,?,?,?)',
+                (cnyes_bulk_fingerprint(registry.sources['cnyes']), path.stem,
+                 time.time()-10, 1, CAPTURED, 'cached_bulk_local_io_unavailable'))
+        assert replay.cached_bulk_local_retry_next_wake_delay(queue, 60) == 60
+        with queue.db:
+            queue.db.execute('UPDATE articles SET due=0')
+        assert replay.cached_bulk_local_retry_next_wake_delay(queue, 60) == 1
+        assert replay_cached_cnyes(queue)['accepted_heads'] == 1
+    finally:
+        queue.close()
+
+
+def test_cached_retry_wake_uses_deadline_index(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        retained(queue)
+        inventory_fixture_pages(queue, 1)
+        monkeypatch.setattr(replay, 'replay_source_path',
+                            lambda *_args: (_ for _ in ()).throw(OSError('synthetic local outage')))
+        assert replay_cached_cnyes(queue)['local_io_deferrals'] == 1
+        statements = []
+        queue.db.set_trace_callback(statements.append)
+        assert replay.cached_bulk_local_retry_next_wake_delay(queue, 60) <= 1
+        queue.db.set_trace_callback(None)
+        statement, = [sql for sql in statements if sql.startswith('SELECT min(l.not_before_epoch)')]
+        plan = [row[3] for row in queue.db.execute('EXPLAIN QUERY PLAN ' + statement)]
+        assert any('cached_bulk_local_retry_due' in row for row in plan)
+        assert not any('TEMP B-TREE' in row for row in plan)
+    finally:
+        queue.close()
+
+
+def test_idle_service_recovers_cached_page_during_publisher_cooldown(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+    from downloader.news_fulltext import run_service
+    from test_news_fulltext import http_fixture
+
+    cfg.update(cached_cnyes_replay_enabled=True, cached_cnyes_metadata_replay_enabled=False,
+               retained_cnyes_failure_replay_enabled=False, adaptive_rate={'enabled': False},
+               service_idle_max_seconds=30)
+    http, session = http_fixture(cfg, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        path = retained(queue)
+        original_path = replay.replay_source_path
+        attempts = []
+
+        def fail_once(root, relative):
+            if relative == str(path.relative_to(root)):
+                attempts.append(time.monotonic())
+                if len(attempts) == 1:
+                    raise OSError('synthetic local outage')
+            return original_path(root, relative)
+
+        monkeypatch.setattr(replay, 'replay_source_path', fail_once)
+        http.defer('cnyes', 120)
+        run_service(queue, http, cfg, max_articles=0, max_discovery_requests=0, duration_seconds=5)
+        assert len(attempts) == 2 and attempts[1] - attempts[0] >= 1
+        assert queue.db.execute('SELECT state,captured_at_utc FROM articles').fetchone()[:] == ('complete', CAPTURED)
+        assert queue.db.execute('SELECT count(*) FROM cached_bulk_local_retries').fetchone()[0] == 0
+        assert not session.calls and verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+        http.close()
 
 
 @pytest.mark.parametrize('state', ['inflight', 'retry', 'retry_cooldown'])
@@ -401,7 +641,16 @@ def test_readonly_audit_proves_metadata_fallback_without_claiming_full_body(cfg,
         data = payload(ids=(2,))
         data['items']['data'][0]['content'] = '&lt;p&gt;null&lt;/p&gt;'
         path = retained(queue, data)
-        replay_cached_cnyes(queue)
+        # Inventory and replay share bounded wall-time slices. Under load the
+        # first slice may only establish the scan; resume it on later ticks.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            replay_cached_cnyes(queue)
+            row = queue.db.execute('SELECT state FROM cached_bulk_replays WHERE response_sha256=?',
+                                   (path.stem,)).fetchone()
+            if row and row[0] != 'pending':
+                break
+            time.sleep(.005)
         result = audit(tmp_path, registry, [str(path.relative_to(tmp_path))])
         assert result['accepted'] and result['publisher_http_requests'] == 0
         assert result['source_proofs'][0]['metadata_only_html_fallback']
@@ -544,3 +793,110 @@ def test_mixed_source_page_with_valid_body_is_not_no_body_checkpointed(cfg, tmp_
         assert verify_bodies(tmp_path)['body_versions_verified'] == 1
     finally:
         queue.close()
+
+
+def test_missing_crosscheck_binds_exact_post_and_skips_previously_verified_pairs(cfg, tmp_path, monkeypatch):
+    from downloader.news_fulltext_cnyes_history import digest, encoded, initialize
+    from downloader.news_fulltext_replay import ensure_replay_schema
+    from scripts.audit_news_cnyes_retained_missing import audit
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    data = payload(ids=(1, 2))
+    data['items']['data'][1]['content'] = None
+    try:
+        path = retained(queue, data)
+        source = registry.sources['cnyes']
+        fingerprint = cnyes_bulk_fingerprint(source)
+        initialize(queue)
+        ensure_replay_schema(queue)
+        observation = {'provider': 'cnyes', 'contract_version': 1, 'scope_url': 'scope', 'page': 1,
+            'response_sha256': path.stem, 'source_bulk_fingerprint': fingerprint,
+            'authorization_fingerprint': source.authorization_fingerprint,
+            'identities': [{'newsId': p['newsId'], 'publishAt': p['publishAt'], 'source_post_sha256': digest(p)}
+                           for p in data['items']['data']],
+            'artifact': {'kind': 'canonical_quarantine', 'parquet_path': 'quarantine/' + path.name,
+                         'receipt_path': 'quarantine/' + path.name + '.receipt.json'}}
+        with queue.db:
+            queue.add_articles([{'url': f'https://news.cnyes.com/news/id/{i}'} for i in (1, 2)])
+            queue.db.execute("UPDATE articles SET state='source_article_empty_template'")
+            queue.db.execute('INSERT INTO cnyes_history_page_observations VALUES (?,?,?,?,?,?,?,?)',
+                ('scope', 1, path.stem, 1, fingerprint, source.authorization_fingerprint,
+                 digest(observation), encoded(observation)))
+    finally:
+        queue.close()
+    prior = {'rows': [{'news_id': 2, 'observations': [
+        {'source_response_sha256': path.stem, 'evidence_state': 'verified', 'content_class': 'content_missing'}]}]}
+    result = audit(tmp_path, registry, prior)
+    assert result['publisher_http_requests'] == result['production_queue_writes'] == 0
+    assert result['unresolved_matching_observations'] == 0
+    assert result['candidate_pairs'] == result['responses_verified'] == 1
+    assert result['pair_outcome_counts'] == {'validated_source_body': 1}
+    assert result['target_outcomes'][0]['news_id'] == 1
+    assert result['target_outcomes'][0]['head']['state'] == 'source_article_empty_template'
+    assert result['target_outcomes'][0]['source_observed_at_utc'] == CAPTURED
+    assert 'body' not in result['target_outcomes'][0]
+    assert audit(tmp_path, registry, {'target_outcomes': result['target_outcomes'] + [
+        {'news_id': 2, 'source_response_sha256': path.stem, 'evidence_state': 'verified'}]})['candidate_pairs'] == 0
+    assert audit(tmp_path, registry, [prior, result])['candidate_pairs'] == 0
+    stale = {**result, 'parser_identity': {'changed': 'parser'}}
+    assert audit(tmp_path, registry, [prior, stale])['candidate_pairs'] == 1
+    all_pairs = audit(tmp_path, registry, {})
+    assert all_pairs['pair_outcome_counts'] == {'validated_source_body': 1, 'bulk_body_not_provided': 1}
+    selected = audit(tmp_path, registry, {}, only_responses=[path.stem])
+    assert selected['selected_responses_requested'] == 1 and selected['candidate_pairs'] == 2
+    absent = audit(tmp_path, registry, {}, only_responses=['f' * 64])
+    assert absent['selected_responses_without_candidate'] == ['f' * 64]
+    with pytest.raises(ValueError, match='invalid_selected_responses'):
+        audit(tmp_path, registry, {}, only_responses=['not-a-digest'])
+    from scripts import audit_news_cnyes_retained_missing as module
+    actual_sha256 = module.sha256_file
+    policy_reads = []
+
+    def changed_policy(path):
+        digest = actual_sha256(path)
+        if str(path).endswith('downloader/news_fulltext_policy.py'):
+            policy_reads.append(1)
+            return digest if len(policy_reads) == 1 else 'changed'
+        return digest
+
+    with monkeypatch.context() as context:
+        context.setattr(module, 'sha256_file', changed_policy)
+        with pytest.raises(ValueError, match='parser_changed_during_audit'):
+            audit(tmp_path, registry, {})
+    db = sqlite3.connect((tmp_path / 'queue.sqlite3').as_uri() + '?mode=ro&immutable=1', uri=True)
+    try:
+        assert db.execute('SELECT count(*) FROM articles WHERE body_sha256 IS NOT NULL').fetchone()[0] == 0
+    finally:
+        db.close()
+    db = sqlite3.connect(tmp_path / 'queue.sqlite3')
+    try:
+        with db:
+            db.execute("UPDATE cnyes_history_page_observations SET observation_sha256=?", ('0' * 64,))
+    finally:
+        db.close()
+    invalid = audit(tmp_path, registry, {})
+    assert invalid['unresolved_matching_observations'] == 1 and invalid['candidate_pairs'] == 0
+
+
+def test_missing_crosscheck_rejects_a_post_hash_mismatch_and_uncheckpointed_wal(cfg, tmp_path):
+    from downloader.news_fulltext_cnyes_history import digest
+    from downloader.news_fulltext_replay import ensure_replay_schema
+    from scripts.audit_news_cached_replay import _source_proof
+    from scripts.audit_news_cnyes_retained_missing import audit
+
+    registry, _ = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    data = payload(ids=(1,))
+    try:
+        path = retained(queue, data)
+        ensure_replay_schema(queue)
+        source = registry.sources['cnyes']
+        with pytest.raises(ValueError, match='post_identity_mismatch'):
+            _source_proof(tmp_path, registry, source, queue.db, str(path.relative_to(tmp_path)),
+                          cnyes_bulk_fingerprint(source), target_hashes={1: {digest({'wrong': 1})}})
+    finally:
+        queue.close()
+    (tmp_path / 'queue.sqlite3-wal').write_bytes(b'uncheckpointed')
+    with pytest.raises(ValueError, match='requires_empty_wal'):
+        audit(tmp_path, registry, {})

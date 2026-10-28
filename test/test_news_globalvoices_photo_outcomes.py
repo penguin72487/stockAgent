@@ -92,6 +92,7 @@ def test_photo_classification_does_not_exempt_identity_clock_license_or_access(o
 
 def test_capture_outcome_is_versioned_without_prose_requeue_http_or_rss_reset(monkeypatch,tmp_path):
     import downloader.news_fulltext_policy as policy
+    monkeypatch.setattr(policy,'GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION',0)
     config,_,repo=load_config(Path('configs/news_fulltext.json'))
     settings=deepcopy(config);settings['providers']=[p for p in config['providers'] if p['id']=='globalvoices']
     settings.pop('provider_catalog',None)

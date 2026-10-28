@@ -71,6 +71,58 @@ def test_explicit_twd_universe_retains_all_classes_adjustments_and_foreign_indic
     assert source.height == 8
 
 
+@pytest.mark.parametrize(('scope', 'expected'), [
+    ('stock_futures', ['CAF', 'CA1']),
+    ('etf_futures', ['NYF']),
+    ('index_futures', ['TX', 'UNF']),
+    ('domestic_index_futures', ['TX']),
+    ('foreign_index_futures', ['UNF']),
+    ('commodity_futures', ['TGF']),
+    ('interest_rate_futures', ['CPF']),
+    ('other_twd_futures', ['TGF', 'CPF']),
+])
+def test_twd_universe_class_scopes_keep_only_verified_currency(scope, expected):
+    from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
+    selected = futures_preparation_universe(source_universe_scope_fixture(), scope=scope)
+    assert selected['product'].to_list() == expected
+
+
+def test_empty_or_unknown_twd_universe_scope_cannot_be_admitted():
+    from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
+    source = source_universe_scope_fixture().filter(pl.col('product') == 'GDF')
+    with pytest.raises(ValueError, match='empty'):
+        futures_preparation_universe(source, scope='commodity_futures')
+    with pytest.raises(ValueError, match='unsupported'):
+        futures_preparation_universe(source, scope='futures_and_options')
+
+
+def test_explicit_futures_union_is_order_independent_and_keeps_adjusted_codes():
+    from stockagent.data.tw_futures_margin_preparation import (
+        futures_preparation_universe, normalize_futures_universe_scope,
+    )
+    source = source_universe_scope_fixture()
+    a = normalize_futures_universe_scope('foreign_index_futures+etf_futures+stock_futures')
+    b = normalize_futures_universe_scope('stock_futures+foreign_index_futures+etf_futures')
+    assert a == b == 'stock_futures+etf_futures+foreign_index_futures'
+    expected = ['CAF', 'CA1', 'NYF', 'UNF']
+    assert futures_preparation_universe(source, scope=a)['product'].to_list() == expected
+    assert futures_preparation_universe(source, scope=b)['product'].to_list() == expected
+    # Overlapping groups do not create duplicate slots or admit USD products.
+    union = futures_preparation_universe(source, scope='index_futures+foreign_index_futures+commodity_futures')
+    assert union['product'].to_list() == ['TX', 'UNF', 'TGF']
+    # One empty component does not make another valid component empty.
+    subset = source.filter(pl.col('product').is_in(['CAF', 'GDF']))
+    assert futures_preparation_universe(subset, scope='stock_futures+commodity_futures')['product'].to_list() == ['CAF']
+
+
+@pytest.mark.parametrize('scope', ['stock_futures+', '+etf_futures',
+                                  'stock_futures+stock_futures', 'stock_futures+options', ''])
+def test_explicit_futures_union_rejects_ambiguous_or_unknown_scopes(scope):
+    from stockagent.data.tw_futures_margin_preparation import normalize_futures_universe_scope
+    with pytest.raises(ValueError, match='unsupported or duplicate'):
+        normalize_futures_universe_scope(scope)
+
+
 @pytest.mark.parametrize('defect', ['duplicate', 'currency_proof', 'unknown_class', 'blank_underlying'])
 def test_explicit_twd_universe_rejects_unresolved_identity_and_currency(defect):
     from stockagent.data.tw_futures_margin_preparation import futures_preparation_universe
@@ -93,6 +145,33 @@ def test_margin_requires_product_local_currency_and_order():
                  PDF.replace('調整後保證金金額 調整前保證金金額', '調整前保證金金額 調整後保證金金額')]:
         with pytest.raises(ValueError):
             margin_pdf_values(text, 'TX')
+
+
+def test_class_specific_seasonal_continuation_does_not_extend_restored_commodities():
+    from scripts.build_tw_futures_margin_event_candidates import declared_seasonal_margin_continuations
+    text=('臺灣期貨交易所新聞稿 中華民國114年2月3日。'
+        '公告臺股期貨契約(TX)等25檔股價指數類契約及元大台灣50ETF期貨(NYF)等27檔'
+        '標的證券為受益憑證之股票類契約，維持春節期間保證金收取標準，不予回調。'
+        '臺幣黃金期貨契約(TGF)恢復調整前金額，並自114年2月4日一般交易時段結束後起實施。')
+    prior=dict(product='UNF',published_date='2025-01-21',effective_date='2025-01-22',
+        effective_phase='after_product_regular_close',known_at='2025-01-21T23:59:59+08:00',
+        margin_kind='fixed_twd',issue_date_bound=True,source_url='prior',source_content_sha256='a'*64,
+        after=[50000.,40000.,38000.],before=[45000.,35000.,33000.],requires_reversion_review=True,
+        temporary_end_evidence=json.dumps([dict(date_iso='2025-02-04',boundary='after_regular_session')]))
+    docs={'new':dict(content_sha256='b'*64,text=text),'prior':dict(content_sha256='a'*64,
+        text='臺灣期貨交易所新聞稿 中華民國114年1月21日。因應春節假期調高保證金。')}
+    archive=SimpleNamespace(document=docs.__getitem__)
+    facts=[prior,dict(prior,product='TX'),dict(prior,product='TGF')]
+    classes={'UNF':'index_future','TX':'index_future','TGF':'commodity_future'}
+    rows=declared_seasonal_margin_continuations(archive,facts,'new','2025-02-03',
+        products=set(classes),product_classes=classes)
+    assert {r['product']for r in rows}=={'UNF','TX'}
+    assert all(r['after']==prior['after'] and r['known_at']=='2025-02-03T23:59:59+08:00' for r in rows)
+    with pytest.raises(ValueError,match='source-bound product classes'):
+        declared_seasonal_margin_continuations(archive,facts,'new','2025-02-03',products=set(classes))
+    docs['new']=dict(docs['new'],text=text.replace('不予回調','預計回調'))
+    assert not declared_seasonal_margin_continuations(archive,facts,'new','2025-02-03',
+        products=set(classes),product_classes=classes)
 
 
 def test_csv_pdf_crosscheck_does_not_trust_reused_url():
@@ -182,6 +261,50 @@ def test_native_non_disposed_margin_column_is_not_transition_before():
         assert rows[0]['declared_non_disposed_margin']==[.162,.1242,.12]
     assert not margin_table_candidates(text.replace('24.84%','24.84'))
     assert not margin_grid_candidates(cells[:1]+cells[2:],'單位：比例(%)')
+
+
+def test_explicit_seasonal_continuation_retains_the_raised_level_after_its_old_expiry():
+    from copy import deepcopy
+    from scripts.build_tw_futures_margin_event_candidates import declared_seasonal_margin_continuations
+    from stockagent.data.tw_futures_margin_preparation import margin_candidate_intervals,align_product_margin_intervals
+    text=('臺灣期貨交易所新聞稿 中華民國109年1月30日。'
+        '公告調升臺股期貨(TX)、小型臺指期貨(MTX)、電子期貨(TE)、金融期貨(TF)保證金。'
+        '上列契約外，餘春節假期前公告調高保證金之各項契約，維持原春節保證金收取標準，'
+        '並自109年1月31日一般交易時段結束後起實施。')
+    prior=dict(product='T5F',published_date='2020-01-17',effective_date='2020-01-20',
+        effective_phase='after_product_regular_close',known_at='2020-01-17T23:59:59+08:00',
+        margin_kind='fixed_twd',issue_date_bound=True,source_url='prior',source_content_sha256='a'*64,
+        after=[44000.,34000.,32000.],before=[40000.,31000.,29000.],requires_reversion_review=True,
+        temporary_end_evidence=json.dumps([dict(date_iso='2020-01-31',boundary='after_regular_session')]))
+    docs={'new':dict(content_sha256='b'*64,text=text),'prior':dict(content_sha256='a'*64,
+        text='臺灣期貨交易所新聞稿 中華民國109年1月17日。因應春節假期調高保證金。')}
+    archive=SimpleNamespace(document=docs.__getitem__)
+    facts=[prior,dict(prior,product='TX')];original=deepcopy(facts)
+    rows=declared_seasonal_margin_continuations(archive,facts,'new','2020-01-30',products={'T5F','TX'})
+    assert facts==original and len(rows)==1 and rows[0]['product']=='T5F'
+    assert rows[0]['after']==prior['after'] and rows[0]['after']!=prior['before']
+    assert rows[0]['known_at']=='2020-01-30T23:59:59+08:00'
+    assert rows[0]['effective_date']=='2020-01-31' and not rows[0]['requires_reversion_review']
+    levels,issues=margin_candidate_intervals([prior,*rows]);assert not issues
+    query=pl.DataFrame({'date':[date(2020,2,3)],'product':['T5F']})
+    bound=align_product_margin_intervals(query,pl.DataFrame(levels))
+    assert bound['opening_initial'].to_list()==[44000.]
+    docs['scanned']=dict(content_sha256='c'*64,text='')
+    scanned=dict(prior,source_url='scanned',source_content_sha256='c'*64)
+    assert not declared_seasonal_margin_continuations(archive,[scanned],
+        'new','2020-01-30',products={'T5F'})
+    assert len(declared_seasonal_margin_continuations(archive,[scanned,prior],
+        'new','2020-01-30',products={'T5F'}))==1
+    for changed in [dict(prior,after=[45000.,34000.,32000.]),
+                    dict(prior,temporary_end_evidence='[]'),dict(prior,issue_date_bound=False),
+                    dict(prior,margin_kind='notional_rate')]:
+        source=[prior,changed] if changed['after']!=prior['after'] else [changed]
+        assert not declared_seasonal_margin_continuations(archive,source,'new','2020-01-30',products={'T5F'})
+    intervening=dict(prior,effective_date='2020-01-24',after=[50000.,39000.,37000.])
+    assert not declared_seasonal_margin_continuations(archive,[prior,intervening],
+        'new','2020-01-30',products={'T5F'})
+    docs['new']=dict(docs['new'],text=text.replace('維持原春節保證金收取標準','預計恢復調整前保證金'))
+    assert not declared_seasonal_margin_continuations(archive,[prior],'new','2020-01-30',products={'T5F'})
 
 
 def test_numbered_native_extension_owns_prior_expiry_and_preserves_old_clocks():
@@ -613,9 +736,16 @@ def test_same_notice_margin_clock_composition_keeps_event_identity(change):
         assert json.loads(incomplete['same_notice_clock_evidence'])['source_content_sha256s']==['a'*64,'b'*64]
 
 
-def test_native_non_disposed_restoration_still_requires_own_dated_reference():
-    from scripts.build_tw_futures_margin_event_candidates import referenced_before_restoration
+@pytest.mark.parametrize('indexed', [False, True])
+def test_native_non_disposed_restoration_still_requires_own_dated_reference(indexed):
+    from scripts.build_tw_futures_margin_event_candidates import (
+        _restoration_reference_context, referenced_before_restoration)
     from stockagent.data.tw_futures_margin_preparation import compact
+
+    def resolve(views, fact, facts):
+        context = _restoration_reference_context(facts) if indexed else None
+        return referenced_before_restoration(views, fact, facts, _context=context)
+
     text=('發文日期：中華民國115年3月24日。旺宏期貨契約(DIF)，'
           '115年4月8日一般交易時段結束後恢復為標的證券未經處置前之保證金。'
           'DIF(旺宏期貨)115年4月8日一般交易時段結束後恢復為'
@@ -626,12 +756,77 @@ def test_native_non_disposed_restoration_still_requires_own_dated_reference():
     prior=dict(product='DIF',effective_date='2026-03-20',margin_kind='notional_rate',
         before=[.162,.1242,.12],known_at='2026-03-19T23:59:59+08:00',issue_date_bound=True,
         source_content_sha256='a'*64)
-    bound=referenced_before_restoration([compact(text)],fact,[prior,fact])
+    bound=resolve([compact(text)],fact,[prior,fact])
     assert bound['restoration_target']==[.162,.1242,.12]
     assert bound['restoration_rule']=='return_to_referenced_before'
-    assert referenced_before_restoration([compact(text)],fact,[dict(prior,product='HAF'),fact]) is None
-    assert referenced_before_restoration([compact(text)],dict(fact,declared_non_disposed_margin=[.216,.1656,.16]),[prior]) is None
-    assert referenced_before_restoration([compact(text.split('。')[0]+'。'+text.split('。')[1])],fact,[prior]) is None
+    assert resolve([compact(text)],fact,[dict(prior,product='HAF'),fact]) is None
+    assert resolve([compact(text)],dict(fact,declared_non_disposed_margin=[.216,.1656,.16]),[prior]) is None
+    assert resolve([compact(text.split('。')[0]+'。'+text.split('。')[1])],fact,[prior]) is None
+
+
+@pytest.mark.parametrize('indexed', [False, True])
+@pytest.mark.parametrize('change', ['none', 'conflict', 'future', 'unbound', 'other_kind'])
+def test_restoration_reference_index_preserves_conflicts_and_known_at(indexed, change):
+    from scripts.build_tw_futures_margin_event_candidates import (
+        _restoration_reference_context, referenced_before_restoration)
+    text = ('發文日期：中華民國115年3月24日。旺宏期貨契約(DIF)，'
+            '115年4月8日一般交易時段結束後恢復為115年3月20日調整前保證金。')
+    fact = dict(product='DIF', effective_date='2026-03-25', margin_kind='notional_rate',
+        known_at='2026-03-24T23:59:59+08:00', issue_date_bound=True)
+    prior = dict(product='DIF', effective_date='2026-03-20', margin_kind='notional_rate',
+        before=[.162, .1242, .12], known_at='2026-03-19T23:59:59+08:00',
+        issue_date_bound=True, source_content_sha256='a' * 64)
+    if change == 'future':
+        prior['known_at'] = '2026-03-25T00:00:00+08:00'
+    if change == 'unbound':
+        prior['issue_date_bound'] = False
+    if change == 'other_kind':
+        prior['margin_kind'] = 'fixed_twd'
+    facts = [prior, fact]
+    if change == 'conflict':
+        facts.append(dict(prior, before=[.216, .1656, .16], source_content_sha256='b' * 64))
+    context = _restoration_reference_context(facts) if indexed else None
+    result = referenced_before_restoration([text], fact, facts, _context=context)
+    if change != 'none':
+        assert result is None
+    else:
+        assert result['restoration_target'] == [.162, .1242, .12]
+        assert json.loads(result['restoration_reference_evidence'])['source_content_sha256s'] == ['a' * 64]
+        result['restoration_target'][0] = 999
+        assert referenced_before_restoration([text], fact, facts, _context=context)['restoration_target'] == [.162, .1242, .12]
+
+
+def test_restoration_reference_context_cannot_cross_fact_invocations():
+    from scripts.build_tw_futures_margin_event_candidates import (
+        _restoration_reference_context, referenced_before_restoration)
+    fact = dict(product='DIF', effective_date='2026-03-25', margin_kind='notional_rate',
+        known_at='2026-03-24T23:59:59+08:00')
+    facts = [fact]
+    context = _restoration_reference_context(facts)
+    with pytest.raises(ValueError, match='another fact invocation'):
+        referenced_before_restoration([], fact, list(facts), _context=context)
+    facts.append(dict(fact))
+    with pytest.raises(ValueError, match='another fact invocation'):
+        referenced_before_restoration([], fact, facts, _context=context)
+
+
+@pytest.mark.parametrize('bounds', [(True, False, True), (False, True, False)])
+def test_restoration_notice_reuse_keeps_publication_year_binding(bounds):
+    from scripts.build_tw_futures_margin_event_candidates import (
+        _restoration_reference_context, referenced_before_restoration)
+    text = ('發文日期：中華民國115年3月24日。旺宏期貨契約(DIF)於4月8日、'
+            '華邦電期貨契約(JJF)於4月9日一般交易時段結束後恢復為3月20日調整前保證金。')
+    fact = dict(product='DIF', effective_date='2026-03-25', margin_kind='notional_rate',
+        known_at='2026-03-24T23:59:59+08:00')
+    prior = dict(fact, effective_date='2026-03-20', known_at='2026-03-19T23:59:59+08:00',
+        before=[.162, .1242, .12], issue_date_bound=True, source_content_sha256='a' * 64)
+    facts = [prior, fact]
+    context = _restoration_reference_context(facts)
+    for bound in bounds:
+        current = dict(fact, issue_date_bound=bound)
+        observed = referenced_before_restoration([text], current, facts, _context=context)
+        assert observed == referenced_before_restoration([text], current, facts)
+        assert bool(observed) is bound
 
 
 def test_listing_grid_metric_owns_the_percentage_before_fixed_clearing_label():
@@ -773,6 +968,95 @@ def test_late_known_relaxation_retains_stricter_limit_but_tightening_fails():
         reviewed_legacy_events(legacy_position_archive(digest='b'*64),date(2011,1,3))
     with pytest.raises(ValueError,match='predates'):
         reviewed_legacy_events(legacy_position_archive(),date(2010,1,3))
+
+
+@pytest.mark.parametrize('defect', [None,'worklist','changed_scope','existing_overlap','source_tamper','inference'])
+def test_bounded_margin_amendment_preserves_other_repairs_and_source_scope(tmp_path,defect):
+    from scripts.repair_tw_futures_margin_source_intervals import compose_bounded_margin_amendments
+    from downloader.artifact_io import atomic_write_json
+    current,delta=tmp_path/'current',tmp_path/'delta'
+    current.mkdir();delta.mkdir()
+    base=pl.DataFrame(dict(product=['TX','CAF'],initial=[100.,200.]))
+    base.write_parquet(current/'margin_level_intervals.parquet')
+    atomic_write_json(current/'manifest.json',dict(outputs={
+        'margin_level_intervals.parquet':dict(sha256=sha256_file(current/'margin_level_intervals.parquet'))}))
+    incoming=base.with_columns(pl.when(pl.col('product')=='TX').then(125.).otherwise(pl.col('initial')).alias('initial'))
+    if defect=='changed_scope':
+        incoming=incoming.with_columns(pl.when(pl.col('product')=='CAF').then(225.).otherwise(pl.col('initial')).alias('initial'))
+    incoming.write_parquet(delta/'margin_level_intervals.parquet')
+    incoming.rename({'initial':'after'}).write_parquet(delta/'margin_event_candidates.parquet')
+    source=delta/'original.txt';source.write_text('retained original')
+    worklist=tmp_path/'gaps.csv'
+    pl.DataFrame(dict(product=['TX'],contract=['202601'],date=['2026-01-02'],
+        missing_opening_margin=[True],missing_settlement_margin=[True])).write_csv(worklist)
+    proof=dict(status='bounded_margin_restoration_sources_prepared',
+        parent_manifest_sha256=sha256_file(current/'manifest.json'),worklist_sha256=sha256_file(worklist),
+        changed_products=['TX'],financial_values_inferred=False,
+        outputs={name:dict(sha256=sha256_file(delta/name)) for name in
+            ['margin_level_intervals.parquet','margin_event_candidates.parquet']},
+        sources=[dict(path='original.txt',sha256=sha256_file(source),url='https://www.taifex.com.tw/original',kind='original')])
+    if defect=='worklist':proof['worklist_sha256']='0'*64
+    if defect=='inference':proof['financial_values_inferred']=True
+    atomic_write_json(delta/'manifest.json',proof)
+    if defect=='source_tamper':source.write_text('changed original')
+    # CAF is an already accepted, unrelated repair and must remain at 250.
+    accepted=base.with_columns(pl.when(pl.col('product')=='CAF').then(250.).otherwise(pl.col('initial')).alias('initial'))
+    if defect=='existing_overlap':
+        accepted=accepted.with_columns(pl.when(pl.col('product')=='TX').then(110.).otherwise(pl.col('initial')).alias('initial'))
+    accepted_facts=accepted.rename({'initial':'after'})
+    before_facts,before_levels=accepted_facts.clone(),accepted.clone()
+    def copy(path,digest,**kw):
+        if sha256_file(path)!=digest:raise ValueError('original source changed')
+        return str(path.name)
+    archive=SimpleNamespace(copy=copy)
+    if defect:
+        with pytest.raises(ValueError):
+            compose_bounded_margin_amendments(current,accepted_facts,accepted,[(delta,worklist)],archive=archive)
+    else:
+        facts,levels,evidence=compose_bounded_margin_amendments(
+            current,accepted_facts,accepted,[(delta,worklist)],archive=archive)
+        assert levels.filter(pl.col('product')=='TX')['initial'].item()==125.
+        assert levels.filter(pl.col('product')=='CAF')['initial'].item()==250.
+        assert facts.filter(pl.col('product')=='CAF')['after'].item()==250.
+        assert evidence[0]['products']==['TX'] and evidence[0]['worklist_sha256']==sha256_file(worklist)
+    assert accepted_facts.equals(before_facts) and accepted.equals(before_levels)
+
+
+def test_legacy_margin_source_adapter_revalidates_originals_and_keeps_other_events(tmp_path):
+    from scripts.build_tw_futures_margin_event_candidates import (
+        source_review_candidates, replace_reviewed_margin_facts)
+    archive = legacy_position_archive()
+    url = 'https://www.taifex.com.tw/margin.pdf'
+    archive.conn.execute('INSERT INTO announcements VALUES (?,?)',(url,'2011-09-07'))
+    archive.document = lambda u:dict(content_sha256='a'*64,text='')
+    copied = []
+    archive.copy = lambda p,digest,**kw:copied.append((sha256_file(p),digest,kw))
+    notice = dict(url=url,announcement_url=url,published_date='2011-09-07',issued_date='2011-09-07',
+        effective_date='2011-09-08',kind='margin',currency='TWD',column_order=['after','before'],
+        content_sha256='a'*64,pages_one_based=[1],
+        values=dict(TX=[83000,64000,61000,75000,57000,55000],
+                    MTX=[20750,16000,15250,18750,14250,13750]))
+    payload=dict(schema_version=1,reviews=[],legacy=dict(verified_start='2011-01-03',notices=[notice]))
+    path=tmp_path/'review.json';path.write_text(json.dumps(payload))
+    reviewed, positions = source_review_candidates(archive,path)
+    assert not positions and len(reviewed)==2
+    assert all(r['effective_date']=='2011-09-08' and r['legacy_margin_review'] for r in reviewed)
+    assert all(a==b for a,b,_ in copied)
+    assert archive.legacy['notices'][0]['kind']=='position'  # Scoped adaptation does not mutate its owner.
+    current=dict(reviewed[0],effective_date=None,chronological=False,requires_reversion_review=True,
+        temporary_end_evidence=json.dumps([dict(date_iso='2011-09-20',boundary='after_regular_session')]))
+    restoration=dict(reviewed[0],effective_date='2011-09-20',after=[75000,57000,55000],
+        before=[83000,64000,61000])
+    unrelated=dict(reviewed[0],product='TE')
+    result=replace_reviewed_margin_facts([current,restoration,unrelated],reviewed)
+    assert restoration in result and unrelated in result and current not in result
+    assert reviewed[0]['requires_reversion_review']
+    assert json.loads(reviewed[0]['temporary_end_evidence'])[0]['date_iso']=='2011-09-20'
+    with pytest.raises(ValueError,match='contradictory'):
+        replace_reviewed_margin_facts([dict(current,after=[84000,64000,61000])],reviewed)
+    notice['content_sha256']='b'*64;path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError,match='different source bytes'):
+        source_review_candidates(archive,path)
 
 
 @pytest.mark.parametrize('clause,expected', [
@@ -1016,6 +1300,51 @@ def test_scanned_margin_issuing_page_owns_only_its_bound_attachment_clock(tmp_pa
         assert margins[0]['after'] == [.432, .3312, .32]
 
 
+@pytest.mark.parametrize('problem', [None, 'unbound_clause', 'different_clause', 'open_scheduled_day',
+                                    'wrong_next_day', 'tampered_calendar', 'opening_phase'])
+def test_margin_closure_clause_uses_its_original_and_next_observed_market_day(tmp_path, problem):
+    from scripts.build_tw_futures_margin_event_candidates import source_review_candidates
+    c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
+    c.executescript("CREATE TABLE announcements(url,published_date);"
+                   "INSERT INTO announcements VALUES('source','2024-10-30');")
+    clause = '如實施日遇本公司集中交易市場休市，順延至次一一般交易時段結束後起實施。'
+    text = '發文日期：中華民國113年10月30日。自113年10月31日一般交易時段結束後起實施。' + clause
+    image = tmp_path/'page.png'; image.write_bytes(b'inspected original notice')
+    calendar_path = tmp_path/'all_futures_daily_sessions.parquet'
+    days = [date(2024,10,30), date(2024,11,1), date(2024,11,4)]
+    if problem == 'open_scheduled_day': days.append(date(2024,10,31))
+    pl.DataFrame(dict(date=days, session=['一般']*len(days))).write_parquet(calendar_path)
+    digest = sha256_file(calendar_path)
+    (tmp_path/'manifest.json').write_text(json.dumps(dict(outputs={calendar_path.name:dict(sha256=digest)})))
+    def copy(path, expected, **kwargs):
+        if sha256_file(path) != expected: raise ValueError('source SHA mismatch')
+    archive = SimpleNamespace(conn=c, document=lambda url:dict(content_sha256='a'*64,text=text), copy=copy)
+    resolution = dict(rule='first_market_session_after_original_scheduled_date',
+        reviewed_amendment_clause=clause, amendment_content_sha256='a'*64,
+        calendar_source_path=str(calendar_path), calendar_source_sha256=digest)
+    review = dict(review_kind='source_bound_visual_transcription', source_url='source',
+        content_sha256='a'*64, published_date='2024-10-30', known_at='2024-10-30T23:59:59+08:00',
+        original_scheduled_date='2024-10-31', effective_date='2024-11-01',
+        effective_phase='after_product_regular_close', margin_kind='fixed_twd',
+        transcribed_text=text, pages=[dict(page=1,path=image.name,sha256=sha256_file(image))],
+        postponement_resolution=resolution,
+        rows=[dict(product='TGF',page=1,after=dict(initial=67000,maintenance=51000,clearing=49000),
+                   before=dict(initial=57000,maintenance=44000,clearing=42000))])
+    if problem == 'unbound_clause': resolution['amendment_content_sha256']='b'*64
+    if problem == 'different_clause': resolution['reviewed_amendment_clause']='集中交易市場休市順延至次一營業日'
+    if problem == 'wrong_next_day': review['effective_date']='2024-11-04'
+    if problem == 'tampered_calendar': resolution['calendar_source_sha256']='c'*64
+    if problem == 'opening_phase': review['effective_phase']='product_regular_open'
+    path=tmp_path/'review.json'; path.write_text(json.dumps(review))
+    if problem:
+        with pytest.raises(ValueError): source_review_candidates(archive,path)
+    else:
+        facts,_=source_review_candidates(archive,path)
+        assert facts[0]['effective_date']=='2024-11-01'
+        assert facts[0]['known_at']=='2024-10-30T23:59:59+08:00'
+        assert facts[0]['after']==[67000,51000,49000]
+
+
 def test_bounded_margin_reextraction_never_opens_an_unselected_original():
     from scripts.build_tw_futures_margin_event_candidates import reextract_retained_margin_text
     c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
@@ -1042,6 +1371,68 @@ def test_bounded_margin_reextraction_never_opens_an_unselected_original():
     assert facts[0]['declared_non_disposed_margin'] == [.162, .1242, .12]
     assert facts[0]['effective_date'] == '2026-05-04'
     assert facts[0]['issue_date_bound']
+
+
+@pytest.mark.parametrize('defect', [None, 'sha', 'publication', 'category', 'unlinked', 'scope', 'issuing_date', 'duplicate'])
+def test_omitted_captured_margin_original_requires_its_own_publication_and_gap_scope(defect):
+    from scripts.repair_tw_futures_margin_source_intervals import bind_retained_margin_sources
+    c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
+    c.execute('CREATE TABLE announcements(url,published_date,category)')
+    c.execute('INSERT INTO announcements VALUES (?,?,?)',
+              ('notice', '2026-09-08', 'positions' if defect == 'category' else 'margins'))
+    binding = dict(source_url='attachment', content_sha256='a' * 64, announcement_url='notice',
+                   published_date='2026-09-08', products=['PTF', 'ULF'])
+    if defect == 'sha': binding['content_sha256'] = 'b' * 64
+    if defect == 'publication': binding['published_date'] = '2026-09-07'
+    if defect == 'scope': binding['products'] = ['PTF', 'TX']
+    opened = []
+    def document(url):
+        opened.append(url)
+        return dict(content_sha256='a' * 64, text='發文日期：中華民國115年9月'
+                    + ('9' if defect == 'issuing_date' else '8') + '日。')
+    archive = SimpleNamespace(conn=c, document=document,
+        children=lambda url: [] if defect == 'unlinked' else ['attachment'])
+    bindings = [binding, binding] if defect == 'duplicate' else [binding]
+    if defect:
+        with pytest.raises(ValueError):
+            bind_retained_margin_sources(archive, bindings, products={'PTF', 'ULF'})
+    else:
+        assert bind_retained_margin_sources(archive, bindings, products={'PTF', 'ULF'}) == bindings
+        assert opened == ['attachment', 'notice']
+    c.close()
+
+
+@pytest.mark.parametrize('defect', [None, 'sha', 'publication', 'category', 'missing',
+                                   'pending', 'issuing_date', 'duplicate', 'unused', 'extra_values'])
+def test_omitted_canonical_seasonal_source_requires_completed_dated_original(defect):
+    from scripts.repair_tw_futures_margin_source_intervals import bind_canonical_seasonal_sources
+    c = sqlite3.connect(':memory:'); c.row_factory = sqlite3.Row
+    c.execute('CREATE TABLE announcements(url,published_date,category)')
+    c.execute('CREATE TABLE documents(url,state)')
+    c.execute('INSERT INTO announcements VALUES (?,?,?)',
+              ('original', '2020-01-30', 'positions' if defect == 'category' else 'margins'))
+    if defect != 'missing':
+        c.execute('INSERT INTO documents VALUES (?,?)',
+                  ('original', 'pending' if defect == 'pending' else 'complete'))
+    binding = dict(source_url='original', content_sha256='a' * 64, published_date='2020-01-30')
+    if defect == 'sha': binding['content_sha256'] = 'b' * 64
+    if defect == 'publication': binding['published_date'] = '2020-01-29'
+    if defect == 'extra_values': binding['after'] = [29000, 22000, 21000]
+    opened = []
+    def document(url):
+        opened.append(url)
+        return dict(content_sha256='a' * 64, text='臺灣期貨交易所 新聞稿\n中華民國109年1月'
+                    + ('31' if defect == 'issuing_date' else '30') + '日。')
+    archive = SimpleNamespace(conn=c, document=document)
+    bindings = [binding, binding] if defect == 'duplicate' else [binding]
+    requested = [] if defect == 'unused' else [('original', binding['published_date'])]
+    if defect:
+        with pytest.raises(ValueError):
+            bind_canonical_seasonal_sources(archive, bindings, continuations=requested)
+    else:
+        assert bind_canonical_seasonal_sources(archive, bindings, continuations=requested) == bindings
+        assert opened == ['original']
+    c.close()
 
 
 def test_candidate_reuse_preserves_provenance_and_rejects_tampering(tmp_path):

@@ -13,6 +13,89 @@ from downloader.finmind_queue_indexes import (
     ensure_eta_read_indexes, eta_work_index, eta_recent_index,
 )
 from scripts.benchmark_finmind_status import AGGREGATE_SQL, claim_release, main
+from downloader.finmind_queue_indexes import (
+    MONITOR_COUNTS_INDEX, ensure_monitor_counts_index, monitor_counts_index, monitor_counts_sql,
+)
+
+
+_BAR_COUNTS_SQL = """SELECT dataset,SUM(rows),COUNT(DISTINCT first_data_date),
+    MIN(first_data_date),MAX(last_data_date),COUNT(*),
+    SUM(CASE WHEN first_data_date IS NULL OR last_data_date IS NULL
+        OR first_data_date!=last_data_date THEN 1 ELSE 0 END)
+    FROM tasks WHERE dataset IN (?,?) AND state='complete' AND rows>0 GROUP BY dataset"""
+
+
+def _counts_db(path=':memory:'):
+    connection = sqlite3.connect(path)
+    # No affinity deliberately retains legacy real/text/blob/null values.
+    connection.execute('CREATE TABLE tasks(dataset TEXT,state TEXT,rows,bytes,first_data_date,'
+                       'last_data_date,last_attempt_at_utc)')
+    ensure_status_index(connection)
+    connection.execute('DROP INDEX ' + MONITOR_COUNTS_INDEX)
+    return connection
+
+
+@pytest.mark.parametrize('legacy', [None, 1.25, '3x', b'4', float('inf')])
+def test_monitor_projection_preserves_types_null_dates_and_legacy_sum_order(legacy):
+    with _counts_db() as connection:
+        values = [('A', 'complete', 2**51, 0, '2026-01-02', '2026-01-03', None),
+                  ('A', 'complete', 3, 0, '2026-01-01', '2026-01-01', None),
+                  ('A', 'complete', 5, 0, None, None, None),
+                  ('B', 'complete', 7, 0, '2026-01-01', None, None),
+                  ('B', 'complete', 0, 0, 'wrong', 'wrong', None),
+                  ('B', 'failed', 99, 0, 'wrong', 'wrong', None)]
+        if legacy is not None:
+            values.append(('A', 'complete', legacy, 0, '2026-01-04', '2026-01-04', None))
+        connection.executemany('INSERT INTO tasks VALUES (?,?,?,?,?,?,?)', values)
+        expected = connection.execute(_BAR_COUNTS_SQL, ('A', 'B')).fetchall()
+        before = connection.total_changes
+        ensure_monitor_counts_index(connection)
+        ensure_monitor_counts_index(connection)
+        selected = monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B'))
+        assert connection.execute(selected, ('A', 'B')).fetchall() == expected
+        assert connection.total_changes == before
+        assert not connection.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall()
+        assert ('INDEXED BY ' + (STATUS_INDEX if legacy is not None else MONITOR_COUNTS_INDEX)) in selected
+        if legacy is None:
+            plan = connection.execute('EXPLAIN QUERY PLAN ' + selected, ('A', 'B')).fetchall()
+            assert any('COVERING INDEX ' + MONITOR_COUNTS_INDEX in row[3] for row in plan)
+        assert monitor_counts_sql(connection, 'SELECT * FROM tasks', ()) == 'SELECT * FROM tasks'
+        connection.execute('DROP INDEX ' + MONITOR_COUNTS_INDEX)
+        assert monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B')) == _BAR_COUNTS_SQL
+        connection.execute(f'CREATE INDEX {MONITOR_COUNTS_INDEX} ON tasks(dataset)')
+        assert monitor_counts_index(connection) == ''
+        assert monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B')) == _BAR_COUNTS_SQL
+
+
+def test_monitor_projection_retains_integer_overflow_failure():
+    with _counts_db() as connection:
+        connection.executemany('INSERT INTO tasks(dataset,state,rows) VALUES (?,?,?)',
+                               [('A', 'complete', 2**62)] * 2)
+        with pytest.raises(sqlite3.OperationalError, match='integer overflow'):
+            connection.execute(_BAR_COUNTS_SQL, ('A', 'B')).fetchall()
+        ensure_monitor_counts_index(connection)
+        query = monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B'))
+        with pytest.raises(sqlite3.OperationalError, match='integer overflow'):
+            connection.execute(query, ('A', 'B')).fetchall()
+
+
+def test_monitor_type_guard_and_aggregate_share_wal_snapshot(tmp_path):
+    path = tmp_path / 'queue.sqlite3'
+    with _counts_db(path) as connection:
+        connection.execute('PRAGMA journal_mode=WAL')
+        connection.execute("INSERT INTO tasks(dataset,state,rows) VALUES ('A','complete',2)")
+        ensure_monitor_counts_index(connection)
+        connection.commit()
+        connection.execute('BEGIN')
+        query = monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B'))
+        assert connection.in_transaction
+        with sqlite3.connect(path) as writer:
+            writer.execute("INSERT INTO tasks(dataset,state,rows) VALUES ('A','complete',1.5)")
+        assert connection.execute(query, ('A', 'B')).fetchone()[1] == 2
+        connection.rollback()
+        query = monitor_counts_sql(connection, _BAR_COUNTS_SQL, ('A', 'B'))
+        assert 'INDEXED BY ' + STATUS_INDEX in query
+        assert connection.execute(query, ('A', 'B')).fetchone()[1] == 3.5
 
 
 def test_index_is_idempotent_and_changes_no_rows_or_triggers(tmp_path):

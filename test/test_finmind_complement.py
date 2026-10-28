@@ -12,6 +12,52 @@ import pytest
 from downloader import download_finmind_complement as complement
 
 
+@pytest.fixture
+def admitted_capacity(tmp_path):
+    """Keep scheduling tests independent of the machine's real disk headroom."""
+    from types import SimpleNamespace
+    return SimpleNamespace(root=tmp_path.absolute(),
+                           initial_sample=lambda: {'state': 'admitted'},
+                           sample=lambda: {'state': 'admitted'})
+
+
+def test_physical_capacity_pause_preserves_source_counts_without_credentials(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    previous = {'state': 'batch_complete', 'observed_at_utc': '2026-01-01T00:00:00+00:00',
+                'series': {'test': {'rows': 123}}, 'last_task': {'dataset': 'test'}}
+    (tmp_path / 'status.json').write_text(json.dumps(previous))
+    admission = {'state': 'deferred', 'reason': 'physical_backing_reserve'}
+    sampler = SimpleNamespace(root=tmp_path.absolute(), initial_sample=lambda: admission)
+    monkeypatch.setattr(complement, 'load_env_file', lambda *_a, **_k: pytest.fail('credential read'))
+    result = complement.run_once(tmp_path, capacity_sampler=sampler)
+    assert result['state'] == 'disk_guard' and result['capacity_admission'] == admission
+    assert result['dispatch_contract_version'] == complement.DISPATCH_CONTRACT_VERSION
+    assert result['series'] == previous['series'] and result['last_task'] == previous['last_task']
+    assert result['source_status_observed_at_utc'] == previous['observed_at_utc']
+
+
+def test_physical_capacity_sampler_cannot_be_shared_with_a_different_root(tmp_path):
+    from types import SimpleNamespace
+    with pytest.raises(ValueError, match='different workspace'):
+        complement.run_once(tmp_path / 'source', capacity_sampler=SimpleNamespace(root=tmp_path / 'other'))
+
+
+def test_capacity_wait_rechecks_each_minute_and_reuses_sampler(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    sampler = SimpleNamespace(root=tmp_path.absolute())
+    monkeypatch.setattr(complement, 'AcquisitionCapacitySampler', lambda _root: sampler)
+    seen, delays = [], []
+    def cycle(_root, **kwargs):
+        seen.append(kwargs['capacity_sampler'])
+        if len(seen) == 3:
+            raise KeyboardInterrupt
+        return {'state': 'disk_guard'}
+    monkeypatch.setattr(complement, 'run_once', cycle)
+    monkeypatch.setattr(complement, 'wait_for_next_cycle', lambda _r, _s, delay, **_k: delays.append(delay))
+    assert complement.main(['--root', str(tmp_path), '--loop']) == 130
+    assert seen == [sampler, sampler, sampler] and delays == [60, 60]
+
+
 def test_exact_key_cli_holds_shared_worker_lock(tmp_path: Path, monkeypatch) -> None:
     calls = []
 
@@ -197,7 +243,7 @@ def test_finite_accounting_keys_validate_scope_before_loading_credentials(tmp_pa
             complement.run_once(tmp_path,required_keys=keys)
 
 
-def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_path, monkeypatch) -> None:
+def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_path, monkeypatch, admitted_capacity) -> None:
     from types import SimpleNamespace
 
     now = datetime(2026, 9, 27, 8, tzinfo=UTC)
@@ -213,7 +259,7 @@ def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_pat
         conn, [("TaiwanStockInfo", "", "latest", "snapshot", 0)],
     ))
     monkeypatch.setattr(complement, "_request", lambda *_a, **_kw: [{"stock_id": "2330", "date": "2026-09-24"}])
-    result = complement.run_once(tmp_path, max_requests=1)
+    result = complement.run_once(tmp_path, max_requests=1, capacity_sampler=admitted_capacity)
     assert result["state"] == "batch_complete"
     assert result["series"]["TaiwanStockInfo"]["complete"] == 1
 
@@ -221,7 +267,7 @@ def test_completed_bounded_batch_writes_status_before_closing_connection(tmp_pat
 @pytest.mark.parametrize("keep_prepared,verified,remaining", [(True, True, 100), (False, True, 100),
                                                           (True, False, 100), (True, True, 0)])
 def test_short_cross_lane_preemption_reuses_prepared_owner_without_reseeding(
-        tmp_path, monkeypatch, keep_prepared, verified, remaining):
+        tmp_path, monkeypatch, admitted_capacity, keep_prepared, verified, remaining):
     from types import SimpleNamespace
     from downloader import finmind_integrity
 
@@ -260,14 +306,15 @@ def test_short_cross_lane_preemption_reuses_prepared_owner_without_reseeding(
         ready[0] = False
 
     monkeypatch.setattr(complement, "wait_for_next_cycle", wait)
-    result = complement.run_once(tmp_path, max_requests=1, keep_prepared_on_priority_wait=keep_prepared)
+    result = complement.run_once(tmp_path, max_requests=1, keep_prepared_on_priority_wait=keep_prepared,
+                                 capacity_sampler=admitted_capacity)
     should_reuse = keep_prepared and verified and remaining > 1
     assert result["state"] == ("batch_complete" if should_reuse else "incremental_reserve")
     assert len(fetched) == len(waits) == int(should_reuse)
     assert len(prepared) == len(audited) == 1 and prepared == audited
 
 
-def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_path, monkeypatch) -> None:
+def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_path, monkeypatch, admitted_capacity) -> None:
     from types import SimpleNamespace
     from downloader import finmind_integrity
 
@@ -292,7 +339,7 @@ def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_p
         assert not kwargs.get('full_history',False)
         return [{'date':'2025-07-01','stock_id':'1234'}]
     monkeypatch.setattr(complement,'_request',request)
-    result=complement.run_once(tmp_path,max_requests=1,required_keys=(key,))
+    result=complement.run_once(tmp_path,max_requests=1,required_keys=(key,),capacity_sampler=admitted_capacity)
     assert result['state']=='batch_complete' and requested==[key]
     with complement._db(tmp_path/'queue.sqlite3') as connection:
         assert connection.execute("SELECT state FROM tasks WHERE partition='2025'").fetchone()[0]=='complete'
@@ -527,13 +574,18 @@ def test_request_uses_free_per_id_and_bulk_history_contract(tmp_path: Path) -> N
     ]
 
 
+@pytest.mark.parametrize("http_envelope", [True, False])
 @pytest.mark.parametrize("status,message,expected", [
     (400, "Your level is register. Please update your user level", "not_entitled"),
     (400, "Bad parameters", "provider_bad_request"),
     (403, "ip banned", "ip_banned"),
+    (403, "Your level is register. Please update your user level", "not_entitled"),
+    (403, "Invalid token", "invalid_token"),
+    (403, "Too many requests", "rate_limited"),
+    (403, "Temporary forbidden", "http_403"),
 ])
 def test_client_errors_are_classified_without_automatic_repeat(
-    tmp_path: Path, status: int, message: str, expected: str,
+    tmp_path: Path, status: int, message: str, expected: str, http_envelope: bool,
 ) -> None:
     class Limiter:
         deferred: int | None = None
@@ -545,7 +597,7 @@ def test_client_errors_are_classified_without_automatic_repeat(
             self.deferred = seconds
 
     class Response:
-        status_code = status
+        status_code = status if http_envelope else 200
         headers: dict[str, str] = {}
 
         def json(self) -> dict:
@@ -565,7 +617,44 @@ def test_client_errors_are_classified_without_automatic_repeat(
     task = complement.Task("TaiwanExchangeRate", "USD", "history", "id_history", 1, "pending")
     with pytest.raises(complement.SourceError, match=expected):
         complement._request(Session(), limiter, tmp_path, task, "secret", today=date(2026, 9, 25))
-    assert limiter.deferred == (1800 if expected == "ip_banned" else None)
+    assert limiter.deferred == {"ip_banned": 1800, "rate_limited": 3600}.get(expected)
+
+
+def test_explicit_blocked_retry_respects_dataset_scope_and_preserves_payload(tmp_path):
+    root = tmp_path / 'complement'
+    first = ('TaiwanAssetSwapOptionDaily', '54501', 'history')
+    other = ('TaiwanAssetSwapFixedIncomeDaily', '54501', 'history')
+    with complement._db(root / 'queue.sqlite3') as connection:
+        for key in (first, other):
+            connection.execute('INSERT INTO tasks '
+                '(dataset,data_id,partition,kind,priority,state,error_code,rows,bytes,receipt_path,last_attempt_at_utc) '
+                "VALUES (?,?,?,'id_history',0,'not_entitled','not_entitled',495,12993,'receipts/prior.json',?)",
+                (*key, '2026-10-26T16:00:00+00:00'))
+        connection.commit()
+    assert complement._retry_blocked(root, (first[0],)) == 1
+    with complement._db(root / 'queue.sqlite3') as connection:
+        one = connection.execute('SELECT state,error_code,rows,bytes,receipt_path,last_attempt_at_utc '
+                                 'FROM tasks WHERE dataset=?', (first[0],)).fetchone()
+        assert one == ('pending', None, 495, 12993, 'receipts/prior.json', '2026-10-26T16:00:00+00:00')
+        assert connection.execute('SELECT state FROM tasks WHERE dataset=?', (other[0],)).fetchone() == ('not_entitled',)
+    with pytest.raises(ValueError, match='registered_datasets'):
+        complement._retry_blocked(root, ())
+
+
+def test_unknown_403_keeps_retry_and_does_not_poison_other_dataset_tasks(tmp_path):
+    from datetime import timedelta
+    root = tmp_path / 'complement'
+    now = datetime(2026, 10, 27, 1, tzinfo=UTC)
+    task = complement.Task('TaiwanAssetSwapOptionDaily', '54501', 'history', 'id_history', 0, 'pending')
+    with complement._db(root / 'queue.sqlite3') as connection:
+        for identifier in (task.data_id, '55344'):
+            connection.execute('INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) '
+                               "VALUES (?,?,'history','id_history',0,'pending')", (task.dataset, identifier))
+        connection.commit()
+        complement._save_failure(connection, task, complement.SourceError('http_403', retry_after=3600), now)
+        assert connection.execute('SELECT state,error_code,next_attempt_at_utc FROM tasks WHERE data_id=?',
+                                  (task.data_id,)).fetchone() == ('failed', 'http_403', (now + timedelta(hours=1)).isoformat())
+        assert connection.execute("SELECT state FROM tasks WHERE data_id='55344'").fetchone() == ('pending',)
 
 
 def _minute_publication_rows():

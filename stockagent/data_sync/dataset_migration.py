@@ -902,12 +902,22 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
     # observation preservation is read-only and uses file/SQLite fences instead
     # of waiting forever for an always-on downloader to stop.
     native_news = entry["dataset"] == "news-training-local"
-    with (_source_coordination_lock(entry, wait_seconds=0) if native_news else nullcontext()), \
+    retained_contract = entry.get('retained_source_contract')
+    if retained_contract:
+        from stockagent.data_sync.retained_source import validate_catalog
+        validate_catalog(entry)
+    with (_source_coordination_lock(entry, wait_seconds=0)
+          if native_news or retained_contract else nullcontext()), \
             MetadataRows(dict, dict) as bootstrap_index:
         status = _status(entry, _running_commands(), sync_root=cold)
         if not status["source_exists"] or (native_news and status["active_blockers"]):
             return None, {"state": "waiting_source_owner", "source_status": status}
         source = _source_path(entry).resolve()
+        from stockagent.data_sync.retained_source import BINDING, load_retained_source
+        if not retained_contract and ((source / BINDING).exists() or (source / BINDING).is_symlink()):
+            raise SnapshotError('retained source binding requires its catalogued publisher contract')
+        retained = (load_retained_source(source, str(entry['dataset']), cold=cold, read_originals=False)
+                    if retained_contract else None)
         from stockagent.data_sync.private_source_links import (
             guard_source_links, prepare_source_links, source_link_metadata,
         )
@@ -947,6 +957,8 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
         hints = SealedPackHints(args.migration_state.absolute() / 'sealed-pack-checkpoints' / str(entry['dataset']),
                                cold, source, str(entry['dataset']))
         def source_guard():
+            if retained is not None:
+                retained.check_generation()
             parquet_proof.guard()
             if source_links:
                 guard_source_links(source, source_links)
@@ -966,7 +978,8 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             private_staging_file_rules=staging_rules,
             sealed_pack_hints=hints,
             file_overrides={name: Path(row["path"]) for name, row in prepared["controls"].items()},
-            **({"source_guard": source_guard} if source_links or parquet_proof.applicable else {}),
+            **({"source_guard": source_guard} if source_links or parquet_proof.applicable or retained else {}),
+            **({'retained_source_files': retained.publication_request()} if retained is not None else {}),
             progress=getattr(args, "publication_progress", None),
             metadata={"role": str(entry["role"]), "shared_export": "false", "nas_export": "false",
                       **parquet_proof.metadata,
@@ -1179,6 +1192,31 @@ def _committed_catalog_release(entry: dict, args, cold: Path):
     return saved
 
 
+def _pending_source_priorities(value, entries):
+    """Queue preference changes no source scope, release or frozen-plan identity."""
+    if (not isinstance(value, (list, tuple)) or len(value) > 128
+            or any(not isinstance(name, str) or not name for name in value)
+            or len(set(value)) != len(value)
+            or set(value) - {entry['dataset'] for entry in entries}):
+        raise SnapshotError('pending source priorities must be unique known dataset names')
+    return {name: index for index, name in enumerate(value)}
+
+
+def _source_step_order(entries, datasets, priorities):
+    """Finish fixed recovery first; prioritize only untouched pending work.
+
+    Finite pending work still advances before source retries. Retries retain
+    their oldest-attempt order and original per-source eligibility deadlines.
+    This cannot interrupt the current source or replace an accepted version.
+    """
+    def key(entry):
+        row = datasets[entry['dataset']]
+        phase = 0 if 'snapshot_id' in row else 1 if row['state'] == 'pending' else 2
+        preference = priorities.get(entry['dataset'], len(priorities)) if phase == 1 else 0
+        return phase, preference, row.get('started_at_utc', ''), row.get('attempts', 0)
+    return sorted(entries, key=key)
+
+
 def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     """One resumable operation; all concrete catalog sources, not just repo links."""
     from scripts.publish_data_releases import _publish_entry, _source_path
@@ -1198,6 +1236,7 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
         raise SnapshotError("migration journal must remain outside cold and every source")
     policy = version_policy(repo)
     entries = migration_entries(repo, catalog, policy)
+    priorities = _pending_source_priorities(getattr(args, 'pending_source_priority', ()), entries)
     identity = _identity({"catalog": entries, "policy": policy})
     run_args = SimpleNamespace(**vars(args))
     run_args.all_ready = True
@@ -1235,6 +1274,10 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     last_interruption={**{k: interruption[k] for k in
                         ('state', 'attempt_id', 'started_at_utc', 'snapshot_id', 'detected_at_utc', 'reason')
                         if k in interruption}, 'receipt': str(receipt)})
+        if priorities:
+            result['pending_source_priority'] = list(priorities)
+        else:
+            result.pop('pending_source_priority', None)
         activity = {**migration_process_identity(), 'activity_id': uuid.uuid4().hex,
                     'started_at_utc': _now(), 'active_dataset': None, 'active_attempt_id': None}
         result['runtime_owner'] = activity
@@ -1251,13 +1294,11 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
             # changing multi-million-file source must not starve every pending
             # branch on each durable activity. Among retries, oldest attempt
             # goes first: historical failure counts are not waiting time.
-            ordered = sorted(entries, key=lambda entry: (
-                0 if "snapshot_id" in result["datasets"][entry["dataset"]] else
-                1 if result["datasets"][entry["dataset"]]["state"] == "pending" else 2,
-                result["datasets"][entry["dataset"]].get("started_at_utc", ""),
-                result["datasets"][entry["dataset"]].get("attempts", 0)))
+            ordered = _source_step_order(entries, result['datasets'], priorities)
             for entry in ordered:
                 row = result["datasets"][entry["dataset"]]
+                if getattr(args, 'committed_recovery_only', False) and 'snapshot_id' not in row:
+                    continue
                 if row["state"] == "verified":
                     continue
                 if row.get("retry_at_unix", 0) > time.time():
@@ -1413,6 +1454,186 @@ def _inflight_lock_only_catalog(repo: Path, root: Path, current: dict, catalog: 
     return frozen
 
 
+def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
+    """Carry exact accepted work for unchanged per-source contracts.
+
+    No moving head, source payload or acceptance timestamp is substituted. A
+    committed, unfinished release finishes in its original operation first.
+    Changed sources receive fresh acceptance; completed daily cycles retain their
+    original deadline. The old journal remains an independently readable record.
+    """
+    from stockagent.data_sync.closed_source import _read
+    from scripts.publish_data_releases import _source_path
+
+    operation = Path(current['operation_directory'])
+    if operation.resolve() != operation or not operation.is_relative_to(root / 'operations'):
+        raise SnapshotError('pending catalog transition has a redirected original operation')
+
+    def control(path, limit=32 * 1024**2):
+        if path.resolve() != path:
+            raise SnapshotError('pending catalog transition control is redirected')
+        raw = _read(path, limit=limit)
+        return raw, json.loads(raw)
+
+    with _operation_owner(operation):
+        plan_raw, saved = control(operation / 'plan.json')
+        progress_raw, previous = control(operation / 'progress.json')
+        if (saved.get('contract') != CONTRACT or previous.get('contract') != CONTRACT
+                or saved.get('plan_sha256') != current['plan_sha256']
+                or previous.get('plan_sha256') != current['plan_sha256']
+                or _identity({'catalog': saved['catalog'], 'policy': saved['policy']}) != current['plan_sha256']):
+            raise SnapshotError('pending catalog transition differs from its original fixed plan')
+        entries = migration_entries(repo, catalog, policy)
+        old = {entry['dataset']: entry for entry in saved['catalog']}
+        new = {entry['dataset']: entry for entry in entries}
+        rows = previous['datasets']
+        if (set(rows) != set(old) or previous.get('source_count') != len(old)
+                or previous.get('verified_datasets') != sum(row.get('state') == 'verified' for row in rows.values())):
+            raise SnapshotError('pending catalog transition has inconsistent source coverage')
+        # A newly enrolled source must not discard already accepted sources or
+        # an unfinished fixed release. Removing a source is a different scope
+        # change and retains the existing new-plan behavior.
+        if saved['policy'] != policy or not set(old).issubset(new):
+            return None
+        added = set(new) - set(old)
+        changed = [name for name in old if old[name] != new[name]]
+        if not changed and not added:
+            return None
+        if any(row.get('state') != 'verified' and 'snapshot_id' in row for row in rows.values()):
+            frozen = [old[entry['dataset']] for entry in catalog if entry['dataset'] in old]
+            if migration_entries(repo, frozen, policy) != saved['catalog']:
+                raise SnapshotError('pending transition cannot reconstruct the committed original plan')
+            return {'state': 'finish_original_committed_recovery', 'catalog': frozen}
+
+        from stockagent.data_sync.private_source_links import manifest_source_links, source_link_dependencies
+
+        proofs, adopted, carried = {}, {}, []
+
+        def fixed_proof(authority, binding, source_directory, target_directory):
+            dataset = binding['dataset']
+            release = resolve_packed_snapshot_id(authority, dataset, binding['snapshot_id'],
+                                                require_objects=False)
+            path = source_directory / (dataset + '.json')
+            raw, proof = control(path, 1024**2)
+            count, size = release.manifest['source']['files'], release.manifest['source']['logical_bytes']
+            if (proof.get('contract') != CONTRACT or proof.get('dataset') != dataset
+                    or proof.get('snapshot_id') != binding['snapshot_id']
+                    or proof.get('manifest_sha256') != binding.get('manifest_sha256')
+                    or proof['manifest_sha256'] != release.manifest_sha256
+                    or proof.get('full_original_file_reconstruction_verified') is not True
+                    or type(proof.get('independently_reconstructed_files')) is not int
+                    or type(proof.get('independently_reconstructed_bytes')) is not int
+                    or proof['independently_reconstructed_files'] != count
+                    or proof['independently_reconstructed_bytes'] != size):
+                raise SnapshotError('accepted migration proof does not cover its exact fixed release')
+            target = target_directory / path.name
+            if target in proofs and proofs[target] != raw:
+                raise SnapshotError('accepted dependency proofs collide across fixed releases')
+            proofs[target] = raw
+            return release, raw
+
+        proof_bytes = len(plan_raw) + len(progress_raw)
+        for name, entry in new.items():
+            if name in changed or name in added:
+                adopted[name] = {'state': 'pending', 'attempts': 0,
+                    'domain': 'shared' if entry['publish'] else 'host_private',
+                    'source': str(_source_path(entry))}
+                continue
+            row = rows[name]
+            copied = dict(row)
+            if row['state'] == 'verified':
+                # Each accepted source owns its dependency closure. A changed
+                # dependency can then receive a fresh proof without overwriting
+                # an unchanged parent's previously fixed dependency version.
+                source_directory = operation / 'recovery'
+                if 'adopted_verification' in row:
+                    if row['adopted_verification'].get('contract') != 'unchanged_fixed_migration_proof_v1':
+                        raise SnapshotError('unsupported adopted migration proof contract')
+                    source_directory = source_directory / 'adopted' / name
+                target_directory = Path('recovery') / 'adopted' / name
+                path = source_directory / (name + '.json')
+                if (row.get('recovery_receipt') != str(path)
+                        or row.get('source') != str(_source_path(entry))
+                        or row.get('domain') != ('shared' if entry['publish'] else 'host_private')):
+                    raise SnapshotError('accepted migration proof escaped its original source or recovery owner')
+                authority = cold if entry['publish'] else private_history_root(cold, policy, initialize=False)
+                release, raw = fixed_proof(authority, {**row, 'dataset': name},
+                                           source_directory, target_directory)
+                count, size = release.manifest['source']['files'], release.manifest['source']['logical_bytes']
+                if row.get('source_files') != count or row.get('logical_bytes') != size:
+                    raise SnapshotError('accepted migration proof does not cover its exact fixed release')
+                # SQLite side releases are part of the original acceptance too.
+                for database in row.get('publication', {}).get('sqlite_states', []):
+                    fixed_proof(authority, database, source_directory, target_directory)
+                bindings = manifest_source_links(release)
+                for binding in source_link_dependencies(bindings):
+                    fixed_proof(authority, binding, source_directory, target_directory)
+                if bindings:
+                    link_path = source_directory / (name + '.source-links.json')
+                    if row.get('source_links_recovery_receipt') != str(link_path):
+                        raise SnapshotError('accepted source-link receipt escaped its original proof owner')
+                    link_raw, link_proof = control(link_path, 1024**2)
+                    if (link_proof.get('contract') != CONTRACT
+                            or link_proof.get('snapshot_id') != row['snapshot_id']
+                            or link_proof.get('manifest_sha256') != release.manifest_sha256
+                            or link_proof.get('bindings') != bindings
+                            or link_proof.get('all_fixed_dependencies_recovered') is not True
+                            or link_proof.get('unsafe_absolute_links_materialized') is not False):
+                        raise SnapshotError('accepted source-link receipt lacks its complete fixed dependency closure')
+                    proofs[target_directory / link_path.name] = link_raw
+                copied['adopted_verification'] = {'contract': 'unchanged_fixed_migration_proof_v1',
+                    'original_operation': str(operation), 'original_plan_sha256': current['plan_sha256'],
+                    'original_receipt': str(path), 'receipt_sha256': hashlib.sha256(raw).hexdigest(),
+                    'scope': 'previous_fixed_release_full_reconstruction_not_new_payload_or_NAS_verification'}
+                carried.append(name)
+            elif row['state'] in ('processing', 'recovery'):
+                copied.update(state='waiting_retry', retry_at_unix=0,
+                    previous_operation_interruption={'operation': str(operation),
+                        'reason': 'original_exclusive_operation_owner_released'})
+            adopted[name] = copied
+        proof_bytes += sum(map(len, proofs.values()))
+        if proof_bytes > 64 * 1024**2:
+            raise SnapshotError('pending source transition exceeds its bounded metadata admission')
+        identity = _identity({'catalog': entries, 'policy': policy})
+        destination = root / 'operations' / (identity[:16] + '-' + uuid.uuid4().hex)
+        transition = {'contract': 'source_catalog_contract_transition_v1', 'state': 'prepared',
+            'original_operation': str(operation), 'original_plan_sha256': current['plan_sha256'],
+            'original_progress_sha256': hashlib.sha256(progress_raw).hexdigest(),
+            'plan_sha256': identity, 'operation_directory': str(destination),
+            'changed_sources': sorted(changed), 'added_sources': sorted(added),
+            'adopted_verified_sources': sorted(carried),
+            'source_files_deleted': 0, 'NAS_acceptance': False, 'new_source_payload_verification': False}
+        deadline = current.get('preserved_cycle_deadline_unix')
+        if current.get('state') == 'verified':
+            deadline = current['next_cycle_unix']
+        if deadline is not None:
+            transition['preserved_cycle_deadline_unix'] = deadline
+        # Complete bounded controls before exposing the new current pointer.
+        # Failure preserves the old operation and any new incomplete preparation.
+        with _operation_owner(destination):
+            _require_capture_headroom(destination, proof_bytes * 2)
+            atomic_write_bytes(destination / 'previous-plan.json', plan_raw)
+            atomic_write_bytes(destination / 'previous-progress.json', progress_raw)
+            atomic_write_json(destination / 'transition.json', transition)
+            for relative, raw in proofs.items():
+                target = destination / relative
+                atomic_write_bytes(target, raw)
+            for name in carried:
+                directory = destination / 'recovery' / 'adopted' / name
+                adopted[name]['recovery_receipt'] = str(directory / (name + '.json'))
+                if 'source_links_recovery_receipt' in adopted[name]:
+                    adopted[name]['source_links_recovery_receipt'] = str(directory / (name + '.source-links.json'))
+            atomic_write_json(destination / 'plan.json', {'contract': CONTRACT, 'plan_sha256': identity,
+                'catalog': entries, 'policy': policy, 'source_retirement': False})
+            atomic_write_json(destination / 'progress.json', {'contract': CONTRACT,
+                'plan_sha256': identity, 'state': 'processing', 'created_at_utc': _now(),
+                'source_count': len(entries), 'source_retirement': False,
+                'nas_acceptance': 'original_lifecycle_owner_not_this_operation',
+                'verified_datasets': len(carried), 'datasets': adopted,
+                'catalog_transition': transition})
+        return transition
+
+
 def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | None = None) -> dict:
     """One bounded source step for the existing Temporal storage worker.
 
@@ -1438,11 +1659,15 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
     root = Path(configuration["state_root"]).absolute() / settings["state_directory"]
     catalog = _load_catalog(repo / "configs/data_sync/packed_datasets.json")
     policy = version_policy(repo)
-    plan = _identity({"catalog": migration_entries(repo, catalog, policy), "policy": policy})
+    entries = migration_entries(repo, catalog, policy)
+    _pending_source_priorities(settings.get('pending_source_priority', ()), entries)
+    plan = _identity({"catalog": entries, "policy": policy})
     observed = time.time() if now is None else now
     with _operation_owner(root):
         current_path = root / "current.json"
         current = json.loads(current_path.read_text()) if current_path.exists() else None
+        transition = None
+        committed_recovery_only = False
         # Coordination policy changes neither the accepted bytes nor their
         # source scope. Complete an in-flight original plan, and preserve a
         # completed cycle's deadline instead of immediately rereading every
@@ -1457,11 +1682,24 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
                     current['deferred_catalog_plan_sha256'] = plan
                     atomic_write_json(current_path, current)
                 catalog, plan = frozen, current['plan_sha256']
+            else:
+                transition = _catalog_contract_transition(repo, root, current, catalog, policy, cold)
+                if transition is not None and transition['state'] == 'finish_original_committed_recovery':
+                    current['deferred_catalog_plan_sha256'] = plan
+                    atomic_write_json(current_path, current)
+                    catalog, plan = transition['catalog'], current['plan_sha256']
+                    transition = None
+                    committed_recovery_only = True
         if (current is None or current.get("plan_sha256") != plan
                 or (current.get("state") == "verified" and observed >= current["next_cycle_unix"])):
             current = {"contract": CONTRACT, "plan_sha256": plan, "state": "processing",
-                "operation_directory": str(root / "operations" / (plan[:16] + "-" + uuid.uuid4().hex)),
+                "operation_directory": (transition['operation_directory'] if transition is not None else
+                    str(root / "operations" / (plan[:16] + "-" + uuid.uuid4().hex))),
                 "created_at_utc": _now(), "shared_export_permissions_changed": False}
+            if transition is not None:
+                current['adopted_verified_sources'] = transition['adopted_verified_sources']
+                if 'preserved_cycle_deadline_unix' in transition:
+                    current['preserved_cycle_deadline_unix'] = transition['preserved_cycle_deadline_unix']
             atomic_write_json(current_path, current)
         elif current.get("state") == "verified":
             return {"state": "waiting_next_daily_cycle", "verified_datasets": current["verified_datasets"],
@@ -1472,19 +1710,22 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
             node_id=None, retry_seconds=retry, maximum_passes=1, watch=False,
             maximum_completed_sources=1, retire_staging=True,
             maximum_attempted_sources=1,
+            pending_source_priority=settings.get('pending_source_priority', ()),
+            committed_recovery_only=committed_recovery_only,
             recover_missing_base_objects=False, source_lock_fd=None)
         result = migrate_catalog(repo, args, catalog)
         current.update(state=result["state"], verified_datasets=result["verified_datasets"],
                        source_count=result["source_count"], updated_at_utc=_now())
         if result["state"] == "verified":
-            current["next_cycle_unix"] = observed + interval
+            current["next_cycle_unix"] = current.get('preserved_cycle_deadline_unix', observed + interval)
         atomic_write_json(current_path, current)
         # Host paths and licensed source metadata stay in the local journal,
         # not in Temporal history or a public dashboard.
         # Hand off immediately when another source is eligible. Busy sources
         # have individual deadlines; never hot-poll them to remove a blanket
         # 30-second delay, or hold the operation lock while sleeping.
-        pending = [row for row in result['datasets'].values() if row['state'] != 'verified']
+        pending = [row for row in result['datasets'].values() if row['state'] != 'verified'
+                   and (not committed_recovery_only or 'snapshot_id' in row)]
         poll_clock = time.time()
         remaining = min((row.get('retry_at_unix', 0) - poll_clock for row in pending), default=0)
         delay = min(retry, max(0, math.ceil(remaining)))

@@ -47,6 +47,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.run_tw_day_trade_simulation import _mode_specs, _rule_data_dir  # noqa: E402
+from stockagent.live.paper_journal import open_paper_journal
 from downloader.download_tw_public_data import (  # noqa: E402
     DEFAULT_DATASETS,
     _parse_historical_response_content,
@@ -61,6 +62,7 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     ModeSpec,
     REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    REPLAY_FULL_COUNTERFACTUAL_CONTRACTS,
     MARGIN_CARRY_CONTRACT,
     EXECUTION_REALISM_CONTRACT,
     ENTRY_PRICE_GUARD_CONTRACT,
@@ -112,7 +114,7 @@ HISTORICAL_OFFICIAL_CLOSE_FILL_CONTRACT = (
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -497,7 +499,8 @@ def _source_ledger_signal_artifacts(
             read_receipt(path, source_ledger_dir)
     state_path = source_ledger_dir / "state.json"
     if state_path.is_file():
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        from stockagent.live.paper_mode_snapshot import read_paper_state
+        state = read_paper_state(state_path)
         for market, row in state.get("modes", {}).items():
             accept(str(row.get("session_date") or ""), {**row, "market": market})
     return artifacts
@@ -509,6 +512,7 @@ def _source_ledger_signal_ids(
     start_date: date,
     end_date: date,
     accepted_repair_manifests: tuple[Path, ...] = (),
+    selected_markets: set[str] | None = None,
 ) -> tuple[dict[tuple[str, str], str], dict[str, Any]]:
     path = source_ledger_dir / "events.jsonl"
     if not path.is_file():
@@ -517,7 +521,7 @@ def _source_ledger_signal_ids(
     lineage = _accepted_repair_signal_lineage(source_ledger_dir, accepted_repair_manifests)
     observed: dict[tuple[str, str], set[str]] = defaultdict(set)
     accepted_repairs = {}
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             try:
                 row = json.loads(line)
@@ -530,6 +534,8 @@ def _source_ledger_signal_ids(
             if session_date < start_date or session_date > end_date:
                 continue
             market = str(row.get("market") or "")
+            if selected_markets is not None and market not in selected_markets:
+                continue
             signal_id = str(row.get("signal_id") or "")
             if not market or not signal_id:
                 raise ValueError(f"{path}:{line_number}: signal identity is incomplete")
@@ -558,6 +564,7 @@ def _source_ledger_signal_ids(
         "path": str(path.resolve()),
         "sha256": _sha256(path),
         "signal_registrations": len(resolved),
+        "selected_markets": sorted(selected_markets) if selected_markets is not None else None,
         "accepted_repair_lineage": [{"session_date": key[0], "market": key[1], **proof}
                                     for key, proof in sorted(accepted_repairs.items())],
     }
@@ -859,6 +866,15 @@ def _verified_no_trade_through_0901(
     )
     if not complete_query:
         return set()
+    def explicitly_zero(value: object) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(number) and number == 0.0
+
     zero_volume_kbar_no_trade = {
         symbol
         for symbol, row in books.items()
@@ -868,12 +884,87 @@ def _verified_no_trade_through_0901(
         and str(row.get("execution_price_0901_method") or "")
         == "minute_close"
         and str(row.get("observed_volume_unit_0901") or "") == "shares"
-        and (_finite(row.get("tick_volume_units_0901")) or 0.0) == 0.0
+        and explicitly_zero(row.get("tick_volume_units_0901"))
         and _finite(row.get("session_open_price_0900")) is None
     }
-    return (
-        (requested_symbols - set(books)) | zero_volume_kbar_no_trade
-    ) & attempted
+    # An empty response can mean a contract, entitlement or source gap; it is
+    # not evidence that the exchange had no trade.
+    return requested_symbols & zero_volume_kbar_no_trade & attempted
+
+
+def _verified_local_0901_observations(
+    *, books: Mapping[str, Mapping[str, Any]], trading_date: date,
+) -> tuple[dict[str, float], set[str]]:
+    """Read receipt-verified Shioaji first-minute opens and zero-volume rows.
+
+    Unreceipted partitions, missing volume, empty responses and ambiguous bars
+    remain unknown. Check the file again after reading to detect concurrent
+    mutation; never equate a cached close with an exchange fill.
+    """
+    from downloader.download_shioaji_tw_minute_kbars import minute_receipt_valid
+
+    first_trades: dict[str, float] = {}
+    no_trades: set[str] = set()
+    prefixes = ("local_minute_parquet_0901_minute_close:",
+                "local_minute_parquet_0901_minute_vwap:")
+    for symbol, book in books.items():
+        source = str(book.get("source") or "")
+        prefix = next((item for item in prefixes if source.startswith(item)), None)
+        if prefix is None or book.get("observed_volume_known_0901") is not True:
+            continue
+        path = Path(source[len(prefix):])
+        receipt_path = path.with_suffix(".receipt.json")
+        try:
+            start_text, end_text = path.stem.split("_")
+            start, end = date.fromisoformat(start_text), date.fromisoformat(end_text)
+            if path.parent.name != symbol or not start <= trading_date <= end:
+                continue
+            payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+            def valid() -> bool:
+                return minute_receipt_valid(
+                    receipt_path, symbol=symbol, start=start, end=end,
+                    required_dates={trading_date},
+                )
+            if (payload.get("status") != "ok"
+                    or payload.get("query_performed") is not True
+                    or Path(str((payload.get("output_receipt") or {}).get("path") or "")).resolve() != path.resolve()
+                    or not valid()):
+                continue
+            frame = pl.read_parquet(path)
+            if not {"ts", "symbol", "Volume", "volume_shares"}.issubset(frame.columns):
+                continue
+            stamp = pl.col("ts")
+            if isinstance(frame.schema["ts"], pl.Datetime) and frame.schema["ts"].time_zone:
+                stamp = stamp.dt.convert_time_zone("Asia/Taipei").dt.replace_time_zone(None)
+            rows = frame.filter(
+                (pl.col("symbol") == symbol)
+                & (stamp.cast(pl.Datetime("us")) == datetime.combine(trading_date, time(9, 1)))
+            )
+            if rows.height != 1:
+                continue
+            row = rows.row(0, named=True)
+            if not valid():
+                continue
+            if (row.get("Volume") == 0.0 and row.get("volume_shares") == 0.0
+                    and row.get("volume_unit_proof") == "zero_trade"
+                    and row.get("Close") == book.get("execution_price_0901")
+                    and book.get("session_open_price_0900") is None):
+                no_trades.add(symbol)
+            elif (_finite(row.get("Volume")) is not None
+                  and _finite(row.get("volume_shares")) is not None
+                  and row.get("volume_shares") == book.get("tick_volume_units_0901")
+                  and (opening := _finite(row.get("Open"))) is not None
+                  and opening == _finite(book.get("session_open_price_0900"))):
+                first_trades[symbol] = opening
+        except (OSError, ValueError, TypeError, KeyError, pl.exceptions.PolarsError):
+            continue
+    return first_trades, no_trades
+
+
+def _verified_local_no_trade_through_0901(
+    *, books: Mapping[str, Mapping[str, Any]], trading_date: date,
+) -> set[str]:
+    return _verified_local_0901_observations(books=books, trading_date=trading_date)[1]
 
 
 def _retained_missed_opening_0901_rows(
@@ -1468,6 +1559,9 @@ def _persist_historical_entry_books(
         "ask_source_row_index": pl.Int64,
         "last": pl.Float64,
         "execution_price_0901": pl.Float64,
+        "execution_price_0901_method": pl.String,
+        "observed_volume_unit_0901": pl.String,
+        "observed_volume_known_0901": pl.Boolean,
         "valuation_price_0901": pl.Float64,
         "session_open_price_0900": pl.Float64,
         "session_open_price_source": pl.String,
@@ -1526,8 +1620,12 @@ def _official_aggregate_daily_rows(
     for path, symbol_column, price_columns, source in sources:
         if not path.is_file():
             continue
+        lazy = pl.scan_parquet(path)
+        volume_expr = (_price("成交股數", "volume_shares")
+                       if "成交股數" in lazy.collect_schema()
+                       else pl.lit(None, dtype=pl.Float64).alias("volume_shares"))
         frame = (
-            pl.scan_parquet(path)
+            lazy
             .filter(pl.col("date").cast(pl.String) == trading_date.isoformat())
             .select(
                 pl.col(symbol_column).cast(pl.String).str.strip_chars().alias("symbol"),
@@ -1535,6 +1633,7 @@ def _official_aggregate_daily_rows(
                     _price(source_column, target_column)
                     for target_column, source_column in price_columns.items()
                 ),
+                volume_expr,
                 pl.lit(source).alias("_official_source"),
             )
             .collect(engine="streaming")
@@ -1559,6 +1658,7 @@ def _official_aggregate_daily_rows(
             "max": row.get("max"),
             "min": row.get("min"),
             "close": row.get("close"),
+            "volume_shares": row.get("volume_shares"),
             "_official_source": row.get("_official_source"),
         }
     return rows
@@ -1594,6 +1694,19 @@ def _official_daily_row(
         tpex_daily_ohlcv_path,
         trading_date,
     ).get(symbol)
+
+
+def _official_zero_volume_no_ohlc(daily: Mapping[str, Any]) -> bool:
+    """Only an explicit zero-volume venue row proves an entire no-print day."""
+    volume = daily.get("volume_shares")
+    if volume is None or isinstance(volume, bool):
+        return False
+    try:
+        number = float(volume)
+    except (TypeError, ValueError):
+        return False
+    return (math.isfinite(number) and number == 0.0
+            and all(daily.get(name) is None for name in ("open", "max", "min", "close")))
 
 
 def _official_open_map(
@@ -1646,19 +1759,104 @@ def _official_open_map(
                 opens[symbol] = opening
                 source = str(daily.get("_official_source") or "unknown")
                 source_counts[source] = source_counts.get(source, 0) + 1
-            elif not any(
-                value is not None and math.isfinite(float(value)) and float(value) > 0.0
-                for value in (
-                    daily.get("open"),
-                    daily.get("max"),
-                    daily.get("min"),
-                    daily.get("close"),
-                )
-            ):
-                # A retained venue row with every OHLC field empty is positive
-                # evidence of no session trade print, not a downloader gap.
+            elif _official_zero_volume_no_ohlc(daily):
+                # Missing OHLC with positive/unknown volume is ambiguous
+                # (for example, an odd-lot-only session), not no-trade proof.
                 no_trade_symbols.add(symbol)
     return opens, source_counts, no_trade_symbols
+
+
+def _previous_official_last_trades(
+    *, symbols: set[str], trading_date: date, twse_path: Path, tpex_path: Path,
+) -> dict[str, dict[str, Any]]:
+    """Latest earlier positive-volume regular-session close, with date/venue.
+
+    An absent or zero-volume daily row is not itself a last trade. Do not use
+    today's daily close, an indicative price, or a corporate-action reference.
+    """
+    if not symbols:
+        return {}
+    frames = []
+    for path, symbol_col, open_col, close_col, venue in (
+        (twse_path, "證券代號", "開盤價", "收盤價", "twse_daily_ohlcv"),
+        (tpex_path, "代號", "開盤", "收盤", "tpex_daily_ohlcv"),
+    ):
+        if not path.is_file():
+            continue
+        def number(column: str) -> pl.Expr:
+            return (pl.col(column).cast(pl.String).str.strip_chars()
+                    .str.replace_all(",", "").cast(pl.Float64, strict=False))
+        frame = (pl.scan_parquet(path)
+                 .select(pl.col(symbol_col).cast(pl.String).str.strip_chars().alias("symbol"),
+                         pl.col("date").cast(pl.String).str.to_date("%Y-%m-%d", strict=False).alias("date"),
+                         number(open_col).alias("open"), number(close_col).alias("close"),
+                         number("成交股數").alias("volume"), pl.lit(venue).alias("source"))
+                 .filter(pl.col("symbol").is_in(sorted(symbols))
+                         & (pl.col("date") < trading_date)
+                         & (pl.col("volume") > 0) & (pl.col("open") > 0)
+                         & (pl.col("close") > 0))
+                 .collect(engine="streaming"))
+        if frame.height:
+            frames.append(frame)
+    if not frames:
+        return {}
+    by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in pl.concat(frames, how="vertical").iter_rows(named=True):
+        by_symbol[row["symbol"]].append(row)
+    result: dict[str, dict[str, Any]] = {}
+    for symbol, rows in by_symbol.items():
+        latest_day = max(row["date"] for row in rows)
+        latest = [row for row in rows if row["date"] == latest_day]
+        if len(latest) != 1:
+            # Duplicated venue/day identity needs investigation, not an
+            # arbitrary source choice.
+            continue
+        row = latest[0]
+        result[symbol] = {"price": float(row["close"]),
+                          "session_date": latest_day.isoformat(),
+                          "source": row["source"]}
+    return result
+
+
+def _causal_0901_reference_map(
+    *, symbols: set[str], official_daily_opens: Mapping[str, float],
+    first_minute_opens: Mapping[str, float], no_trade: set[str],
+    prior_trades: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """Use an observed first print, or a prior real trade for proven no-print.
+
+    A post-close daily Open may have occurred after 09:01 and therefore cannot
+    establish the historical opening reference by itself.
+    """
+    references: dict[str, float] = {}
+    conflicts: list[str] = []
+    carried: dict[str, dict[str, Any]] = {}
+    for symbol in sorted(symbols):
+        minute_open = _finite(first_minute_opens.get(symbol))
+        official_open = _finite(official_daily_opens.get(symbol))
+        if minute_open is not None and symbol in no_trade:
+            conflicts.append(symbol)
+        elif minute_open is not None:
+            if official_open is not None and not math.isclose(minute_open, official_open, rel_tol=0, abs_tol=1e-8):
+                conflicts.append(symbol)
+            else:
+                references[symbol] = minute_open
+        elif symbol in no_trade:
+            prior = prior_trades.get(symbol) or {}
+            price = _finite(prior.get("price"))
+            if price is not None and prior.get("session_date") and prior.get("source"):
+                references[symbol] = price
+                carried[symbol] = dict(prior)
+    return references, {
+        "contract": "receipt_verified_first_minute_or_previous_real_trade_reference_v1",
+        "reference_only_not_execution_price": True,
+        "requested_symbols": len(symbols),
+        "resolved_symbols": len(references),
+        "first_minute_trade_symbols": sorted(set(references) - set(carried)),
+        "prior_trade_references": carried,
+        "conflicting_source_symbols": conflicts,
+        "unresolved_symbols": sorted(symbols - set(references)),
+    }
 
 
 def _capture_current_open_map(
@@ -2484,7 +2682,7 @@ def _apply_historical_kbar_brackets(
     """
 
     mode = engine.state["modes"][market]
-    full_target = mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+    full_target = mode.get("entry_fill_contract") in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
     valuation_quotes: dict[str, dict[str, Any]] = {}
     minute_key = observed.isoformat(timespec="minutes")
     for position in (mode.get("positions") or {}).values():
@@ -2674,7 +2872,7 @@ def _eod_kbar_quotes(
     observed: datetime,
 ) -> dict[str, dict[str, Any]]:
     quotes: dict[str, dict[str, Any]] = {}
-    full_target = mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+    full_target = mode.get("entry_fill_contract") in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
     minute_key = observed.isoformat(timespec="minutes")
     for position in (mode.get("positions") or {}).values():
         if int(position.get("signed_shares") or 0) == 0:
@@ -2828,7 +3026,7 @@ def _retained_prior_paper_fills(
     if not path.is_file():
         raise FileNotFoundError(path)
     grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.endswith("\n"):
                 break  # active writer's incomplete last line is not a record
@@ -3174,7 +3372,12 @@ def main() -> None:
     if args.margin_action_data_dir is not None:
         reference = args.margin_action_data_dir.resolve() / "tw_corporate_action_reference.parquet"
         specs = [replace(spec, margin_corporate_action_reference_path=reference) for spec in specs]
-    if args.paper_market_at_best:
+    if args.preflight_only:
+        # Source inspection must not change the live execution contract. In
+        # particular progressive specs cannot be coerced into a single-signal
+        # historical execution policy merely to verify their source artifacts.
+        pass
+    elif args.paper_market_at_best:
         specs = [
             replace(
                 spec,
@@ -3265,6 +3468,7 @@ def main() -> None:
             start_date=start,
             end_date=end,
             accepted_repair_manifests=tuple(args.accepted_repair_manifest),
+            selected_markets=set(specs_by_market),
         )
         expected_signal_keys = {
             (day.isoformat(), spec.market)
@@ -3428,8 +3632,8 @@ def main() -> None:
                 "existing local paper entry fills retain their original price and "
                 "time, with the full legal NAV-funded target attributed to that "
                 "counterfactual; symbols without a prior paper fill use the "
-                "source-backed right-labelled 09:01 minute price; missing both "
-                "fails closed"
+                "source-backed right-labelled 09:01 minute price with positive "
+                "observed volume; missing both fails closed"
                 if args.historical_full_fill_0901
                 else
                 "the official 09:00 open is used only for inference/sizing and every "
@@ -4024,6 +4228,60 @@ def main() -> None:
                     ),
                 }
             )
+        if args.historical_full_fill_0901 and should_close:
+            # V2 is a distinct candidate contract: a full-day Open can be the
+            # first print *after* 09:01. Only source-verified first-minute
+            # trades may be used as today's opening reference; verified
+            # no-print names use the latest earlier real close for model/NAV
+            # reference only, never as an invented 09:01 execution price.
+            local_first, local_no_trade = _verified_local_0901_observations(
+                books=historical_books, trading_date=day,
+            )
+            daily_rows = _official_aggregate_daily_rows(
+                twse_daily_ohlcv_path, tpex_daily_ohlcv_path, day,
+            )
+            official_zero_no_ohlc = {
+                symbol for symbol in requested_book_symbols
+                if symbol in daily_rows and _official_zero_volume_no_ohlc(daily_rows[symbol])
+            }
+            verified_no_trade = local_no_trade | set(
+                historical_book_query.get("verified_no_trade_through_0901_symbols") or ()
+            ) | official_zero_no_ohlc
+            prior_source_hashes = {str(path): _sha256(path) for path in
+                                   (twse_daily_ohlcv_path, tpex_daily_ohlcv_path)}
+            previous_trades = _previous_official_last_trades(
+                symbols=verified_no_trade, trading_date=day,
+                twse_path=twse_daily_ohlcv_path, tpex_path=tpex_daily_ohlcv_path,
+            )
+            if any(_sha256(Path(path)) != digest for path, digest in prior_source_hashes.items()):
+                raise RuntimeError(f"{day}: official prior-trade source changed during replay")
+            canonical_open_by_symbol, reference_receipt = _causal_0901_reference_map(
+                symbols=set(requested_book_symbols), official_daily_opens=canonical_open_by_symbol,
+                first_minute_opens=local_first, no_trade=verified_no_trade,
+                prior_trades=previous_trades,
+            )
+            canonical_open_source = "verified_first_minute_trade_or_previous_real_trade_reference"
+            reference_receipt["prior_trade_source_sha256"] = prior_source_hashes
+            reference_receipt["verified_no_trade_symbols"] = sorted(verified_no_trade)
+            reference_receipt["verified_local_first_minute_symbols"] = sorted(local_first)
+            reference_receipt["official_full_session_zero_volume_symbols"] = sorted(official_zero_no_ohlc)
+            session_receipt["canonical_open"]["causal_0901_reference"] = reference_receipt
+            historical_book_query["verified_no_trade_through_0901_symbols"] = sorted(verified_no_trade)
+            session_receipt["historical_entry_books"][
+                "verified_no_trade_through_0901_symbols"
+            ] = sorted(verified_no_trade)
+            # The persisted raw books remain unchanged as forensic evidence.
+            # V2 execution may consume only receipt-verified first-minute
+            # positive-volume records (or an independently retained paper fill,
+            # attached later). A source without that proof is not a fill price.
+            masked_symbols = sorted(set(historical_books) - set(local_first))
+            historical_books = {
+                symbol: (book if symbol in local_first else {
+                    **book, "execution_price_0901": None, "tick_volume_units_0901": None,
+                })
+                for symbol, book in historical_books.items()
+            }
+            session_receipt["historical_entry_books"]["v2_masked_unverified_execution_symbols"] = masked_symbols
         if minute_price_at_0901:
             resolved_symbols = set(historical_books)
             missing_symbols = sorted(

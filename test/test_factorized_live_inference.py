@@ -38,6 +38,22 @@ def assert_tree_bits(a, b):
         assert a == b
 
 
+@pytest.mark.parametrize("ready", [False, True])
+def test_device_timing_observes_without_waiting_or_claiming_enqueue_completion(ready):
+    from types import SimpleNamespace
+    calls = []
+    start = SimpleNamespace(elapsed_time=lambda end: calls.append(end) or 1.23456)
+    end = SimpleNamespace(query=lambda: ready)
+    window = object.__new__(FactorizedLiveWindow)
+    window._reconstruction_events = (start, end)
+    window.transport_stats = {"input_reconstruct_enqueue_ms": 9.5}
+    window.finish_reconstruction_timing()
+    assert window.transport_stats["input_reconstruct_device_timing_complete"] is ready
+    assert window.transport_stats["input_reconstruct_stream_ms"] == (1.235 if ready else None)
+    assert calls == ([end] if ready else [])
+    assert window.transport_stats["input_reconstruct_enqueue_ms"] == 9.5
+
+
 @pytest.mark.parametrize(("device", "direct_destination", "prepared_host_packets"),
                          [("cpu", False, False), ("cuda", False, False),
                           ("cuda", True, False), ("cuda", False, True)])
@@ -66,6 +82,15 @@ def test_live_transport_complete_outputs_preserve_bits_and_source(tmp_path, monk
         actual = window.materialize(target, direct_destination=direct_destination,
                                     prepared_host_packets=prepared_host_packets).cpu().numpy()[0]
     assert actual.tobytes() == expected.tobytes()
+    window.finish_reconstruction_timing()
+    timing = window.transport_stats
+    assert timing["opening_overlay_host_to_device_transfers"] == int(overlay and device == "cuda")
+    assert timing["opening_overlay_host_to_device_bytes"] == (3 * 4 if overlay and device == "cuda" else 0)
+    assert timing["input_reconstruct_device_timing_complete"] is (device == "cuda")
+    if device == "cuda":
+        assert timing["input_reconstruct_stream_ms"] >= 0
+    else:
+        assert timing["input_reconstruct_stream_ms"] is None
     assert window[-1].tobytes() == expected[-1].tobytes()
     with pytest.raises(IndexError):
         window[0]
@@ -94,6 +119,31 @@ def test_live_transport_complete_outputs_preserve_bits_and_source(tmp_path, monk
     assert view[1:5].tobytes() == original.tobytes()
     if prepared_host_packets:
         assert panel.features._cache.prepared_hits > 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("chunk_stocks", [1, 2, 128])
+def test_opening_overlay_is_one_complete_transfer_not_a_per_chunk_barrier(tmp_path, monkeypatch, device, chunk_stocks):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    panel, path, dense = example(tmp_path)
+    attach_factorized_features(panel, path, host_cache_bytes=4096)
+    values = np.array([-.02, -0., .025], dtype=np.float32)
+    window = FactorizedLiveWindow(panel.features, 2, 6).with_last_feature(1, values)
+    expected = np.nan_to_num(dense[2:6], nan=0., posinf=0., neginf=0.)
+    expected[-1, :, 1] = values
+    original_to, transfers = torch.Tensor.to, []
+    def counted(tensor, *args, **kwargs):
+        if (tensor.device.type == "cpu" and tuple(tensor.shape) == (3,)
+                and tensor.detach().numpy().tobytes() == values.tobytes()):
+            transfers.append(1)
+        return original_to(tensor, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "to", counted)
+    with torch.inference_mode():
+        chunks = list(window.stock_chunks(torch.device(device), chunk_stocks=chunk_stocks))
+        result = torch.cat(chunks, dim=2).cpu().numpy()[0]
+    assert transfers == [1]
+    assert result.tobytes() == expected.tobytes()
 
 
 def test_prepared_packets_preserve_order_overlay_and_one_existing_byte_budget(tmp_path):

@@ -37,7 +37,7 @@ def inventory():
 
 def test_selected_order_focus_then_descending_counts_not_old_small_first():
     result = plan_sources(inventory(), work_order=POLICY)
-    assert result['contract_version'] == 6 and result['work_order_contract_version'] == 1
+    assert result['contract_version'] == 9 and result['work_order_contract_version'] == 1
     rows = result['sources']
     assert rows[0]['provider'] == 'cnyes' and rows[-1]['provider'] == 'cna'
     phase1 = [row for row in rows if row['work_phase'] == 1]
@@ -86,7 +86,7 @@ def test_parallel_background_order_is_attention_not_permission_or_global_http_ga
     before = inventory()
     original = deepcopy(before)
     result = plan_sources(before, work_order=PARALLEL_POLICY)
-    assert result['contract_version'] == 7 and result['work_order_contract_version'] == 2
+    assert result['contract_version'] == 10 and result['work_order_contract_version'] == 2
     assert result['background_attention_order'] == ['medium', 'small', 'large']
     assert [row['provider'] for row in result['sources'][:4]] == ['cnyes', 'medium', 'small', 'large']
     assert not result['background_waits_for_focus_completion']
@@ -215,6 +215,49 @@ def test_only_unfinished_questions_are_projected_without_promoting_partial_sourc
     assert json.loads(rows['large']['remaining_review_questions_json']) == []
     assert rows['large']['source_review_work_state'] == 'not_started'
     assert not result['all_history_complete'] and reviews == original
+
+
+def test_open_question_summary_preserves_scope_review_and_includes_nonrunnable_keys():
+    def review(decision, questions):
+        return {'capture_decision': decision, 'current_scope_review': {
+            'completed_questions': ['previously answered'], 'remaining_questions': questions}}
+
+    reviews = {
+        'cnyes': review('reviewed_existing_scope', ['focus follow-up']),
+        'medium': review('review_incomplete', ['partial review']),
+        'small': review('private_public_candidate', ['candidate follow-up']),
+        'large': review('permission_required', ['permission follow-up']),
+        'all_stored': review('reviewed_existing_scope', ['follow-up A', 'follow-up B']),
+        'redirect': review('review_incomplete', ['original identity']),
+        'cna': review('authorized_api_configuration_required', ['deferred API']),
+        'gov': review('reviewed_existing_scope', []),
+    }
+    original = deepcopy(reviews)
+    result = plan_sources(inventory(), reviews=reviews, work_order=PARALLEL_POLICY)
+    rows = {row['provider']: row for row in result['sources']}
+    keys = result['recorded_open_question_source_keys']
+    assert result['recorded_open_question_projection_contract_version'] == 1
+    assert keys == [row['provider'] for row in result['sources']
+                    if row['recorded_open_review_question_count'] > 0]
+    assert keys[0] == 'cnyes' and keys[-1] == 'cna'
+    assert set(keys) == {'cnyes', 'medium', 'small', 'large', 'all_stored', 'redirect', 'cna'}
+    assert result['recorded_open_question_source_key_count'] == 7
+    assert result['recorded_open_question_count'] == 8
+    assert rows['all_stored']['recorded_review_stage_complete']
+    assert rows['all_stored']['source_review_work_state'] == 'completed_for_recorded_scope'
+    assert rows['large']['source_review_work_state'] == 'completed_waiting_permission'
+    assert rows['cna']['implementation_state'] == 'deferred_by_user'
+    for key in ('all_stored', 'large', 'redirect', 'cna'):
+        assert key not in result['remaining_source_review_order']
+    assert rows['gov']['review_question_inventory_available']
+    assert not rows['unknown']['review_question_inventory_available']
+    assert rows['gov']['recorded_open_review_question_count'] == 0
+    assert rows['unknown']['recorded_open_review_question_count'] == 0
+    assert not result['recorded_open_question_actionability_verified']
+    assert not result['recorded_open_questions_are_exhaustive']
+    assert not result['work_order_grants_source_access']
+    assert result['publisher_requests'] == 0 and not result['queue_writes']
+    assert reviews == original
 
 
 @pytest.mark.parametrize('scope', [

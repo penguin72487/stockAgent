@@ -17,6 +17,10 @@ from stockagent.data_sync.immutable_replication import digest, read_manifest, re
 from stockagent.runtime_identity import identity_sha256, runtime_identity, validate_runtime_lock
 
 
+class CatalogOwnerBusy(BlockingIOError):
+    """The canonical catalog owner is working; the committed catalog is intact."""
+
+
 def configuration(path=Path("/etc/stockagent/lakehouse-control.json")) -> dict:
     if path.is_symlink() or path.stat().st_mode & 0o077 or path.stat().st_uid != os.geteuid():
         raise ValueError("lakehouse control needs its private locally owned configuration")
@@ -131,7 +135,7 @@ def _metadata_value(c, row):
             'bytes': row['bytes'], 'content_utf8': raw.decode('utf-8')}
 
 
-def _new_metadata_descriptors(c, files, registered_keys):
+def _new_metadata_descriptors(c, files, registered_keys, *, workers=1):
     """Validate every captured value, but retain only new small descriptors.
 
     Known content is still read, hashed and UTF-8 validated before any registry
@@ -139,12 +143,39 @@ def _new_metadata_descriptors(c, files, registered_keys):
     consumed; a late change must abort the transaction, not commit partial data.
     Captured mutable heads retain their original, already pinned bytes.
     """
+    if type(workers) is not int or not 1 <= workers <= 4:
+        raise ValueError('metadata verification workers must be between one and four')
     incoming = []
-    for row in files:
-        if row['role'] == 'cold_metadata':
-            _metadata_value(c, row)
-            if (row['relative'], row['sha256']) not in registered_keys:
-                incoming.append(row)
+    candidates = (row for row in files if row['role'] == 'cold_metadata')
+
+    def verify(row):
+        # Do not retain the decoded payload in a completed Future. Every
+        # original byte, length, SHA and UTF-8 value is still checked.
+        _metadata_value(c, row)
+        return row
+
+    def admit(row):
+        if (row['relative'], row['sha256']) not in registered_keys:
+            incoming.append(row)
+
+    if workers == 1:
+        for row in candidates:
+            admit(verify(row))
+        return incoming
+
+    # D's per-file RPC latency dominates this pass. Keep only one outstanding
+    # read per worker and consume in original order, so failure, descriptor
+    # ordering and the transaction boundary remain the same as serial mode.
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='catalog-metadata') as pool:
+        pending = deque()
+        for row in candidates:
+            pending.append(pool.submit(verify, row))
+            if len(pending) == workers:
+                admit(pending.popleft().result())
+        while pending:
+            admit(pending.popleft().result())
     return incoming
 
 
@@ -266,13 +297,16 @@ def _source_metadata_signature(paths, include_orphans):
 
 
 def register(c: dict) -> dict:
-    from stockagent.data_sync.backup_stream import capture_catalog
+    from stockagent.data_sync.backup_stream import _catalog_metadata_workers, capture_catalog
     import pyarrow as pa
     started = time.perf_counter()
     guard(c)
     state = Path(c["state_root"])
     with (state / "catalog-owner.lock").open("a") as owner:
-        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CatalogOwnerBusy('canonical catalog owner is busy') from error
         # Immutable manifests and publication heads are the change boundary.
         # Bounded reuse avoids 20k HDD stats each minute; a full catalog recapture
         # remains mandatory hourly and for any unavailable source/recovery.
@@ -327,7 +361,8 @@ def register(c: dict) -> dict:
             con.execute("CREATE TABLE IF NOT EXISTS lake.source_metadata (relative VARCHAR, sha256 VARCHAR, bytes BIGINT, content_utf8 VARCHAR)")
             captured = con.execute("SELECT count(*) FROM lake.catalog_captures WHERE capture_sha256=?", [catalog["identity_sha256"]]).fetchone()[0]
             registered_keys = set(con.execute('SELECT relative,sha256 FROM lake.source_metadata').fetchall())
-            metadata = _new_metadata_descriptors(c, catalog['files'], registered_keys)
+            metadata = _new_metadata_descriptors(c, catalog['files'], registered_keys,
+                workers=_catalog_metadata_workers(Path(c['cold_root'])))
             missing_metadata = len(metadata)
             changed = not captured or bool(missing_metadata)
             if changed:

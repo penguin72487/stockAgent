@@ -50,6 +50,9 @@ def register(queue, page=1, day=DAY):
 
 def accept(queue, data, page=1, day=DAY):
     task = register(queue,page,day)
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+    prepare_dispatch(queue, task)
+    task['_cnyes_revision_scope_idle'] = True  # This fixture dispatches one response at a time.
     source = queue.registry.sources['cnyes']
     r = response(data,task['url'])
     links = parse_index(r,source)[2]

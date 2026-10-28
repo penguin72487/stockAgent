@@ -15,6 +15,7 @@ Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_taifex_all_futures_daily.sh"
 Restart=on-failure
 RestartSec=5min
+RestartPreventExitStatus=75
 Nice=10
 CPUWeight=25
 IOWeight=25

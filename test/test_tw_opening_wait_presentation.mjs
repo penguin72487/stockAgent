@@ -4,7 +4,7 @@ import vm from "node:vm";
 import test from "node:test";
 
 const source = fs.readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
-const helpers = source.slice(source.indexOf("function pendingOpeningAttempts("), source.indexOf("function renderOvernightOperations("));
+const helpers = source.slice(source.indexOf("function operationalIssuesForDisplay("), source.indexOf("function renderOvernightOperations("));
 function context(overnight = false) {
   const state = {IS_OVERNIGHT: overnight, number: value => Number(value).toLocaleString("en-US")};
   vm.runInNewContext(helpers, state);
@@ -36,4 +36,24 @@ test("shared overnight UI does not borrow opening waits from day trade", () => {
 
 test("source write lease remains a wait, not a successful signal", () => {
   assert.match(context().openingWaitDescription({reason_code: "tw_public_source_update_pending"}), /不是訊號已完成/);
+});
+
+test("latest unfilled revision does not deny earlier open positions", () => {
+  const data = {modes: [{market: "mgda", today_execution_outcome: "no_fill", entry_unfilled_shares: 88000, open_position_count: 12}],
+    operational_issues: [{market: "mgda", code: "entry_no_fill", detail: "沒有建立任何成交部位"}]};
+  const issue = context().operationalIssuesForDisplay(data)[0];
+  assert.match(issue.detail, /88,000 股未成交/);
+  assert.match(issue.detail, /12 筆先前建立的未平模擬持倉/);
+  assert.doesNotMatch(issue.detail, /沒有建立任何成交部位/);
+  assert.equal(data.operational_issues[0].detail, "沒有建立任何成交部位");
+});
+
+test("late replay input is disclosed once and is not called an actual fill", () => {
+  const mode = {market: "a", label: "A", counterfactual_open_replay: true,
+    source_signal_at: "2026-10-28T09:10:03+08:00", signal_at: "2026-10-28T09:01:00+08:00"};
+  const issue = context().operationalIssuesForDisplay({modes: [mode]})[0];
+  assert.equal(issue.code, "replay_signal_after_simulated_time");
+  assert.match(issue.detail, /不能視為當時已取得的訊號或即時成交/);
+  assert.equal(context().operationalIssuesForDisplay({modes: [mode], operational_issues: [issue]}).length, 1);
+  assert.equal(context().operationalIssuesForDisplay({modes: [{...mode, source_signal_at: "2026-10-28T09:00:12+08:00"}]}).length, 0);
 });

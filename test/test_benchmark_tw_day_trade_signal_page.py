@@ -33,14 +33,16 @@ def test_signal_benchmark_requires_gateway_projection_directory(tmp_path, monkey
 
 
 def test_signal_benchmark_records_complete_exact_page(tmp_path, monkeypatch, capsys):
-    args = _args(tmp_path)
+    args = _args(tmp_path) + ["--hide-zero-targets"]
 
     def build(**kwargs):
+        assert kwargs["hide_zero_targets"] is True
         kwargs["timing_ms"]["source_projection"] = 1.5
         return {
             "total": 2, "returned": 1, "scan_limit_reached": False,
             "opening_execution_audit_scope": "complete_current_signal_rows_per_mode",
-            "rows": [{"symbol": "2330"}],
+            "rows": [{"symbol": "2330"}], "source_rows_scanned": 10,
+            "record_count": 12,
         }
 
     monkeypatch.setattr(benchmark, "build_dashboard_signal_page", build)
@@ -51,6 +53,9 @@ def test_signal_benchmark_records_complete_exact_page(tmp_path, monkeypatch, cap
     assert len(result["signals_signature"]) == 5
     assert len(result["state_signature"]) == 5
     assert result["total"] == 2
+    assert result["source_rows_scanned"] == 10
+    assert result["record_count"] == 12
+    assert result["hide_zero_targets"] is True
     assert result["stages_ms"]["source_projection"] == 1.5
     assert len(result["result_sha256"]) == 64
 
@@ -114,4 +119,26 @@ def test_narrow_probe_reports_only_verified_summary(tmp_path, monkeypatch, capsy
 
     args[-1] = "0" * 64
     assert benchmark.main(args) == 2
+    assert json.loads(capsys.readouterr().out)["complete"] is False
+
+
+def test_signal_benchmark_covers_public_projection_and_encoding(tmp_path, monkeypatch, capsys):
+    args = _args(tmp_path) + ["--public-price-root", str(tmp_path)]
+    monkeypatch.setattr(benchmark, "build_dashboard_signal_page", lambda **kw: {
+        "simulation_only": True, "production_order_possible": False,
+        "total": 2, "returned": 1, "scan_limit_reached": False,
+        "opening_execution_audit_scope": "complete_current_signal_rows_per_mode",
+        "rows": [{"symbol": "2330", "session_date": "2026-09-21"}],
+    })
+    assert benchmark.main(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["public_quote_source_unchanged"] is True
+    assert result["network_measured"] is False
+    assert result["public_rows_with_official_daily_quote"] == 0
+    assert result["public_json_bytes"] > 0
+    assert result["stages_ms"]["public_quote_projection"] >= 0
+    assert result["stages_ms"]["public_json_encoding"] >= 0
+    assert benchmark.main(args + ["--expected-public-sha", result["public_result_sha256"]]) == 0
+    capsys.readouterr()
+    assert benchmark.main(args + ["--expected-public-sha", "0" * 64]) == 2
     assert json.loads(capsys.readouterr().out)["complete"] is False

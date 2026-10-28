@@ -71,6 +71,63 @@ def test_scoped_materialization_keeps_parent_calendar_gaps_visible():
             materialize_margin_market_rows(source,raw,universe,market_dates=invalid)
 
 
+def test_cash_only_date_keeps_real_previous_exchange_liquidity_and_account_carry():
+    source, raw, universe = source_rows()
+    cash_day = date(2026, 1, 3)
+    source = source.with_columns(
+        (pl.col('date') == cash_day).alias('accounting_only_date'),
+        *[pl.when(pl.col('date') == cash_day).then(None).otherwise(pl.col(name)).alias(name)
+          for name in ('official_open', 'official_close', 'official_high', 'official_low',
+                       'outright_volume', 'spread_leg_volume')],
+        pl.when(pl.col('date') == cash_day).then(101.).otherwise(pl.col('valuation_price')).alias('valuation_price'),
+    )
+    raw = raw.filter(pl.col('date') != cash_day)
+    calendar = source.select('date', 'accounting_only_date').unique()
+    daily, _ = materialize_margin_market_rows(source, raw, universe, market_dates=calendar)
+    account = daily.filter(pl.col('date') == cash_day).sort('product')
+    assert account['volume'].null_count() == 2
+    assert not account['executable'].any()
+    assert account['previous_symbol_date'].to_list() == [date(2026, 1, 2)] * 2
+    after = daily.filter(pl.col('date') == date(2026, 1, 4)).sort('product')
+    assert after['previous_symbol_date'].to_list() == [cash_day] * 2
+    assert after['previous_exchange_session_date'].to_list() == [date(2026, 1, 2)] * 2
+    assert after['previous_volume'].to_list() == [10., 0.]
+    assert after['previous_open_interest'].to_list() == [3., 3.]
+    assert after['same_contract_as_previous_session'].all()
+    assert daily.filter(pl.col('date') == date(2026, 1, 5))['previous_volume'].to_list() == [10., 0.]
+
+    # No last-known fill when the immediately preceding exchange session is
+    # unknown, and no borrowing across a reused physical generation.
+    unknown = source.with_columns(pl.when((pl.col('date') == date(2026, 1, 2)) & (pl.col('product') == 'TX'))
+                                  .then(None).otherwise(pl.col('outright_volume')).alias('outright_volume'))
+    changed = unknown.with_columns(pl.when((pl.col('date') >= date(2026, 1, 4)) & (pl.col('product') == 'ZZ1'))
+        .then(pl.col('physical_instance') + 'new').otherwise(pl.col('physical_instance')).alias('physical_instance'))
+    rejected, _ = materialize_margin_market_rows(changed, raw, universe, market_dates=calendar)
+    after = rejected.filter(pl.col('date') == date(2026, 1, 4)).sort('product')
+    assert after['previous_volume'].null_count() == 2
+    assert after['previous_open_interest'].to_list() == [3., None]
+    assert after['same_contract_as_previous_session'].to_list() == [True, False]
+
+
+def test_accounting_calendar_rejects_conflicts_and_real_trades_on_cash_only_dates():
+    source, raw, universe = source_rows()
+    marked = source.with_columns((pl.col('date') == date(2026, 1, 3)).alias('accounting_only_date'))
+    calendar = marked.select('date', 'accounting_only_date').unique()
+    # A date with an actual positive trade cannot be relabelled as cash-only.
+    marked = marked.with_columns(pl.when((pl.col('date') == date(2026, 1, 3)) & (pl.col('product') == 'TX'))
+        .then(1).otherwise(pl.col('outright_volume')).alias('outright_volume'))
+    with pytest.raises(ValueError, match='positive trading volume'):
+        materialize_margin_market_rows(marked, raw, universe, market_dates=calendar)
+    conflicting = calendar.with_columns(pl.when(pl.col('date') == date(2026, 1, 3))
+        .then(False).otherwise(pl.col('accounting_only_date')).alias('accounting_only_date'))
+    with pytest.raises(ValueError, match='classifications disagree'):
+        materialize_margin_market_rows(marked, raw, universe, market_dates=conflicting)
+    with pytest.raises(ValueError, match='classification is missing'):
+        materialize_margin_market_rows(marked.filter(pl.col('date') != date(2026, 1, 3)),
+            raw.filter(pl.col('date') != date(2026, 1, 3)), universe,
+            market_dates=calendar.select('date'))
+
+
 def test_affected_product_replay_preserves_full_portfolio_coordinates_and_features():
     source, raw, universe = source_rows()
     whole, _ = materialize_margin_market_rows(source, raw, universe)
@@ -188,6 +245,32 @@ def test_corporate_first_day_must_inherit_old_inventory(broken):
             validate_accounting_continuation(frame, rules)
     else:
         validate_accounting_continuation(frame, rules)
+
+
+def test_component_overlap_keeps_prior_ancestry_but_rejects_prior_financial_gaps():
+    from stockagent.data.tw_futures_margin_release import select_complete_margin_components
+    d0,d1,d2=date(2026,1,1),date(2026,1,2),date(2026,1,3)
+    identities=['OLD','NEW','NEW','BAD0','BAD1','BAD1','ENDED']
+    days=[d0,d1,d2,d0,d1,d2,date(2025,12,31)]
+    frame=pl.DataFrame(dict(date=days,physical_contract=identities,product=identities,
+        next_market_date=[d1,d2,None,d1,d2,None,d0],
+        cash_settlement=[False,False,True,False,False,True,True],
+        lifetime_status=['official_final']*7))
+    rules=frame.select('date','physical_contract').with_columns(
+        pl.Series('carry_from_date',[None,d0,d1,None,d0,d1,None],dtype=pl.Date),
+        pl.Series('carry_from_physical_contract',['','OLD','NEW','','BAD0','BAD1','']),
+        pl.Series('terminal_event',['mark_only','mark_only','cash_settlement',
+            'mark_only','mark_only','cash_settlement','cash_settlement']))
+    flags=frame.select('date','physical_contract').with_columns(pl.lit(False).alias('is_warmup'),
+        pl.Series('has_blocker',[False,False,False,True,False,False,False]))
+    with pytest.raises(ValueError,match='no complete inventory'):
+        select_complete_margin_components(frame,rules,flags,start=d1,end=d2)
+    selected,chosen,coverage=select_complete_margin_components(frame,rules,flags,start=d1,end=d2,
+        allow_component_history_before_start=True)
+    assert set(selected['physical_contract'])=={'OLD','NEW'}
+    assert selected['date'].min()==d0
+    assert set(chosen['physical_contract'])=={'OLD','NEW'}
+    assert set(coverage.filter(pl.col('selected'))['physical_contract'])=={'OLD','NEW'}
 
 
 def test_component_selection_keeps_proved_empty_origins_needed_by_publication(tmp_path):
@@ -387,7 +470,13 @@ def test_admitted_compiler_output_runs_the_shared_margin_account(tmp_path, produ
         from stockagent.data.tw_futures_position_research import POSITION_RESEARCH_COLUMNS
         policy_path = terms_dir/'sources/position_research_policy.json'
         policy_path.parent.mkdir()
-        policy = (Path(__file__).parents[1]/'configs/markets/tw_futures_position_research_v1.json').read_text()
+        # A synthetic, self-contained policy keeps this account-mechanism test
+        # independent of a deployment config outside its frozen test capsule.
+        policy = json.dumps(dict(contract='stock_futures_previous_capacity_research_v1',
+            research_only=True, fallback_standard_contracts=1250, standard_shares_per_contract=2000,
+            fallback_known_at='2010-01-15T23:59:59+08:00', fallback_effective_date='2010-01-25',
+            fallback_source_content_sha256='a'*64,
+            fallback_source_url='https://www.taifex.com.tw/synthetic-unit-test-reference'))
         policy_path.write_text(policy)
         rules = rules.with_columns(pl.lit(False).alias(POSITION_RESEARCH_COLUMNS[0]),
             pl.lit(None,dtype=pl.String).alias(POSITION_RESEARCH_COLUMNS[1]),

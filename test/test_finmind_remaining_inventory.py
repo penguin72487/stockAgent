@@ -31,3 +31,18 @@ def test_inventory_deduplicates_catalog_and_selects_canonical_owner(monkeypatch,
     assert items[sponsor]['release_minute_taipei'] == 30
     assert items[complement]['rows'] == 123 and items[complement]['materialized_tasks'] == 120
     assert result['provider_calls'] == 0 and result['queue_writes'] == 0
+
+
+def test_markdown_inventory_lists_exhausted_history_without_pending_calls(tmp_path):
+    row = {'dataset': 'UKStockPrice', 'configured_first_date': '1900-01-01',
+           'first_observed_date': '2014-11-04', 'last_observed_date': '2026-09-29',
+           'rows': 311539, 'pending_queued_tasks': 0, 'unseeded_candidates': 0,
+           'planned_requests': 0, 'blocked_tasks': 0, 'inflight_tasks': 0,
+           'retry_exhausted_tasks': 133}
+    audit.write_report(tmp_path, {'observed_at_utc': '2026-10-26T18:00:00+00:00',
+        'datasets': [row], 'unique_datasets': 1, 'catalog_rows': 1,
+        'acquisition': {'completion_estimate': {'stages': []}}})
+    markdown = (tmp_path / 'inventory.md').read_text()
+    assert '| UKStockPrice |' in markdown and '| 重試耗盡 |' in markdown
+    assert '| 311539 | 0 | 0 | 0 | 133 |' in markdown
+    assert 'UKStockPrice' in (tmp_path / 'incomplete_for_ranking.csv').read_text()

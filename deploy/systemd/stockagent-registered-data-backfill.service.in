@@ -13,6 +13,7 @@ Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource_window.sh"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_registered_data_refresh.sh" backfill
+SuccessExitStatus=75
 Nice=15
 CPUWeight=10
 IOWeight=10

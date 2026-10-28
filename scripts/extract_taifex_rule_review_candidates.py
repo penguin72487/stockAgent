@@ -124,17 +124,52 @@ def is_blank_render(pixmap, native_text: str) -> bool:
 
 def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3,
             languages='chi_tra+eng', tessdata_dir=None, force_ocr=False, rapidocr_config=None,
-            rapidocr_profile_dir=None) -> dict:
+            rapidocr_profile_dir=None, verified_payload: bytes | None = None,
+            selected_pages=None, page_rotations=None) -> dict:
+    """Keep completed profiles intact; a selected repair gets a distinct profile.
+
+    Page numbers are physical, one-based PDF indexes. Explicit clockwise
+    quarter-turns change only the review render, never the source PDF. The
+    default whole-document profile and receipt remain unchanged.
+    """
     import pymupdf
     source = item['document']
+    selection = None
+    if selected_pages is not None:
+        if (not isinstance(selected_pages, (list, tuple)) or not selected_pages
+                or any(type(p) is not int or p <= 0 for p in selected_pages)
+                or len(set(selected_pages)) != len(selected_pages) or len(selected_pages) > max_pages):
+            raise ValueError('bounded distinct physical PDF pages required')
+        if page_rotations is None:
+            page_rotations = {}
+        if (not isinstance(page_rotations, dict)
+                or any(type(p) is not int or p not in selected_pages or type(angle) is not int
+                       or angle not in (90, 180, 270) for p, angle in page_rotations.items())):
+            raise ValueError('review rotations require selected pages and clockwise quarter-turns')
+        selection = dict(physical_pdf_pages=sorted(selected_pages),
+            clockwise_rotations={str(p):page_rotations[p] for p in sorted(page_rotations)})
+    elif page_rotations is not None:
+        raise ValueError('review rotations require selected physical PDF pages')
     profile=(rapidocr_review_profile(rapidocr_config, dpi, force_ocr)
              if rapidocr_config else extraction_profile(dpi,psm,languages,tessdata_dir,force_ocr))
+    if selection is not None:
+        profile += '_selected_pages_v1_' + hashlib.sha256(
+            json.dumps(selection, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     runtime=rapidocr_runtime(rapidocr_config)[1] if rapidocr_config else runtime_profile(tessdata_dir,languages)
     bounded = rapidocr_config and 'execution' in rapidocr_runtime(rapidocr_config)[0]
     if bounded:
         runtime = dict(rapidocr_engine(rapidocr_config, rapidocr_profile_dir).runtime,
                        extractor_sha256=sha256_file(Path(__file__)))
-    body = read_verified_raw(root, source)
+    # Other canonical collectors retain PDF bytes inside their own containers.
+    # Reuse this page/OCR implementation without making an intermediate gzip
+    # archive or changing the existing TAIFEX archive reader and its receipts.
+    if verified_payload is None:
+        body = read_verified_raw(root, source)
+    else:
+        if (not isinstance(verified_payload, bytes) or not 0 < len(verified_payload) <= 32 << 20
+                or hashlib.sha256(verified_payload).hexdigest() != source['content_sha256']):
+            raise ValueError('verified PDF payload size or content hash mismatch')
+        body = verified_payload
     if not body.startswith(b'%PDF-'):
         return dict(url=source['url'], status='not_pdf')
     dest = out / 'documents' / source['content_sha256']
@@ -142,23 +177,34 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
     if receipt_path.exists():
         receipt = json.loads(receipt_path.read_text())
         if (receipt['profile'] != profile or receipt['content_sha256'] != source['content_sha256']
-                or receipt.get('runtime') != runtime):
+                or receipt.get('runtime') != runtime
+                or verified_payload is not None and (receipt.get('source_raw_sha256') != source['raw_sha256']
+                                                      or receipt.get('url') != source['url'])):
             raise ValueError('review receipt belongs to another extraction profile')
         for record in receipt['files']:
             if sha256_file(dest / record['path']) != record['sha256']:
                 raise ValueError('review output hash mismatch')
         return receipt
-    dest.mkdir(parents=True, exist_ok=True)
-    atomic_write_bytes(dest / 'source.pdf', body)
     pages, chunks = [], []
     with pymupdf.open(stream=body, filetype='pdf') as pdf:
         count = len(pdf)
-        for index in range(min(count, max_pages)):
+        if selection is not None and max(selection['physical_pdf_pages']) > count:
+            raise ValueError('selected physical page outside source PDF')
+        dest.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(dest / 'source.pdf', body)
+        indexes = (p-1 for p in selection['physical_pdf_pages']) if selection is not None else range(min(count, max_pages))
+        for index in indexes:
             page = pdf[index]
             text = page.get_text(sort=True)
             words = page.get_text('words', sort=True)
             record = dict(page=index+1, extraction='native', width=page.rect.width,
                           height=page.rect.height, native_word_count=len(words))
+            if page_rotations and index+1 in page_rotations:
+                record.update(source_page_width=page.rect.width,source_page_height=page.rect.height,
+                    source_page_rotation=page.rotation,review_rotation_clockwise=page_rotations[index+1],
+                    native_geometry_basis='source PDF extraction before review rotation')
+                page.set_rotation((page.rotation+page_rotations[index+1])%360)
+                record.update(width=page.rect.width,height=page.rect.height)
             # A mixed text+scanned-table page still needs OCR. Preserve the
             # native extraction separately instead of discarding either view.
             images = page.get_images(full=True)
@@ -223,8 +269,9 @@ def extract(root: Path, out: Path, item: dict, max_pages: int, *, dpi=200, psm=3
     text = '\n'.join(chunks)
     atomic_write_bytes(dest / 'candidate.txt', text.encode())
     receipt = dict(profile=profile, runtime=runtime, url=source['url'], content_sha256=source['content_sha256'],
-                   source_raw_sha256=source['raw_sha256'], status='complete' if count <= max_pages else 'partial',
+                   source_raw_sha256=source['raw_sha256'], status='complete' if len(pages)==count else 'partial',
                    document_pages=count, extracted_pages=len(pages), pages=pages,
+                   **({'page_selection':selection} if selection is not None else {}),
                    candidate_only=True, point_in_time_verified=False,
                    temporal_mentions=temporal_mentions(text),
                    files=[dict(path=str(p.relative_to(dest)),sha256=sha256_file(p),bytes=p.stat().st_size)

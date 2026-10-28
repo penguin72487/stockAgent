@@ -34,15 +34,19 @@ from downloader.news_fulltext_candidate_originals import (
     ETTODAY_CREDIT_ORIGINAL_QUESTION, ETTODAY_INLINE_ORIGINAL_QUESTION, ETTODAY_VISIBLE_ORIGINAL_QUESTION,
     ETTODAY_IMAGE_ORIGINAL_QUESTION, ETTODAY_NONEMPTY_ORIGINAL_QUESTION,
     ETTODAY_CANONICAL_ORIGINAL_QUESTION,
+    ETTODAY_CONFLICT_ORIGINAL_QUESTION,
     GVM_ORIGINAL_QUESTION,
 )
-from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, NewsError, normalize_url
+from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, NewsError, REQUEST_DEFERRAL_CODES, normalize_url
 from downloader.news_fulltext_bastillepost import BASTILLE_RESIDENT_EVIDENCE_VERSIONS
 from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_EVIDENCE_QUESTIONS, CONTENTPLATFORM_EVIDENCE_VERSIONS
 from downloader.news_fulltext_setn import (
     INEWS_BOUNDARY_QUESTION, INEWS_LAYOUT_VERSIONS, INEWS_PROVIDER, inews_literal_article_url,
 )
-from downloader.news_fulltext_ettoday import ETTODAY_BOUNDARY_QUESTION, ettoday_literal_diagnostic_url
+from downloader.news_fulltext_ettoday import (
+    ETTODAY_BOUNDARY_QUESTION, ETTODAY_PRELUDE_EXCERPT_QUESTION, ETTODAY_ATTRIBUTION_PREDICATES_QUESTION,
+    ettoday_literal_diagnostic_url,
+)
 from downloader.news_fulltext_pdf import BOARD_PDF_ORIGINAL_LAYOUT, BOARD_PDF_ORIGINAL_QUESTION, private_board_pdf_permit
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_repairs import (
@@ -51,18 +55,71 @@ from downloader.news_fulltext_repairs import (
 )
 
 CONTRACT_VERSION = 1
+CANDIDATE_DEFERRAL_CONTRACT_VERSION = 1
 MAX_PENDING = 16
 PUMP_INTERVAL_SECONDS = 5
 _KIND = 'reviewed_native_candidate_metadata'
 _SAFE_HASH = re.compile(r'[0-9a-f]{64}')
 _TERMINAL = frozenset({'observed', 'observed_error', 'skipped', 'uncertain_outcome'})
 _CANDIDATE_FAILURES = REPAIRABLE - {'body_not_found'}
-_EVIDENCE_VERSIONS = frozenset(range(1, 46))
+_EVIDENCE_VERSIONS = frozenset(range(1, 69))
+
+
+class _ETtodayInlinePredecessorError(ValueError):
+    """Keep the public guard error stable and expose only a finite private cause."""
+
+    _DETAILS = frozenset({'state', 'payload', 'identity', 'result', 'site', 'hash', 'clock', 'malformed'})
+
+    def __init__(self, detail):
+        if detail not in self._DETAILS:
+            raise ValueError('invalid_predecessor_guard_detail')
+        super().__init__('completed_ettoday_plain_credit_original_scope_refusal_required')
+        self.detail = detail
+        # Python's traceback renders notes while str(error) stays compatible.
+        # This also diagnoses submit-time failures, before a job can exist.
+        self.add_note('ettoday_inline_predecessor_guard=' + detail)
 
 
 def _failure_states(layout, evidence):
     # These are diagnoses, NOT normal article requeues. The same exact head,
     # current source, lease/deadline and once-only observation key still bind.
+    if evidence == 67:
+        from downloader.news_fulltext_moneyweekly_excerpt import LAYOUT
+        return {'unsupported_article_path', 'body_not_found'} if layout == LAYOUT else set()
+    if evidence == 66:
+        from downloader.news_fulltext_moneyweekly_metadata import LAYOUT
+        return {'unsupported_article_path', 'body_not_found'} if layout == LAYOUT else set()
+    if evidence == 65:
+        from downloader.news_fulltext_moneyweekly import BODY_GEOMETRY_LAYOUT
+        return {'unsupported_article_path', 'body_not_found'} if layout == BODY_GEOMETRY_LAYOUT else set()
+    if evidence == 64:
+        from downloader.news_fulltext_moneyweekly import ROUTE_METADATA_LAYOUT
+        return {'unsupported_article_path'} if layout == ROUTE_METADATA_LAYOUT else set()
+    if evidence in {61, 62, 63, 68}:
+        return {'article_attribution_not_verified'} if layout == 'ettoday_visible_article_v41' else set()
+    if evidence == 60:
+        return {'article_attribution_not_verified'} if layout == 'ettoday_visible_article_v40' else set()
+    if evidence == 59:
+        return {'article_identity_not_verified'} if layout=='manager_public_written_article_v5' else set()
+    if evidence == 58:
+        return {'body_not_found'} if layout == 'manager_public_written_article_v4' else set()
+    if evidence == 57:
+        from downloader.news_fulltext_knews import KNEWS_GRID_NATIVE_LAYOUT
+        return {'article_identity_not_verified'} if layout == KNEWS_GRID_NATIVE_LAYOUT else set()
+    if evidence == 56:
+        from downloader.news_fulltext_knews import KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_MULTI_REPORTER_LAYOUT
+        return ({'article_identity_not_verified', 'article_attribution_not_verified'}
+                if layout in {KNEWS_SPARSE_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_MULTI_REPORTER_LAYOUT} else set())
+    if evidence == 55:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_WRITTEN_HTML_LAYOUT
+        return {'article_identity_not_verified'} if layout == CONTENTPLATFORM_WRITTEN_HTML_LAYOUT else set()
+    if evidence == 50:
+        return {'awaiting_authorization', 'body_not_found'} if layout == 'gnn_native_legacy_article_v4' else set()
+    if evidence in {48,49} or layout in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}:
+        return set(REPAIRABLE) if evidence in {48,49} and layout in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'} else set()
+    if evidence in {46,47} or layout in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}:
+        return (set(REPAIRABLE) | {'article_rights_or_scope_excluded'}
+                if evidence in {46,47} and layout in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'} else set())
     from downloader.news_fulltext_gvm import GVM_CANDIDATE_LAYOUTS
     from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ORIGINAL_LAYOUTS
     if evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS or layout in CONTENTPLATFORM_ORIGINAL_LAYOUTS:
@@ -73,7 +130,7 @@ def _failure_states(layout, evidence):
                 if evidence==34 else {'article_identity_not_verified'})
     if evidence in {38, 39}:
         return {'body_not_found'} if layout == 'setn_inews_native_article_v8' else set()
-    if evidence in {27, 28, 29, 30, 31, 32, 33}:
+    if evidence in {27, 28, 29, 30, 31, 32, 33, 51, 52}:
         return ({'article_identity_not_verified', 'article_attribution_not_verified'}
                 if layout == 'ettoday_visible_article_v39' else set())
     if evidence in {24, 25, 26} or layout in INEWS_LAYOUT_VERSIONS:
@@ -85,7 +142,7 @@ def _failure_states(layout, evidence):
                 or layout == 'upmedia_public_modern_article_v2' and evidence in {20, 22}
                 or layout == 'upmedia_public_modern_article_v3' and evidence in {20, 23}
                 or layout == 'upmedia_public_modern_article_v4' and evidence == 20 else set())
-    if evidence == 19:
+    if evidence in {19,54}:
         return {'article_identity_not_verified'} if layout == 'cmnews_visible_article_v1' else set()
     if layout == 'taiwannews_completed_public_original_v3' or evidence == 18:
         return ({'article_identity_not_verified', 'article_title_not_verified'}
@@ -130,6 +187,8 @@ def _pocket_failure_states(layout, evidence):
 
 
 def _candidate_head_problem(row, now, *, registry, layout, evidence):
+    if evidence in {65, 66, 67} and row is not None and row['state'] not in _failure_states(layout, evidence):
+        return 'not_semantic_parser_failure'
     problem = _head_problem(row, now, registry=registry,
         allowed_failure_states=_failure_states(layout, evidence))
     # Legacy Board PDF failures predate last_checked_at_utc. An unknown OLD
@@ -139,11 +198,18 @@ def _candidate_head_problem(row, now, *, registry, layout, evidence):
     if (problem == 'missing_or_invalid_check' and evidence == 12
             and layout == BOARD_PDF_ORIGINAL_LAYOUT and row['last_checked_at_utc'] is None):
         return None
+    if (problem == 'missing_or_invalid_check' and evidence in {64, 65, 66, 67}
+            and row['state'] == 'unsupported_article_path' and row['last_checked_at_utc'] is None):
+        # Path exclusion can be classified without an article GET. Its NULL
+        # clock is unknown, not a future check or a failed source observation.
+        # This fixed first-hop question still requires the exact unhandled
+        # route, body-free unleased head, elapsed deadline and once-only key.
+        return None
     return problem
 
 
 def _candidate_check_clock(value, evidence):
-    return value is None and evidence == 12 or _clock(value) <= time.time()
+    return value is None and evidence in {12, 64, 65, 66, 67} or _clock(value) <= time.time()
 
 
 def _inbox(root):
@@ -155,14 +221,18 @@ def _key(target, candidate, *, evidence_contract_version=1):
     # User reasons/timestamps and changing failure counters cannot buy a second
     # observation of the same URL and candidate contract.
     if (type(evidence_contract_version) is not int or evidence_contract_version not in _EVIDENCE_VERSIONS
+            or (target['provider'] == 'moneyweekly') != (evidence_contract_version in {64, 65, 66, 67})
+            or (target['provider'] == 'knews') != (evidence_contract_version in {56, 57})
+            or (target['provider'] == 'gnn') != (evidence_contract_version in {48,49,50})
+            or (target['provider'] == 'managertoday') != (evidence_contract_version in {46,47,58,59})
             or evidence_contract_version in {3, 4, 5, 7} and target['provider'] != 'pocket'
             or evidence_contract_version == 6 and target['provider'] != 'watchmedia'
             or evidence_contract_version == 12 and target['provider'] != 'fed_board'
             or evidence_contract_version == 13 and target['provider'] != 'globalvoices'
-            or evidence_contract_version == 19 and target['provider'] != 'cmnews'
-            or (target['provider'] == 'contentplatform') != (evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS)
+            or evidence_contract_version in {19,54} and target['provider'] != 'cmnews'
+            or (target['provider'] == 'contentplatform') != (evidence_contract_version in CONTENTPLATFORM_EVIDENCE_VERSIONS or evidence_contract_version == 55)
             or (target['provider'] == 'gvm') != (evidence_contract_version in GVM_CANDIDATE_LAYOUTS)
-            or evidence_contract_version in {27, 28, 29, 30, 31, 32, 33} and target['provider'] != 'ettoday'
+            or evidence_contract_version in {27, 28, 29, 30, 31, 32, 33, 51, 52, 60, 61, 62, 63, 68} and target['provider'] != 'ettoday'
             or (target['provider'] == INEWS_PROVIDER) != (evidence_contract_version in {24, 25, 26, 38, 39})
             or (target['provider'] == 'upmedia') != (evidence_contract_version in {20, 21, 22, 23})
             or (target['provider'] == 'stockfeel') != (evidence_contract_version in {14, 15})
@@ -170,9 +240,68 @@ def _key(target, candidate, *, evidence_contract_version=1):
             or evidence_contract_version in BASTILLE_RESIDENT_EVIDENCE_VERSIONS and target['provider'] != 'bastillepost'):
         raise ValueError('reviewed_candidate_evidence_contract_required')
     basis = [CONTRACT_VERSION, target['provider'], target['id'], candidate]
+    if evidence_contract_version == 67:
+        from downloader.news_fulltext_moneyweekly_excerpt import QUESTION as MONEYWEEKLY_EXCERPT_QUESTION
+        return hashlib.sha256(_bytes([67, target['provider'], target['id'], MONEYWEEKLY_EXCERPT_QUESTION])).hexdigest()
+    if evidence_contract_version == 66:
+        from downloader.news_fulltext_moneyweekly_metadata import QUESTION as MONEYWEEKLY_METADATA_QUESTION
+        return hashlib.sha256(_bytes([66, target['provider'], target['id'], MONEYWEEKLY_METADATA_QUESTION])).hexdigest()
+    if evidence_contract_version == 65:
+        from downloader.news_fulltext_moneyweekly import BODY_GEOMETRY_QUESTION
+        return hashlib.sha256(_bytes([65, target['provider'], target['id'], BODY_GEOMETRY_QUESTION])).hexdigest()
+    if evidence_contract_version == 64:
+        from downloader.news_fulltext_moneyweekly import ROUTE_METADATA_QUESTION
+        return hashlib.sha256(_bytes([64, target['provider'], target['id'], ROUTE_METADATA_QUESTION])).hexdigest()
+    if evidence_contract_version == 68:
+        basis = [68, target['provider'], target['id'], ETTODAY_CONFLICT_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 63:
+        basis = [63, target['provider'], target['id'], ETTODAY_ATTRIBUTION_PREDICATES_QUESTION]
+    elif evidence_contract_version == 62:
+        from downloader.news_fulltext_ettoday import ETTODAY_PRELUDE_EXCERPT_QUESTION
+        basis = [62, target['provider'], target['id'], ETTODAY_PRELUDE_EXCERPT_QUESTION]
+    elif evidence_contract_version == 61:
+        from downloader.news_fulltext_ettoday import ETTODAY_CREDIT_DECLARATION_QUESTION
+        basis = [61, target['provider'], target['id'], ETTODAY_CREDIT_DECLARATION_QUESTION]
+    elif evidence_contract_version == 60:
+        from downloader.news_fulltext_candidate_originals import ETTODAY_CAPTION_ORIGINAL_QUESTION
+        basis = [60, target['provider'], target['id'], ETTODAY_CAPTION_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 59:
+        from downloader.news_fulltext_managertoday import MANAGER_MULTIPLE_ORIGINAL_QUESTION
+        basis = [59,target['provider'],target['id'],MANAGER_MULTIPLE_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 58:
+        from downloader.news_fulltext_managertoday import MANAGER_BODY_ORIGINAL_QUESTION
+        basis = [58,target['provider'],target['id'],MANAGER_BODY_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 57:
+        from downloader.news_fulltext_knews import KNEWS_HEADER_SHAPE_QUESTION
+        basis = [57, target['provider'], target['id'], KNEWS_HEADER_SHAPE_QUESTION]
+    elif evidence_contract_version == 56:
+        from downloader.news_fulltext_knews import KNEWS_FAILURE_ORIGINAL_QUESTION
+        basis = [56, target['provider'], target['id'], KNEWS_FAILURE_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 55:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_FAILURE_SHAPE_QUESTION
+        basis = [55,target['provider'],target['id'],CONTENTPLATFORM_FAILURE_SHAPE_QUESTION]
+    elif evidence_contract_version == 48:
+        from downloader.news_fulltext_gnn import GNN_METADATA_QUESTION
+        basis = [48, target['provider'], target['id'], GNN_METADATA_QUESTION]
+    elif evidence_contract_version == 49:
+        from downloader.news_fulltext_gnn import GNN_BOUNDARY_ORIGINAL_QUESTION
+        basis = [49, target['provider'], target['id'], GNN_BOUNDARY_ORIGINAL_QUESTION]
+    elif evidence_contract_version == 50:
+        from downloader.news_fulltext_gnn import GNN_ROUTE_QUESTION
+        basis = [50, target['provider'], target['id'], GNN_ROUTE_QUESTION]
+    elif evidence_contract_version == 51:
+        from downloader.news_fulltext_ettoday import ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+        basis = [51, target['provider'], target['id'], ETTODAY_SCHEMA_RELATIONSHIP_QUESTION]
+    elif evidence_contract_version == 52:
+        from downloader.news_fulltext_candidate_originals import ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION
+        basis = [52, target['provider'], target['id'], ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION]
     if target['provider'] == 'cmnews' and evidence_contract_version == 1:
         basis = [1, target['provider'], target['id'], 'cmnews_current_identity_boundary_v1']
-    if evidence_contract_version == 2:
+    if evidence_contract_version in {46,47}:
+        from downloader.news_fulltext_managertoday import MANAGER_METADATA_QUESTION, MANAGER_PLAIN_CREDIT_QUESTION
+        basis = [evidence_contract_version, target['provider'], target['id'],
+            MANAGER_METADATA_QUESTION if evidence_contract_version==46 else MANAGER_PLAIN_CREDIT_QUESTION]
+    elif evidence_contract_version == 2:
         # A fixed, reviewed NEW question, not an arbitrary reason or hash that
         # could rearm v1. Completed v1 rows/keys/receipts remain unchanged.
         basis = [2, target['provider'], target['id'], candidate, 'videoland_native_credit_clock_v1']
@@ -222,6 +351,9 @@ def _key(target, candidate, *, evidence_contract_version=1):
     elif evidence_contract_version == 19:
         from downloader.news_fulltext_publishers import CMNEWS_CANONICAL_RELATION_QUESTION
         basis = [19, target['provider'], target['id'], CMNEWS_CANONICAL_RELATION_QUESTION]
+    elif evidence_contract_version == 54:
+        from downloader.news_fulltext_publishers import CMNEWS_CANONICAL_ATTRIBUTE_QUESTION
+        basis = [54, target['provider'], target['id'], CMNEWS_CANONICAL_ATTRIBUTE_QUESTION]
     elif evidence_contract_version == 20:
         from downloader.news_fulltext_upmedia import UPMEDIA_BOUNDARY_QUESTION
         basis = [20, target['provider'], target['id'], UPMEDIA_BOUNDARY_QUESTION]
@@ -387,6 +519,58 @@ def _prior_contentplatform_image_refusal(db, source, url):
                 or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
                     <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
             raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+        raise ValueError(error) from None
+
+
+def _prior_contentplatform_prefix_refusal(db, source, url):
+    """A closed whole-paragraph refusal leaves a distinct prefix question.
+
+    Require the same failed head and source at submit and claim. Any retained
+    original or unfinished predecessor forbids buying another source request.
+    """
+    from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_ROOT_QUESTION
+    from downloader.news_fulltext_repairs import _unique
+    _prior_contentplatform_root_refusal(db, source, url)
+    error = 'completed_contentplatform_unretained_whole_credit_refusal_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        key = _key(target, source.data_fingerprint, evidence_contract_version=44)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?', (key,)).fetchone()
+        if (not prior or prior['state'] != 'observed' or any(
+                not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072
+                for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = (json.loads(prior[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        shape = result['native_root_shape']
+        if (hashlib.sha256(_bytes(request)).hexdigest() != prior['request_id']
+                or request['target'] != target or request['observation_key'] != key
+                or request['source'] != _source_contract(db, source, url)[1]
+                or request['candidate_layout'] != source.embedded_article_layout
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or request['evidence_contract_version'] != 44 or result['evidence_contract_version'] != 44
+                or result['question'] != CONTENTPLATFORM_ROOT_QUESTION
+                or result['provider'] != source.provider or result['requested_url'] != url or result['final_url'] != url
+                or type(result['status']) is not int or result['status'] != 200
+                or result['private_original_scope_error'] != 'private_contentplatform_nested_credit_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result[k] is not False for k in ('raw_or_names_or_body_retained', 'accepted_as_article',
+                    'body_completeness_verified', 'identity_or_alias_accepted'))
+                or shape['contract_version'] != 1 or shape['native_identity_author_clock_verified'] is not True
+                or shape['first_credit_matches_declared_author'] is not False
+                or shape['body_geometry_accepted'] is not False or shape['article_accepted'] is not False
+                or shape['source_text_exported'] is not False
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+        for row in db.execute('SELECT state,request_json,result_json FROM native_candidate_jobs WHERE provider=?',
+                (source.provider,)):
+            other = json.loads(row['request_json'], object_pairs_hook=_unique)
+            if other['target']['id'] != target['id'] or other.get('evidence_contract_version') == 53:
+                continue
+            outcome = json.loads(row['result_json'], object_pairs_hook=_unique) if row['result_json'] else {}
+            if row['state'] not in {'observed', 'observed_error', 'skipped'} or outcome.get('private_original'):
+                raise ValueError(error)
     except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
         raise ValueError(error) from None
 
@@ -630,9 +814,212 @@ def _prior_upmedia_remaining_context(db, source, identity, url):
         raise ValueError(error) from None
 
 
+def _prior_knews_missing_header(db, source, url):
+    """Only an unanswered header structure after the exact closed raw refusal."""
+    from downloader.news_fulltext_knews import (
+        KNEWS_FAILURE_ORIGINAL_QUESTION, KNEWS_GRID_NATIVE_LAYOUT, KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_TABLE_HTTP_BINDING)
+    error = 'completed_knews_unretained_native_header_refusal_required'
+    try:
+        row = db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()
+        target = _head(row)
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=56),)).fetchone()
+        if prior is None:
+            raise ValueError(error)
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        old_source = request['source']
+        sites = result['private_original_scope_failure_location']['sites']
+        if (source.embedded_article_layout != KNEWS_GRID_NATIVE_LAYOUT
+                or target != request['target'] or target['state'] != 'article_identity_not_verified'
+                or prior['state'] != 'observed' or request['evidence_contract_version'] != 56
+                or set(old_source) != SOURCE_FIELDS
+                or old_source['authorization_fingerprint'] != source.authorization_fingerprint
+                or ((old_source['data_fingerprint'], old_source['authorization_fingerprint'])
+                    != (source.data_fingerprint, source.authorization_fingerprint)
+                    and ((old_source['data_fingerprint'], old_source['authorization_fingerprint']) != KNEWS_TABLE_HTTP_BINDING[:2]
+                        or (source.http_capacity_source_fingerprint, source.http_capacity_authorization_fingerprint)
+                            != KNEWS_TABLE_HTTP_BINDING[2:]))
+                or request['candidate_fingerprint'] != old_source['data_fingerprint']
+                or request['candidate_layout'] not in {KNEWS_TABLE_NATIVE_LAYOUT, KNEWS_GRID_NATIVE_LAYOUT}
+                or result['question'] != KNEWS_FAILURE_ORIGINAL_QUESTION
+                or result['provider'] != source.provider or result['requested_url'] != url or result['final_url'] != url
+                or type(result['status']) is not int or result['status'] != 200
+                or result['private_original_scope_error'] != 'article_identity_not_verified'
+                or 'private_original' in result or 'private_original_permit' in result
+                or any(result[k] is not False for k in ('raw_or_names_or_body_retained', 'accepted_as_article',
+                    'body_completeness_verified', 'identity_or_alias_accepted'))
+                or len(sites) < 2 or sites[-2].get('function') not in {'_native_frame', '_native_credit'}
+                or sites[-1].get('function') != '_one'
+                or sites[-2].get('module') != 'news_fulltext_knews.py'
+                or sites[-1].get('module') != 'news_fulltext_public_originals.py'
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError, AttributeError):
+        raise ValueError(error) from None
+
+
+def _prior_ettoday_empty_credit_declarations(db, source, url):
+    """An excerpt is distinct from, and cannot rearm, the closed credit question."""
+    from downloader.news_fulltext_ettoday import ETTODAY_CREDIT_DECLARATION_QUESTION
+    error = 'closed_empty_ettoday_credit_declarations_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        prior = db.execute('SELECT state,request_json,result_json FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=61),)).fetchone()
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        header = result['ettoday_native_header']
+        if (prior['state'] != 'observed' or request['target'] != target
+                or request['evidence_contract_version'] != 61
+                or request['source'] != _source_contract(db, source, url)[1]
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or result['question'] != ETTODAY_CREDIT_DECLARATION_QUESTION
+                or result['status'] != 200 or result['requested_url'] != url or result['final_url'] != url
+                or result['accepted_as_article'] is not False or result['raw_or_body_retained'] is not False
+                or result['raw_or_names_or_body_retained'] is not False
+                or header['native_credit_declarations'] != []
+                or not all(header['native_identity_relations'].values())
+                or 'private_original' in result or 'private_original_permit' in result):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, RecursionError, sqlite3.OperationalError):
+        raise ValueError(error) from None
+
+
+def _prior_ettoday_short_prelude(db, source, url):
+    """Closed excerpt remains reusable after a later failed article attempt.
+
+    The current request/claim still freezes its canonical current head. Only the
+    two monotonically advancing attempt fields may differ from question 62;
+    this neither reopens that question nor permits a changed body or source.
+    """
+    error = 'closed_ettoday_short_prelude_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        prior = db.execute('SELECT state,request_json,result_json FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=62),)).fetchone()
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        excerpt, old = result['ettoday_unclassified_prelude'], request['target']
+        same = lambda head: {k:v for k,v in head.items() if k not in {'attempts','last_checked_at_utc'}}
+        if (prior['state'] != 'observed' or same(old) != same(target)
+                or type(old['attempts']) is not int or target['attempts'] < old['attempts']
+                or _clock(target['last_checked_at_utc']) < _clock(old['last_checked_at_utc'])
+                or request['evidence_contract_version'] != 62
+                or request['source'] != _source_contract(db, source, url)[1]
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or result['question'] != ETTODAY_PRELUDE_EXCERPT_QUESTION
+                or result['requested_url'] != url or result['final_url'] != url or result['status'] != 200
+                or result['accepted_as_article'] is not False or result['diagnostic_excerpt_retained'] is not True
+                or result['raw_response_retained'] is not False or result['full_body_retained'] is not False
+                or excerpt['question'] != ETTODAY_PRELUDE_EXCERPT_QUESTION or excerpt['paragraph_index'] != 2
+                or not isinstance(excerpt['text'], str) or not 1 <= len(excerpt['text']) <= 160
+                or excerpt['text_sha256'] != hashlib.sha256(excerpt['text'].encode()).hexdigest()
+                or excerpt['author_or_supplier_accepted'] is not False
+                or 'private_original' in result or 'private_original_permit' in result):
+            raise ValueError(error)
+    except (KeyError, TypeError, ValueError, AttributeError, RecursionError, sqlite3.OperationalError):
+        raise ValueError(error) from None
+
+
+def _prior_ettoday_creator_conflict(db, source, url):
+    """Reuse the closed attribution observation without replaying its question."""
+    error = 'closed_ettoday_creator_conflict_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        prior = db.execute('SELECT state,request_json,result_json FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=63),)).fetchone()
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        old, facts = request['target'], result['ettoday_attribution_predicates']
+        same = lambda head: {k: v for k, v in head.items() if k not in {'attempts', 'last_checked_at_utc'}}
+        creator = facts['creator_values']
+        article_id = urlsplit(url).path.rsplit('/', 1)[-1]
+        if (prior['state'] != 'observed' or same(old) != same(target)
+                or type(old['attempts']) is not int or target['attempts'] < old['attempts']
+                or _clock(target['last_checked_at_utc']) < _clock(old['last_checked_at_utc'])
+                or request['evidence_contract_version'] != 63
+                or request['source'] != _source_contract(db, source, url)[1]
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or not _ettoday_attribution_predicates_result(result, url)
+                or not facts['literal_role_name'] or not facts['creator_is_list']
+                or facts['creator_values_withheld'] or facts['creator_count'] != 2
+                or not facts['creator_identifier_valid'] or facts['creator_matches_literal_role_name']
+                or not isinstance(creator, list) or len(creator) != 2
+                or creator[1] != article_id or not creator[0].startswith(article_id + '-')
+                or len(creator[0]) <= len(article_id) + 1
+                or not facts['author_is_exact_publisher_organization']
+                or not facts['publisher_is_expected_organization'] or facts['authors_truncated']
+                or facts['author_person_matches_literal_role_name']
+                or any(item['parse_succeeded'] or item['error_code'] != 'article_attribution_not_verified'
+                    or item['attribution_failure_stage'] != 'bare_reporter_creator_mismatch'
+                    for item in facts['parser_outcomes'])):
+            raise ValueError(error)
+        keys = ('prelude_text_sha256', 'literal_role_name', 'creator_values',
+            'published_at_raw', 'modified_at_raw', 'native_authors', 'native_publisher')
+        return {key: facts[key] for key in keys}
+    except (KeyError, TypeError, ValueError, AttributeError, RecursionError, sqlite3.OperationalError):
+        raise ValueError(error) from None
+
+
 def _question_source(db, registry, url, evidence):
+    if evidence == 67:
+        from downloader.news_fulltext_moneyweekly_excerpt import require_prior_excerpt
+        source = require_prior_excerpt(db, registry.require(url), url)
+        return _source_contract(db, source, url)
+    if evidence == 66:
+        from downloader.news_fulltext_moneyweekly_metadata import require_prior_template
+        source = require_prior_template(db, registry.require(url), url)
+        return _source_contract(db, source, url)
+    if evidence == 65:
+        from downloader.news_fulltext_moneyweekly import moneyweekly_body_geometry_route, moneyweekly_body_geometry_source
+        source = registry.require(url)
+        if not moneyweekly_body_geometry_source(source) or not moneyweekly_body_geometry_route(url):
+            raise ValueError('literal_known_moneyweekly_body_geometry_route_required')
+        return _source_contract(db, source, url)
+    if evidence == 64:
+        from downloader.news_fulltext_moneyweekly import (
+            moneyweekly_literal_navigation_route, moneyweekly_literal_unhandled_route,
+            moneyweekly_route_source, require_prior_moneyweekly_navigation,
+        )
+        source = registry.require(url)
+        if moneyweekly_literal_navigation_route(url):
+            require_prior_moneyweekly_navigation(db, source, url)
+        elif not moneyweekly_route_source(source) or not moneyweekly_literal_unhandled_route(url):
+            raise ValueError('literal_known_moneyweekly_unhandled_route_required')
+        return _source_contract(db, source, url)
     if evidence != 7:
         source, identity = _source(db, registry, url)
+        if evidence in {61, 62, 63, 68}:
+            from downloader.news_fulltext_ettoday import ettoday_resident_source
+            if (not ettoday_resident_source(source, layout='ettoday_visible_article_v41')
+                    or not ettoday_literal_diagnostic_url(url)
+                    or urlsplit(url).netloc != 'finance.ettoday.net'):
+                raise ValueError('literal_current_ettoday_finance_credit_route_required')
+            if evidence == 62:
+                _prior_ettoday_empty_credit_declarations(db, source, url)
+            elif evidence == 63:
+                _prior_ettoday_short_prelude(db, source, url)
+            elif evidence == 68:
+                _prior_ettoday_creator_conflict(db, source, url)
+        if evidence == 60:
+            from downloader.news_fulltext_ettoday import ettoday_resident_source
+            if (not ettoday_resident_source(source, layout='ettoday_visible_article_v40')
+                    or not ettoday_literal_diagnostic_url(url)
+                    or urlsplit(url).netloc != 'finance.ettoday.net'):
+                raise ValueError('literal_current_ettoday_finance_caption_route_required')
+        if evidence == 57:
+            _prior_knews_missing_header(db, source, url)
+        if evidence == 50:
+            from downloader.news_fulltext_gnn import GNN_LEGACY_LAYOUT, gnn_literal_route, gnn_metadata_source
+            # A previous destination authorization failure is NOT permission
+            # to follow it. Recheck the current ORIGINAL route only.
+            if (not gnn_metadata_source(source) or source.embedded_article_layout != GNN_LEGACY_LAYOUT
+                    or not gnn_literal_route(url)):
+                raise ValueError('literal_registered_GNN_route_required')
+        if evidence == 47:
+            _prior_manager_no_profile_header(db, source, url)
+        if evidence == 58:
+            _prior_manager_embedded_document(db,source,url)
+        if evidence == 59:
+            _prior_manager_multiple_roots(db,source,url)
         if evidence==41:
             _prior_gvm_header_refusal(db,source,url)
         if evidence==42:
@@ -641,6 +1028,8 @@ def _question_source(db, registry, url, evidence):
             _prior_contentplatform_root_refusal(db, source, url)
         if evidence == 45:
             _prior_contentplatform_image_refusal(db, source, url)
+        if evidence == 53:
+            _prior_contentplatform_prefix_refusal(db, source, url)
         if evidence == 12:
             from downloader.news_fulltext_pdf import board_pdf_original_url
             if not board_pdf_original_url(url, source):
@@ -653,6 +1042,8 @@ def _question_source(db, registry, url, evidence):
             _prior_taiwannews_single_root(db, source, url)
         if evidence == 19:
             _prior_cmnews_canonical_relation(db, source, identity, url)
+        if evidence == 54:
+            _unanswered_cmnews_canonical_attribute(db, source, identity, url)
         if evidence == 21:
             _prior_upmedia_missing_header(db, source, identity, url)
         if evidence == 22:
@@ -675,6 +1066,10 @@ def _question_source(db, registry, url, evidence):
             _prior_ettoday_nonempty_credit(db, source, identity, url)
         if evidence == 33:
             _prior_ettoday_canonical_credit(db, source, identity, url)
+        if evidence == 51:
+            _prior_ettoday_schema_relationship_refusal(db, source, identity, url)
+        if evidence == 52:
+            _prior_ettoday_person_disagreement(db, source, identity, url)
         return source, identity
     from downloader.news_fulltext_pocket_scope import non_school_route
     source = registry.require(url)
@@ -683,31 +1078,119 @@ def _question_source(db, registry, url, evidence):
     return _source_contract(db, source, url)
 
 
+def _prior_manager_multiple_roots(db,source,url):
+    """A distinct original question after the closed two-header/body shape."""
+    from downloader.news_fulltext_managertoday import MANAGER_LAYOUTS,MANAGER_METADATA_QUESTION,manager_metadata_source
+    error='closed_manager_two_root_shape_required'
+    if not manager_metadata_source(source) or source.embedded_article_layout!='manager_public_written_article_v5':
+        raise ValueError(error)
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone():
+        raise ValueError(error)
+    rows=db.execute("SELECT state,request_json,result_json FROM native_candidate_jobs WHERE provider='managertoday' "
+        "AND json_extract(request_json,'$.evidence_contract_version')=46 "
+        "AND json_extract(request_json,'$.target.url')=?",(url,)).fetchall()
+    try:
+        if len(rows)!=1 or rows[0]['state']!='observed':raise ValueError
+        request,result=json.loads(rows[0]['request_json']),json.loads(rows[0]['result_json'])
+        native=result['manager_native_header'];shapes=native['body_structure_without_prose']
+        if (request['candidate_layout'] not in MANAGER_LAYOUTS or result['question']!=MANAGER_METADATA_QUESTION
+                or result['requested_url']!=url or result['final_url']!=url or result['status']!=200
+                or result['raw_or_body_retained'] is not False or result['accepted_as_article'] is not False
+                or native['header_count']!=2 or native['body_container_count']!=2 or native['main_container_count']!=2
+                or len(shapes)!=2 or any(s['node_limit_reached'] for s in shapes)):
+            raise ValueError
+    except (ValueError,KeyError,TypeError):raise ValueError(error) from None
+
+
+def _prior_manager_embedded_document(db,source,url):
+    """A new raw-document question after a closed, bounded shape observation."""
+    from downloader.news_fulltext_managertoday import MANAGER_LAYOUTS, MANAGER_METADATA_QUESTION, manager_metadata_source
+    error = 'closed_manager_failed_embedded_document_shape_required'
+    if not manager_metadata_source(source) or source.embedded_article_layout!='manager_public_written_article_v4':
+        raise ValueError(error)
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone():
+        raise ValueError(error)
+    rows = db.execute("SELECT state,request_json,result_json FROM native_candidate_jobs WHERE provider='managertoday' "
+        "AND json_extract(request_json,'$.evidence_contract_version')=46 "
+        "AND json_extract(request_json,'$.target.url')=?",(url,)).fetchall()
+    try:
+        if len(rows)!=1 or rows[0]['state']!='observed':
+            raise ValueError
+        request,result = json.loads(rows[0]['request_json']),json.loads(rows[0]['result_json'])
+        native = result['manager_native_header']
+        shape, = native['body_structure_without_prose']
+        if (result['question']!=MANAGER_METADATA_QUESTION or result['requested_url']!=url
+                or result['final_url']!=url or result['status']!=200
+                or result['raw_or_body_retained'] is not False or result['accepted_as_article'] is not False
+                # Old bounded shapes are evidence, never an access grant.
+                # The current source and newly received raw header are gated
+                # independently; no refetch of the closed old question.
+                or request['candidate_layout'] not in MANAGER_LAYOUTS
+                or native['header_count']!=1 or native['body_container_count']!=1 or native['main_container_count']!=1
+                or shape['node_limit_reached'] or not any(t['has_table_cells'] is False
+                    and t['x_ref']=='src' and t['parent_tag']=='div' and t['parent_x_data']=='iframe'
+                    and set(t['parent_classes'])=={'widget','w-full','iframe'} for t in shape['templates'])):
+            raise ValueError
+    except (ValueError,KeyError,TypeError):
+        raise ValueError(error) from None
+
+
+def _prior_manager_no_profile_header(db, source, url):
+    """Only a closed, bounded v46 no-profile result buys this NEW question."""
+    from downloader.news_fulltext_managertoday import MANAGER_METADATA_QUESTION, manager_metadata_source
+    if not manager_metadata_source(source):
+        raise ValueError('current_manager_source_required')
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone():
+        raise ValueError('closed_manager_no_profile_header_required')
+    rows=db.execute("SELECT state,result_json FROM native_candidate_jobs WHERE provider='managertoday' "
+        "AND json_extract(request_json,'$.evidence_contract_version')=46 "
+        "AND json_extract(request_json,'$.target.url')=?",(url,)).fetchall()
+    try:
+        if len(rows)!=1 or rows[0]['state']!='observed':
+            raise ValueError
+        result=json.loads(rows[0]['result_json'])
+        native=result['manager_native_header']
+        if (result['question']!=MANAGER_METADATA_QUESTION or result['requested_url']!=url
+                or result['final_url']!=url or result['status']!=200
+                or result['raw_or_body_retained'] is not False
+                or native['header_count']!=1 or len(native['headers'])!=1
+                or native['headers'][0]['credits']!=[]):
+            raise ValueError
+    except (ValueError,KeyError,TypeError):
+        raise ValueError('closed_manager_no_profile_header_required') from None
+
+
 def _prior_ettoday_inline_credit(db, source, identity, url):
     """A new inline-prefix question, only after the closed plain-line refusal."""
     _prior_ettoday_leading_credit(db,source,identity,url)
-    error = 'completed_ettoday_plain_credit_original_scope_refusal_required'
     try:
         target = _head(db.execute('SELECT * FROM articles WHERE url=?',(url,)).fetchone())
         prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
             (_key(target,source.data_fingerprint,evidence_contract_version=28),)).fetchone()
-        if (not prior or prior['state'] != 'observed_error'
-                or any(not isinstance(prior[k],str) or not 0 < len(prior[k]) <= 131072
-                    for k in ('request_json','result_json'))):
-            raise ValueError(error)
+        if not prior or prior['state'] != 'observed_error':
+            raise _ETtodayInlinePredecessorError('state')
+        if any(not isinstance(prior[k],str) or not 0 < len(prior[k]) <= 131072
+               for k in ('request_json','result_json')):
+            raise _ETtodayInlinePredecessorError('payload')
         request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
-        if (request['target'] != target or request['source'] != identity or request['evidence_contract_version'] != 28
-                or result['error'] != 'private_ettoday_credit_original_scope_not_verified'
-                or result['raw_or_names_or_body_retained'] is not False or result['accepted_as_article'] is not False
-                or not any(site['module'] == 'news_fulltext_candidate_originals.py'
-                    and site['function'] == 'private_ettoday_credit_original_permit'
-                    for site in result['failure_location']['sites'])
-                or hashlib.sha256(prior['request_json'].encode()).hexdigest() != prior['request_id']
-                or not (_clock(prior['created_at_utc']) <= _clock(prior['reserved_at_utc'])
-                    <= _clock(prior['completed_at_utc']) <= time.time())):
-            raise ValueError(error)
+        if request['target'] != target or request['source'] != identity or request['evidence_contract_version'] != 28:
+            raise _ETtodayInlinePredecessorError('identity')
+        if (result['error'] != 'private_ettoday_credit_original_scope_not_verified'
+                or result['raw_or_names_or_body_retained'] is not False or result['accepted_as_article'] is not False):
+            raise _ETtodayInlinePredecessorError('result')
+        if not any(site['module'] == 'news_fulltext_candidate_originals.py'
+                   and site['function'] == 'private_ettoday_credit_original_permit'
+                   for site in result['failure_location']['sites']):
+            raise _ETtodayInlinePredecessorError('site')
+        if hashlib.sha256(prior['request_json'].encode()).hexdigest() != prior['request_id']:
+            raise _ETtodayInlinePredecessorError('hash')
+        if not (_clock(prior['created_at_utc']) <= _clock(prior['reserved_at_utc'])
+                <= _clock(prior['completed_at_utc']) <= time.time()):
+            raise _ETtodayInlinePredecessorError('clock')
+    except _ETtodayInlinePredecessorError:
+        raise
     except (KeyError,IndexError,TypeError,ValueError,RecursionError):
-        raise ValueError(error) from None
+        raise _ETtodayInlinePredecessorError('malformed') from None
 
 
 def _prior_ettoday_visible_credit(db, source, identity, url):
@@ -827,6 +1310,84 @@ def _prior_ettoday_canonical_credit(db, source, identity, url):
                     <= _clock(prior['completed_at_utc']) <= time.time())):
             raise ValueError(error)
     except (KeyError,IndexError,TypeError,ValueError,RecursionError):
+        raise ValueError(error) from None
+
+
+def _prior_ettoday_schema_relationship_refusal(db, source, identity, url):
+    """A closed combined predicate refusal permits one distinct metadata question.
+
+    The old original-retention question remains closed. No raw response,
+    names, body, changed parser or clock can rearm this fixed question.
+    """
+    _prior_ettoday_canonical_credit(db, source, identity, url)
+    error = 'completed_ettoday_combined_schema_relationship_refusal_required'
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=33),)).fetchone()
+        if (not prior or prior['state'] != 'observed'
+                or any(not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072
+                       for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        trace = result['visible_credit_scope']
+        if (request['source'] != identity or request['target'] != target
+                or request['evidence_contract_version'] != 33 or result['evidence_contract_version'] != 33
+                or result['provider'] != 'ettoday' or result['question'] != ETTODAY_CANONICAL_ORIGINAL_QUESTION
+                or result['private_original_scope_error'] != 'article_rights_or_scope_excluded'
+                or trace['verification_stage'] != 'same_article_author'
+                or trace['separator_found'] is not True or trace['following_visible_text'] is not True
+                or not any(site['module'] == 'news_fulltext_ettoday.py' and site['function'] == '_schemas'
+                           for site in result['failure_location']['sites'])
+                or result['status'] != 200 or result['requested_url'] != url or result['final_url'] != url
+                or result['redirect_count'] != 0 or result['raw_or_names_or_body_retained'] is not False
+                or result['accepted_as_article'] is not False or 'private_original' in result
+                or 'private_original_permit' in result
+                or hashlib.sha256(prior['request_json'].encode()).hexdigest() != prior['request_id']
+                or not (_clock(prior['created_at_utc']) <= _clock(prior['reserved_at_utc'])
+                        <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, IndexError, TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+
+
+def _prior_ettoday_person_disagreement(db, source, identity, url):
+    """Only the completed identity/clock/publisher-positive Person disagreement.
+
+    The new private-original question does not retry the metadata question or
+    resolve the conflict. Reserve once and independently recheck actual bytes.
+    """
+    from downloader.news_fulltext_ettoday import ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+    _prior_ettoday_schema_relationship_refusal(db, source, identity, url)
+    error = 'completed_ettoday_literal_person_disagreement_required'
+    expected = {'identity_and_source_clocks_verified': True, 'publisher_is_object': True,
+        'publisher_is_organization': True, 'publisher_name_matches': True,
+        'schema_author_count': 1, 'schema_author_is_exact_publisher': False,
+        'schema_author_matches_last_of_two': False, 'schema_authors_all_person': True,
+        'schema_authors_match_all_visible_reporters': False, 'schema_authors_match_ordered_subset': False,
+        'visible_reporter_count': 1}
+    try:
+        target = _head(db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+        prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
+            (_key(target, source.data_fingerprint, evidence_contract_version=51),)).fetchone()
+        if (not prior or prior['state'] != 'observed' or any(
+                not isinstance(prior[k], str) or not 0 < len(prior[k]) <= 131072 for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, result = json.loads(prior['request_json']), json.loads(prior['result_json'])
+        if (request['target'] != target or request['source'] != identity or request['evidence_contract_version'] != 51
+                or result['evidence_contract_version'] != 51 or result['question'] != ETTODAY_SCHEMA_RELATIONSHIP_QUESTION
+                or result['provider'] != 'ettoday' or result['schema_relationships'] != expected
+                or any(type(v) is not type(expected[k]) for k, v in result['schema_relationships'].items())
+                or result['scope_error'] != 'article_rights_or_scope_excluded'
+                or result['status'] != 200 or result['requested_url'] != url or result['final_url'] != url
+                or result['redirect_count'] != 0 or result['accepted_as_article'] is not False
+                or result['raw_or_names_or_body_retained'] is not False or 'private_original' in result
+                or 'private_original_permit' in result
+                or hashlib.sha256(prior['request_json'].encode()).hexdigest() != prior['request_id']
+                or not (_clock(prior['created_at_utc']) <= _clock(prior['reserved_at_utc'])
+                        <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, IndexError, TypeError, ValueError, RecursionError):
         raise ValueError(error) from None
 
 
@@ -1006,6 +1567,64 @@ def _prior_cmnews_canonical_relation(db, source, identity, url):
         raise ValueError('cmnews_literal_canonical_already_recorded')
 
 
+def _unanswered_cmnews_canonical_attribute(db, source, identity, url):
+    """Only a missing literal declaration, never a replay of a retained one.
+
+    Early failed heads may have no native observation. A closed ASCII-only
+    observation permits this distinct URI/IRI question only when it attests
+    the exact native head but explicitly did not retain its sole canonical.
+    The shared pending/uncertain-outcome barrier still applies to both cases.
+    """
+    from downloader.news_fulltext_publishers import CMNEWS_CANONICAL_RELATION_QUESTION
+    from downloader.news_fulltext_repairs import _unique
+    row = db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()
+    target = _head(row)
+    if recorded_cmnews_canonical(db, source, target):
+        raise ValueError('cmnews_literal_canonical_already_recorded')
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone():
+        return
+    prior = db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
+        (_key(target, source.data_fingerprint, evidence_contract_version=19),)).fetchone()
+    if prior is None:
+        return
+    error = 'prior_unretained_cmnews_canonical_required'
+    try:
+        if (prior['state'] != 'observed' or any(not isinstance(prior[k], str)
+                or not 0 < len(prior[k]) <= 131072 for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, facts = (json.loads(prior[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        if not isinstance(request, dict) or not isinstance(facts, dict):
+            raise ValueError(error)
+        native, relation = facts['native_identity'], facts['canonical_relation']
+        if not isinstance(native, dict) or not isinstance(relation, dict):
+            raise ValueError(error)
+        if (hashlib.sha256(_bytes(request)).hexdigest() != prior['request_id']
+                or request['source'] != identity or request['target'] != target
+                or request['evidence_contract_version'] != 19
+                or request['candidate_fingerprint'] != source.data_fingerprint
+                or request['candidate_layout'] != 'cmnews_visible_article_v1'
+                or facts['provider'] != 'cmnews' or facts['question'] != CMNEWS_CANONICAL_RELATION_QUESTION
+                or facts['evidence_contract_version'] != 19 or facts['status'] != 200
+                or any(facts.get(k) is not False for k in ('accepted_as_article',
+                    'raw_or_names_or_body_retained', 'body_completeness_verified', 'identity_or_alias_accepted'))
+                or any(type(native.get(k)) is not int or native[k] != expected for k, expected in {
+                    'canonical_count': 1, 'matching_canonical_count': 0, 'matching_native_scope_count': 1,
+                    'native_title_count': 1, 'nonempty_native_title_count': 1,
+                    'native_body_container_count': 1}.items())
+                or native.get('native_slug_matches') is not True
+                or native.get('native_UUID_container_matches') is not True
+                or native.get('ambiguous_native_scope') is not False
+                or relation.get('canonical_count') != 1
+                or relation.get('canonical_locators') != [{'literal_locator_retained': False}]
+                or relation.get('canonical_list_truncated') is not False
+                or relation.get('article_or_alias_accepted') is not False
+                or not (_clock(target['last_checked_at_utc']) <= _clock(prior['created_at_utc'])
+                    <= _clock(prior['reserved_at_utc']) <= _clock(prior['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+    except (KeyError, IndexError, TypeError, ValueError, RecursionError):
+        raise ValueError(error) from None
+
+
 def recorded_cmnews_canonical(db, source, target):
     """Reuse exact prior failure metadata before asking a new HTTP question.
 
@@ -1149,6 +1768,12 @@ def submit_candidate(root, config, registry, url, layout, *, reason, evidence_co
         raise ValueError('literal_candidate_url_required')
     root = Path(root).resolve()
     candidate = native_candidate_source(config, registry, registry.base, layout)
+    if candidate.provider == 'moneyweekly':
+        from downloader.news_fulltext_moneyweekly_metadata import LAYOUT
+        from downloader.news_fulltext_moneyweekly_excerpt import LAYOUT as EXCERPT_LAYOUT
+        from downloader.news_fulltext_moneyweekly import BODY_GEOMETRY_LAYOUT, ROUTE_METADATA_LAYOUT
+        if {64: ROUTE_METADATA_LAYOUT, 65: BODY_GEOMETRY_LAYOUT, 66: LAYOUT, 67: EXCERPT_LAYOUT}.get(evidence_contract_version) != layout:
+            raise ValueError('reviewed_candidate_evidence_contract_required')
     if not candidate_evidence_allowed(registry.sources[candidate.provider], candidate, evidence_contract_version):
         raise ValueError('reviewed_candidate_evidence_contract_required')
     if evidence_contract_version in {24, 25, 26, 38, 39} and not inews_literal_article_url(url):
@@ -1207,7 +1832,7 @@ def submit_candidate(root, config, registry, url, layout, *, reason, evidence_co
                     'request_id': existing['request_id'], 'state': existing['state'],
                     'publisher_requests': 0, 'article_heads_mutated': False, 'accepted_as_article': False}
             if (candidate.provider == 'cmnews' or evidence_contract_version in {
-                    7, 12, 13, 14, 15, 18, 20, 21, 22, 23, 24, 25, 26, 27, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}) and _prior_unfinished_observation(db, target):
+                    7, 12, 13, 14, 15, 18, 20, 21, 22, 23, 24, 25, 26, 27, 34, 35, 36, 37, 38, 39, 40, 41, 42, 48, 49, 50, 55, 56, 57, 60, 61, 62, 63, 64, 65, 66, 67, 68, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}) and _prior_unfinished_observation(db, target):
                 raise ValueError('prior_observation_not_terminal')
     request = {'contract_version': CONTRACT_VERSION, 'kind': _KIND,
         'created_at_utc': utc_now(), 'reason': reason.strip(), 'target': target, 'source': identity,
@@ -1256,19 +1881,30 @@ def _load(path):
                    for key in SOURCE_FIELDS - {'contract_version'})
             or not isinstance(request['candidate_layout'], str) or not (
                 request['candidate_layout'] == BOARD_PDF_ORIGINAL_LAYOUT
+                or request['candidate_layout'] in {'moneyweekly_known_route_metadata_v1', 'moneyweekly_known_body_geometry_v1', 'moneyweekly_unresolved_template_metadata_v1', 'moneyweekly_short_template_and_query_declaration_v1'}
                 or request['candidate_layout'] in CONTENTPLATFORM_ORIGINAL_LAYOUTS
+                or request['candidate_layout'] == 'contentplatform_native_article_v7'
                 or request['candidate_layout'] in GVM_CANDIDATE_LAYOUTS.values()
                 or request['candidate_layout'] in INEWS_LAYOUT_VERSIONS
                 or request['candidate_layout'] in {'upmedia_public_modern_article_v1', 'upmedia_public_modern_article_v2', 'upmedia_public_modern_article_v3', 'upmedia_public_modern_article_v4'}
                 or request['candidate_layout'] in {'taiwannews_completed_public_original_v2', 'taiwannews_completed_public_original_v3'}
+                or request['candidate_layout'] in {'manager_public_written_article_v1', 'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}
+                or request['candidate_layout'] in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}
+                or request['candidate_layout'] in {'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'}
                 or request['candidate_layout'] == GLOBALVOICES_ORIGINAL_LAYOUT
                 or request['candidate_layout'] in {'stockfeel_visible_original_v1', 'stockfeel_visible_original_v2', 'stockfeel_visible_original_v3', 'stockfeel_visible_original_v4', 'stockfeel_visible_original_v5', 'stockfeel_visible_original_v6', 'stockfeel_visible_original_v7'}
                 or BASTILLE_LAYOUT_VERSIONS.get(request['candidate_layout'], 0) >= 2 or re.fullmatch(
-                    r'(?:cmnews_visible_article_v1|pocket_visible_article_v[0-9]{1,2}|videoland_visible_article_v4|watchmedia_visible_article_v3|ettoday_visible_article_v39|max_visible_post_v[0-9]{1,2})',
+                    r'(?:cmnews_visible_article_v1|pocket_visible_article_v[0-9]{1,2}|videoland_visible_article_v4|watchmedia_visible_article_v3|ettoday_visible_article_v(?:39|40|41)|max_visible_post_v[0-9]{1,2})',
                     request['candidate_layout']))
             or not isinstance(request['candidate_fingerprint'], str) or not _SAFE_HASH.fullmatch(request['candidate_fingerprint'])
             or not isinstance(request['observation_key'], str)):
         raise ValueError('invalid_native_candidate_request')
+    if request['candidate_layout'] in {'moneyweekly_known_route_metadata_v1', 'moneyweekly_known_body_geometry_v1', 'moneyweekly_unresolved_template_metadata_v1', 'moneyweekly_short_template_and_query_declaration_v1'}:
+        from downloader.news_fulltext_moneyweekly_excerpt import LAYOUT as EXCERPT_LAYOUT
+        from downloader.news_fulltext_moneyweekly_metadata import LAYOUT
+        from downloader.news_fulltext_moneyweekly import BODY_GEOMETRY_LAYOUT, ROUTE_METADATA_LAYOUT
+        if {64: ROUTE_METADATA_LAYOUT, 65: BODY_GEOMETRY_LAYOUT, 66: LAYOUT, 67: EXCERPT_LAYOUT}.get(evidence) != request['candidate_layout']:
+            raise ValueError('invalid_native_candidate_request')
     target = request['target']
     if (not isinstance(target['url'], str) or normalize_url(target['url']) != target['url']
             or target['id'] != hashlib.sha256(target['url'].encode()).hexdigest()
@@ -1280,14 +1916,30 @@ def _load(path):
             or evidence == 2 and (target['provider'] != 'videoland'
                 or request['candidate_layout'] != 'videoland_visible_article_v4')
             or request['candidate_layout'] == 'cmnews_visible_article_v1' and (
-                target['provider'] != 'cmnews' or evidence not in {1, 19})
-            or evidence == 19 and (target['provider'] != 'cmnews' or request['candidate_layout'] != 'cmnews_visible_article_v1')
+                target['provider'] != 'cmnews' or evidence not in {1, 19, 54})
+            or evidence in {19, 54} and (target['provider'] != 'cmnews' or request['candidate_layout'] != 'cmnews_visible_article_v1')
+            or (request['candidate_layout'] in {'knews_public_native_article_v7', 'knews_public_native_article_v8', 'knews_public_native_article_v9', 'knews_public_native_article_v10'}) != (evidence in {56, 57})
+            or evidence in {56, 57} and (target['provider'] != 'knews'
+                or not re.fullmatch(r'https://www[.]knews[.]com[.]tw/news/[0-9A-F]{32}', target['url']))
+            or (request['candidate_layout'] in {'gnn_native_reporter_article_v1', 'gnn_native_credited_article_v2', 'gnn_native_written_article_v3', 'gnn_native_legacy_article_v4'}) != (evidence in {48,49,50})
+            or evidence in {48,49,50} and target['provider'] != 'gnn'
+            or evidence == 50 and request['candidate_layout'] != 'gnn_native_legacy_article_v4'
             or (request['candidate_layout'] in CONTENTPLATFORM_ORIGINAL_LAYOUTS) != (evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS)
             or evidence in CONTENTPLATFORM_EVIDENCE_VERSIONS and (target['provider'] != 'contentplatform' or contentplatform_article_id(target['url']) is None)
+            or evidence == 55 and (target['provider'] != 'contentplatform' or request['candidate_layout'] != 'contentplatform_native_article_v7'
+                or contentplatform_article_id(target['url']) is None)
             or (request['candidate_layout'] in GVM_CANDIDATE_LAYOUTS.values() or evidence in GVM_CANDIDATE_LAYOUTS)
                 and (target['provider']!='gvm' or GVM_CANDIDATE_LAYOUTS.get(evidence)!=request['candidate_layout'])
-            or evidence in {27, 28, 29, 30, 31, 32, 33} and (target['provider'] != 'ettoday' or request['candidate_layout'] != 'ettoday_visible_article_v39')
-            or request['candidate_layout'] == 'ettoday_visible_article_v39' and evidence not in {1, 27, 28, 29, 30, 31, 32, 33}
+            or evidence in {27, 28, 29, 30, 31, 32, 33, 51, 52} and (target['provider'] != 'ettoday' or request['candidate_layout'] != 'ettoday_visible_article_v39')
+            or request['candidate_layout'] == 'ettoday_visible_article_v39' and evidence not in {1, 27, 28, 29, 30, 31, 32, 33, 51, 52}
+            or (request['candidate_layout'] == 'ettoday_visible_article_v40') != (evidence == 60)
+            or (request['candidate_layout'] == 'ettoday_visible_article_v41') != (evidence in {61, 62, 63, 68})
+            or evidence in {61, 62, 63, 68} and (target['provider'] != 'ettoday'
+                or not ettoday_literal_diagnostic_url(target['url'])
+                or urlsplit(target['url']).netloc != 'finance.ettoday.net')
+            or evidence == 60 and (target['provider'] != 'ettoday'
+                or not ettoday_literal_diagnostic_url(target['url'])
+                or urlsplit(target['url']).netloc != 'finance.ettoday.net')
             or (request['candidate_layout'] in INEWS_LAYOUT_VERSIONS) != (evidence in {24, 25, 26, 38, 39})
             or evidence in {24, 25, 26, 38, 39} and (target['provider'] != INEWS_PROVIDER or not inews_literal_article_url(target['url']))
             or request['candidate_layout'] == 'watchmedia_visible_article_v3' and (
@@ -1325,9 +1977,13 @@ def _load(path):
         if pocket_article_id(target['url'], adapter_contract_version=(
                 original_route_version(request['candidate_layout']) if evidence == 4 else 1)) is None:
             raise ValueError('literal_current_pocket_canonical_route_required')
-    if evidence in {27, 28, 29, 30, 31, 32, 33} and not ettoday_literal_diagnostic_url(target['url'], allow_house=True):
+    if evidence in {27, 28, 29, 30, 31, 32, 33, 51, 52} and not ettoday_literal_diagnostic_url(target['url'], allow_house=True):
         # Host review is also checked against the current registry at claim.
         raise ValueError('literal_current_ettoday_route_required')
+    if evidence == 50:
+        from downloader.news_fulltext_gnn import gnn_literal_route
+        if not gnn_literal_route(target['url']):
+            raise ValueError('literal_registered_GNN_route_required')
     if evidence == 5 and not legacy_route(target['url'], adapter_contract_version=original_route_version(request['candidate_layout'])):
         raise ValueError('literal_current_pocket_legacy_route_required')
     if evidence == 6:
@@ -1355,11 +2011,100 @@ def _schema(queue):
             'state TEXT NOT NULL,request_json TEXT NOT NULL,result_json TEXT,'
             'created_at_utc TEXT NOT NULL,reserved_at_utc TEXT,completed_at_utc TEXT,owner_id TEXT NOT NULL)')
         queue.db.execute('CREATE INDEX IF NOT EXISTS native_candidate_ready ON native_candidate_jobs(state,provider,created_at_utc)')
+        queue.db.execute('CREATE TABLE IF NOT EXISTS native_candidate_wait('
+            'request_id TEXT PRIMARY KEY,not_before_epoch REAL NOT NULL,last_gate_code TEXT NOT NULL,'
+            'last_deferred_at_utc TEXT NOT NULL,deferral_count INTEGER NOT NULL)')
         # A dispatch reservation is the unknown-outcome barrier, not permission
         # to send again. Committed results are archived below without any GET.
         queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome',completed_at_utc=? "
             "WHERE state='reserved' AND owner_id<>?", (utc_now(), queue.owner))
     queue.native_candidate_schema_ready = True
+
+
+def candidate_progress(queue):
+    """Bounded owner-side view of diagnostic work, never article completion.
+
+    Pending files are submissions, and registered jobs are observations; they
+    are separate counts because a registered request may still have its file.
+    Do not create a schema, move a file, fetch a publisher or expose requests.
+    """
+    # A reservation belongs only to its dispatching owner. A previous owner's
+    # reservation must not appear as currently executing before recovery runs.
+    states = ('ready', 'reserved', 'orphaned_reservation', 'uncertain_outcome')
+    keys = ('pending_unadmitted', *states)
+    zero = lambda: {key: 0 for key in keys}
+    result = {'contract_version': 1, 'available': True, 'request_files': 0,
+              'pending_unadmitted': 0, 'already_registered': 0, 'invalid_or_unreadable': 0,
+              'jobs': {state: 0 for state in states}, 'providers': {}, 'unregistered': zero()}
+
+    def bucket(provider):
+        if (isinstance(provider, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', provider)
+                and provider in queue.registry.sources):
+            return result['providers'].setdefault(provider, zero())
+        return result['unregistered']
+
+    try:
+        has_jobs = bool(queue.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                         "AND name='native_candidate_jobs'").fetchone())
+        if has_jobs:
+            rows = queue.db.execute("SELECT provider, CASE WHEN state='reserved' AND owner_id<>? "
+                "THEN 'orphaned_reservation' ELSE state END AS projected_state, count(*) "
+                "FROM native_candidate_jobs WHERE state IN ('ready','reserved','uncertain_outcome') "
+                "GROUP BY provider,projected_state LIMIT 4097", (queue.owner,)).fetchall()
+            if len(rows) > 4096:
+                raise ValueError('candidate_progress_provider_limit')
+            for provider, state, count in rows:
+                if state not in states or type(count) is not int or count < 0:
+                    raise ValueError('candidate_progress_invalid_job_count')
+                result['jobs'][state] += count
+                bucket(provider)[state] += count
+        directory = queue.root
+        for part in ('reviewed_repairs', 'candidate_diagnostics', 'pending'):
+            directory = directory / part
+            try:
+                info = directory.lstat()
+            except FileNotFoundError:
+                queue._candidate_progress_cache = {}
+                return result
+            if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
+                raise ValueError('candidate_inbox_not_private_directory')
+        paths = _pending(directory)
+        if len(paths) > MAX_PENDING:
+            raise ValueError('candidate_inbox_exceeds_limit')
+        result['request_files'] = len(paths)
+        previous = getattr(queue, '_candidate_progress_cache', {})
+        cache = {}
+        for path in paths:
+            try:
+                def signature():
+                    value = path.lstat()
+                    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                            value.st_mtime_ns, value.st_ctime_ns)
+                before = signature()
+                cached = previous.get(path.name)
+                if cached is not None and cached[0] == before:
+                    provider, observation_key = cached[1:]
+                else:
+                    request = _load(path)
+                    provider, observation_key = request['target']['provider'], request['observation_key']
+                    if signature() != before:
+                        raise ValueError('candidate_request_changed_during_read')
+                cache[path.name] = (before, provider, observation_key)
+                job = (queue.db.execute('SELECT provider FROM native_candidate_jobs WHERE observation_key=?',
+                                        (observation_key,)).fetchone() if has_jobs else None)
+                if job is not None:
+                    if job[0] != provider:
+                        raise ValueError('candidate_progress_provider_mismatch')
+                    result['already_registered'] += 1
+                else:
+                    result['pending_unadmitted'] += 1
+                    bucket(provider)['pending_unadmitted'] += 1
+            except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError, NewsError):
+                result['invalid_or_unreadable'] += 1
+        queue._candidate_progress_cache = cache
+    except (OSError, ValueError, sqlite3.Error):
+        return {'contract_version': 1, 'available': False}
+    return result
 
 
 def _archive(queue, path, job, *, duplicate_of=None):
@@ -1455,8 +2200,10 @@ def claim_candidate(queue, http, config, provider):
     if (provider not in getattr(queue, 'native_candidate_ready_providers', ())
             or http.provider_not_before.get(provider, 0) > time.time()):
         return None
-    for job in queue.db.execute("SELECT * FROM native_candidate_jobs WHERE state='ready' AND provider=? "
-            'ORDER BY created_at_utc LIMIT ?', (provider, MAX_PENDING)).fetchall():
+    for job in queue.db.execute("SELECT j.* FROM native_candidate_jobs AS j "
+            'LEFT JOIN native_candidate_wait AS w ON w.request_id=j.request_id '
+            "WHERE j.state='ready' AND j.provider=? AND coalesce(w.not_before_epoch,0)<=? "
+            'ORDER BY j.created_at_utc LIMIT ?', (provider, time.time(), MAX_PENDING)).fetchall():
         request = json.loads(job['request_json'])
         target = request['target']
         evidence_version = request.get('evidence_contract_version', 1)
@@ -1465,7 +2212,7 @@ def claim_candidate(queue, http, config, provider):
                 or parts.scheme+'://'+parts.netloc in http.blocked_robots_origins(provider)):
             continue
         try:
-            if evidence_version in {7, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}:
+            if evidence_version in {7, 12, 13, 14, 15, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS}:
                 # Pending files can race before either enters SQLite. Serialize
                 # ready questions in a stable order; otherwise they would each
                 # see the other as "prior" and wait forever. Reservations and
@@ -1489,7 +2236,7 @@ def claim_candidate(queue, http, config, provider):
             if problem or _head(row) != target:
                 raise ValueError('head_changed_or_protected')
             source, identity = _question_source(queue.db, queue.registry, target['url'], evidence_version)
-            if evidence_version in {27, 28, 29, 30, 31, 32, 33} and not ettoday_literal_diagnostic_url(target['url'],
+            if evidence_version in {27, 28, 29, 30, 31, 32, 33, 51, 52} and not ettoday_literal_diagnostic_url(target['url'],
                     allow_house='house.ettoday.net' in source.reviewed_article_subsites):
                 raise ValueError('literal_current_ettoday_route_required')
             if source.provider != provider or identity != request['source']:
@@ -1499,20 +2246,67 @@ def claim_candidate(queue, http, config, provider):
                 raise ValueError('candidate_identity_changed')
             if not candidate_evidence_allowed(source, candidate, evidence_version):
                 raise ValueError('reviewed_candidate_evidence_contract_required')
+            expected_conflict = (_prior_ettoday_creator_conflict(queue.db, source, target['url'])
+                if evidence_version == 68 else None)
         except (ValueError, NewsError) as error:
+            outcome = {'reason': error.code if isinstance(error, NewsError) else 'head_or_source_no_longer_eligible'}
+            if isinstance(error, _ETtodayInlinePredecessorError):
+                # Fixed labels only: do not write source text, exception values,
+                # clock values or traceback locals into the private receipt.
+                outcome['ettoday_inline_predecessor_guard'] = error.detail
             with queue.db:
                 queue.db.execute("UPDATE native_candidate_jobs SET state='skipped',completed_at_utc=?,owner_id=?,result_json=? "
                     'WHERE request_id=?', (utc_now(), queue.owner,
-                        _bytes({'reason': error.code if isinstance(error, NewsError) else 'head_or_source_no_longer_eligible'}).decode(), job['request_id']))
+                        _bytes(outcome).decode(), job['request_id']))
             continue
         # The same main-thread writer owns reservation and future completion.
         # Reserve durably before handing any HTTP operation to the executor.
         with queue.db:
             queue.db.execute("UPDATE native_candidate_jobs SET state='reserved',reserved_at_utc=?,owner_id=? "
                 "WHERE request_id=? AND state='ready'", (utc_now(), queue.owner, job['request_id']))
-        return {'request_id': job['request_id'], 'provider': provider, 'url': target['url'],
+        result = {'request_id': job['request_id'], 'provider': provider, 'url': target['url'],
             'source': source, 'candidate': candidate, 'evidence_contract_version': evidence_version}
+        if evidence_version == 68:
+            result.update(expected_conflict=expected_conflict, frozen_target=target, frozen_source=identity)
+        return result
     return None
+
+
+def candidate_next_wake_delay(queue, provider_cooldowns, request_scope_cooldowns, maximum):
+    """Wake for bounded future candidate gates without spinning on ready jobs.
+
+    Ready work has already had a dispatch opportunity in this cycle. Only a
+    future known deadline can cause an earlier wake here; an eligible but
+    predecessor-blocked job must not start an empty service-cycle loop.
+    """
+    if not getattr(queue, 'native_candidate_schema_ready', False):
+        return maximum
+    now = time.time()
+    deadlines = []
+    for provider in getattr(queue, 'native_candidate_ready_providers', ()):
+        source = queue.registry.sources.get(provider)
+        if source is None or not source.request_enabled:
+            continue
+        # Equality on (state, provider) uses the existing ready index; bound
+        # each provider separately so another publisher cannot be hidden by a
+        # large provider's first rows or trigger a sort of all ready jobs.
+        rows = queue.db.execute("SELECT j.request_json,w.not_before_epoch "
+            'FROM native_candidate_jobs AS j LEFT JOIN native_candidate_wait AS w ON w.request_id=j.request_id '
+            "WHERE j.state='ready' AND j.provider=? ORDER BY j.created_at_utc LIMIT ?",
+            (provider, MAX_PENDING)).fetchall()
+        for row in rows:
+            try:
+                url = json.loads(row['request_json'])['target']['url']
+                parts = urlsplit(url)
+                origin = parts.scheme + '://' + parts.netloc
+                scope = request_scope_cooldowns.get(provider, {})
+                due = max(row['not_before_epoch'] or 0, provider_cooldowns.get(provider, 0),
+                    scope.get('hosts', {}).get(parts.netloc, 0), scope.get('origins', {}).get(origin, 0))
+                if type(due) in (int, float) and math.isfinite(due) and due > now:
+                    deadlines.append(due)
+            except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
+                continue  # The normal claim path handles malformed or changed work.
+    return min(maximum, min(deadlines) - now) if deadlines else maximum
 
 
 def fetch_candidate(http, job):
@@ -1521,7 +2315,8 @@ def fetch_candidate(http, job):
             or not candidate_evidence_allowed(job['source'], job['candidate'], evidence_version)):
         raise ValueError('reviewed_candidate_evidence_contract_required')
     started = time.perf_counter()
-    response = http.get(job['url'])
+    response = (http.get(job['url'], follow_redirects=False)
+        if evidence_version in {50,55,56,57,58,59,60,61,62,63,64,65,66,67,68} else http.get(job['url']))
     received = time.perf_counter()
     if evidence_version == 6:
         from downloader.news_fulltext_watchmedia import watchmedia_article_id
@@ -1535,10 +2330,11 @@ def fetch_candidate(http, job):
         raise NewsError('candidate_literal_response_not_verified')
     facts = candidate_response_metadata(response, job['source'], job['candidate'],
         evidence_contract_version=evidence_version,
-        **({'requested_url':job['url']} if evidence_version in {5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS} else {}))
+        **({'requested_url':job['url']} if evidence_version in {5, 6, 7, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 46, 47, 48, 49, 50, 51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, *CONTENTPLATFORM_EVIDENCE_VERSIONS, *BASTILLE_RESIDENT_EVIDENCE_VERSIONS} else {}),
+        **({'expected_conflict':job.get('expected_conflict')} if evidence_version == 68 else {}))
     parsed = time.perf_counter()
     permit = None
-    if evidence_version in {15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS}:
+    if evidence_version in {15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, 49, 52, 56, 58, 59, 60, 68, *CONTENTPLATFORM_EVIDENCE_VERSIONS}:
         permit = facts.pop('private_original_permit', None)
     current_errors = {'article_identity_not_verified'}
     if evidence_version == 5 and original_route_version(job['source'].embedded_article_layout) == 11:
@@ -1575,7 +2371,114 @@ def fetch_candidate(http, job):
     return facts
 
 
+def _ettoday_attribution_predicates_result(result, url):
+    """A schema-name question cannot become an arbitrary-text retention path."""
+    from downloader.news_fulltext_metrics import ETTODAY_ATTRIBUTION_FAILURE_STAGES
+
+    def short(value, bound):
+        return value is None or isinstance(value, str) and 1 <= len(value) <= bound and not re.search(r'[\x00-\x1f\x7f]', value)
+
+    def named(value):
+        return (isinstance(value, dict) and set(value) == {'type','name'}
+            and value['type'] in {None,'Person','Organization'} and short(value['name'], 80))
+
+    keys = {'contract_version','evidence_contract_version','provider','question','status','requested_url','final_url',
+        'redirect_count','response_bytes','response_sha256','current_source_not_candidate','accepted_as_article',
+        'public_schema_declarations_retained','raw_or_names_or_body_retained','raw_or_body_retained',
+        'raw_response_retained','full_body_retained','body_completeness_verified','identity_or_alias_accepted',
+        'ettoday_attribution_predicates'}
+    if not isinstance(result, dict) or set(result) - {'timing'} != keys:
+        return False
+    facts = result['ettoday_attribution_predicates']
+    fact_keys = {'contract_version','question','published_at_raw','modified_at_raw','native_identity_relations',
+        'prelude_text_sha256','literal_role_name','creator_values','creator_is_list','creator_count','creator_values_withheld',
+        'creator_identifier_valid','creator_matches_literal_role_name','native_authors','authors_truncated',
+        'author_is_exact_publisher_organization','author_person_matches_literal_role_name','publisher_is_expected_organization',
+        'native_publisher','parser_outcomes','author_or_supplier_accepted','raw_response_retained','full_body_retained','source_values_rewritten'}
+    if not isinstance(facts, dict) or set(facts) != fact_keys:
+        return False
+    try:
+        if (result['contract_version'] != 1 or result['evidence_contract_version'] != 63 or result['provider'] != 'ettoday'
+                or result['question'] != ETTODAY_ATTRIBUTION_PREDICATES_QUESTION
+                or result['status'] != 200 or result['redirect_count'] != 0
+                or result['requested_url'] != url or result['final_url'] != url
+                or type(result['response_bytes']) is not int or not 0 < result['response_bytes'] <= 2 << 20
+                or not isinstance(result['response_sha256'], str) or not _SAFE_HASH.fullmatch(result['response_sha256'])
+                or any(result[key] is not True for key in ('current_source_not_candidate','public_schema_declarations_retained','raw_or_names_or_body_retained'))
+                or any(result[key] is not False for key in ('accepted_as_article','raw_or_body_retained','raw_response_retained',
+                    'full_body_retained','body_completeness_verified','identity_or_alias_accepted'))
+                or facts['contract_version'] != 1 or facts['question'] != ETTODAY_ATTRIBUTION_PREDICATES_QUESTION
+                or not isinstance(facts['prelude_text_sha256'], str) or not _SAFE_HASH.fullmatch(facts['prelude_text_sha256'])
+                or not short(facts['literal_role_name'], 8)
+                or any(facts[key] is not False for key in ('author_or_supplier_accepted','raw_response_retained','full_body_retained','source_values_rewritten'))):
+            return False
+        relations = facts['native_identity_relations']
+        if (not isinstance(relations, dict) or set(relations) != {'url_equals_literal_request',
+                'main_entity_equals_literal_request','headline_equals_single_native_heading'}
+                or any(value is not True for value in relations.values())):
+            return False
+        _clock(facts['published_at_raw']); _clock(facts['modified_at_raw'])
+        values = facts['creator_values']
+        if values is not None and (not isinstance(values, list) or len(values) > 4
+                or any(not isinstance(value, str) or not short(value, 160) for value in values)):
+            return False
+        if (facts['creator_count'] is not None and (type(facts['creator_count']) is not int or not 0 <= facts['creator_count'] <= 2 << 20)
+                or not isinstance(facts['native_authors'], list) or len(facts['native_authors']) > 4
+                or not all(named(value) for value in facts['native_authors']) or not named(facts['native_publisher'])
+                or any(type(facts[key]) is not bool for key in ('creator_is_list','creator_values_withheld',
+                    'creator_identifier_valid','creator_matches_literal_role_name','authors_truncated',
+                    'author_is_exact_publisher_organization','author_person_matches_literal_role_name','publisher_is_expected_organization'))):
+            return False
+        outcomes = facts['parser_outcomes']
+        if not isinstance(outcomes, list) or len(outcomes) != 2:
+            return False
+        for version, outcome in zip((41,42), outcomes):
+            if (not isinstance(outcome, dict) or set(outcome) != {'version','parse_succeeded','error_code',
+                    'attribution_failure_stage','failure_sites'} or outcome['version'] != version
+                    or type(outcome['parse_succeeded']) is not bool
+                    or outcome['parse_succeeded'] != (outcome['error_code'] is None)
+                    or outcome['error_code'] is not None and (not isinstance(outcome['error_code'], str)
+                        or not re.fullmatch(r'[a-z][a-z0-9_]{0,95}', outcome['error_code']))
+                    or outcome['attribution_failure_stage'] not in ETTODAY_ATTRIBUTION_FAILURE_STAGES | {None}
+                    or not isinstance(outcome['failure_sites'], list) or len(outcome['failure_sites']) > 8):
+                return False
+            for site in outcome['failure_sites']:
+                if (not isinstance(site, dict) or set(site) != {'module','function','line'}
+                        or not re.fullmatch(r'news_fulltext(?:_[a-z_]+)?[.]py', site['module'])
+                        or not re.fullmatch(r'[_a-zA-Z][_a-zA-Z0-9]{0,120}', site['function'])
+                        or type(site['line']) is not int or not 0 < site['line'] <= 1000000):
+                    return False
+        if 'timing' in result:
+            timing = result['timing']
+            if (not isinstance(timing, dict) or set(timing) != {'http_seconds','parse_seconds','scope_seconds','total_seconds'}
+                    or any(type(value) not in (int,float) or not math.isfinite(value) or not 0 <= value <= 3600 for value in timing.values())):
+                return False
+        return True
+    except (TypeError, ValueError, KeyError, AttributeError, RecursionError):
+        return False
+
+
 def finish_candidate(queue, job, *, result=None, error=None):
+    if (isinstance(error, NewsError) and error.request_deferred is True and error.retry is True
+            and error.code in REQUEST_DEFERRAL_CODES and getattr(error, 'initial_request_not_sent', False) is True
+            and type(error.delay) in (int, float) and math.isfinite(error.delay) and error.delay >= 0):
+        # get() proves only that this observation's initial URL was not sent;
+        # prior robots requests remain counted. A crash before this transaction
+        # still recovers the reservation as an unknown outcome, not a retry.
+        with queue.db:
+            cursor = queue.db.execute("UPDATE native_candidate_jobs SET state='ready',reserved_at_utc=NULL "
+                "WHERE request_id=? AND state='reserved' AND owner_id=?", (job['request_id'], queue.owner))
+            if cursor.rowcount != 1:
+                raise ValueError('candidate_completion_owner_mismatch')
+            queue.db.execute('INSERT INTO native_candidate_wait VALUES (?,?,?,?,1) '
+                'ON CONFLICT(request_id) DO UPDATE SET '
+                'not_before_epoch=max(native_candidate_wait.not_before_epoch,excluded.not_before_epoch),'
+                'last_gate_code=excluded.last_gate_code,last_deferred_at_utc=excluded.last_deferred_at_utc,'
+                'deferral_count=native_candidate_wait.deferral_count+1',
+                (job['request_id'], time.time() + max(0.05, error.delay), error.code, utc_now()))
+            queue.counter('native_candidate_gate_deferrals', 1)
+        queue.metrics.count(job['provider'], 'native_candidate_gate_deferrals')
+        return
     original_result = isinstance(result, PendingOriginal)
     retention_uncertain = False
     if original_result and error is None:
@@ -1586,6 +2489,14 @@ def finish_candidate(queue, job, *, result=None, error=None):
         if not reserved or job.get('evidence_contract_version') not in ORIGINAL_EVIDENCE_VERSIONS:
             raise ValueError('candidate_completion_owner_mismatch')
         try:
+            if job.get('evidence_contract_version') == 68:
+                row = queue.db.execute('SELECT * FROM articles WHERE url=?', (job['url'],)).fetchone()
+                source, identity = _question_source(queue.db, queue.registry, job['url'], 68)
+                if (_candidate_head_problem(row, time.time(), registry=queue.registry,
+                        layout='ettoday_visible_article_v41', evidence=68)
+                        or _head(row) != job.get('frozen_target') or identity != job.get('frozen_source')
+                        or _prior_ettoday_creator_conflict(queue.db, source, job['url']) != job.get('expected_conflict')):
+                    raise ValueError('candidate_predecessor_changed_before_retention')
             if (not isinstance(result.facts, dict) or result.facts.get('accepted_as_article') is not False
                     or result.facts.get('raw_or_names_or_body_retained') is not False
                     or len(_bytes(result.facts)) > 60000):
@@ -1613,8 +2524,57 @@ def finish_candidate(queue, job, *, result=None, error=None):
     else:
         state = 'observed'
     try:
+        # This fixed question keeps public header names/declarations, never an
+        # original/raw response or article prose. Do not label names absent,
+        # and do not extend private-original retention to metadata questions.
+        declaration_result = (job.get('evidence_contract_version') in {46,47,48,61}
+            and isinstance(result, dict) and not original_result
+            and result.get('public_header_declarations_retained') is True
+            and result.get('raw_or_body_retained') is False
+            and result.get('raw_or_names_or_body_retained') is True
+            and 'private_original' not in result)
+        excerpt = result.get('ettoday_unclassified_prelude') if isinstance(result, dict) else None
+        excerpt_result = (job.get('evidence_contract_version') == 62 and not original_result
+            and isinstance(excerpt, dict) and isinstance(excerpt.get('text'), str)
+            and 1 <= len(excerpt['text']) <= 160 and excerpt.get('possibly_prose') is True
+            and excerpt.get('text_sha256') == hashlib.sha256(excerpt['text'].encode()).hexdigest()
+            and excerpt.get('question') == ETTODAY_PRELUDE_EXCERPT_QUESTION
+            and result.get('question') == ETTODAY_PRELUDE_EXCERPT_QUESTION
+            and excerpt.get('paragraph_index') == 2
+            and excerpt.get('attribution_accepted') is False
+            and excerpt.get('author_or_supplier_accepted') is False
+            and excerpt.get('raw_response_retained') is False and excerpt.get('full_body_retained') is False
+            and result.get('body_completeness_verified') is False and result.get('identity_or_alias_accepted') is False
+            and result.get('diagnostic_excerpt_retained') is True
+            and result.get('raw_or_body_retained') is True and result.get('raw_or_names_or_body_retained') is True
+            and result.get('raw_response_retained') is False and result.get('full_body_retained') is False
+            and 'private_original' not in result and 'private_original_permit' not in result)
+        predicates_result = (job.get('evidence_contract_version') == 63 and not original_result
+            and _ettoday_attribution_predicates_result(result, job['url']))
+        moneyweekly_excerpt_result = False
+        if job.get('evidence_contract_version') == 67 and error is None:
+            from downloader.news_fulltext_moneyweekly_excerpt import excerpt_result as moneyweekly_excerpt_valid
+            moneyweekly_excerpt_result = not original_result and moneyweekly_excerpt_valid(result, job['url'])
+            if not moneyweekly_excerpt_result:
+                raise ValueError('finite_candidate_metadata_required')
+        if job.get('evidence_contract_version') == 66 and error is None:
+            from downloader.news_fulltext_moneyweekly_metadata import template_result
+            if original_result or not template_result(result, job['url']):
+                raise ValueError('finite_candidate_metadata_required')
+        if job.get('evidence_contract_version') == 65 and error is None:
+            from downloader.news_fulltext_moneyweekly import moneyweekly_body_geometry_result
+            if original_result or not moneyweekly_body_geometry_result(result, job['url']):
+                raise ValueError('finite_candidate_metadata_required')
+        if job.get('evidence_contract_version') == 64 and error is None:
+            from downloader.news_fulltext_moneyweekly import (
+                moneyweekly_literal_navigation_route, moneyweekly_navigation_metadata_result,
+            )
+            if moneyweekly_literal_navigation_route(job['url']) and (original_result
+                    or not moneyweekly_navigation_metadata_result(result, job['url'])):
+                raise ValueError('finite_candidate_metadata_required')
         if (not isinstance(result, dict) or result.get('accepted_as_article') is not False
                 or result.get('raw_or_names_or_body_retained') is not False
+                and not declaration_result and not excerpt_result and not predicates_result and not moneyweekly_excerpt_result
                 and not (original_result and job.get('evidence_contract_version') in ORIGINAL_EVIDENCE_VERSIONS
                     and (result.get('raw_or_names_or_body_retained') is True or retention_uncertain))):
             raise ValueError('finite_candidate_metadata_required')
@@ -1649,9 +2609,16 @@ def candidate_status(root, request_id):
                 'FROM native_candidate_jobs WHERE request_id=?', (request_id,)).fetchone()
             if row:
                 result = json.loads(row['result_json']) if row['result_json'] else None
-                return dict(flags, **retention_flags(json.loads(row['request_json']), result, row['state']),
+                output = dict(flags, **retention_flags(json.loads(row['request_json']), result, row['state']),
                     **{key: result if key == 'result_json' else value
                        for key, value in dict(row).items() if key != 'request_json'})
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_wait' AND type='table'").fetchone():
+                    waiting = db.execute('SELECT not_before_epoch,last_gate_code,last_deferred_at_utc,deferral_count '
+                                         'FROM native_candidate_wait WHERE request_id=?', (request_id,)).fetchone()
+                    if waiting:
+                        output['last_request_deferral'] = dict(waiting, contract_version=CANDIDATE_DEFERRAL_CONTRACT_VERSION,
+                            waiting=row['state'] == 'ready' and waiting['not_before_epoch'] > time.time())
+                return output
     path = root/'reviewed_repairs'/'candidate_diagnostics'/'pending'/(request_id+'.json')
     if path.exists():
         _load(path)

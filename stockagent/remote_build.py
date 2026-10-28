@@ -63,11 +63,42 @@ def _storage(path: Path, mounts: list[dict]) -> dict:
             'filesystem': mount['filesystem'], 'source': mount['source']}
 
 
-def effective_limits(affinity: list[int], memory_available: int, groups: list[dict]) -> dict:
+def _clean_file_reclaim(group: dict) -> int:
+    """Bound clean filesystem LRU bytes; never count anonymous/shared memory.
+
+    `file` includes shmem, whereas file LRUs describe reclaim candidates.
+    Both independent bounds are required. Subtract dirty, writeback and all
+    unevictable bytes conservatively; slab/swap are deliberately not credits.
+    Kernel counters are observations, never a reserved allocation guarantee.
+    """
+    raw = group.get('memory_stat')
+    if not isinstance(raw, str):
+        raise ValueError('clean-file admission requires observed memory.stat')
+    values = {}
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or parts[0] in values or not re.fullmatch(r'\d+', parts[1]):
+            raise ValueError('invalid or duplicate cgroup memory statistic')
+        values[parts[0]] = int(parts[1])
+    required = {'file', 'shmem', 'inactive_file', 'active_file', 'file_dirty', 'file_writeback', 'unevictable'}
+    if not required <= values.keys():
+        raise ValueError('clean-file admission needs complete reclaimability counters')
+    eligible = min(max(0, values['file'] - values['shmem']),
+                   values['inactive_file'] + values['active_file'])
+    excluded = values['file_dirty'] + values['file_writeback'] + values['unevictable']
+    return max(0, eligible - excluded)
+
+
+def effective_limits(affinity: list[int], memory_available: int, groups: list[dict], *,
+                     memory_policy: str = 'no_reclaim') -> dict:
+    if memory_policy not in {'no_reclaim', 'clean_file_reclaim_v1'}:
+        raise ValueError('unknown observed memory admission policy')
     if not affinity or memory_available < 0:
         raise ValueError('invalid observed capacity')
     cpu_capacity = float(len(affinity))
     memory_headroom = memory_available
+    unreclaimed_headroom = memory_available
+    reclaim_bounds = []
     for group in groups:
         quota = group.get('cpu_max')
         if quota is not None:
@@ -82,15 +113,25 @@ def effective_limits(affinity: list[int], memory_available: int, groups: list[di
         if limit is not None and limit != 'max':
             if used is None or int(limit) < 0 or int(used) < 0:
                 raise ValueError('unverified cgroup memory headroom')
-            memory_headroom = min(memory_headroom, max(0, int(limit) - int(used)))
-    return {'cpu_capacity': cpu_capacity, 'cpu_worker_budget': max(1, math.floor(cpu_capacity)),
+            headroom = max(0, int(limit) - int(used))
+            unreclaimed_headroom = min(unreclaimed_headroom, headroom)
+            reclaim = 0 if memory_policy == 'no_reclaim' else min(int(used), _clean_file_reclaim(group))
+            memory_headroom = min(memory_headroom, max(0, int(limit) - max(0, int(used) - reclaim)))
+            reclaim_bounds.append({'path': group.get('path'), 'clean_file_bytes': reclaim,
+                                   'unreclaimed_headroom_bytes': headroom})
+    result = {'cpu_capacity': cpu_capacity, 'cpu_worker_budget': max(1, math.floor(cpu_capacity)),
             'cpu_thread_trial_cap': min(len(affinity), 2 * max(1, math.ceil(cpu_capacity))),
             'memory_headroom_bytes': memory_headroom,
             'memory_policy': 'conservative MemAvailable and visible ancestor max-minus-current; no reclaim assumed'}
+    if memory_policy != 'no_reclaim':
+        result.update(memory_policy=memory_policy, memory_unreclaimed_headroom_bytes=unreclaimed_headroom,
+            memory_reclaim_bounds=reclaim_bounds,
+            memory_admission_scope='observed clean filesystem LRU only; no anonymous/shmem/slab/swap credit or reserved allocation')
+    return result
 
 
 def observe_node(source: Path, scratch: Path, *, proc: Path = Path('/proc'),
-                 sys: Path = Path('/sys')) -> dict:
+                 sys: Path = Path('/sys'), memory_policy: str = 'no_reclaim') -> dict:
     """Read actual affinity, accessible cgroup-v2 ancestors, topology and mounts."""
     source, scratch = source.resolve(strict=True), scratch.resolve(strict=True)
     mounts = _mounts(proc)
@@ -112,6 +153,13 @@ def observe_node(source: Path, scratch: Path, *, proc: Path = Path('/proc'),
         groups.append({'path': str(current), **{key: _read(current / key) for key in
                         ('cpu.max', 'memory.max', 'memory.current', 'cpu.stat', 'memory.events')}})
         groups[-1] = {key.replace('.', '_'): value for key, value in groups[-1].items()}
+        if memory_policy != 'no_reclaim':
+            groups[-1]['memory_stat'] = _read(current / 'memory.stat')
+            after = _read(current / 'memory.current')
+            before = groups[-1].get('memory_current')
+            if after is not None and before is not None:
+                # Do not take credit for usage disappearing between counters.
+                groups[-1]['memory_current'] = str(max(int(before), int(after)))
         if current == base:
             break
         current = current.parent
@@ -119,7 +167,7 @@ def observe_node(source: Path, scratch: Path, *, proc: Path = Path('/proc'),
               for line in (proc / 'meminfo').read_text().splitlines()
               if line.startswith(('MemAvailable:', 'MemTotal:'))}
     affinity = sorted(os.sched_getaffinity(0))
-    limits = effective_limits(affinity, memory['MemAvailable'], groups)
+    limits = effective_limits(affinity, memory['MemAvailable'], groups, memory_policy=memory_policy)
     topology, node_cpus = [], {}
     for cpu in affinity:
         directory = sys / f'devices/system/cpu/cpu{cpu}/topology'
@@ -136,6 +184,8 @@ def observe_node(source: Path, scratch: Path, *, proc: Path = Path('/proc'),
                 'cgroup_limits': [{key: group[key] for key in ('path', 'cpu_max', 'memory_max')}
                                   for group in groups], 'memory_total_bytes': memory['MemTotal'],
                 'source_storage': _storage(source, mounts), 'scratch_storage': _storage(scratch, mounts)}
+    if memory_policy != 'no_reclaim':
+        identity['memory_admission_policy'] = memory_policy
     return {'schema_version': 1, 'identity': identity, 'machine_sha256': digest(identity),
             'limits': limits, 'cgroups': groups,
             'observations': {'mem_available_bytes': memory['MemAvailable'],

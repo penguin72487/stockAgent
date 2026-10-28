@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,9 +66,12 @@ def readiness(queue, **changes):
     return value
 
 
-def test_blocked_transport_scan_releases_owner_and_preserves_concurrent_ledger(stream, monkeypatch):
+@pytest.mark.parametrize("operation", ["publish", "inspect", "notify"])
+def test_blocked_transport_scan_releases_owner_and_preserves_concurrent_ledger(stream, monkeypatch, operation):
     queue = stream[0]
     readiness(queue)
+    if operation != "publish":
+        queue.cycle()
     scanning, finish = threading.Event(), threading.Event()
     outcome = {}
 
@@ -77,7 +81,7 @@ def test_blocked_transport_scan_releases_owner_and_preserves_concurrent_ledger(s
 
     def cycle():
         try:
-            outcome['result'] = queue.cycle()
+            outcome['result'] = queue.notify_transport() if operation == "notify" else queue.cycle(publish=operation == "publish")
         except Exception as error:
             outcome['error'] = error
 
@@ -106,6 +110,379 @@ def test_blocked_transport_scan_releases_owner_and_preserves_concurrent_ledger(s
     assert not worker.is_alive()
     assert 'error' not in outcome, outcome.get('error')
     assert queue.load_ledger()['concurrent_owner_evidence'] == 'committed_while_network_scan_waited'
+
+
+def scan_api(queue, monkeypatch, *, state="idle", fail_sub=None):
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue.config["syncthing_folder_id"] = "backup-test"
+    monkeypatch.setattr(queue, "paired_transport", lambda: ("test-api", "test-key", "backup-test"))
+    calls, remaining_failures = [], [fail_sub] if fail_sub is not None else []
+
+    def request(base, key, path, query=None, *, method="GET", timeout=30):
+        calls.append((path, query, method, timeout))
+        assert 1 <= timeout <= 30
+        if path == "/rest/db/status":
+            return {"state": state}
+        assert path == "/rest/db/scan" and method == "POST"
+        if remaining_failures and query["sub"] == remaining_failures[0]:
+            remaining_failures.pop()
+            raise TimeoutError("synthetic notification timeout; data stays committed")
+        return {}
+
+    monkeypatch.setattr(api, "request", request)
+    return calls
+
+
+def test_partial_scan_ack_is_durable_without_granting_nas_acceptance(stream, monkeypatch):
+    queue = enable_pipeline(stream[0])
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    keys = list(ledger["deliveries"])
+    assert len(keys) >= 2
+    calls = scan_api(queue, monkeypatch, fail_sub=ledger["deliveries"][keys[1]]["dispatch"]["batch_relative"])
+    before = queue.ledger_path.read_bytes()
+    notification = queue.scan_transport(ledger)
+    assert notification["state"] == "retryable_scan_error"
+    assert len(notification["batch_scan_receipts"]) == 1
+    assert queue.ledger_path.read_bytes() == before, "network worker never writes the owner journal"
+    queue.record_transport_scan(ledger, notification)
+    module.private_json(queue.ledger_path, ledger)
+    restarted = BackupStream(queue.config)
+    monkeypatch.setattr(restarted, "paired_transport", queue.paired_transport)
+    current = restarted.load_ledger()
+    retried = restarted.scan_transport(current)
+    assert retried["state"] == "scan_request_acknowledged"
+    restarted.record_transport_scan(current, retried)
+    module.private_json(restarted.ledger_path, current)
+    first = ledger["deliveries"][keys[0]]["dispatch"]["batch_relative"]
+    assert sum(query.get("sub") == first for path, query, _, _ in calls if path == "/rest/db/scan") == 1
+    assert not retried["NAS_backup_verified"]
+    assert all(not row.get("acceptance") for row in current["deliveries"].values())
+    assert all(row["transport_scan_notification"]["state"] == "scan_request_acknowledged"
+               for row in current["deliveries"].values())
+    changed_generation = deepcopy(current)
+    changed_generation["deliveries"][keys[0]]["dispatch"]["identity_sha256"] = "b" * 64
+    changed_generation["deliveries"][keys[0]].pop("transport_scan_notification")
+    restarted.record_transport_scan(changed_generation, notification)
+    assert "transport_scan_notification" not in changed_generation["deliveries"][keys[0]]
+
+
+@pytest.mark.parametrize("state", ["scanning", ""])
+def test_busy_or_invalid_transport_scan_state_never_posts_or_marks_ack(stream, monkeypatch, state):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    calls = scan_api(queue, monkeypatch, state=state)
+    notification = queue.scan_transport(ledger)
+    queue.record_transport_scan(ledger, notification)
+    assert notification["state"].startswith("deferred_")
+    assert notification["pending_batch_scans"] == len(ledger["deliveries"])
+    assert notification["batch_scan_receipts"] == []
+    assert [path for path, _, _, _ in calls] == ["/rest/db/status"]
+    assert all("transport_scan_notification" not in row for row in ledger["deliveries"].values())
+
+
+def test_final_scan_timeout_keeps_cycle_receipt_and_committed_deliveries(stream, monkeypatch):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    before = queue.load_ledger()["deliveries"]
+    scan_api(queue, monkeypatch, fail_sub="tools")
+    result = queue.cycle(publish=False)
+    assert result["transport_scan"]["state"] == "retryable_scan_error"
+    assert result["pipeline"]["scan_errors"] == ["TimeoutError"]
+    assert json.loads((queue.state / "status.json").read_bytes())["transport_scan"] == result["transport_scan"]
+    assert queue.load_ledger()["deliveries"] == before
+    for key, delivery in before.items():
+        verify(queue.transport / delivery["dispatch"]["batch_relative"], key)
+
+
+@pytest.mark.parametrize("publish", [False, True])
+@pytest.mark.parametrize("folder_state", ["idle", "scanning"])
+def test_cycle_final_status_and_clock_match_private_and_receiver_copies(stream, monkeypatch, publish, folder_state):
+    queue = stream[0]
+    readiness(queue)
+    scan_api(queue, monkeypatch, state=folder_state)
+    clock = [100.0]
+    epoch = time.time()
+    local_time = SimpleNamespace(**vars(time))
+    local_time.perf_counter = lambda: clock[0]
+    monkeypatch.setattr(module, "time", local_time)
+
+    class ClockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromtimestamp(epoch + clock[0] - 100, tz)
+
+    monkeypatch.setattr(module, "datetime", ClockDatetime)
+    original_index, original_scan = module.recovery_index, queue.scan_transport
+
+    def late_index(*args, **kwargs):
+        clock[0] += 11
+        return original_index(*args, **kwargs)
+
+    def delayed_scan(ledger):
+        clock[0] += 7
+        return original_scan(ledger)
+
+    monkeypatch.setattr(module, "recovery_index", late_index)
+    monkeypatch.setattr(queue, "scan_transport", delayed_scan)
+    result = queue.cycle(publish=publish)
+    private = (queue.state / "status.json").read_bytes()
+    receiver = (queue.transport / "tools/source-status.json").read_bytes()
+    assert json.loads(private) == result
+    assert json.loads(receiver) == result
+    assert result["complete_cycle_seconds"] == clock[0] - 100
+    assert result["observed_at_utc"] == ClockDatetime.now(timezone.utc).isoformat()
+    assert private == receiver
+
+
+def test_redirected_transport_pairing_still_rejects_before_scan(stream, monkeypatch):
+    queue = stream[0]
+    queue.config["syncthing_folder_id"] = "backup-test"
+    def redirected():
+        raise SnapshotError("backup transport no longer has the paired send-only scope")
+    monkeypatch.setattr(queue, "paired_transport", redirected)
+    with pytest.raises(SnapshotError, match="paired send-only"):
+        queue.scan_transport(module.empty_ledger())
+
+
+def test_notify_only_resumes_scan_without_catalog_capture_or_reexport(stream, monkeypatch):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    before = deepcopy(queue.load_ledger()["deliveries"])
+    calls = scan_api(queue, monkeypatch)
+    monkeypatch.setattr(module, "capture_catalog", lambda *a, **kw: pytest.fail("notification cannot recapture history"))
+    monkeypatch.setattr(module, "export_incremental_delivery", lambda *a, **kw: pytest.fail("notification cannot reexport payload"))
+    notification = queue.notify_transport()
+    assert notification["state"] == "scan_request_acknowledged"
+    current = queue.load_ledger()["deliveries"]
+    assert current.keys() == before.keys()
+    for key, delivery in current.items():
+        assert {name: value for name, value in delivery.items() if name != "transport_scan_notification"} == before[key]
+        verify(queue.transport / delivery["dispatch"]["batch_relative"], key)
+    assert len(calls) == 2 + len(before)
+    assert json.loads((queue.state / "transport-scan-status.json").read_bytes()) == notification
+
+
+def test_scan_budget_retains_exact_unnotified_batches_for_next_call(stream, monkeypatch):
+    queue = enable_pipeline(stream[0])
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    calls = scan_api(queue, monkeypatch)
+    monkeypatch.setattr(module, "MAX_TRANSPORT_SCAN_BATCHES", 1)
+    while any("transport_scan_notification" not in row for row in ledger["deliveries"].values()):
+        notification = queue.scan_transport(ledger)
+        assert len(notification["batch_scan_receipts"]) == 1
+        queue.record_transport_scan(ledger, notification)
+    paths = [query["sub"] for path, query, _, _ in calls if path == "/rest/db/scan" and query["sub"] != "tools"]
+    assert len(paths) == len(set(paths)) == len(ledger["deliveries"])
+
+
+def test_scan_wall_budget_expires_without_starting_another_request(stream, monkeypatch):
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue = stream[0]
+    queue.config["syncthing_folder_id"] = "backup-test"
+    monkeypatch.setattr(queue, "paired_transport", lambda: ("test-api", "test-key", "backup-test"))
+    clock, calls = [100.0], []
+    def request(base, key, path, query=None, **kwargs):
+        calls.append(path)
+        clock[0] = 131.0
+        return {"state": "idle"}
+    monkeypatch.setattr(api, "request", request)
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    notification = queue.scan_transport(module.empty_ledger())
+    assert notification["state"] == "deferred_scan_budget"
+    assert not notification["tools_scan_requested"]
+    assert calls == ["/rest/db/status"]
+
+
+@pytest.mark.parametrize("timeout", [0, True, "30", 1801])
+def test_scan_rejects_invalid_budget_before_any_request(stream, monkeypatch, timeout):
+    queue = stream[0]
+    queue.config.update(syncthing_folder_id="backup-test", scan_timeout_seconds=timeout)
+    monkeypatch.setattr(queue, "paired_transport", lambda: pytest.fail("invalid budget cannot reach the API"))
+    with pytest.raises(SnapshotError, match="timeout must be bounded"):
+        queue.scan_transport(module.empty_ledger())
+
+
+def test_scan_rejects_unsafe_batch_path_before_any_request(stream, monkeypatch):
+    queue = stream[0]
+    queue.config["syncthing_folder_id"] = "backup-test"
+    monkeypatch.setattr(queue, "paired_transport", lambda: pytest.fail("invalid path cannot reach the API"))
+    ledger = {"deliveries": {"a" * 64: {"dispatch": {"identity_sha256": "b" * 64, "batch_relative": "../outside"}}}}
+    with pytest.raises(SnapshotError, match="batch scan path"):
+        queue.scan_transport(ledger)
+
+
+def test_notify_only_rejects_redirected_owner_lock(stream, tmp_path):
+    queue = stream[0]
+    outside = tmp_path / "outside-lock"
+    outside.write_text("preserve")
+    (queue.state / "owner.lock").symlink_to(outside)
+    with pytest.raises(SnapshotError, match="owner lock is redirected"):
+        queue.notify_transport()
+    assert outside.read_text() == "preserve"
+
+
+def test_scan_http_error_closes_response_and_reports_bounded_capacity_reason(stream, monkeypatch):
+    import io
+    import urllib.error
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue = stream[0]
+    queue.config["syncthing_folder_id"] = "backup-test"
+    monkeypatch.setattr(queue, "paired_transport", lambda: ("test-api", "test-key", "backup-test"))
+    body = io.BytesIO(b'insufficient space on disk for database; never publish this raw body')
+    def request(*args, **kwargs):
+        raise urllib.error.HTTPError("test-api", 500, "scan failed", {}, body)
+    monkeypatch.setattr(api, "request", request)
+    result = queue.scan_transport(module.empty_ledger())
+    assert body.closed
+    assert result["state"] == "retryable_scan_error" and result["reason"] == "database_disk_reserve"
+    assert result["http_status"] == 500 and result["error_type"] == "HTTPError"
+    assert "never publish" not in json.dumps(result)
+
+
+def test_catalog_capture_yields_owner_and_rebases_published_auxiliary_and_ack(stream, tmp_path, monkeypatch):
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    readiness(queue)
+    capture = module.capture_catalog
+    capturing, finish = threading.Event(), threading.Event()
+    outcome = {}
+
+    def blocked_capture(*args, **kwargs):
+        result = capture(*args, **kwargs)
+        capturing.set()
+        assert finish.wait(10), 'test must finish the catalog observation'
+        return result
+
+    def cycle():
+        try:
+            outcome['result'] = queue.cycle()
+        except Exception as error:
+            outcome['error'] = error
+
+    monkeypatch.setattr(module, 'capture_catalog', blocked_capture)
+    worker = threading.Thread(target=cycle)
+    worker.start()
+    try:
+        assert capturing.wait(5), 'the source must reach the full catalog capture'
+        with pytest.raises(SnapshotError, match='another source stream cycle is active'):
+            queue.cycle(publish=False)
+        with (queue.state / 'owner.lock').open('a') as owner:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pytest.fail('read-only catalog capture retained the publication owner')
+            ledger = queue.load_ledger()
+            pending = ledger['auxiliary_pending']
+            key = pending['export']['envelope_identity_sha256']
+            queue.publish_closed(ledger, pending['files'], queue.transport / pending['staging_relative'],
+                                 key, 'a' * 64, 'code_and_control_backup')
+            queue.recover_publications(ledger)
+            ledger['concurrent_catalog_evidence'] = 'keep the newer journal'
+            module.private_json(queue.ledger_path, ledger)
+            acknowledge(queue, ledger['deliveries'][key])
+    finally:
+        finish.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert 'error' not in outcome, outcome.get('error')
+    ledger = queue.load_ledger()
+    assert ledger['concurrent_catalog_evidence'] == 'keep the newer journal'
+    assert ledger['last_auxiliary_delivery'] == key
+    assert not ledger.get('auxiliary_pending')
+    assert ledger['deliveries'][key]['state'] == 'nas_file_restore_acknowledged'
+    assert len([d for d in ledger['deliveries'].values()
+                if d['dispatch']['delivery_kind'] == 'code_and_control_backup']) == 1
+    assert outcome['result']['auxiliary_nas_acknowledged'] is True
+    verify(queue.transport / ledger['deliveries'][key]['dispatch']['batch_relative'], key)
+
+
+def test_redirected_cycle_guard_rejected_before_catalog_or_publication(stream, tmp_path, monkeypatch):
+    queue = stream[0]
+    outside = tmp_path / 'unchanged-control'
+    outside.write_text('preserve')
+    (queue.state / 'cycle.lock').symlink_to(outside)
+    monkeypatch.setattr(module, 'capture_catalog', lambda *a, **kw: pytest.fail('redirected cycle entered capture'))
+    with pytest.raises(SnapshotError, match='cycle lock is redirected'):
+        queue.cycle()
+    assert outside.read_text() == 'preserve'
+    assert not queue.load_ledger()['deliveries']
+
+
+def test_failed_catalog_preserves_staged_auxiliary_and_concurrent_journal(stream, tmp_path, monkeypatch):
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    capturing, finish = threading.Event(), threading.Event()
+    outcome = {}
+
+    def failed_capture(*args, **kwargs):
+        capturing.set()
+        assert finish.wait(10)
+        raise SnapshotError('synthetic full catalog failure')
+
+    def cycle():
+        try:
+            queue.cycle()
+        except Exception as error:
+            outcome['error'] = error
+
+    monkeypatch.setattr(module, 'capture_catalog', failed_capture)
+    worker = threading.Thread(target=cycle)
+    worker.start()
+    try:
+        assert capturing.wait(5)
+        with (queue.state / 'owner.lock').open('a') as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            ledger = queue.load_ledger()
+            pending = deepcopy(ledger['auxiliary_pending'])
+            ledger['concurrent_catalog_evidence'] = 'preserve after failed observation'
+            module.private_json(queue.ledger_path, ledger)
+    finally:
+        finish.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert isinstance(outcome.get('error'), SnapshotError)
+    ledger = queue.load_ledger()
+    assert ledger['concurrent_catalog_evidence'] == 'preserve after failed observation'
+    assert ledger['auxiliary_pending'] == pending
+    assert not ledger['deliveries']
+    verify(queue.transport / pending['staging_relative'], pending['export']['envelope_identity_sha256'])
+    with (queue.state / 'owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_catalog_reentry_rechecks_storage_before_publication(stream, monkeypatch):
+    queue = stream[0]
+    readiness(queue)
+    capture = module.capture_catalog
+    guard = queue.storage_guard
+    captured = False
+
+    def observed(*args, **kwargs):
+        nonlocal captured
+        result = capture(*args, **kwargs)
+        captured = True
+        return result
+
+    def changed_storage():
+        if captured:
+            raise SnapshotError('synthetic transport mount replacement')
+        guard()
+
+    monkeypatch.setattr(module, 'capture_catalog', observed)
+    monkeypatch.setattr(queue, 'storage_guard', changed_storage)
+    with pytest.raises(SnapshotError, match='transport mount replacement'):
+        queue.cycle()
+    assert not queue.load_ledger()['deliveries']
+    assert not (queue.state / 'catalog.json').exists()
+    assert not list(queue.transport.glob('batch-*'))
 
 
 def test_independent_publication_keeps_sending_during_stale_or_unavailable_nas(stream):
@@ -439,6 +816,103 @@ def test_inventory_deduplicates_objects_across_retained_versions(stream):
     assert catalog["missing_objects"] == []
 
 
+@pytest.mark.parametrize("damage", [None, "missing", "short", "symlink"])
+@pytest.mark.parametrize("metadata_workers", [1, 4])
+def test_catalog_observes_shared_objects_once_and_preserves_every_release(
+        tmp_path, monkeypatch, damage, metadata_workers):
+    cold, source = tmp_path / "cold", tmp_path / "source"
+    initialize_packed_layout(cold, node_id="penguin")
+    source.mkdir()
+    for number in range(96):
+        (source / f"{number:03}.bin").write_bytes(hashlib.sha256(str(number).encode()).digest())
+    first = publish_packed_snapshot(cold, "prices", source, loose_file_threshold_bytes=1)
+    (source / "new.bin").write_bytes(b"new observed source")
+    second = publish_packed_snapshot(cold, "prices", source, loose_file_threshold_bytes=1)
+    policy = tmp_path / "catalog.json"
+    policy.write_text(json.dumps({"datasets": [{"dataset": "prices", "publish": True}]}))
+    versions = [first, second]
+    references = {
+        version.manifest["snapshot_id"]: [version.manifest["archive"]["inventory"], *version.manifest["archive"]["objects"]]
+        for version in versions
+    }
+    paths = {ref["relpath"] for refs in references.values() for ref in refs}
+    shared = sorted({ref["relpath"] for ref in references[first.manifest["snapshot_id"]]}
+                    & {ref["relpath"] for ref in references[second.manifest["snapshot_id"]]})[0]
+    if damage:
+        target = cold / shared
+        target.unlink()
+        if damage == "short":
+            target.write_bytes(b"")
+        elif damage == "symlink":
+            target.symlink_to(source / "000.bin")
+    seen = []
+    original = module.PinnedObjectSignatures.regular_file_signature
+
+    def observed(reader, relative):
+        seen.append(relative)
+        return original(reader, relative)
+
+    monkeypatch.setattr(module.PinnedObjectSignatures, "regular_file_signature", observed)
+    catalog = capture_catalog(cold, policy, metadata_workers=metadata_workers)
+    assert len(seen) == len(paths) and set(seen) == paths
+    assert len(catalog["releases"]) == len(versions)
+    assert {row["relative"] for row in catalog["files"] if row["role"] == "packed_object"} == (
+        paths - ({shared} if damage else set())
+    )
+    for release in catalog["releases"]:
+        refs = references[release["snapshot_id"]]
+        assert release["required_file_keys"] == sorted([
+            release["manifest_relative"] + "@" + release["manifest_sha256"],
+            *(ref["relpath"] + "@" + ref["sha256"] for ref in refs),
+        ])
+        assert release["missing_objects"] == ([shared] if damage else [])
+    assert [row["relative"] for row in catalog["missing_objects"]] == ([shared] if damage else [])
+
+
+@pytest.mark.parametrize("metadata_workers", [1, 4])
+def test_catalog_rejects_object_directory_replacement_after_observation(stream, monkeypatch, metadata_workers):
+    queue, cold, *_ = stream
+    original = module.PinnedObjectSignatures.regular_file_signature
+    replaced = []
+
+    def replace_after_stat(reader, relative):
+        observed = original(reader, relative)
+        if not replaced:
+            directory = (cold / relative).parent
+            directory.rename(directory.with_name(directory.name + "-retained"))
+            directory.mkdir()
+            replaced.append(directory)
+        return observed
+
+    monkeypatch.setattr(module.PinnedObjectSignatures, "regular_file_signature", replace_after_stat)
+    with pytest.raises(SnapshotError, match="directory changed"):
+        capture_catalog(cold, Path(queue.config["publication_catalog"]), metadata_workers=metadata_workers)
+    assert replaced
+
+
+def test_parallel_catalog_preserves_complete_identity_and_does_overlap_leaf_stats(stream, monkeypatch):
+    from threading import Barrier, Lock
+    queue, cold, *_ = stream
+    policy = Path(queue.config['publication_catalog'])
+    baseline = capture_catalog(cold, policy, metadata_workers=1)
+    barrier, lock, entered = Barrier(2), Lock(), []
+    original = module.PinnedObjectSignatures.regular_file_signature
+
+    def observed(reader, relative):
+        with lock:
+            entered.append(relative)
+            wait = len(entered) <= 2
+        if wait:
+            barrier.wait(timeout=5)
+        return original(reader, relative)
+
+    monkeypatch.setattr(module.PinnedObjectSignatures, 'regular_file_signature', observed)
+    parallel = capture_catalog(cold, policy, metadata_workers=4)
+    assert entered
+    assert {k:v for k,v in parallel.items() if k != 'observed_at_utc'} == {
+        k:v for k,v in baseline.items() if k != 'observed_at_utc'}
+
+
 def test_optional_unreferenced_cold_evidence_is_backed_without_inventing_release(stream):
     queue, cold, *_ = stream
     raw = b'unreferenced unique bytes'
@@ -718,6 +1192,60 @@ def test_auxiliary_precedes_large_data_and_identical_capture_is_not_republished(
     ledger = queue.load_ledger()
     assert sum(d["dispatch"]["delivery_kind"] == "code_and_control_backup" for d in ledger["deliveries"].values()) == 1
     assert ledger["deliveries"][key]["acceptance"]["control_database_restore_verified"] is False
+
+
+def test_unchanged_auxiliary_avoids_capacity_census_and_keeps_retained_payload(stream, tmp_path, monkeypatch):
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    key = ledger['last_auxiliary_delivery']
+    receipt = Path(queue.config['auxiliary']['control_receipt'])
+    ledger['auxiliary_last_capture_epoch'] = 0
+    retained = queue.transport/'.staging/failed-copy-to-preserve'
+    retained.parent.mkdir(exist_ok=True)
+    retained.write_bytes(b'unknown failed copy; never discard')
+    monkeypatch.setattr(queue, 'transport_usage', lambda: pytest.fail('no export needs no capacity census'))
+    queue.stage_auxiliary(ledger)
+    assert not ledger.get('auxiliary_pending')
+    assert ledger['auxiliary_last_capture_epoch'] > 0
+    assert ledger['auxiliary_source_control_receipt_sha256'] == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    assert retained.read_bytes() == b'unknown failed copy; never discard'
+    verify(queue.transport/ledger['deliveries'][key]['dispatch']['batch_relative'], key)
+    assert len(ledger['deliveries']) == 1
+
+
+@pytest.mark.parametrize("changed_input", ["code", "control_receipt"])
+def test_changed_auxiliary_keeps_full_capacity_admission_before_export(stream, tmp_path, monkeypatch, changed_input):
+    from stockagent.data_sync import backup_auxiliary
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    ledger['auxiliary_last_capture_epoch'] = 0
+    code = Path(queue.config['auxiliary']['repository_root'])/'README.md'
+    receipt = Path(queue.config['auxiliary']['control_receipt'])
+    if changed_input == "code":
+        code.write_text('changed code must get a new backup\n')
+    else:
+        control = json.loads(receipt.read_bytes())
+        control['observed_at_utc'] = "2026-01-02T03:04:05+00:00"
+        receipt.write_text(json.dumps(control))
+    retained_inputs = {path: path.read_bytes() for path in (code, receipt)}
+    before = deepcopy(ledger)
+    observed = []
+    def full_capacity():
+        observed.append(True)
+        return {'retained_transport_bytes':queue.config['maximum_retained_transport_bytes'],
+                'retained_staging_bytes':0}
+    monkeypatch.setattr(queue, 'transport_usage', full_capacity)
+    monkeypatch.setattr(backup_auxiliary, 'export_auxiliary', lambda *a, **kw: pytest.fail('capacity denied export'))
+    with pytest.raises(SnapshotError, match='auxiliary capacity budget reached'):
+        queue.stage_auxiliary(ledger)
+    assert observed == [True] and ledger == before
+    assert all(path.read_bytes() == body for path, body in retained_inputs.items())
 
 
 def test_auxiliary_restart_after_journal_commit_finishes_handoff_once(stream, tmp_path, monkeypatch):

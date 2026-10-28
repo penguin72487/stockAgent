@@ -123,7 +123,8 @@ def _load_base_bundle(path: Path, *, selected: pl.DataFrame, daily_digest: str,
 def normalize_continuous_ticks(frame: pl.DataFrame, *, day: date, alias: str,
                                physical: str, digest: str, product: str | None = None,
                                asset_class: str = "stock_future", query_dates: tuple[date, ...] | None = None,
-                               is_last_trading_day: bool = False) -> tuple[pl.DataFrame, dict]:
+                               is_last_trading_day: bool = False,
+                               dated_specification: pl.DataFrame | None = None) -> tuple[pl.DataFrame, dict]:
     required = {"event_ts", "ts", "close", "volume", "trading_date", "query_contract", "source_row_index"}
     if not required <= set(frame.columns) or frame.is_empty():
         raise ValueError("missing tick schema or empty complete receipt")
@@ -134,7 +135,17 @@ def normalize_continuous_ticks(frame: pl.DataFrame, *, day: date, alias: str,
     if frame.filter(pl.col("event_ts").cast(pl.Int64) != pl.col("ts")).height:
         raise ValueError("tick event timestamp differs from wall-clock ts")
     start_minute, end_minute = 525, 825
-    if product is not None:
+    dated_seconds=None
+    if dated_specification is not None:
+        from stockagent.data.tw_futures_decision_clock import dated_entry_sessions
+        if (dated_specification.height!=1 or dated_specification['date'][0]!=day
+                or dated_specification['product'][0]!=product
+                or dated_specification['physical_contract'][0]!=physical):
+            raise ValueError('dated tick specification differs from physical query identity')
+        row=dated_entry_sessions(dated_specification).row(0,named=True)
+        dated_seconds=(row['_start'],row['_end'])
+        start_minute,end_minute=dated_seconds[0]//60,dated_seconds[1]//60
+    elif product is not None:
         from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
         start_minute, end_minute = taifex_futures_day_session_minutes(
             day, product_code=product, asset_class=asset_class,
@@ -147,9 +158,10 @@ def normalize_continuous_ticks(frame: pl.DataFrame, *, day: date, alias: str,
     ).sort(["event_ts", *(["_query_partition_order"] if "_query_partition_order" in frame.columns else []), "source_row_index"])
     if product is not None:
         day_ns = int(np.datetime64(day, "ns").astype(np.int64))
+        start_s,end_s=dated_seconds or (start_minute*60,end_minute*60)
         session = session.filter(pl.col("ts").is_between(
-            day_ns + start_minute * 60_000_000_000,
-            day_ns + end_minute * 60_000_000_000,
+            day_ns + start_s * 1_000_000_000,
+            day_ns + end_s * 1_000_000_000,
         ))
     if session.is_empty():
         raise ValueError("no day-session trades")
@@ -158,7 +170,13 @@ def normalize_continuous_ticks(frame: pl.DataFrame, *, day: date, alias: str,
         raise ValueError("invalid day-session price/volume")
     # A transaction is a grid-constrained outright price; the minute VWAP
     # calculated below is not. Use the session date, never today's FOP rule.
-    if product is None:
+    if dated_specification is not None and dated_specification['spec_tick_kind'][0]=='fixed':
+        tick=dated_specification['spec_tick_size'][0]
+        if tick is None or not np.isfinite(tick) or tick<=0:
+            raise ValueError('dated fixed tick must be positive')
+        quotients=session['close'].to_numpy()/tick
+        valid_grid=np.isclose(quotients,np.rint(quotients),rtol=0,atol=1e-7)
+    elif product is None:
         valid_grid = price_on_tick_grid_numpy(
             session["close"].to_numpy(), np.datetime64(day), security_types=asset_class,
         )

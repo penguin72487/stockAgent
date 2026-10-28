@@ -20,6 +20,23 @@ from stockagent.data_sync.packed_snapshots import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def tiny_metadata_scratch_capacity(monkeypatch):
+    # Forced one-row spills exercise SQLite/binding semantics with a handful
+    # of owned records, independently of a busy host's transient free space.
+    # Keep every production check; only its observed test capacity is fixed.
+    native_usage = migration.shutil.disk_usage
+
+    def usage(path):
+        observed = native_usage(path)
+        if Path(path) == Path('/var/tmp'):
+            free = 64 * 1024**3
+            return observed._replace(free=free, used=observed.total - free)
+        return observed
+
+    monkeypatch.setattr(migration.shutil, 'disk_usage', usage)
+
+
 @pytest.mark.parametrize('kind', ['json', 'streamed', 'sqlite'])
 def test_new_migration_captures_preserve_configured_free_space(tmp_path, monkeypatch, kind):
     # The old 5 GiB check accepted 10 GiB free and could exhaust the shared
@@ -244,6 +261,7 @@ def setup(tmp_path, monkeypatch):
     (repo / "configs").mkdir(parents=True)
     policy = json.loads((ROOT / "configs/columnar_storage.json").read_text())
     policy["source_versioning"]["roots"] = {}
+    policy["dataset_version_lifecycle"]["pending_source_priority"] = []
     (repo / "configs/columnar_storage.json").write_text(json.dumps(policy))
     monkeypatch.setattr(publisher, "REPO_ROOT", repo)
     cold = tmp_path / "cold"
@@ -260,6 +278,83 @@ def setup(tmp_path, monkeypatch):
         retry_seconds=1, maximum_passes=1, watch=False, recover_missing_base_objects=False,
         source_lock_fd=None)
     return repo, cold, entries, args, policy["source_versioning"]
+
+
+def test_pending_priority_changes_only_untouched_order_with_real_recovery(setup):
+    repo, _, entries, args, _ = setup
+    args.maximum_attempted_sources = 1
+    args.pending_source_priority = ['private']
+    first = migration.migrate_catalog(repo, args, entries)
+    assert first['datasets']['private']['state'] == 'verified'
+    assert first['datasets']['public']['state'] == 'pending'
+    binding = dict(first['datasets']['private'])
+    plan = (args.migration_state / 'plan.json').read_bytes()
+    args.pending_source_priority = ['public', 'private']
+    second = migration.migrate_catalog(repo, args, entries)
+    assert second['state'] == 'verified' and second['source_count'] == 2
+    assert second['datasets']['private'] == binding
+    assert second['plan_sha256'] == first['plan_sha256']
+    assert (args.migration_state / 'plan.json').read_bytes() == plan
+    assert second['pending_source_priority'] == ['public', 'private']
+
+
+def test_queue_preference_never_outranks_committed_recovery_or_oldest_retry():
+    entries = [{'dataset': name} for name in ['bulk', 'finlab', 'finmind', 'retry-new', 'retry-old']]
+    rows = {'bulk': {'state': 'waiting_retry', 'snapshot_id': 'fixed', 'started_at_utc': 'later'},
+            'finlab': {'state': 'pending'}, 'finmind': {'state': 'pending'},
+            'retry-new': {'state': 'waiting_retry', 'started_at_utc': '2026-10-27', 'attempts': 1},
+            'retry-old': {'state': 'waiting_retry', 'started_at_utc': '2026-10-26', 'attempts': 200}}
+    priorities = migration._pending_source_priorities(['finmind', 'retry-new'], entries)
+    assert [row['dataset'] for row in migration._source_step_order(entries, rows, priorities)] == [
+        'bulk', 'finmind', 'finlab', 'retry-old', 'retry-new']
+
+
+def test_future_retry_deadline_still_yields_to_other_work(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    args.maximum_attempted_sources = 1
+    original = publisher._publish_entry
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *_: ({'publish_ready': False}, None))
+    first = migration.migrate_catalog(repo, args, entries)
+    path = args.migration_state / 'progress.json'
+    document = json.loads(path.read_bytes())
+    document['datasets']['public']['retry_at_unix'] = 10**20
+    path.write_text(json.dumps(document))
+    monkeypatch.setattr(publisher, '_publish_entry', original)
+    args.pending_source_priority = ['public']
+    second = migration.migrate_catalog(repo, args, entries)
+    assert second['datasets']['private']['state'] == 'verified'
+    assert second['datasets']['public']['attempts'] == first['datasets']['public']['attempts']
+    assert second['datasets']['public']['retry_at_unix'] == 10**20
+
+
+@pytest.mark.parametrize('value', [None, 'private', ['private', 'private'], ['unknown'], [False], [[]], ['']])
+def test_invalid_priority_rejects_before_creating_operation(setup, value):
+    repo, _, entries, args, _ = setup
+    args.pending_source_priority = value
+    with pytest.raises(SnapshotError, match='pending source priorities'):
+        migration.migrate_catalog(repo, args, entries)
+    assert not args.migration_state.exists()
+
+
+def test_lifecycle_priority_change_keeps_original_operation_and_daily_deadline(setup, monkeypatch):
+    repo, cold, entries, args, _ = setup
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    configuration = {'cold_root': str(cold), 'state_root': str(args.migration_state.parent / 'control')}
+    first = migration.advance_catalog_versions(repo, configuration, now=100)
+    current_path = args.migration_state.parent / 'control/dataset-versions/current.json'
+    before = json.loads(current_path.read_bytes())
+    plan = (Path(before['operation_directory']) / 'plan.json').read_bytes()
+    path = repo / 'configs/columnar_storage.json'
+    settings = json.loads(path.read_bytes())
+    settings['dataset_version_lifecycle']['pending_source_priority'] = ['private']
+    path.write_text(json.dumps(settings))
+    second = migration.advance_catalog_versions(repo, configuration, now=200)
+    after = json.loads(current_path.read_bytes())
+    assert second['state'] == 'verified' and second['verified_datasets'] == 2
+    assert after['plan_sha256'] == first['plan_sha256']
+    assert after['operation_directory'] == before['operation_directory']
+    assert (Path(before['operation_directory']) / 'plan.json').read_bytes() == plan
+    assert migration.advance_catalog_versions(repo, configuration, now=300)['next_cycle_unix'] == 200 + 86400
 
 
 def test_all_sources_including_private_have_exact_verified_versions(setup):
@@ -397,7 +492,8 @@ def _futures_interfaces(setup):
     return repo, cold, catalog, args, policy
 
 
-def test_futures_cross_root_interfaces_bind_fixed_versions_without_payload_copy(setup, monkeypatch):
+def test_futures_cross_root_interfaces_bind_fixed_versions_without_payload_copy(
+        setup, monkeypatch, tiny_metadata_scratch_capacity):
     from stockagent.data_sync import private_source_links as links
     from scripts import packed_snapshot as cli
     repo, cold, catalog, args, policy = _futures_interfaces(setup)
@@ -734,7 +830,7 @@ def test_recursive_mutable_controls_do_not_restart_the_entire_baseline(setup, mo
     ('data_tej', ['progress/task-attempt.json.progress.json']),
 ])
 def test_named_provider_controls_stream_into_cold_without_millions_of_freeze_files(
-        setup, monkeypatch, root, controls, memory_rows):
+        setup, monkeypatch, root, controls, memory_rows, tiny_metadata_scratch_capacity):
     from stockagent.data_sync import packed_snapshots as packed
     monkeypatch.setattr(packed, 'METADATA_MEMORY_ROWS', memory_rows)
     repo, cold, entries, args, policy = setup
@@ -2267,7 +2363,22 @@ def small_benchmark_capture_policy(monkeypatch):
     from stockagent.data_sync import cache_capacity
     native = cache_capacity.load_capacity_policy
     monkeypatch.setattr(cache_capacity, 'load_capacity_policy',
-                        lambda: {**native(), 'minimum_free_bytes': 5 * 1024**3})
+                        lambda: {**native(), 'minimum_free_bytes': 1024**2})
+    # The live-readback harness also has its own 5 GiB scratch admission.
+    # These tests use at most 32 tiny synthetic records, not a live catalog.
+    # Isolate that success path only for the harness's owned fixture roots;
+    # production capacity policy and every other filesystem stay untouched.
+    import shutil
+    native_usage = shutil.disk_usage
+    def fixture_usage(path):
+        usage = native_usage(path)
+        resolved = Path(path).resolve()
+        if any(p.parent == Path('/var/tmp') and p.name.startswith('stockagent-sealed-pack-benchmark-')
+               for p in (resolved, *resolved.parents)):
+            free = 64 * 1024**3
+            return usage._replace(free=free, used=usage.total-free)
+        return usage
+    monkeypatch.setattr(shutil, 'disk_usage', fixture_usage)
 
 
 def test_benchmark_retry_wait_honors_recorded_deadline_after_clock_correction(monkeypatch):
@@ -2768,6 +2879,7 @@ def test_existing_lifecycle_resumes_all_sources_then_sleeps_daily_not_per_poll(s
     path = repo / "configs/columnar_storage.json"
     document = json.loads(path.read_text())
     document["dataset_version_lifecycle"] = json.loads((ROOT / "configs/columnar_storage.json").read_text())["dataset_version_lifecycle"]
+    document["dataset_version_lifecycle"].pop("pending_source_priority", None)
     path.write_text(json.dumps(document))
     monkeypatch.setattr(publisher, "_load_catalog", lambda *_: entries)
     configuration = {"cold_root": str(cold), "state_root": str(args.migration_state.parent / "control")}

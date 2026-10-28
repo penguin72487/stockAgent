@@ -63,6 +63,37 @@ def bulk_fixture():
     return raw, expected
 
 
+@pytest.mark.parametrize('official_open,expected_0900', [(10.1, 10.1), (10.2, None), (None, None)])
+def test_first_second_uses_certified_real_open_or_fails_closed(official_open, expected_0900):
+    from datetime import datetime
+    from stockagent.data.tw_futures_decision_clock import resolve_opening_references
+    from stockagent.data.tw_futures_finmind_ticks import stock_print_views
+
+    contract = 'DDF:202004@life1'
+    prints = pl.DataFrame(dict(physical_contract=[contract] * 3,
+        event_ts=[datetime(2020, 3, 23, 8, 45, 0)] * 2 + [datetime(2020, 3, 23, 8, 55, 0)],
+        source_row_index=[0, 1, 2], price=[10.05, 10.1, 10.05], volume=[1, 1, 1]))
+    evidence = (None if official_open is None else pl.DataFrame(
+        dict(date=[DAY], physical_contract=[contract], observed_open=[official_open])))
+    _, _, events = stock_print_views(prints, day=DAY, source_sha256='a'*64,
+                                     opening_evidence=evidence)
+    previous = pl.DataFrame(dict(physical_contract=[contract], price=[9.9],
+        trade_date=[date(2020, 3, 20)], trade_ts=[datetime(2020, 3, 20, 13, 30)],
+        available_by=[datetime(2020, 3, 20, 13, 31)], source_sha256=['b'*64],
+        is_session_open=[False], opening_ambiguous=[False]))
+    events = pl.concat([previous, events], how='vertical_relaxed')
+    decisions = pl.DataFrame(dict(date=[DAY], physical_contract=[contract]))
+    early = resolve_opening_references(decisions, events, decision_time='08:45').row(0, named=True)
+    late = resolve_opening_references(decisions, events, decision_time='09:00').row(0, named=True)
+    assert early['reference_quote'] == 9.9 and early['reference_kind'] == 'last_observed_trade'
+    assert late['reference_quote'] == expected_0900
+    assert late['reference_kind'] == ('observed_session_open' if expected_0900 is not None else 'unavailable')
+    if expected_0900 is not None:
+        assert late['reference_trade_ts'] == datetime(2020, 3, 23, 8, 45)
+        assert late['reference_available_by'] == datetime(2020, 3, 23, 8, 46)
+        assert late['reference_source_sha256'] == 'a'*64
+
+
 def test_bulk_all_months_double_sided_quantity_exact_closing_print_and_real_reference():
     from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
     from stockagent.data.tw_futures_decision_clock import resolve_opening_references
@@ -122,7 +153,7 @@ def test_expanded_bulk_respects_product_session_and_verified_history_window():
         source_sha256='b'*64,asset_scope='twd_equity')
     assert coverage['verified'].all() and bars['minute'].item() == 961
     with pytest.raises(ValueError,match='verified historical window'):
-        decode_bulk_stock_prices(raw['price'].to_numpy(),day=date(2019,12,31),
+        decode_bulk_stock_prices(raw['price'].to_numpy(),day=date(2014,10,3),
             products=raw['futures_id'].to_numpy(),asset_classes='etf_future')
 
 

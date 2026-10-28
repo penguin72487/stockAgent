@@ -15,6 +15,7 @@ ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_outside_tw_opening_resource
 ExecCondition=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_due.sh"
 ExecStartPre=/usr/bin/bash -n "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_refresh_frozen.sh"
+SuccessExitStatus=75
 Nice=10
 CPUWeight=20
 IOWeight=20

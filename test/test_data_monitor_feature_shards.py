@@ -43,6 +43,64 @@ def _snapshot(root):
     return frame
 
 
+def test_unchanged_generation_rechecks_all_sources_without_decoding_footer_cache(setup, monkeypatch):
+    root, first, second, status, output = setup
+    initial = _snapshot(root)
+    shards.publish_feature_shards(root, output, snapshot=initial, monitor_status=status)
+    expected = json.loads(output.read_bytes())
+    warm = _snapshot(root)
+    assert warm.payload is None and warm.unchanged_selection is not None
+    calls = []
+    stat = Path.stat
+    def checked(path, *args, **kwargs):
+        if path in (first, second):
+            calls.append(path)
+        return stat(path, *args, **kwargs)
+    def forbidden(*args, **kwargs):
+        raise AssertionError('unchanged generation must avoid complete footer materialization')
+    monkeypatch.setattr(Path, 'stat', checked)
+    monkeypatch.setattr(inventory, 'FeatureInventoryScan', forbidden)
+    result = shards.publish_feature_shards(root, output, snapshot=warm, monitor_status=status)
+    assert result.rebuilt_datasets == 0 and result.reused_datasets == len(warm.selected)
+    assert first in calls and second in calls
+    assert result.timing_ms['unchanged_generation_proof'] == 1.
+    actual = json.loads(output.read_bytes())
+    assert actual == expected
+
+
+@pytest.mark.parametrize('mutation', ['source', 'generation', 'labels', 'proof', 'summary', 'object'])
+def test_unchanged_generation_proof_falls_back_on_every_input_boundary(setup, monkeypatch, mutation):
+    root, first, _second, status, output = setup
+    shards.publish_feature_shards(root, output, snapshot=_snapshot(root), monitor_status=status)
+    warm = _snapshot(root)
+    assert warm.unchanged_selection is not None
+    store = shards.ProjectionStore(output)
+    if mutation == 'source':
+        _write(first, values=(9., 10.))
+    elif mutation == 'generation':
+        path = root/'artifacts/live/data_monitor/record_inventory_cache.json'
+        path.write_bytes(path.read_bytes())
+    elif mutation == 'labels':
+        status['sources'][0]['title'] = 'New source title'
+    elif mutation == 'proof':
+        warm.unchanged_selection['fingerprint'] = '0'*32
+    elif mutation == 'summary':
+        manifest = store.manifest()
+        manifest['verified_summary']['files_total'] += 1
+        store.commit(manifest)
+    else:
+        item = next(item for item in store.manifest()['datasets'].values() if item['fields'])
+        (store.objects/(item['sha256']+'.rows')).write_bytes(b'corrupt')
+    original = inventory.FeatureInventoryScan
+    calls = []
+    def full(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(inventory, 'FeatureInventoryScan', full)
+    shards.publish_feature_shards(root, output, snapshot=warm, monitor_status=status)
+    assert calls, mutation
+
+
 @pytest.mark.parametrize("prefer_shards", [True, False])
 def test_publisher_retains_prior_json_and_receipts_when_source_revision_moves(setup, prefer_shards):
     from scripts import snapshot_data_refresh_services as producer
@@ -84,6 +142,113 @@ def test_projection_requires_fresh_footers_even_if_observed_roots_match():
         inventory.require_coherent_feature_source(
             {"source_observation_root": "same", "source_observation_matches_cache": False}, "same"
         )
+
+
+@pytest.mark.parametrize("prefer_shards", [True, False])
+def test_captured_features_keep_their_verified_generation_during_public_work(setup, prefer_shards):
+    from scripts import snapshot_data_refresh_services as producer
+
+    root, first, _, status, output = setup
+    frame = inventory.InventorySnapshot(root)
+    record = inventory.build_record_inventory(root, refresh=True, snapshot=frame, capture_features=True)
+    assert frame.verified_features is not None
+    verified_at = frame.verified_features.verified_at_utc
+    expected = inventory.build_feature_inventory(root, snapshot=frame)
+    # Same event ordering as a source update while tick/bar/public work runs.
+    # The already verified finite observation keeps its actual source root and
+    # clock, rather than claiming the subsequently written values are current.
+    _write(first, values=(None, None))
+    result = producer.publish_feature_inventory_snapshot(
+        root, output, snapshot=frame, public_status=status,
+        feature_revision=record["feature_revision"], source_metadata_sha256="a" * 64,
+        expected_source_observation_root=record["source_observation_root"], prefer_shards=prefer_shards,
+    )
+    assert result["source_observation_root"] == expected["source_observation_root"]
+    assert result["source_verified_at_utc"] == verified_at
+    assert json.loads(output.read_bytes()) == build_data_monitor_feature_inventory(
+        root, monitor_status=status, inventory=expected,
+    )
+    receipt = json.loads(producer._feature_reuse_receipt_path(output).read_bytes())
+    assert receipt["source_verified_at_utc"] == verified_at
+    assert frame.payload is frame.verified_features is None
+    fresh = _snapshot(root)
+    assert inventory.build_feature_inventory(root, snapshot=fresh)["source_observation_root"] != result["source_observation_root"]
+
+
+def test_capture_reconciles_a_tail_that_changes_before_record_aggregation(setup, monkeypatch):
+    root, first, _, _, _ = setup
+    original = inventory._aggregate
+    changed = False
+    def moving(paths, cache, **options):
+        nonlocal changed
+        if first in paths and not changed:
+            _write(first, values=(None, 4.0))
+            changed = True
+        return original(paths, cache, **options)
+    monkeypatch.setattr(inventory, "_aggregate", moving)
+    frame = inventory.InventorySnapshot(root)
+    result = inventory.build_record_inventory(root, refresh=True, snapshot=frame, capture_features=True)
+    assert changed and result["source_observation_matches_cache"] is True
+    assert frame.verified_features is not None
+    fields = inventory.build_feature_inventory(root, snapshot=frame)
+    inventory.require_coherent_feature_source(fields, result["source_observation_root"])
+    assert next(row for row in fields["rows"] if row["dataset_id"] == "yahoo:us_stocks" and row["field"] == "close")["non_null_count"] == 1
+
+
+def test_capture_refuses_tail_movement_between_record_and_feature_checks(setup, monkeypatch):
+    root, first, _, _, _ = setup
+    original = inventory._scan_feature_dataset
+    def moving(dataset, paths, *args):
+        if first in paths:
+            _write(first, values=(None, None))
+        return original(dataset, paths, *args)
+    monkeypatch.setattr(inventory, "_scan_feature_dataset", moving)
+    frame = inventory.InventorySnapshot(root)
+    result = inventory.build_record_inventory(root, refresh=True, snapshot=frame, capture_features=True)
+    assert result["source_observation_matches_cache"] is True
+    assert frame.verified_features is None
+    raw = inventory.build_feature_inventory(root, snapshot=frame)
+    with pytest.raises(inventory.SourceRevisionChanged):
+        inventory.require_coherent_feature_source(raw, result["source_observation_root"])
+
+
+def test_captured_features_cannot_bind_to_a_replaced_frame(setup):
+    root, _, _, _, _ = setup
+    frame = inventory.InventorySnapshot(root)
+    inventory.build_record_inventory(root, refresh=True, snapshot=frame, capture_features=True)
+    frame.payload = dict(frame.payload)
+    with pytest.raises(inventory.SourceRevisionChanged, match="frame no longer matches"):
+        inventory.build_feature_inventory(root, snapshot=frame)
+
+
+def test_capture_does_not_publish_unrefreshed_tail_as_current(setup):
+    root, first, _, _, _ = setup
+    _snapshot(root)
+    _write(first, values=(None, 3.0))
+    frame = inventory.InventorySnapshot(root)
+    result = inventory.build_record_inventory(root, refresh=True, snapshot=frame,
+                                               capture_features=True, max_refresh_files=0)
+    assert result["source_observation_matches_cache"] is False
+    assert frame.verified_features is None
+
+
+def test_capture_cannot_reconcile_an_alias_after_an_owner_consumed_its_footer(setup, monkeypatch):
+    root, first, _, _, _ = setup
+    selected = inventory._selected_files(root)
+    selected["alias"] = [first]
+    monkeypatch.setattr(inventory, "_selected_files", lambda _root: selected)
+    original = inventory._aggregate
+    def moving(paths, cache, **options):
+        if options["dataset"] == "alias":
+            _write(first, values=(None, 4.0))
+        return original(paths, cache, **options)
+    monkeypatch.setattr(inventory, "_aggregate", moving)
+    frame = inventory.InventorySnapshot(root)
+    result = inventory.build_record_inventory(root, refresh=True, snapshot=frame, capture_features=True)
+    assert result["source_observation_matches_cache"] is False
+    assert frame.verified_features is None
+    assert frame.payload["files"][str(first)]["stats"]["non_null"][1] == 1
+    assert result["datasets"]["alias"]["files_inspected"] == 0
 
 
 def _publish(root, output, status, frame=None, **kwargs):

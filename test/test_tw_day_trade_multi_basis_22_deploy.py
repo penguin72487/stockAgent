@@ -51,14 +51,14 @@ def test_history_deploy_timer_is_week_calendar_based() -> None:
     assert "OnBootSec" not in timer
 
 
-def test_history_deploy_wrapper_executes_resolved_python_not_shell_function() -> None:
+def test_history_deploy_wrapper_executes_through_canonical_runtime() -> None:
     root = Path(__file__).resolve().parents[1]
     wrapper = (
         root / "scripts/run_tw_day_trade_multi_basis_22_history_deploy.sh"
     ).read_text(encoding="utf-8")
 
-    assert 'FINTECH_PYTHON="$(resolve_fintech_python)"' in wrapper
-    assert 'exec "$FINTECH_PYTHON"' in wrapper
+    assert 'source scripts/runtime_env.sh' in wrapper
+    assert 'exec_fintech_python scripts/deploy_tw_day_trade_multi_basis_22_history.py "$@"' in wrapper
     assert "exec run_fintech_python" not in wrapper
 
 

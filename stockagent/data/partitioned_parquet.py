@@ -204,6 +204,16 @@ class ParquetSource:
             if payload_info(path) != before:
                 raise ValueError(f"Parquet source member changed during read: {path}")
 
+    @property
+    def member_footers(self):
+        """Parsed metadata bound to this snapshot, in explicit member order.
+
+        Consumers stay inside this source's context and retain its complete
+        before/after member checks. Pass these footers to ParquetFile instead
+        of parsing the same metadata a second time for a column projection.
+        """
+        return tuple(self._metadata)
+
     def table(self, *, columns=None, filters=None, tail_rows=None):
         self.verify()
         selected_schema = self.schema if columns is None else pa.schema(

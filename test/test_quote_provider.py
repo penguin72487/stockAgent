@@ -33,6 +33,9 @@ from stockagent.live.quote_provider import (
 def _isolate_opening_quote_receipts(monkeypatch, tmp_path):
     monkeypatch.setenv("STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT", str(tmp_path / "opening_receipts"))
     monkeypatch.setattr(quote_provider, "_SHIOAJI_HISTORY_REQUEST_TIMES", deque())
+    # Source parsing tests exercise the after-session path independently of
+    # the machine's wall clock; intraday deferral has its own explicit tests.
+    monkeypatch.setattr(quote_provider, "_defer_live_0901_history", lambda *_a, **_kw: False)
 
 
 def test_symbol_yahoo_map_derives_suffix_from_official_venue(tmp_path) -> None:

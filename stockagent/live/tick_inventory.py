@@ -17,8 +17,9 @@ import time
 
 VERSION = 1
 MARKETS = {"taiwan_equity": "台股／指數", "taiwan_derivatives": "臺灣期貨／選擇權",
-           "global_equity": "海外股票", "forex": "外匯", "crypto": "加密貨幣"}
-KINDS = {"trade": "逐筆成交", "book": "五檔委買賣事件", "book_snapshot": "每秒五檔快照（非 tick）"}
+           "global_equity": "海外股票", "forex": "外匯", "macro": "總體／大宗商品", "crypto": "加密貨幣"}
+KINDS = {"trade": "逐筆成交", "index": "指數逐筆報價（非成交）",
+         "book": "五檔委買賣事件", "book_snapshot": "每秒五檔快照（非 tick）"}
 FINMIND = {"TaiwanStockPriceTick": ("台股全市場逐筆", "taiwan_equity"),
            "TaiwanFuturesTick": ("期貨全市場逐筆", "taiwan_derivatives"),
            "TaiwanOptionTick": ("選擇權全市場逐筆", "taiwan_derivatives"),
@@ -43,7 +44,9 @@ def _json(path):
 
 def _signature(path):
     try:
-        st = path.stat()
+        # Accept both canonical Path objects and already normalized receipt
+        # strings; a fresh source stat is required in either case.
+        st = os.stat(path)
         return [st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns]
     except FileNotFoundError:
         return None
@@ -82,7 +85,9 @@ class _Sources:
             self.footer_pool.shutdown(wait=True, cancel_futures=True)
 
     def read(self, key, paths, loader, *, resume=False):
-        paths = sorted(set(paths))
+        paths = list(paths)
+        if len(paths) > 1:
+            paths = sorted(set(paths))
         try:
             before = [[str(p), _signature(p)] for p in paths]
             cached = self.previous.get(key, {})
@@ -104,15 +109,20 @@ class _Sources:
             return None
 
 
-def _database(path, query, parameters=()):
+def _database(path, query, parameters=(), *, timeout_seconds=3., monitor_counts=False):
     def read(*, immutable=False):
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + timeout_seconds
         uri = path.resolve().as_uri() + "?mode=ro" + ("&immutable=1" if immutable else "")
         with closing(sqlite3.connect(uri, uri=True, timeout=.2)) as conn:
             conn.execute("PRAGMA query_only=ON")
             conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 10_000)
             conn.execute("BEGIN")
-            return conn.execute(query, parameters).fetchall()
+            if monitor_counts:
+                from downloader.finmind_queue_indexes import monitor_counts_sql
+                selected_query = monitor_counts_sql(conn, query, parameters)
+            else:
+                selected_query = query
+            return conn.execute(selected_query, parameters).fetchall()
     try:
         return read()
     except sqlite3.OperationalError as error:
@@ -233,6 +243,7 @@ def _historical(root, cache):
     for collection, (title, market) in HISTORY.items():
         item = summary.get("by_collection", {}).get(collection, {})
         rows.append(_row("shioaji-history:" + collection, title, "永豐 Shioaji", market,
+            kind="index" if collection == "indices" else "trade",
             count=_integer(item.get("tick_rows")), days=_integer(item.get("tick_data_days")),
             first=item.get("tick_first_data_date"), last=item.get("tick_last_data_date"),
             symbols=_integer(item.get("tick_symbols_with_data")), observed_at_utc=summary.get("written_at_utc"),

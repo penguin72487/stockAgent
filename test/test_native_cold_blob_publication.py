@@ -30,7 +30,7 @@ def test_bounded_small_pack_keeps_complete_sha_and_final_generation(tmp_path, mo
 
 @pytest.mark.parametrize('bytes_count,members,stored', [
     (1024**2+1,2,None), (1024,129,None), (1024,2,500)])
-def test_large_many_member_and_subset_packs_keep_native_admission(tmp_path, monkeypatch, bytes_count, members, stored):
+def test_explicit_ssd_path_keeps_physical_admission_for_all_pack_sizes(tmp_path, monkeypatch, bytes_count, members, stored):
     from contextlib import contextmanager
     from types import SimpleNamespace
     path=tmp_path/'pack.zip';payload=b'X'*bytes_count;path.write_bytes(payload)
@@ -44,7 +44,10 @@ def test_large_many_member_and_subset_packs_keep_native_admission(tmp_path, monk
     monkeypatch.setattr(native,'binary_reader',reader)
     monkeypatch.setattr(packed.shutil,'disk_usage',lambda path:SimpleNamespace(free=64*1024**3))
     monkeypatch.setattr(native,'admit_workspace',lambda *a:calls.append('physical-admission'))
-    with packed._native_pack_source(path,item,enabled=True) as source:
+    # Force the SSD path whose physical admission this fixture verifies.
+    # Bounded native RAM and its independent resource/failure gates are covered
+    # in test_native_pack_buffer.py; no real host headroom decides this test.
+    with packed._native_pack_source(path,item,enabled=True,prefer_memory=False) as source:
         assert source.read()==payload
     assert calls==['physical-admission','native']
 

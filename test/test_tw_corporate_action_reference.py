@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+import hashlib
 from io import BytesIO
+import json
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import polars as pl
 import pytest
+from requests.exceptions import HTTPError, ReadTimeout
 
+from downloader import download_tw_corporate_action_reference as reference
 from downloader.download_tw_corporate_action_reference import (
     MonthlyDocumentIdentityError,
     _monthly_query_document_id,
@@ -17,6 +22,7 @@ from downloader.download_tw_corporate_action_reference import (
     _tpex_event_candidates,
     _write_immutable_raw,
 )
+from scripts.run_tw_public_0830_check import _receipt_dependency_errors
 
 
 def test_tpex_disposition_query_retains_cross_year_notice_and_literal_no_data():
@@ -388,3 +394,224 @@ def test_write_immutable_monthly_raw_is_content_addressed(tmp_path) -> None:
 
     assert first["path"] != second["path"]
     assert len(list(tmp_path.glob("*.ods"))) == 2
+
+
+def test_annual_fetch_preserves_prior_generation_receipt_on_partial_failure(
+    tmp_path, monkeypatch
+) -> None:
+    raw_dir = tmp_path / "raw" / "tw_corporate_action_reference"
+    raw_dir.mkdir(parents=True)
+    legacy = raw_dir / "twse_2026.json"
+    original = b"previous verified official response"
+    legacy.write_bytes(original)
+    summary = tmp_path / "reference.summary.json"
+    summary.write_text(json.dumps({"source_receipts": [{
+        "path": str(legacy), "size": len(original),
+        "sha256": hashlib.sha256(original).hexdigest(),
+    }]}))
+    payload = {
+        "stat": "OK",
+        "fields": ["資料日期", "股票代號", "除權息參考價"],
+        "data": [["115年10月27日", "2330", "600.00"]],
+    }
+    content = json.dumps(payload, ensure_ascii=False).encode()
+
+    def fetch(url, **kwargs):
+        if "tpex" in url:
+            raise TimeoutError("another required source failed")
+        return SimpleNamespace(url=url, content=content, json=lambda: payload)
+
+    monkeypatch.setattr(reference, "_http_get", fetch)
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=0, skip_raw=False)
+    success = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    failure = reference._fetch_year("tpex", 2026, date(2026, 10, 27), args)
+
+    assert success.error is None and failure.error is not None
+    assert legacy.read_bytes() == original
+    assert success.raw_path != str(legacy)
+    assert success.raw_receipt["sha256"] == hashlib.sha256(content).hexdigest()
+    assert _receipt_dependency_errors(summary, live_root=tmp_path, keys=("source_receipts",)) == []
+
+
+def test_annual_fetch_revisions_remain_distinct_and_skip_raw_is_respected(
+    tmp_path, monkeypatch
+) -> None:
+    payload = {
+        "stat": "OK",
+        "fields": ["資料日期", "股票代號", "除權息參考價"],
+        "data": [["115年10月27日", "2330", "600.00"]],
+    }
+    contents = [b"first official bytes", b"revised official bytes", b"not retained"]
+    monkeypatch.setattr(reference, "_http_get", lambda url, **kwargs:
+        SimpleNamespace(url=url, content=contents.pop(0), json=lambda: payload))
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=0, skip_raw=False)
+    first = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    second = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    args.skip_raw = True
+    third = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+
+    assert first.error is second.error is third.error is None
+    assert first.raw_path != second.raw_path
+    assert reference.Path(first.raw_path).read_bytes() == b"first official bytes"
+    assert reference.Path(second.raw_path).read_bytes() == b"revised official bytes"
+    assert third.raw_path is None and third.raw_receipt is None
+
+
+def _annual_daily_fixture(tmp_path, monkeypatch):
+    payload = {
+        "stat": "OK", "strDate": "20260101", "endDate": "20261027",
+        "fields": ["資料日期", "股票代號", "除權息參考價"],
+        "data": [["115年10月27日", "2330", "600.00"]],
+    }
+    content = json.dumps(payload, ensure_ascii=False).encode()
+    monkeypatch.setattr(reference, "_http_get", lambda url, **kwargs:
+        SimpleNamespace(url=url, content=content, json=lambda: payload))
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=0, skip_raw=False, mode="daily")
+    original = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    assert original.error is None
+    path = reference._annual_cache_path(
+        tmp_path / "raw" / "tw_corporate_action_reference", "twse", 2026, date(2026, 10, 27)
+    )
+    assert path.is_file()
+    return args, original, path
+
+
+def test_annual_daily_retry_reuses_only_recent_verified_official_success(tmp_path, monkeypatch):
+    args, original, _ = _annual_daily_fixture(tmp_path, monkeypatch)
+    def timeout(*args, **kwargs):
+        raise ReadTimeout("upstream is slow")
+    monkeypatch.setattr(reference, "_http_get", timeout)
+
+    recovered = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+
+    assert recovered.error is None
+    assert recovered.rows == original.rows
+    assert recovered.raw_receipt["sha256"] == original.raw_receipt["sha256"]
+    assert recovered.raw_receipt["observed_at_utc"] == original.raw_receipt["observed_at_utc"]
+    assert recovered.raw_receipt["retry_cache_reused"] is True
+    assert recovered.raw_receipt["retry_failure_type"] == "ReadTimeout"
+
+
+@pytest.mark.parametrize("defect", ["expired", "future", "digest", "end_date", "source_url", "content"])
+def test_annual_daily_retry_rejects_stale_foreign_or_corrupt_cache(tmp_path, monkeypatch, defect):
+    args, original, path = _annual_daily_fixture(tmp_path, monkeypatch)
+    entry = json.loads(path.read_text())
+    if defect == "expired":
+        entry["observed_at_utc"] = (datetime.now(timezone.utc) - timedelta(seconds=301)).isoformat()
+    elif defect == "future":
+        entry["observed_at_utc"] = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    elif defect == "digest":
+        entry["raw_receipt"]["sha256"] = "f" * 64
+    elif defect == "end_date":
+        entry["end_date"] = "2026-10-26"
+    elif defect == "source_url":
+        entry["raw_receipt"]["source_url"] = "https://example.invalid/data"
+    else:
+        reference.Path(original.raw_path).write_bytes(b"corrupted")
+    path.write_text(json.dumps(entry))
+    def timeout(*args, **kwargs):
+        raise ReadTimeout("upstream is slow")
+    monkeypatch.setattr(reference, "_http_get", timeout)
+
+    recovered = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+
+    assert recovered.error and "ReadTimeout" in recovered.error
+    assert recovered.raw_receipt is None
+
+
+@pytest.mark.parametrize("failure", [HTTPError("quota or access rejected"), ValueError("bad response")])
+def test_annual_retry_never_hides_permission_or_semantic_failures(tmp_path, monkeypatch, failure):
+    args, _, _ = _annual_daily_fixture(tmp_path, monkeypatch)
+    def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(reference, "_http_get", fail)
+    result = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    assert result.error and type(failure).__name__ in result.error
+    assert result.raw_receipt is None
+
+
+def test_annual_retry_is_daily_only_and_rejects_foreign_query_bounds(tmp_path, monkeypatch):
+    args, _, _ = _annual_daily_fixture(tmp_path, monkeypatch)
+    def timeout(*args, **kwargs):
+        raise ReadTimeout("upstream is slow")
+    monkeypatch.setattr(reference, "_http_get", timeout)
+    args.mode = "repair"
+    assert reference._fetch_year("twse", 2026, date(2026, 10, 27), args).error
+    payload = {"stat": "OK", "strDate": "20250101", "endDate": "20251231", "fields": [], "data": []}
+    monkeypatch.setattr(reference, "_http_get", lambda url, **kwargs:
+        SimpleNamespace(url=url, content=json.dumps(payload).encode(), json=lambda: payload))
+    result = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    assert result.error and "bounds differ" in result.error
+
+
+def test_annual_twse_uses_second_official_host_after_transport_timeout(tmp_path, monkeypatch):
+    payload = {
+        "stat": "OK", "strDate": "20260101", "endDate": "20261027",
+        "fields": ["資料日期", "股票代號", "除權息參考價"],
+        "data": [["115年10月27日", "2330", "600.00"]],
+    }
+    content = json.dumps(payload, ensure_ascii=False).encode()
+    calls = []
+    def fetch(url, **kwargs):
+        calls.append((url, kwargs["retries"]))
+        if url == reference.TWSE_URL:
+            raise ReadTimeout("primary timed out")
+        return SimpleNamespace(url=url, content=content, json=lambda: payload,
+                               _stockagent_response_attempts=2)
+    monkeypatch.setattr(reference, "_http_get", fetch)
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=2, skip_raw=False, mode="daily")
+
+    result = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+
+    assert result.error is None
+    assert calls == [(reference.TWSE_URL, 0), (reference.TWSE_ALTERNATE_URL, 2)]
+    assert result.url == reference.TWSE_ALTERNATE_URL
+    assert [row.get("error_type") for row in result.raw_receipt["transport_attempts"]] == ["ReadTimeout", None]
+    assert result.http_attempt_count == 3
+
+
+def test_annual_partial_retry_reuses_only_original_successes_across_attempts(tmp_path, monkeypatch):
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=0, skip_raw=False, mode="daily")
+    stage = {"attempt": 1}
+    def fetch(url, **kwargs):
+        start = kwargs["params"]["startDate"]
+        year = int(start[:4])
+        if (stage["attempt"] == 1 and year == 2026) or (stage["attempt"] == 2 and year == 2025):
+            raise ReadTimeout("one annual source is temporarily unavailable")
+        end = "20251231" if year == 2025 else "20261027"
+        payload = {"stat": "OK", "strDate": f"{year}0101", "endDate": end,
+            "fields": ["資料日期", "股票代號", "除權息參考價"],
+            "data": [[f"{year - 1911}年10月27日", "2330", "600.00"]]}
+        return SimpleNamespace(url=url, content=json.dumps(payload, ensure_ascii=False).encode(), json=lambda: payload)
+    monkeypatch.setattr(reference, "_http_get", fetch)
+
+    first_success = reference._fetch_year("twse", 2025, date(2026, 10, 27), args)
+    first_failure = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+    stage["attempt"] = 2
+    second_recovered = reference._fetch_year("twse", 2025, date(2026, 10, 27), args)
+    second_success = reference._fetch_year("twse", 2026, date(2026, 10, 27), args)
+
+    assert first_success.error is None and first_failure.error
+    assert second_recovered.error is None and second_success.error is None
+    assert second_recovered.raw_receipt["retry_cache_reused"] is True
+    assert second_recovered.raw_receipt["sha256"] == first_success.raw_receipt["sha256"]
+    assert second_recovered.raw_receipt["transport_attempts"] == first_success.raw_receipt["transport_attempts"]
+    assert [attempt["error_type"] for attempt in second_recovered.raw_receipt["retry_transport_attempts"]] == ["ReadTimeout", "ReadTimeout"]
+    assert second_recovered.http_attempt_count == 2
+    assert second_success.raw_receipt["retry_cache_reused"] is False
+
+
+def test_monthly_request_count_includes_actual_transport_retries(tmp_path, monkeypatch):
+    args = SimpleNamespace(output_dir=tmp_path, timeout=1, retries=2, skip_raw=True)
+
+    def fetch(url, **kwargs):
+        count = 2 if url == reference.TPEX_MONTHLY_REPORT_URL else 3
+        return SimpleNamespace(url=url, content=b"official", json=lambda: {},
+                               _stockagent_response_attempts=count)
+
+    monkeypatch.setattr(reference, "_http_get", fetch)
+    monkeypatch.setattr(reference, "_monthly_query_document_id", lambda *a, **k: "document-id")
+    monkeypatch.setattr(reference, "_parse_tpex_monthly_ods", lambda *a, **k: [{"symbol": "2330"}])
+    result = reference._fetch_tpex_monthly_document(2026, 10, 1, args)
+    assert result.status == "parsed"
+    assert result.http_attempt_count == 5

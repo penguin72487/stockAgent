@@ -62,6 +62,57 @@ def test_idle_sweep_does_not_request_account_quota(tmp_path, monkeypatch):
     quota.assert_not_called()
 
 
+def test_explicit_active_priority_alone_runs_through_opening_window(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from scripts import check_outside_tw_opening_resource_window as window
+    from stockagent.data import finlab_gap_priority
+
+    required, ordinary, expired = "financial_statement:EPS", "price:收盤價", "financial_statement:old"
+    monkeypatch.setattr(history, "credential_available", lambda: True)
+    monkeypatch.setattr(history, "sync_selection", lambda *args, **kwargs: [ordinary, required, expired])
+    monkeypatch.setattr(history, "record_core_acquisition_status", lambda *args, **kwargs:
+                        {"required_complete": False, "required_pending": 3, "required_blocked": 0})
+    monkeypatch.setattr(finlab_gap_priority, "pending_gap_requests", lambda *args, **kwargs: {
+        required: {"expires_at_utc": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+        expired: {"expires_at_utc": (datetime.now(UTC) - timedelta(seconds=1)).isoformat()},
+    })
+    monkeypatch.setattr(history, "has_local_download", lambda *args: True)
+    monkeypatch.setattr(history, "incremental_quota_exempt", lambda *args, **kwargs: True)
+    monkeypatch.setattr(history, "release_sdk_frames", lambda: False)
+    monkeypatch.setattr(window, "evaluate", lambda *args, **kwargs: pytest.fail("priority work was deferred"))
+    fetch = Mock(return_value={"last_check_result": "unchanged", "rows_with_values": 1})
+    monkeypatch.setattr(history, "fetch_one", fetch)
+    result = history.sync_catalog(
+        [ordinary, required, expired], {}, tmp_path, limit=10, refresh_days=1,
+        min_quota_remaining_mb=50, retry_unavailable=False, key_timeout_seconds=5,
+        priority_datasets=frozenset({required, expired}),
+    )
+    fetch.assert_called_once_with(required, tmp_path, refresh=True, incremental=True)
+    assert result["selection_scope"] == "explicit_active_priority"
+    assert result["attempted"] == 1
+    assert result["required_pending"] == 3  # Full catalogue, not subset completion.
+
+
+def test_unregistered_priority_request_does_not_fetch(tmp_path, monkeypatch):
+    from stockagent.data import finlab_gap_priority
+
+    key = "financial_statement:EPS"
+    monkeypatch.setattr(history, "credential_available", lambda: True)
+    monkeypatch.setattr(history, "sync_selection", lambda *args, **kwargs: [key])
+    monkeypatch.setattr(history, "record_core_acquisition_status", lambda *args, **kwargs:
+                        {"required_complete": False, "required_pending": 1, "required_blocked": 0})
+    monkeypatch.setattr(finlab_gap_priority, "pending_gap_requests", lambda *args, **kwargs: {})
+    monkeypatch.setattr(history, "has_local_download", lambda *args: True)
+    fetch = Mock()
+    monkeypatch.setattr(history, "fetch_one", fetch)
+    result = history.sync_catalog(
+        [key], {}, tmp_path, limit=1, refresh_days=1, min_quota_remaining_mb=50,
+        retry_unavailable=False, priority_datasets=frozenset({key}),
+    )
+    fetch.assert_not_called()
+    assert result["pending_before"] == 0
+
+
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_missing_or_corrupt_history_cannot_claim_incremental_exemption(tmp_path, monkeypatch, corrupt):
     key = "price:收盤價"

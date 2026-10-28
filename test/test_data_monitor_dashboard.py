@@ -783,7 +783,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     assert "設定／憑證閘門" in html
     assert "清冊參照／不重複計算" in html
     assert "styles.css?v=21" in html
-    assert "app.js?v=52" in html
+    assert "app.js?v=53" in html
     assert 'id="tw-calendar-state"' in html
     assert "data.tw_stock_calendar" in javascript
     assert 'id="feature-rows"' in html

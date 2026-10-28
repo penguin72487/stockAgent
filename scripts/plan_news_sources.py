@@ -17,7 +17,64 @@ if __package__ in {None, ''}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text, sha256_file
-from stockagent.data.news_source_catalog import classify_news_outcomes, NEWS_OUTCOME_CLASSIFICATION_VERSION
+from stockagent.data.news_source_catalog import (
+    classify_news_outcomes, NEWS_OUTCOME_CLASSIFICATION_VERSION, recorded_review_questions,
+)
+
+
+def _planning_scope(inventory):
+    """A complete plan for selected inputs is not a complete global plan."""
+    keys = ('inventory_scope', 'all_known_source_keys_included', 'selected_source_keys')
+    legacy = 'inventory_scope_contract_version' not in inventory
+    if legacy:
+        if any(key in inventory for key in keys):
+            raise ValueError('incomplete inventory scope contract')
+        return {'inventory_scope_contract_version': 1, 'inventory_scope': 'all_known_source_keys',
+                'all_known_source_keys_included': True, 'selected_source_keys': None,
+                'input_scope_assumed_legacy_full_inventory': True}
+    scope, included, selected = (inventory.get(key) for key in keys)
+    if (type(inventory['inventory_scope_contract_version']) is not int
+            or inventory['inventory_scope_contract_version'] != 1 or type(included) is not bool):
+        raise ValueError('invalid inventory scope contract')
+    if scope == 'all_known_source_keys':
+        if not included or selected is not None:
+            raise ValueError('invalid full inventory scope')
+    elif scope == 'selected_source_keys':
+        if (included or not isinstance(selected, list) or not selected
+                or any(not isinstance(p, str) or not p or p != p.strip() for p in selected)
+                or len(set(selected)) != len(selected) or set(selected) != set(inventory['providers'])):
+            raise ValueError('invalid selected inventory scope')
+    else:
+        raise ValueError('unsupported inventory scope for source planning')
+    return {key: inventory[key] for key in ('inventory_scope_contract_version', *keys)} | {
+        'input_scope_assumed_legacy_full_inventory': False}
+
+
+def _literal_work(original_metadata, known, links):
+    coverage = original_metadata.get('target_url_coverage')
+    fields = ('alias_associations', 'distinct_target_urls', 'queued_target_urls',
+              'stored_body_target_urls', 'unqueued_target_urls')
+    if 'target_url_coverage' in original_metadata:
+        if (not isinstance(coverage, dict) or type(coverage.get('contract_version')) is not int
+                or coverage['contract_version'] != 1
+                or any(type(coverage.get(key)) is not int or coverage[key] < 0 for key in fields)):
+            raise ValueError('invalid literal target coverage counts')
+        aliases, distinct, queued, stored, unqueued = (coverage[key] for key in fields)
+        if (aliases != links or not 0 <= stored <= queued <= distinct <= aliases
+                or (aliases > 0 and distinct == 0) or unqueued != distinct - queued):
+            raise ValueError('inconsistent literal target coverage counts')
+        pending = unqueued > 0
+    else:
+        # Existing queue heads do not prove overlap with remaining literal links.
+        # Unknown is explicit, rather than silently declaring no further work.
+        pending = (None if known else True) if links else False
+    return {'literal_target_coverage_verified': coverage is not None,
+            **{key: coverage[key] if coverage is not None else None for key in fields[1:]},
+            'unqueued_literal_link_work': pending}
+
+
+def _has_literal_work(row):
+    return bool(row['literal_metadata_links'] and row['unqueued_literal_link_work'] is not False)
 
 
 FINANCIAL_PROVIDERS = frozenset({
@@ -98,24 +155,13 @@ def review_resume_plan(item, review):
     # Source-level status alone cannot distinguish an answered subquestion
     # from a genuinely unresolved one. Project only the recorded scope; an
     # empty legacy list is unknown, never proof there is no remaining work.
-    scope = review.get('current_scope_review', {})
-    if not isinstance(scope, dict):
-        raise ValueError('invalid recorded source review questions')
-    completed_questions = scope.get('completed_questions', [])
-    remaining_questions = scope.get('remaining_questions', [])
-    for questions in (completed_questions, remaining_questions):
-        if (not isinstance(questions, list) or len(questions) > 64
-                or any(not isinstance(q, str) or not q.strip() or len(q) > 800
-                       or not q.isprintable() for q in questions)
-                or len(set(questions)) != len(questions)):
-            raise ValueError('invalid recorded source review questions')
-    if set(completed_questions) & set(remaining_questions):
-        raise ValueError('invalid recorded source review questions')
+    completed_questions, remaining_questions = recorded_review_questions(review)
     return {"source_review_work_state": state, "recorded_review_stage_complete": completed,
             "review_resume_action": action,
             "review_revisit_trigger": "new_scope_policy_authorization_or_scheduled_policy_revalidation",
             "review_annotation_grants_capture_access": False,
             "review_question_inventory_available": bool(completed_questions or remaining_questions),
+            "recorded_open_review_question_count": len(remaining_questions),
             "completed_review_questions_json": json.dumps(completed_questions, ensure_ascii=False),
             "remaining_review_questions_json": json.dumps(remaining_questions, ensure_ascii=False),
             "review_questions_are_exhaustive_body_work": False}
@@ -243,10 +289,11 @@ def apply_work_order(rows, policy):
         row['implementation_state'] = (
             'deferred_by_user' if provider in deferred else
             'waiting_source_permission' if (not row['enabled']
-                and (row['missing_body_urls'] or row['unqueued_literal_link_work'])
+                and (row['missing_body_urls'] or _has_literal_work(row))
                 and row['implementation_action'] == 'permission_required_before_automatic_body_capture') else
             'repair_or_backfill_known_urls' if row['missing_body_urls'] else
             'review_literal_original_links' if row['unqueued_literal_link_work'] else
+            'verify_literal_target_coverage' if _has_literal_work(row) else
             'maintenance_only' if row['known_urls'] else 'review_discovery_after_known_urls')
         row['implementation_order_basis'] = ('selected_focus_with_ordered_parallel_background'
             if version == 2 else 'selected_focus_first_then_known_url_count_descending')
@@ -282,6 +329,7 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
                  work_order=None) -> dict:
     if type(small_threshold) is not int or not 1 <= small_threshold <= 10000:
         raise ValueError("small cohort threshold must be 1..10000")
+    scope = _planning_scope(inventory)
     entries, reviews = entries or {}, reviews or {}
     rows = []
     for provider, item in inventory["providers"].items():
@@ -294,6 +342,7 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         literal_links = original_metadata.get("literal_metadata_links", 0)
         if type(literal_links) is not int or literal_links < 0:
             raise ValueError("invalid original metadata link counts")
+        literal_work = _literal_work(original_metadata, known, literal_links)
         role = item["source_role"]
         # A .gov hostname proves neither monetary/economic relevance nor an
         # open license. Prioritize known monetary releases, then financial and
@@ -354,7 +403,7 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
             "known_urls": known, "stored_bodies": stored, "missing_body_urls": known - stored,
             "literal_metadata_links": literal_links,
             "literal_metadata_link_grain": "local original-resolution alias associations, not unique articles or queued heads",
-            "unqueued_literal_link_work": known == 0 and literal_links > 0,
+            **literal_work,
             "first_metadata_day": item.get("earliest_metadata_day"),
             "last_metadata_day": item.get("latest_metadata_day"),
             "metadata_dates_are_publisher_clocks": False,
@@ -373,8 +422,9 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
     counts = Counter(row["strategy"] for row in rows)
     ordering = apply_work_order(rows, work_order) if work_order is not None else {}
     return {
-        "contract_version": (7 if work_order is not None and work_order['contract_version'] == 2
-                             else 6 if work_order is not None else 5),
+        "contract_version": (10 if work_order is not None and work_order['contract_version'] == 2
+                             else 9 if work_order is not None else 8),
+        **scope, 'literal_target_work_contract_version': 2,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         **ordering, "input_observed_at_utc": inventory["observed_at_utc"],
         "queue_owner_id": inventory.get("queue_owner_id"),
@@ -385,7 +435,8 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         "known_urls": sum(row["known_urls"] for row in rows),
         "stored_bodies": sum(row["stored_bodies"] for row in rows),
         "literal_metadata_links": sum(row["literal_metadata_links"] for row in rows),
-        "unqueued_literal_link_source_keys": sum(row["unqueued_literal_link_work"] for row in rows),
+        "unqueued_literal_link_source_keys": sum(row["unqueued_literal_link_work"] is True for row in rows),
+        "unknown_literal_target_coverage_source_keys": sum(row["unqueued_literal_link_work"] is None for row in rows),
         "plan_is_acquisition_acceptance": False, "all_history_complete": False,
         "source_policy_review_counts": dict(Counter(row["source_policy_review"] for row in rows)),
         "review_resume_contract_version": 2,
@@ -395,15 +446,31 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         "remaining_source_review_order": [row['provider'] for row in rows
             if row['source_review_work_state'] in {'not_started', 'partially_completed'}
             and row['source_role'] not in {'redirector', 'aggregator', 'social_or_video'}
-            and (row['missing_body_urls'] or row['unqueued_literal_link_work'])
+            and (row['missing_body_urls'] or _has_literal_work(row))
             and row.get('implementation_state') != 'deferred_by_user'],
+        # A scope review can be complete while recorded follow-up questions
+        # remain. Keep the existing review queue semantics, and expose these
+        # separately without promoting them to runnable or exhaustive work.
+        "recorded_open_question_projection_contract_version": 1,
+        "recorded_open_question_source_keys": [row['provider'] for row in rows
+            if row['recorded_open_review_question_count']],
+        "recorded_open_question_source_key_count": sum(
+            row['recorded_open_review_question_count'] > 0 for row in rows),
+        "recorded_open_question_count": sum(
+            row['recorded_open_review_question_count'] for row in rows),
+        "recorded_open_question_grain": "recorded questions per provider or hostname key; aliases may repeat",
+        "recorded_open_question_order_basis": "source plan order, including selected focus and deferred sources",
+        "recorded_open_question_actionability_verified": False,
+        "recorded_open_questions_are_exhaustive": False,
         "waiting_source_permission_keys": [row['provider'] for row in rows
             if not row['enabled'] and row['source_policy_review'] == 'permission_required'
-            and (row['missing_body_urls'] or row['unqueued_literal_link_work'])],
+            and (row['missing_body_urls'] or _has_literal_work(row))],
         "completed_review_is_not_completed_body_history": True,
         "implementation_action_counts": dict(Counter(row["implementation_action"] for row in rows)),
-        "all_source_keys_planned": len(rows) == len(inventory["providers"]),
-        "all_sites_live_reviewed": all(row["source_policy_review"] != "not_reviewed" for row in rows),
+        "all_input_source_keys_planned": len(rows) == len(inventory["providers"]),
+        "all_source_keys_planned": scope['all_known_source_keys_included'] and len(rows) == len(inventory["providers"]),
+        "all_input_sites_live_reviewed": all(row["source_policy_review"] != "not_reviewed" for row in rows),
+        "all_sites_live_reviewed": scope['all_known_source_keys_included'] and all(row["source_policy_review"] != "not_reviewed" for row in rows),
     }
 
 

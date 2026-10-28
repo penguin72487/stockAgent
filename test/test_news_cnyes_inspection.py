@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +22,110 @@ from test_news_fulltext import article_html
 
 
 URL = 'https://news.cnyes.com/news/id/42'
+
+
+def test_inspection_cli_runs_directly_without_repository_pythonpath(tmp_path):
+    env = os.environ.copy()
+    env.pop('PYTHONPATH', None)
+    script = Path(inspector.__file__).resolve()
+    result = subprocess.run([sys.executable, str(script), '--help'], cwd=tmp_path,
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert '--unsupported-paths-only' in result.stdout
+    assert '--market-route-provenance-only' in result.stdout
+    assert '--corpus-market-heads-only' in result.stdout
+
+
+def _literal_google_url(original):
+    import base64
+    value = original.encode()
+    assert len(value) < 128
+    return 'https://news.google.com/rss/articles/' + base64.urlsafe_b64encode(
+        b'\x08\x13\x22' + bytes([len(value)]) + value).decode().rstrip('=')
+
+
+def _corpus_fixture(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from downloader.artifact_io import sha256_file
+
+    root, source = tmp_path / 'corpus', tmp_path / 'collector'
+    root.mkdir()
+    source.mkdir()
+    direct = 'https://www.cnyes.com/twstock/6689/company/--'
+    alias = _literal_google_url(direct)
+    genuine = 'https://news.cnyes.com/news/id/479014'
+    rows = [
+        {'url': direct, 'text_kind': 'headline'},
+        {'url': alias, 'text_kind': 'headline'},
+        {'url': genuine, 'text_kind': 'headline'},
+        {'url': _literal_google_url(genuine), 'text_kind': 'headline'},
+        {'url': 'https://www.cnyes.com.evil.example/twstock/6689', 'text_kind': 'headline'},
+        {'url': 'https://news.google.com/rss/articles/opaque', 'text_kind': 'headline'},
+    ]
+    parts = []
+    for name, items in [('headline.parquet', rows), ('full.parquet', [
+            {'url': direct, 'text_kind': 'fulltext'},
+            {'url': genuine, 'text_kind': 'fulltext'}])]:
+        path = root / name
+        pq.write_table(pa.Table.from_pylist(items), path)
+        parts.append({'path': name, 'table_name': 'articles', 'rows': len(items),
+                      'bytes': path.stat().st_size, 'sha256': sha256_file(path)})
+    manifest = {'state': 'ready', 'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2',
+                'generation': 'versions/test', 'parts': parts, 'row_counts': {'articles': 8},
+                'source_snapshot': {'source_root': str(source), 'counts': {'headline_articles': 6}}}
+    atomic_write_json(root / 'manifest.json', manifest)
+    return root, source
+
+
+def test_corpus_market_audit_reads_all_headlines_but_keeps_fulltext_and_original_files(tmp_path, monkeypatch):
+    from downloader.artifact_io import sha256_file
+
+    root, source = _corpus_fixture(tmp_path)
+    before = {p.name: sha256_file(p) for p in root.iterdir()}
+    monkeypatch.setattr(inspector, 'load_config', lambda *a, **kw: pytest.fail('must not open the collector'))
+    monkeypatch.setattr(inspector, 'NewsHTTP', lambda *a, **kw: pytest.fail('must not request a publisher'))
+    output = tmp_path / 'audit.json'
+    assert inspector.main(['--output', str(output), '--corpus-market-heads-only', '--corpus-root', str(root)]) == 0
+    result = json.loads(output.read_text())
+    assert result['headline_rows_examined'] == 6 and result['fulltext_rows'] == 2
+    assert result['metadata_only_market_headlines'] == 2
+    assert result['metadata_only_by_reason'] == {'cnyes_market_route': 1, 'literal_google_cnyes_market_route': 1}
+    assert result['fulltext_rows_pruned_by_statistics'] == 2
+    assert result['body_columns_read'] == result['publisher_requests'] == result['source_or_corpus_writes'] == 0
+    assert result['full_part_sha_reverified'] is False and result['article_identity_inferred'] is False
+    assert {p.name: sha256_file(p) for p in root.iterdir()} == before
+    assert not any(source.iterdir())
+
+
+@pytest.mark.parametrize('output_under', ['corpus', 'source'])
+def test_corpus_audit_refuses_to_write_evidence_into_source_or_corpus(tmp_path, output_under):
+    root, source = _corpus_fixture(tmp_path)
+    output = (root if output_under == 'corpus' else source) / 'audit.json'
+    with pytest.raises(SystemExit) as error:
+        inspector.main(['--output', str(output), '--corpus-market-heads-only', '--corpus-root', str(root)])
+    assert error.value.code == 2 and not output.exists()
+
+
+def test_corpus_audit_rejects_mismatched_manifest_counts(tmp_path):
+    root, _ = _corpus_fixture(tmp_path)
+    manifest_path = root / 'manifest.json'
+    value = json.loads(manifest_path.read_text())
+    value['source_snapshot']['counts']['headline_articles'] = 5
+    atomic_write_json(manifest_path, value)
+    with pytest.raises(ValueError, match='row counts disagree'):
+        inspector.cnyes_corpus_market_head_audit(root)
+
+
+@pytest.mark.parametrize('probe_args', [['--probe', URL], ['--canonical-fetch']])
+def test_market_route_audit_refuses_probes_before_loading_config(monkeypatch, tmp_path, probe_args):
+    def fail_if_loaded(*args, **kwargs):
+        raise AssertionError('read-only mode must reject HTTP probes first')
+    monkeypatch.setattr(inspector, 'load_config', fail_if_loaded)
+    with pytest.raises(SystemExit) as failure:
+        inspector.main(['--output', str(tmp_path / 'audit.json'), '--market-route-provenance-only', *probe_args])
+    assert failure.value.code == 2
+    assert not (tmp_path / 'audit.json').exists()
 
 
 @pytest.mark.parametrize('url,hint', [
@@ -120,6 +227,216 @@ def test_invalid_or_foreign_route_samples_do_not_export_credentials():
     db.close()
 
 
+def test_market_route_provenance_counts_only_bounded_existing_evidence():
+    db = sqlite3.connect(':memory:')
+    db.executescript('''
+        CREATE TABLE articles(id BLOB PRIMARY KEY,url TEXT,title TEXT,provider TEXT,
+                              state TEXT,due REAL,body_sha256 TEXT);
+        CREATE INDEX dispatch ON articles(provider,state,due);
+        CREATE TABLE source_links(article_id BLOB,origin_id INTEGER,
+                                  PRIMARY KEY(article_id,origin_id)) WITHOUT ROWID;
+        CREATE TABLE original_url_resolutions(original_id BLOB,contract_version INTEGER,outcome TEXT);
+        CREATE INDEX original_url_target ON original_url_resolutions(original_id,contract_version)
+            WHERE original_id IS NOT NULL;
+    ''')
+    entries = [
+        (b'one', 'https://www.cnyes.com/twstock/2330?private=secret', '台積電 2330 - 總覽', 'cnyes', 'unsupported_article_path', 1, None),
+        (b'two', 'https://www.cnyes.com/twstock/3680/company/--', '家登 - 簡介', 'cnyes', 'unsupported_article_path', 2, 'retained'),
+        (b'three', 'https://www.cnyes.com/twstock/009820/fund/dividend', '股利', 'cnyes', 'unsupported_article_path', 3, None),
+        (b'four', 'https://www.cnyes.com/twstock/00936', '', 'cnyes', 'unsupported_article_path', 4, None),
+        (b'other', 'https://news.cnyes.com/20110124/ABC.shtml', '舊文', 'cnyes', 'unsupported_article_path', 5, None),
+        (b'done', 'https://www.cnyes.com/twstock/9999', '完成', 'cnyes', 'complete', 0, 'stored'),
+    ]
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?,?,?)', entries)
+    db.executemany('INSERT INTO articles VALUES (?,?,?,?,?,?,?)', [
+        (f'done-{i}'.encode(), f'https://www.cnyes.com/twstock/done{i}', '已存',
+         'cnyes', 'complete', 0, 'stored') for i in range(10000)])
+    db.executemany('INSERT INTO source_links VALUES (?,?)', [(b'one', 1), (b'one', 2), (b'two', 1)])
+    db.executemany('INSERT INTO original_url_resolutions VALUES (?,?,?)', [
+        (b'one', 1, 'literal_original'), (b'one', 1, 'literal_original'),
+        (b'three', 1, 'literal_original'), (b'four', 2, 'literal_original'),
+        (b'four', 1, 'other'),
+    ])
+    db.commit()
+    before = db.total_changes
+    steps = []
+    db.set_progress_handler(lambda: steps.append(1) or 0, 100)
+    result = inspector.cnyes_market_route_provenance(db)
+    assert len(steps) < 30  # The unrelated 10k completed heads are not scanned.
+    db.set_progress_handler(None, 0)
+    assert db.total_changes == before
+    assert result['heads_examined'] == 5 and result['market_route_heads_examined'] == 4
+    assert result['missing_body_heads'] == 3 and result['stored_body_heads'] == 1
+    assert result['literal_path_shape_counts'] == {'company_path': 1, 'other_twstock_path': 1, 'symbol_overview_path': 2}
+    assert result['metadata_title_hint_counts'] == {'mentions_overview': 1, 'mentions_profile': 1, 'missing': 1, 'other': 1}
+    assert result['recorded_pointer_kind_counts'] == {'both': 1, 'literal_pointer_only': 1,
+                                                       'metadata_link_only': 1, 'neither_recorded': 1}
+    assert result['literal_resolution_contract_version'] == 1
+    assert result['all_current_unsupported_heads_included'] and not result['head_limit_reached']
+    for key in ('metadata_identity_verified', 'article_identity_inferred',
+                'source_absence_or_permission_inferred', 'completion_denominator_changed'):
+        assert result[key] is False
+    for key in ('publisher_requests', 'production_queue_writes', 'completed_body_rows_scanned', 'raw_or_body_payloads_read'):
+        assert result[key] == 0
+    assert 'secret' not in json.dumps(result)
+    limited = inspector.cnyes_market_route_provenance(db, head_limit=2)
+    assert limited['heads_examined'] == 2 and limited['market_route_heads_examined'] == 2
+    assert limited['head_limit_reached'] and not limited['all_current_unsupported_heads_included']
+    assert db.total_changes == before
+    db.execute('UPDATE articles SET title=? WHERE id=?', ('x' * 5000 + '總覽', b'four'))
+    db.commit()
+    oversized = inspector.cnyes_market_route_provenance(db)
+    assert oversized['metadata_title_hint_counts']['oversized'] == 1
+    assert oversized['metadata_title_hint_counts']['mentions_overview'] == 1
+    db.close()
+
+
+def legacy_candidate_database():
+    db = sqlite3.connect(':memory:')
+    db.executescript('''
+        CREATE TABLE articles(url TEXT, provider TEXT, state TEXT, due REAL, body_sha256 TEXT,
+                              title TEXT, metadata_date_raw TEXT, metadata_order_day TEXT,
+                              id BLOB, parquet_path TEXT);
+        CREATE TABLE accepted_batches(path TEXT, receipt_path TEXT);
+        CREATE INDEX dispatch ON articles(provider,state,due);
+        CREATE INDEX dispatch_latest ON articles(provider,state,metadata_order_day DESC,due);
+    ''')
+    return db
+
+
+def test_legacy_candidates_are_bounded_hints_preserve_ambiguity_and_do_not_write():
+    db = legacy_candidate_database()
+    old = 'https://news.cnyes.com/20180807/20180807194318000419069.shtml?token=private'
+    db.executemany('INSERT INTO articles(url,provider,state,due,body_sha256,title,metadata_date_raw,metadata_order_day) VALUES (?,?,?,?,?,?,?,?)', [
+        (old, 'cnyes', 'unsupported_article_path', 1, None,
+         '公司 1+1 研究 - 鉅亨網', '2018-08-07 11:55:56', '2018-08-07'),
+        ('https://news.cnyes.com/news/id/1', 'cnyes', 'complete', 1, 'a' * 64,
+         '公司1+1研究', '2018-08-07T11:55:56+00:00', '2018-08-07'),
+        ('https://news.cnyes.com/news/id/2', 'cnyes', 'complete', 2, 'b' * 64,
+         '公司1+1研究', '2018-08-08T00:00:00+00:00', '2018-08-08'),
+        ('https://news.cnyes.com/news/id/3', 'cnyes', 'complete', 3, 'c' * 64,
+         '公司11研究', '2018-08-07', '2018-08-07'),
+        ('https://news.cnyes.com/news/id/4', 'cnyes', 'pending', 4, 'd' * 64,
+         '公司1+1研究', '2018-08-07', '2018-08-07'),
+        ('https://news.cnyes.com/news/id/5', 'cnyes', 'complete', 5, 'e' * 64,
+         '公司1+1研究', '2020-08-07', '2020-08-07'),
+        ('https://news.cnyes.com/news/id/6?secret=yes', 'cnyes', 'complete', 6, 'f' * 64,
+         '公司1+1研究', '2018-08-07', '2018-08-07'),
+    ])
+    db.commit()
+    before = db.total_changes
+    statements = []
+    db.set_trace_callback(statements.append)
+    result = inspector.cnyes_legacy_reuse_candidates(db)
+    assert db.total_changes == before
+    assert result['legacy_heads_examined'] == result['legacy_heads_with_candidates'] == 1
+    assert result['legacy_heads_with_multiple_candidates'] == 1
+    item = result['items'][0]
+    assert item['candidate_count'] == 2
+    assert [candidate['canonical_url'] for candidate in item['candidates']] == [
+        'https://news.cnyes.com/news/id/1', 'https://news.cnyes.com/news/id/2']
+    assert item['legacy_query_present'] and '?token' not in item['legacy_origin_path']
+    assert 'private' not in json.dumps(result) and 'secret=yes' not in json.dumps(result)
+    assert not item['same_article_or_version_verified'] and not item['old_url_body_present']
+    assert not result['candidate_matching_is_identity_proof'] and not result['absence_proved']
+    assert not result['body_integrity_independently_verified'] and not result['completion_denominator_changed']
+    assert result['publisher_requests'] == result['production_queue_writes'] == result['raw_or_body_payloads_decoded'] == 0
+    dated = [statement for statement in statements if 'INDEXED BY dispatch_latest' in statement]
+    assert len(dated) == result['days_examined'] == 3
+    assert all('metadata_order_day=' in statement and 'LIMIT 4097' in statement for statement in dated)
+    db.close()
+
+
+def test_legacy_candidate_caps_and_missing_dates_do_not_claim_absence():
+    db = legacy_candidate_database()
+    db.executemany('INSERT INTO articles(url,provider,state,due,body_sha256,title,metadata_date_raw,metadata_order_day) VALUES (?,?,?,?,?,?,?,?)', [
+        ('https://news.cnyes.com/20180807/123.shtml', 'cnyes', 'unsupported_article_path', 1, None,
+         '可搜尋的標題', None, None),
+        ('https://news.cnyes.com/20180808/124.shtml', 'cnyes', 'unsupported_article_path', 2, None,
+         '另一個標題', None, None),
+        ('https://news.cnyes.com/news/id/1', 'cnyes', 'complete', 1, 'a' * 64,
+         '不相符標題', None, '2018-08-07'),
+        ('https://news.cnyes.com/news/id/2', 'cnyes', 'complete', 2, 'b' * 64,
+         '可搜尋的標題', None, '2018-08-07'),
+    ])
+    result = inspector.cnyes_legacy_reuse_candidates(db, head_limit=1, day_limit=1)
+    assert result['head_limit_reached'] and result['legacy_heads_examined'] == 1
+    assert result['capped_days'] == result['items'][0]['candidate_days_capped'] == ['2018-08-07']
+    assert result['legacy_heads_without_candidates'] == 1
+    assert not result['absence_proved']
+    assert inspector._legacy_candidate_days('https://news.cnyes.com/00000000/a.shtml', 'invalid') == []
+    assert inspector._legacy_candidate_days('https://news.cnyes.com/99991231/a.shtml', None) == [
+        '9999-12-30', '9999-12-31']
+    db.close()
+
+
+def test_legacy_candidate_global_date_budget_marks_unsearched_days():
+    from datetime import date, timedelta
+
+    db = legacy_candidate_database()
+    rows = []
+    for i in range(180):
+        day = date(2010, 1, 1) + timedelta(days=i * 5)
+        rows.append((f'https://news.cnyes.com/{day:%Y%m%d}/{i}.shtml', 'cnyes',
+                     'unsupported_article_path', i, None, f'新聞標題{i}', None, None))
+    db.executemany('INSERT INTO articles(url,provider,state,due,body_sha256,title,metadata_date_raw,metadata_order_day) VALUES (?,?,?,?,?,?,?,?)', rows)
+    result = inspector.cnyes_legacy_reuse_candidates(db)
+    assert result['days_examined'] == result['max_days'] == 512
+    assert result['unsearched_days'] and any(item['candidate_days_unsearched'] for item in result['items'])
+    assert not result['head_limit_reached'] and not result['absence_proved']
+    db.close()
+
+
+def test_legacy_candidate_fallback_reads_only_verified_title_columns(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from downloader.artifact_io import sha256_file
+
+    db = legacy_candidate_database()
+    article_id, body_sha = bytes.fromhex('11' * 32), 'a' * 64
+    parquet = tmp_path / 'saved.parquet'
+    pq.write_table(pa.Table.from_pylist([{'article_id': article_id.hex(), 'title': '已存新聞標題',
+                                          'body_sha256': body_sha, 'body': 'private body'}]), parquet)
+    receipt = tmp_path / 'saved.receipt.json'
+    receipt.write_text(json.dumps({'sha256': sha256_file(parquet), 'rows': 1}))
+    db.execute('INSERT INTO accepted_batches VALUES (?,?)', ('saved.parquet', 'saved.receipt.json'))
+    db.execute('INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?)', (
+        'https://news.cnyes.com/20180807/123.shtml', 'cnyes', 'unsupported_article_path', 1, None,
+        '已存新聞標題 - 鉅亨網', None, '2018-08-07', None, None))
+    db.execute('INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?)', (
+        'https://news.cnyes.com/news/id/1', 'cnyes', 'complete', 1, body_sha,
+        '', None, '2018-08-07', article_id, 'saved.parquet'))
+    db.commit()
+    before = db.total_changes
+    result = inspector.cnyes_legacy_reuse_candidates(db, root=tmp_path)
+    assert db.total_changes == before
+    assert result['legacy_heads_with_candidates'] == 1
+    assert result['items'][0]['candidates'][0]['title_source'] == 'verified_parquet_title'
+    fallback = result['missing_title_fallback']
+    assert fallback['verified_titles'] == 1 and fallback['unavailable_or_invalid_heads'] == 0
+    assert fallback['encoded_bytes_read'] > 0 and fallback['body_columns_decoded'] == 0
+    assert 'private body' not in json.dumps(result)
+    with parquet.open('ab') as stream:
+        stream.write(b'corrupt')
+    failed = inspector.cnyes_legacy_reuse_candidates(db, root=tmp_path)
+    assert failed['legacy_heads_with_candidates'] == 0
+    assert failed['missing_title_fallback']['unavailable_or_invalid_heads'] == 1
+    assert not failed['absence_proved']
+    db.close()
+
+
+def test_known_metadata_wrappers_are_only_title_hints():
+    assert inspector._legacy_title_key('新聞標題| 鉅 ... - Anue鉅亨') == inspector._legacy_title_key('新聞標題')
+    assert inspector._legacy_title_key('公告台股公告證券公告鉅亨網新聞中心※來源 - 鉅亨網') == inspector._legacy_title_key('證券公告')
+    assert inspector._legacy_title_key('公司1+1研究') != inspector._legacy_title_key('公司11研究')
+
+
+@pytest.mark.parametrize('head_limit,day_limit', [(0, 1), (True, 1), (4097, 1), (1, 0), (1, True), (1, 4097)])
+def test_legacy_candidates_reject_invalid_work_bounds(head_limit, day_limit):
+    with pytest.raises(ValueError, match='1..4096'):
+        inspector.cnyes_legacy_reuse_candidates(None, head_limit=head_limit, day_limit=day_limit)
+
+
 @pytest.mark.parametrize('head_limit', [0, -1, 4097, True, 1.5])
 def test_route_census_rejects_unbounded_or_invalid_work(head_limit):
     with pytest.raises(ValueError, match='1..4096'):
@@ -197,11 +514,34 @@ def test_path_only_mode_avoids_full_status_services_and_http(cfg, tmp_path, monk
     assert db_path.read_bytes() == before
 
 
+def test_legacy_reuse_mode_uses_one_readonly_snapshot_without_http(cfg, tmp_path, monkeypatch):
+    _, output = environment(cfg, tmp_path, monkeypatch)
+    db_path = tmp_path / 'store/queue.sqlite3'
+    before = db_path.read_bytes()
+    monkeypatch.setattr(inspector, 'NewsHTTP', lambda *_a: pytest.fail('legacy audit acquired HTTP'))
+    monkeypatch.setattr(inspector.subprocess, 'check_output', lambda *_a, **_k: pytest.fail('legacy audit scanned services'))
+    assert inspector.main(['--legacy-reuse-candidates-only', '--output', str(output)]) == 0
+    result = json.loads(output.read_text())
+    assert result['legacy_heads_examined'] == 0 and result['publisher_requests'] == 0
+    assert result['raw_or_body_payloads_decoded'] == 0 and 'status' not in result and 'services' not in result
+    assert db_path.read_bytes() == before
+
+
 @pytest.mark.parametrize('args', [['--probe', URL], ['--canonical-fetch'], ['--unsupported-head-limit', '4097']])
 def test_path_only_mode_rejects_probe_or_unbounded_work_before_loading_configuration(tmp_path, monkeypatch, args):
     monkeypatch.setattr(inspector, 'load_config', lambda *_a: pytest.fail('invalid inspection loaded configuration'))
     with pytest.raises(SystemExit) as result:
         inspector.main(['--unsupported-paths-only', '--output', str(tmp_path / 'result.json'), *args])
+    assert result.value.code == 2
+
+
+@pytest.mark.parametrize('args', [
+    ['--probe', URL], ['--canonical-fetch'], ['--legacy-day-limit', '4097'], ['--unsupported-paths-only'],
+])
+def test_legacy_mode_rejects_probe_conflicting_mode_or_unbounded_work_before_config(tmp_path, monkeypatch, args):
+    monkeypatch.setattr(inspector, 'load_config', lambda *_a: pytest.fail('invalid inspection loaded configuration'))
+    with pytest.raises(SystemExit) as result:
+        inspector.main(['--legacy-reuse-candidates-only', '--output', str(tmp_path / 'result.json'), *args])
     assert result.value.code == 2
 
 

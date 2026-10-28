@@ -1,0 +1,12 @@
+# Causal factor signals, with the exact existing 2011-start financial generation.
+# The source scope is a dated admitted subset, not a claim of all-TWD readiness.
+base_config: tw_futures_historical_universe_20261025_v3.yaml
+experiment_name: tw-futures-residual-signals-20261027-v1
+training:
+  financial_transformer:
+    futures_residual_signal_context: false
+    futures_net_notional_cap: null
+    futures_beta_notional_cap: null
+runner:
+  output_dir: artifacts/markets/tw_futures_residual_signals_20261027_v1/twd_equity__control_0845
+  resume: false

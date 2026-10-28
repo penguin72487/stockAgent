@@ -172,6 +172,7 @@ def test_download_command_is_exact_date_and_verifies_prior_open_calendar(
         trading_date=date(2026, 8, 18),
     )
 
+    assert command[command.index("--start-date") + 1] == "2026-08-18"
     assert command[command.index("--end-date") + 1] == "2026-08-18"
     assert command[command.index("--same-session-rule-date") + 1] == "2026-08-18"
     assert "--require-taiex-session-calendar" in command

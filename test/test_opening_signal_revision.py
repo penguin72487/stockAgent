@@ -11,11 +11,12 @@ from stockagent.live.market_config import (
     OPENING_PROVISIONAL_REFERENCE_POLICY, SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE,
 )
 from stockagent.live.opening_signal_revision import (
-    opening_input_fingerprint, revision_admission, revision_fields,
+    opening_input_fingerprint, opening_source_revision, revision_admission, revision_fields,
 )
 from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.tw_day_trade_simulation import (
-    ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET, TwDayTradeSimulationEngine,
+    ENTRY_FILL_POLICY_0901_MINUTE_PRICE, ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET,
+    REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, TwDayTradeSimulationEngine,
 )
 from test_tw_day_trade_simulation import (
     _spec, _row, _quote, _eligibility, _provisional_summary, _now,
@@ -61,8 +62,247 @@ def ledger(path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
 
+def test_initial_opening_publication_proof_survives_later_revisions(tmp_path):
+    spec = revision_spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first_at = _now(9, 0, 5)
+    proof = {"kind": "execution_pointer_written_at", "at": first_at.isoformat()}
+    first = revision_summary(0, first_at) | {
+        "opening_entry_clock_contract": "initial_pointer_publication_before_0901_v2",
+        "initial_opening_signal_id": "revision-0",
+        "initial_opening_publication_proof": proof,
+    }
+    assert engine.register_signal(spec=spec, summary=first, signal_rows=[_row(.4)],
+        quotes={"2330": book(first_at + timedelta(microseconds=1))},
+        eligibility=_eligibility(), eligibility_coverage={},
+        now=first_at + timedelta(milliseconds=1)) == "registered"
+    register(engine, spec, 1, .2, previous=first)
+    mode = engine.state["modes"][spec.market]
+    assert mode["initial_opening_signal_id"] == "revision-0"
+    assert mode["initial_opening_publication_proof"] == proof
+    assert ledger(engine.signals_path)[-1]["initial_opening_publication_proof"] == proof
+    assert json.loads(engine.service_sync_path.read_text())["modes"][spec.market][
+        "initial_opening_publication_proof"] == proof
+
+
+@pytest.mark.parametrize("hour,minute", [(13, 20), (22, 20)])
+def test_close_cache_cannot_replace_intraday_signal_or_consume_ledger(tmp_path, hour, minute):
+    spec = revision_spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first = register(engine, spec, 0, .4)
+    mode = engine.state["modes"][spec.market]
+    prior_id = mode["signal_id"]
+    prior_processed = list(mode.get("processed_signal_ids") or ())
+    prior_events = engine.events_path.read_bytes()
+    prior_fills = engine.fills_path.read_bytes()
+    # A completed-session cache is not a progressive opening signal.  The
+    # old order of checks blocked it and overwrote the genuine signal ID.
+    after = _now(hour, minute)
+    close_cache = {**first, "signal_id": "postclose-cache",
+                   "day_trade_signal_update_policy": SIGNAL_UPDATE_ONCE}
+    assert engine.register_signal(spec=spec, summary=close_cache, signal_rows=[_row(.2)],
+        quotes={}, eligibility=_eligibility(), eligibility_coverage={}, now=after) == "ignored_after_entry_cutoff"
+    assert mode["signal_id"] == prior_id
+    assert list(mode.get("processed_signal_ids") or ()) == prior_processed
+    assert engine.events_path.read_bytes() == prior_events
+    assert engine.fills_path.read_bytes() == prior_fills
+
+
+def _replayed_initial_with_revision_lineage(tmp_path):
+    spec = revision_spec(tmp_path)
+    replay_spec = replace(spec, signal_update_policy=SIGNAL_UPDATE_ONCE,
+                          entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE)
+    initial = revision_summary(0, _now(9, 1, 10))
+    replay = initial | {
+        "day_trade_signal_update_policy": SIGNAL_UPDATE_ONCE,
+        "opening_signal_revision": None,
+        "missed_opening_original_signal_revision": initial["opening_signal_revision"],
+        "missed_opening_original_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+        "missed_opening_original_policy_fingerprint": initial["day_trade_signal_update_policy_fingerprint"],
+        "missed_opening_recovery": True,
+        "simulation_replay": True,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+        "replay_basis": "source_backed_test_counterfactual",
+    }
+    quote = _quote(minute_volume_lots=100.) | {
+        "execution_price_0901": 1000., "quote_at": _now(9, 1).isoformat()}
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    assert engine.register_signal(spec=replay_spec, summary=replay,
+        signal_rows=[dict(_row(.4), open_price=1000.)], quotes={"2330": quote},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1),
+        counterfactual_open_replay=True) == "registered"
+    assert inventory(engine, spec) == 4000
+    return engine, spec, initial
+
+
+def test_replayed_open_can_continue_with_later_causal_revision_after_restart(tmp_path):
+    engine, spec, initial = _replayed_initial_with_revision_lineage(tmp_path)
+    origin = engine.state["modes"][spec.market]["session_open_replay_origin"]
+    assert origin["signal_id"] == initial["signal_id"]
+    assert origin["open_reconstructed_at"] == _now(9, 1).isoformat()
+    original_fill = ledger(engine.fills_path)[0]
+    assert original_fill["simulation_replay"] is True
+    # A quote after model-ready but before the pointer was observed cannot
+    # execute the revision or its inventory reduction.
+    ready = _now(9, 2, 10)
+    pointer = ready + timedelta(microseconds=500000)
+    revision = revision_summary(1, ready, initial) | {
+        "execution_pointer_observed_at": pointer.isoformat()}
+    assert engine.register_signal(spec=spec, summary=revision, signal_rows=[_row(.2)],
+        quotes={"2330": book(ready + timedelta(microseconds=250000))},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 2, 11)) == "registered"
+    assert inventory(engine, spec) == 4000 and len(ledger(engine.fills_path)) == 1
+    mode = engine.state["modes"][spec.market]
+    assert mode["simulation_replay"] is False
+    assert mode["session_open_replay_origin"] == origin
+    assert mode["pending_reduction_shares"] == 2000
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine._mode(spec)  # Readiness must not replace the current retry policy.
+    assert engine.state["modes"][spec.market]["entry_fill_policy"] == ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+    engine.process_quotes(quotes={"2330": book(_now(9, 2, 12))}, now=_now(9, 2, 12))
+    fills = ledger(engine.fills_path)
+    assert inventory(engine, spec) == 2000 and len(fills) == 2
+    assert fills[0] == original_fill and fills[1]["simulation_replay"] is False
+    assert engine.state["modes"][spec.market]["session_open_replay_origin"] == origin
+    later = revision_summary(2, _now(9, 2, 13), revision) | {
+        "execution_pointer_observed_at": _now(9, 2, 13).isoformat()}
+    assert engine.register_signal(spec=spec, summary=later, signal_rows=[_row(0.)],
+        quotes={"2330": book(_now(9, 2, 14))}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 2, 14)) == "registered"
+    assert inventory(engine, spec) == 0 and ledger(engine.fills_path)[0] == original_fill
+    assert engine.state["modes"][spec.market]["session_open_replay_origin"] == origin
+
+
+def test_replayed_open_with_missing_lineage_waits_without_consuming_revision(tmp_path):
+    engine, spec, initial = _replayed_initial_with_revision_lineage(tmp_path)
+    mode = engine.state["modes"][spec.market]
+    mode.pop("session_open_replay_origin")
+    at = _now(9, 2, 10)
+    revision = revision_summary(1, at, initial) | {"execution_pointer_observed_at": at.isoformat()}
+    assert engine.register_signal(spec=spec, summary=revision, signal_rows=[_row(.2)],
+        quotes={"2330": book(_now(9, 2, 11))}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 2, 11)) == "waiting_replay_lineage"
+    assert inventory(engine, spec) == 4000 and revision["signal_id"] not in mode["processed_signal_ids"]
+    assert mode["engine_status"] == "waiting_replay_lineage"
+
+
+def test_replayed_open_revision_requires_observed_pointer(tmp_path):
+    engine, spec, initial = _replayed_initial_with_revision_lineage(tmp_path)
+    revision = revision_summary(1, _now(9, 2, 10), initial)
+    assert engine.register_signal(spec=spec, summary=revision, signal_rows=[_row(.2)],
+        quotes={"2330": book(_now(9, 2, 11))}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 2, 11)) == "waiting_quote"
+    assert inventory(engine, spec) == 4000
+    assert engine.state["modes"][spec.market]["pending_wait_reason"] == "live_revision_pointer_observation_required"
+
+
+@pytest.mark.parametrize("damage", ["fingerprint", "root", "policy_fingerprint"])
+def test_replayed_open_with_corrupted_lineage_fails_closed(tmp_path, damage):
+    engine, spec, initial = _replayed_initial_with_revision_lineage(tmp_path)
+    origin = engine.state["modes"][spec.market]["session_open_replay_origin"]
+    if damage == "root":
+        origin["revision"]["root_signal_id"] = "foreign"
+    else:
+        origin[damage] = "corrupt"
+    at = _now(9, 2, 10)
+    revision = revision_summary(1, at, initial) | {"execution_pointer_observed_at": at.isoformat()}
+    assert engine.register_signal(spec=spec, summary=revision, signal_rows=[_row(.2)],
+        quotes={"2330": book(_now(9, 2, 11))}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 2, 11)) == "waiting_replay_lineage"
+    assert inventory(engine, spec) == 4000 and len(ledger(engine.fills_path)) == 1
+
+
+def test_source_revision_ignores_receipt_churn_but_not_opening_facts(tmp_path):
+    path = tmp_path / "opening.json"
+    session = "2026-09-23"
+    row = {"available": True, "open_prices": 100.}
+    payload = {"session_date": session, "requested_symbols": ["2330", "0050"],
+        "rows": {"2330": row}, "official_trading_universe": {"fingerprint": "scope-1"}}
+    from datetime import datetime
+    row["timestamp_ms"] = int(datetime.fromisoformat(session + "T09:00:00+08:00").timestamp() * 1000)
+    def save():
+        path.write_text(json.dumps(payload))
+        return opening_source_revision(path, session_date=session)
+    first = save()
+    row.update(price=101., bid_prices=100., ask_prices=102., volumes=100,
+        timestamp_ms=row["timestamp_ms"] + 1000, no_open_print_observed_ms=0)
+    payload["captured_at_taipei"] = "later"
+    payload["requested_symbols"].reverse()
+    payload["rows"]["outside-axis"] = dict(row, open_prices=999.)
+    assert save() == first
+    row["open_prices"] = 101.
+    changed = save()
+    assert changed != first
+    payload["rows"]["0050"] = dict(row, open_prices=100.)
+    assert save() not in {first, changed}
+    payload["official_trading_universe"]["fingerprint"] = "scope-2"
+    assert save() != first
+
+
+def test_source_revision_retries_invalid_reads_and_fences_retained_mtime(tmp_path):
+    import os
+    from datetime import datetime
+    path = tmp_path / "opening.json"
+    session = "2026-09-23"
+    assert opening_source_revision(path, session_date=session) is None
+    path.write_text("{")
+    with pytest.raises(ValueError):
+        opening_source_revision(path, session_date=session)
+    payload = {"session_date": session, "requested_symbols": ["2330"], "rows": {"2330": {
+        "available": True, "open_prices": 100.,
+        "timestamp_ms": int(datetime.fromisoformat(session + "T09:00:00+08:00").timestamp() * 1000)}}}
+    path.write_text(json.dumps(payload))
+    first = opening_source_revision(path, session_date=session)
+    info = path.stat()
+    payload["rows"]["2330"]["open_prices"] = 101.
+    path.write_text(json.dumps(payload))
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+    assert path.stat().st_size == info.st_size
+    assert opening_source_revision(path, session_date=session) != first
+    with pytest.raises(ValueError, match="another session"):
+        opening_source_revision(path, session_date="2026-09-24")
+
+
+@pytest.mark.parametrize("damaged", [[], None, 1, "invalid", {"session_date": "2026-09-23",
+    "requested_symbols": ["2330"], "rows": {}, "official_trading_universe": ["invalid"]},
+    {"session_date": "2026-09-23", "requested_symbols": [], "rows": {}}])
+def test_invalid_source_shape_remains_a_retryable_value_error(tmp_path, damaged):
+    path = tmp_path / "opening.json"
+    path.write_text(json.dumps(damaged))
+    with pytest.raises(ValueError):
+        opening_source_revision(path, session_date="2026-09-23")
+    # A bad source is not cached as accepted or fatal to the observer task.
+    path.write_text(json.dumps({"session_date": "2026-09-23",
+        "requested_symbols": ["2330"], "rows": {}}))
+    assert opening_source_revision(path, session_date="2026-09-23")
+
+
 def inventory(engine, spec):
     return sum(int(p["signed_shares"]) for p in engine.state["modes"][spec.market]["positions"].values())
+
+
+def test_six_mode_financial_oracle_is_repeatable_with_explicit_fixture_clock(tmp_path, monkeypatch):
+    from scripts.benchmark_opening_signal_pipeline import _new_isolated_entry_engine, _paper_ledger_financial_oracle
+    from stockagent.live import tw_day_trade_simulation as simulation
+    original_iso = simulation._iso
+    sequences = []
+    for run in range(2):
+        monkeypatch.setattr(simulation, "_iso", lambda value=None, _run=run:
+            original_iso(value) if value is not None else f"2026-10-25T12:00:0{_run}+08:00")
+        root = tmp_path / f"independent-{run}"
+        root.mkdir()
+        engine = _new_isolated_entry_engine(root / "ledger", created_at=_now(8, 50))
+        base_spec = revision_spec(root)
+        previous, proofs = {}, []
+        for index, weight in enumerate((.4, .2, 0.)):
+            for mode in range(6):
+                spec = replace(base_spec, market=f"fixture_{mode}")
+                previous[mode] = register(engine, spec, index, weight, previous.get(mode))
+                proofs.append(_paper_ledger_financial_oracle(engine))
+        assert proofs[-1]["journals"]["signals.jsonl"]["records"] == 18
+        assert proofs[-1]["journals"]["fills.jsonl"]["records"] > 0
+        sequences.append(proofs)
+    assert sequences[0] == sequences[1]
 
 
 @pytest.mark.parametrize("change", ["append", "replace", "rewrite"])
@@ -359,6 +599,21 @@ def test_dashboard_invalidation_keeps_order_changes_but_not_private_template_pay
     assert engine.state["dashboard_content_revision"] == revision + 1
 
 
+def test_private_capacity_history_is_durable_but_not_rendered_material(tmp_path):
+    spec = revision_spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    register(engine, spec, 0, .4, quote={})
+    mode = engine.state["modes"][spec.market]
+    revision = engine.state["dashboard_content_revision"]
+    mode["margin_exit_capacity_used"] = {"2026-10-05:13:20:2330": 2000}
+    engine._persist(_now(9, 0, 7))
+    assert engine.state["dashboard_content_revision"] == revision
+    assert json.loads(engine.state_path.read_bytes())["modes"][spec.market]["margin_exit_capacity_used"] == mode["margin_exit_capacity_used"]
+    mode["entry_unfilled_shares"] = 1000
+    engine._persist(_now(9, 0, 8))
+    assert engine.state["dashboard_content_revision"] == revision + 1
+
+
 def test_retry_withholds_unpaid_receivable_once_not_twice(tmp_path):
     spec = revision_spec(tmp_path)
     engine = TwDayTradeSimulationEngine(tmp_path / "state")
@@ -475,10 +730,10 @@ def test_single_flight_coalesces_new_source_generations_and_retries_failure(monk
     monkeypatch.setattr(module, "_scheduled_markets", lambda: ["fixture"])
     monkeypatch.setattr(module, "_resolve_market", lambda *_: cfg)
     monkeypatch.setattr(module, "_scheduled_market_session_day", lambda *_: (True, "fixture"))
-    monkeypatch.setattr(module, "_intraday_waits_for_opening", lambda: False)
+    monkeypatch.setattr(module, "_opening_revision_initial_work_pending", lambda: False)
     monkeypatch.setattr(module, "_log_exception", lambda *_: None)
     generation = [0]
-    monkeypatch.setattr(module, "_path_revision", lambda *_: generation[0])
+    monkeypatch.setattr("stockagent.live.opening_signal_revision.opening_source_revision", lambda *_, **__: generation[0])
     for field in ("_opening_revision_jobs", "_opening_revision_seen", "_opening_revision_retry"):
         monkeypatch.setattr(module.bot, field, {})
     async def exercise():
@@ -506,3 +761,57 @@ def test_single_flight_coalesces_new_source_generations_and_retries_failure(monk
         await module.progressive_opening_signal.coro()
         assert len(calls) == 2 and not module.bot._opening_revision_jobs
     asyncio.run(exercise())
+
+
+def test_completed_revision_reports_drain_after_exit_cutoff_without_new_model(monkeypatch):
+    import asyncio
+    from datetime import datetime
+    from types import SimpleNamespace
+    from services.discord_bot import bot as module
+    at = _now(13, 20)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz)
+    monkeypatch.setattr(module, "datetime", Clock)
+    cfg = SimpleNamespace(market="fixture")
+    monkeypatch.setattr(module, "_resolve_market", lambda *_: cfg)
+    monkeypatch.setattr(module, "_scheduled_markets", lambda: pytest.fail("must not start work after cutoff"))
+    deliveries = []
+    monkeypatch.setattr(module, "_enqueue_scheduled_results", lambda rows, errors: deliveries.extend(rows))
+    monkeypatch.setattr(module.bot, "_opening_revision_jobs", {})
+    result = SimpleNamespace(summary={"asof_date": at.isoformat(), "signal_id": "committed"})
+    async def exercise():
+        job = asyncio.get_running_loop().create_future()
+        job.set_result(result)
+        module.bot._opening_revision_jobs["fixture"] = job
+        await module.progressive_opening_signal.coro()
+        await module.progressive_opening_signal.coro()
+    asyncio.run(exercise())
+    assert deliveries == [(cfg, result, f"{at.date()}:fixture:revision")]
+    assert not module.bot._opening_revision_jobs
+
+
+def test_initial_priority_does_not_freeze_healthy_modes_for_source_retries(monkeypatch):
+    from types import SimpleNamespace
+    from services.discord_bot import bot as module
+
+    monkeypatch.setattr(module.bot, "_opening_attempt_started_monotonic", None)
+    monkeypatch.setattr(module.bot, "_scheduled_input_jobs", {})
+    # The old first-15-seconds gate would still be True for a source retry.
+    monkeypatch.setattr(module, "_intraday_waits_for_opening", lambda: True)
+    assert not module._opening_revision_initial_work_pending()
+    def job(*, done, error):
+        return {"task": SimpleNamespace(done=lambda: done, cancelled=lambda: False,
+            result=lambda: (None, error, 0., None, {}))}
+    module.bot._scheduled_input_jobs["waiting_source"] = job(done=False, error=None)
+    module.bot._scheduled_input_jobs["failed_source"] = job(done=True, error=RuntimeError("source"))
+    assert not module._opening_revision_initial_work_pending()
+    module.bot._scheduled_input_jobs["ready_initial"] = job(done=True, error=None)
+    assert module._opening_revision_initial_work_pending()
+    module.bot._scheduled_input_jobs.clear()
+    monkeypatch.setattr(module.bot, "_opening_attempt_started_monotonic", 1.)
+    monkeypatch.setattr(module.bot, "_opening_attempt_stage", "inference")
+    assert module._opening_revision_initial_work_pending()
+    monkeypatch.setattr(module.bot, "_opening_attempt_stage", "realtime_prepare")
+    assert not module._opening_revision_initial_work_pending()

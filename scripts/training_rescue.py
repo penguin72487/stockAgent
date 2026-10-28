@@ -23,6 +23,12 @@ def main():
     commands.add_parser("cycle", help="Monitor enrolled runs and preserve committed checkpoints")
     r = commands.add_parser("register", help="Enroll an explicit immutable recovery contract")
     r.add_argument("--spec", type=Path, required=True)
+    r = commands.add_parser("bind-bootstrap", help="Bind preserved code/runtime to the unchanged original enrollment")
+    r.add_argument("--request", type=Path, required=True)
+    r = commands.add_parser("register-input-recipe", help="Attach fixed recovery inputs without changing original source enrollment")
+    r.add_argument("--spec", type=Path, required=True)
+    inventory = commands.add_parser("inventory-backup", help="Freeze current private recovery inputs for the existing encrypted NAS relay")
+    inventory.add_argument("--output", type=Path, required=True)
     for name in ("capture", "seal-bootstrap", "verify-sources"):
         s = commands.add_parser(name)
         s.add_argument("--run", required=True)
@@ -51,16 +57,31 @@ def main():
     rescue = Rescue(load_policy(args.policy))
     if args.action == "status":
         result = rescue.status()
+    elif args.action == "verify-sources":
+        # Full D decoding owns a per-run claim and short control transactions.
+        # Wrapping it in this outer owner lock would starve checkpoint capture.
+        result = rescue.verify_sources(args.run, owner_wait_seconds=args.owner_wait_seconds)
+    elif args.action == "bind-bootstrap":
+        request = json.loads(args.request.read_bytes())
+        if isinstance(request, list):
+            result = rescue.bind_bootstrap_batch(request, owner_wait_seconds=args.owner_wait_seconds)
+        else:
+            result = rescue.bind_bootstrap(request, owner_wait_seconds=args.owner_wait_seconds)
+    elif args.action == "inventory-backup":
+        from scripts.inventory_training_rescue import write_inventory
+        # The helper freezes small controls under the original owner, then
+        # releases it before immutable D census and control preservation.
+        result = write_inventory(rescue, args.output, owner_wait_seconds=args.owner_wait_seconds)
     else:
         with rescue.lock(wait_seconds=args.owner_wait_seconds):
             if args.action == "register":
                 result = rescue.register(json.loads(args.spec.read_bytes()))
+            elif args.action == "register-input-recipe":
+                result = rescue.register_input_recipe(json.loads(args.spec.read_bytes()))
             elif args.action == "capture":
                 result = rescue.capture(args.run)
             elif args.action == "seal-bootstrap":
                 result = rescue.seal_bootstrap(args.run)
-            elif args.action == "verify-sources":
-                result = rescue.verify_sources(args.run)
             elif args.action == "cycle":
                 result = rescue.cycle()
             elif args.action == "fence-provider":

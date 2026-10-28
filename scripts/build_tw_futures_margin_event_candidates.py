@@ -129,6 +129,17 @@ def candidate_notice_clock(text: str, published: str) -> dict:
             dates={d for d,_ in own_starts}
             starts={s for s in starts if s[1]!='date_only' or s[0] not in dates}
             starts.update(own_starts)
+        # Older margin notices literally say "收盤後生效". Before the
+        # exchange's 2017-05-15 night-session launch this identifies the sole
+        # regular close, just as margin_effective's dated rule does. Reclassify
+        # only an already identified operative date with bound publication;
+        # later generic closes still require their own product/session proof.
+        if issue_bound:
+            for m in re.finditer(ROC_DATE+r'(?:\([^()]{1,24}\))?收盤後(?:生效|起實施)',compact(text)):
+                day=str(roc_date(m))
+                if day<'2017-05-15' and (day,'date_only') in starts:
+                    starts.remove((day,'date_only'))
+                    starts.add((day,'after_regular_session'))
         listings={str(roc_date(m)) for m in re.finditer(
             r'(?:訂於|自)'+ROC_DATE+r'(?:起)?上市',compact(text))}
         listings.update(str(roc_date(m)) for m in re.finditer(
@@ -217,6 +228,8 @@ def source_review_candidates(archive, path):
     Per-row ratios and position limits cannot be inherited from adjacent rows.
     """
     payload=json.loads(path.read_text())
+    if payload.get('schema_version') == 1 and isinstance(payload.get('legacy'), dict):
+        return legacy_margin_source_review_candidates(archive, path, payload), []
     reviews=payload.get('reviews',[payload])
     facts=[];positions=[]
     for review in reviews:
@@ -254,10 +267,22 @@ def source_review_candidates(archive, path):
             raise ValueError('reviewed source clock mismatch')
         if review.get('original_scheduled_date') and not review.get('requires_effective_date_review', False):
             resolution = review.get('postponement_resolution', {})
+            clause = compact(resolution.get('reviewed_amendment_clause', ''))
+            clause_sha = resolution.get('amendment_content_sha256')
+            # A closure contingency can be part of the original notice;
+            # it need not arrive in a subsequent amendment. Bind the exact
+            # operative clause to its inspected original or amendment.
+            bound = next((s for s in dependencies if s['content_sha256'] == clause_sha), None)
+            clause_text = (review.get('transcribed_text', '') if bound is not None
+                           and bound['source_url'] == review['source_url']
+                           and any(p.get('page') == 1 for p in review.get('pages', []))
+                           else archive.document(bound['source_url'])['text'] if bound else '')
+            next_session_clause = ('順延至次一一般交易時段結束後起實施' in clause
+                                   and '集中交易市場休市' in clause
+                                   and review['effective_phase'] == 'after_product_regular_close')
             if (resolution.get('rule') != 'first_market_session_after_original_scheduled_date'
-                    or '順延至次一營業日' not in compact(resolution.get('reviewed_amendment_clause', ''))
-                    or resolution.get('amendment_content_sha256') not in
-                       {s['content_sha256'] for s in review.get('amendments', [])}):
+                    or not ('順延至次一營業日' in clause or next_session_clause)
+                    or bound is None or clause not in compact(clause_text)):
                 raise ValueError('resolved postponement requires a bound amendment clause')
             calendar_path = Path(resolution['calendar_source_path'])
             calendar_manifest = calendar_path.with_name('manifest.json')
@@ -266,9 +291,12 @@ def source_review_candidates(archive, path):
             if (calendar_sha != resolution['calendar_source_sha256']
                     or calendar_receipt.get('outputs', {}).get(calendar_path.name, {}).get('sha256') != calendar_sha):
                 raise ValueError('postponement calendar source SHA mismatch')
-            next_day = (pl.scan_parquet(calendar_path)
-                .filter((pl.col('session') == '一般')
-                        & (pl.col('date') > date.fromisoformat(review['original_scheduled_date'])))
+            scheduled = date.fromisoformat(review['original_scheduled_date'])
+            calendar = pl.scan_parquet(calendar_path).filter(pl.col('session') == '一般')
+            # An open scheduled day cannot be postponed by a closure clause.
+            if calendar.filter(pl.col('date') == scheduled).select(pl.len()).collect().item():
+                raise ValueError('postponement scheduled date was an official market session')
+            next_day = (calendar.filter(pl.col('date') > scheduled)
                 .select(pl.col('date').min()).collect().item())
             if str(next_day) != review['effective_date']:
                 raise ValueError('postponed date differs from the next official market session')
@@ -359,6 +387,80 @@ def source_review_candidates(archive, path):
                     underlying_symbol=row.get('underlying_symbol'),
                     requires_adjusted_contract_and_mini_group_review=True))
     return facts,positions
+
+
+def legacy_margin_source_review_candidates(archive, path, payload):
+    """Reuse the canonical byte-bound TX/MTX reviews without importing old rules.
+
+    Only margin cells and their reviewed clocks are adapted. Native conditional
+    ends remain binding; position reviews and their separate publication policy
+    are outside this adapter. The original archive validates every notice,
+    attachment, source hash, page and six independently transcribed cells.
+    """
+    from copy import copy
+    from stockagent.data.tw_futures_margin_preparation import reviewed_legacy_events
+    scope = payload['legacy']
+    notices = [r for r in scope['notices'] if r['kind'] == 'margin']
+    if not notices or any(r.get('publication_date_confirmation') for r in notices):
+        raise ValueError('legacy margin adapter requires directly bound publication dates')
+    scoped = copy(archive)
+    scoped.legacy = dict(scope, notices=notices)
+    margins, positions, _ = reviewed_legacy_events(scoped, date.fromisoformat(scope['verified_start']))
+    if positions:
+        raise ValueError('legacy margin adapter cannot change position policy')
+    digest = sha256_file(path)
+    archive.copy(path, digest, url='', kind='legacy_margin_visual_source_review')
+    facts = []
+    for product, events in margins.items():
+        for event in events:
+            doc = archive.document(event['source_url'])
+            clock = product_margin_restoration_clock(doc['text'], product,
+                candidate_notice_clock(doc['text'], event['published_date']))
+            facts.append(dict(clock, product=product, margin_kind='fixed_twd',
+                after=event['after'], before=event['before'],
+                source_url=event['source_url'], announcement_url=next(r['announcement_url'] for r in notices
+                    if r['url']==event['source_url']), published_date=event['published_date'],
+                source_content_sha256=event['content_sha256'], known_at=event['known_at'],
+                effective_date=event['effective_at'][:10], effective_phase='after_product_regular_close',
+                clock_error=None, issue_date_bound=True, chronological=True,
+                candidate_only=True, point_in_time_verified=False,
+                requires_dated_session_rule=True, extraction='source_bound_visual_transcription',
+                visual_review_sha256=digest, legacy_margin_review=True,
+                legacy_review_pages_one_based=event['pages_one_based']))
+    if sha256_file(path) != digest:
+        raise ValueError('legacy margin review changed during adaptation')
+    return facts
+
+
+def replace_reviewed_margin_facts(existing, reviewed):
+    """A reviewed old event cannot erase a separately evidenced restoration."""
+    legacy = [r for r in reviewed if r.get('legacy_margin_review')]
+    if not legacy:
+        return replace_reviewed_product_facts(existing, reviewed)
+    if len(legacy) != len(reviewed):
+        raise ValueError('mixed legacy and ordinary review scopes')
+    keys = {(r['source_content_sha256'], r['product']): r for r in legacy}
+    if len(keys) != len(legacy):
+        raise ValueError('duplicate legacy margin source/product')
+    retained = []
+    for row in existing:
+        target = keys.get((row['source_content_sha256'], row['product']))
+        if target is None:
+            retained.append(row)
+            continue
+        if row['after'] != target['after'] or row.get('before') != target.get('before'):
+            if (row.get('chronological') and row.get('effective_date')
+                    and row['effective_date'] != target['effective_date']):
+                retained.append(row)
+                continue
+            raise ValueError('legacy review leaves a contradictory margin cell/event unresolved')
+        if row.get('requires_reversion_review'):
+            target['requires_reversion_review'] = True
+        old_ends = json.loads(row.get('temporary_end_evidence') or '[]')
+        ends = json.loads(target.get('temporary_end_evidence') or '[]')
+        target['temporary_end_evidence'] = json.dumps(list({json.dumps(e,sort_keys=True):e
+            for e in ends+old_ends}.values()), ensure_ascii=False)
+    return retained+reviewed
 
 
 def apply_product_code_reviews(archive, facts, path, *, kind):
@@ -516,6 +618,106 @@ def reviewed_corporate_code_pair_corrections(review, facts):
     return corrections
 
 
+def reviewed_corporate_event_scope_corrections(review, facts):
+    """Bind an exact misdecoded event to one fully inspected replacement.
+
+    A wrong year/month or effective day cannot be repaired by widening a
+    product-level overwrite. Both the old and corrected scopes are finite,
+    explicit, and source-local; all financial cells still come from the table.
+    """
+    corrections = review.get('corrected_ocr_event_scopes', [])
+    fields = ('from_product', 'product', 'effective_date', 'contract_months')
+    required = set(fields) | {'corrected_' + field for field in fields}
+    seen = set()
+    for item in corrections:
+        if set(item) != required:
+            raise ValueError('corporate event correction requires exact old and corrected event scopes')
+        scopes = []
+        for prefix in ('', 'corrected_'):
+            for field in ('from_product', 'product'):
+                if not re.fullmatch(r'[A-Z]{2}[F1-9]', item.get(prefix + field) or ''):
+                    raise ValueError('corporate event correction contains an invalid physical code')
+            day = date.fromisoformat(item[prefix + 'effective_date']).isoformat()
+            months = item[prefix + 'contract_months']
+            if (not months or len(months) != len(set(months))
+                    or any(not re.fullmatch(r'\d{4}(?:0[1-9]|1[0-2])', month) for month in months)):
+                raise ValueError('corporate event correction requires finite unique physical months')
+            scopes.append((item[prefix + 'from_product'], item[prefix + 'product'], day,
+                           tuple(sorted(months))))
+        if scopes[0] == scopes[1] or scopes[0] in seen:
+            raise ValueError('corporate event correction must change one unique old scope')
+        matches = [fact for fact in facts if
+            (fact.get('from_product'), fact.get('product'), fact.get('effective_date'),
+             tuple(sorted(fact.get('contract_months') or []))) == scopes[1]]
+        if len(matches) != 1:
+            raise ValueError('corporate event correction lacks one exact inspected replacement')
+        seen.add(scopes[0])
+    return corrections
+
+
+def corporate_extraction_view_identity(fact):
+    """Identify an exact decoded financial view, including absent old scopes."""
+    fields = ('source_content_sha256', 'from_product', 'product', 'effective_date',
+        'contract_months', 'contract_multiplier', 'deliverable_security_quantity',
+        'deliverable_cash_twd', 'subscription_rights_at_final_settlement',
+        'requires_rights_valuation', 'has_equity_credit_fields', 'cash_equity_pair_agrees',
+        'equity_credit_long_per_contract', 'equity_debit_short_per_contract',
+        'fixed_subscription_rights_twd', 'deliverable_components_resolved')
+    result = {field: fact.get(field) for field in fields}
+    result['contract_months'] = sorted(fact.get('contract_months') or [])
+    for field in ('contract_multiplier', 'deliverable_security_quantity',
+            'deliverable_cash_twd', 'equity_credit_long_per_contract',
+            'equity_debit_short_per_contract', 'fixed_subscription_rights_twd'):
+        value = result[field]
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError('corporate extraction view contains a nonfinite financial cell')
+            result[field] = float(value)
+    return result
+
+
+def reviewed_corporate_extraction_view_corrections(review, facts):
+    """Retire only enumerated wrong views against one inspected physical event.
+
+    An unknown old month/date is not a wildcard: all decoded financial cells
+    and the source SHA must match. This preserves other events in the original.
+    """
+    corrections = review.get('corrected_ocr_extraction_views', [])
+    required = {'old_view', 'corrected_from_product', 'corrected_product',
+        'corrected_effective_date', 'corrected_contract_months'}
+    source = review['content_sha256']
+    seen = set()
+    for item in corrections:
+        if set(item) != required:
+            raise ValueError('corporate extraction correction requires a complete old view and exact target')
+        old = item['old_view']
+        if (not isinstance(old, dict) or old != corporate_extraction_view_identity(old)
+                or old['source_content_sha256'] != source
+                or not re.fullmatch(r'[a-f0-9]{64}', source)):
+            raise ValueError('corporate extraction correction lacks an exact source-bound old view')
+        for prefix, scope in (('', old), ('corrected_', item)):
+            for field in ('from_product', 'product'):
+                if not re.fullmatch(r'[A-Z]{2}[F1-9]', scope.get(prefix + field) or ''):
+                    raise ValueError('corporate extraction correction contains an invalid physical code')
+            day = scope[prefix + 'effective_date']
+            if day is not None:
+                date.fromisoformat(day)
+            months = scope[prefix + 'contract_months']
+            if (not isinstance(months, list) or len(months) != len(set(months))
+                    or any(not re.fullmatch(r'\d{4}(?:0[1-9]|1[0-2])', m) for m in months)
+                    or (prefix and (not day or not months))):
+                raise ValueError('corporate extraction correction has an invalid physical event scope')
+        targets = [fact for fact in facts if all(fact.get(field) == item['corrected_' + field]
+            for field in ('from_product', 'product', 'effective_date'))
+            and sorted(fact.get('contract_months') or []) == sorted(item['corrected_contract_months'])]
+        key = json.dumps(old, sort_keys=True)
+        if (len(targets) != 1 or key in seen or old == corporate_extraction_view_identity(
+                dict(targets[0], source_content_sha256=source))):
+            raise ValueError('corporate extraction correction lacks one distinct inspected replacement')
+        seen.add(key)
+    return corrections
+
+
 def replace_reviewed_corporate_facts(existing, reviewed):
     """An inspected code cell owns its exact source, origin, date and months.
 
@@ -525,6 +727,8 @@ def replace_reviewed_corporate_facts(existing, reviewed):
     """
     scopes = {}
     corrected_pairs = {}
+    corrected_events = set()
+    corrected_views = set()
     for row in reviewed:
         key = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'effective_date'))
         if all(key) and row.get('contract_months'):
@@ -542,8 +746,40 @@ def replace_reviewed_corporate_facts(existing, reviewed):
             for item in corrections:
                 old = (row['source_content_sha256'], item['from_product'], item['product'], item['effective_date'])
                 corrected_pairs.setdefault(old, set()).update(item['contract_months'])
+        if row.get('reviewed_event_scope_corrections'):
+            if (row.get('extraction') != 'source_bound_visual_corporate_cells'
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('visual_review_sha256') or '')
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('source_content_sha256') or '')
+                    or not row.get('issue_date_bound')):
+                raise ValueError('corporate event correction requires source-bound inspected cells')
+            corrections = json.loads(row['reviewed_event_scope_corrections'])
+            own_review = [fact for fact in reviewed
+                if fact.get('source_content_sha256') == row['source_content_sha256']]
+            reviewed_corporate_event_scope_corrections(
+                {'corrected_ocr_event_scopes': corrections}, own_review)
+            corrected_events.update((row['source_content_sha256'], item['from_product'],
+                item['product'], item['effective_date'], tuple(sorted(item['contract_months'])))
+                for item in corrections)
+        if row.get('reviewed_extraction_view_corrections'):
+            if (row.get('extraction') != 'source_bound_visual_corporate_cells'
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('visual_review_sha256') or '')
+                    or not re.fullmatch(r'[a-f0-9]{64}', row.get('source_content_sha256') or '')
+                    or not row.get('issue_date_bound')):
+                raise ValueError('corporate extraction correction requires source-bound inspected cells')
+            corrections = json.loads(row['reviewed_extraction_view_corrections'])
+            own_review = [fact for fact in reviewed
+                if fact.get('source_content_sha256') == row['source_content_sha256']]
+            reviewed_corporate_extraction_view_corrections(dict(
+                content_sha256=row['source_content_sha256'], corrected_ocr_extraction_views=corrections), own_review)
+            corrected_views.update(json.dumps(item['old_view'], sort_keys=True) for item in corrections)
     kept = []
-    for row in replace_reviewed_product_facts(existing, reviewed):
+    # Corporate originals may contain more than one dated event for the same
+    # product. Unlike a whole product-table replacement, a partial event review
+    # must keep every unreviewed date/month. Deduplicate equal reviewed rows
+    # without changing their order or mutating either input.
+    reviewed_values = {json.dumps(row, sort_keys=True) for row in reviewed}
+    pending = [row for row in existing if json.dumps(row, sort_keys=True) not in reviewed_values]
+    for row in [*pending, *reviewed]:
         if row in reviewed:
             # A source-bound terminal formula revision is retained in its
             # review receipt. It is not a second conversion of the security,
@@ -554,6 +790,10 @@ def replace_reviewed_corporate_facts(existing, reviewed):
         key = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'effective_date'))
         months = set(row.get('contract_months') or [])
         old = tuple(row.get(c) for c in ('source_content_sha256', 'from_product', 'product', 'effective_date'))
+        if corrected_views and json.dumps(corporate_extraction_view_identity(row), sort_keys=True) in corrected_views:
+            continue
+        if (*old, tuple(sorted(months))) in corrected_events:
+            continue
         if months and months <= corrected_pairs.get(old, set()):
             continue
         if months and months <= scopes.get(key, set()):
@@ -1188,6 +1428,103 @@ def reviewed_corporate_publication(archive, path, review, doc, text, notice):
         render_review_sha256=review['render_evidence']['sha256'])
 
 
+def reviewed_corporate_publication_clock(review, text, notice):
+    """Keep an inspected issuing date distinct from a later index posting.
+
+    The automatic seven-day heuristic protects reusable attachment names.
+    An explicit source-bound review may prove a longer posting delay, but it
+    still uses the later index clock. It never backdates knowledge to issuance.
+    """
+    proof = review.get('publication_clock_review')
+    if proof is None:
+        check_publication(text, review['published_date'])
+        return {}
+    fields = {'kind', 'issued_date', 'index_published_date', 'notice_number'}
+    first = [page for page in review['pages'] if page['page'] == 1]
+    issued = {m['date_iso'] for m in temporal_mentions(text) if m['role'] == 'publication'}
+    number = proof.get('notice_number', '')
+    if (set(proof) != fields or proof['kind'] != 'inspected_issue_with_later_index_v1'
+            or notice is None or notice['published_date'] != review['published_date']
+            or proof['index_published_date'] != review['published_date']
+            or proof['issued_date'] != review.get('issued_date')
+            or issued != {proof['issued_date']}
+            or date.fromisoformat(proof['issued_date']) >= date.fromisoformat(review['published_date'])
+            or review.get('publication_evidence') or len(first) != 1
+            or 1 not in review.get('visually_reviewed_pages', [])
+            or not first[0].get('image_path')
+            or not re.fullmatch(r'[a-f0-9]{64}', first[0].get('image_sha256') or '')
+            or not re.fullmatch(r'\d{10,11}', number)
+            or not re.search(r'發文字號[:：]?[臺台]期交字第' + number + '號',
+                             compact(first[0]['native_text']))):
+        raise ValueError('corporate delayed index clock lacks an exact inspected issuing page')
+    return dict(publication_basis='inspected_issuing_notice_with_later_index',
+                index_publication_verified=True, issuing_notice_number=number)
+
+
+def reviewed_stock_deliverable_rule_image(archive, path, item, source_url):
+    """Resolve an inspected page by its original or retained bound receipt."""
+    image_path = path.parent / item['image_path']
+    if not image_path.exists():
+        retained = {archive.bundle / source['path'] for source in archive.sources.values()
+            if source['kind'] == 'visual_stock_deliverable_multiplier_rule_page'
+            and source['url'] == source_url and source['sha256'] == item['image_sha256']}
+        if len(retained) != 1:
+            raise ValueError('relocated stock multiplier rule lacks one bound page receipt')
+        image_path = retained.pop()
+    if sha256_file(image_path) != item['image_sha256']:
+        raise ValueError('stock deliverable multiplier review image mismatch')
+    return image_path
+
+
+def reviewed_stock_deliverable_multiplier_rule(archive, path, review):
+    """Bind the explicitly inspected 2015 stock-futures unit rule, or omit it.
+
+    The attachment is scanned. The two reviewed images must be exact renders
+    of its original source bytes; the reviewed sentence has a fixed scope and
+    cannot authorize an unrelated product, a different value or backdating.
+    """
+    proof = review.get('stock_deliverable_multiplier_rule')
+    if proof is None:
+        return None
+    import gzip
+    import hashlib
+    import fitz
+    expected_url = 'https://www.taifex.com.tw/file/taifex/CHINESE/11/attach/20150402函_公告增加級距保證金.pdf'
+    expected_sha = '5bbc5c53852b8485b88a26d80f410264bd4f1066de10635c7a250638a85538b4'
+    expected_text = '前揭契約乘數，未經本契約交易規則所定之契約調整者為2,000，經契約調整者為調整後之標的證券股數。'
+    if (proof.get('source_url') != expected_url or proof.get('content_sha256') != expected_sha
+            or proof.get('published_date') != '2015-04-02'
+            or proof.get('effective_date') != '2015-06-01'
+            or proof.get('reviewed_text') != expected_text
+            or proof.get('render_scale') != 1
+            or review.get('published_date', '') <= proof['published_date']):
+        raise ValueError('stock deliverable multiplier rule scope mismatch')
+    doc = archive.document(expected_url)
+    notice = archive.conn.execute('SELECT * FROM announcements WHERE url=?',
+                                  (expected_url,)).fetchone()
+    if (doc['content_sha256'] != expected_sha or notice is None
+            or notice['published_date'] != proof['published_date']):
+        raise ValueError('stock deliverable multiplier rule source/clock mismatch')
+    raw_path = archive.root / doc['raw_path']
+    raw = gzip.decompress(raw_path.read_bytes())
+    if hashlib.sha256(raw).hexdigest() != expected_sha:
+        raise ValueError('stock deliverable multiplier original hash mismatch')
+    images = proof.get('reviewed_pages') or []
+    if [item.get('page') for item in images] != [1, 2]:
+        raise ValueError('stock deliverable multiplier rule requires both reviewed pages')
+    with fitz.open(stream=raw, filetype='pdf') as pdf:
+        for item in images:
+            image_path = reviewed_stock_deliverable_rule_image(archive, path, item, expected_url)
+            rendered = pdf[item['page'] - 1].get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False).tobytes('png')
+            if hashlib.sha256(rendered).hexdigest() != item['image_sha256']:
+                raise ValueError('stock deliverable multiplier image is not from original')
+            archive.copy(image_path, item['image_sha256'], url=expected_url,
+                         kind='visual_stock_deliverable_multiplier_rule_page')
+    return dict(unit_rule_source_sha256=expected_sha,
+                unit_rule_published_date=proof['published_date'],
+                unit_rule_effective_date=proof['effective_date'])
+
+
 def corporate_source_review_candidates(archive, path, *, source_urls=None):
     """Bind a visual cell transcription to the exact original PDF and notice."""
     payload=json.loads(path.read_text());reviews=payload.get('reviews',[payload])
@@ -1254,7 +1591,8 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
                          kind='corporate_publication_text')
             archive.copy(manifest_path,proof['manifest_sha256'],url='',
                          kind='corporate_publication_parent_manifest')
-        check_publication(publication_text,review['published_date'])
+        publication_proof.update(reviewed_corporate_publication_clock(
+            review, publication_text, notice))
         issued = review.get('issued_date')
         if issued is not None:
             literal_issued={v['date_iso'] for v in temporal_mentions(publication_text)
@@ -1277,7 +1615,13 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
                 raise ValueError('visual notice amendment lacks exact original/reference binding')
             check_publication(old['first_page_text'],old['published_date'])
             superseded.append(old['content_sha256'])
-        facts=reviewed_fixed_subscription_rights(corporate_native_table_candidates(pages),review)
+        unit_rule = reviewed_stock_deliverable_multiplier_rule(archive, path, review)
+        facts=reviewed_fixed_subscription_rights(corporate_native_table_candidates(
+            pages, allow_stock_deliverable_multiplier=unit_rule is not None),review)
+        if unit_rule and any(r.get('contract_multiplier_origin') == 'reviewed_stock_deliverable_quantity_v1'
+                             and (not r.get('effective_date') or r['effective_date'] < unit_rule['unit_rule_effective_date'])
+                             for r in facts):
+            raise ValueError('stock deliverable multiplier rule is not yet effective')
         terminal_revision = review.get('terminal_formula_revision_only') is True
         if not facts or any(not r['deliverable_components_resolved'] or not r['contract_months']
                 or not r['effective_date'] or (r['effective_date']<=review['published_date'] and not terminal_revision)
@@ -1290,10 +1634,18 @@ def corporate_source_review_candidates(archive, path, *, source_urls=None):
             extraction='source_bound_visual_corporate_cells',visual_review_sha256=sha256_file(path),
             supersedes_source_sha256s=sorted(set(superseded)),
             supersession_review_sha256=sha256_file(path) if superseded else None)
+        if unit_rule:
+            provenance.update(unit_rule)
         provenance.update(publication_proof)
         corrections = reviewed_corporate_code_pair_corrections(review, facts)
         if corrections:
             provenance['reviewed_code_pair_corrections'] = json.dumps(corrections, sort_keys=True)
+        event_corrections = reviewed_corporate_event_scope_corrections(review, facts)
+        if event_corrections:
+            provenance['reviewed_event_scope_corrections'] = json.dumps(event_corrections, sort_keys=True)
+        view_corrections = reviewed_corporate_extraction_view_corrections(review, facts)
+        if view_corrections:
+            provenance['reviewed_extraction_view_corrections'] = json.dumps(view_corrections, sort_keys=True)
         if issued is not None:
             provenance['issued_date']=issued
         bound_facts=[dict(fact,**provenance) for fact in facts]
@@ -1845,6 +2197,99 @@ def bind_native_margin_period_extension(archive, text, amendment, facts):
         candidate_only=True)
 
 
+def declared_seasonal_margin_continuations(archive, facts, source_url, published_date, *, products,
+                                         product_classes=None):
+    """Join an explicit unchanged seasonal level to its expiring own source.
+
+    This creates a newly known continuation at the old expiry. It never extends
+    the earlier source's knowledge clock or treats a planned reversion as fact.
+    Named products in the new notice have their own adjustments and are excluded.
+    """
+    doc=archive.document(source_url)
+    text=compact(doc['text'])
+    own_clock=candidate_notice_clock(doc['text'],published_date)
+    if (not own_clock['issue_date_bound']
+            or not re.fullmatch('[a-f0-9]{64}',doc.get('content_sha256',''))):
+        raise ValueError('seasonal continuation lacks its own original publication')
+    clause=re.search(r'上列契約外[,，]?[餘原]春節假期前公告調高保證金之各項契約'
+        r'[,，]?維持原春節保證金收取標準',text)
+    class_clause=re.search(r'公告[臺台]股期貨契約\(TX\)等\d+檔股價指數類契約'
+        r'及元大[臺台]灣50ETF期貨\(NYF\)等\d+檔標的證券為受益憑證'
+        r'之股票類契約[,，]維持春節期間保證金收取標準[,，]不予回調',text)
+    dates={str(roc_date(m)) for m in re.finditer(
+        r'並自'+ROC_DATE+r'一般交易時段結束後(?:起)?實施',text)}
+    if (clause is None and class_clause is None) or len(dates)!=1:return []
+    effective=next(iter(dates))
+    if (not published_date<effective or own_clock['effective_date']!=effective
+            or own_clock['effective_phase']!='after_product_regular_close'):return []
+    known=timestamp(date.fromisoformat(published_date),'23:59:59')
+    excluded=set(re.findall(r'\(([A-Z][A-Z0-9]{1,2})\)',text))
+    if not excluded:return []
+    class_scope=None
+    if class_clause is not None:
+        if product_classes is None or not set(products)<=set(product_classes):
+            raise ValueError('class-specific seasonal continuation requires source-bound product classes')
+        class_scope={p for p in products if product_classes[p] in ('index_future','etf_future')}
+    grouped={}
+    for prior in facts:
+        product=prior['product']
+        if (product not in products
+                or (product not in class_scope if class_scope is not None else product in excluded)
+                or not prior.get('issue_date_bound')
+                or not prior.get('requires_reversion_review')
+                or prior.get('margin_kind')!='fixed_twd'
+                or prior.get('effective_phase')!='after_product_regular_close'
+                or not prior.get('published_date') or not prior.get('effective_date')
+                or not prior['published_date']<=prior['effective_date']<published_date
+                or prior['effective_date'][:4]!=effective[:4]
+                or prior.get('known_at')!=timestamp(date.fromisoformat(prior['published_date']),'23:59:59')):
+            continue
+        ends={(v['date_iso'],v['boundary']) for v in json.loads(prior.get('temporary_end_evidence') or '[]')}
+        if ends!={(effective,'after_regular_session')}:continue
+        after=prior.get('after') or []
+        if (len(after)!=3 or not all(isinstance(v,(int,float)) and not isinstance(v,bool)
+                and math.isfinite(v) and v>0 for v in after) or not after[0]>=after[1]>=after[2]):continue
+        original=archive.document(prior['source_url'])
+        if original['content_sha256']!=prior['source_content_sha256']:
+            raise ValueError('seasonal continuation original content SHA mismatch')
+        if not candidate_notice_clock(original['text'],prior['published_date'])['issue_date_bound']:
+            # A retained scanned attachment may require its inspected clock.
+            # Keep that original; use a directly date-bound sibling source for
+            # this new continuation when one exists.
+            continue
+        if '春節' not in compact(original['text']):continue
+        grouped.setdefault(product,[]).append(prior)
+    result=[]
+    for product,priors in sorted(grouped.items()):
+        if len({tuple(r['after']) for r in priors})!=1:continue
+        prior=priors[0]
+        # Conflicting source views must stay unresolved. Do not discard the
+        # older one first and accidentally promote the later conflicting view.
+        if any(r['product']==product and r.get('issue_date_bound')
+                and min(p['effective_date'] for p in priors)<(r.get('effective_date') or '')<effective
+                and r.get('known_at','9999')<=known and r.get('after')!=prior['after'] for r in facts):continue
+        proof=dict(rule='declared_unchanged_seasonal_level_from_own_expiring_sources',
+            clause=(class_clause or clause)[0],excluded_named_products=sorted(excluded) if class_scope is None else [],
+            admitted_product_classes=sorted({product_classes[p] for p in class_scope}) if class_scope is not None else None,
+            prior_sources=[{k:r[k] for k in ('source_url','source_content_sha256','published_date',
+                'known_at','effective_date','effective_phase','after')} for r in priors],
+            continuation_source_content_sha256=doc['content_sha256'],known_at=known)
+        row=dict(prior,source_url=source_url,announcement_url=source_url,
+            source_content_sha256=doc['content_sha256'],published_date=published_date,known_at=known,
+            effective_date=effective,effective_phase='after_product_regular_close',
+            before=list(prior['after']),after=list(prior['after']),event_type='before_after',
+            temporary_end_evidence='[]',requires_reversion_review=False,clock_error=None,
+            chronological=True,issue_date_bound=True,candidate_only=True,point_in_time_verified=False,
+            extraction='declared_seasonal_level_continuation',
+            extension_join_evidence=json.dumps(proof,ensure_ascii=False))
+        for field in ('restoration_rule','restoration_target','restoration_reference_evidence',
+                'restoration_evidence','original_temporary_end_evidence','temporary_end_postponement_evidence',
+                'source_review_clock_text','visual_review_sha256','margin_clock_repair_original'):
+            row[field]=None
+        result.append(row)
+    return result
+
+
 def compose_bound_margin_extension_views(archive, facts):
     """Bind incomplete amount views only to a proved extension of their own bytes."""
     from copy import deepcopy
@@ -2326,15 +2771,31 @@ def preceding_restoration_products(prefix, aliases=None):
     return products
 
 
-def referenced_before_restoration(views, fact, facts):
+def _restoration_reference_context(facts):
+    """Index one immutable invocation's facts and pure source-text parses."""
+    by_key = {}
+    for row in facts:
+        key = (row['product'], row.get('effective_date'), row.get('margin_kind'))
+        by_key.setdefault(key, []).append(row)
+    return dict(owner=facts, row_count=len(facts), by_key=by_key, views={})
+
+
+def referenced_before_restoration(views, fact, facts, *, _context=None):
     """Resolve an explicitly named product's reference to an older before column."""
     if not fact.get('effective_date') or not fact.get('known_at'):
         return None
     references=set(); clauses=[]
     pattern=r'恢復為(?P<ref>(?:\d{2,3}年)?\d{1,2}月\d{1,2}日)?(?:調整前|標的證券未經處置前)(?:之)?保證金'
+    if _context is not None and (_context['owner'] is not facts or _context['row_count'] != len(facts)):
+        raise ValueError('restoration reference context belongs to another fact invocation')
     for text in views:
-        aliases=margin_notice_product_aliases(text)
-        assigned=named_margin_restoration_clauses(text,publication_bound=bool(fact.get('issue_date_bound')))
+        bound = bool(fact.get('issue_date_bound'))
+        key = (text, bound)
+        parsed = _context['views'] if _context is not None else {}
+        if key not in parsed:
+            parsed[key] = (margin_notice_product_aliases(text),
+                named_margin_restoration_clauses(text, publication_bound=bound))
+        aliases, assigned = parsed[key]
         if assigned is not None:
             for clause in assigned:
                 if fact['product'] not in clause['products']:continue
@@ -2384,7 +2845,9 @@ def referenced_before_restoration(views, fact, facts):
     if day==fact['effective_date']:
         if not fact.get('before'):return None
         return dict(restoration_target=list(fact['before']),restoration_rule='return_to_declared_before')
-    prior=[r for r in facts if r['product']==fact['product'] and r.get('effective_date')==day
+    candidates = facts if _context is None else _context['by_key'].get(
+        (fact['product'], day, fact['margin_kind']), ())
+    prior=[r for r in candidates if r['product']==fact['product'] and r.get('effective_date')==day
         and r.get('margin_kind')==fact['margin_kind'] and r.get('issue_date_bound')
         and r.get('before') and r.get('known_at') and r['known_at']<=fact['known_at']]
     values={tuple(r['before']) for r in prior}
@@ -2558,6 +3021,8 @@ def verified_disposal_restorations(archive, facts, path, *, source_urls=None):
     for source in evidence['sources']:
         archive.copy(Path(source['path']),source['sha256'],url=source.get('url',''),kind=source['kind'])
     texts={};verified=[]
+    closed_notice_views = {}
+    reference_context = _restoration_reference_context(facts)
     for row in facts:
         row=dict(row)
         if source_urls is not None and row.get('source_url') not in source_urls:
@@ -2591,13 +3056,16 @@ def verified_disposal_restorations(archive, facts, path, *, source_urls=None):
                         for r in review_payload.get('reviews',[review_payload]))
                 if not bound:raise ValueError('restoration review context differs from its retained review')
                 views=[compact(row['source_review_clock_text'])]
-            if has_closed_cash_postponement_clause(views):
+            view_key = tuple(views)
+            if view_key not in closed_notice_views:
+                closed_notice_views[view_key] = has_closed_cash_postponement_clause(views)
+            if closed_notice_views[view_key]:
                 row['restoration_delay_rule']='postpone_for_closed_or_full_day_halted_cash_sessions'
             # A notice can restore a level from an EARLIER adjustment, not its
             # own before column. Do not turn any matching sibling clause into
             # permission to restore this product's immediately preceding level.
             # Explicit earlier references require a composed source-bound chain.
-            target=referenced_before_restoration(views,row,facts)
+            target=referenced_before_restoration(views,row,facts, _context=reference_context)
             if target:
                 row.update(target)
             elif row.get('before') and has_local_before_restoration(views, row['effective_date']):
@@ -4685,7 +5153,7 @@ def compile_candidate_bundle(a,code_sha):
         position_facts.extend(native_position_candidates(archive,root,market_dates=position_dates))
     for path in a.source_reviews:
         reviewed_margins,reviewed_positions=source_review_candidates(archive,path)
-        facts=replace_reviewed_product_facts(facts, reviewed_margins)
+        facts=replace_reviewed_margin_facts(facts, reviewed_margins)
         position_facts.extend(reviewed_positions)
     corporate_refreshed=refresh_corporate_candidates(archive,corporate_facts) if a.reextract_corporate else 0
     corporate_text_issues=[];corporate_text_added=0

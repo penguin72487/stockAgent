@@ -45,6 +45,69 @@ def _runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sponsor, "backfill_budget", lambda *_a, **_kw: {"allowed": True})
     monkeypatch.setattr(sponsor, "protected_stock_opening", lambda *_a: False)
     monkeypatch.setattr(sponsor.shutil, "disk_usage", lambda *_a: SimpleNamespace(free=100 * 1024**3))
+    monkeypatch.setattr(sponsor, "AcquisitionCapacitySampler", lambda _root: SimpleNamespace(
+        initial_sample=lambda: {"state": "admitted"}, sample=lambda: {"state": "admitted"}))
+
+
+def test_physical_disk_pause_preserves_receipts_and_never_checks_the_account(tmp_path, monkeypatch):
+    previous = {"state": "batch_complete", "observed_at_utc": "2026-01-01T00:00:00+00:00",
+                "series": {"source": {"rows": 123}}, "tier": "Sponsor"}
+    (tmp_path / "status.json").write_text(json.dumps(previous))
+    receipt = tmp_path / "existing.receipt"
+    receipt.write_bytes(b"original source evidence")
+    admission = {"state": "deferred", "reason": "physical_backing_headroom_unconfirmed"}
+    monkeypatch.setattr(sponsor, "AcquisitionCapacitySampler", lambda _root: SimpleNamespace(
+        initial_sample=lambda: admission))
+    monkeypatch.setattr(sponsor, "load_env_file", lambda *_a, **_k: pytest.fail("credential read"))
+    monkeypatch.setattr(sponsor, "verified_account", lambda *_a, **_k: pytest.fail("provider call"))
+    result = sponsor.run_once(tmp_path)
+    assert result["state"] == "disk_guard" and result["capacity_admission"] == admission
+    assert result["series"] == previous["series"] and result["tier"] == "Sponsor"
+    assert result["source_status_observed_at_utc"] == previous["observed_at_utc"]
+    assert receipt.read_bytes() == b"original source evidence"
+
+
+def test_capacity_sampler_cannot_be_reused_for_another_workspace(tmp_path, monkeypatch):
+    sampler = sponsor.AcquisitionCapacitySampler(tmp_path / "other")
+    monkeypatch.setattr(sponsor, "load_env_file", lambda *_a, **_k: pytest.fail("credential read"))
+    with pytest.raises(ValueError, match="different workspace"):
+        sponsor.run_once(tmp_path / "source", capacity_sampler=sampler)
+
+
+def test_loop_reuses_one_sampler_across_capacity_retries(tmp_path, monkeypatch):
+    seen, created = [], []
+    marker = object()
+    monkeypatch.setattr(sponsor, "AcquisitionCapacitySampler",
+                        lambda root: created.append(root) or marker)
+    def cycle(_root, **kwargs):
+        seen.append(kwargs["capacity_sampler"])
+        if len(seen) == 3:
+            raise KeyboardInterrupt
+        return {"state": "disk_guard"}
+    monkeypatch.setattr(sponsor, "run_once", cycle)
+    monkeypatch.setattr(sponsor, "wait_for_next_cycle", lambda *_a, **_k: None)
+    assert sponsor.main(["--root", str(tmp_path), "--loop"]) == 130
+    assert created == [tmp_path] and seen == [marker, marker, marker]
+
+
+def test_low_capacity_stops_new_dispatch_but_finishes_inflight_receipt(tmp_path, monkeypatch):
+    _runtime(monkeypatch)
+    blocked = {"state": "deferred", "reason": "physical_backing_headroom_unconfirmed"}
+    samples = iter([{"state": "admitted"}, {"state": "admitted"}, blocked, blocked])
+    monkeypatch.setattr(sponsor, "AcquisitionCapacitySampler", lambda _root: SimpleNamespace(
+        initial_sample=lambda: {"state": "admitted"}, sample=lambda: next(samples, blocked)))
+    monkeypatch.setattr(sponsor, "_claim_batch", lambda *_a, **_k: None)
+    calls = []
+    monkeypatch.setattr(sponsor, "_fetch_rows", lambda *_a, **_k: calls.append(_a[-1]) or [])
+    with sponsor._db(tmp_path / "queue.sqlite3") as conn:
+        _years(conn, 2024, 2025)
+    result = sponsor.run_once(tmp_path, workers=2, max_requests=2)
+    assert len(calls) == 1 and result["state"] == "disk_guard"
+    assert result["capacity_admission"]["reason"] == blocked["reason"]
+    with sponsor._db(tmp_path / "queue.sqlite3") as conn:
+        states = conn.execute("SELECT state, receipt_path FROM tasks ORDER BY partition").fetchall()
+    assert states[0][0] == "pending" and states[1][0] == "observed_empty"
+    assert (tmp_path / states[1][1]).is_file()
 
 
 def test_claim_batches_only_due_contiguous_pending_neighbors(tmp_path: Path) -> None:

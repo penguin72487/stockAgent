@@ -20,6 +20,22 @@ CAPTURED = "2026-10-16T01:00:00+00:00"
 URLS = [f"https://news.example.com/article/{i}" for i in range(4)]
 
 
+@pytest.fixture(autouse=True)
+def _fixture_disk_admission(monkeypatch):
+    """Corpus fixtures are independent of the host's changing WSL capacity."""
+    class FilesystemSampler:
+        def __init__(self, root, **kwargs):
+            pass
+
+        def sample(self, filesystem_free):
+            return {"state": "not_required", "free_bytes": filesystem_free, "inflight": False}
+
+        def wait(self, timeout):
+            raise AssertionError("native fixture should not wait for a backing probe")
+
+    monkeypatch.setattr(corpus, "BackingDiskSampler", FilesystemSampler)
+
+
 def source_fixture(tmp_path):
     root = tmp_path / "source"
     root.mkdir()
@@ -88,6 +104,81 @@ def source_fixture(tmp_path):
     db.commit()
     db.close()
     return root
+
+
+@pytest.mark.parametrize("state,free", [
+    ("available", corpus.MIN_FREE_BYTES - 1),
+    ("unavailable", None),
+    ("stale", None),
+    ("pending", None),
+])
+def test_dataset_guard_blocks_before_source_snapshot_when_physical_space_is_unsafe(tmp_path, monkeypatch, state, free):
+    source, output = source_fixture(tmp_path), tmp_path / "dataset"
+    class UnsafeSampler:
+        def __init__(self, root, **kwargs):
+            pass
+
+        def sample(self, filesystem_free):
+            # A plentiful virtual filesystem is not proof of WSL backing room.
+            assert filesystem_free >= corpus.MIN_FREE_BYTES
+            return {"state": state, "free_bytes": free, "inflight": False}
+
+    monkeypatch.setattr(corpus, "BackingDiskSampler", UnsafeSampler)
+    monkeypatch.setattr(corpus, "freeze_inputs", lambda *args, **kwargs: pytest.fail("snapshot must not start"))
+    with pytest.raises(RuntimeError, match="news dataset disk guard"):
+        corpus.build_news_dataset(source, output)
+    assert not (output / "manifest.json").exists()
+    assert not (output / ".active-build.json").exists()
+    assert not (output / "versions").exists()
+
+
+def test_dataset_guard_waits_for_initial_sample_and_blocks_verification_if_backing_disappears(tmp_path, monkeypatch):
+    source, output = source_fixture(tmp_path), tmp_path / "dataset"
+    class PendingThenSafe:
+        def __init__(self, root, **kwargs):
+            self.waited = False
+
+        def sample(self, filesystem_free):
+            if not self.waited:
+                return {"state": "pending", "free_bytes": None, "inflight": True}
+            return {"state": "available", "free_bytes": filesystem_free, "inflight": False}
+
+        def wait(self, timeout):
+            assert timeout == 30
+            self.waited = True
+            return True
+
+    monkeypatch.setattr(corpus, "BackingDiskSampler", PendingThenSafe)
+    corpus.build_news_dataset(source, output, batch_rows=2)
+    manifest_before = sha256_file(output / "manifest.json")
+    class Unavailable(PendingThenSafe):
+        def sample(self, filesystem_free):
+            return {"state": "unavailable", "free_bytes": None, "inflight": False}
+
+    monkeypatch.setattr(corpus, "BackingDiskSampler", Unavailable)
+    with pytest.raises(RuntimeError, match="backing space unconfirmed"):
+        corpus.verify_news_dataset(output)
+    assert sha256_file(output / "manifest.json") == manifest_before
+
+
+def test_capacity_drop_during_refresh_does_not_replace_committed_dataset(tmp_path, monkeypatch):
+    source, output = source_fixture(tmp_path), tmp_path / "dataset"
+    corpus.build_news_dataset(source, output)
+    before = sha256_file(output / "manifest.json")
+    class FallingSpace:
+        def __init__(self, root, **kwargs):
+            self.samples = 0
+
+        def sample(self, filesystem_free):
+            self.samples += 1
+            free = filesystem_free if self.samples == 1 else corpus.MIN_FREE_BYTES - 1
+            return {"state": "available", "free_bytes": free, "inflight": False}
+
+    monkeypatch.setattr(corpus, "BackingDiskSampler", FallingSpace)
+    with pytest.raises(RuntimeError, match="retain 25 GiB"):
+        corpus.build_news_dataset(source, output, refresh=True)
+    assert sha256_file(output / "manifest.json") == before
+    assert not (output / ".active-build.json").exists()
 
 
 def read_table(root, name):
@@ -334,6 +425,104 @@ def test_legacy_literal_google_metadata_links_to_retained_original_only(tmp_path
     assert observation["resolved_article_id"] == url_article_id(URLS[0]).hex()
     association = next(r for r in read_table(output, "article_stocks") if r["metadata_provider"] == "finmind")
     assert association["article_id"] == url_article_id(URLS[0]).hex()
+
+
+def test_cnyes_market_page_and_literal_pointer_stay_metadata_not_headlines(tmp_path):
+    import base64
+
+    source, output = source_fixture(tmp_path), tmp_path / "data_news"
+    market = "https://www.cnyes.com/twstock/6689/company/--"
+    literal = market.encode()
+    envelope = b"\x08\x13\x22" + bytes([len(literal)]) + literal
+    alias = "https://news.google.com/rss/articles/" + base64.urlsafe_b64encode(envelope).decode().rstrip("=")
+    legacy = "https://news.cnyes.com/Content/20170422/20170422000008000197525.shtml"
+    path = source / "metadata/finmind.parquet"
+    metadata = [
+        {"link": market, "stock_id": "6689", "title": "伊雲谷 6689 - 簡介"},
+        {"link": alias, "stock_id": "6689", "title": "伊雲谷 6689 - 簡介"},
+        {"link": legacy, "stock_id": "6472", "title": "保瑞舊公告"},
+    ]
+    atomic_write_parquet(path, pa.Table.from_pylist(metadata))
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.executemany("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+            (url_article_id(url), url, provider, title, "2017-04-22", CAPTURED, CAPTURED,
+             None, None, None, "unsupported_article_path")
+            for url, provider, title in (
+                (market, "cnyes", "伊雲谷 6689 - 簡介"),
+                (alias, "unregistered:news.google.com", "伊雲谷 6689 - 簡介"),
+                (legacy, "cnyes", "保瑞舊公告"))
+        ])
+        db.execute("UPDATE state_metrics SET articles=articles+3")
+        db.execute("UPDATE origins SET sha256=?,rows=3 WHERE id=2", (sha256_file(path),))
+
+    result = corpus.build_news_dataset(source, output, batch_rows=2)
+    manifest = json.loads((output / "manifest.json").read_text())
+    assert result["row_counts"]["articles"] == 4
+    assert manifest["headline_scope_contract"] == corpus.HEADLINE_SCOPE_CONTRACT
+    assert manifest["source_snapshot"]["counts"]["metadata_only_market_heads"] == 2
+    articles = read_table(output, "articles")
+    assert not {market, alias} & {row["url"] for row in articles}
+    assert any(row["url"] == legacy and row["text_kind"] == "headline" for row in articles)
+    observations = [r for r in read_table(output, "metadata_observations") if r["metadata_provider"] == "finmind"]
+    assert {r["url_raw"] for r in observations} == {market, alias, legacy}
+    assert all(r["resolved_article_id"] is None for r in observations if r["url_raw"] in {market, alias})
+    links = read_table(output, "article_stocks")
+    assert not any(r["stock_id"] == "6689" for r in links)
+    assert any(r["stock_id"] == "6472" and r["article_id"] == url_article_id(legacy).hex() for r in links)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://www.cnyes.com/twstock/6689/company/--", "cnyes_market_route"),
+    ("http://www.cnyes.com/twstock/2330", "cnyes_market_route"),
+    ("https://www.cnyes.com.evil.example/twstock/2330", None),
+    ("https://news.cnyes.com/news/id/479014", None),
+    ("https://news.cnyes.com/20160510/20160510110007000909372.shtml", None),
+    ("https://news.google.com/rss/articles/opaque", None),
+    (None, None),
+])
+def test_market_metadata_filter_does_not_infer_other_url_identity(url, expected):
+    from stockagent.data.news_dataset_sources import headline_metadata_only_reason
+    assert headline_metadata_only_reason(url) == expected
+
+
+def test_existing_body_is_not_dropped_by_market_metadata_filter(tmp_path):
+    from stockagent.data.news_dataset_sources import freeze_inputs
+
+    source = source_fixture(tmp_path)
+    market = "https://www.cnyes.com/twstock/6689/company/--"
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.execute("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            url_article_id(market), market, "cnyes", "來源已保存正文", "2020-01-01", CAPTURED, CAPTURED,
+            CAPTURED, "declared-body-sha", "bodies/current.parquet", "complete"))
+        db.execute("UPDATE state_metrics SET articles=articles+1")
+        db.execute("UPDATE stored_body_metrics SET heads=heads+1")
+    frozen = tmp_path / "snapshot"
+    plan = freeze_inputs(source, frozen)
+    with sqlite3.connect(frozen / "snapshot.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM metadata_only_heads WHERE id=?", (url_article_id(market),)).fetchone()[0] == 0
+    assert plan["counts"]["fulltext_articles"] == 3
+
+
+def test_new_headline_scope_requires_separate_root_and_current_snapshot(tmp_path):
+    from stockagent.data.news_dataset_sources import reuse_snapshot
+
+    source, output = source_fixture(tmp_path), tmp_path / "data_news"
+    corpus.build_news_dataset(source, output)
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    frozen = output / manifest["generation"]
+    snapshot_path = frozen / "snapshot.json"
+    snapshot = json.loads(snapshot_path.read_text())
+    snapshot.pop("headline_scope_contract")
+    atomic_write_json(snapshot_path, snapshot)
+    with pytest.raises(ValueError, match="incompatible headline scope"):
+        reuse_snapshot(source, tmp_path / "new_frozen", frozen)
+    manifest.pop("headline_scope_contract")
+    atomic_write_json(manifest_path, manifest)
+    before = sha256_file(manifest_path)
+    with pytest.raises(ValueError, match="separate output root"):
+        corpus.build_news_dataset(source, output, refresh=True)
+    assert sha256_file(manifest_path) == before
 
 
 def test_inconsistent_source_counters_are_not_accepted_as_coverage(tmp_path):

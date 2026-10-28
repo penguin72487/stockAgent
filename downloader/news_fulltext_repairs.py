@@ -13,10 +13,12 @@ ABI6 permits one explicit missing-only address-validation recheck per URL,
 independent of parser generations. It grants no permission or DNS exemption.
 ABI7 permits one reviewed missing-only publication-clock recheck per parser.
 The current parser still owns clock validation; no timestamp is rewritten.
+ABI10 classifies an exact paid-preview footer from sealed prior native geometry;
+only state/error change, without new source checks, bodies or retries.
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import closing
 from datetime import datetime
 import hashlib
@@ -52,14 +54,22 @@ PUBLICATION_CLOCK_RECHECK_VERSION = 7
 PUBLICATION_CLOCK_RECHECK_KIND = 'reviewed_publication_clock_recheck'
 PUBLICATION_CLOCK_RECHECK_OUTCOME = 'publication_clock_recheck_enqueued'
 PUBLICATION_CLOCK_RECHECK_STATES = frozenset({'invalid_bulk_publication_clock'})
-ADMITTED_OUTCOMES = frozenset({'enqueued', 'revalidation_enqueued', NATIVE_SUCCESS_OUTCOME,
+ADMITTED_OUTCOMES = frozenset({'enqueued', 'revalidation_enqueued', NATIVE_SUCCESS_OUTCOME, 'native_article_route_recheck_enqueued',
                               ADDRESS_RECHECK_OUTCOME, PUBLICATION_CLOCK_RECHECK_OUTCOME})
+CLASSIFIED_NONTEXT_OUTCOMES = frozenset({'classified_source_body_image_only',
+                                       'classified_source_article_empty_template'})
+CLASSIFIED_SOURCE_OUTCOMES = CLASSIFIED_NONTEXT_OUTCOMES | {'classified_paywall_or_login'}
 STORED_HEAD_FIELDS = ('body_sha256', 'body_bytes', 'parquet_path', 'captured_at_utc',
                       'etag', 'last_modified', 'validator_url')
 MAX_TARGETS = 512
 MAX_PENDING = 64
 MAX_REQUEST_BYTES = 1 << 20
 PUMP_INTERVAL_SECONDS = 5
+CONTINUATION_INTERVAL_SECONDS = 0.25
+MAX_VALIDATED_REQUESTS = 16
+MAX_VALIDATED_REQUEST_BYTES = 4 << 20
+ROUND_ROBIN_CURSOR_KEY = 'reviewed_repairs:last_considered_request_v1'
+_REQUEST_NAME = re.compile(r'[0-9a-f]{64}[.]json')
 REPAIRABLE = frozenset({"body_not_found", "article_identity_not_verified",
                        "article_attribution_not_verified", "article_title_not_verified"})
 _REVIEWED_SCOPE_FAILURE = "article_rights_or_scope_excluded"
@@ -100,6 +110,29 @@ def _reviewed_prior_scope_failure(row, registry):
     if registry is None or row["state"] != _REVIEWED_SCOPE_FAILURE:
         return False
     source = registry.sources.get(row["provider"])
+    if source is not None and source.provider == 'contentplatform':
+        from downloader.news_fulltext_contentplatform import (
+            CONTENTPLATFORM_V4_HTTP_BINDING, CONTENTPLATFORM_V4_SCOPE_CUTOFF,
+            contentplatform_article_id, contentplatform_known_native_source,
+        )
+        try:
+            return bool(len(CONTENTPLATFORM_V4_HTTP_BINDING) == 5
+                and contentplatform_known_native_source(source)
+                and (source.data_fingerprint, source.authorization_fingerprint) == CONTENTPLATFORM_V4_HTTP_BINDING[:2]
+                and contentplatform_article_id(row['url']) is not None
+                and _clock(row['last_checked_at_utc']) < _clock(CONTENTPLATFORM_V4_SCOPE_CUTOFF))
+        except (ValueError, TypeError, OverflowError):
+            return False
+    if source is not None and source.provider == 'managertoday':
+        from downloader.news_fulltext_managertoday import (
+            MANAGER_ORIGIN, MANAGER_V1_SCOPE_CUTOFF, manager_metadata_source)
+        try:
+            return bool(manager_metadata_source(source)
+                and source.embedded_article_layout in {'manager_public_written_article_v2', 'manager_public_written_article_v3', 'manager_public_written_article_v4', 'manager_public_written_article_v5'}
+                and re.fullmatch(re.escape(MANAGER_ORIGIN) + r'/articles/view/[1-9][0-9]*', row['url'])
+                and _clock(row['last_checked_at_utc']) < _clock(MANAGER_V1_SCOPE_CUTOFF))
+        except (ValueError, TypeError, OverflowError):
+            return False
     if source is not None and source.provider == 'stockfeel':
         from downloader.news_fulltext_stockfeel import (
             STOCKFEEL_V2_REPAIR_COHORT, STOCKFEEL_V2_PRIOR_SCOPE_CUTOFF, stockfeel_role_repair_source,
@@ -280,6 +313,29 @@ def _pending(directory):
             (entry for entry in entries if entry.name.endswith(".json")), MAX_PENDING + 1)), key=lambda p: p.name)
 
 
+def _rotation_order(queue, paths):
+    """Continue after the previous request, including across owner restarts.
+
+    Only bounded private mailbox ordering changes. A saved cursor is never
+    used as a path, source permission, article identity or admission proof.
+    """
+    saved = queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
+                             (ROUND_ROBIN_CURSOR_KEY,)).fetchone()
+    if saved is None or not isinstance(saved[0], str) or not _REQUEST_NAME.fullmatch(saved[0]):
+        return paths
+    split = next((index for index, path in enumerate(paths) if path.name > saved[0]), len(paths))
+    return paths[split:] + paths[:split]
+
+
+def _record_turn(queue, path, stop):
+    # Commit with the existing admission transaction/cursor. An interrupted
+    # transaction rolls back both the once-only outcome and this scheduling
+    # position; removed/archived paths still give an unambiguous next turn.
+    if _REQUEST_NAME.fullmatch(path.name) and not (stop is not None and stop.is_set()):
+        queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
+                         (ROUND_ROBIN_CURSOR_KEY, path.name))
+
+
 def _already_admitted(db, provider, parser_fingerprint, article_id, outcome):
     # A parser change must not mint another security recheck for this URL.
     if outcome == ADDRESS_RECHECK_OUTCOME:
@@ -291,8 +347,15 @@ def _already_admitted(db, provider, parser_fingerprint, article_id, outcome):
 
 
 def submit_repairs(root, registry, urls, *, reason, retained_originals=None, empty_response_witnesses=None,
-                   native_success_witnesses=None, address_recheck=False, publication_clock_recheck=False):
+                   native_success_witnesses=None, address_recheck=False, publication_clock_recheck=False,
+                   native_route_witnesses=None):
     """Seal explicit eligible failures while the canonical owner stays alive."""
+    if native_route_witnesses is not None:
+        from downloader.news_fulltext_route_rechecks import submit
+        if address_recheck or publication_clock_recheck or any(v is not None for v in
+                (retained_originals,empty_response_witnesses,native_success_witnesses)):
+            raise ValueError('invalid_native_route_recheck_mode')
+        return submit(root,registry,urls,reason=reason,witnesses=native_route_witnesses)
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
         raise ValueError("repair_requires_bounded_review_reason")
     selected = list(islice(urls, MAX_TARGETS + 1))
@@ -423,7 +486,16 @@ def _read_private_request(path):
 
 
 def _load(path):
-    request = _read_private_request(path)
+    return _validate_request(_read_private_request(path))
+
+
+def _validate_request(request):
+    from downloader.news_fulltext_moneyweekly_outcomes import VERSION as PAID_VERSION, validate_request as validate_paid_request
+    if isinstance(request, dict) and request.get('contract_version') == PAID_VERSION:
+        return validate_paid_request(request)
+    from downloader.news_fulltext_route_rechecks import VERSION as ROUTE_VERSION, validate_request as validate_route_request
+    if isinstance(request,dict) and request.get('contract_version')==ROUTE_VERSION:
+        return validate_route_request(request)
     from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, validate_request
     if isinstance(request, dict) and request.get('contract_version') == QUALITY_VERSION:
         return validate_request(request)
@@ -497,6 +569,31 @@ def _load(path):
     return request
 
 
+def _load_for_admission(queue, path):
+    """Reuse shape validation, never private-file or current-head admission.
+
+    Every slice still opens the actual bounded private file without following
+    symlinks, verifies its content-addressed name, and rejects duplicate keys.
+    Equal decoded content can reuse owner-local validation. All dynamic source,
+    lease, deadline, retained-original and once-only checks stay in _admit.
+    """
+    request = _read_private_request(path)
+    cache = getattr(queue, 'reviewed_repair_validated_requests', None)
+    if cache is None:
+        cache = queue.reviewed_repair_validated_requests = OrderedDict()
+    previous = cache.pop(path.name, None)
+    now = time.time()
+    if previous is not None and previous[0] == request and now >= previous[2]:
+        cache[path.name] = previous
+        return previous[0]
+    request = _validate_request(request)
+    cache[path.name] = (request, len(_bytes(request)), time.time())
+    while (len(cache) > MAX_VALIDATED_REQUESTS
+           or sum(item[1] for item in cache.values()) > MAX_VALIDATED_REQUEST_BYTES):
+        cache.popitem(last=False)
+    return request
+
+
 def _schema(queue):
     if getattr(queue, "reviewed_repair_schema_ready", False):
         return
@@ -518,10 +615,18 @@ def _schema(queue):
                          "provider,article_id) WHERE outcome='address_validation_recheck_enqueued'")
         queue.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewed_publication_clock_once ON reviewed_repair_items("
                          "provider,parser_fingerprint,article_id) WHERE outcome='publication_clock_recheck_enqueued'")
+        queue.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reviewed_native_route_once ON reviewed_repair_items("
+                         "provider,parser_fingerprint,article_id) WHERE outcome='native_article_route_recheck_enqueued'")
     queue.reviewed_repair_schema_ready = True
 
 
 def _admit(queue, request, target):
+    from downloader.news_fulltext_moneyweekly_outcomes import VERSION as PAID_VERSION, admit as admit_paid_preview
+    if request['contract_version'] == PAID_VERSION:
+        return admit_paid_preview(queue, request, target)
+    from downloader.news_fulltext_route_rechecks import VERSION as ROUTE_VERSION, admit as admit_route
+    if request['contract_version']==ROUTE_VERSION:
+        return admit_route(queue,request,target)
     from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, admit as admit_quality
     if request['contract_version'] == QUALITY_VERSION:
         return admit_quality(queue, request, target)
@@ -579,6 +684,19 @@ def _archive(queue, path, request=None):
     receipt = {"contract_version": CONTRACT_VERSION, **job, "outcomes": outcomes,
                "admitted_targets": sum(row["outcome"] in ADMITTED_OUTCOMES for row in outcomes),
                "accepted_as_bodies": False, "request_sha256": path.stem}
+    from downloader.news_fulltext_moneyweekly_outcomes import VERSION as PAID_VERSION, KIND as PAID_KIND, OUTCOME as PAID_OUTCOME
+    if request is not None and request['contract_version'] == PAID_VERSION:
+        receipt.update(contract_version=PAID_VERSION, kind=PAID_KIND, witnesses=request['witnesses'],
+            reclassified_targets=sum(row['outcome'] == PAID_OUTCOME for row in outcomes),
+            publisher_requests=0, body_acceptances=0, source_freshness_verified=False,
+            source_check_and_publication_clocks_changed=False, immutable_bodies_preserved=True,
+            review_clock_basis='reviewed_repair_items.recorded_at_utc')
+    from downloader.news_fulltext_route_rechecks import VERSION as ROUTE_VERSION, KIND as ROUTE_KIND
+    if request is not None and request['contract_version'] == ROUTE_VERSION:
+        receipt.update(contract_version=ROUTE_VERSION, kind=ROUTE_KIND, witnesses=request['witnesses'],
+            publisher_requests=0, body_acceptances=0,
+            attempts_deadlines_errors_checks_and_saved_bodies_changed=False,
+            full_body_still_requires_normal_capture=True, source_freshness_verified=False)
     from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION, KIND as QUALITY_KIND
     if request is not None and request['contract_version'] == QUALITY_VERSION:
         receipt.update(contract_version=QUALITY_VERSION, kind=QUALITY_KIND, originals=request['originals'],
@@ -589,7 +707,7 @@ def _archive(queue, path, request=None):
             source_freshness_verified=False)
     if request is not None and request['contract_version']==3:
         receipt.update(contract_version=3,kind=request['kind'],originals=request['originals'],
-            reclassified_targets=sum(row['outcome']=='classified_source_body_image_only' for row in outcomes),
+            reclassified_targets=sum(row['outcome'] in CLASSIFIED_NONTEXT_OUTCOMES for row in outcomes),
             publisher_requests=0,body_acceptances=0,check_and_publication_clocks_changed=False)
     if request is not None and request['contract_version'] == EMPTY_RESPONSE_RECHECK_VERSION:
         receipt.update(contract_version=EMPTY_RESPONSE_RECHECK_VERSION, kind=request['kind'],
@@ -650,16 +768,19 @@ def _quarantine(queue, path, error):
 
 
 def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
-    """Bound local admission work; normal dispatch still owns every request."""
+    """Rotate bounded admission slices; normal dispatch owns every request."""
     if type(limit) is not int or not 1 <= limit <= MAX_TARGETS or not math.isfinite(max_seconds) or not 0 < max_seconds <= 0.1:
         raise ValueError("invalid_bounded_repair_slice")
     started, counts, processed = time.monotonic(), Counter(), 0
+    queue.reviewed_repair_pending = False
+    queue.reviewed_repair_continuation_pending = False
+    progressed, considered = False, 0
     base = queue.root / "reviewed_repairs"
     if not base.exists() and not base.is_symlink():
         return {"processed": 0, "outcomes": {}}
     try:
         directory = _directory(queue.root, "pending")
-        paths = _pending(directory)
+        paths = _rotation_order(queue, _pending(directory))
     except (OSError, ValueError):
         queue.metrics.count("local_repairs", "inbox_unavailable")
         return {"processed": 0, "outcomes": {}, "inbox_unavailable": True}
@@ -667,14 +788,18 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
         if processed >= limit or time.monotonic() - started >= max_seconds or stop is not None and stop.is_set():
             break
         try:
-            request = _load(path)
+            request = _load_for_admission(queue, path)
         except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError, NewsError) as error:
             try:
                 _quarantine(queue, path, error)
+                progressed = True
             except (OSError, ValueError):
                 queue.metrics.count("local_repairs", "quarantine_deferred")
             counts["invalid_request"] += 1
             processed += 1
+            with queue.db:
+                _record_turn(queue, path, stop)
+            considered += 1
             continue
         _schema(queue)
         with queue.db:
@@ -682,6 +807,7 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                              (path.stem, len(request["targets"]), request["created_at_utc"], queue.owner))
             job = queue.db.execute("SELECT * FROM reviewed_repair_jobs WHERE request_id=?", (path.stem,)).fetchone()
             cursor = job["next_index"]
+            previous_cursor = cursor
             while cursor < len(request["targets"]) and processed < limit:
                 if time.monotonic() - started >= max_seconds or stop is not None and stop.is_set():
                     break
@@ -715,15 +841,23 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                         queue.counter('reviewed_address_validation_rechecks_admitted', 1)
                     elif outcome == PUBLICATION_CLOCK_RECHECK_OUTCOME:
                         queue.counter('reviewed_publication_clock_rechecks_admitted', 1)
-                elif outcome in {'classified_source_body_image_only', 'stored_quality_reclassified'}:
+                elif outcome in CLASSIFIED_SOURCE_OUTCOMES or outcome == 'stored_quality_reclassified':
                     queue.counter('reviewed_retained_outcomes_classified',1)
             complete = cursor == len(request["targets"])
             queue.db.execute("UPDATE reviewed_repair_jobs SET next_index=?,completed_at_utc=coalesce(completed_at_utc,?) "
                              "WHERE request_id=?", (cursor, utc_now() if complete else None, path.stem))
+            _record_turn(queue, path, stop)
+        # Hints follow the successful commit. A rollback, unavailable retained
+        # original or completed-but-unarchived file cannot cause a fast loop.
+        progressed |= cursor > previous_cursor
+        queue.reviewed_repair_pending |= not complete
+        considered += 1
         if complete:
             try:
                 from downloader.news_fulltext_stored_quality import VERSION as QUALITY_VERSION
-                if request['contract_version'] in {3, EMPTY_RESPONSE_RECHECK_VERSION, NATIVE_SUCCESS_VERSION, ADDRESS_RECHECK_VERSION, PUBLICATION_CLOCK_RECHECK_VERSION, QUALITY_VERSION}:
+                from downloader.news_fulltext_route_rechecks import VERSION as ROUTE_VERSION
+                from downloader.news_fulltext_moneyweekly_outcomes import VERSION as PAID_VERSION
+                if request['contract_version'] in {3, EMPTY_RESPONSE_RECHECK_VERSION, NATIVE_SUCCESS_VERSION, ADDRESS_RECHECK_VERSION, PUBLICATION_CLOCK_RECHECK_VERSION, QUALITY_VERSION, ROUTE_VERSION, PAID_VERSION}:
                     _archive(queue,path,request=request)
                 else:
                     _archive(queue,path)
@@ -731,4 +865,6 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                 queue.metrics.count("local_repairs", "archive_deferred")
     for outcome, count in counts.items():
         queue.metrics.count("local_repairs", "reviewed_" + outcome, count)
+    queue.reviewed_repair_continuation_pending = progressed and (
+        queue.reviewed_repair_pending or considered < len(paths))
     return {"processed": processed, "outcomes": dict(counts)}

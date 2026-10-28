@@ -65,13 +65,74 @@ def test_empty_incremental_retains_all_verified_history_and_original_dates():
     plan = refresh.request_plan({'fetched_at_utc': NOW.isoformat(), 'source_last_date': '2026-09-25'}, NOW, NOW.date())
     assert refresh.merge_response(old, [], 'BRK-A', plan) == old
     assert plan['empty_response_policy'] == 'retain_verified_baseline_no_new_observation'
-    assert plan['history_refresh_contract_version'] == 2
+    assert plan['history_refresh_contract_version'] == refresh.CONTRACT_VERSION
 
 
 def test_empty_full_refetch_never_erases_verified_history():
     plan = refresh.request_plan({}, NOW, NOW.date())
     with pytest.raises(ValueError, match='unexpected_empty_after_nonempty'):
         refresh.merge_response([row('2026-09-25')], [], 'BRK-A', plan)
+
+
+def test_nonempty_partial_full_response_preserves_verified_history_and_new_corrections():
+    old = [row('2014-01-02'), row('2026-09-24', 2), row('2026-09-25', 3)]
+    incoming = [row('2026-09-25', 4), row('2026-09-28', 5)]
+    plan = refresh.request_plan({'sha256': 'verified-baseline'}, NOW, NOW.date())
+    assert plan['query_shape'] == 'per_id_full_history'
+    assert refresh.merge_response(old, incoming, 'BRK-A', plan) == [*old[:2], *incoming]
+    assert plan['baseline_sha256'] == 'verified-baseline'
+    assert plan['retained_baseline_rows'] == 2
+    assert plan['full_response_rows'] == 2
+    assert plan['provider_history_completeness_verified'] is False
+
+
+def test_authoritative_correction_still_replaces_full_history():
+    plan = refresh.request_plan({}, NOW, NOW.date())
+    incoming = [row('2026-09-25', 4)]
+    assert refresh.merge_response([row('2014-01-02')], incoming, 'BRK-A', plan,
+                                  authoritative_replace=True) == incoming
+    assert 'retained_baseline_rows' not in plan
+
+
+def test_partial_full_response_does_not_bless_an_invalid_baseline():
+    plan = refresh.request_plan({}, NOW, NOW.date())
+    with pytest.raises(ValueError, match='history_wrong_data_id'):
+        refresh.merge_response([{'date': '2014-01-02', 'stock_id': 'WRONG'}],
+                               [row('2026-09-25')], 'BRK-A', plan)
+
+
+def test_failed_history_worker_recovery_cannot_publish_a_tail_as_full_history(tmp_path, monkeypatch):
+    task = worker.Task('USStockPrice', 'BRK-A', 'history', 'id_history', 0, 'complete')
+    old = [row('2014-01-02'), row('2026-09-25', 3)]
+    original = worker._store(tmp_path, task, old, NOW - timedelta(days=1))
+    with worker._db(tmp_path / 'queue.sqlite3') as conn:
+        worker._add_tasks(conn, [(task.dataset, task.data_id, task.partition, task.kind, task.priority)])
+        worker._save_result(conn, task, original, NOW - timedelta(days=1))
+        conn.execute("UPDATE tasks SET state='failed',error_code='unexpected_empty_after_nonempty',"
+                     "next_attempt_at_utc=?", (NOW.isoformat(),))
+    account = {'tier': 'SponsorPro', 'official_requests_per_hour': 20000,
+               'observed_at_utc': NOW.isoformat(), 'provider_used_in_hour': 0}
+    monkeypatch.setenv('FINMIND_TOKEN', 'unit-test-placeholder')
+    monkeypatch.setattr(worker, 'load_env_file', lambda *_a, **_k: None)
+    monkeypatch.setattr(worker, '_now', lambda: NOW)
+    monkeypatch.setattr(worker, 'verified_account', lambda *_a, **_k: account)
+    monkeypatch.setattr(worker, 'refresh_dispatch_account', lambda *_a, **_k: account)
+    monkeypatch.setattr(worker, 'incremental_reservation', lambda *_a, **_k: {
+        'reserve_requests': 0, 'ready_requests': 0, 'queue_errors': [], 'observed_at_utc': NOW.isoformat()})
+    monkeypatch.setattr(worker, 'MIN_FREE_BYTES', 0)
+    calls = []
+    def fetch(_session, _limiter, _root, _dataset, _token, params, **_kwargs):
+        calls.append(params)
+        return [row('2026-09-28', 5)]
+    monkeypatch.setattr(worker, '_fetch_rows', fetch)
+    worker.run_once(tmp_path, max_requests=1, required_keys=((task.dataset, task.data_id, task.partition),))
+    receipt, loaded = refresh.read_baseline(tmp_path, task)
+    assert len(calls) == 1 and calls[0]['start_date'] == '1900-01-01'
+    assert loaded == [*old, row('2026-09-28', 5)]
+    assert receipt['request']['baseline_sha256'] == original['sha256']
+    assert receipt['request']['retained_baseline_rows'] == 2
+    assert receipt['request']['response_rows'] == 1
+    assert receipt['request']['history_refresh_contract_version'] == 3
 
 
 def test_empty_incremental_does_not_bless_invalid_old_values():

@@ -5,6 +5,17 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/runtime_env.sh"
 
+# PID 1 does not inherit the login WSL identity or Windows executable PATH.
+# Prepare the existing enrolled bridge before checking physical backing space.
+if ! ensure_enrolled_wsl_identity "$repo_root"; then
+  printf '%s\n' 'Registered refresh deferred: enrolled runtime identity unavailable' >&2
+  exit 75
+fi
+
+# Reject a new cycle before credentials, provider calls or source writes. Keep
+# the existing policy floor; exit 75 leaves retrying to the original timer.
+run_fintech_python "$repo_root/scripts/check_acquisition_capacity.py" --path "$repo_root"
+
 if [[ -f "$repo_root/.env" ]]; then
   set -a
   # shellcheck disable=SC1091

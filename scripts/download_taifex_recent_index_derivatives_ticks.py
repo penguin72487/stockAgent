@@ -477,7 +477,55 @@ def _parse_options_rows(
     trading_date: date,
     source_file: str,
     source_sha256: str,
+    products: tuple[str, ...] = ("TXO",),
+    session_windows: dict[str, tuple[tuple[int, int], tuple[int, int] | None]] | None = None,
 ) -> pl.DataFrame:
+    """Parse selected products without changing the legacy TXO partition.
+
+    Non-TXO products require caller-supplied, date-specific session windows.
+    Each window is inclusive and expressed in minutes after midnight; a night
+    window may cross midnight. This is source parsing only, not a listing,
+    contract-rule, fill or training admission decision.
+    """
+    normalized_products = tuple(str(value).strip().upper() for value in products)
+    if not normalized_products or any(not value for value in normalized_products):
+        raise ValueError("option products must contain non-empty product codes")
+    if len(set(normalized_products)) != len(normalized_products):
+        raise ValueError("option products must not contain duplicates")
+    product_set = frozenset(normalized_products)
+    if session_windows is None:
+        if product_set != {"TXO"}:
+            raise ValueError("non-TXO options require dated session windows")
+    else:
+        if set(session_windows) != product_set:
+            raise ValueError("dated option session windows must match requested products")
+        for product, windows in session_windows.items():
+            if len(windows) != 2 or len(windows[0]) != 2:
+                raise ValueError(f"invalid option session windows for {product}")
+            day, night = windows
+            if not all(isinstance(v, int) and 0 <= v < 1440 for v in day) or day[0] > day[1]:
+                raise ValueError(f"invalid option day window for {product}")
+            if night is not None:
+                if len(night) != 2 or not all(isinstance(v, int) and 0 <= v < 1440 for v in night):
+                    raise ValueError(f"invalid option night window for {product}")
+                night_minutes = (set(range(night[0], night[1] + 1)) if night[0] <= night[1]
+                                 else set(range(night[0], 1440)) | set(range(night[1] + 1)))
+                if night_minutes.intersection(range(day[0], day[1] + 1)):
+                    raise ValueError(f"overlapping option session windows for {product}")
+
+    def session_for(product: str, value: int, row_number: int) -> str:
+        if session_windows is None:
+            return _session_for_time(value, row_number=row_number)
+        day, night = session_windows[product]
+        clock = (value // 10000) * 3600 + ((value // 100) % 100) * 60 + value % 100
+        if day[0] * 60 <= clock <= day[1] * 60:
+            return "day"
+        if night is not None:
+            start, end = night[0] * 60, night[1] * 60
+            if (start <= clock <= end if start <= end else clock >= start or clock <= end):
+                return "night"
+        raise ValueError(f"row {row_number}: event falls outside dated option sessions for {product}")
+
     raw: dict[str, list[object]] = {
         "event_date_raw": [],
         "event_time": [],
@@ -494,12 +542,15 @@ def _parse_options_rows(
     }
     for row_number, row in enumerate(csv.reader(text), start=1):
         cells = [cell.strip() for cell in row]
-        if len(cells) < 9 or not cells[0].isdigit() or cells[1] != "TXO":
+        if len(cells) < 9 or not cells[0].isdigit() or cells[1] not in product_set:
             continue
         if len(cells) > 9 and any(cells[9:]):
             raise ValueError(f"row {row_number}: unexpected nonempty option columns")
         _validate_event_date(cells[0], trading_date=trading_date, row_number=row_number)
         event_time = _parse_time(cells[5], row_number=row_number)
+        session = session_for(cells[1], event_time, row_number)
+        if session_windows is not None and session == "day" and cells[0] != trading_date.strftime("%Y%m%d"):
+            raise ValueError(f"row {row_number}: dated option day session is not on trading date")
         if cells[4] not in {"C", "P"}:
             raise ValueError(f"row {row_number}: invalid option right {cells[4]!r}")
         try:
@@ -514,8 +565,8 @@ def _parse_options_rows(
             raise ValueError(f"row {row_number}: invalid auction marker {cells[8]!r}")
         raw["event_date_raw"].append(cells[0])
         raw["event_time"].append(cells[5])
-        raw["session"].append(_session_for_time(event_time, row_number=row_number))
-        raw["product"].append("TXO")
+        raw["session"].append(session)
+        raw["product"].append(cells[1])
         raw["delivery_month_week"].append(cells[3])
         raw["strike_price"].append(
             _parse_float(cells[2], row_number=row_number, field="strike price")
@@ -551,7 +602,7 @@ def _parse_options_rows(
     )
     if unpaired.height:
         raise ValueError(
-            f"{source_file}: {unpaired.height} TXO second-price buckets have "
+            f"{source_file}: {unpaired.height} option second-price buckets have "
             "unpaired B-or-S quantities"
         )
     return frame.select(OPTION_COLUMNS).sort(["event_ts", "source_row_number"])
@@ -653,6 +704,8 @@ def _parse_zip(
     futures_products: tuple[str, ...] = ("TX",),
     futures_outright_contracts_only: bool = False,
     futures_day_sessions: dict[str, tuple[int, int]] | None = None,
+    option_products: tuple[str, ...] = ("TXO",),
+    option_session_windows: dict[str, tuple[tuple[int, int], tuple[int, int] | None]] | None = None,
 ) -> pl.DataFrame:
     expected_member = (
         f"OptionsDaily_{trading_date.strftime('%Y_%m_%d')}.csv"
@@ -667,6 +720,8 @@ def _parse_zip(
                     trading_date=trading_date,
                     source_file=str(path),
                     source_sha256=source_sha256,
+                    products=option_products,
+                    session_windows=option_session_windows,
                 )
             return _parse_futures_rows(
                 text,

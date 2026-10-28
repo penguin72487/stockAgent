@@ -21,6 +21,40 @@ def isolated_cache():
         snapshots._JSON_RESIDENT_BYTES = 0
 
 
+def test_one_pass_snapshots_preserve_values_without_disposable_cache_packets(tmp_path):
+    import math
+    path = tmp_path / "wide.json"
+    payload = {"kept": [2**100, None, -0.0, False, "台灣"], "unused": ["wide"] * 10_000}
+    path.write_text(json.dumps(payload))
+    projected = snapshots.read_json_snapshot(path, cache=False)
+    assert projected == payload
+    assert type(projected["kept"][0]) is int
+    assert math.copysign(1, projected["kept"][2]) == -1
+    projected["kept"].append("caller mutation")
+    assert snapshots.read_json_snapshot(path, cache=False)["kept"] == payload["kept"]
+    assert snapshots.json_snapshot_metrics()["entries"] == 0
+    assert snapshots.read_json_snapshot(path) == payload
+    assert snapshots.json_snapshot_metrics()["entries"] == 1
+    path.write_text('{"kept":[123],"unused":null}')
+    assert snapshots.read_json_snapshot(path, cache=False) == {"kept": [123], "unused": None}
+
+
+@pytest.mark.parametrize("body", [b'{"kept":1,"unused":[}', b'{"kept":1,"unused":"\xff"}'])
+def test_one_pass_snapshot_rejects_malformed_source(tmp_path, body):
+    path = tmp_path / "receipt.json"
+    path.write_bytes(body)
+    assert snapshots.read_json_snapshot(path, "invalid", cache=False) == "invalid"
+
+
+def test_one_pass_snapshot_fallback_keeps_legacy_nonfinite_and_numeric_types(tmp_path, monkeypatch):
+    from stockagent import private_json
+    monkeypatch.setattr(private_json, "_native", None)
+    path = tmp_path / "legacy.json"
+    path.write_text('{"kept":-0.0,"extra":Infinity}')
+    assert snapshots.read_json_snapshot(path, cache=False) == {"kept": -0.0, "extra": float("inf")}
+    assert snapshots.read_json_snapshot(path)["extra"] == float("inf")
+
+
 def test_only_changed_daily_source_is_decoded_and_values_are_isolated(tmp_path):
     paths = [tmp_path / f"day-{day}.json" for day in range(100)]
     for number, path in enumerate(paths):

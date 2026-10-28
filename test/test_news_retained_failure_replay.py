@@ -92,7 +92,8 @@ def test_newer_http_check_blocks_stale_original_even_after_due(cnyes_config, tmp
         result = replay_retained_cnyes_failures(queue)
         assert result['accepted_heads'] == 0 and result['responses_checked'] == 1
         assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
-        assert queue.db.execute('SELECT state FROM retained_failure_replays').fetchone()[0] == 'failed_validation'
+        stored = queue.db.execute('SELECT state,error_code FROM retained_failure_replays').fetchone()
+        assert tuple(stored) == ('failed_validation', 'retained_failure_head_clock_outside_window')
 
 
 def test_unresolved_local_parser_does_not_add_retry_attempt_or_reset_error(cnyes_config, tmp_path, monkeypatch):
@@ -115,7 +116,197 @@ def test_corrupt_pair_keeps_original_proof_and_failure_head(cnyes_config, tmp_pa
         result = replay_retained_cnyes_failures(queue)
         assert result['accepted_heads'] == 0 and result['responses_checked'] == 1
         assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
-        assert queue.db.execute('SELECT state FROM retained_failure_replays').fetchone()[0] == 'failed_validation'
+        stored = queue.db.execute('SELECT state,error_code FROM retained_failure_replays').fetchone()
+        assert tuple(stored) == ('failed_validation', 'retained_failure_pair_unverified')
+
+
+def test_local_read_failure_defers_and_recovers_after_restart_without_new_http(cnyes_config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    registry = PolicyRegistry(cnyes_config, base=tmp_path)
+    queue = NewsQueue(tmp_path, registry)
+    try:
+        original, ledger = prepare(queue, monkeypatch)
+        paths, _ = reports(tmp_path)
+        immutable = {str(path): sha256_file(path) for path in (*paths, *(p.with_suffix('.receipt.json') for p in paths))}
+        def unavailable(_job):
+            raise OSError('synthetic local storage outage; not a source response')
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', unavailable)
+        first = replay_retained_cnyes_failures(queue)
+        assert first['local_io_deferrals'] == 1 and first['accepted_heads'] == 0 and first['http_requests'] == 0
+        assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
+        assert queue.db.execute('SELECT count(*) FROM retained_failure_replays').fetchone()[0] == 0
+        assert 0 < replay.retained_failure_next_wake_delay(queue, 60) <= 1
+        assert replay_retained_cnyes_failures(queue)['responses_checked'] == 0
+    finally:
+        queue.close()
+    with closing(NewsQueue(tmp_path, registry)) as restarted:
+        configure_focus(restarted, spec())
+        assert 0 < replay.retained_failure_next_wake_delay(restarted, 60) <= 1
+        assert replay_retained_cnyes_failures(restarted)['responses_checked'] == 0
+        current_time = time.time
+        monkeypatch.setattr(time, 'time', lambda: current_time() + 2)
+        assert replay.retained_failure_next_wake_delay(restarted, 60) == 0
+        recovered = replay_retained_cnyes_failures(restarted)
+        assert recovered['accepted_heads'] == 1 and recovered['http_requests'] == 0
+        assert restarted.db.execute('SELECT count(*) FROM retained_failure_local_retries').fetchone()[0] == 0
+        assert restarted.failure_diagnostic_focus.progress() == ledger
+        assert all(sha256_file(path) == digest for path, digest in immutable.items())
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_temporarily_missing_retained_pair_remains_scheduled(cnyes_config, tmp_path, monkeypatch):
+    registry = PolicyRegistry(cnyes_config, base=tmp_path)
+    with closing(NewsQueue(tmp_path, registry)) as queue:
+        original, _ = prepare(queue, monkeypatch)
+        data_path = reports(tmp_path)[0][0]
+        backup = data_path.with_suffix('.local-fixture-backup')
+        digest = sha256_file(data_path)
+        data_path.rename(backup)  # Only the synthetic fixture is temporarily moved.
+        try:
+            first = replay_retained_cnyes_failures(queue)
+            assert first['local_io_deferrals'] == 1 and first['accepted_heads'] == 0
+            assert queue.db.execute('SELECT count(*) FROM retained_failure_replays').fetchone()[0] == 0
+            assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
+        finally:
+            backup.rename(data_path)
+        assert sha256_file(data_path) == digest
+        current_time = time.time
+        monkeypatch.setattr(time, 'time', lambda: current_time() + 2)
+        assert replay_retained_cnyes_failures(queue)['accepted_heads'] == 1
+
+
+def test_local_retry_does_not_wake_for_a_newer_terminal_head(cnyes_config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cnyes_config, base=tmp_path))) as queue:
+        prepare(queue, monkeypatch)
+        def unavailable(_job):
+            raise OSError('synthetic local storage outage')
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', unavailable)
+        assert replay_retained_cnyes_failures(queue)['local_io_deferrals'] == 1
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='source_not_found',error_code='source_not_found' WHERE url=?", (URL,))
+        original = dict(queue.db.execute('SELECT * FROM articles').fetchone())
+        assert replay.retained_failure_next_wake_delay(queue, 60) == 60
+        current_time = time.time
+        monkeypatch.setattr(time, 'time', lambda: current_time() + 5)
+        assert replay_retained_cnyes_failures(queue)['responses_checked'] == 0
+        assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
+
+
+def test_repeated_local_outages_back_off_and_never_hot_loop(cnyes_config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cnyes_config, base=tmp_path))) as queue:
+        original, ledger = prepare(queue, monkeypatch)
+        now = [time.time()]
+        monkeypatch.setattr(time, 'time', lambda: now[0])
+
+        def unavailable(_job):
+            raise OSError('synthetic persistent local storage outage')
+
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', unavailable)
+        for attempt, delay in enumerate((1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300), 1):
+            result = replay_retained_cnyes_failures(queue)
+            assert result['local_io_deferrals'] == 1 and result['http_requests'] == 0
+            row = queue.db.execute('SELECT local_attempts,not_before_epoch FROM retained_failure_local_retries').fetchone()
+            assert row[0] == attempt and row[1] == now[0] + delay
+            assert replay.retained_failure_next_wake_delay(queue, 500) == delay
+            assert replay_retained_cnyes_failures(queue)['responses_checked'] == 0
+            now[0] += delay
+        assert dict(queue.db.execute('SELECT * FROM articles').fetchone()) == original
+        assert queue.failure_diagnostic_focus.progress() == ledger
+        assert queue.db.execute('SELECT count(*) FROM retained_failure_replays').fetchone()[0] == 0
+
+
+def test_oversized_local_retry_does_not_cause_an_idle_wake_loop(cnyes_config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_replay as replay
+
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cnyes_config, base=tmp_path))) as queue:
+        prepare(queue, monkeypatch)
+        original_read = queue.failure_diagnostic_focus.read_retained_response
+
+        def unavailable(_job):
+            raise OSError('synthetic local storage outage')
+
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', unavailable)
+        assert replay_retained_cnyes_failures(queue)['local_io_deferrals'] == 1
+        current_time = time.time
+        monkeypatch.setattr(time, 'time', lambda: current_time() + 2)
+        size = queue.db.execute('SELECT reserved_bytes FROM failure_evidence_focus_attempts').fetchone()[0]
+        with queue.db:
+            queue.db.execute('UPDATE failure_evidence_focus_attempts SET reserved_bytes=?',
+                             (replay.RETAINED_FAILURE_DEFAULT_RAW_BYTES + 1,))
+        assert replay.retained_failure_next_wake_delay(queue, 60) == 60
+        assert replay_retained_cnyes_failures(queue)['responses_checked'] == 0
+        with queue.db:
+            queue.db.execute('UPDATE failure_evidence_focus_attempts SET reserved_bytes=?', (size,))
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', original_read)
+        assert replay.retained_failure_next_wake_delay(queue, 60) == 0
+        assert replay_retained_cnyes_failures(queue)['accepted_heads'] == 1
+
+
+def test_deferred_local_item_does_not_block_another_eligible_item(cnyes_config, tmp_path, monkeypatch):
+    second_url = URL.replace('/42', '/43')
+    second_page = short_page(canonical=second_url, change={'newsId': 43, 'url': second_url},
+                             schema_change={'url': second_url, 'mainEntityOfPage': {'@id': second_url}})
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cnyes_config, base=tmp_path))) as queue:
+        configure_focus(queue, spec(urls=[URL, second_url]))
+        fail(queue, Response(URL, 200, {'content-type': 'text/html'}, short_page()))
+        fail(queue, Response(second_url, 200, {'content-type': 'text/html'}, second_page))
+        simulated_now = time.time() + 4000
+        monkeypatch.setattr(time, 'time', lambda: simulated_now)
+        original_read = queue.failure_diagnostic_focus.read_retained_response
+        blocked = []
+
+        def first_item_unavailable(job):
+            if not blocked:
+                blocked.append(job[0])
+                raise OSError('synthetic item-specific local outage')
+            return original_read(job)
+
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', first_item_unavailable)
+        first = replay_retained_cnyes_failures(queue, maximum_responses=1, maximum_wall_seconds=2)
+        assert first['local_io_deferrals'] == 1 and first['accepted_heads'] == 0
+        second = replay_retained_cnyes_failures(queue, maximum_responses=1, maximum_wall_seconds=2)
+        assert second['accepted_heads'] == 1 and second['http_requests'] == 0
+        assert queue.db.execute('SELECT body_sha256 FROM articles WHERE id=?', (blocked[0],)).fetchone()[0] is None
+        assert queue.db.execute('SELECT count(*) FROM articles WHERE state="complete"').fetchone()[0] == 1
+        assert replay_retained_cnyes_failures(queue, maximum_responses=1, maximum_wall_seconds=2)['responses_checked'] == 0
+
+
+def test_service_wakes_for_local_retry_while_provider_is_cooling_down(cnyes_config, tmp_path, monkeypatch):
+    from downloader.news_fulltext import run_service
+    from test_news_fulltext import http_fixture
+
+    cnyes_config.update(retained_cnyes_failure_replay_enabled=True, cached_cnyes_replay_enabled=False,
+                        cached_cnyes_metadata_replay_enabled=False, service_idle_max_seconds=30,
+                        adaptive_rate={'enabled': False})
+    http, session = http_fixture(cnyes_config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        _, ledger = prepare(queue, monkeypatch)
+        http.defer('cnyes', 120)
+        original_read = queue.failure_diagnostic_focus.read_retained_response
+        attempts = []
+
+        def fail_once(job):
+            attempts.append(time.monotonic())
+            if len(attempts) == 1:
+                raise OSError('synthetic temporary local outage')
+            return original_read(job)
+
+        monkeypatch.setattr(queue.failure_diagnostic_focus, 'read_retained_response', fail_once)
+        run_service(queue, http, cnyes_config, max_articles=0, max_discovery_requests=0, duration_seconds=3)
+        assert len(attempts) == 2 and attempts[1] - attempts[0] >= 1
+        assert queue.db.execute('SELECT state FROM articles WHERE url=?', (URL,)).fetchone()[0] == 'complete'
+        assert queue.db.execute('SELECT count(*) FROM retained_failure_local_retries').fetchone()[0] == 0
+        assert queue.failure_diagnostic_focus.progress() == ledger
+        assert not session.calls and verify_bodies(tmp_path)['accepted']
+    finally:
+        http.close()
+        queue.close()
 
 
 def test_durable_receipt_recovers_after_commit_failure_under_same_head(cnyes_config, tmp_path, monkeypatch):

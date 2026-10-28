@@ -28,6 +28,63 @@ def test_affinity_and_fractional_quota_are_both_limits():
     assert effective_limits([2], 100, [{'memory_max': '10', 'memory_current': '20'}])['memory_headroom_bytes'] == 0
 
 
+def memory_stats(**changes):
+    values = dict(file=800, shmem=200, active_file=300, inactive_file=250,
+                  file_dirty=20, file_writeback=10, unevictable=40,
+                  anon=5000, slab_reclaimable=9000, swapcached=8000)
+    values.update(changes)
+    return '\n'.join(f'{key} {value}' for key, value in values.items())
+
+
+def test_opt_in_clean_file_capacity_keeps_default_and_does_not_count_shmem_or_slab():
+    group = {'path': '/cg/job', 'memory_max': '1000', 'memory_current': '950',
+             'memory_stat': memory_stats()}
+    assert effective_limits([0], 2000, [group])['memory_headroom_bytes'] == 50
+    measured = effective_limits([0], 2000, [group], memory_policy='clean_file_reclaim_v1')
+    assert measured['memory_unreclaimed_headroom_bytes'] == 50
+    assert measured['memory_headroom_bytes'] == 530  # 50 + min(600, 550) - 70.
+    assert measured['memory_reclaim_bounds'] == [{'path': '/cg/job', 'clean_file_bytes': 480,
+                                                 'unreclaimed_headroom_bytes': 50}]
+
+
+@pytest.mark.parametrize('changes,expected', [
+    ({'file': 250, 'shmem': 200}, 0),
+    ({'file_dirty': 600}, 0),
+    ({'unevictable': 600}, 0),
+    ({'active_file': 0, 'inactive_file': 0}, 0),
+    ({'file': 200, 'shmem': 250}, 0),
+    ({'file': 350, 'shmem': 200, 'anon': 99999999, 'slab_reclaimable': 99999999}, 80),
+])
+def test_only_clean_filesystem_lru_is_credited(changes, expected):
+    group = {'memory_max': '1000', 'memory_current': '1000', 'memory_stat': memory_stats(**changes)}
+    assert effective_limits([0], 2000, [group], memory_policy='clean_file_reclaim_v1')['memory_headroom_bytes'] == expected
+
+
+def test_clean_file_capacity_obeys_host_and_every_ancestor_instead_of_adding_credits():
+    groups = [{'memory_max': '1000', 'memory_current': '950', 'memory_stat': memory_stats()},
+              {'memory_max': '2000', 'memory_current': '1980', 'memory_stat': memory_stats(file=300, shmem=200)}]
+    assert effective_limits([0], 2000, groups, memory_policy='clean_file_reclaim_v1')['memory_headroom_bytes'] == 50
+    assert effective_limits([0], 25, groups, memory_policy='clean_file_reclaim_v1')['memory_headroom_bytes'] == 25
+    # Counters can be sampled across a reclaim; never exceed the limit itself.
+    groups[0]['memory_current'] = '10'
+    assert effective_limits([0], 2000, groups[:1], memory_policy='clean_file_reclaim_v1')['memory_headroom_bytes'] == 1000
+
+
+@pytest.mark.parametrize('stats', [None, '', 'file 1\nfile 2', 'file -1', 'file 1 extra',
+                                   memory_stats().replace('unevictable 40', ''),
+                                   memory_stats().replace('file_dirty 20', 'file_dirty NaN')])
+def test_reclaim_admission_rejects_missing_invalid_or_duplicate_stats(stats):
+    group = {'memory_max': '1000', 'memory_current': '950', 'memory_stat': stats}
+    with pytest.raises(ValueError):
+        effective_limits([0], 2000, [group], memory_policy='clean_file_reclaim_v1')
+    assert effective_limits([0], 2000, [group])['memory_headroom_bytes'] == 50
+
+
+def test_unknown_memory_admission_policy_is_rejected():
+    with pytest.raises(ValueError, match='unknown'):
+        effective_limits([0], 1000, [], memory_policy='guess_all_cache_is_free')
+
+
 @pytest.mark.parametrize('group', [{'cpu_max': '100 0'}, {'cpu_max': '0 100'},
                                  {'memory_max': '10'}, {'memory_max': '10', 'memory_current': '-1'}])
 def test_unknown_or_invalid_limits_cannot_be_admitted(group):
@@ -168,3 +225,22 @@ def test_probe_resolves_nested_cgroups_and_fingerprints_capacity_not_current_usa
     assert second['limits']['memory_headroom_bytes'] == 999999800
     (group/'parent/cpu.max').write_text('350000 100000')
     assert observe_node(tmp_path, tmp_path, proc=proc, sys=sys)['machine_sha256'] != first['machine_sha256']
+
+
+def test_probe_records_explicit_reclaim_policy_and_observed_counters(tmp_path, monkeypatch):
+    proc, sys = tmp_path / 'proc', tmp_path / 'sys'
+    group = tmp_path / 'cgroup'; group.mkdir(); (proc / 'self').mkdir(parents=True)
+    (proc / 'self/mountinfo').write_text(f'1 0 0:1 / / rw - ext4 /dev/fixture rw\n2 1 0:2 / {group} rw - cgroup2 cgroup rw\n')
+    (proc / 'self/cgroup').write_text('0::/\n')
+    (proc / 'meminfo').write_text('MemTotal: 10000 kB\nMemAvailable: 9000 kB\n')
+    (proc / 'cpuinfo').write_text('model name : CPU fixture\n')
+    (group / 'memory.max').write_text('1000');(group / 'memory.current').write_text('950')
+    (group / 'memory.stat').write_text(memory_stats())
+    monkeypatch.setattr('stockagent.remote_build.os.sched_getaffinity', lambda _: {0})
+    original = observe_node(tmp_path, tmp_path, proc=proc, sys=sys)
+    opt = observe_node(tmp_path, tmp_path, proc=proc, sys=sys, memory_policy='clean_file_reclaim_v1')
+    assert opt['limits']['memory_headroom_bytes'] == 530
+    assert opt['limits']['memory_unreclaimed_headroom_bytes'] == 50
+    assert opt['identity']['memory_admission_policy'] == 'clean_file_reclaim_v1'
+    assert opt['machine_sha256'] != original['machine_sha256']
+    assert opt['cgroups'][0]['memory_stat'] == memory_stats()

@@ -63,6 +63,34 @@ def test_success_exit_with_wrong_marker_is_not_a_usable_bridge(monkeypatch, tmp_
         native._windows_process_environment()
 
 
+def test_probe_and_file_launch_do_not_depend_on_login_windows_path(monkeypatch, tmp_path):
+    endpoints(monkeypatch, tmp_path, ['20_interop'])
+    monkeypatch.setenv('PATH', '/private-no-Windows-executables')
+    monkeypatch.setenv('WSL_INTEROP', str(tmp_path / '20_interop'))
+    calls = []
+
+    def probe(argv, **kwargs):
+        assert argv[0] == native.POWERSHELL and Path(argv[0]).is_absolute()
+        assert kwargs['env']['PATH'] == '/private-no-Windows-executables'
+        assert kwargs['input'] == b'[]\n'
+        calls.append('probe')
+        return SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER)
+
+    process = object()
+    def launch(argv, **kwargs):
+        assert argv[0] == native.POWERSHELL
+        assert kwargs['env']['WSL_INTEROP'] == str(tmp_path / '20_interop')
+        calls.append('file-launch')
+        return process
+
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    monkeypatch.setattr(native.subprocess, 'Popen', launch)
+    returned, errors = native._launch([], batched=True)
+    errors.close()
+    assert returned is process and calls == ['probe', 'file-launch']
+    assert os.environ['PATH'] == '/private-no-Windows-executables'
+
+
 def test_failed_probe_is_bounded_and_never_launches_file_operation(monkeypatch, tmp_path):
     endpoints(monkeypatch, tmp_path, [str(i) + '_interop' for i in range(1, 15)])
     monkeypatch.setenv('WSL_INTEROP', str(tmp_path / '1_interop'))
@@ -81,6 +109,72 @@ def test_failed_probe_is_bounded_and_never_launches_file_operation(monkeypatch, 
         native._launch([], batched=True)
     assert len(calls) == len(set(calls)) == 8
     assert native._INTEROP_CACHE is None
+
+
+def test_one_transient_empty_admission_timeout_retries_without_any_file_configuration(monkeypatch, tmp_path):
+    endpoints(monkeypatch, tmp_path, ['20_interop'])
+    good = str(tmp_path / '20_interop')
+    monkeypatch.setenv('WSL_INTEROP', good)
+    calls, waits = [], []
+    monkeypatch.setattr(native.time, 'sleep', waits.append)
+    def probe(argv, **options):
+        calls.append(options)
+        assert options['input'] == b'[]\n'
+        assert options['env']['WSL_INTEROP'] == good
+        if len(calls) == 1:
+            raise native.subprocess.TimeoutExpired(argv, options['timeout'])
+        return SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER)
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    assert native._windows_process_environment()['WSL_INTEROP'] == good
+    assert len(calls) == 2 and waits == [.25]
+    assert native._windows_process_environment()['WSL_INTEROP'] == good
+    assert len(calls) == 2
+
+
+def test_single_unavailable_bridge_has_three_attempts_and_never_starts_file_IO(monkeypatch, tmp_path):
+    endpoints(monkeypatch, tmp_path, ['20_interop'])
+    calls, waits = [], []
+    monkeypatch.setattr(native.time, 'sleep', waits.append)
+    def probe(argv, **options):
+        calls.append(options['input'])
+        raise native.subprocess.TimeoutExpired(argv, options['timeout'])
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    monkeypatch.setattr(native.subprocess, 'Popen', lambda *_a, **_k: pytest.fail('file I/O started'))
+    with pytest.raises(SnapshotError, match='not started'):
+        native._windows_process_environment()
+    assert calls == [b'[]\n'] * 3 and waits == [.25, 1.0]
+
+
+@pytest.mark.parametrize('failure', ['partial-output-timeout', 'wrong-marker', 'script-error', 'permission-error'])
+def test_ambiguous_or_permanent_admission_failure_is_not_retried(monkeypatch, tmp_path, failure):
+    endpoints(monkeypatch, tmp_path, ['20_interop'])
+    calls = []
+    monkeypatch.setattr(native.time, 'sleep', lambda *_: pytest.fail('permanent failure retried'))
+    def probe(argv, **options):
+        calls.append(options['input'])
+        if failure == 'partial-output-timeout':
+            raise native.subprocess.TimeoutExpired(argv, options['timeout'], output=b'partial marker')
+        if failure == 'permission-error':
+            raise PermissionError('fixture permission rejection')
+        return SimpleNamespace(returncode=1 if failure == 'script-error' else 0, stdout=b'wrong marker')
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    with pytest.raises(SnapshotError, match='not started'):
+        native._windows_process_environment()
+    assert calls == [b'[]\n']
+
+
+def test_replaced_socket_is_never_retried_or_admitted_after_a_probe(monkeypatch, tmp_path):
+    signatures = endpoints(monkeypatch, tmp_path, ['20_interop'])
+    good = str(tmp_path / '20_interop')
+    calls = []
+    def probe(argv, **options):
+        calls.append(options['input'])
+        signatures[good] = (good, 1, 999)
+        return SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER)
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    with pytest.raises(SnapshotError, match='not started'):
+        native._windows_process_environment()
+    assert calls == [b'[]\n'] and native._INTEROP_CACHE is None
 
 
 def test_cached_bridge_is_revalidated_after_timeout(monkeypatch, tmp_path):
@@ -156,3 +250,58 @@ def test_only_owned_init_sockets_and_fixed_alias_are_admitted(monkeypatch, tmp_p
             assert signature[0] == str(endpoint)
     finally:
         server.close()
+
+
+def test_expired_verified_generation_gets_fresh_probe_before_eight_newer_endpoints(monkeypatch, tmp_path):
+    signatures = endpoints(monkeypatch, tmp_path, ['2_interop'] + [f'{i}_interop' for i in range(20, 40)])
+    good = str(tmp_path / '2_interop')
+    bad = str(tmp_path / '39_interop')
+    monkeypatch.setenv('WSL_INTEROP', bad)
+    monkeypatch.setattr(native.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(native, '_INTEROP_CACHE', (signatures[good], 1.0))
+    calls = []
+
+    def probe(*args, **kwargs):
+        calls.append(kwargs['env']['WSL_INTEROP'])
+        assert kwargs['input'] == b'[]\n'
+        return SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER if calls[-1] == good else b'')
+
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    assert native._windows_process_environment()['WSL_INTEROP'] == good
+    assert calls == [good]
+    assert native._INTEROP_CACHE == (signatures[good], 100.0)
+    assert os.environ['WSL_INTEROP'] == bad
+
+
+@pytest.mark.parametrize('failure', ['wrong-marker', 'script-error', 'partial-timeout'])
+def test_previous_success_never_bypasses_new_failed_empty_admission(monkeypatch, tmp_path, failure):
+    signatures = endpoints(monkeypatch, tmp_path, ['2_interop'])
+    good = str(tmp_path / '2_interop')
+    monkeypatch.setenv('WSL_INTEROP', good)
+    monkeypatch.setattr(native.time, 'monotonic', lambda: 100.0)
+    monkeypatch.setattr(native, '_INTEROP_CACHE', (signatures[good], 1.0))
+    calls = []
+
+    def probe(argv, **kwargs):
+        calls.append(kwargs['input'])
+        if failure == 'partial-timeout':
+            raise native.subprocess.TimeoutExpired(argv, kwargs['timeout'], output=b'partial')
+        return SimpleNamespace(returncode=1 if failure == 'script-error' else 0, stdout=b'wrong')
+
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    with pytest.raises(SnapshotError, match='not started'):
+        native._windows_process_environment()
+    assert calls == [b'[]\n'] and native._INTEROP_CACHE is None
+
+
+def test_changed_previous_generation_does_not_displace_original_preferred_probe(monkeypatch, tmp_path):
+    signatures = endpoints(monkeypatch, tmp_path, ['2_interop', '30_interop'])
+    old = str(tmp_path / '2_interop')
+    preferred = str(tmp_path / '30_interop')
+    monkeypatch.setenv('WSL_INTEROP', preferred)
+    monkeypatch.setattr(native, '_INTEROP_CACHE', ((old, 1, 999999), 0.0))
+    calls = []
+    monkeypatch.setattr(native.subprocess, 'run', lambda *a, **kw: calls.append(kw['env']['WSL_INTEROP']) or
+        SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER))
+    assert native._windows_process_environment()['WSL_INTEROP'] == preferred
+    assert calls == [preferred]

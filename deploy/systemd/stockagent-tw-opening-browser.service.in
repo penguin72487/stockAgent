@@ -9,6 +9,11 @@ User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
+# Playwright/Chromium need writable private scratch even when strict system
+# protection makes /tmp read-only inside this service's mount namespace.
+RuntimeDirectory=stockagent-tw-opening-browser
+RuntimeDirectoryMode=0700
+Environment="TMPDIR=/run/stockagent-tw-opening-browser"
 ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python -m scripts.benchmark_dashboard_browser --scheduled --cdp-port 9241'
 TimeoutStartSec=1150
 KillMode=control-group
@@ -17,5 +22,6 @@ CPUWeight=10
 IOWeight=10
 NoNewPrivileges=true
 ProtectSystem=strict
+PrivateTmp=true
 ReadWritePaths=@REPO_ROOT@/artifacts/operations
 UMask=0077

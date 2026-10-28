@@ -8,6 +8,7 @@ MAINTENANCE_TIMER_NAME="stockagent-discord-artifact-maintenance.timer"
 MAINTENANCE_PATH_NAME="stockagent-discord-artifact-maintenance.path"
 RETRY_SERVICE_NAME="stockagent-discord-artifact-retry.service"
 RETRY_TIMER_NAME="stockagent-discord-artifact-retry.timer"
+PRIORITY_SOURCE_SERVICE_NAME="stockagent-tw-day-trade-priority-source.service"
 POSTCLOSE_CACHE_SERVICE_NAME="stockagent-discord-postclose-cache.service"
 HEAVY_DATA_SLICE_NAME="stockagent-heavy-data.slice"
 START_NOW=true
@@ -36,11 +37,12 @@ if [[ "$OPENING_AUDIT_ONLY" == true && "$RETRY_ONLY" == true ]]; then
   echo "[discord-service] select one scoped installer" >&2
   exit 2
 fi
-unit_names=("$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME" "$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_SERVICE_NAME" "$OPENING_BROWSER_TIMER_NAME")
+unit_names=("$SERVICE_NAME" "$MAINTENANCE_SERVICE_NAME" "$MAINTENANCE_TIMER_NAME" "$MAINTENANCE_PATH_NAME" "$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$PRIORITY_SOURCE_SERVICE_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME" "$HEAVY_DATA_SLICE_NAME" "$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_SERVICE_NAME" "$OPENING_BROWSER_TIMER_NAME")
 if [[ "$RETRY_ONLY" == true ]]; then
-  # Scoped maintenance deployment must not rewrite/restart Gateway, market,
-  # full-history or source owners, nor hide a failed inotify path.
-  unit_names=("$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME")
+  # The priority-source unit is only a scoped wakeup supervisor for the
+  # existing data owner. Do not rewrite/restart Gateway, market, full-history
+  # or canonical collector units, nor hide a failed inotify path.
+  unit_names=("$RETRY_SERVICE_NAME" "$RETRY_TIMER_NAME" "$PRIORITY_SOURCE_SERVICE_NAME" "$POSTCLOSE_CACHE_SERVICE_NAME")
 fi
 if [[ "$OPENING_AUDIT_ONLY" == true ]]; then
   unit_names=("$OPENING_AUDIT_SERVICE_NAME" "$OPENING_AUDIT_TIMER_NAME" "$QUOTE_PHASE_SERVICE_NAME" "$QUOTE_PHASE_TIMER_NAME" "$OPENING_BROWSER_SERVICE_NAME" "$OPENING_BROWSER_TIMER_NAME")

@@ -99,7 +99,7 @@ def test_0830_main_read_scans_allow_inference_and_recheck_write_upgrade(
     monkeypatch.setattr(owner, "_wait_for_event_monitor", lambda *a, **k: ({}, [], 0.))
     monkeypatch.setattr(owner, "_event_monitor_errors", lambda *a, **k: [])
     monkeypatch.setattr(owner, "create_opening_revision_freeze", lambda *a, **k: {})
-    monkeypatch.setattr(owner, "_defer_opening_bulk_step", lambda *a: False)
+    monkeypatch.setattr(owner, "_defer_opening_bulk_step", lambda *a, **k: False)
     monkeypatch.setattr(owner, "_reusable_audit", lambda *a, **k: ({"model_safe": True}, {}))
     monkeypatch.setattr(owner, "_live_runtime_errors", lambda **k: [])
     monkeypatch.setattr(owner, "_derived_data_dates", lambda *a: {})
@@ -1989,10 +1989,13 @@ def test_source_event_service_is_persistent_and_restarting() -> None:
     assert "WatchdogSec=5min" in service
     assert "Restart=always" in service
     assert "OOMScoreAdjust=-250" in service
-    assert "MemoryHigh=48G" in service
-    assert "MemoryMax=64G" in service
-    assert "MemorySwapMax=8G" in service
-    assert "TasksMax=2048" in service
+    assert "Nice=0" in service
+    assert "CPUWeight=5000" in service
+    assert "IOWeight=5000" in service
+    assert "MemoryHigh=infinity" in service
+    assert "MemoryMax=infinity" in service
+    assert "MemorySwapMax=infinity" in service
+    assert "TasksMax=infinity" in service
     assert "watch_tw_public_source_events" not in service
     assert "run_tw_public_source_event_monitor.sh" in service
 
@@ -2044,14 +2047,14 @@ def test_0830_acceptance_uses_bounded_timer_retries() -> None:
     assert "08:29:00 Asia/Taipei" in timer
     assert "09:15:00 Asia/Taipei" in timer
     assert "ExecStartPost" not in service
-    assert "Nice=10" in service
-    assert "CPUWeight=25" in service
-    assert "IOWeight=25" in service
-    assert "MemoryHigh=64G" in service
-    assert "MemoryMax=72G" in service
-    assert "OOMScoreAdjust=500" in service
-    assert "TasksMax=4096" in service
-    assert "Slice=stockagent-heavy-data.slice" in service
+    assert "Nice=0" in service
+    assert "CPUWeight=5000" in service
+    assert "IOWeight=5000" in service
+    assert "MemoryHigh=infinity" in service
+    assert "MemoryMax=infinity" in service
+    assert "OOMScoreAdjust=-250" in service
+    assert "TasksMax=infinity" in service
+    assert "Slice=system.slice" in service
 
 
 def test_0830_derived_warmup_does_not_wait_for_same_session_eligibility() -> None:
@@ -2069,7 +2072,7 @@ def test_0830_derived_warmup_does_not_wait_for_same_session_eligibility() -> Non
     ) == ["publication:preopen publication is not current"]
 
 
-def test_0830_bulk_writes_and_audit_defer_through_opening_window() -> None:
+def test_0830_only_optional_work_defers_through_opening_window() -> None:
     check = run_tw_public_0830_check._defer_opening_bulk_step
     for step in (
         "refresh_corporate_action_reference",
@@ -2085,6 +2088,8 @@ def test_0830_bulk_writes_and_audit_defer_through_opening_window() -> None:
         assert check(step, datetime(2026, 9, 22, 9, 5, tzinfo=TAIPEI))
         assert check(step, datetime(2026, 9, 22, 9, 9, 59, tzinfo=TAIPEI))
         assert not check(step, datetime(2026, 9, 22, 9, 10, tzinfo=TAIPEI))
+        assert not check(step, datetime(2026, 9, 22, 8, 50, tzinfo=TAIPEI), required=True)
+        assert not check(step, datetime(2026, 9, 22, 9, 0, tzinfo=TAIPEI), required=True)
     assert not check(
         "refresh_corporate_action_entitlements",
         datetime(2026, 9, 22, 9, 0, tzinfo=TAIPEI),
@@ -2110,7 +2115,8 @@ def test_eligibility_timer_has_weekday_boot_and_opening_catchups() -> None:
     assert "RandomizedDelaySec=0" in timer
 
 
-def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
+@pytest.mark.parametrize("transport", ["mis", "parallel"])
+def test_final_preopen_gate_requires_public_model_and_executor_proofs(transport) -> None:
     observed = datetime(2026, 8, 17, 8, 59, tzinfo=TAIPEI)
     public = {
         "status": "ok",
@@ -2137,10 +2143,12 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
                     "status": "ready",
                     "run_id": "discord-process-1",
                     "completed_at": "2026-08-17T08:55:00+08:00",
+                    "panel_cache_epoch": 12,
                     "live_latency": {
                         "panel_cache_hit": True,
                         "checkpoint_cache_hit": True,
                         "model_cache_hit": True,
+                        "alignment_cache_hit": True,
                     },
                     "opening_source_prewarm": {
                         "ready": True,
@@ -2151,6 +2159,13 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
             }
         }
     }
+    if transport == "parallel":
+        model["markets"]["tw_day_trade"]["final_arm"]["opening_source_prewarm"].update({
+            "source": "parallel_opening_sources",
+            "proof": "responding_transport_not_opening_price_readiness",
+            "providers": {"official_mis": {"state": "failed", "ready": False},
+                          "finmind_snapshot": {"state": "complete", "ready": True}},
+        })
     simulation = {
         "status": "ready",
         "session_date": "2026-08-17",
@@ -2170,6 +2185,8 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
         "stockagent-discord-bot.service": "active",
         "stockagent-tw-day-trade-simulation.service": "active",
     }
+    model_cache = {"run_id": "discord-process-1", "live_panel_cache_epoch": 12,
+                   "updated_at": observed.isoformat()}
     ready = evaluate_readiness(
         observed=observed,
         strict_after=datetime(2026, 8, 17, 8, 57, tzinfo=TAIPEI).time(),
@@ -2178,8 +2195,18 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
         model_receipt=model,
         simulation_receipt=simulation,
         service_states=services,
+        model_cache_receipt=model_cache,
     )
     assert ready["status"] == "ready"
+    stale_cache = evaluate_readiness(
+        observed=observed,
+        strict_after=datetime(2026, 8, 17, 8, 57, tzinfo=TAIPEI).time(),
+        market_names=("tw_day_trade",), public_receipt=public, model_receipt=model,
+        simulation_receipt=simulation, service_states=services,
+        model_cache_receipt={**model_cache, "live_panel_cache_epoch": 13},
+    )
+    assert not stale_cache["model_final_arm"]["tw_day_trade"]["ready"]
+    assert stale_cache["model_final_arm"]["tw_day_trade"]["observed_cache_epoch"] == 13
     simulation["components"]["shioaji_quote"]["status"] = "failed"
     failed = evaluate_readiness(
         observed=observed,
@@ -2189,9 +2216,35 @@ def test_final_preopen_gate_requires_public_model_and_executor_proofs() -> None:
         model_receipt=model,
         simulation_receipt=simulation,
         service_states=services,
+        model_cache_receipt=model_cache,
     )
     assert failed["status"] == "failed"
     assert failed["ready"] is False
+
+
+@pytest.mark.parametrize("change", ["missing_proof", "prices_not_transport", "empty", "running",
+                                   "failed", "false_ready", "malformed_providers"])
+def test_parallel_prewarm_requires_real_completed_transport_evidence(change) -> None:
+    from stockagent.live.opening_readiness import opening_transport_proven
+
+    receipt = {"ready": True, "source": "parallel_opening_sources",
+               "proof": "responding_transport_not_opening_price_readiness",
+               "providers": {"official_mis": {"state": "complete", "ready": True}}}
+    if change == "missing_proof":
+        receipt.pop("proof")
+    elif change == "prices_not_transport":
+        receipt["proof"] = "opening_prices_ready"
+    elif change == "empty":
+        receipt["providers"] = {}
+    elif change == "running":
+        receipt["providers"]["official_mis"]["state"] = "running"
+    elif change == "failed":
+        receipt["providers"]["official_mis"]["state"] = "failed"
+    elif change == "false_ready":
+        receipt["ready"] = False
+    else:
+        receipt["providers"] = ["official_mis"]
+    assert opening_transport_proven(receipt) is False
 
 
 def test_final_preopen_gate_rejects_legacy_materialized_snapshot_receipt() -> None:
@@ -2411,9 +2464,82 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
         engine_sync_receipt=engine_sync,
         execution_latency_rows=latency_rows,
     )
-    assert result["opening_execution"]["ready"] is True
-    assert result["opening_execution"]["modes"][market]["commit_slo_met"] is True
+    assert result["opening_execution"]["ready"] is False
+    assert result["opening_execution"]["modes"][market]["commit_slo_met"] is False
     assert result["opening_execution"]["modes"][market]["entry_commit_delay_ms"] == 2500.0
+    assert result["opening_ledger_slo_met"] is False
+    assert result["opening_slo_met"] is None
+    assert result["deadline_taipei"] == "2026-08-17T09:00:01+08:00"
+
+    engine_sync["modes"][market]["entry_completed_at"] = "2026-08-17T09:00:00.800+08:00"
+    on_time_row = {**latency_rows[0], "ledger_persisted_at": "2026-08-17T09:00:01+08:00"}
+    on_time = evaluate_readiness(
+        observed=observed, strict_after=datetime_time(8, 57), market_names=(market,),
+        public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
+        engine_sync_receipt=engine_sync, execution_latency_rows=[on_time_row],
+    )
+    # Registration plus current quantities do not prove when targets filled.
+    assert on_time["opening_execution"]["ready"] is False
+    assert on_time["opening_ledger_slo_met"] is False
+    assert on_time["opening_slo_met"] is None  # Browser paint is not measured here.
+    progress_row = {
+        "market": market, "signal_id": "signal-1", "session_date": "2026-08-17",
+        "contract": "state_fsync_then_paper_target_progress_v1",
+        "measurement_boundary": "paper_target_quantities_after_state_commit_not_broker_fill",
+        "clock_basis": "engine_publication_clock_not_economic_event",
+        "recorded_at": "2026-08-17T09:00:01+08:00", "state_revision": 1,
+        "engine_run_id": "run-1", "simulation_only": True,
+        "production_order_possible": False, "live_execution_eligible": True,
+        "simulation_replay": False, "entry_fill_policy": "causal_market_full_target_at_best_quote",
+        "entry_requested_shares": 1000, "entry_filled_shares": 1000,
+        "entry_unfilled_shares": 0, "pending_entry_shares": 0,
+        "pending_entry_source_count": 0, "unsized_entry_target_count": 0,
+        "signal_registration_committed": True, "entry_fill_outcome": "filled",
+        "signal_reason_counts": {},
+    }
+
+    def with_progress(row):
+        return evaluate_readiness(
+            observed=observed, strict_after=datetime_time(8, 57), market_names=(market,),
+            public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
+            engine_sync_receipt=engine_sync, execution_latency_rows=[on_time_row],
+            execution_progress_rows=[row],
+        )
+
+    proven = with_progress(progress_row)
+    assert proven["opening_execution"]["ready"] is True
+    assert proven["opening_ledger_slo_met"] is True
+    assert proven["opening_execution"]["modes"][market]["target_progress_delay_ms"] == 1000.0
+    assert proven["opening_slo_met"] is None
+    for changes in (
+        {"signal_id": "other"}, {"simulation_replay": True},
+        {"recorded_at": "2026-08-17T09:00:00.900"},
+        {"recorded_at": "2026-08-17T09:00:01.001+08:00"},
+        {"pending_entry_source_count": 1}, {"state_revision": True},
+        {"entry_fill_policy": "official_open_replay"},
+    ):
+        assert not with_progress({**progress_row, **changes})["opening_execution"]["ready"]
+    engine_sync["modes"][market]["entry_filled_shares"] = 500
+    engine_sync["modes"][market]["entry_unfilled_shares"] = 500
+    partial = evaluate_readiness(
+        observed=observed, strict_after=datetime_time(8, 57), market_names=(market,),
+        public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
+        engine_sync_receipt=engine_sync, execution_latency_rows=[on_time_row],
+    )
+    assert partial["opening_execution"]["modes"][market]["entry_execution_complete"]
+    assert not partial["opening_execution"]["modes"][market]["all_requested_shares_filled"]
+    assert not partial["opening_execution"]["ready"]
+    # A truly cash-only signal is distinct from a rejected or unsized order.
+    engine_sync["modes"][market]["entry_requested_shares"] = 0
+    engine_sync["modes"][market]["entry_filled_shares"] = 0
+    engine_sync["modes"][market]["entry_unfilled_shares"] = 0
+    no_order = {**progress_row, "entry_requested_shares": 0, "entry_filled_shares": 0,
+                "entry_fill_outcome": "no_order"}
+    assert with_progress(no_order)["opening_execution"]["ready"]
+    assert not with_progress({**no_order, "unsized_entry_target_count": 1})["opening_execution"]["ready"]
+    engine_sync["modes"][market]["entry_requested_shares"] = 1000
+    engine_sync["modes"][market]["entry_filled_shares"] = 1000
+    engine_sync["modes"][market]["entry_unfilled_shares"] = 0
 
     unknown_commit = evaluate_readiness(
         observed=observed, strict_after=datetime_time(8, 57), market_names=(market,),
@@ -2438,7 +2564,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
     )
     assert failed["opening_execution"]["ready"] is False
     assert (
-        "09:00 live signals and causal paper execution were not durably complete for every mode by 09:00:15"
+        "09:00 live signals and full causal paper targets were not durably complete for every mode within 1 second(s)"
         in failed["failures"]
     )
 
@@ -2485,6 +2611,7 @@ def test_post_open_gate_keeps_fractional_commit_overrun_and_replay_delay():
             strict_after=datetime_time(8, 57), market_names=(market,),
             public_receipt={}, model_receipt={}, simulation_receipt={}, service_states={},
             engine_sync_receipt={"modes": {market: mode}}, execution_latency_rows=rows,
+            opening_commit_slo_seconds=15.0,
         )["opening_execution"]["modes"][market]
 
     late = evaluate([record])
@@ -2564,6 +2691,9 @@ def test_eligibility_watcher_retries_delayed_official_publication() -> None:
     assert "RestartSec=30s" in service
     assert "StartLimitIntervalSec=10min" in service
     assert "StartLimitBurst=3" in service
+    assert "Nice=0" in service
+    assert "CPUWeight=10000" in service
+    assert "IOWeight=10000" in service
 
 
 def test_service_wrappers_exec_resolved_python_not_shell_function() -> None:

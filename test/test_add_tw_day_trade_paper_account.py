@@ -77,6 +77,26 @@ def test_composition_preserves_open_old_book_and_every_old_ledger_byte(accounts)
     assert engine.state["modes"]["old"] == old
 
 
+def test_composition_of_immutable_journals_keeps_both_accounts_and_exact_old_bytes(accounts):
+    from stockagent.live import paper_journal
+    live, candidate, merged = accounts
+    retained = {}
+    for root in (live, candidate):
+        for name in paper_journal.FILENAMES:
+            path = root / name
+            if path.exists():
+                retained[(root, name)] = path.read_bytes()
+                paper_journal.publish_snapshot(path, operation="seed")
+    receipt = compose_account(live, candidate, merged, "new")
+    assert receipt["old_ledger_prefixes_unchanged"]
+    assert receipt["retained_immutable_journal_clones"]
+    for name in paper_journal.FILENAMES:
+        if (live / name).exists():
+            with paper_journal.open_paper_journal(merged / name) as stream:
+                assert stream.read().startswith(retained[(live, name)])
+            assert (live / name).read_bytes() == retained[(live, name)]
+
+
 def test_engine_created_empty_placeholder_can_be_replaced_without_old_book_change(
     accounts,
 ):
@@ -100,6 +120,47 @@ def test_engine_created_empty_placeholder_can_be_replaced_without_old_book_chang
     assert after["modes"]["new"]["positions"]
     assert receipt["configured_empty_placeholder_replaced"] is True
     assert receipt["preserved_markets"] == ["old"]
+
+
+def test_composition_refuses_rewritten_execution_observer_prefix(accounts, monkeypatch):
+    live, candidate, merged = accounts
+    path = live / "execution_latency.jsonl"
+    before = path.read_bytes()
+    assert before
+    persist = TwDayTradeSimulationEngine._persist
+
+    def rewrite_then_persist(engine, *args, **kwargs):
+        persist(engine, *args, **kwargs)
+        if engine.state_dir == merged:
+            target = merged / "execution_latency.jsonl"
+            raw = target.read_bytes()
+            # Same-length corruption plus a valid appended observation must
+            # never be accepted as an append-only telemetry change.
+            target.write_bytes(b" " + raw[1:])
+
+    monkeypatch.setattr(TwDayTradeSimulationEngine, "_persist", rewrite_then_persist)
+    with pytest.raises(ValueError, match="existing file changed: execution_latency"):
+        compose_account(live, candidate, merged, "new")
+    assert path.read_bytes() == before
+
+
+def test_composition_requires_its_new_durable_ack(accounts, monkeypatch):
+    from stockagent.live.tw_day_trade_service_sync import (
+        PaperReadChanged, SERVICE_SYNC_DURABLE_ACK_FILENAME,
+    )
+    live, candidate, merged = accounts
+    before = (live / SERVICE_SYNC_DURABLE_ACK_FILENAME).read_bytes()
+    persist = TwDayTradeSimulationEngine._persist
+
+    def stale_ack_after_persist(engine, *args, **kwargs):
+        persist(engine, *args, **kwargs)
+        if engine.state_dir == merged:
+            (merged / SERVICE_SYNC_DURABLE_ACK_FILENAME).write_bytes(before)
+
+    monkeypatch.setattr(TwDayTradeSimulationEngine, "_persist", stale_ack_after_persist)
+    with pytest.raises(PaperReadChanged, match="commit marker"):
+        compose_account(live, candidate, merged, "new")
+    assert (live / SERVICE_SYNC_DURABLE_ACK_FILENAME).read_bytes() == before
 
 
 @pytest.mark.parametrize(

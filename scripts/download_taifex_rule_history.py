@@ -43,6 +43,10 @@ MAX_COMPRESSED_BYTES = MAX_RESPONSE_BYTES + 1024 * 1024
 SEEDS = (
     ('legal_revisions', '歷史法規修訂資訊與原始附件', LEGAL_INDEX_URL),
     ('contract_adjustments', '契約調整近期表', BASE + '/cht/4/contractAdj'),
+    # Unlike the announcement index, this is today's actual outstanding
+    # adjusted-code and delivery-month inventory. Each capture is a snapshot;
+    # it must never be backdated into historical contract terms.
+    ('outstanding_adjusted_contracts', '現存調整型契約及到期月份', BASE + '/cht/4/sSFAdjustedInfo'),
     ('position_limits_non_equity', '非個股部位限額', BASE + '/cht/4/traderPLNonEquity'),
     ('position_limits_equity', '個股部位限額', BASE + '/cht/4/traderPLEquity'),
     ('contract_specs', '全商品契約規格', BASE + '/cht/2/sTF'),

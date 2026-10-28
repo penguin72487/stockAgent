@@ -428,5 +428,60 @@ def main() -> int:
     return 0 if result["state"] == "verified" else 2
 
 
+ORDERED_ARROW_VALUES_CONTRACT = "openbb_ordered_arrow_logical_values_v1"
+
+
+def ordered_arrow_values_sha256(table) -> str:
+    """Hash every field, row position, null and value without scalar boxing.
+
+    This ordered diagnostic identity is separate from the existing SQL row
+    multiset and legacy JSON hashes. Primitive float bits (including signed
+    zero/NaN payloads), integer widths and clocks remain exact. Null-slot
+    garbage and unreachable sliced buffers are deliberately excluded. Nested
+    or unknown types keep the original complete JSON-value fallback.
+    """
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    digest = hashlib.sha256(ORDERED_ARROW_VALUES_CONTRACT.encode())
+    def part(body):
+        digest.update(len(body).to_bytes(8, "little"))
+        digest.update(body)
+    part(table.schema.serialize().to_pybytes())
+    part(table.num_rows.to_bytes(8, "little"))
+    for column in table.columns:
+        part(column.null_count.to_bytes(8, "little"))
+        if column.null_count == len(column):
+            continue
+        # A complete normalized null mask preserves exact row positions while
+        # avoiding a Python integer and eight bytes per missing position.
+        part(pc.is_null(column).to_numpy(zero_copy_only=False).tobytes())
+        values = pc.drop_null(column).combine_chunks()
+        dtype = values.type
+        if pa.types.is_boolean(dtype):
+            part(b"bool")
+            values = pc.cast(values, pa.uint8())
+            part(memoryview(values.buffers()[1])[values.offset:values.offset + len(values)])
+        elif (pa.types.is_integer(dtype) or pa.types.is_floating(dtype)
+              or pa.types.is_temporal(dtype) or pa.types.is_decimal(dtype)
+              or pa.types.is_fixed_size_binary(dtype)):
+            part(b"fixed")
+            width = dtype.byte_width if pa.types.is_fixed_size_binary(dtype) else dtype.bit_width // 8
+            part(memoryview(values.buffers()[1])[values.offset * width:(values.offset + len(values)) * width])
+        elif (pa.types.is_string(dtype) or pa.types.is_large_string(dtype)
+              or pa.types.is_binary(dtype) or pa.types.is_large_binary(dtype)):
+            part(b"variable")
+            large = pa.types.is_large_string(dtype) or pa.types.is_large_binary(dtype)
+            offsets = np.frombuffer(values.buffers()[1], dtype="<i8" if large else "<i4",
+                count=len(values) + 1, offset=values.offset * (8 if large else 4))
+            part((offsets - offsets[0]).tobytes())
+            part(memoryview(values.buffers()[2])[int(offsets[0]):int(offsets[-1])])
+        else:
+            part(b"legacy-json")
+            part(json.dumps(values.to_pylist(), ensure_ascii=False, default=str).encode())
+    return digest.hexdigest()
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -59,6 +59,8 @@ except SystemExit as exc:
     assert exc.code == 0
 else:
     raise AssertionError('help did not exit before invoking the data owner')
+assert 'scripts.prepare_tw_day_trade_factorized_live' not in sys.modules
+assert 'train' not in sys.modules and 'torch' not in sys.modules
 import polars as pl, pyarrow as pa, torch
 visible = len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else (os.cpu_count() or 1)
 expected = min(int(os.environ['STOCKAGENT_FACTORIZED_PREP_THREADS']), visible)
@@ -262,6 +264,53 @@ def test_projection_rejects_an_uncovered_earlier_horizon(tmp_path, monkeypatch):
         data=SimpleNamespace(panel_start_date="2013-01-01")))
     with pytest.raises(ValueError, match="precedes"):
         updater._projection_start_date(tmp_path / "config.yaml", parent)
+
+
+def test_user_selected_2026_scope_is_shared_by_producer_and_live_consumers(tmp_path):
+    import yaml
+    from stockagent.config import load_config
+
+    root = Path(__file__).resolve().parents[1]
+    deployments = root / "configs/deployments"
+    candidate = deployments / "tw_day_trade_factorized_scale_separated_cash_fold11_candidate_v1.yaml"
+    factorized = deployments / "tw_day_trade_factorized_scale_separated_cash_fold11_live_v1.yaml"
+    mgda = deployments / "tw_day_trade_unit_mgda_fold10_live_v1.yaml"
+    source = yaml.safe_load(candidate.read_text())
+    live = yaml.safe_load(factorized.read_text())
+    alternative = yaml.safe_load(mgda.read_text())
+    assert source["data"]["panel_start_date"] == "2026-01-01"
+    assert live["base_config"] == candidate.name
+    assert live["data"].get("panel_start_date", source["data"]["panel_start_date"]) == "2026-01-01"
+    assert alternative["data"]["panel_start_date"] == "2026-01-01"
+    assert source["walk_forward"]["expected_first_year"] == 2026
+    assert alternative["walk_forward"]["expected_first_year"] == 2026
+    assert alternative["walk_forward"]["split_start_year"] == 2026
+    # Exercise the canonical validator, not just YAML literals: start-date and
+    # expected-year must agree even when the runtime mode is inference.
+    selected = load_config(candidate)
+    assert selected.data.panel_start_date == "2026-01-01"
+    assert selected.walk_forward.expected_first_year == 2026
+    assert selected.training.lookback == 32
+    live_selected = load_config(factorized)
+    assert live_selected.data.panel_start_date == "2026-01-01"
+    assert live_selected.walk_forward.expected_first_year == 2026
+    assert live_selected.runner.mode == "infer"
+    # The private restored MGDA artifact is not a test dependency. Reproduce
+    # its inherited historical range and split metadata with a public config,
+    # then validate the real deployment overlay through canonical inheritance.
+    historical = json.loads(json.dumps(source))
+    historical["data"]["panel_start_date"] = "2014-01-06"
+    historical["walk_forward"].update(expected_first_year=2014, split_start_year=2015)
+    original = tmp_path / "original.yaml"
+    original.write_text(yaml.safe_dump(historical))
+    overlay = {**alternative, "base_config": str(original)}
+    overlay_path = tmp_path / "mgda.yaml"
+    overlay_path.write_text(yaml.safe_dump(overlay))
+    mgda_selected = load_config(overlay_path)
+    assert mgda_selected.data.panel_start_date == "2026-01-01"
+    assert mgda_selected.walk_forward.expected_first_year == 2026
+    assert mgda_selected.walk_forward.split_start_year == 2026
+    assert mgda_selected.runner.mode == "infer"
 
 
 @pytest.mark.parametrize("dates", [[], ["bad-date"], ["2026-10-16", "2014-01-06"],

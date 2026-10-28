@@ -68,6 +68,7 @@ def test_lists_are_typed_scopes_not_body_progress_or_global_eta(tmp_path):
     assert index['verified_pages'] == 345 and index['metadata_rows'] == 10218
     assert index['public_ID_row_observations'] == 10200 and index['source_dates_observed'] == 12
     assert index['dates_all_reported_pages_observed'] == 8
+    assert index['dates_reconciling_page_membership'] is None  # Legacy snapshots did not record this.
     assert index['article_bodies_accepted_by_index'] == 0
     assert index['source_total_is_not_unique_story_count'] and index['category_gaps_preserved']
     history = source['history_list_progress']
@@ -84,6 +85,104 @@ def test_lists_are_typed_scopes_not_body_progress_or_global_eta(tmp_path):
     assert result['acquisition'] == baseline['acquisition']
     assert not result['scope']['publisher_calls_on_page_view']
     assert 'PRIVATE_' not in json.dumps(result)
+
+
+def test_revision_count_is_bounded_and_projected_without_scope_details(tmp_path):
+    status = setup(tmp_path)
+    status['providers']['cnyes']['public_index_progress']['dates_reconciling_page_membership'] = 3
+    index = cnyes(save(tmp_path, status))['public_index_progress']
+    assert index['dates_reconciling_page_membership'] == 3
+    status['providers']['cnyes']['public_index_progress']['dates_reconciling_page_membership'] = 5
+    assert cnyes(save(tmp_path, status))['public_index_progress'] is None
+
+
+def test_local_overflow_recovery_shows_only_safe_page_counts(tmp_path):
+    status = setup(tmp_path)
+    status['providers']['cnyes']['history_list_progress']['overflow_retained_recovery'] = {
+        'contract_version': 1, 'scan_state': 'scanning', 'pending_retained_pages': 17,
+        'local_raw_only': True, 'category_gap_completion_claimed': False, 'publisher_requests': 0,
+        'private_scope': 'PRIVATE_URL'}
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    recovery = history['overflow_retained_recovery']
+    assert recovery['scan_state'] == 'scanning' and recovery['pending_retained_pages'] == 17
+    assert recovery['local_retry_pages'] is None  # Older snapshot: do not invent a zero.
+    assert 'PRIVATE_URL' not in json.dumps(history)
+    status['providers']['cnyes']['history_list_progress']['overflow_retained_recovery']['local_retry_pages'] = 4
+    assert cnyes(save(tmp_path, status))['history_list_progress']['overflow_retained_recovery']['local_retry_pages'] == 4
+
+
+def test_nonzero_local_scan_projects_candidate_counts_without_private_cursor(tmp_path):
+    status = setup(tmp_path)
+    status['providers']['cnyes']['history_list_progress']['unobserved_nonzero_retained_scan'] = {
+        'contract_version': 1, 'scan_state': 'scanning', 'checked_steps': 40,
+        'queued_candidate_pages': 17, 'local_raw_only': True, 'all_history_complete': False,
+        'publisher_requests': 0, 'scope_url': 'PRIVATE_URL'}
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    local = history['unobserved_nonzero_retained_scan']
+    assert local['checked_steps'] == 40 and local['queued_candidate_pages'] == 17
+    assert local['scan_state'] == 'scanning' and history['finish_eta_utc'] is None
+    assert 'PRIVATE_URL' not in json.dumps(history)
+
+
+def test_accepted_batch_local_scan_projects_counts_without_private_cursor(tmp_path):
+    status = setup(tmp_path)
+    status['providers']['cnyes']['history_list_progress']['accepted_body_batch_scan'] = {
+        'contract_version': 1, 'scan_state': 'local_retry_wait', 'scanned_batches': 40,
+        'indexed_candidates': 17, 'local_raw_only': True, 'all_history_complete': False,
+        'publisher_requests': 0, 'path': 'PRIVATE_PATH'}
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    local = history['accepted_body_batch_scan']
+    assert local['scan_state'] == 'local_retry_wait' and local['scanned_batches'] == 40
+    assert local['indexed_candidates'] == 17 and history['finish_eta_utc'] is None
+    assert 'PRIVATE_PATH' not in json.dumps(history)
+
+
+@pytest.mark.parametrize('change', [
+    {'contract_version': True}, {'scan_state': 'PRIVATE_PATH'}, {'scanned_batches': True},
+    {'indexed_candidates': -1}, {'local_raw_only': False}, {'all_history_complete': True},
+    {'publisher_requests': True}, {'publisher_requests': 1},
+])
+def test_unverified_accepted_batch_scan_does_not_hide_other_history_progress(tmp_path, change):
+    status = setup(tmp_path)
+    local = {'contract_version': 1, 'scan_state': 'scanning', 'scanned_batches': 40,
+             'indexed_candidates': 17, 'local_raw_only': True, 'all_history_complete': False,
+             'publisher_requests': 0}
+    local.update(change)
+    status['providers']['cnyes']['history_list_progress']['accepted_body_batch_scan'] = local
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    assert history['accepted_body_batch_scan'] is None and history['unresolved_category_scopes'] == 1518
+
+
+@pytest.mark.parametrize('change', [
+    {'contract_version': True}, {'scan_state': 'PRIVATE_URL'}, {'checked_steps': True},
+    {'queued_candidate_pages': -1}, {'queued_candidate_pages': 41}, {'local_raw_only': False},
+    {'all_history_complete': True}, {'publisher_requests': True}, {'publisher_requests': 1},
+])
+def test_unverified_nonzero_scan_does_not_hide_other_history_progress(tmp_path, change):
+    status = setup(tmp_path)
+    local = {'contract_version': 1, 'scan_state': 'scanning', 'checked_steps': 40,
+             'queued_candidate_pages': 17, 'local_raw_only': True, 'all_history_complete': False,
+             'publisher_requests': 0}
+    local.update(change)
+    status['providers']['cnyes']['history_list_progress']['unobserved_nonzero_retained_scan'] = local
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    assert history['unobserved_nonzero_retained_scan'] is None and history['unresolved_category_scopes'] == 1518
+
+
+@pytest.mark.parametrize('change', [
+    {'contract_version': True}, {'scan_state': 'PRIVATE_URL'}, {'pending_retained_pages': True},
+    {'pending_retained_pages': -1}, {'local_retry_pages': True}, {'local_retry_pages': -1},
+    {'local_raw_only': False}, {'category_gap_completion_claimed': True},
+    {'publisher_requests': True}, {'publisher_requests': 1},
+])
+def test_unverified_local_recovery_does_not_hide_other_history_progress(tmp_path, change):
+    status = setup(tmp_path)
+    recovery = {'contract_version': 1, 'scan_state': 'complete', 'pending_retained_pages': 0,
+                'local_raw_only': True, 'category_gap_completion_claimed': False, 'publisher_requests': 0}
+    recovery.update(change)
+    status['providers']['cnyes']['history_list_progress']['overflow_retained_recovery'] = recovery
+    history = cnyes(save(tmp_path, status))['history_list_progress']
+    assert history['overflow_retained_recovery'] is None and history['unresolved_category_scopes'] == 1518
 
 
 @pytest.mark.parametrize('patch', [
@@ -218,6 +317,8 @@ def test_actual_reader_renders_fixture_missingness_and_keeps_native_details(tmp_
         status['providers']['cnyes']['public_index_progress']['metadata_rows'] = True
     elif case == 'invalid_history':
         status['providers']['cnyes']['history_list_progress']['retired_gap_receipts'] = True
+    elif case == 'observed':
+        status['providers']['cnyes']['public_index_progress']['dates_reconciling_page_membership'] = 3
     save(tmp_path, status)
     server = _server(tmp_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -246,6 +347,8 @@ def test_actual_reader_renders_fixture_missingness_and_keeps_native_details(tmp_
             expect(detail).to_have_attribute('data-news-index-state', 'observed')
             expect(detail.locator('[data-news-index-count="pages"]')).to_have_text('345')
             expect(detail.locator('[data-news-index-count="rows"]')).to_have_text('10,218')
+            if case == 'observed':
+                expect(detail.locator('[data-news-index-count="revision_dates"]')).to_have_text('3')
         if case in ('legacy', 'invalid_history'):
             expect(detail).to_contain_text('缺口數未知，不視為已補齊')
             expect(detail.locator('[data-news-history-count]')).to_have_count(0)

@@ -202,7 +202,7 @@ def test_cna_authorized_setup_not_reasked_or_misclassified_as_public_html():
     result = plan_sources({"providers": {"cna": {"source_role": "publisher_or_other_unverified", "known_urls": 90}},
                            "observed_at_utc": "2026-10-09T00:00:00Z"}, reviews={"cna": review})
     row = result["sources"][0]
-    assert result["contract_version"] == 5
+    assert result["contract_version"] == 8
     assert row["implementation_action"] == "configure_and_verify_authorized_api_contract"
     assert row["collector_family"] == "authorized_provider_api"
     assert row["strategy"] == "authorized_api_configuration_and_capability_check"

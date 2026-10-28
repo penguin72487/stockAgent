@@ -1223,6 +1223,26 @@ def test_nullable_column_matches_scalar_serialization_without_mutating_input(dty
         signal_engine._finite_float_column(values.reshape(1, -1))
 
 
+def test_position_return_projection_preserves_original_scalar_semantics():
+    import struct
+
+    weights = [float("nan"), float("inf"), -float("inf"), -0.0, 0.0,
+               -1e-13, 1e-13, -1e-12, 1e-12, -1.0, 1.0, 1e308]
+    prices = signal_engine._finite_float_column(np.array(
+        [float("nan"), float("inf"), -float("inf"), -0.0, 0.0, -0.25, 0.25, 1e308]
+    ))
+
+    def bits(value):
+        return None if value is None else struct.pack(">d", value)
+
+    for weight in weights:
+        for price in prices:
+            old = (signal_engine._position_stock_return(weight, price),
+                   signal_engine._position_portfolio_contribution(weight, price))
+            new = signal_engine._position_returns_for_finite_price(weight, price)
+            assert tuple(map(bits, new)) == tuple(map(bits, old))
+
+
 @pytest.mark.parametrize("has_score", (False, True))
 @pytest.mark.parametrize("has_raw_score", (False, True))
 def test_decision_row_reuse_is_same_inference_exact_output(has_score, has_raw_score):

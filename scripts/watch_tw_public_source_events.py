@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as datetime_time, timedelta
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -80,6 +81,12 @@ from stockagent.live.tw_public_opening_revision import (  # noqa: E402
 TAIPEI = ZoneInfo("Asia/Taipei")
 SCHEMA_VERSION = 1
 VERSION_CONTRACT = "canonical_body_sha256_v2"
+TWT96U_CSV_URL = "https://www.twse.com.tw/SBL/TWT96U?response=open_data"
+TWT96U_CSV_HEADER = (
+    "集中市場證券代號", "集中市場可借券賣出股數",
+    "店頭市場證券代號", "店頭市場可借券賣出股數",
+)
+TWT96U_JSON_FIELDS = ("TWSECode", "TWSEAvailableVolume", "GRETAICode", "GRETAIAvailableVolume")
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "Chrome/124.0 Safari/537.36 stockAgent-tw-public-event-monitor/1"
@@ -158,6 +165,8 @@ class ProbeResult:
     not_modified: bool = False
     resources: dict[str, dict[str, Any]] | None = None
     error: str | None = None
+    fallback_used: bool = False
+    primary_error: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -308,6 +317,21 @@ def _response_body_sha256(
         return hashlib.sha256(canonical).hexdigest()
     # Preserve fail-closed behavior for a publisher error page returned as 200.
     return _body_sha256(content, expected_json=True)
+
+
+def _twt96u_csv_json_sha256(content: bytes) -> str:
+    """Compare TWSE's published CSV to its OpenAPI JSON, not byte formats."""
+    try:
+        rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise ValueError("invalid TWSE TWT96U CSV") from exc
+    if (len(rows) < 2 or tuple(rows[0]) != TWT96U_CSV_HEADER
+            or any(len(row) != len(TWT96U_JSON_FIELDS) for row in rows[1:])):
+        raise ValueError("unexpected or empty TWSE TWT96U CSV schema")
+    records = [dict(zip(TWT96U_JSON_FIELDS, row)) for row in rows[1:]]
+    if any(not row["TWSECode"] and not row["GRETAICode"] for row in records):
+        raise ValueError("TWSE TWT96U CSV contains an empty security row")
+    return _body_sha256(json.dumps(records, ensure_ascii=False).encode(), expected_json=True)
 
 
 def _in_close_probe_window(observed: datetime) -> bool:
@@ -686,6 +710,31 @@ def _probe_one(
             **fetched,
         )
     except Exception as exc:
+        if spec.name == "twse_api_sbl_twt96u":
+            # The government data catalog links this TWSE CSV representation of
+            # the same dataset. Do not reuse JSON endpoint HTTP validators on a
+            # different host, and never acknowledge a changed version here:
+            # the existing downloader/receipt path still owns publication.
+            try:
+                fetched = _request(
+                    requests.Session(), url=TWT96U_CSV_URL, previous={},
+                    expected_json=True, limiter=limiter, args=args,
+                )
+                digest = _twt96u_csv_json_sha256(fetched.pop("content"))
+                fetched.update(version=digest, body_sha256=digest,
+                               etag=None, last_modified=None, not_modified=False)
+                return ProbeResult(
+                    dataset=spec.name, status="ok", url=TWT96U_CSV_URL,
+                    checked_at_taipei=observed.astimezone(TAIPEI).isoformat(timespec="seconds"),
+                    fallback_used=True, primary_error=str(exc), **fetched,
+                )
+            except Exception as fallback_exc:
+                return ProbeResult(
+                    dataset=spec.name, status="failed", url=url,
+                    checked_at_taipei=observed.astimezone(TAIPEI).isoformat(timespec="seconds"),
+                    error=f"primary: {exc}; official CSV fallback: {fallback_exc}",
+                    primary_error=str(exc),
+                )
         return ProbeResult(
             dataset=spec.name,
             status="failed",
@@ -852,6 +901,9 @@ def _apply_probe_results(
                 "interval_seconds": interval,
                 "last_checked_at_taipei": result.checked_at_taipei,
                 "last_probe_status": result.status,
+                "primary_probe_status": "failed" if result.primary_error else result.status,
+                "primary_probe_error": result.primary_error,
+                "official_fallback_used": result.fallback_used,
             }
         )
         if result.status == "ok" and result.version:

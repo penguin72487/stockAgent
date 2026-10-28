@@ -21,6 +21,28 @@ taifex_futures_day_session_minutes(day, *, product_code, asset_class,
 
 ## 指數期貨
 
+2026-10-25補證：歷史registry v5已將TE、TF、T5F、GTF、XIF的數值規則延伸至
+2011-01-03，ETF延伸至2014-10-06，並按2015-07-20切換國外成分ETF日盤收盤時間。
+下表2020起日保留為原研究範圍；新邊界、官方原文、失敗紀錄及完整歷史排程見
+[725商品歷史研究](tw_futures_historical_universe_2026-10-25.md)。
+
+2026-10-25另修正G2F下限：registry v6依
+[2019年9月印製的期交所上市摺頁](https://report.taifex.com.tw/file/taifex/event/cht/G2F_UNF/file_g2f/富櫃200期貨_摺頁文宣.pdf)
+採2019-09-30、1點tick、一般日盤08:45–13:45／到期13:30。
+來源原件及SHA收據保留於
+`data_tw_index_futures/preparation_sources/universe725_repair_20261025_v3/g2f_price_history/`。
+這只延伸已驗證的數值／時段規則，不替代當日保證金、上市月份或成交來源驗證。
+先前2020-03-23是已選來源範圍；把它作為所有商品共同下限，曾使完整分鐘重建
+掃至2200日才拒絕2020-03-19的G2F。失敗證據保留於725 recovery operations。
+
+2026-10-27 的 registry v7 僅把股票期貨數值報價與一般時段規則延至當日，依
+[2026-07-06 生效修訂](tw_price_precision_tick_contract.md)及
+[期交所股票期貨契約規格](https://www.taifex.com.tw/cht/2/sTF)交叉核對。該日
+官方網頁原件與收據保留於
+`data_tw_index_futures/preparation_sources/universe765_repair_20261027_v1/stock_futures_spec_20261027_v1/`。ETF、指數與
+其他商品的原歷史上限不變。此數值／時段範圍不證明商品上市、調整、持倉轉移、
+保證金或實際成交；它們仍需各自來源，新的資料與快取使用 v7 身分。
+
 除 TJF 以外，表列一般日盤均為臺北時間 08:45–13:45。TJF 為 08:00–16:15。這是完整來源身份驗證時段，不改策略的 08:46 與 13:20–13:30 event bars。
 
 | 商品 | 普通單式 tick（指數點） | 新 API 起日 | 歷史官方依據 |

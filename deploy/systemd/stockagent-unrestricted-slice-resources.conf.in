@@ -1,0 +1,13 @@
+# Install for stockagent.slice and the stockagent-.slice.d prefix.
+[Slice]
+CPUQuota=
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
+AllowedCPUs=
+AllowedMemoryNodes=
+IOReadBandwidthMax=
+IOWriteBandwidthMax=
+IOReadIOPSMax=
+IOWriteIOPSMax=

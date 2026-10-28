@@ -2,6 +2,7 @@
 from contextlib import closing
 import json
 from pathlib import Path
+import sqlite3
 import uuid
 
 import pytest
@@ -43,6 +44,77 @@ def test_exact_failed_attempt_registration_is_recovered_without_source_retry(reg
     audit = json.loads((root / 'operator_replays' / (attempt + '-unlaunched-metadata.json')).read_text())
     assert audit['provider_queries_sent'] == 0 and audit['unknown_source_actions_retried'] == 0
     assert not recover_unlaunched_metadata_claim(root, task['task_id'], request)
+
+
+def _interrupt_after_unlaunched_audit(root, task, request, monkeypatch):
+    import downloader.tej_desktop_attempts as attempts
+    write = attempts.atomic_write_json
+
+    def fail_after_audit(path, value):
+        write(path, value)
+        if path.parent == root / 'operator_replays':
+            raise sqlite3.OperationalError('database is locked after durable audit')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(attempts, 'atomic_write_json', fail_after_audit)
+        with pytest.raises(sqlite3.OperationalError):
+            attempts.recover_unlaunched_metadata_claim(root, task['task_id'], request)
+
+
+def test_unlaunched_audit_survives_failed_commit_and_is_reused(registry, monkeypatch):
+    from datetime import UTC, datetime
+    from downloader.tej_desktop_attempts import recover_unlaunched_metadata_claim
+    root, task, attempt, request = _unlaunched_claim(registry)
+    _interrupt_after_unlaunched_audit(root, task, request, monkeypatch)
+    audit_path = root / 'operator_replays' / (attempt + '-unlaunched-metadata.json')
+    before = audit_path.read_bytes()
+    atomic_write_json(root / 'worker_status.json', {'state': 'waiting_metadata',
+                      'observed_at_utc': datetime.now(UTC).isoformat()})
+    assert recover_unlaunched_metadata_claim(root, task['task_id'], request)
+    assert audit_path.read_bytes() == before
+    with closing(connect(root)) as con:
+        assert tuple(con.execute('SELECT state,active_attempt_id FROM tasks WHERE task_id=?',
+                                 (task['task_id'],)).fetchone()) == ('pending', None)
+        assert con.execute("SELECT state FROM traffic WHERE event_id='unlaunched'").fetchone()[0] == 'failed_before_desktop_launch'
+        assert con.execute('SELECT count(*) FROM desktop_attempts').fetchone()[0] == 0
+    audit = json.loads(before)
+    assert audit['provider_queries_sent'] == audit['unknown_source_actions_retried'] == 0
+    assert audit['source_rows_adopted'] is False
+
+
+@pytest.mark.parametrize(('field', 'bad_value'), [
+    ('task_id', 'other'), ('prepared_request_sha256', '0' * 64),
+    ('bridge_launch_order_sha256', '0' * 64), ('proof', 'unverified'),
+    ('provider_queries_sent', False), ('source_rows_adopted', 0),
+    ('metadata_failed_at_utc', '2000-01-01T00:00:00+00:00'),
+    ('observed_at_utc', '2099-01-01T00:00:00+00:00'),
+])
+def test_unlaunched_existing_audit_must_match_exact_proof(registry, monkeypatch, field, bad_value):
+    from downloader.tej_desktop_attempts import recover_unlaunched_metadata_claim
+    root, task, attempt, request = _unlaunched_claim(registry)
+    _interrupt_after_unlaunched_audit(root, task, request, monkeypatch)
+    audit_path = root / 'operator_replays' / (attempt + '-unlaunched-metadata.json')
+    audit = json.loads(audit_path.read_bytes())
+    audit[field] = bad_value
+    atomic_write_json(audit_path, audit)
+    before = audit_path.read_bytes()
+    with pytest.raises(ValueError):
+        recover_unlaunched_metadata_claim(root, task['task_id'], request)
+    assert audit_path.read_bytes() == before
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()[0] == 'running'
+        assert con.execute("SELECT state FROM traffic WHERE event_id='unlaunched'").fetchone()[0] == 'running'
+
+
+def test_unlaunched_existing_audit_does_not_override_new_source_evidence(registry, monkeypatch):
+    from downloader.tej_desktop_attempts import recover_unlaunched_metadata_claim
+    root, task, attempt, request = _unlaunched_claim(registry)
+    _interrupt_after_unlaunched_audit(root, task, request, monkeypatch)
+    atomic_write_json(root / 'raw' / (attempt + '.json.stage.json'), {'stage': 'prepreview_verified'})
+    with pytest.raises(ValueError, match='Source stage'):
+        recover_unlaunched_metadata_claim(root, task['task_id'], request)
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()[0] == 'running'
 
 
 @pytest.mark.parametrize('artifact', ['stage', 'response', 'progress', 'registered_attempt',

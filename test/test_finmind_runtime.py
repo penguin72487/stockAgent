@@ -60,6 +60,27 @@ def test_wait_wakes_when_admission_changes_without_waiting_for_ten_minute_poll(t
     assert ticks[0] == 30
 
 
+def test_capacity_wait_is_not_shortened_by_an_already_due_release(tmp_path, monkeypatch):
+    status = {'state': 'disk_guard', 'observed_at_utc': NOW.isoformat()}
+    original = json.dumps(status)
+    (tmp_path / 'status.json').write_text(original)
+    ticks, heartbeats = [0.0], []
+    monkeypatch.setattr('downloader.finmind_runtime.next_cycle_delay',
+                        lambda *_a, **_kw: pytest.fail('due work cannot bypass capacity wait'))
+
+    def sleep(seconds):
+        heartbeats.append(json.loads((tmp_path / 'worker_status.json').read_text()))
+        ticks[0] += seconds
+
+    wait_for_next_cycle(tmp_path, {'state': 'disk_guard'}, 60,
+                        sources=[_s('DueSource', '2020-01-01', 'day', 1, 18)],
+                        snapshot_hours=(18,), clock=lambda: NOW + timedelta(seconds=ticks[0]),
+                        sleep=sleep, monotonic=lambda: ticks[0])
+    assert ticks[0] == 60 and len(heartbeats) == 2
+    assert all(item['reason'] == 'disk_guard' and item['phase'] == 'waiting' for item in heartbeats)
+    assert (tmp_path / 'status.json').read_text() == original
+
+
 def test_new_primary_retry_wakes_even_when_secondary_gate_says_no(tmp_path):
     from downloader.download_finmind_sponsor import _ready_after_wait
     with _db(tmp_path / 'queue.sqlite3') as conn:

@@ -221,7 +221,10 @@ def test_student_article_still_requires_both_current_share_urls_byline_date_and_
 
 
 @pytest.mark.parametrize('provider',URLS)
-def test_formal_chain_downloads_only_new_local_head_no_old_rescan_or_dormant_index_dispatch(tmp_path,provider):
+def test_formal_chain_downloads_only_new_local_head_no_old_rescan_or_dormant_index_dispatch(tmp_path,provider,monkeypatch):
+    # This exercises source scope and receipts with tiny temporary fixtures;
+    # production backing-disk admission is independently tested elsewhere.
+    monkeypatch.setattr('downloader.news_fulltext.refresh_disk_admission', lambda *_: False)
     old_url,new_url = URLS[provider]
     oldcfg = scoped_config(provider,finite=True,legacy_parser=True)
     robots = 'https://' + ('abmedia.io' if provider == 'abmedia' else 'www.kmdn.gov.tw') + '/robots.txt'

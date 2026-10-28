@@ -1152,7 +1152,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f"dashboard-core.css?v={core_version}" in html
         assert "dashboard-responsive.css?v=10" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        script_version = 17 if relative == "tw_day_trade_dashboard/index.html" else 15
+        script_version = 19 if relative == "tw_day_trade_dashboard/index.html" else 15
         assert f'dashboard-core.js?v={script_version}" defer' in html
         assert html.index(f"dashboard-core.js?v={script_version}") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
@@ -1936,7 +1936,7 @@ def test_tick_catalog_route_projects_snapshot_without_database_or_api(monkeypatc
         assert result["read_only"] and not result["production_control_possible"]
         assert result["revision"] == "sample-revision"
         handler = SimpleNamespace(server=server)
-        for asset in ("ticks.js", "ticks.css"):
+        for asset in ("ticks.js", "ticks.css", "storage.js", "storage.css"):
             assert PublicDashboardHandler._static_response(handler, "/data-monitor/" + asset) is not None
         parsed = PublicDashboardHandler._tick_query("provider=FinMind&market=taiwan_derivatives&kind=trade&detail=1")
         assert parsed == {"provider": "FinMind", "market": "taiwan_derivatives", "kind": "trade",
@@ -1954,6 +1954,36 @@ def test_tick_catalog_route_projects_snapshot_without_database_or_api(monkeypatc
 def test_tick_catalog_query_rejects_invalid_or_unbounded_requests(query):
     with pytest.raises(InvalidPublicRequest):
         PublicDashboardHandler._tick_query(query)
+
+
+@pytest.mark.parametrize("query", ["grain=15m", "grain=daily&grain=1m", "kind=invalid", "limit=101",
+                                  "offset=-1", "provider=a&provider=b", "file=/secret", "q=%00", "market=unknown"])
+def test_market_series_query_rejects_ambiguous_or_unbounded_requests(query):
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._series_query(query)
+
+
+def test_market_series_gateway_uses_snapshot_and_preserves_metadata_dates(tmp_path, monkeypatch):
+    from stockagent.live.bar_inventory import _row
+    import stockagent.live.bar_inventory as bars
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        payload = server.cached_local_json(cache_key="series-fixture", ttl_seconds=60, cache_control="no-store",
+            builder=lambda: {"bar_inventory": {"version": 1, "revision": "v1", "groups": [
+                _row("daily", "收盤價", "FinLab", "taiwan_equity", "daily", count=5, days=3,
+                     earliest_date="2020-01-01", latest_date="2026-10-22") ]}})
+        server.data_monitor_status = lambda: payload
+        monkeypatch.setattr(bars, "_database", lambda *args: pytest.fail("HTTP cannot query source databases"))
+        handler = SimpleNamespace(server=server, _series_query=PublicDashboardHandler._series_query)
+        response = PublicDashboardHandler._api_response(handler, "/data-monitor/api/series", "grain=daily&provider=FinLab")
+        result = json.loads(response.body)
+        assert result["rows"][0]["latest_date"] == "2026-10-22"
+        assert result["rows"][0]["count"] == 5 and result["rows"][0]["days"] == 3
+        assert "last" not in result["rows"][0] and result["read_only"]
+        assert PublicDashboardHandler._series_query("grain=1m&kind=bar")["grain"] == "1m"
+    finally:
+        server.server_close()
 
 
 def test_tick_summary_omits_contract_list_and_preserves_days_in_provider_projection():
@@ -1975,6 +2005,7 @@ def test_tick_browser_filters_paging_provider_scope_and_mobile_layout(protocol_s
     from playwright.sync_api import sync_playwright
     from scripts.probe_browser_runtime import browser_profile_launch_options
     from stockagent.live.tick_inventory import _row, tick_page
+    from stockagent.live.bar_inventory import series_page
     from urllib.parse import parse_qs, urlsplit
 
     groups = [_row("finlab:tw_tick", "台股逐筆", "FinLab", "taiwan_equity", count=9, days=2,
@@ -1995,7 +2026,8 @@ def test_tick_browser_filters_paging_provider_scope_and_mobile_layout(protocol_s
     def respond(route):
         query = parse_qs(urlsplit(route.request.url).query)
         value = lambda key, default: query.get(key, [default])[0]
-        payload = tick_page(inventory, provider=value("provider", "all"), market=value("market", "all"),
+        payload = series_page({"version": 1, "revision": "bars", "groups": []}, inventory,
+            grain=value("grain", "all"), provider=value("provider", "all"), market=value("market", "all"),
             kind=value("kind", "all"), search=value("q", ""), detail=value("detail", "0") == "1",
             offset=int(value("offset", "0")), limit=int(value("limit", "30")))
         observed_requests.append({"query": query, "revision": payload["revision"], "rows": len(payload["rows"])})
@@ -2008,7 +2040,7 @@ def test_tick_browser_filters_paging_provider_scope_and_mobile_layout(protocol_s
                 page = browser.new_page(viewport={"width": width, "height": 844})
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
-                page.route("**/data-monitor/api/ticks?*", respond)
+                page.route("**/data-monitor/api/series?*", respond)
                 page.route("**/data-monitor/api/summary", lambda route: route.fulfill(content_type="application/json",
                     body=json.dumps({"summary": {}, "groups": [], "sources": [], "provider_summaries": []})))
                 page.goto(f"http://127.0.0.1:{protocol_server.port}/data-monitor/#tick-inventory", wait_until="domcontentloaded")
@@ -2033,6 +2065,7 @@ def test_tick_browser_filters_paging_provider_scope_and_mobile_layout(protocol_s
                 # A changed producer generation must reset the page, not mix
                 # contracts from two different snapshots during append.
                 inventory["revision"] = f"changed-{width}"
+                inventory["datasets"][-1]["count"] += 1
                 page.locator("#tick-more").click()
                 try:
                     page.wait_for_function("() => document.querySelectorAll('#tick-rows tr').length === 30 && !document.querySelector('#tick-more').disabled", timeout=8000)
@@ -2587,6 +2620,71 @@ def test_status_revision_is_bound_to_the_actual_committed_snapshot(monkeypatch, 
         prefix = "tw-status:" if product == "tw" else "overnight-status:"
         keys = [key for key in server._cache if key.startswith(prefix)]
         assert keys and all("2:history:quotes" in key for key in keys)
+    finally:
+        server.server_close()
+
+
+@pytest.mark.parametrize("product", ["tw", "overnight"])
+@pytest.mark.parametrize("expired", [False, True])
+def test_status_owner_restart_cannot_reuse_prior_owner_with_same_content(monkeypatch, product, expired):
+    server = _test_server()
+    generation = ["first-run"]
+    builds = []
+
+    def reader():
+        current = generation[0]
+        return server.cached_local_json(cache_key=f"owner-fixture-{current}", ttl_seconds=60,
+            cache_control="no-store", builder=lambda: {"revision_token":"unchanged:history:quotes",
+                "engine_revision_token":"unchanged", "content_revision":7, "engine_generation":current})
+
+    def snapshot(**kwargs):
+        builds.append(generation[0])
+        return {"simulation_only":True, "production_order_possible":False, "modes":[],
+            "service_sync":{"revision_token":"unchanged", "content_revision":7,
+                "engine_generation":generation[0]}}
+
+    setattr(server, f"{product}_revision", reader)
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", snapshot)
+    try:
+        first = getattr(server, f"{product}_status")()
+        assert json.loads(first.body)["service_sync"]["engine_generation"] == "first-run"
+        if expired:
+            for key, entry in server._cache.items():
+                if key.startswith(f"{product if product == 'tw' else 'overnight'}-status:"):
+                    entry.expires_at = time.monotonic() - 1
+        generation[0] = "second-run"
+        second = getattr(server, f"{product}_status")()
+        assert json.loads(second.body)["service_sync"]["engine_generation"] == "second-run"
+        assert builds == ["first-run", "second-run"]
+    finally:
+        server.server_close()
+
+
+@pytest.mark.parametrize("product", ["tw", "overnight"])
+def test_status_retries_owner_restart_during_build_even_if_content_token_is_unchanged(monkeypatch, product):
+    server = _test_server()
+    generation = ["first-run"]
+    builds = []
+
+    def reader():
+        current = generation[0]
+        return server.cached_local_json(cache_key=f"restart-fixture-{current}", ttl_seconds=60,
+            cache_control="no-store", builder=lambda: {"revision_token":"unchanged:history:quotes",
+                "engine_revision_token":"unchanged", "content_revision":7, "engine_generation":current})
+
+    def snapshot(**kwargs):
+        current = generation[0]
+        builds.append(current)
+        generation[0] = "second-run"
+        return {"simulation_only":True, "production_order_possible":False, "modes":[],
+            "service_sync":{"revision_token":"unchanged", "content_revision":7, "engine_generation":current}}
+
+    setattr(server, f"{product}_revision", reader)
+    monkeypatch.setattr("scripts.serve_public_dashboards.build_dashboard_snapshot", snapshot)
+    try:
+        response = getattr(server, f"{product}_status")()
+        assert json.loads(response.body)["service_sync"]["engine_generation"] == "second-run"
+        assert builds == ["first-run", "second-run"]
     finally:
         server.server_close()
 

@@ -56,12 +56,36 @@ proof. Setup and measured engine trials are in
 
 ## Workspace And Environment
 
+Penguin's 2026-10-27 resource policy follows the user's explicit request to
+finish work sooner without CPU, I/O or memory ceilings. The reusable systemd
+drop-ins are
+[`stockagent-unrestricted-service-resources.conf.in`](../../deploy/systemd/stockagent-unrestricted-service-resources.conf.in)
+and
+[`stockagent-unrestricted-slice-resources.conf.in`](../../deploy/systemd/stockagent-unrestricted-slice-resources.conf.in).
+The local installation uses `stockagent-.service.d/zz-unrestricted-resources.conf`,
+`stockagent-.slice.d/zz-unrestricted-resources.conf` and
+`stockagent.slice.d/zz-unrestricted-resources.conf` below `/etc/systemd/system`;
+the enrolled PostgreSQL 18 control instance has the equivalent named drop-in.
+They reset CPU quota, memory high/max/swap max, task/CPU-set restrictions and
+I/O bandwidth/IOPS limits. Earlier unit templates' finite budgets are historical
+defaults overridden by this explicit local policy. Relative scheduler weights
+are separate from ceilings. Reload systemd after installation and independently
+read effective service **and ancestor** cgroup files; a file in the repository
+does not prove adoption. See the measured scope, natural owner continuity and
+remaining work in [the CPU/disk report](../cpu_disk_load_2026-10-25.md).
+
 - Repo root contains `AGENTS.md`, `train.py` and `scripts/`; this file is under
   `docs/agents/`. Resolve the current checkout root, for example with
   `git rev-parse --show-toplevel`; its absolute path differs across machines.
 - Preferred Python runtime is the `fintech` Conda/Mamba environment, whose absolute
   path differs across machines. Source `scripts/runtime_env.sh` and use
   `run_fintech_python`; `FINTECH_ENV_PATH` or `PYTHON_BIN` may override discovery.
+- For a direct `.py` invocation whose resolved file is under this checkout's
+  `scripts/`, the runtime puts this checkout first in the child `PYTHONPATH` while
+  retaining caller entries. It resolves symlinks and remembers the checkout even
+  after `cd`; it does not change the parent shell's `PYTHONPATH`. Module/`-c` invocations and
+  scripts outside the checkout keep their existing import environment. The exec
+  variant applies the same direct-script rule before replacing its shell.
 - Do not assume `python` exists on PATH or hard-code one user's home directory.
   Run `run_fintech_python scripts/check_environment.py --require-cuda --strict` before expensive jobs.
 - CUDA is expected for training. If CUDA is unavailable and `runner.require_cuda` is true, do not silently fall back to CPU.
@@ -105,7 +129,36 @@ DrvFs view; a check in another namespace cannot establish the caller's storage
 readiness. The observer preserves market/source/settlement blockers and never
 restarts or liquidates a trading process to manufacture a ready status.
 
+Shell entrypoints that initialize WSL native I/O use
+`ensure_enrolled_wsl_identity` from the existing runtime wrapper. Sourcing
+`runtime_env.sh` selects Python but deliberately does not bootstrap Windows.
+The registered daily/intraday/features/backfill entrypoint performs that explicit
+initialization before its capacity gate, credentials or provider requests.
+Missing enrollment defers with exit 75; capacity denial keeps its original code
+and reserve. Never treat virtual ext4 headroom as physical backing admission.
+Direct Python capacity admission can resolve the same existing authority
+enrollment itself; it never guesses a default distribution.
+The shared native byte adapter uses the existing absolute PowerShell executable
+for both its empty-batch bridge probe and file launch. It must not depend on a
+login Windows PATH; trusted socket/marker validation and per-call environment
+isolation still precede every admitted operation.
+
 Use focused tests after small changes, then broader tests when training/model/loss code changes.
+
+For acceptance while other work edits tests or frontend assets, a frozen code
+release alone is insufficient. The existing `service_code_release` probe owner
+can freeze Git-visible test/public-asset roots with `freeze_probe_inputs` and
+mount them read-only via `run_in_namespace(..., verification_inputs=receipt)`.
+The capsule has an independent full-file fingerprint, is checked before/after
+the probe, and is never added to native service mounts or model code identity.
+Keep code and verification dependency closures compatible; a fixed capsule does
+not excuse missing dependencies. `include_files=(...)` can select an explicit
+Git-visible dependency closure within the declared roots when unrelated work
+changes other tests. Include conftest/imported fixtures/assets actually used;
+selected-member changes still reject capture. The mounted root has only those
+members, so a missing dependency fails instead of reading the mutable tree.
+See [the measured boundary and preserved
+failures](../tw_opening_latency_stages_2026-10-14.md#round-21-驗收版本邊界與保留失敗).
 
 Common commands:
 

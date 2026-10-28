@@ -23,6 +23,13 @@ if ! flock -n 9; then
   exit 0
 fi
 
+# The WSL filesystem's free-space figure can exceed its Windows backing disk.
+# Recheck the shared acquisition reserve before materializing any large daily
+# sources or projections. Exit 75 leaves the existing source intact; the timer
+# will try again when capacity recovers.
+run_fintech_python "$repo_root/scripts/check_acquisition_capacity.py" \
+  --path "$repo_root/data_tw_index_futures"
+
 run_fintech_python "$repo_root/scripts/download_tw_index_futures_day_session.py" \
   --output-dir "$repo_root/data_tw_index_futures" \
   --start-year 1998 \
@@ -34,19 +41,20 @@ run_fintech_python "$repo_root/scripts/download_tw_index_futures_day_session.py"
 run_fintech_python "$repo_root/scripts/download_taifex_contract_codes.py" \
   --output "$repo_root/data_tw_futures/taifex_contract_codes.csv"
 
-run_fintech_python "$repo_root/scripts/build_taifex_futures_portfolio_daily.py" \
-  --source "$repo_root/data_tw_index_futures/all_futures_daily_sessions.parquet" \
-  --official-product-codes "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
-  --output-root "$repo_root/data_tw_futures/taifex_portfolio_daily_v4"
-
 # Preserve official final settlement separately from daily settlement.  The
 # collector reuses immutable old receipts and refreshes only the open year and
-# recent delivery months on scheduled runs.
+# recent delivery months on scheduled runs. It does not depend on the legacy
+# v4 slot layout, so a full layout must not prevent updating this source.
 run_fintech_python "$repo_root/scripts/download_taifex_futures_final_settlement_history.py" \
   --start-date 2014-01-01 \
   --end-date "$target_session" \
   --output-dir "$repo_root/data_tw_futures/final_settlement_v1" \
   --refresh-current
+
+run_fintech_python "$repo_root/scripts/build_taifex_futures_portfolio_daily.py" \
+  --source "$repo_root/data_tw_index_futures/all_futures_daily_sessions.parquet" \
+  --official-product-codes "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
+  --output-root "$repo_root/data_tw_futures/taifex_portfolio_daily_v4"
 
 # Read-only dashboard enrichment has a separate acceptance gate. A failure is
 # visible in maintenance status, but must not prevent the canonical panel build.

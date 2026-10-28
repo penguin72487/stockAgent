@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$ExpectedVhdPath,
     [long]$TargetSizeBytes = 2499999170560,
+    [string[]]$CompanionDistroNames = @(),
     [string]$RepoRoot = '/root/stockAgent',
     [string]$ReceiptRoot = (Join-Path $env:LOCALAPPDATA 'StockAgent\WslStorage\receipts'),
     [ValidateRange(0, 300)][int]$DelaySeconds = 0,
@@ -20,9 +21,14 @@ if ($DistroName -notmatch '^[A-Za-z0-9_.-]+$' -or
     $RepoRoot -notmatch '^/[A-Za-z0-9_./-]+$') {
     throw 'Unsafe distribution or repository argument'
 }
-if ($TargetSizeBytes -le 0 -or $TargetSizeBytes -gt 2500000000000 -or
+if ($TargetSizeBytes -le 0 -or $TargetSizeBytes -gt 3298534883328 -or
     $TargetSizeBytes % 1MB -ne 0) {
-    throw 'Target must be positive, MiB-aligned and no greater than decimal 2.5 TB'
+    throw 'Target must be positive, MiB-aligned and no greater than 3 TiB'
+}
+if (@($CompanionDistroNames | Where-Object {
+    $_ -notmatch '^[A-Za-z0-9_.-]+$' -or $_ -eq $DistroName
+}).Count -or @($CompanionDistroNames | Select-Object -Unique).Count -ne $CompanionDistroNames.Count) {
+    throw 'Companion distributions must be distinct explicitly named safe identifiers'
 }
 $registration = @(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' |
     Get-ItemProperty | Where-Object DistributionName -eq $DistroName)
@@ -71,10 +77,19 @@ $receipt = [ordered]@{
     distro = $DistroName; registration = $registration[0].PSChildName; vhd_path = $vhdPath;
     target_bytes = $TargetSizeBytes; before = Get-VhdObservation;
     running_distributions = @(Get-RunningDistributions); tasks = $tasks;
+    companion_distributions = @($CompanionDistroNames);
     sparse_enabled_by_worker = $false; instantaneous_reclaim = $false;
     script_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash;
     errors = @(); events = @(); recovery = $null
 }
+$plannedGrowth = $TargetSizeBytes - [long]$receipt.before.virtual_bytes
+$receipt['capacity_plan'] = [ordered]@{
+    future_growth_bytes=$plannedGrowth; reserve_bytes=32GB;
+    required_host_free_bytes=($plannedGrowth + 32GB);
+    host_free_bytes=$receipt.before.host_free_bytes;
+    full_growth_covered_before_compaction=($receipt.before.host_free_bytes -ge ($plannedGrowth + 32GB));
+    final_admission='remeasure_after_offline_read_only_compaction';
+    virtual_limit_is_not_host_physical_space=$true }
 if ($Mode -eq 'Plan' -or -not $Apply) {
     $receipt | ConvertTo-Json -Depth 12
     return
@@ -108,8 +123,21 @@ function Add-Event([string]$Name) {
     Save-Receipt 'running'
 }
 function Invoke-WslChecked([string[]]$WslArguments) {
-    $output = (& $wsl @WslArguments 2>&1 | Out-String)
-    $code = $LASTEXITCODE
+    if ($WslArguments.Count -and $WslArguments[0] -eq '--distribution') {
+        # A companion need not contain this checkout's UNC working directory.
+        # Pin Linux cwd explicitly instead of letting WSL translate that path.
+        $WslArguments = @('--cd', '/') + $WslArguments
+    }
+    # Windows PowerShell 5 wraps native stderr as ErrorRecord. Tools such as
+    # e2fsck may use it even on exit 0: preserve it, then check the actual exit.
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = (& $wsl @WslArguments 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
     [IO.File]::AppendAllText((Join-Path $runRoot 'wsl.log'), $output)
     if ($code -ne 0) { throw "wsl.exe exited $code; see wsl.log" }
     return $output
@@ -135,6 +163,7 @@ function Compact-StoppedVhd {
 
 $restoreRequired = $false
 $shutdownRequested = $false
+$companionShutdownRequested = @()
 $exitCode = 0
 try {
     Save-Receipt 'admitted'
@@ -153,16 +182,15 @@ try {
         }
     } else {
         $running = @(Get-RunningDistributions)
-        if (@($running | Where-Object { $_ -ne $DistroName }).Count) {
+        if (@($running | Where-Object { $_ -ne $DistroName -and $_ -notin $CompanionDistroNames }).Count) {
             throw 'Refusing global WSL shutdown while another distribution is running'
         }
         if ($DistroName -notin $running) {
             throw 'Expansion requires a running distro for a fresh filesystem identity baseline'
         }
         if ((Get-VHD -Path $vhdPath).Size -gt $TargetSizeBytes) { throw 'Refusing virtual-disk shrink' }
-        $growth = $TargetSizeBytes - (Get-VHD -Path $vhdPath).Size
-        if ((Get-VhdObservation).host_free_bytes -lt ($growth + 32GB)) {
-            throw 'Host cannot cover future growth plus a 32 GiB reserve'
+        if ((Get-VhdObservation).host_free_bytes -lt 32GB) {
+            throw 'Host lacks the unchanged 32 GiB physical reserve before maintenance'
         }
         $tasks = @($taskNames | ForEach-Object {
             $task = Get-ScheduledTask -TaskName $_ -TaskPath '\'
@@ -184,6 +212,19 @@ try {
             Disable-ScheduledTask -TaskName $task.name -TaskPath '\' | Out-Null
             if ($task.running) { Stop-ScheduledTask -TaskName $task.name -TaskPath '\' }
         }
+        # Only explicitly named companions may stop. All running unknown
+        # distributions still block maintenance before any task mutation.
+        foreach ($companion in @($running | Where-Object { $_ -in $CompanionDistroNames })) {
+            $companionShutdownRequested += $companion
+            Add-Event ('graceful-companion-poweroff-' + $companion)
+            $null = Invoke-WslChecked @('--distribution', $companion, '--user', 'root',
+                '--exec', '/bin/systemctl', 'poweroff')
+            $deadline = (Get-Date).AddSeconds(180)
+            while ($companion -in @(Get-RunningDistributions)) {
+                if ((Get-Date) -gt $deadline) { throw 'Graceful companion poweroff timed out; no forced VM termination' }
+                Start-Sleep -Seconds 2
+            }
+        }
         if ($DistroName -in $running) {
             Add-Event 'sync-and-trim-before-shutdown'
             $null = Invoke-WslChecked @('--distribution', $DistroName, '--user', 'root', '--exec',
@@ -200,6 +241,20 @@ try {
         }
         $null = Invoke-WslChecked @('--shutdown')
         if ((Get-VHD -Path $vhdPath).Attached) { throw 'VHD is still attached after shutdown' }
+        # Retired ext4 blocks are not proof of reclaimed NTFS allocation.
+        # Compact via the existing read-only owner, then measure admission
+        # for ALL future growth plus the unchanged 32 GiB physical reserve.
+        if (-not (Compact-StoppedVhd)) { throw 'VHD unexpectedly restarted before capacity admission' }
+        $growth = $TargetSizeBytes - (Get-VHD -Path $vhdPath).Size
+        $capacity = Get-VhdObservation
+        $receipt['resize_admission'] = [ordered]@{
+            growth_bytes=$growth; reserve_bytes=32GB;
+            required_host_free_bytes=($growth + 32GB); host_free_bytes=$capacity.host_free_bytes;
+            admitted=($capacity.host_free_bytes -ge ($growth + 32GB)) }
+        Save-Receipt 'offline-capacity-observed'
+        if (-not $receipt.resize_admission.admitted) {
+            throw 'Host cannot cover future growth plus a 32 GiB reserve after compaction'
+        }
         Add-Event 'offline-resize-started'
         $null = Invoke-WslChecked @('--manage', $DistroName, '--resize', ($TargetSizeBytes.ToString() + 'B'))
         if ((Get-VHD -Path $vhdPath).Size -ne $TargetSizeBytes) { throw 'VHD capacity readback mismatch' }
@@ -230,14 +285,28 @@ try {
         if ($shutdownRequested) {
             try {
                 Add-Event 'boot-readback-started'
-                $capacityProbe = 'set -e; test "$(findmnt -no UUID /)" = "__UUID__"; test "$(blockdev --getsize64 "$(findmnt -no SOURCE /)")" -eq __TARGET__; findmnt -no SOURCE,UUID,OPTIONS /; df -B1 /; cat /proc/sys/kernel/random/boot_id; '
-                $capacityProbe = $capacityProbe.Replace('__UUID__', $receipt.root_uuid).Replace('__TARGET__', $TargetSizeBytes.ToString())
+                # Admission can reject after shutdown. Recover that unchanged
+                # disk too; do not compare its old size with the new target.
+                $expectedBootBytes = [long](Get-VHD -Path $vhdPath).Size
+                $capacityProbe = 'set -e; test "$(findmnt -no UUID /)" = "__UUID__"; test "$(blockdev --getsize64 "$(findmnt -no SOURCE /)")" -eq __TARGET__; fs_bytes=$(LC_ALL=C tune2fs -l "$(findmnt -no SOURCE /)" | awk -F: ''/^Block count:/ {n=$2} /^Block size:/ {s=$2} END {printf "%.0f", n*s}''); test "$fs_bytes" -eq __TARGET__; findmnt -no SOURCE,UUID,OPTIONS /; df -B1 /; cat /proc/sys/kernel/random/boot_id; '
+                $capacityProbe = $capacityProbe.Replace('__UUID__', $receipt.root_uuid).Replace('__TARGET__', $expectedBootBytes.ToString())
                 $probe = $capacityProbe + "cd $RepoRoot && timeout 180 bash scripts/run_boot_recovery_audit.sh"
                 $receipt.recovery = Invoke-WslChecked @('--distribution', $DistroName, '--user', 'root',
                     '--exec', '/bin/bash', '-lc', $probe)
                 Add-Event 'canonical-boot-audit-passed'
             } catch {
                 $receipt.errors += "Boot readback: $($_.Exception.Message)"
+                $exitCode = 1
+            }
+        }
+        foreach ($companion in $companionShutdownRequested) {
+            try {
+                # Bound boot observation even if a companion service fails.
+                $companionBoot = Invoke-WslChecked @('--distribution', $companion, '--user', 'root',
+                    '--exec', '/usr/bin/timeout', '180', '/bin/systemctl', 'is-system-running', '--wait')
+                Add-Event ('companion-boot-verified-' + $companion)
+            } catch {
+                $receipt.errors += "Companion restoration $($companion): $($_.Exception.Message)"
                 $exitCode = 1
             }
         }

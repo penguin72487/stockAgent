@@ -1,10 +1,12 @@
 """Missing-only repairs must not become another downloader or retry reset."""
 from contextlib import closing
+from collections import Counter
 from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import threading
 import time
 
@@ -411,9 +413,15 @@ def test_reviewed_v7_legacy_scope_retry_reuses_live_owner_without_scope_or_budge
     assert queue.owner == owner and queue.db.total_changes == changes
     request = repair._load(Path(result["request_path"]))
     assert request["contract_version"] == 2
-    assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
+    # This checks authorization/admission, not how much real I/O fits in one
+    # production slice. Deadline/stop behavior has independent scheduler tests.
+    with monkeypatch.context() as clock:
+        clock.setattr(repair.time, 'monotonic', lambda: 0.0)
+        assert repair.consume_repairs(queue)["outcomes"] == {"enqueued": 1}
     assert head(queue, MITRADE_URL) == dict(before, state="retry")
-    assert dict(queue.db.execute("SELECT key,value FROM queue_settings")) == settings_before
+    settings_after = dict(queue.db.execute("SELECT key,value FROM queue_settings"))
+    assert settings_after.pop(repair.ROUND_ROBIN_CURSOR_KEY) == result['request_id']+'.json'
+    assert settings_after == settings_before  # Only scheduling position is new; every source/budget value is exact.
     assert queue.owner == owner and repair.consume_repairs(queue)["processed"] == 0
 
 
@@ -576,15 +584,29 @@ def test_archive_failure_after_commit_resumes_without_rearming(queue, monkeypatc
     assert queue.db.execute("SELECT count(*) FROM reviewed_repair_items").fetchone()[0] == 1
 
 
-def test_replayed_processed_input_is_idempotent_after_actual_attempt(queue):
+@pytest.mark.parametrize('first_pump_deferred', [False, True])
+def test_replayed_processed_input_is_idempotent_after_actual_attempt(queue, monkeypatch, first_pump_deferred):
     failure(queue)
     result = submit(queue)
     request = Path(result['request_path']).read_bytes()
-    repair.consume_repairs(queue)
+    actual_consume = repair.consume_repairs
+    calls = 0
+    def consume(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {'processed': 0, 'outcomes': {}} if first_pump_deferred and calls == 1 else actual_consume(*args, **kwargs)
+    monkeypatch.setattr(repair, 'consume_repairs', consume)
+    deadline = time.monotonic() + 5
+    while head(queue)['state'] != 'retry' and time.monotonic() < deadline:
+        repair.consume_repairs(queue, max_seconds=.1)
+    assert head(queue)['state'] == 'retry'
     protected = failure(queue, attempts=8, last_checked_at_utc="2026-02-01T00:00:00+00:00")
     atomic_write_bytes(result['request_path'], request, durable=True, mode=0o600)
     total = queue.db.execute("SELECT count(*) FROM reviewed_repair_items").fetchone()[0]
-    assert repair.consume_repairs(queue)['processed'] == 0
+    deadline = time.monotonic() + 5
+    while Path(result['request_path']).exists() and time.monotonic() < deadline:
+        assert repair.consume_repairs(queue, max_seconds=.1)['processed'] == 0
+    assert not Path(result['request_path']).exists()
     assert head(queue) == protected
     assert queue.db.execute("SELECT count(*) FROM reviewed_repair_items").fetchone()[0] == total
 
@@ -640,7 +662,10 @@ def test_finite_cohort_is_not_expanded(config, tmp_path):
         queue.close()
 
 
-def test_bounded_slices_resume_and_stop_without_new_scans(queue):
+def test_bounded_slices_resume_and_stop_without_new_scans(queue, monkeypatch):
+    # Exercise the item budget/cursor without host scheduling consuming the
+    # independent wall-time budget. Stop/deadline tests cover preemption.
+    monkeypatch.setattr(repair, 'time', SimpleNamespace(monotonic=lambda: 0.0, time=time.time))
     urls = ["https://publisher.test/story/" + str(i) for i in range(70)]
     for url in urls:
         failure(queue, url)
@@ -713,7 +738,14 @@ def test_bad_control_file_quarantined_without_blocking_later_work(queue, malform
     failure(queue, good_url)
     submit(queue, [good_url])
     original = head(queue)
-    outcomes = repair.consume_repairs(queue, max_seconds=0.1)["outcomes"]
+    # Quarantine durably writes evidence. A slow fsync may exhaust this
+    # bounded slice; the next ordinary owner iteration must still admit the
+    # good request, without relaxing the production wall-time budget.
+    outcomes = Counter()
+    for _ in range(8):
+        outcomes.update(repair.consume_repairs(queue, max_seconds=0.1)["outcomes"])
+        if outcomes.get('enqueued'):
+            break
     assert outcomes == {"invalid_request": 1, "enqueued": 1}
     assert not path.exists() and not path.is_symlink()
     assert head(queue) == original and head(queue, good_url)["state"] == "retry"
@@ -794,7 +826,7 @@ def test_explicit_submission_is_bounded(queue, urls, reason):
 
 
 @pytest.mark.parametrize('clock', [False, True])
-def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_path, clock):
+def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_path, clock, monkeypatch):
     healthy = "https://publisher.test/story/2"
     http, session = http_fixture(config, tmp_path, {
         "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
@@ -807,7 +839,14 @@ def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_pa
             queue.add_articles([{"url": healthy}])
         clock_submit(queue) if clock else submit(queue)
         owner = queue.owner
-        result = run_service(queue, http, config, max_articles=1, max_discovery_requests=0, duration_seconds=0.2)
+        accept = queue.accept
+        def stop_after_both_durable_acceptances(records):
+            accepted = accept(records)
+            if queue.db.execute("SELECT count(*) FROM articles WHERE state='complete'").fetchone()[0] == 2:
+                http.stop.set()
+            return accepted
+        monkeypatch.setattr(queue, 'accept', stop_after_both_durable_acceptances)
+        result = run_service(queue, http, config, max_articles=1, max_discovery_requests=0, duration_seconds=5)
         assert queue.owner == owner and result["states"] == {"complete": 2}
         assert [url for url, kwargs in session.calls].count(URL) == 1
         assert [url for url, kwargs in session.calls].count(healthy) == 1
@@ -823,7 +862,7 @@ def test_actual_service_uses_original_http_and_durable_acceptance(config, tmp_pa
         queue.close()
 
 
-def test_service_admission_does_not_clear_existing_provider_deadline(config, tmp_path):
+def test_service_admission_does_not_clear_existing_provider_deadline(config, tmp_path, monkeypatch):
     http, session = http_fixture(config, tmp_path, {})
     queue = NewsQueue(tmp_path, http.registry)
     try:
@@ -831,7 +870,14 @@ def test_service_admission_does_not_clear_existing_provider_deadline(config, tmp
         submit(queue)
         deadline = time.time() + 600
         http.provider_not_before['publisher'] = deadline
-        run_service(queue, http, config, max_articles=1, max_discovery_requests=0, duration_seconds=0.03)
+        consume = repair.consume_repairs
+        def stop_after_admission(*args, **kwargs):
+            result = consume(*args, **kwargs)
+            if head(queue)['state'] == 'retry':
+                http.stop.set()
+            return result
+        monkeypatch.setattr(repair, 'consume_repairs', stop_after_admission)
+        run_service(queue, http, config, max_articles=1, max_discovery_requests=0, duration_seconds=5)
         assert head(queue) == dict(before, state='retry')
         assert session.calls == [] and http.provider_not_before['publisher'] == deadline
     finally:

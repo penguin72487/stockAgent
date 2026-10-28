@@ -145,10 +145,22 @@ _SOURCE_INTEGRITY_FAILURE_PATTERNS = (
     "indentationerror:",
     "taberror:",
 )
+_FUTURES_ACCOUNT_CALENDAR_FAILURE = re.compile(
+    r"valueerror:\s*(?:stock context omits \d+ "
+    r"(?:in-horizon all-twd account dates|all-twd futures sessions)"
+    r"|futures broker holiday account calendar \d{4}-\d{2}-\d{2} to "
+    r"\d{4}-\d{2}-\d{2} requires source-bound 2011/2012 processing and valuation review"
+    r"|holiday broker account calendar incomplete or conflicts with market sessions:"
+    r"|holiday nonterminal valuations require complete source-bound account review"
+    r"|futures source calendar has ambiguous account-only classification"
+    r"|dual account panel must first be clipped to the verified clock horizon)"
+)
 _TEMPORAL_BASIS_CONFIGURATION_FAILURE_PATTERNS = (
     "temporal basis overrides are not enabled in the configured families",
     "temporal basis metadata component limits are not enabled",
 )
+_OOM_FAILURE_GRACE_SECONDS = 30.0
+_CAPACITY_OBSERVE_INTERVAL_SECONDS = 5.0
 
 
 @dataclass
@@ -164,6 +176,7 @@ class _ActiveRun:
     attempt: int
     consecutive_no_progress_failures: int
     progress_before: tuple[int, int, int]
+    oom_failed_since: float | None = None
 
 
 def _per_job_thread_budget(total: object | None, parallel_jobs: int) -> int | None:
@@ -257,6 +270,10 @@ def _failure_kind(returncode: int, log_text: str) -> str:
         return "source_integrity_failure"
     if any(pattern in lowered for pattern in _CHECKPOINT_CONTRACT_FAILURE_PATTERNS):
         return "checkpoint_contract_mismatch"
+    if _FUTURES_ACCOUNT_CALENDAR_FAILURE.search(lowered):
+        # The same pinned date axes cannot repair their missing account nodes
+        # on a repeat DDP launch. Preserve the traceback and run the next case.
+        return "futures_account_calendar_mismatch"
     if any(
         pattern in lowered
         for pattern in _TEMPORAL_BASIS_CONFIGURATION_FAILURE_PATTERNS
@@ -392,6 +409,38 @@ def _terminate_process_tree(
                 return
             time.sleep(0.1)
     process.poll()
+
+
+def _recover_stalled_reported_oom(job: _ActiveRun, now: float) -> None:
+    """Let capacity retry handle an OOM whose distributed runner cannot exit.
+
+    An active process or a stale failure alone is insufficient evidence. The
+    lifecycle must report a CUDA OOM continuously for the grace period, and
+    the current attempt's log suffix must contain the corresponding error.
+    """
+    try:
+        progress = json.loads((job.run['output_dir'] / 'progress.json').read_text())
+        failure = progress.get('failure') or {}
+        reported = (progress.get('state') == 'failed'
+                    and failure.get('type') == 'OutOfMemoryError'
+                    and 'cuda out of memory' in str(failure.get('message', '')).lower())
+    except (OSError, ValueError, AttributeError, TypeError):
+        reported = False
+    if not reported:
+        job.oom_failed_since = None
+        return
+    if job.oom_failed_since is None:
+        job.oom_failed_since = now
+        return
+    if now - job.oom_failed_since < _OOM_FAILURE_GRACE_SECONDS:
+        return
+    if job.process.poll() is not None or _failure_kind(1, _attempt_log_text(job)) != 'cuda_oom':
+        return
+    print(f"[{job.run['name']}] terminating stalled runner after recorded CUDA OOM; "
+          "preserving the attempt for capacity retry", flush=True)
+    _terminate_process_tree(job.process)
+    # Do not repeat an unsuccessful termination on every scheduler tick.
+    job.oom_failed_since = now
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -1438,8 +1487,11 @@ def main() -> None:
                         start_new_session=True,
                         text=True,
                     )
-                except OSError:
+                except OSError as exc:
+                    detail = f"[{run['name']}] launch failed: {type(exc).__name__}: {exc}"
+                    print(detail, flush=True)
                     if log_handle is not None:
+                        log_handle.write(detail + "\n")
                         log_handle.close()
                     record_result(
                         order=item["order"],
@@ -1467,14 +1519,10 @@ def main() -> None:
                     progress_before=_run_progress_signature(run["output_dir"]),
                 )
 
-            finished = [
-                pid
-                for pid, job in active.items()
-                if job.process.poll() is not None
-            ]
             if capacity_policy and time.monotonic() >= next_timing_read_at:
                 from downloader.artifact_io import atomic_write_json
                 for job in active.values():
+                    _recover_stalled_reported_oom(job, time.monotonic())
                     timing = _steady_timing(job.run["output_dir"])
                     if timing["steady_samples"] and last_timing.get(job.run["name"]) != timing:
                         last_timing[job.run["name"]] = timing
@@ -1484,7 +1532,12 @@ def main() -> None:
                             "complete_fold_lifecycle_verified": False, **timing})
                         print(f"[{job.run['name']}] steady epoch3+ MAX rank median="
                               f"{timing['steady_epoch_max_rank_median_s']:.3f}s", flush=True)
-                next_timing_read_at = time.monotonic() + 5.0
+                next_timing_read_at = time.monotonic() + _CAPACITY_OBSERVE_INTERVAL_SECONDS
+            finished = [
+                pid
+                for pid, job in active.items()
+                if job.process.poll() is not None
+            ]
             if not finished:
                 if active:
                     time.sleep(0.25)
@@ -1534,6 +1587,7 @@ def main() -> None:
                     non_retryable_failure = failure_kind in {
                         "checkpoint_contract_mismatch",
                         "source_integrity_failure",
+                        "futures_account_calendar_mismatch",
                         "temporal_basis_configuration_failure",
                     }
                     if infrastructure_wait:

@@ -27,9 +27,709 @@
     "unregistered:www.pocket.tw": "pocket",
     "unregistered:www.watchmedia01.com": "watchmedia",
     "unregistered:www.pinview.com.tw": "pinview",
-    "unregistered:www.contentplatform.info": "contentplatform"
+    "unregistered:www.contentplatform.info": "contentplatform",
+    "unregistered:www.managertoday.com.tw": "managertoday",
+    "unregistered:gnn.gamer.com.tw": "gnn",
+    "unregistered:www.nstock.tw": "nstock"
   },
   "providers": {
+    "unregistered:www.nbd.com.cn": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T23:47:19+00:00",
+      "evidence_urls": [
+        "https://www.nbd.com.cn/articles/2026-04-27/4362268.html"
+      ],
+      "observation_scope": "A read-only census of existing local URL heads and the publisher's 2026 copyright statement; no source-article request or whole-history survey.",
+      "observation": "The local queue contains 38 HTTP URL heads, all awaiting authorization, none with a recorded canonical attempt or stored body. The metadata dates and date-shaped URL paths are not verified source publication clocks. The publisher's statement mentions personal study and research with attribution conditions, while separately restricting machine learning and data mining without written permission; the statement does not establish permission for automated bulk history collection. The web reader could not retrieve robots.txt, which is not evidence of a source HTTP status or a robots decision.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nbd-census-20261028.json"
+      ],
+      "current_scope_review": {
+        "known_url_heads": 38,
+        "awaiting_authorization_heads": 38,
+        "stored_body_heads": 0,
+        "canonical_source_attempted_heads": 0,
+        "dated_article_url_heads": 37,
+        "other_route_url_heads": 1,
+        "metadata_dates_are_verified_source_clocks": false,
+        "personal_research_exception_mentioned": true,
+        "bulk_automatic_scope_verified": false,
+        "source_robot_policy_verified": false,
+        "model_training_right_verified": false,
+        "source_authorization_granted": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Count existing URL heads and recorded body and attempt states without issuing a publisher request.",
+          "Read the current primary-source copyright statement and retain the distinction between personal research, automated historical collection and model training."
+        ],
+        "remaining_questions": [
+          "Verify the actual origin robots response and source-specific article representations before designing an adapter.",
+          "Determine the applicable scope for automated collection and training, preserving any third-party attribution and the publisher's stated conditions.",
+          "Review actual source clocks and historical discovery coverage without interpreting metadata date strings as publication times."
+        ]
+      }
+    },
+    "nstock": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T23:31:52+00:00",
+      "evidence_urls": [
+        "https://www.nstock.tw/robots.txt",
+        "https://www.nstock.tw/api/sitemap.xml",
+        "https://www.nstock.tw/api/sitemap-news.xml",
+        "https://www.nstock.tw/app/user-agreement",
+        "https://www.nstock.tw/news/article_m?id=169138",
+        "https://www.nstock.tw/news/article_m?id=455676",
+        "https://mopsov.twse.com.tw/mops/web/t146sb10"
+      ],
+      "observation_scope": "Two public nStock company announcements corresponding to two already identified CNYES empty-template events, plus a bounded current sitemap observation. Separate source IDs, source clocks and representations are preserved; this is not a whole-history survey or official MOPS identity proof.",
+      "observation": "Direct robots response permits the reviewed news path and disallows /nstock_demo. Two unauthenticated public article observations have matching visible headings, native IDs, desk credits, explicit +08:00 second clocks, issuer codes and announcement keys. One previously retained response was rendered using the same-origin scripts with the document fulfilled from local bytes: all 478 normalized characters of the source announcement matched exactly one visible native body. The 2024 and 2026 event keys also match two CNYES empty-template records by issuer, source date and exact subject; neither observation establishes identical source bodies or publication instants. The currently observed news sitemap has 45000 distinct URLs across three routes, including 15000 announcement-route URLs; its lastmod values are not release clocks, and one reviewed April2026 article is absent. The APP agreement describes personal noncommercial APP use and copying restrictions, but its applicability to the public web page or bulk history is not established. The finite adapter is scoped to the two exact public URLs. After successful regressions, the canonical owner fetched both once, and independent readback verified both stored nStock heads, raw response and batch receipt; diagnostic originals alone were not treated as canonical bodies.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-robots.txt",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-source-census.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-visible-proof.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-dom-parity.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-finite-enqueue.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-finite-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-four-gap-research-candidates.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-four-gap-metadata-enqueue.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/nstock-four-gap-inbox-readback-20261028.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-missing-local-audit.json"
+      ],
+      "current_scope_review": {
+        "literal_public_announcement_urls_reviewed": 2,
+        "literal_cnyes_empty_events_with_issuer_day_subject_match": 2,
+        "retained_public_response_bodies_examined": 2,
+        "retained_response_full_rendered_body_parity_verified": 1,
+        "reviewed_finite_canonical_stored_body_heads": 2,
+        "additional_search_candidates_submitted_for_metadata": 4,
+        "additional_search_candidates_native_response_or_body_verified": false,
+        "news_sitemap_observed_distinct_urls": 45000,
+        "news_sitemap_observed_announcement_route_urls": 15000,
+        "reviewed_april2026_article_present_in_current_sitemap": false,
+        "diagnostic_originals_are_canonical_stored_bodies": false,
+        "official_mops_source_identity_verified": false,
+        "cnyes_body_equivalence_verified": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Inspect actual robots and one bounded source sitemap; preserve the lastmod versus publication distinction.",
+          "Identify two literal public announcement pages by exact issuer, day and subject against existing CNYES missing-head evidence, without marking the CNYES bodies complete.",
+          "Verify two source-native IDs, visible headings, desk credits and explicit +08:00 clocks, and full rendered-text parity for one retained source response.",
+          "Implement a finite source-specific parser in the canonical collector; reject unreviewed URLs, computed objects, redirects, hidden content and contradictory identity or clock evidence.",
+          "Enqueue only the two reviewed source URLs, observe their actual canonical downloads and independently verify both durable batch receipts, current heads and response hashes.",
+          "Preserve four additional search-result candidates in the original metadata inbox; the pending submission is not article admission, a source response or a downloaded body. The existing reader remains explicitly scoped to the two reviewed URLs."
+        ],
+        "remaining_questions": [
+          "Separately verify the precise official MOPS originals and their own clocks without promoting source keys to proof of origin.",
+          "Investigate discoverable older announcement URLs and source scope without treating the current sitemap as complete history or guessing IDs.",
+          "After physical capacity admission, review the four pending metadata candidates, the actual source representations and scope before considering any expanded reader; preserve each source identity and clock and do not count search snippets as accepted bodies."
+        ]
+      }
+    },
+    "cnyes": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T23:27:46+00:00",
+      "evidence_urls": [
+        "https://news.cnyes.com/",
+        "https://news.cnyes.com/news/id/4179193",
+        "https://news.cnyes.com/news/id/4116460",
+        "https://news.cnyes.com/news/id/1424771",
+        "https://mopsov.twse.com.tw/robots.txt",
+        "https://eshop.twse.com.tw/zh/mops/detail/000000007af53455017af57a15fe0007",
+        "https://eshop.twse.com.tw/zh/mops/list"
+      ],
+      "observation_scope": "Finite review of missing legacy shtml URL heads, stored canonical candidates, unsupported market-route metadata pointers and recorded category-day gaps; one separately discovered public source URL was acquired by the normal owner. Not whole-publisher history, URL alias proof or a change of source policy.",
+      "observation": "A coherent indexed snapshot had578 unsupported Cnyes URL heads, including32 missing legacy shtml candidates. Of these32,28 have locally stored canonical title/date candidates, including2 heads with multiple candidates;4 have no candidate within this search scope. Three canonical queue titles were empty, so their receipt-verified Parquet title columns were read within a strict byte budget; all3 were valid, and2 supplied new matching heads. A truncated publisher-label suffix exposed one further candidate. Independent receipt/Parquet/body digest readback verified31 distinct canonical candidate heads, reusing the prior28-head readback and checking only3 new heads. The retained original API responses for the first28 candidates contain no literal legacy path or filename; that does not prove no redirect exists. On October28, Internet Archive availability returned one accessible snapshot for21 query-free candidate URLs; the other20 returned empty availability results, which do not prove historical absence. A bounded archived-page read of that one snapshot found the same title and identical four-paragraph body SHA as one previously receipt-verified modern body. The archived page displays2014-08-04 19:21 without a source-declared timezone or seconds; its publisher-API candidate has2014-08-04T11:21:28+00:00. Their minutes agree only under a Taipei-time assumption. The archive replay normalizes case and URL encoding, and this observation does not establish a publisher-declared alias, redirect or source authorization. Two additional query-free heads without local candidates returned empty archive availability results. No legacy URL was marked complete or requeued, no body was copied to the production queue, and the finite archive research was separate from the publisher collector.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/candidates-v2.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/candidate-readback-v2.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/candidate-source-references.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/market-route-provenance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/market-route-parent-origins.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/corpus-market-head-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/corpus-market-heads-audit.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cnyes_legacy_reuse_20261027/post-disk-resume-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-candidates.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-availability.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-comparison.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-query-path-candidates.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-public-category-query-candidates.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-legacy-public-category-candidates.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-category-index-overlap-v2.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-category-local-bodies.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-gap-alias-census.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-gap-1424771-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-missing-local-audit.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-missing-independent-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-43-1-candidate-worklist-20261028.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-43-1-worklist-independent-readback-20261028.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/mopsov-robots-20261028.txt",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/mopsov-robots-20261028.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/wayback-hk-category-candidates.json"
+      ],
+      "current_scope_review": {
+        "legacy_missing_heads_examined": 32,
+        "legacy_heads_with_candidates": 28,
+        "legacy_heads_with_multiple_candidates": 2,
+        "legacy_heads_without_candidates_in_bounded_search": 4,
+        "distinct_canonical_candidate_heads_verified": 31,
+        "legacy_query_free_candidates_archive_availability_examined": 21,
+        "legacy_query_free_candidates_archive_snapshots_available": 1,
+        "legacy_archived_body_exact_matches_verified": 1,
+        "legacy_unmatched_archive_availability_examined": 2,
+        "legacy_query_stripped_archive_availability_examined": 8,
+        "legacy_query_stripped_archive_snapshots_available": 0,
+        "legacy_exact_public_category_archive_availability_examined": 3,
+        "legacy_exact_public_category_archive_snapshots_available": 0,
+        "legacy_exact_older_public_category_archive_availability_examined": 2,
+        "legacy_exact_older_public_category_archive_snapshots_available": 0,
+        "legacy_exact_hk_public_category_archive_availability_examined": 2,
+        "legacy_exact_hk_public_category_archive_snapshots_available": 0,
+        "legacy_original_query_urls_not_examined_exactly": 1,
+        "category_gap_sample_category_pages_observed": 30,
+        "category_gap_sample_category_pages_reported": 41,
+        "category_gap_sample_category_observed_distinct_ids": 900,
+        "category_gap_sample_daily_index_pages_observed": 54,
+        "category_gap_sample_daily_index_distinct_ids": 1610,
+        "category_gap_sample_observed_category_ids_in_daily_index": 0,
+        "category_gap_sample_category_completeness_proven": false,
+        "category_gap_sample_exact_local_url_heads": 900,
+        "category_gap_sample_exact_local_stored_body_heads": 900,
+        "category_gap_single_day_scope_records_examined": 814,
+        "category_gap_single_day_endpoint_day_groups": 407,
+        "category_gap_matching_page_recorded_hash_pairs_examined": 12210,
+        "category_gap_matching_page_recorded_hash_pairs_different": 0,
+        "category_gap_pages_without_current_direct_observation": 1260,
+        "category_gap_related_search_discovered_new_verified_body_heads": 1,
+        "category_gap_selected_pages_observed_in_missing_head_join": 11580,
+        "category_gap_selected_groups_without_current_page_observations": 21,
+        "category_gap_matching_missing_heads": 320,
+        "category_gap_missing_heads_with_verified_empty_api_content": 319,
+        "category_gap_missing_heads_with_verified_test_placeholder": 1,
+        "category_gap_exact_issuer_key_heads_compared_with_finlab": 286,
+        "category_gap_exact_issuer_key_finlab_matches": 0,
+        "bounded_empty_heads_with_literal_43_1_title_candidate": 253,
+        "bounded_43_1_candidates_cnyes_publication_days": 47,
+        "mopsov_robots_allows_query_for_collector_user_agent": false,
+        "official_u16_historical_availability_or_exact_event_identity_verified": false,
+        "legacy_archive_formal_body_added": false,
+        "market_route_heads_examined": 531,
+        "market_route_literal_google_parent_heads": 508,
+        "market_route_direct_finmind_metadata_heads": 23,
+        "pinned_corpus_headline_rows_examined": 2413783,
+        "pinned_corpus_market_route_headlines": 1035,
+        "source_identity_or_alias_accepted": false,
+        "formal_body_added": true,
+        "completed_questions": [
+          "Use the existing indexed unsupported-path census and the existing source queue to identify the32 missing legacy shtml candidates without changing source or queue state.",
+          "Search102 bounded date windows once each, using explicit title normalization and checked Parquet title-column fallback; preserve capped or unsearched ranges as unknown.",
+          "Reuse28 prior independently verified canonical bodies and verify3 newly identified canonical candidates against their immutable receipts and body digests without HTTP or copying content.",
+          "Inspect retained source responses for literal old paths for the initial28 candidates; no mention was found, and absence is not proof of historical redirect absence.",
+          "Classify the 531 market-route URL shapes and recorded metadata pointers in bounded read-only snapshots; all have FinMind associations, 508 through literal Google News parent pointers. These associations do not establish article identity.",
+          "Independently verify one market-page head mislabeled as a headline in the existing local corpus, and implement a new separately versioned build scope that preserves observations and existing bodies. The existing corpus has not been rebuilt.",
+          "Audit every article part in the pinned existing corpus using URL and text-kind columns only: 527 direct market-route headlines and 508 strict literal Google market-route headlines. Parquet fulltext row groups were skipped by statistics, part size and stat generations were checked, but every part SHA was not reverified. This is the rule's observed scope in that corpus, not the live queue or an all-history census.",
+          "After physical capacity was sampled above the existing reserve, the original news owner resumed. Four selected recent Cnyes current heads were independently matched to accepted receipts and their Parquet, source-response and body hashes; all four replayed through the current parser. This is bounded liveness evidence, not sustained capacity or historical completeness.",
+          "Check archive availability once for21 query-free legacy candidates and2 unmatched heads, preserving each response. One candidate snapshot was available;20 candidate and2 unmatched responses were empty, not proof of absence. At that stage seven candidate URLs and one unmatched URL had omitted query strings and were not probed.",
+          "Read the one available archive snapshot separately from the publisher owner; match its title and four-paragraph body SHA exactly to one previously receipt-verified current body. Preserve the archive capture and the archived page's minute-only, timezone-unspecified clock; do not adopt an alias or infer seconds.",
+          "Reuse the original queue heads to check the query-stripped variants of the eight remaining query-bearing URLs, without sending their query values: all8 availability results were empty. Separately check the exact original URLs of3 whose only query is a public category label: all3 were empty. These11 metadata observations did not fetch bodies, prove aliases or prove historical absence;5 exact query-bearing heads had not yet been sent at that point.",
+          "Check only the2 additional exact original URLs with publicly evidenced legacy category labels tw_stk and tw_bull; both archive availability responses were empty. Earlier3 exact checks were not repeated; the3 other exact query URLs remain unexamined.",
+          "For one existing announcement scope, compare its30 retained category pages and54 retained all-list pages for the same effective source day. Verify stored observation and raw-response/file digests; all900 observed distinct category IDs are absent from the1610 distinct index IDs. The category reports41 pages;11 pages remain unobserved. These captures occurred at different times and this finite overlap is not proof of all-category behavior, missing bodies, permanent absence or a retired gap.",
+          "Join exactly those900 native IDs to their canonical local URL heads using one read-only queue snapshot; all900 are present with stored-body pointers and complete state. This pointer census does not reverify each body digest or prove the unseen11 pages; do not enqueue the900 already stored heads.",
+          "Compare recorded same-page hashes across814 unresolved single-day scopes grouped by endpoint and effective day:12210 paired page records agree. This compares stored ID hashes, not fresh raw-response digests or article bodies;1260 page records lack a current observation and unseen pages remain unresolved.",
+          "Find one publicly indexed 2013-01-10 announcement absent from the local URL heads and submit only that exact public URL to the original owner. A new body and its source response, receipt and current head were independently verified. Its membership in the unobserved category pages is not established; the legacy archive observation did not add or copy a body.",
+          "Check only the two remaining original legacy URLs whose sole query is the registered public hk_report category; both archive availability results were empty. Preserve the remaining other-query URL privately and do not repeat the five earlier exact checks.",
+          "Join 11580 existing category pages from one selected alias per single-day gap group to missing native URL heads. Independently verify all 241 matching source envelopes and hashes: 319 heads have empty or null API content and one is a test placeholder. For 286 unambiguous issuer/date/literal-subject candidates an independent Polars exact join finds zero matches in the receipt-verified local FinLab material-announcement table. This neither verifies unseen pages nor proves no other source holds a version.",
+          "Build a digest-bound private worklist for 253 literal 43-1 title candidates, grouped into 47 CNYES publication days and retaining the distinct source observations. These are candidates only; no current queue states, official event identities, official filing clocks or missing CNYES bodies have been established by the grouping.",
+          "Save and hash the 2026-10-28 mopsov robots response: the configured collector user agent is disallowed from the announcement query. The TWSE information shop lists U16 as a related announcement category in a paid package; its historical availability and applicability to individual candidates are unverified."
+        ],
+        "remaining_questions": [
+          "Establish source-declared identity and historical version, attribution and clock for the28 legacy heads with candidate matches before any alias or reuse decision; retain ambiguity for the2 multi-candidate heads. One has matching archived title and body evidence, but no publisher-declared alias, and its archived clock has only minute precision with no declared timezone.",
+          "Continue source or authorized historical evidence for the4 remaining legacy heads and the other unsupported or missing-body routes; a bounded title/date miss is not source absence.",
+          "For the1518 existing category gap records, use source-declared category-capable alternatives or a verifiable pagination method; the completed all-list cannot itself establish announcement-category completeness for the sampled day. Preserve the existing first30 category pages and do not assume eleven missing pages mean eleven missing bodies. The 319 verified empty API heads remain missing; locate independently available primary disclosures with their own dates and permissions rather than relabeling another source as Cnyes.",
+          "Investigate a permitted source or entitled official historical bulk route for the bounded 43-1 candidates, and recheck current queue states before dispatch. Do not automate the disallowed mopsov query, infer an official event from the title, or count another source's disclosure as the missing CNYES body.",
+          "Determine whether any of the 531 market-route metadata heads refer to an identifiable article using independent source evidence; retain the current head and do not infer a missing article from a market-page pointer.",
+          "After establishing enough physical capacity for the entire build, build the revised headline scope in a separate corpus root and verify its rows and manifest; the existing corpus still contains 1035 heads matching that rule.",
+          "Continue monitoring real capacity, source pacing and actual Cnyes receipts under the existing news owner; the 4-head resumed readback does not prove sustained capacity. Allow the existing storage owner to finish exact recovery and report actual reclaimed bytes.",
+          "Continue discovery and incremental capture for the full source history; the currently known URL-head counts do not provide a verified total-history denominator or completion ETA."
+        ]
+      }
+    },
+    "unregistered:ieknet.iek.org.tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T17:00:41+00:00",
+      "evidence_urls": [
+        "https://ieknet.iek.org.tw/register/memberTxt.aspx",
+        "https://ieknet.iek.org.tw/services/",
+        "https://ieknet.iek.org.tw/robots.txt",
+        "https://ieknet.iek.org.tw/ieknews/news_open.aspx?nsl_id=143b4477fcce411e88d1858d6e80d41a",
+        "https://ieknet.iek.org.tw/ieknews/news_open.aspx?nsl_id=0409e2245a6e4ac1ba6ed71e5dad5ef2",
+        "https://ieknet.iek.org.tw/ieknews/news_open.aspx/news_more.aspx?actiontype=ieknews&indu_idno=1&nsl_id=c2dca7d6383d40be876e5e602f09a7e4",
+        "https://ieknet.iek.org.tw/ieknews/news_open.aspx?nsl_id=ed6527efc09249728661fa23d1fd1d35"
+      ],
+      "observation_scope": "One indexed local provider cohort and four public source representations; not the entire IEK service, a collector grant, source alias proof, or historic completeness.",
+      "robots_research_observation": "A separate single direct GET on October28 returned HTTP200 and a zero-byte robots response. The earlier web research reader failed to load it; that reader failure is not an IEK denial. Empty robots does not confer article rights or identify an official request rate. Response headers retained with cookie values redacted.",
+      "observation": "A read-only current queue snapshot has52 literal IEK URL heads, all awaiting authorization and0 stored bodies. It includes18 news_open.aspx,30 news_more.aspx and4 nested news_open.aspx/news_more.aspx paths. An indexed official nested-path example shows a real article representation; do not normalize or repair all four solely because the path looks unusual. Official source pages explicitly credit Economic Daily or CNA in sampled representations, so the host is not automatically the original copyright owner; CNA remains deferred. One same-ID Economic Daily page showed2026-02-07 while its queue metadata carried2026-03-05, so metadata dates are not trusted publication timestamps. The IEK member terms reserve third-party rights and limit unconsented reproduction; its member-services page describes free registered reading for marked items, not blanket historical bulk, training or redistribution rights. The four representations were read via a web research reader, not the canonical collector;0 IEK bodies or queue changes were accepted. A source-specific robots check failed in the research reader and is not evidence of a source403 or permission. Historical limits, quota, automatic access scope, original-to-mirror equivalence and unexamined item-level rights remain unresolved.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/iek-census.json"
+      ],
+      "current_scope_review": {
+        "known_URL_heads": 52,
+        "stored_body_heads": 0,
+        "awaiting_authorization_heads": 52,
+        "nested_route_heads": 4,
+        "nested_route_indexed_source_examples": 1,
+        "source_alias_accepted": false,
+        "source_authorization_granted": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Inventory the indexed local IEK URL heads and route shapes without a collector request or queue mutation.",
+          "Record the member terms, free reading scope and sampled source credits separately; no broad reuse grant is inferred.",
+          "After a web-reader fetch failed, perform one direct bounded robots read and retain the HTTP200 empty response with sensitive header values redacted; do not infer authorization or a numeric rate.",
+          "Verify that one apparently nested ASPX route is a source-indexed article representation; do not invent aliases for the other heads."
+        ],
+        "remaining_questions": [
+          "Determine the ownership and exact original-source links for each IEK item; retain central-agency work deferred and avoid treating different versions as identical.",
+          "Confirm applicable access and reuse scope and any available history or quota contract before admitting an automatic body collector; revalidate robots when needed rather than repeating the completed observation.",
+          "Verify publication clocks and each of the remaining route representations from source evidence without treating metadata dates as publication times."
+        ]
+      }
+    },
+    "unregistered:www.cool3c.com": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T17:03:27+00:00",
+      "evidence_urls": [
+        "https://www.cool3c.com/robots.txt",
+        "https://www.cool3c.com/",
+        "https://www.cool3c.com/article/241065"
+      ],
+      "observation_scope": "Current local provider-head count and one direct robots observation; not a grant to collect bodies or an all-history review.",
+      "observation": "The current queue snapshot has44 known numeric article URL heads, all awaiting authorization with0 stored bodies. A single direct robots request returned HTTP200 with462 bytes; the web research reader had failed to retrieve robots, which was not evidence of a source denial. The response explicitly disallows all paths for GPTBot and ChatGPT-User as named agents, and disallows /api/ under the wildcard group while allowing other wildcard paths. Do not change identity to evade a named restriction, infer an API grant from wildcard Allow, or extend those named restrictions to every possible external client. One separately indexed article declares an external original source, demonstrating that publisher and author/article rights may differ; that is one representation, not the whole cohort. Automatic source acquisition remains disabled: no source article body request was made by the canonical collector, no source alias or authorization was accepted, and no history or rate limit was established.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cool3c-robots.txt",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cool3c-robots.headers"
+      ],
+      "current_scope_review": {
+        "known_URL_heads": 44,
+        "stored_body_heads": 0,
+        "awaiting_authorization_heads": 44,
+        "source_authorization_granted": false,
+        "source_alias_accepted": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Inspect the current indexed queue cohort and one robots response without scheduling a collector or promoting a body.",
+          "Record the named agent disallows and separate wildcard API restriction; preserve their distinct user-agent scopes."
+        ],
+        "remaining_questions": [
+          "Determine article-specific original sources and their applicable access and reuse terms; do not assume the current host owns every article.",
+          "Establish a supported non-bypass collection scope and any history, publication-clock and quota contract before enabling an automatic adapter."
+        ]
+      }
+    },
+    "unregistered:www.tcpttw.com": {
+      "capture_decision": "permission_required",
+      "reviewed_at_utc": "2026-10-27T17:12:54+00:00",
+      "evidence_urls": [
+        "https://tcpttw.com/%E5%8F%B0%E7%81%A3%E8%AD%A6%E8%A8%8A%E6%99%82%E5%A0%B1%E5%85%A7%E5%AE%B9%E6%8E%88%E6%AC%8A%E8%AA%AA%E6%98%8E/",
+        "https://www.tcpttw.com/robots.txt",
+        "https://www.tcpttw.com/life/2026/10/22/322980/",
+        "https://www.tcpttw.com/other/other_industrial/2026/08/18/301204/"
+      ],
+      "observation_scope": "A read-only snapshot of50 already indexed URL heads, a single direct robots response and selected public research representations; not all historical content or a legal fair-use determination.",
+      "observation": "All50 indexed heads are awaiting authorization and have0 stored bodies. The official licensing page says its text and other materials may not be reproduced or republished without authorization and provides an application process; no scoped automatic full-text license has been verified for these heads. A single direct robots GET returned200 with a wildcard disallow only for /search/ and a sitemap location; this observation is not a content license or rate limit. Public research representations include both an own-reporter article and an article crediting an outside news source, so the host alone does not establish per-item authorship or ownership. The research reader is not the canonical collector; no article body, alias, queue mutation, guessed endpoint or history-completion claim was accepted. This is a bounded planning decision, not a legal fair-use verdict. CNYES priority and CNA deferral remain unchanged.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/tcpttw-census.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/tcpttw-robots.txt"
+      ],
+      "current_scope_review": {
+        "known_URL_heads": 50,
+        "stored_body_heads": 0,
+        "awaiting_authorization_heads": 50,
+        "source_authorization_granted": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Retain a single read-only cohort census and exact URL-head digest, without requeueing previously inventoried work.",
+          "Record one direct robots response, the official content-licensing statement and distinct sampled own-reporter and external-origin representations."
+        ],
+        "remaining_questions": [
+          "Reconsider this finite scope if a source license or supported export establishes applicable automatic full-text permission; revalidate the current robots policy then.",
+          "For each permitted item establish its original source, byline, publication clock, retained raw and receipt before merging or accepting it."
+        ]
+      }
+    },
+    "unregistered:news.pchome.com.tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T12:24:45.323204+00:00",
+      "evidence_urls": [
+        "https://news.pchome.com.tw/",
+        "https://news.pchome.com.tw/media",
+        "https://news.pchome.com.tw/robots.txt",
+        "https://member.pchome.com.tw/law.html"
+      ],
+      "observation_scope": "This is news.pchome.com.tw, a distinct host from the previously reviewed pchome.megatime.com.tw. Local URL heads and current transport observations are finite snapshots, not source authorization or complete history.",
+      "observation": "The local indexed snapshot contains1253 URL heads and0 stored bodies; path components include idn363, cna_business307, crwant152 and nownews128 as routing hints only. Metadata timestamp strings span2025-07-01..2026-10-25 and have not been verified as publisher release clocks. A separate web research view of the official homepage showed a multi-publisher portal, not a grant of bulk capture. The local resolver returned an A record, while one honest-client robots request and one homepage HEAD failed to obtain an HTTPS response within their respective deadlines; the HEAD connected TCP and a separate TLS-only handshake verified the certificate. This does not prove DNS failure, a robots disallow or permanent source unavailability. No article or canonical owner request was made and no alias or body was accepted. CNA remains deferred.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/unreviewed_aggregators_20261027/local-index-evidence.json"
+      ],
+      "current_scope_review": {
+        "known_URL_heads": 1253,
+        "stored_body_heads": 0,
+        "source_identity_or_alias_accepted": false,
+        "formal_body_added": false,
+        "completed_questions": [
+          "Preserve the indexed1253 local URL heads, their states, raw metadata clocks, path-hint counts and ordered snapshot hash without changing the queue; this host is distinct from the stock subdomain.",
+          "Observe one current honest-client robots request and one homepage HEAD: no HTTPS response within12 and8 seconds respectively; the latter established TCP and a separate TLS-only handshake verified the certificate. Retain this as bounded network observations, not a robots rule or permanent access conclusion.",
+          "The public homepage shows a multi-publisher portal; path components and matching titles are only routing hints and do not prove article identity, rights or publication timing. CNA remains deferred.",
+          "The publisher's public media directory separately lists partners including 自立晚報 and 今日新聞. This supports a portal-level partnership observation only, not any individual URL alias, full-text permission, publication clock or live robots response."
+        ],
+        "remaining_questions": [
+          "When the original host is reachable, inspect its current robots rules and applicable source-specific terms; do not infer permission from the failed sample or from a different PChome subdomain.",
+          "For each in-scope third-party publisher, verify literal original URLs, byline, full body, source timing and rights before mapping or deduplicating; prioritize existing canonical collectors and do not re-fetch already stored originals.",
+          "After physical capacity is admitted, implement or enqueue only verified, permitted remaining work, test incremental updates and estimate completion from observed usable throughput."
+        ]
+      }
+    },
+    "unregistered:times.hinet.net": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-27T12:24:45.323204+00:00",
+      "evidence_urls": [
+        "https://times.hinet.net/",
+        "https://times.hinet.net/robots.txt",
+        "https://buy.line.me/u/article/566729",
+        "https://n.yam.com/Article/20221017768218"
+      ],
+      "observation_scope": "Finite local URL-head and current local-resolver observation, not proof that the historical service or its content is permanently unavailable.",
+      "observation": "The local indexed snapshot contains1072 URL heads and0 stored bodies; URL paths include731 news,117 topic,93 mobile news,63 picNews,37 magazine and27 mobile magazine entries. Raw metadata clock strings span2018-01-11..2023-06-18 and are not verified publisher release timestamps. The WSL resolver returned NXDOMAIN for A and AAAA, with an hinet.net SOA, and the honest-client robots request failed name resolution. A query directed to ans1.hinet.net returned NXDOMAIN without the authoritative-answer flag; neither observation establishes provider retirement or authorization. No HTTP article request, alias adoption or body acceptance occurred.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/unreviewed_aggregators_20261027/local-index-evidence.json"
+      ],
+      "current_scope_review": {
+        "known_URL_heads": 1072,
+        "stored_body_heads": 0,
+        "source_identity_or_alias_accepted": false,
+        "formal_body_added": false,
+        "completed_questions": [
+          "Preserve the indexed1072 local URL heads, their states, raw metadata clocks, path-category counts and ordered snapshot hash without changing the queue; topic, magazine and image paths are not automatically counted as missing news bodies.",
+          "The current WSL resolver returns NXDOMAIN for A and AAAA with the hinet.net SOA, and one robots request fails name resolution. A query directed to ans1.hinet.net also returns NXDOMAIN without the authoritative-answer flag; these are timestamped resolver observations, not proof of permanent retirement.",
+          "A 2023-04-07 secondary technology-news report describes the HiNet news service as ended; no operator cessation notice or historical export has been verified. Do not attribute the report's separate Xuite closure announcement to this service. Four bounded exact-URL web searches found no indexed match; title-based searches found coverage of the same event with differing credited reporters, not proof of the same article or an acceptable alias."
+        ],
+        "remaining_questions": [
+          "Check authoritative operator evidence for any supported replacement or historical export; do not guess a hostname, reuse an old address or bypass a source restriction.",
+          "Find and verify original publishers and exact article identities for unresolved heads, keeping metadata, image, topic and magazine items distinct; reuse previously stored bodies without re-downloading.",
+          "Only after a verified permitted route and sufficient physical capacity exist, enqueue the missing work under the canonical owner and measure incremental progress."
+        ]
+      }
+    },
+    "gnn": {
+      "capture_decision": "private_public_candidate",
+      "reviewed_at_utc": "2026-10-25T07:26:57.942110+00:00",
+      "observation_scope": "Reuse accepted74/77 bodies and22 closed questions. Three first-time resident literal first-hop observations, without following destinations, explain two source-scope failures and one HTTP route; repair only the witnessed same-source HTTP gap. No RSS, guessed IDs, media traversal or source-permission bypass.",
+      "evidence_urls": [
+        "https://gnn.gamer.com.tw/",
+        "https://gnn.gamer.com.tw/robots.txt",
+        "https://gnn.gamer.com.tw/detail.php?sn=237675",
+        "https://user.gamer.com.tw/help/detail.php?sn=137"
+      ],
+      "observation": "Current independently verified durable coverage is75/77 known literal heads. The accepted v1/v2 bodies46 and v3/v4 additions28 were reused without downloading them again. One fixed resident first-hop question ran once for each of the three missing heads, keeping normal source/REP/DNS/refusal gates, with follow_redirects=False, no prose retention, no article-head changes and no destination request. HTTPS heads262008 and150409 return302 to home.gamer.com.tw/creationDetail.php, a member-creation route outside the current GNN source; this is a source/attribution boundary, not proven corrupt or irreparable data. Literal HTTP35518 returns301 to the same GNN article on HTTPS. The existing missing-only v4 repair followed the actual checked redirect once, retaining both source addresses and the transport witness rather than inventing an alias. It added one durable body with native release2009-03-12T18:57:31+08:00; receipt/Parquet/raw/body SHA, native reporter/clock and independent lxml prose/table readback pass. All74 prior body heads,83 Manager heads,25 now-closed questions and all source authorization/capture/learned-HTTP identities remain preserved. Shared534 tests cover current boundaries, source refusals, no-follow behavior, leases, deadlines and crash uncertainty. Only the news owner was reloaded once to adopt the new finite diagnostic; trading/quote owners were unchanged. Startup receipt replay remains software overhead, and measured selected repairs are not stable maximum throughput or full-history ETA. The prior eighteen private originals remain diagnostic evidence, not accepted articles. Four capture ABIs preserve reporter/supplier/press-release/editorial/contributing-editor roles, raw values and exact unexecuted media/UI boundaries. Known literal-target routing remains separate from exhaustive publisher history, same-story identity, historical revisions, reuse/training/export rights and PIT. Cached policy evidence and the help-host403 remain preserved.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "One selected coherent local census includes55 current URL heads and34 distinct incoming literal targets, with22 not yet queued; no full-frontier rescan",
+          "Native REP and one literal public HTML response verified through the canonical transport and refusal gates, without RSS or alternative-host access",
+          "Retained raw/receipt SHA readback, exact native reporter/heading/OG URL/explicit-offset release pairing and676-character independent native prose/table oracle",
+          "Supplier-provided material is labelled separately from the GNN reporter credit and no reuse or historical-PIT rights are inferred",
+          "Canonical native adapter and focused source/queue recovery tests implemented; existing source identities and Manager20 protected by a pre-adoption snapshot",
+          "Sole-owner v1/v2 adoption,27 initial plus19 new durable bodies, independent receipt/raw/Parquet/native-text readback and explicit supplier roles verified; prior27 bodies and all83 Manager heads preserved",
+          "Existing shared routing queued all34 distinct incoming literal targets including22 previously absent heads;20 targets have stored bodies and no story-identity alias was inferred",
+          "Public progress independently read back as46/77 stored bodies,31 missing, attention and unknown all-history ETA; old source pacing/refusal identity and four closed metadata questions preserved",
+          "686 shared regression tests,264 final boundary/config tests and374 lifecycle/adoption tests passed for the prior v1/v2 snapshot; overlapping test sets are not summed",
+          "V3 added14 bodies and v4 added14; independent current raw/receipt/Parquet/native-text readback preserves all46 prior bodies and83 Manager heads",
+          "Eighteen once-only private original observations retain diagnostic flags and paired readback evidence; all22 closed questions survive parser changes and recovery without duplicate GETs",
+          "V4 native143/shared569 tests and adopted-configuration checks passed; public74/77 matches, only3 route/scope heads remain, and the existing configuration supervisor avoided an additional manual restart",
+          "Three once-only first-hop observations explain the remaining routes without following unauthorized destinations; one witnessed HTTP-to-HTTPS same-source repair adds a durable2009 body, increasing verified coverage to75/77 while preserving74 prior bodies and all25 closed questions; shared534 tests pass"
+        ],
+        "remaining_questions": [
+          "Resolve2 current missing heads262008/150409 which actually redirect to the member-creation source home.gamer.com.tw/creationDetail.php; inspect source/author scope separately, preserve75 bodies and25 closed questions, and do not repeat the closed first-hop question or clear authorization/refusal gates",
+          "Reduce measured startup receipt-recovery software overhead without skipping original receipts or recovery integrity; no hardware-bound optimality claim",
+          "Verify future metadata/revision incrementality, measured stable capacity and source history beyond known local literal references; routing already queued the22 prior gaps",
+          "Complete inaccessible policy details and any reuse/training/export authorization separately from private local HTML reading"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_review_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_review_20261025/native-boundary-review.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_native_20261025/offline-acceptance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_native_20261025/v1-durable-acceptance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_native_20261025/v2-durable-acceptance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_native_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_native_20261025/public-status.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_remaining_native_20261025/v3-durable-acceptance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_remaining_native_20261025/v4-offline-boundaries.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_remaining_native_20261025/v4-durable-acceptance.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_remaining_native_20261025/v4-public-status.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_route_20261025/route-results.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/gnn_route_20261025/http-durable-readback.json"
+      ]
+    },
+    "unregistered:life.tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-25T04:37:23.019467+00:00",
+      "observation_scope": "Complete selected local URL-head and incoming literal-target census, plus official cached terms, REP, platform-about and partner-directory review. No Life article HTTP, archive, source alias or body acceptance.",
+      "evidence_urls": [
+        "https://life.tw/?app=terms",
+        "https://life.tw/robots.txt",
+        "https://life.tw/?app=about",
+        "https://life.tw/Index/partner"
+      ],
+      "observation": "The pinned local snapshot contains62 current URL heads and0 stored bodies, with no incoming literal-target associations. The official terms reader identifies a2026-10-11 update and explicitly prohibits automated mass content extraction. Cached REP Allow does not override those terms. Official About/partner pages identify the multi-publisher platform role, so the catalog now classifies life.tw as an aggregator; that role neither proves that every article is a reprint nor supplies an article-specific original URL or retrieval grant. Preserve the known URLs and pursue native original-publisher links or a permitted retrieval product rather than a Life bulk crawler or rate probe. Official document observations are cached-reader evidence, not retained native origin responses or exhaustive historical-rights proof.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All62 current local URL heads and incoming target coverage counted in one selected read-only snapshot; no stored body or incoming target association",
+          "Official terms automation restriction distinguished from the separately permissive cached REP",
+          "Platform/partner directory establishes advisory aggregator role only; no article-level upstream identity or body-equivalence inference"
+        ],
+        "remaining_questions": [
+          "Find actual native original-publisher URL declarations for the known article URLs without a prohibited mass archive",
+          "Verify a permitted source export/API or explicit automation scope, including history, quota and data rights",
+          "Capture and validate accessible original-publisher bodies, contributors and source clocks only after their individual scope review"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "publisher_article_requests": 0,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/inventory.json"
+      ]
+    },
+    "unregistered:leho.com.tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-25T04:44:44.391906+00:00",
+      "observation_scope": "Complete selected local census, cached official-home review and one canonical REP-gated metadata diagnostic. No article representation was requested, retained or accepted.",
+      "evidence_urls": [
+        "https://leho.com.tw/",
+        "https://leho.com.tw/robots.txt"
+      ],
+      "observation": "The selected snapshot contains59 current local URL heads and0 stored bodies, with no incoming literal target. The document reader could show the public homepage but could not access REP; it supplied no authoritative REP status. The canonical native diagnostic then requested robots.txt once and received403 from the source at2026-10-25T04:44:42.112551Z. Its body was not read and the home/article request was not sent. The source cooldown/refusal evidence remains retained; no alternate host, guessed WordPress API, changed identity or challenge bypass was attempted. A public cached homepage or WordPress appearance is not proof of a permitted bulk endpoint, original ownership or full history. The bounded source-access question is answered; legitimate API/export/original-publisher alternatives and actual article scope remain unresolved rather than declaring all alternatives exhausted.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All59 current local URL heads and incoming target coverage counted without source HTTP",
+          "Canonical REP request independently confirms native403, distinct from a reader-tool access failure; article/home request withheld",
+          "One bounded refusal receipt and persistent cooldown preserved without bypass, rate ramp or duplicate article retry"
+        ],
+        "remaining_questions": [
+          "Obtain an actual permitted source access/API/export route or native original-publisher declaration with evidence",
+          "Confirm article ownership/byline, current full native body, clocks, history and incrementality only within accessible reviewed scope",
+          "Find applicable source terms and an official numeric quota if any; cached home and denied REP alone do not establish either"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "publisher_article_requests": 0,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/metadata-probes.json"
+      ]
+    },
+    "managertoday": {
+      "capture_decision": "private_public_candidate",
+      "reviewed_at_utc": "2026-10-26T15:06:31.950165+00:00",
+      "observation_scope": "Only one unresolved old Manager identity head; current normal v5 recovery after a finite closed diagnostic refusal.",
+      "evidence_urls": [
+        "https://www.managertoday.com.tw/",
+        "https://www.managertoday.com.tw/robots.txt",
+        "https://www.managertoday.com.tw/columnist/view/5738",
+        "https://www.managertoday.com.tw/articles/view/73138"
+      ],
+      "observation": "Followup2026-10-26:45/83 durable Manager body heads. Closed59 did not reconfirm old multiple-root geometry and retained no raw/article. The normal canonical current-v5 owner alone then recovered62608; independent native DOM readback confirms one root and exact written prose. Current parser, source identities, raw publication/modification clocks and protected services remain unchanged. All44 previous bodies and597 closed diagnostics are preserved.38 missing heads remain source/attribution/exclusion cases, not another unresolved multiple-root parser target.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All56 initial local heads and42 incoming associations counted;35 targets deduplicated with27 verified absent from current heads in the same snapshot",
+          "Native public REP and literal73138 canonical/OG/NewsArticle identity, editor-linked writing credits, exact release/revision and article notice reviewed",
+          "Native private raw response and receipt hashes checked; independent lxml written-text oracle matches6326-character native body, excluding script/style/media-figure text",
+          "Canonical known-URL source recipe and source-specific native adapter implemented without discovery/API/member/media requests or a second collector",
+          "All88 preexisting source data/authorization identities independently unchanged; separate native contract/regression suite327 tests passed",
+          "Native question46 for52 previously unobserved missing heads and question47 for31 no-profile headers completed once; all595 prior/current question rows preserved.",
+          "V4 accepts matching literal native bylines/desks/composite strings and witnessed writing-role punctuation/date pairs; no profile/person/ownership invented and no empty header fallback.",
+          "All20 previous Manager originals retain raw body/title/author/clock fields with both parsers and zero publisher HTTP; preserve effective v3 HTTP identity, REP, refusals and deadlines.",
+          "Only23 witnessed missing heads normally repaired; 23 new bodies independently checked against whole native written DOM, literal bylines, raw clocks and raw/body/Parquet/receipt SHA.",
+          "Actual sole-owner loaded code/policy, process/heartbeat clocks, original closed diagnostics and protected trading services independently read back.",
+          "Question58 retained one current-header/clock-verified failed embedded document through the original resident owner; all596 closed questions preserved.",
+          "V5 separates outer article metadata from the inert document metadata and retains every written ETF card value in order without executing handlers or requesting subresources.",
+          "All43 accepted originals retain original-version fields and current raw/body/title/byline/clocks with both parsers and zero HTTP; parser upgrade preserves exact prior HTTP capacity/authorization/refusal/deadline identities.",
+          "Only73055 reused the retained question58 original through canonical ABI2; original observation clock, bytes and receipt retained, with independent whole-written-DOM, dual-parser and durable-batch readback.",
+          "All39 remaining missing-body heads classified using the existing closed46/47 metadata only, with zero new HTTP and no source alias or article admission.",
+          "Five blank native credits are witnessed in61617,61560,61559,61649,61630; this complete inventory supersedes the earlier four-credit summary.",
+          "Question59 is closed: the current200 response did not meet the previous two-root geometry. The private-original permit refused; no original or body was retained, and the question must never be replayed.",
+          "Only still-missing62608 used the canonical current-v5 normal repair owner once. It now has one independently verified native body root, with raw/body/Parquet/receipt checks and dual-parser all-field equality. No parser relaxation or version change was needed.",
+          "All44 prior bodies, all597 closed questions, source/capacity/auth/refusal/deadline identities and protected services remain preserved; the public API reports45/83."
+        ],
+        "remaining_questions": [
+          "Continue only38 missing heads, classified from preserved evidence:5 nonarticle paths,25 explicit upstream credits,1 cooperation reprint,2 foreign canonicals and5 empty native credits.",
+          "Find literal original-source URL evidence under its own owner or independent native attribution evidence. Do not invent author ownership or aliases, and do not replay closed questions46/47/58/59.",
+          "Known URL coverage is not the full archive, historical PIT, a measured maximum RPS or an unconditional completion ETA."
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "capture_access_granted": false,
+        "planning_annotation_is_not_runtime_policy": true,
+        "reviewed_at_utc": "2026-10-26T15:06:31.950165+00:00",
+        "current_known_url_heads": 83,
+        "current_durable_body_heads": 45,
+        "v4_old_body_originals_reused": 20,
+        "v4_missing_only_selected": 23,
+        "v4_new_bodies_with_independent_readback": 23,
+        "closed_native_questions_preserved": 597,
+        "whole_publisher_history_complete": false,
+        "all_known_articles_complete": false,
+        "literal_desks_composite_names_and_native_punctuation_preserved": true,
+        "person_identity_or_ownership_inferred": false,
+        "v5_old_body_originals_reused": 43,
+        "v5_missing_only_selected": 1,
+        "v5_new_bodies_with_independent_readback": 1,
+        "v5_additional_publisher_requests": 0,
+        "remaining_classifications": {
+          "nonarticle_path": 5,
+          "explicit_upstream_credit": 25,
+          "declared_other_publisher": 2,
+          "empty_native_credit": 5,
+          "unreviewed_multiple_article_roots": 1,
+          "explicit_reprint_credit": 1
+        },
+        "remaining_only_old_body_originals_reused": 44,
+        "remaining_only_missing_selected": 1,
+        "remaining_only_new_bodies_with_independent_readback": 1
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/metadata-probes.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/manager-native-probe.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/life_leho_manager_review_20261025/native-parser-acceptance.json",
+        "artifacts/operations/agent-workflow/runs/news-manager-native-contracts-c-20261025T045611-0f80563a/run.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_native_byline_v4_20261026/offline.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_native_byline_v4_20261026/readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_native_byline_v4_20261026/runtime-admission.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_static_document_v5_20261026/offline.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_static_document_v5_20261026/readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_static_document_v5_20261026/runtime-admission.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_static_document_v5_20261026/remaining-only-plan-final.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/offline.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/closed-result.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/normal-readback.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/runtime-admission.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/remaining-only-plan.json"
+      ],
+      "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/runtime-admission.json",
+      "body_readback": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/normal-readback.json",
+      "remaining_worklist": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/remaining-only-plan.json",
+      "native_failure_diagnosis": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_embedded_original58_20261026/readback.json",
+      "actual_failure_reproduction": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_static_document_v5_20261026/offline.json",
+      "semantic_verification": {
+        "run_receipt": "artifacts/operations/agent-workflow/runs/news-manager-original59-shared-20261026T145735-5817448c/run.json",
+        "summary": "874 passed in 97.36s (0:01:37)",
+        "overlapping_test_counts_are_not_additive": true
+      },
+      "current_failure_diagnostic": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/manager_multiple_original59_20261026/closed-result.json"
+    },
+    "yahoo": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-25T04:12:45+00:00",
+      "observation_scope": "Read-only census of every currently queued Yahoo URL head and every locally decoded incoming Google-to-Yahoo literal target, plus official cached policy/documentation observations. No Yahoo article request, body acceptance, alias, scope expansion or rate experiment.",
+      "evidence_urls": [
+        "https://legal.yahoo.com/tw/zh-hant/yahoo/terms/otos/index.html",
+        "https://publishers.yahooinc.com/docs/article-ingestion"
+      ],
+      "observation": "At the pinned 2026-10-25T04:00:16.948111Z snapshot, 203057 Yahoo URL heads across17 hosts all awaited authorization, with zero stored body heads. Incoming337202 literal alias associations resolve to288149 distinct Yahoo targets, of which12584 already have queue heads and275565 do not. These are Google-to-Yahoo pointers, not Yahoo-to-original-publisher links or accepted body equivalences; no outbound query target was found in the complete existing-head URL census. Native legal-document access returned999 and publisher-document access429; only cached official search text was available. The cached terms require express prior permission for automated collection, and the publisher article-ingestion documentation describes sending articles to Yahoo, not a verified historical download API. Retain these finite observations without repeating their unchanged probes or treating access failures as exhaustive history/alternative-source evidence.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All203057 current Yahoo queue URL heads and17 hosts examined with an independent selected-source aggregate and immutable ordered field digest",
+          "All337202 incoming local alias associations deduplicated into288149 targets;275565 verified absent from current queue heads in the same read snapshot",
+          "Incoming Google-to-Yahoo direction distinguished from unverified Yahoo-to-original-publisher identity; existing URL queries contain no literal upstream target",
+          "Official cached policy and publisher-ingestion document purpose recorded separately from native legal999/document429 failures; no article HTTP or retry"
+        ],
+        "remaining_questions": [
+          "Verify an actual permitted historical retrieval product or source grant and its article scope, API endpoints, history and quota; ingestion documentation is not a retrieval grant",
+          "Obtain native original-publisher URL and rights evidence before creating any aggregator-to-original body equivalence; title/date/hash similarity is insufficient",
+          "Verify native body, byline, publication/revision clocks, history discovery, incrementality and accepted throughput only within a confirmed accessible scope"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "publisher_article_requests": 0,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/yahoo_known_source_review_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/yahoo_known_source_review_20261025/policy-observation.json"
+      ]
+    },
+    "yahoo_tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-25T04:12:45+00:00",
+      "observation_scope": "Separate yahoo.com.tw namespace in the same complete local read-only census and official cached Yahoo document review; no article HTTP or source access change.",
+      "evidence_urls": [
+        "https://legal.yahoo.com/tw/zh-hant/yahoo/terms/otos/index.html",
+        "https://publishers.yahooinc.com/docs/article-ingestion"
+      ],
+      "observation": "2397 queue URL heads across2 hosts all await authorization and have no stored bodies. Incoming80 alias associations yield73 distinct literal targets,2 queued and71 unqueued. Metadata ordering days are absent, not historical publication evidence. No literal outbound query target was observed in any existing source head. Reuse the completed same-snapshot census and shared cached-policy/native999/429 observations; they do not establish an original publisher, body, historical completeness or download permission.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All2397 yahoo.com.tw queue URL heads examined; current states/hosts/body absence reconciled independently",
+          "All80 incoming local alias associations deduplicated into73 targets with71 verified unqueued; no outbound original-publisher identity inferred",
+          "Shared official cached Yahoo terms/ingestion observations and native999/429 failures retained without repeating requests"
+        ],
+        "remaining_questions": [
+          "Confirm a permitted retrieval product or source grant covering yahoo.com.tw historical articles and actual quota",
+          "Verify native original-publisher identity, rights, whole body, byline and publication/revision clocks before any routing or body acceptance",
+          "Verify history discovery, incrementality and effective capture throughput within an accessible authorized scope"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "publisher_article_requests": 0,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/yahoo_known_source_review_20261025/inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/yahoo_known_source_review_20261025/policy-observation.json"
+      ]
+    },
+    "line_today": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-25T04:22:16+00:00",
+      "observation_scope": "First canonical selected-source audit of all current LINE TODAY queue heads and incoming literal targets in one pinned read snapshot; official configured terms read separately through the document reader. No LINE article request, alias, body acceptance or source access change.",
+      "evidence_urls": [
+        "https://terms2.line.me/globalnews_TOS_Plus/sp?country=tw&lang=zh-Hant"
+      ],
+      "observation": "The 2026-10-25T04:20:16.157124Z snapshot contains39323 current URL heads, all awaiting authorization, with zero stored bodies. Incoming37916 alias associations yield35892 distinct literal target URL IDs, none present as current queue heads. This is URL identity, not evidence of35892 additional independent stories or body downloads. Existing examples include both article and discussion namespaces, so no unsupported article classification or aggregator-to-original equivalence is admitted. The official configured terms were readable through the document reader, which labels its crawl two weeks old; origin HTTP status, raw response hash and exact publication/version date were not retained. Section5.4 restricts automated retrieval and section4.3 separately limits retention; personal/noncommercial use alone is not an observed automated-archive grant. The client access configuration stays disabled. Original publishers and permitted retrieval products remain unresolved rather than declaring all alternatives exhausted.",
+      "current_scope_review": {
+        "contract_version": 1,
+        "completed_questions": [
+          "All39323 current LINE TODAY queue URL heads reconciled with independent maintained state counters in a pinned read-only canonical audit",
+          "All37916 incoming alias associations deduplicated into35892 literal target URL IDs; current-head existence checked instead of trusting historical queued hints",
+          "URL targets distinguished from independent stories, discussion pages and upstream-publisher identity; no source aliases inferred",
+          "Configured official terms read through the document reader; section5.4 automation and4.3 retention restrictions recorded with reader-cache and raw-origin evidence limits"
+        ],
+        "remaining_questions": [
+          "Confirm an actual allowed retrieval product or source grant covering historical content and its scope/quota before article requests",
+          "Establish native original-publisher URLs and article-versus-discussion identity within an accessible scope; do not merge URL variants or infer aliases from matching metadata",
+          "Verify original body, byline, publication/revision clocks, history, incremental updates and accepted throughput after source admission"
+        ],
+        "review_complete": false,
+        "full_publisher_history_verified": false,
+        "publisher_article_requests": 0,
+        "capture_access_granted": false
+      },
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/news_selected_source_inventory_20261025/line-inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/news_selected_source_inventory_20261025/line-policy-observation.json"
+      ]
+    },
     "unregistered:pchome.megatime.com.tw": {
       "capture_decision": "review_incomplete",
       "reviewed_at_utc": "2026-10-25T03:45:43.744676+00:00",
@@ -56,7 +756,10 @@
         "unobserved_local_article_route_heads": 40,
         "declared_child_sitemaps": 7,
         "observed_news_sitemaps": 2,
-        "news_sitemap_location_rows_per_document": [16140, 16140],
+        "news_sitemap_location_rows_per_document": [
+          16140,
+          16140
+        ],
         "sitemap_lastmod_min_declared": "2026-09-30",
         "sitemap_lastmod_max_declared": "2026-10-24",
         "sitemap_news_publication_date_elements": 0,
@@ -2177,21 +2880,21 @@
     },
     "knews": {
       "current_scope_review": {
-        "reviewed_at_utc": "2026-10-23T20:36:25.346316+00:00",
-        "operational_scope": "knews_public_native_article_v7; same private known public URLs, verified captionless inline figures, optional written-card wrapper ID and literal sparse printed signatures without invented names or roles; prior body, credit, media boundaries and raw-clock contracts retained",
+        "reviewed_at_utc": "2026-10-26T13:28:29.994383+00:00",
+        "operational_scope": "knews_public_native_article_v10; literal ordered native multiple Person bylines/profiles and schema/meta relationships; distinct printed reporter roles, complete written DOM and raw clocks",
         "supersedes_operational_two_sample_cap_only": true,
         "prior_finite_reviews_and_completed_receipts_preserved": true,
-        "known_main_host_URL_heads": 685,
-        "known_URL_heads": 685,
-        "stored_body_heads": 664,
+        "known_main_host_URL_heads": 686,
+        "known_URL_heads": 686,
+        "stored_body_heads": 675,
         "observed_hosts": 1,
         "primary_evidence_kind": "canonical_HTTP_raw_body_batch_readback_and_live_owner_web_snapshots",
-        "literal_news_URL_heads": 678,
+        "literal_news_URL_heads": 679,
         "nonarticle_search_heads": 7,
         "previously_unrequested_article_heads_admitted": 676,
-        "stored_body_heads_at_observation": 664,
-        "new_bodies_with_completed_independent_readback": 2,
-        "prior_completed_bodies_preserved": 2,
+        "stored_body_heads_at_observation": 675,
+        "new_bodies_with_completed_independent_readback": 3,
+        "prior_completed_bodies_preserved": 672,
         "v3_prior_completed_bodies_preserved": 125,
         "prior_v2_original_readback_evidence_reused": true,
         "v3_witnessed_editor_missing_bodies_repaired": 2,
@@ -2281,9 +2984,8 @@
         "v7_media_requested_or_transcribed": false,
         "v7_missing_printed_reporter_names_filled_from_header": false,
         "states_at_observation": {
-          "complete": 664,
-          "article_identity_not_verified": 10,
-          "article_attribution_not_verified": 1,
+          "complete": 675,
+          "article_identity_not_verified": 1,
           "article_rights_or_scope_excluded": 1,
           "source_not_found": 2,
           "unsupported_article_path": 7
@@ -2311,10 +3013,10 @@
           "All29 distinct V7 missing targets made exactly one admitted attempt: the four witnessed originals yielded4 bodies, then25 followup targets yielded14 bodies and10 identity/structure plus1 attribution failure in28.675465 seconds through the last terminal attempt. Independent actual raw/body hashes, batches and mailbox receipts accepted18 new bodies, preserving the old646 and bringing the total to664. Both local and HTTPS951-source snapshots show664 with the same fresh ready owner. GVM137,309 closed questions, non-target heads and original HTTP capacity/refusal state remain preserved; whole history, an ETA for unresolved parser work and a stable source maximum remain unproved."
         ],
         "remaining_questions": [
-          "Fix only the remaining10 native identity/structure and1 attribution failures, reusing retained responses or a bounded unexamined representative. The four V6 residual originals are now accepted by V7; do not observe them again. Qualify further parser changes against664 accepted raw/body/credit/clock records before actual missing-body readback. No body-not-found or publication-clock failures remain. Do not replay completed V3-V7 requests,664 bodies or309 closed questions. Preserve the existing literal values, raw chronology, missing names/roles, complete card and editor text, captions, TOC, profile/desk declarations, recommendations and media/text boundaries.",
-          "Keep the two source-not-found responses, one third-party/scope exclusion and seven nonarticle search routes distinct from a parser failure or completed article; no alternate-host or access-refusal bypass.",
-          "The20 previously separated bare-host metadata heads remain independent unregistered-origin questions, outside these685 www-host heads; no inferred www alias, repeated completed native original or cross-origin budget.",
-          "Measure stable throughput and completion bounds after real accepted-body outcomes; do not label attempted URLs or current declarations as complete history."
+          "Continue only the remaining native identity failure with two textful Facebook post embeds; retained source original has no static fallback or article alternate. Do not drop embedded text and call the body complete.",
+          "Keep2 source-not-found heads,1 source/scope exclusion and7 nonarticle paths distinct from the remaining native parser failure or successful bodies.",
+          "The20 previously separated bare-host metadata heads remain independent unregistered-origin questions; no inferred www alias or cross-origin budget.",
+          "Whole publisher history, historical PIT, maximum stable throughput and ETA for unresolved work remain unproved. Preserve675 completed heads and512 closed questions; Anue first and CNA deferred."
         ],
         "evidence_artifacts": [
           "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews-known-urls-20261024/qualified.json",
@@ -2371,10 +3073,43 @@
           "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews-sparse-native-20261024/first-readback.json",
           "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews-sparse-native-20261024/remaining-readback.json",
           "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews-sparse-native-20261024/complete-readback.json"
-        ]
+        ],
+        "v8_previous_complete_bodies_preserved": 665,
+        "v8_retained_original_parity_count": 665,
+        "v8_new_bodies_with_independent_readback": 3,
+        "v8_missing_only_selected": 11,
+        "v8_retained_originals_reused_without_HTTP": 2,
+        "v8_fresh_remaining_heads_admitted_once": 9,
+        "v8_closed_native_questions_preserved": 501,
+        "v8_native_diagnostic_questions": 2,
+        "v8_raw_body_credit_clock_values_preserved": true,
+        "v8_failure_attempts_preserved_at_startup": true,
+        "remaining_state_counts": {
+          "article_identity_not_verified": 1,
+          "article_rights_or_scope_excluded": 1,
+          "source_not_found": 2,
+          "unsupported_article_path": 7
+        },
+        "v8_normal_failure_metadata_charges": {
+          "failure_identity_metadata_attempts:v1:knews:20261026": "2"
+        },
+        "v9_previous_complete_bodies_preserved": 668,
+        "v9_retained_original_parity_count": 668,
+        "v9_missing_only_selected": 4,
+        "v9_retained_originals_reused_without_HTTP": 4,
+        "v9_new_bodies_with_independent_readback": 4,
+        "v9_closed_native_questions_preserved": 509,
+        "v9_additional_source_requests_for_materialization": 0,
+        "v9_raw_body_credit_clock_values_preserved": true,
+        "v10_previous_complete_bodies_preserved": 672,
+        "v10_old_original_parity_count": 672,
+        "v10_missing_only_selected": 3,
+        "v10_new_bodies_with_independent_readback": 3,
+        "v10_closed_native_questions_preserved": 512,
+        "v10_original_raw_body_credit_clock_values_preserved": true
       },
       "capture_decision": "review_incomplete",
-      "reviewed_at_utc": "2026-10-22T13:21:23.497614+00:00",
+      "reviewed_at_utc": "2026-10-26T13:28:29.994383+00:00",
       "evidence_urls": [
         "https://www.knews.com.tw/",
         "https://www.knews.com.tw/terms",
@@ -2383,7 +3118,7 @@
         "https://www.knews.com.tw/news/04CE23AF3987F7A667AECC0810CDBF4D",
         "https://www.knews.com.tw/news/F84F5BD478EA9B742886C5819E33B9D7"
       ],
-      "observation": "Remaining-only native stage2026-10-22: preserved the completed shopping/refund, campaign-member and editorial distinctions and the old703-head review below. Canonical public REP200 allowed two previously unexamined literal public articles; both returned200 without redirect, login or access refusal. The new finite native v1 preserves the top caption, full printed-byline introduction and complete editor in source order, excludes duplicated TOC/recommendations/app/ad mounts, and keeps current header/schema names distinct from printed reporter signatures. Source schema seconds/+08:00 publication and revision declarations are retained alongside the visible minute clock, not reconstructed historical first release. Independent whole-text lxml parity and normal durable queue/Parquet/receipt readback accepted exactly2 bodies (953/1223 characters) by reusing the retained original bytes, with zero source HTTP for admission. Current scoped inventory705 URL heads:685www and20 bare,698 news-route and7 search-route heads, not705 verified articles.703 other capture heads, old19 originals,4 accepted finite bodies and217 closed native questions remain unchanged. Bare20 metadata moved to its separate unregistered key without alias inference; all943 old source keys survive within944 current keys. Only one guarded news-owner restart; protected trading/common-dashboard services unchanged. The initial drain preflight correctly stopped before any service action when one new untouched metadata head arrived; v2 permits only such new unattempted metadata while preserving every old capture field. The original failure remains evidence, not a reason to replay source requests. Two-literal private purpose is not whole-publisher permission, member applicability, API/rate entitlement, open license, historical PIT, automatic training/export or public republication. Remaining broad public-news scope and703 URL histories are not complete. Anue first, independent backgrounds, CNA deferred.",
+      "observation": "Remaining-only v10 stage2026-10-26. Three once-only question57 observations through the original owner show two literal reporter anchors and two schema Persons per failed article; the old single anchor requirement caused identity rejection. Metadata questions retained no names, body or raw and did not accept articles. Keep the immutable ledger of512 questions. V10 verifies every ordered name/profile against the ordered schema, matches literal meta-author parts and accounts for every native byline node/separator. Preserve distinct printed reporter roles without inventing aliases, raw title/body/clock values, REP/cooldowns/charges and protected trading/quote services. All672 old raw originals retain financial/body/credit/clock fields with both parsers and zero publisher HTTP. Only three missing heads are normally requeued and their actual HTTP raw/body/Parquet/receipts and full written DOM plus both reporters are independently verified. Scope is current known public originals for personal research; this does not prove whole history, historical PIT, remote-export rights, maximum RPS or unresolved-work ETA. One Facebook embed remains unresolved.",
       "finite_native_capture_review_20261022": {
         "known_URL_heads": 705,
         "stored_body_heads": 2,
@@ -2523,6 +3258,16 @@
             "Verify a legitimately reviewed source-native article's exact identity, written body, credit and publication/revision clocks before downloader activation."
           ]
         }
+      },
+      "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews_multi_reporter_v10_20261026/runtime-admission.json",
+      "body_readback": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews_multi_reporter_v10_20261026/readback.json",
+      "remaining_worklist": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews_multi_reporter_v10_20261026/completion.json",
+      "native_failure_diagnosis": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews_header57_20261026/readback.json",
+      "actual_failure_reproduction": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/knews_header57_20261026/readback.json",
+      "semantic_verification": {
+        "run_receipt": "artifacts/operations/agent-workflow/runs/news-knews-v10-regression-20261026T131744-4b06d248/run.json",
+        "summary": "657 passed in 37.95s",
+        "overlapping_test_counts_are_not_additive": true
       }
     },
     "unregistered:www.taiwannews.com.tw": {
@@ -3314,10 +4059,46 @@
     "unregistered:turnnewsapp.com": {
       "capture_decision": "review_incomplete",
       "evidence_urls": [
-        "https://turnnewsapp.com/robots.txt"
+        "https://turnnewsapp.com/robots.txt",
+        "https://static.chinatimes.com/pages/turnnewsapp-mobile.htm",
+        "https://member.want-media.com/member-term-of-service.htm"
       ],
       "observation": "The2026-10-20 read-only gateway inventory retains2528 literal URL heads, not accepted original stories. The previous preflight made zero publisher requests; its local review rejection was not a source404 or unavailability proof. At15:19:58Z one bounded policy-only request read the official robots.txt itself: HTTP200,1228 UTF-8 bytes, response SHA256 9a767a5998939c2de5b021a77fdf9f6cdd8446af56d8282c41839515d8859115. Its wildcard group excludes/?s=, while a separate named group disallows/ for OAI-SearchBot, GPTBot, ChatGPT-User, ClaudeBot and other listed crawlers; the configured StockAgentNewsResearch agent matches the wildcard group. Preserve these different scopes: neither blanket all-agent denial nor wildcard permission to impersonate a different crawler or evade the named restrictions is inferred. The web reader actually reported OAI-SearchBot robots denial on the main origin. Do not switch identity, use reader/share or another host as a bypass, guess an API, or mistake indexed/search text for retained original-body proof. No home/article GET, body capture, authorization change, queue write or numerical quota was made. The robots policy is not a bulk archive, reuse or training grant; source-supported access and original-text scope still need clarification. Keep the known worklist and source unresolved rather than mark it complete or permanently unavailable. A future reviewed route must establish its own policy, exact original identity, source byline and publication precision before extending the canonical collector.",
-      "reviewed_at_utc": "2026-10-20T15:19:58.796031+00:00"
+      "reviewed_at_utc": "2026-10-20T15:19:58.796031+00:00",
+      "review_artifacts": [
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/turnnews_scope_20261027/selected-inventory.json",
+        "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/turnnews_scope_20261027/route-shapes.json"
+      ],
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T15:18:12.113121+00:00",
+        "known_URL_heads": 2528,
+        "stored_body_heads": 0,
+        "route_counts": {"livenews": 2483, "ct-featured": 32, "ct": 7, "wd": 5, "other": 1},
+        "literal_redirect_associations": 1997,
+        "distinct_literal_redirect_targets": 1978,
+        "literal_targets_already_queued": 139,
+        "literal_targets_not_queued": 1839,
+        "metadata_date_earliest_day": "2001-05-14",
+        "metadata_date_latest_day": "2026-09-29",
+        "completed_questions": [
+          "Reused the earlier robots observation and retained its separate wildcard and named-agent scopes without repeating the completed probe.",
+          "Summarized every2528 locally queued URL head in one bounded indexed read-only snapshot:2483 livenews,32 ct-featured,7 ct,5 wd and1 other; all2528 await authorization and none has a stored body.",
+          "Reconciled1997 literal Google redirect associations to1978 distinct target IDs:139 already queued,1839 not queued and0 stored target bodies. These counts are target metadata, not accepted original article identities.",
+          "Read the related publisher's own description: the Flip News app includes multiple group publications and digital-native content. Its group member terms explicitly name other websites; their applicability to this domain was not established."
+        ],
+        "remaining_questions": [
+          "Establish the actual domain-specific automatic-access and personal-research scope using a source-supported route; do not treat a group relationship or robots wildcard as a blanket fulltext grant.",
+          "Identify original publisher, exact article identity, visible byline, original publication clock and any updates for each eligible route before deduplication or body acceptance.",
+          "Review and route the1839 distinct literal targets not yet queued under the existing canonical owner when access, per-source policy and storage admission permit; do not infer their text, aliases or chronology from the redirect alone.",
+          "Measure actual acquisition and discovery after the physical-capacity gate opens; the local metadata date range and known URL heads do not establish the publisher's full history or a completion ETA."
+        ],
+        "metadata_date_is_publisher_publication_time": false,
+        "article_identity_verified": false,
+        "source_authorization_granted": false,
+        "article_HTTP_requests_by_review": 0,
+        "production_queue_mutations_by_review": 0,
+        "whole_publisher_history_complete": false
+      }
     },
     "unregistered:blog.fugle.tw": {
       "capture_decision": "permission_required",
@@ -3807,6 +4588,15 @@
         "https://member.want-media.com/member-term-of-service.htm"
       ],
       "observation": "The current official terms explicitly cover Chinatimes, Wantrich, truemii and CTEE. Section7(1) requires prior written permission for referenced uses and specifically identifies unauthorized crawler capture/use; section7(3) requires preserving rights notices. The page labels its last revision2024-12-25. This resolves the prior missing planning review, not a transport/parser failure or proof that licensed archives are unavailable. Preserve all locally known article URLs and their original third-party provenance. Keep the existing candidate adapter disabled unless an independently supplied licensed public-text/API scope is verified. No numeric quota, historical coverage or body entitlement is inferred; do not use a different group hostname to route around restrictions. This planning annotation alone changes no source authorization, capture fingerprint, retry deadline or HTTP owner; CNA remains deferred.",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:39:20.244965+00:00",
+        "known_url_heads": 108664,
+        "stored_body_heads": 0,
+        "user_purpose": "personal_noncommercial_nonpublic_research",
+        "completed_questions": ["Retain the existing publisher terms review, source configuration and known URL heads; do not repeat the already confirmed research-purpose question."],
+        "remaining_questions": ["Identify and verify a publisher-specific editorial archive, feed or API scope before enabling the existing article adapter; keep known third-party attribution and source boundaries.", "On a later source-scope change, verify actual historical availability and quota without inferring either from the present URL-head count."],
+        "evidence": ["artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/priority-permission-review-census-20261028.json"]
+      },
       "reviewed_at_utc": "2026-10-13T05:38:01+00:00"
     },
     "maxfinanciallife": {
@@ -3888,13 +4678,80 @@
         "https://www.cmoney.com.tw/product/valued-data",
         "https://owl.cmoney.tw/",
         "https://www.cmoney.tw/member/tos.aspx",
-        "https://www.cmoney.com.tw/owl%E6%95%B8%E6%93%9A%E8%B2%93%E9%A0%AD%E9%B7%B9/%E6%95%B8%E6%93%9A%E8%B2%93%E9%A0%AD%E9%B7%B9API%E8%A6%8F%E6%A0%BC.pdf"
+        "https://www.cmoney.com.tw/owl%E6%95%B8%E6%93%9A%E8%B2%93%E9%A0%AD%E9%B7%B9/%E6%95%B8%E6%93%9A%E8%B2%93%E9%A0%AD%E9%B7%B9API%E8%A6%8F%E6%A0%BC.pdf",
+        "https://readmo.cmoney.tw/",
+        "https://readmo.cmoney.tw/article/07955fdd-af74-4408-a70c-3ac3ef8a5fcf",
+        "https://readmo.cmoney.tw/article/908b12a1-3d1d-4335-bb62-74bb06162dfe"
       ],
       "observation": "Re-read the whole primary CMService registry on2026-10-13:30 distinct operations, of which five are news descriptors. Do not count the WSDL link as a31st operation. All five descriptors were read, not invoked. GetStockRssNews(date,lastDate,fetchSize) and GetMoreStockRssNews(articleId,lastDate,fetchSize) declare commkey/memberPk inputs and StockRssSimpleInfo fields ArticleId,Commkey,CreatTime,RssTitle,RssUrl,SourceChannelCaption,SourceChannelID,ClickCount. GetDailyHeadlineArticles(oldest,num,newsType), GetStockRssArticles(stockId,fetchSize,condition,fromDate,beforeDays,baseArticleId) and its WithFilterType variant declare no credential parameters; descriptor visibility alone does not prove anonymous entitlement or actual historical coverage. Their Article/StockRssArticlePkgObject fields Date,Title,SourceName,Url,Tags,Views,StockIndex,ArticleId contain no authored full body. Preserve the two different field schemas; source Date/CreatTime and exampleHTTP200 are not verified original publication clocks or actual service success. Other listed operations concern accounts, subscription, member state, inventory or click counters and are not silently invoked as news downloads. WSDL failed in the web reader, not a source403 or proven unavailable service. Actual current-owner native observations separately confirm three article403 events at14:40/14:55/15:10 Taipei; preserved header values are Microsoft-IIS/8.5 and1.1 kong/3.9.0, content-type text/plain and no retained Retry-After/challenge signal. Denial bodies were not read. These headers do not prove a specific WAF, rate limit, API token expiry or remote outage cause. The original next15:25:08 retry remains, no accepted CMoney body is proven. Metadata endpoints are not a replacement body or a route around this denial. The separate public23-page Owl specification documents POST /OwlApi/auth with appId/appSecret and Bearer-authenticated GET /OwlApi/api/rss/{product}/{count} or /OwlApi/api/rss/{product}/{stock}/{count}. Pages19/21 declare Title/Data arrays for ID,title,summary,link,creation-time,category, including UDN original links; this is metadata, not full text, author attribution or permission to fetch the linked publisher. The document uses2017/2018 examples, not proof of today's account entitlement, endpoint health, maximal count, history or quota. Owl's documented401/403 contract must not be used to diagnose the different public forum403. No Owl auth/product request sent, public sample credentials not reused, and no CMoney/Owl/UDN credential variable is currently configured in the inspected .env/.env.example key-name inventory. No numeric quota, fetchSize/num maximum, earliest history or body entitlement verified. Product-specific Owl/WCFAdox/CMTrans licensed financial data remain separate. This planning-only annotation changes no collector, capture/authorization fingerprint, deadline, key or owner; CNA remains deferred.",
-      "reviewed_at_utc": "2026-10-13T07:24:17+00:00"
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:21:00.313532+00:00",
+        "readmo_known_url_heads": 148,
+        "readmo_distinct_paths": 143,
+        "readmo_unsupported_article_path_heads": 148,
+        "readmo_stored_body_heads": 0,
+        "readmo_heads_matching_registered_cmoney_path": 0,
+        "unsupported_url_heads": 987,
+        "unsupported_first_path_segment_counts": {"article": 148, "finance": 517, "forum": 177, "notes": 145},
+        "notes_detail_known_url_heads": 40512,
+        "notes_detail_pending_pristine_heads": 40367,
+        "notes_detail_unsupported_url_heads": 145,
+        "notes_detail_numeric_nid_query_heads": 40505,
+        "notes_detail_distinct_literal_query_values": 40492,
+        "notes_detail_stored_body_heads": 0,
+        "notes_detail_time_zone_and_body_completeness_verified": false,
+        "completed_questions": [
+          "A read-only queue snapshot counted the known Readmo host heads and tested every path against the registered CMoney article regex; it issued no publisher request and did not change a head.",
+          "Two cached public-reader views label the pages Answer / Powered by Readmo.ai and link to an original article; they do not prove an identical original or a historical publication clock.",
+          "A complete indexed read-only snapshot found 40512 literal notes/note-detail.aspx query URL heads: 40367 pristine pending heads and 145 locally unsupported heads. The current source regex rejects that path before HTTP, while a public-reader search result contains one exact local URL with a title, credit and displayed clock; it is not a retained native response, verified time zone or full-body proof."
+        ],
+        "remaining_questions": [
+          "Check the Readmo host's actual robots, access and source terms via the existing owner when physical storage admission permits; do not use the host to evade CMoney refusals.",
+          "Verify native response identity, attributed content, clock and original-link relationship before separately classifying or capturing Readmo pages; the current CMoney route rejects all 148 observed heads.",
+          "Establish whether query variants represent the same article by publisher evidence and preserve provenance; 148 URL heads are not 148 verified unique articles.",
+          "For the exact known notes/note-detail.aspx heads, obtain normal same-owner native responses only when physical capacity, the existing source circuit and robots permit; do not treat a reader or search result as an accepted body or a reason to bypass the source denial. Verify literal nid identity, body boundary, credit and publication time before implementing and admitting an adapter.",
+          "Treat finance and forum stock-route shapes as research candidates, not verified missing articles; preserve their URL heads and do not infer identity from route names alone."
+        ],
+        "evidence": [
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmoney-readmo-known-queue-census-20261028.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmoney-unsupported-route-shapes-20261028.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmoney-unsupported-detailed-census-20261028.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmoney-note-detail-pending-census-20261028.json"
+        ]
+      },
+      "reviewed_at_utc": "2026-10-27T20:55:45.136175+00:00"
     },
     "globalvoices": {
       "capture_decision": "reviewed_existing_scope",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T04:38:40.995910+00:00",
+        "recorded_missing_body_heads": 74,
+        "recorded_missing_representations": {
+          "image_only": 68,
+          "embedded_only": 3,
+          "currently_empty_native_entry": 3
+        },
+        "completed_questions": [
+          "The native scope refusal for literal 2005/11/03/3474/ was diagnosed separately on 2026-10-22: empty visible title and empty native entry; the closed evidence13 original question must not be rearmed.",
+          "Two other retained native empty entries have already been independently inspected and classified. Reuse their originals, receipts and completed current-response diagnostics.",
+          "The current-format photo/embedded classifications and the prior denied WordPress author-embed observation are completed questions, not unimplemented body parsers. Preserve the existing ten-second REP floor and disabled profile/API access."
+        ],
+        "remaining_questions": [
+          "Seek independently reviewed real historical text or actual source-restoration evidence for the three currently empty native pages; current emptiness does not prove permanent loss or exhausted historical alternatives.",
+          "Review separately authorized source-native text alternatives for image-only and embedded-only representations. Do not convert photo credits, descriptions or widget pointers into invented article bodies or fetch excluded media."
+        ],
+        "evidence": [
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/globalvoices-scope-3474-observation.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/globalvoices-scope-3474-final.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_missing_source_followup_20261027/baseline.json"
+        ],
+        "canonical_collector_http_requests_by_this_review": 0,
+        "source_authorization_granted": false,
+        "historical_alternatives_exhausted": false,
+        "whole_publisher_history_complete": false,
+        "source_maximum_verified": false,
+        "whole_history_ETA_verified": false
+      },
       "evidence_urls": [
         "https://globalvoices.org/about/global-voices-attribution-policy/",
         "https://globalvoices.org/about/global-voices-policy-on-ai/",
@@ -4126,67 +4983,114 @@
     },
     "cmoneylearning": {
       "capture_decision": "reviewed_existing_scope",
-      "reviewed_at_utc": "2026-10-24T08:50:48.910370+00:00",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T06:38:12.642146+00:00",
+        "known_URL_heads": 44,
+        "stored_body_heads": 44,
+        "known_scope_native_originals_complete": true,
+        "completed_questions": [
+          "Reused all40 completed originals and all749 closed native questions at owner handoff; acquired only four genuinely new literal originals.",
+          "Two canonical locators reused current normal-failure metadata; only two missing literal locators required new resident54 observations. Four actual originals pass independent raw/body/Parquet/receipt SHA, full written DOM, author, clock and dual-parser readback.",
+          "All32 currently missing CMNews parent declarations have their original body available separately. Parent identity failures and17 retained-body identity states are preserved, not relabelled as aliases.",
+          "Indexed transactional same-response outbox and typed finite admission pass interruption, stale-source, rollback and restart tests without another HTTP client or renewed failure budget."
+        ],
+        "remaining_questions": [],
+        "future_revisit_triggers": [
+          "A genuinely new source-declared original: the existing owner may acquire it through the exact source/head-bound finite supplement, subject to normal checks; verify a future natural outbox arrival when it occurs.",
+          "A real source identity, access or content correction. Do not redownload unchanged completed originals or repeat closed metadata questions."
+        ],
+        "evidence": [
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/independent-readback.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/runtime-admission.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/tests.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/public-status.json"
+        ],
+        "canonical_collector_http_requests_by_this_review": 0,
+        "source_authorization_granted": false,
+        "whole_publisher_history_complete": false,
+        "source_maximum_verified": false,
+        "whole_history_ETA_verified": false
+      },
+      "reviewed_at_utc": "2026-10-27T06:38:12.641819+00:00",
       "evidence_urls": [
         "https://cmoneylearning.com.tw/",
         "https://cmoneylearning.com.tw/robots.txt"
       ],
-      "engineering_acceptance": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/ready.json",
-      "body_readback": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/readback.json",
-      "remaining_worklist": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/remaining-only.json",
+      "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/runtime-admission.json",
+      "body_readback": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/independent-readback.json",
+      "remaining_worklist": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/handoff.json",
+      "prior_scope_review_evidence": {
+        "path": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/prior-review-v7.json",
+        "sha256": "e9036eddc3b1daa25b8b688887dc0481b8a8a3a1063b92e0e7bc917d25ad5ca3"
+      },
       "semantic_verification": {
-        "run_receipt": "/root/stockAgent/artifacts/operations/agent-workflow/runs/news-cmoney-six-scoped-accept-20261024T084552-ed85429b/run.json",
-        "summary": "882 passed in 56.57s",
-        "installed_run_receipt": "artifacts/operations/agent-workflow/runs/news-cmoney-six-installed-ledger-20261024T085228-2d0f9321/run.json",
-        "installed_tests_passed": 384,
-        "runtime_files_unchanged_since_test_start": true,
+        "run_receipt": "artifacts/operations/agent-workflow/runs/news-original-declarations-share-20261027T061714-3973446e/run.json",
+        "summary": "913 passed in 134.76s (0:02:14)",
         "overlapping_test_counts_are_not_additive": true,
-        "current_body_and_runtime_acceptance": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/ready.json"
+        "current_body_and_runtime_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews_incremental_originals_20261027/runtime-admission.json"
       },
       "native_progress": {
-        "counter_scope": "v6 phase deltas plus explicitly labelled current total scope",
-        "closed_literal_url_scope": 28,
-        "previous_complete_bodies_preserved": 22,
-        "new_formal_body_heads": 6,
-        "stored_body_heads": 28,
+        "counter_scope": "v8 new-only delta from completed40; current44 source-declared originals",
+        "closed_literal_url_scope": 44,
+        "previous_complete_bodies_preserved": 40,
+        "new_formal_body_heads": 4,
+        "stored_body_heads": 44,
         "remaining_missing_heads_in_this_scope": 0,
         "original_frozen_cohort_urls": 2,
-        "reviewed_supplement_urls": 26,
-        "source_HTTP_requests_for_new_originals": 6,
-        "retained_raw_response_bytes": 637187,
-        "new_body_UTF8_bytes": 61020,
-        "retained_canonical_locators_reused": 6,
-        "canonical_locator_HTTP_requests": 0,
-        "extra_HTTP_for_parser_repair_or_materialization": 0,
+        "reviewed_supplement_urls": 42,
+        "source_article_capture_attempts": 4,
+        "retained_raw_response_bytes": 417899,
+        "new_body_UTF8_bytes": 37373,
+        "retained_normal_failure_locators_reused": 2,
+        "canonical_locator_HTTP_requests": 2,
         "old_complete_bodies_refetched": 0,
-        "closed429_questions_rearmed": false,
+        "closed_native_questions_preserved": 749,
+        "preexisting_closed_questions_at_phase_start": 747,
+        "new_native_questions_this_phase": 2,
+        "public_closed_scope_counts_verified": 44,
         "source_clock_or_refusal_reset": false,
         "CMNews_alias_equivalence_accepted": false,
-        "all951_UI_rows_fresh_and_consistent": true,
         "whole_publisher_history_complete": false,
         "maximum_throughput_verified": false,
-        "newly_closed_CMNews_metadata_questions": 0,
-        "previously_closed_CMNews_metadata_questions_preserved": 429,
-        "additional_pending_originals_outside_closed_scope": 0,
-        "new_unsubmitted_CMNews_identity_questions": 0,
-        "resolved_followups_without_native_job": 2
+        "same_response_outbox_regression_tested": true,
+        "natural_future_outbox_capture_verified": false
       },
-      "observation": "Remaining-only v6: reuse all429 closed CMNews identity/literal-locator questions and22 completed originals. Only six exact missing firstparty originals were fetched once each, retaining the same HTTP/auth pacing and refusal identity. Verify same-response canonical/title/visible byline/native publication and modification clocks, full independent written DOM text, raw/body SHA and dual-parser equality of every extracted field. Admit those retained originals through the existing immutable supplemental writer with zero materialization GETs. Preserve all22 old entire heads/payloads, the frozen two-member cohort, all20 prior supplemental memberships and their receipts, and the six original CMNews failure heads; no alias equivalence or rearmed question. Current28/28 finite original scope and all951 source keys were read back through both local and public status with a new real owner/PID and current loaded source generation. This is no whole-site history, original historical release observation, reuse license, public body or training export, or measured maximum throughput. Anue remains first; CNA deferred. Concurrent unactivated Contentplatform work is preserved, with its independent newline-fixture test failure retained, not silently counted as this scoped acceptance. Followup worklist correction: absence of a native_candidate_jobs row does not mean unprocessed. Both formerly listed new questions already have exact-source failure metadata and complete original heads; reuse those witnesses, issue0HTTP and preserve their CMNews identity failures. Remaining new questions and missing originals from these relations are0. Normal discovery title-age/last-seen updates are recorded separately from unchanged failed identity/body clocks. The independent Contentplatform newline fixture has now been corrected;83 scoped offline tests passed, with no new article request or production admission.",
-      "prior_scope_review_evidence": {
-        "path": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/prior-review-v5.json",
-        "sha256": "f46a8d843519a85570ce6a0c55a8c644095840d5b00b01e885e747704a4c1c78"
-      },
-      "additional_non_capture_work_evidence": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/remaining-only.json",
-      "followup_worklist_verification": {
-        "path": "/root/stockAgent/artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmoneylearning_six_v6_20261024/remaining-only.json",
-        "sha256": "ba1a7e69a46d37f1cf52fcadc76f794924a8acf15b672fc502cb88b88b8b69c7",
-        "retained_relations_reused": 2,
-        "source_requests": 0,
-        "CMNews_article_or_alias_accepted": false
-      }
+      "observation": "Remaining-only v8: preserve completed40,57 original/parent body heads,749 closed questions, frozen memberships, immutable payloads and protected trading/quote owners. Only four new declared originals were acquired by the canonical writer and independently read back; current finite scope44/44, not whole history. Replace fixed-slug config churn with exact source/head-bound supplements from retained normal metadata, closed54 observations or an atomic same-response outbox. No second HTTP client, failure-budget reset, alias acceptance or invented historical clock. Four capture attempts retained417899 raw bytes and37373 body UTF8 bytes. Shared913 semantic tests and current loaded-owner/policy/clock acceptance pass; public finite counts44/44 verified. Natural future outbox arrival, maximum stable source capacity and whole-history ETA remain unproven. Anue keeps its source/REP recovery priority; CNA remains deferred."
     },
     "cmnews": {
       "capture_decision": "reviewed_existing_scope",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:10:15.348542+00:00",
+        "known_url_heads": 66904,
+        "stored_body_heads": 65928,
+        "missing_body_heads": 976,
+        "unsupported_article_path_heads": 143,
+        "unsupported_tag_paths": 137,
+        "unsupported_onlynotecontent_paths": 6,
+        "onlynotecontent_stored_same_slug_candidates": 6,
+        "missing_identity_heads_with_prior_candidate_jobs": 26,
+        "missing_identity_heads_with_reused_failure_literal": 4,
+        "missing_identity_heads_with_new_pending_diagnostic": 2,
+        "census_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-current-scope-census-20261028.json",
+        "candidate_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-onlynotecontent-existing-candidates.json",
+        "identity_diagnostic_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-unanswered-identity-diagnostics-20261028.json",
+        "literal_original_reuse_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-existing-literal-originals-reuse-20261028.json",
+        "same_slug_is_proven_alias": false,
+        "missing_heads_are_unique_articles": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Reuse six already stored same-slug article candidates and their independent body readback; shared slug and title do not prove equivalence to the unsupported onlynotecontent heads.",
+          "Count retained bodies separately from latest states in a single read-only snapshot; source refusals and historical results remain unchanged.",
+          "Reuse 26 previously diagnosed identity heads and four exact source-declared original locators whose current CMoneylearning body heads match earlier accepted batch proofs. The remaining two heads have new pending same-owner diagnostic submissions; no body or alias is accepted."
+        ],
+        "remaining_questions": [
+          "For six onlynotecontent heads, seek publisher-declared identity and access evidence before changing their local scope outcome or accepting any alias.",
+          "Resolve the two pending identity observations after storage admission, and assess the 26 prior diagnostics, four source-declared originals and 80 missing source-not-found heads without repeating closed questions or assuming alias equivalence.",
+          "Keep 720 missing paywall or login heads as access-limited and the image-only head as nontext until independent permitted evidence exists; do not infer body text or entitlement.",
+          "The 137 tag paths are discovery or metadata candidates, not established article bodies; assess useful discovery separately from body completeness.",
+          "After physical storage admission, verify natural rechecks and new committed bodies through the canonical owner; known URL heads are not the whole historical universe."
+        ]
+      },
       "unfinished_work_audit_20261022": {
         "observed_at_utc": "2026-10-22T00:45:50.899851+00:00",
         "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/cmnews-canonical-relation-v19-final.json",
@@ -4241,6 +5145,84 @@
     },
     "moneyweekly": {
       "capture_decision": "reviewed_existing_scope",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T07:49:32+00:00",
+        "known_URL_heads": 3834,
+        "stored_body_heads": 589,
+        "closed_native_questions": 747,
+        "states": {
+          "article_rights_or_scope_excluded": 3055,
+          "body_not_found": 16,
+          "complete": 588,
+          "paywall_or_login": 53,
+          "redirect_not_article": 43,
+          "source_article_empty_template": 7,
+          "unsupported_article_path": 72
+        },
+        "completed_questions": [
+          "Reuse the previously accepted 588 stored body URL heads and 747 closed native questions, including nineteen paid-preview classifications. These are separate denominators, not whole-article or whole-history completeness.",
+          "The sixteen historical body_not_found outcomes were inferred from the retained exhaustive owner/HTTP census, without new source requests or rewriting old errors. Do not repeat their old first-hop question to reconstruct a missing per-job status.",
+          "Seven FN first hops and their seven literal destinations were separately handled: five new distinct bodies, two author-scope exclusions. Preserve opaque queries and original FN heads; no alias equivalence was adopted.",
+          "Five already retained inline PNGs and 825 OCR candidate lines are available with SHA/receipt evidence. Reuse this inference, three witnessed label/name disagreements and the witnessed 0.33-versus-300 numeric error.",
+          "Five native image references deduplicate to two distinct URLs. The current source capture scope excludes independent media downloads; this is a scope boundary, not an implemented asset downloader or completed image capture.",
+          "Compared510 image-bound cells at255 distinct table positions using the retained OCR, separate visual annotations and independent readback.490 agree and20 remain explicitly flagged. Preserve the first-pass manual typo and its separate correction; agreement is not accuracy or source/training admission. Reuse all five images and825 original OCR lines without another inference.",
+          "A complete FinMind receipt naturally refreshed one old URL last_seen_utc and added two new literal URLs: one new verified visible body and one scope exclusion. Old body/capture/source/clock fields remain unchanged. Independently verified the raw response, Parquet, durable receipt, permitted byline and current parser replay; current body heads589.",
+          "Reviewed the remaining321 OCR lines in five retained images as322 separate visual labels, including four missing y-axis labels. Together with504 previously reviewed numeric-grid lines, all825 original OCR lines have explicit review coverage.172 labels agree;139 strict text differences include script/punctuation variants, three are unreadable numeric tokens, three are fragmented and one is a chart-stroke detection. Separate annotations never overwrite OCR, admit financial values, digitize curves or infer publication dates. No repeated OCR or source requests.",
+          "For the previously unresolved article49208 two URL heads, the publisher's research-reader view declares a paid subscription and provides author/day precision; a separately linked 2021 archive shows a member-only preview. Preserve the two conflicting metadata dates, both original heads and historical owner errors. Neither research view is a new canonical HTTP result, full body, accepted alias, permission or intraday publication clock."
+        ],
+        "remaining_questions": [
+          "Before structured-feature admission, resolve the twenty flagged numeric-grid cells and remaining visual-label discrepancies using the preserved separate source-pixel annotations. All825 existing OCR lines are now classified; do not repeat unchanged OCR or grid review. The three curves remain image geometry, not digitized series. Source labels say two weeks (二週以來), flows in lots (張), prices in yuan and return rates in percent. Image dates/periods are not article release clocks; no automatic training admission.",
+          "Continue independently reviewed historical alternatives for sixteen missing original URL heads. Reuse the fourteen first-party indexed metadata hints and the new source/archival paid-preview evidence for the other two heads; do not repeat those views without new evidence. A research-reader view is not a canonical HTTP result, full body, alias, precise publication clock or access grant.",
+          "Support future independently observed FN literal routing only after identity/scope validation. Do not reopen the seven completed declarations, merge old heads by ID, guess URLs or strip opaque query parameters.",
+          "Revisit the two native media assets only if new source-owned media scope evidence changes their current exclusion. Existing public-text capture permission does not itself admit independent image downloads."
+        ],
+        "evidence": [
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_navigation_followup_20261027/completion-audit.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_navigation_followup_20261027/media-worklist.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_missing_source_followup_20261027/unresolved-worklist.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_missing_source_followup_20261027/primary-lookup.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_ocr_numeric_review_20261027/independent-readback.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_ocr_numeric_review_20261027/incremental-arrival-readback.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_ocr_numeric_review_20261027/tests.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_label_review_20261027/independent-readback.json",
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/moneyweekly_paid_archive_followup_20261027/source-evidence.json"
+        ],
+        "latest_table_grid_review": {
+          "visual_review_cells": 510,
+          "distinct_table_cell_positions": 255,
+          "counts": {"agrees": 490, "disagrees": 11, "unreadable_number": 3, "missing_candidate": 6},
+          "N_A_cells_preserved": 22,
+          "two_week_flow_cells_explicit_unit": "60 cells in source lots (張), without conversion; source header 二週以來",
+          "image_table_arithmetic_checks": 30,
+          "distinct_arithmetic_rows": 15,
+          "OCR_inference_repeated": false,
+          "manual_first_pass_typo_preserved_and_revised": true,
+          "original_OCR_and_images_unchanged": true,
+          "financial_observation_admitted": false
+        },
+        "latest_label_review": {
+          "remaining_OCR_lines_reviewed": 321,
+          "completed_numeric_OCR_lines_reused": 504,
+          "all_original_OCR_lines_classified": 825,
+          "separate_visual_labels": 322,
+          "counts": {"agrees": 172, "disagrees": 139, "unreadable_number": 3, "missing_candidate": 4, "fragmented_candidates": 3, "non_text_detection": 1},
+          "strict_text_differences_include_script_and_punctuation_variants": true,
+          "OCR_inference_repeated": false,
+          "original_OCR_and_images_unchanged": true,
+          "chart_curves_digitized": false,
+          "historical_release_clock_inferred": false,
+          "financial_observation_admitted": false
+        },
+        "independent_native_asset_urls": 2,
+        "native_asset_parent_references": 5,
+        "native_media_scope": "outside_current_capture_scope",
+        "canonical_collector_http_requests_by_this_review": 0,
+        "source_authorization_granted": false,
+        "whole_publisher_history_complete": false,
+        "all_OCR_numerical_cells_verified": false,
+        "source_maximum_verified": false,
+        "whole_history_ETA_verified": false
+      },
       "evidence_urls": [
         "https://www.moneyweekly.com.tw/ArticleData/Info/%E7%BD%AE%E5%BA%95%E6%96%87%E7%AB%A0/7",
         "https://www.moneyweekly.com.tw/ArticleData/Info/Article/254394",
@@ -4369,6 +5351,15 @@
         "https://ww2.money-link.com.tw/MemberCenter/MemberTerms.aspx?term=4"
       ],
       "observation": "The current primary public tweb declaration page footer, outside any login, assigns editorial-content rights to Systex and expressly prohibits reproduction in any form. Its separate financial-data disclaimer also requires written permission for downloading/storage and lists external market-data suppliers; do not automatically treat that financial-data product paragraph as the entire news contract. Together with the public copyright notice, this resolves the prior gap that relied only on member/product agreements, not our account's granted licensed-export scope. Third-party credited content remains a separate ownership question. No authorized full-history API, RSS body archive, account quota or paid entitlement was verified; failure to find an explicit RSS grant in reviewed official documents does not prove that no licensed feed exists. Preserve all known RealtimeNews/NewsContent.aspx identities, case-sensitive paths and original SN/PU queries, with metadata clocks distinct from native publication proof. Only public policy/navigation was reviewed; no article HTTP request, article/raw retention, alternate body route, source enable, extra HTTP owner, source deadline reset or quota inference. Keep the existing disabled candidate while obtaining a specifically authorized editorial/export/feed scope; this planning review grants no source permission and CNA remains deferred.",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:39:20.244965+00:00",
+        "known_url_heads": 104420,
+        "stored_body_heads": 0,
+        "user_purpose": "personal_noncommercial_nonpublic_research",
+        "completed_questions": ["Retain the existing editorial-versus-financial-product review and exact URL identities; do not repeat the already confirmed research-purpose question."],
+        "remaining_questions": ["Verify a publisher-specific editorial export, feed or API scope before enabling the current article adapter; retain case-sensitive paths, queries and third-party provenance.", "Determine historical range and quota from evidence for the actual available source, not from locally known URL heads."],
+        "evidence": ["artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/priority-permission-review-census-20261028.json"]
+      },
       "reviewed_at_utc": "2026-10-13T11:38:15+00:00"
     },
     "moneydj": {
@@ -4377,6 +5368,15 @@
         "https://www.moneydj.com/z/ABMoneydj/aboutTermsService.djhtm"
       ],
       "observation": "Current primary website terms section5 explicitly require company agreement before automated devices, scripts, spiders, crawlers or scrapers download site data. Section6 separately addresses written consent for defined AI uses and prohibits automated capture and large-scale reproduction. The prior forum/member references were not the actual whole-news website terms. Keep all known URLs and the canonical candidate adapter; no source permission, bulk endpoint, free archive access or numerical quota inferred. This review annotates the plan and read-only dashboard only; an independently supplied licensed scope requires its own verified configuration, not an automatic retry or cross-provider credential transfer.",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:39:20.244965+00:00",
+        "known_url_heads": 48453,
+        "stored_body_heads": 0,
+        "user_purpose": "personal_noncommercial_nonpublic_research",
+        "completed_questions": ["Retain the existing official website terms review and article adapter; do not repeat the already confirmed research-purpose question."],
+        "remaining_questions": ["Identify a publisher-specific authorized export, feed or API scope before enabling the existing article adapter.", "Verify any resulting historical range, rate and source attribution rather than inferring them from the known URL-head count."],
+        "evidence": ["artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/priority-permission-review-census-20261028.json"]
+      },
       "reviewed_at_utc": "2026-10-10T20:38:00+00:00"
     },
     "udn": {
@@ -4391,6 +5391,15 @@
         "https://mapi.udndata.com/ndapp/mydata/MdIndex"
       ],
       "observation": "Current primary UDN copyright statement covers udn.com and its subdomains including Economic Daily and UDN archives. Source terms require prior authorization for download/reproduction except applicable legal exceptions, separately require original third-party owners' written permission, and expressly require prior written consent for software/program development including LLM/ML/AI training. The earlier footer404 did not prove every licensed archive/API unavailable. On2026-10-13 follow the current official /authority/ footer to /faq/authority.html and /faq/marketing.html:both are readable, the latter explicitly offers original database licensed export and retrospective news licensing. The former identifies a data-analysis application, original newspaper/date/reporter credit and separate third-party/wire/contributor exclusions. Its form link failed in the web reader, not a verified source404 or unavailable licensing route. Ordinary database reading membership and institutional IP access do not by themselves grant programmatic extraction or corpus analysis; no login, purchase, form submission or original article request performed. Official fulltext FAQ separately declares Taiwan-local daily newspaper ingest around04:30 and newspaper-image ingest07:00; these are archive ingest schedules, not each article's exact original publication or historical PIT clocks. Declared full-paper periods:UDN1951-09-16 onward, EconomicDaily1967-04-20 onward, UnitedEvening1988-02-22 through2020-06-01,Upaper2007-03-26 through2018-04-26,MinSheng1978-02-18 through2006-11-30,Star1999-09-01 through2006-10-31; Europe2000-02-01 through2009-08-31 and WorldJournal2000-02-23 onward are partial holdings. Before1999-09-01 retrospective regional coverage is national/Taipei editions, not all local editions; advertising/commodity tables/exams need the separate original-page product. The FAQ's400/5000 personal/institutional yearly reading allowances and50 clipping strategies are product entitlements, not calls per hour, free bulk quota or our account's granted limits. No all-archive row total, precision, licensed-export schema/compression/quota/API health or entitlement verified. Keep all169300 locally known URLs as the prior snapshot, not today's whole-archive body coverage, and keep the canonical candidate adapter disabled until the actual export/feed scope and schema are supplied. Existing CNA/FinLab/TEJ permissions, personal-use intent and public article availability are not UDN permissions. No historical body, quota or reuse permission invented; no collector settings enabled by this planning review.",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:39:20.244965+00:00",
+        "known_url_heads": 170995,
+        "stored_body_heads": 0,
+        "user_purpose": "personal_noncommercial_nonpublic_research",
+        "completed_questions": ["Retain the existing UDN and archive policy and historical-product review; do not repeat the already confirmed research-purpose question."],
+        "remaining_questions": ["Verify the actual publisher-specific archive, licensed export or feed scope and interface before enabling the existing article adapter; preserve original outlet and third-party attribution.", "Confirm actual account eligibility, historical range and request allowance from the applicable interface; known URL heads and reading allowances are not bulk-API quotas."],
+        "evidence": ["artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/priority-permission-review-census-20261028.json"]
+      },
       "reviewed_at_utc": "2026-10-13T07:24:17+00:00"
     },
     "sinotrade_research": {
@@ -4553,6 +5562,31 @@
         "https://news.ltn.com.tw/rss/all.xml"
       ],
       "observation": "The source-declared copyright statement covers ltn.com.tw and its subdomains, restricts reproduction except applicable law or prior written authorization, and distinguishes third-party owners. A separately explicit RSS subscription notice permits noncommercial RSS news information with attribution and reserves withdrawal; this is not blanket HTML/full-history/training permission. Fourteen actual RSS URLs are declared on that primary notice. In a finite two-endpoint RSS-only diagnostic, the canonical NewsHTTP/robots/rate/circuit path returned200 for business.xml and all.xml, each with40 item rows; actual fields are title, description, link and pubDate, with zero content:encoded and zero creator fields. These are RSS metadata/abstracts, not full articles, eighty unique stories, an historical archive or an official maximum batch/quota. The actual REP permits this existing named personal RSS client under its wildcard group and separately disallows listed AI/training bots; no identity change or training entitlement was inferred. The web reader's earlier XML open error is not a publisher denial: canonical source access was independently measured. The diagnostic host is disjoint from enabled production hosts, only three actual HTTP requests including robots were sent, rejected/HTML/article/raw bodies were not retained, and the original Anue owner continued. The production article source remains disabled with its own original authorization fingerprint and every known URL; no duplicate recurring metadata pipeline, body acceptance, source cooldown reset, extra enabled-host owner or rate escalation was introduced.",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-27T21:37:39.869182+00:00",
+        "registered_rss_metadata_feeds": 14,
+        "verified_rss_metadata_feeds": 13,
+        "rss_feeds_with_current_error": 1,
+        "rss_error_endpoint": "people.xml",
+        "rss_error_code": "discovery_http_404",
+        "latest_feed_item_observations": 520,
+        "feed_observations_are_not_unique_articles": true,
+        "rss_article_bodies_accepted": 0,
+        "full_history_or_training_permission_verified": false,
+        "completed_questions": [
+          "Reuse the existing 14 registered metadata RSS jobs and their retained receipts; the earlier planning review predates this implementation, and its claim that no recurring pipeline was introduced describes only that earlier diagnostic.",
+          "A read-only queue and public dashboard observation found 13 verified feeds and one currently failing official people.xml URL; existing RSS title, description, link and pubDate observations remain distinct from full article bodies."
+        ],
+        "remaining_questions": [
+          "Let the existing owner retry the official people.xml feed under its persisted deadline and the physical capacity gate; a past 404 does not establish permanent unavailability or authorize a guessed replacement URL.",
+          "Keep HTML article download and training scope separate from the declared noncommercial RSS information scope; verify any newly supplied source-specific permission before changing that scope.",
+          "Resume the existing 300-second metadata schedule after disk admission and inspect fresh receipts; the last retained snapshot and overlapping feed rows do not establish complete historical coverage."
+        ],
+        "evidence": [
+          "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/ltn-existing-metadata-scope-20261028.json",
+          "docs/news_all_source_repair_2026-10-09.md"
+        ]
+      },
       "reviewed_at_utc": "2026-10-13T06:13:10+00:00"
     },
     "newtalk": {
@@ -4815,70 +5849,19 @@
       }
     },
     "contentplatform": {
-      "capture_decision": "review_incomplete",
-      "reviewed_at_utc": "2026-10-24T09:54:28.116706+00:00",
+      "capture_decision": "reviewed_existing_scope",
+      "reviewed_at_utc": "2026-10-26T11:35:19.659422+00:00",
       "evidence_urls": [
         "https://www.contentplatform.info/service/",
         "https://www.contentplatform.info/copyright/"
       ],
-      "observation": "Only unfinished work continued. Reused all28 CMoneyLearning originals and429 closed questions; two false CMNews followups resolved without HTTP. Registered75 known Mega News URLs through the canonical owner, using the retained original instead of refetching. Native v1 stored11 bodies. One still-missing signed reporter original established an image-only paragraph; v2 independently preserved its complete written text and all dual-parser fields, adopted it with0 new GETs, and retried only the55 remaining missing identity heads. Final14 bodies and9 durable batches independently read back; old11 heads/payloads unchanged. Remaining5 native geometry and56 currently unsupported attribution/scope outcomes remain unfinished, not declared absent or irreparable. Official numerical limits, historical origin, exhaustive discovery and stable maximum remain unverified. Private failure witnesses keep the existing two/provider/day budget; two diagnostic failures remain charged and require scope-versus-write classification review. No budgets, source refusal deadlines, source authorization or CNA deferral reset.",
-      "current_scope_review": {
-        "known_URL_heads": 75,
-        "stored_body_heads": 14,
-        "states": {
-          "article_identity_not_verified": 5,
-          "article_rights_or_scope_excluded": 56,
-          "complete": 14
-        },
-        "scope_basis": "Current75 literal local URLs; exact native canonical/mainEntity, visible Person/profile, signed reporter, complete written text and distinct declared clocks; no discovery or aliases.",
-        "previous_complete_bodies_preserved": 11,
-        "v1_retained_body_heads": 1,
-        "v1_normal_owner_new_body_heads": 10,
-        "v1_article_GETs": 74,
-        "initial_diagnostic_article_GETs": 1,
-        "v2_missing_original_GETs": 1,
-        "v2_retained_formal_body_heads": 1,
-        "v2_retained_materialization_GETs": 0,
-        "v2_owner_article_GETs": 55,
-        "v2_owner_new_body_heads": 2,
-        "old_complete_body_GETs": 0,
-        "body_batches_verified": 9,
-        "body_versions_verified": 14,
-        "current_heads_verified": 14,
-        "loaded_code_and_local_HTTPS_progress_verified": true,
-        "canonical_REP_observed": true,
-        "collector_known_URL_scope_enabled": true,
-        "bounded_first_pass_complete": true,
-        "all_known_bodies_complete": false,
-        "native_adapter_contract": "contentplatform_native_article_v2",
-        "observed_interval_seconds": 1.0,
-        "observed_parallelism": 2,
-        "observed_peak_HTTP_inflight": 2,
-        "stable_maximum_proved": false,
-        "official_rps_limit": null,
-        "official_daily_quota": null,
-        "earliest_available_history": null,
-        "source_authorization_granted": false,
-        "whole_publisher_history_complete": false,
-        "source_maximum_verified": false,
-        "official_numeric_rate_limit_verified": false,
-        "whole_history_ETA_verified": false,
-        "completed_questions": [
-          "Reused28 complete CMoneyLearning bodies and429 closed questions, no completed-source replay.",
-          "Registered the existing known-URL scope and admitted the original retained response without another GET.",
-          "Observed the exact image-only paragraph and preserved every written value;9 batches/14 current body heads verified.",
-          "Preserved11 completed Mega News heads/payloads and real HTTP cooldown/pacing; both dashboards reflect the same ready owner."
-        ],
-        "remaining_questions": [
-          "Diagnose the5 still-failing native article structures using new distinct evidence only; do not repeat the sealed image-paragraph question.",
-          "Review56 currently unsupported byline/scope outcomes against original attribution; unsupported current scope is not proof of nonexistent text. CNA remains deferred.",
-          "Identify whether the2 charged private diagnostic failures came from scope checks or storage; do not reset or refill the existing daily budget.",
-          "Review historical/incremental endpoints and source policies without guessed IDs or broad discovery.",
-          "Measure useful throughput after parser/scope repair; current insufficient useful data cannot establish a stable maximum or completion ETA."
-        ]
+      "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/runtime-admission.json",
+      "body_readback": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/readback.json",
+      "remaining_worklist": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/completion.json",
+      "prior_scope_review_evidence": {
+        "path": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/prior-review.json",
+        "sha256": "7d9cf4bad3b67d03e5044e0c3d16f4eb2118a8c09ce1b8d7ab256aa052076ac8"
       },
-      "engineering_acceptance": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_media_v2_20261024/ready-recovered.json",
-      "body_readback": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_media_v2_20261024/scope-observation.json",
       "historical_initial_review": {
         "known_URL_heads": 74,
         "stored_body_heads": 0,
@@ -4907,12 +5890,52 @@
         "source_maximum_verified": false,
         "official_numeric_rate_limit_verified": false
       },
+      "current_scope_review": {
+        "known_URL_heads": 75,
+        "stored_body_heads": 75,
+        "states": {
+          "complete": 75
+        },
+        "scope_basis": "Official personal noncommercial downloading clause; native identity, account and body credits remain distinct raw declarations.",
+        "previous_complete_bodies_preserved": 15,
+        "v4_new_bodies": 9,
+        "v5_new_bodies": 44,
+        "v5_retained_original_bodies": 2,
+        "v5_retained_materialization_HTTP_requests": 0,
+        "v5_missing_without_raw_selected": 49,
+        "old_complete_body_GETs": 0,
+        "closed_native_questions_preserved": 499,
+        "new_native_questions": 2,
+        "current_heads_verified": 75,
+        "all_known_bodies_complete": true,
+        "native_adapter_contract": "contentplatform_native_article_v8",
+        "personal_noncommercial_download_described_by_official_policy": true,
+        "source_authorization_granted": false,
+        "official_rps_limit": null,
+        "official_daily_quota": null,
+        "whole_publisher_history_complete": false,
+        "source_maximum_verified": false,
+        "whole_history_ETA_verified": false,
+        "v6_previous_complete_bodies_preserved": 68,
+        "v6_new_bodies": 3,
+        "v6_missing_only_selected": 7,
+        "v7_previous_complete_bodies_preserved": 71,
+        "v7_new_bodies": 2,
+        "v7_missing_only_selected": 4,
+        "v8_previous_complete_bodies_preserved": 73,
+        "v8_new_bodies": 2,
+        "v8_missing_only_selected": 2,
+        "static_HTML_only": true,
+        "dynamic_generated_body_not_claimed": true
+      },
       "semantic_verification": {
-        "run_receipt": "artifacts/operations/agent-workflow/runs/news-contentplatform-v2-shared-20261024T094641-68ae52c5/run.json",
-        "summary": "575 passed in 39.26s",
-        "earlier_registration_summary": "910 passed in 69.05s (0:01:09)",
+        "run_receipt": "artifacts/operations/agent-workflow/runs/news-cp-v8-static-contracts-20261026T112738-7575d62c/run.json",
+        "summary": "898 passed in 81.63s (0:01:21)",
         "overlapping_test_counts_are_not_additive": true
-      }
+      },
+      "observation": "Continue only the last two missing heads after v6 added3 and v7 added2. Reuse all73 Mega News bodies, 40 CMoneyLearning bodies and499 closed questions, including two new metadata-only structural observations. Those current responses proved native identity/byline/clocks but failed on a textless leaf and a script. V8 excludes nonrendered scripts without execution, src fetch or data-block decoding, and only empty nonembedded leaves without text, children, events, resource or custom-data attributes. Keep all written parents/siblings; unknown written/hidden/embedded content, identity and access gates remain. Static HTML prose completeness does not claim dynamically generated content. Reparse all73 old originals offline with both parsers and compare all values/bodies; use only canonical missing-head repair and durable receipts. Reproduce each old failure on newly accepted raw, independently check full static written DOM, raw/body SHA, bylines and distinct explicit clocks. No completed-body GET or old-question replay, authorization broadening, REP/cooldown reset or protected-service restart. 75 known URLs are not exhaustive publisher history or maximum-throughput proof; Anue first, CNA deferred.",
+      "native_failure_diagnosis": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_failure_shape55_20261026/readback.json",
+      "actual_failure_reproduction": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/contentplatform_static_document_v8_20261026/root-cause-readback.json"
     }
   }
 }

@@ -18,6 +18,7 @@ from downloader.news_fulltext_queue import utc_now
 
 
 XML_BODY_METADATA_FALLBACK = 'rss_invalid_xml_body_requires_html'
+XML_BODY_NO_USABLE_IDENTITY = 'rss_xml_body_no_usable_identity'
 MONTHLY_FULLTEXT_FEED_CONTRACT_VERSION = 1
 _XML_INVALID_ASCII_CONTROL = re.compile(rb'[\x00-\x08\x0b\x0c\x0e-\x1f]')
 FEED_BODY_PROVENANCE_FIELDS = ('fulltext_feed_body_contract_version', 'fulltext_feed_data_fingerprint',
@@ -129,6 +130,10 @@ def feed_records(response, http, source, *, body_contract_version=None):
     items = tree.findall("./channel/item")
     if len(items) > 100:
         raise NewsError("unbounded_fulltext_feed")
+    if metadata_only and not items:
+        # There is no item on which to carry the page's unreviewed-body state.
+        # Do not treat an invalid channel-level fragment as a successful feed.
+        raise NewsError('invalid_feed')
     historical_urls = None
     if historical_month:
         historical_urls = [normalize_url(item.findtext('link')) for item in items]
@@ -154,7 +159,8 @@ def feed_records(response, http, source, *, body_contract_version=None):
                 # Publication strings are copied only from unmodified fields,
                 # and used for queue ordering, not a training availability claim.
                 errors.append({'item_number': number, 'url': url, 'title': item.findtext('title') or '',
-                    'metadata_date_raw': item.findtext('pubDate') or '', 'error': XML_BODY_METADATA_FALLBACK})
+                    'metadata_date_raw': item.findtext('pubDate') or '', 'error': XML_BODY_METADATA_FALLBACK,
+                    'xml_body_metadata_only': True})
                 continue
             # Only the RSS content module's explicit body, NOT <description>,
             # media content or an unknown namespaced 'content' field.
@@ -220,5 +226,10 @@ def feed_records(response, http, source, *, body_contract_version=None):
                 records[-1].update(fulltext_feed_scope_contract_version=MONTHLY_FULLTEXT_FEED_CONTRACT_VERSION,
                                    fulltext_feed_scope=scope)
         except (NewsError, ValueError, TypeError) as error:
-            errors.append({"item_number": number, "url": url, "error": error.code if isinstance(error, NewsError) else "invalid_bulk_post_fields"})
+            item_error = {"item_number": number, "url": url, "error": error.code if isinstance(error, NewsError) else "invalid_bulk_post_fields"}
+            if metadata_only:
+                # Identity/policy checks can fail before the ordinary fallback
+                # branch; the shared response is still wholly unreviewed.
+                item_error['xml_body_metadata_only'] = True
+            errors.append(item_error)
     return records, errors

@@ -39,8 +39,11 @@ ETTODAY_VISIBLE_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_person_clo
 ETTODAY_IMAGE_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_after_image_person_clock_original_v1'
 ETTODAY_NONEMPTY_ORIGINAL_QUESTION = 'ettoday_private_first_nonempty_reporter_person_clock_original_v1'
 ETTODAY_CANONICAL_ORIGINAL_QUESTION = 'ettoday_private_visible_reporter_canonical_author_original_v1'
+ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION = 'ettoday_private_literal_reporter_schema_person_disagreement_original_v1'
+ETTODAY_CAPTION_ORIGINAL_QUESTION = 'ettoday_private_finance_image_caption_next_reporter_original_v1'
+ETTODAY_CONFLICT_ORIGINAL_QUESTION = 'ettoday_private_finance_conflicting_creator_original_v1'
 GVM_ORIGINAL_QUESTION = 'gvm_private_public_native_header_verified_missing_original_v1'
-ORIGINAL_EVIDENCE_VERSIONS = frozenset({4, 5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, *CONTENTPLATFORM_EVIDENCE_VERSIONS})
+ORIGINAL_EVIDENCE_VERSIONS = frozenset({4, 5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 26, 28, 29, 30, 31, 32, 33, 38, 39, 40, 41, 42, 49, 52, 56, 58, 59, 60, 68, *CONTENTPLATFORM_EVIDENCE_VERSIONS})
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,10 @@ def private_contentplatform_image_original_permit(response, source, requested_ur
     return _private_contentplatform_permit(response, source, requested_url, evidence=45)
 
 
+def private_contentplatform_prefix_original_permit(response, source, requested_url):
+    return _private_contentplatform_permit(response, source, requested_url, evidence=53)
+
+
 def _private_contentplatform_permit(response, source, requested_url, *, evidence):
     """One exact missing signed original through the resident owner's lane.
 
@@ -72,7 +79,7 @@ def _private_contentplatform_permit(response, source, requested_url, *, evidence
     from downloader.news_fulltext_contentplatform import (
         CONTENTPLATFORM_EVIDENCE_QUESTIONS, contentplatform_article_id,
         contentplatform_original_source, contentplatform_private_failure_permit, contentplatform_private_root_permit,
-        contentplatform_private_image_permit,
+        contentplatform_private_image_permit, contentplatform_private_prefix_permit,
     )
     if (not contentplatform_original_source(source) or contentplatform_article_id(requested_url) is None
             or response.status != 200 or response.redirects or response.url != requested_url
@@ -81,7 +88,7 @@ def _private_contentplatform_permit(response, source, requested_url, *, evidence
                 not in {'text/html', 'application/xhtml+xml'}):
         raise NewsError('private_contentplatform_original_scope_not_verified')
     verify = {43: contentplatform_private_failure_permit, 44: contentplatform_private_root_permit,
-        45: contentplatform_private_image_permit}[evidence]
+        45: contentplatform_private_image_permit, 53: contentplatform_private_prefix_permit}[evidence]
     native = verify(response, source)
     return {'contract_version': 1, 'question': CONTENTPLATFORM_EVIDENCE_QUESTIONS[evidence],
         'provider': source.provider, 'url': requested_url,
@@ -265,9 +272,124 @@ def _ettoday_visible_credit(first, *, allow_replaced_images=False, first_nonempt
     return signature, prose, facts
 
 
+def private_ettoday_conflict_original_permit(response, source, requested_url, expected_conflict):
+    """Retain only the same previously diagnosed public creator conflict.
+
+    The predecessor proves a specific unresolved question; it does not establish
+    which declaration is correct or authorize an accepted article. Both the
+    worker and the owner verify the immutable response against that evidence.
+    """
+    from downloader.news_fulltext_ettoday import (
+        _ettoday_finance_credit_context, ettoday_finance_attribution_predicates,
+        ettoday_finance_prelude_excerpt,
+    )
+    error = 'private_ettoday_conflict_original_scope_not_verified'
+    keys = {'prelude_text_sha256', 'literal_role_name', 'creator_values',
+        'published_at_raw', 'modified_at_raw', 'native_authors', 'native_publisher'}
+    if (not isinstance(expected_conflict, dict) or set(expected_conflict) != keys
+            or not isinstance(expected_conflict['creator_values'], list)
+            or len(expected_conflict['creator_values']) != 2
+            or not all(isinstance(value, str) for value in expected_conflict['creator_values'])):
+        raise NewsError(error)
+    predicates = ettoday_finance_attribution_predicates(response, source, requested_url)
+    excerpt = ettoday_finance_prelude_excerpt(response, source, requested_url)
+    _, body, _, _, _ = _ettoday_finance_credit_context(response, source, requested_url)
+    outcomes = predicates['parser_outcomes']
+    if (any(predicates[k] != expected_conflict[k] for k in keys)
+            or excerpt['text_sha256'] != expected_conflict['prelude_text_sha256']
+            or predicates['creator_matches_literal_role_name']
+            or not predicates['creator_identifier_valid']
+            or predicates['creator_values'][1] != urlsplit(requested_url).path.rsplit('/', 1)[-1]
+            or not predicates['author_is_exact_publisher_organization']
+            or not predicates['publisher_is_expected_organization']
+            or any(outcome['parse_succeeded'] or outcome['attribution_failure_stage'] != 'bare_reporter_creator_mismatch'
+                   for outcome in outcomes)
+            or body.select('iframe,form,[data-paywall],.paywall,vip-content')
+            or any(re.match(r'^[（(]?(?:轉載自|轉自|本文轉載|本文由|新聞來源[：:])',
+                p.get_text(' ', strip=True)) for p in body.find_all('p'))):
+        raise NewsError(error)
+    return {'contract_version': 1, 'question': ETTODAY_CONFLICT_ORIGINAL_QUESTION,
+        'provider': source.provider, 'url': requested_url, 'requested_url': requested_url,
+        'document_url': response.url, 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+        'data_fingerprint': source.data_fingerprint, 'authorization_fingerprint': source.authorization_fingerprint,
+        'prelude_text_sha256': predicates['prelude_text_sha256'],
+        'scope': 'same_public_finance_creator_conflict_private_evidence_only',
+        'author_or_supplier_accepted': False, 'source_values_rewritten': False}
+
+
+def private_ettoday_caption_original_permit(response, source, requested_url, *, shape_facts=None):
+    """The current finance caption/image prelude with a separate visible credit.
+
+    Reuse the attested caption geometry and current clock/author relationships,
+    without enabling the house parser on finance or accepting an article. The
+    resident lane is once-only; an unexpected shape retains only finite facts.
+    """
+    from downloader.news_fulltext_ettoday import (
+        ETTODAY_BODY_SELECTOR, _REPORTER, _clocks, _schemas, _visible,
+        _visible_text, _house_image_caption_only, ettoday_literal_diagnostic_url,
+        ettoday_resident_source,
+    )
+    error = 'private_ettoday_caption_original_scope_not_verified'
+    if (not ettoday_resident_source(source, layout='ettoday_visible_article_v40')
+            or not ettoday_literal_diagnostic_url(requested_url)
+            or urlsplit(requested_url).netloc != 'finance.ettoday.net'
+            or response.status != 200 or response.redirects or response.url != requested_url
+            or not isinstance(response.body, bytes) or not 0 < len(response.body) <= MAX_ORIGINAL_BYTES
+            or response.headers.get('content-type', '').split(';', 1)[0].strip().lower()
+                not in {'text/html', 'application/xhtml+xml'}):
+        raise NewsError(error)
+    document = public_article_document(response.body, source, page_url=requested_url)
+    canonical = _one(document, 'head > link[rel~=canonical][itemprop=mainEntityOfPage][href]', error)
+    social = _one(document, 'head > meta[property="og:url"][content]', error)
+    scope = _one(document, '.subject_article', error)
+    heading = _one(scope, ':scope > header > h1.title[itemprop=headline]', error)
+    body = _one(scope, ETTODAY_BODY_SELECTOR, error)
+    title = heading.get_text(' ', strip=True)
+    if (canonical.get('href') != requested_url or social.get('content') != requested_url or not title
+            or len(document.select('.story[itemprop=articleBody]')) != 1
+            or document.html.get('itemtype') not in {'http://schema.org/NewsArticle', 'https://schema.org/NewsArticle'}
+            or body.select('iframe,form,[data-paywall],.paywall,vip-content')):
+        raise NewsError(error)
+    _visible_text(heading); _visible(body)
+    first = body.find('p', recursive=False)
+    if shape_facts is not None:
+        children = ([n for n in first.contents if not isinstance(n, str) or n.strip()]
+            if first is not None else [])
+        shape_facts.update(first_paragraph_present=first is not None,
+            first_paragraph_child_count=len(children),
+            first_paragraph_children=[(n.name if n.name in {'img', 'br', 'strong', 'span', 'b', 'a', 'em'}
+                else 'other') if hasattr(n, 'name') and n.name else 'text' for n in children[:16]],
+            first_paragraph_text_characters=len(first.get_text(' ', strip=True)) if first is not None else 0,
+            following_paragraph_present=first is not None and first.find_next_sibling('p') is not None,
+            literal_text_or_names_retained=False)
+    if (first is None or any(n.get_text(' ', strip=True) for n in first.find_previous_siblings())
+            or _house_image_caption_only(first) is None):
+        raise NewsError(error)
+    credit = first.find_next_sibling()
+    signature = credit.get_text(' ', strip=True)
+    names = _REPORTER.fullmatch(signature)[1].split('、')
+    if (len(names) != len(set(names)) or not any(n.get_text(' ', strip=True)
+            for n in credit.find_next_siblings('p'))
+            or any(re.match(r'^[（(]?(?:轉載自|轉自|本文轉載|本文由|新聞來源[：:])',
+                p.get_text(' ', strip=True)) for p in body.find_all('p'))):
+        raise NewsError(error)
+    published, modified, _ = _clocks(document, scope, 'finance.ettoday.net', adapter_contract_version=40)
+    _schemas(document, requested_url, title, published, modified, names,
+        adapter_contract_version=40, require_headline_witness=True)
+    return {'contract_version': 1, 'question': ETTODAY_CAPTION_ORIGINAL_QUESTION,
+        'provider': source.provider, 'url': requested_url, 'requested_url': requested_url,
+        'document_url': response.url, 'response_sha256': hashlib.sha256(response.body).hexdigest(),
+        'data_fingerprint': source.data_fingerprint, 'authorization_fingerprint': source.authorization_fingerprint,
+        'printed_signature_sha256': hashlib.sha256(signature.encode()).hexdigest(),
+        'caption_image_next_reporter_geometry_verified': True,
+        'reporters_taken_from_whole_visible_signature': True, 'source_values_rewritten': False,
+        'scope': 'known_public_finance_caption_image_reporter_clock_private_evidence_only'}
+
+
 def private_ettoday_credit_original_permit(response, source, requested_url, *, include_document=False,
                                           _inline_credit=False, _visible_credit=False, _replaced_images=False,
-                                          _first_nonempty_line=False, _canonical_author_scope=False):
+                                          _first_nonempty_line=False, _canonical_author_scope=False,
+                                          _relationship_facts=None, _preserve_person_disagreement=False):
     """Exact public WWW original after a separately completed credit-shape lead.
 
     A plain native first line must name the reporter, followed by a direct BR
@@ -348,7 +470,12 @@ def private_ettoday_credit_original_permit(response, source, requested_url, *, i
             trace['verification_stage'] = 'same_article_author' if _canonical_author_scope else 'same_article_person'
         notices = _schemas(document, requested_url, title, published, modified, names,
             adapter_contract_version=39, require_headline_witness=True,
-            native_named_authors=() if _canonical_author_scope else tuple(names))
+            native_named_authors=() if _canonical_author_scope else tuple(names),
+            relationship_facts=_relationship_facts,
+            preserve_person_disagreement=_preserve_person_disagreement)
+        if _preserve_person_disagreement and not any(
+                n['kind'] == 'native_reporter_and_schema_person_disagree' for n in notices):
+            raise NewsError('private_ettoday_person_disagreement_not_observed')
         if trace is not None:
             trace['verification_stage'] = 'reprint_guard'
         if any(re.match(r'^[（(]?(?:轉載自|轉自|本文轉載|本文由|新聞來源[：:])',
@@ -358,9 +485,10 @@ def private_ettoday_credit_original_permit(response, source, requested_url, *, i
         if trace is not None:
             exc.private_scope_facts = trace
         raise
-    mode = ('canonical' if _canonical_author_scope else 'nonempty' if _first_nonempty_line else 'image' if _replaced_images else
+    mode = ('disagreement' if _preserve_person_disagreement else 'canonical' if _canonical_author_scope else 'nonempty' if _first_nonempty_line else 'image' if _replaced_images else
         'visible' if _visible_credit else 'inline' if _inline_credit else 'plain')
     question, scope_suffix = {
+        'disagreement':(ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION,'literal_reporter_disagreeing_schema_person_clock'),
         'canonical':(ETTODAY_CANONICAL_ORIGINAL_QUESTION,'visible_reporter_canonical_author_clock'),
         'nonempty':(ETTODAY_NONEMPTY_ORIGINAL_QUESTION,'first_nonempty_reporter_person_clock'),
         'image':(ETTODAY_IMAGE_ORIGINAL_QUESTION,'visible_reporter_after_image_person_clock'),
@@ -383,7 +511,24 @@ def private_ettoday_credit_original_permit(response, source, requested_url, *, i
             'schema_declares_ordered_subset_of_native_reporters'}})
         permit['reporters_taken_from_whole_visible_signature'] = True
         permit['source_values_rewritten'] = False
+    if _preserve_person_disagreement:
+        permit['author_declarations_disagree'] = True
+        permit['same_person_or_editor_role_inferred'] = False
     return (permit, document) if include_document else permit
+
+
+def private_ettoday_disagreement_original_permit(response, source, requested_url, *, include_document=False,
+                                                relationship_facts=None):
+    """Preserve both source declarations in private evidence, without resolving them.
+
+    Identity, native literal reporter, unique article, publisher, source clocks,
+    visibility and reprint checks still apply. A schema-only author cannot
+    supply the missing visible credit, desk identity or capture permission.
+    """
+    return private_ettoday_credit_original_permit(response, source, requested_url,
+        include_document=include_document, _visible_credit=True, _replaced_images=True,
+        _first_nonempty_line=True, _canonical_author_scope=True, _preserve_person_disagreement=True,
+        _relationship_facts=relationship_facts)
 
 
 def private_ettoday_inline_credit_original_permit(response, source, requested_url, *, include_document=False):
@@ -967,7 +1112,25 @@ def retain_original(queue, job, observation):
     if not isinstance(permit, dict):
         raise ValueError('private_original_permit_mismatch')
     version = job.get('evidence_contract_version')
-    if version == 5:
+    if version == 68:
+        expected = private_ettoday_conflict_original_permit(response, source, job['url'], job.get('expected_conflict'))
+        question = ETTODAY_CONFLICT_ORIGINAL_QUESTION
+    elif version == 60:
+        expected = private_ettoday_caption_original_permit(response, source, job['url'])
+        question = ETTODAY_CAPTION_ORIGINAL_QUESTION
+    elif version == 59:
+        from downloader.news_fulltext_managertoday import MANAGER_MULTIPLE_ORIGINAL_QUESTION,private_manager_multiple_original_permit
+        expected=private_manager_multiple_original_permit(response,source,job['url'])
+        question=MANAGER_MULTIPLE_ORIGINAL_QUESTION
+    elif version == 58:
+        from downloader.news_fulltext_managertoday import MANAGER_BODY_ORIGINAL_QUESTION, private_manager_body_original_permit
+        expected = private_manager_body_original_permit(response,source,job['url'])
+        question = MANAGER_BODY_ORIGINAL_QUESTION
+    elif version == 49:
+        from downloader.news_fulltext_gnn import private_gnn_boundary_original_permit,GNN_BOUNDARY_ORIGINAL_QUESTION
+        expected=private_gnn_boundary_original_permit(response,source,job['url'])
+        question=GNN_BOUNDARY_ORIGINAL_QUESTION
+    elif version == 5:
         expected = _legacy_permit(source, response, job['url'], permit.get('document_url'))
         question = LEGACY_QUESTION
     elif version == 9:
@@ -1023,6 +1186,10 @@ def retain_original(queue, job, observation):
         from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_IMAGE_QUESTION
         expected = private_contentplatform_image_original_permit(response, source, job['url'])
         question = CONTENTPLATFORM_IMAGE_QUESTION
+    elif version == 53:
+        from downloader.news_fulltext_contentplatform import CONTENTPLATFORM_PREFIX_QUESTION
+        expected = private_contentplatform_prefix_original_permit(response, source, job['url'])
+        question = CONTENTPLATFORM_PREFIX_QUESTION
     elif version == 40:
         expected = private_gvm_original_permit(response, source, job['url'])
         question = GVM_ORIGINAL_QUESTION
@@ -1052,6 +1219,13 @@ def retain_original(queue, job, observation):
     elif version == 33:
         expected = private_ettoday_canonical_credit_original_permit(response, source, job['url'])
         question = ETTODAY_CANONICAL_ORIGINAL_QUESTION
+    elif version == 56:
+        from downloader.news_fulltext_knews import KNEWS_FAILURE_ORIGINAL_QUESTION, private_knews_failure_original_permit
+        expected = private_knews_failure_original_permit(response, source, job['url'])
+        question = KNEWS_FAILURE_ORIGINAL_QUESTION
+    elif version == 52:
+        expected = private_ettoday_disagreement_original_permit(response, source, job['url'])
+        question = ETTODAY_DISAGREEMENT_ORIGINAL_QUESTION
     else:
         expected = {'contract_version':1,'question':QUESTION,'provider':'pocket','url':response.url,
             'response_sha256':hashlib.sha256(response.body).hexdigest(),
@@ -1059,7 +1233,7 @@ def retain_original(queue, job, observation):
             'scope':'reviewed_current_public_native_own_organization_private_original_only'}
         question = QUESTION
     bound = source.pdf_max_response_bytes if version == 12 else MAX_ORIGINAL_BYTES
-    expected_provider = ('contentplatform' if version in CONTENTPLATFORM_EVIDENCE_VERSIONS else 'gvm' if version in {40, 41, 42} else 'ettoday' if version in {28, 29, 30, 31, 32, 33} else 'setn_inews_scope' if version in {25, 26, 38, 39} else 'taiwannews' if version in {16, 17, 18} else 'stockfeel' if version == 15 else 'globalvoices' if version == 13 else 'fed_board' if version == 12
+    expected_provider = ('managertoday' if version in {58,59} else 'knews' if version == 56 else 'gnn' if version == 49 else 'contentplatform' if version in CONTENTPLATFORM_EVIDENCE_VERSIONS else 'gvm' if version in {40, 41, 42} else 'ettoday' if version in {28, 29, 30, 31, 32, 33, 52, 60, 68} else 'setn_inews_scope' if version in {25, 26, 38, 39} else 'taiwannews' if version in {16, 17, 18} else 'stockfeel' if version == 15 else 'globalvoices' if version == 13 else 'fed_board' if version == 12
         else 'bastillepost' if version in {9, 11} else 'pocket')
     if (version not in ORIGINAL_EVIDENCE_VERSIONS
             or source.provider != expected_provider
@@ -1082,7 +1256,7 @@ def retain_original(queue, job, observation):
         'authorization_fingerprint':source.authorization_fingerprint,
         'headers_json':json.dumps({k:v for k,v in response.headers.items()
             if k.lower() in {'date','content-type','last-modified'}},ensure_ascii=False),**flags}
-    if version in {5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 28, 29, 30, 31, 32, 33}:
+    if version in {5, 9, 11, 12, 13, 15, 16, 17, 18, 25, 28, 29, 30, 31, 32, 33, 52, 60, 68}:
         record.update(source_document_url=permit['document_url'],
             transport_redirects_json=json.dumps([asdict(hop) for hop in response.redirects],ensure_ascii=False,sort_keys=True))
     atomic_write_parquet(path,table_from_records([record]),compression='zstd',compression_level=9,durable=True)
@@ -1102,6 +1276,26 @@ def retain_original(queue, job, observation):
 
 def retention_flags(request, result, state):
     """Uncertain outcomes must not falsely promise that no raw witness exists."""
+    if request.get('evidence_contract_version') == 63:
+        retained = (result.get('public_schema_declarations_retained', False) if result is not None
+            else None if state in {'reserved', 'uncertain_outcome'} else False)
+        return {'raw_or_names_or_body_retained': retained, 'public_schema_declarations_retained': retained,
+                'raw_or_body_retained': False, 'raw_response_retained': False, 'full_body_retained': False}
+    if (request.get('evidence_contract_version') == 62
+            or request.get('evidence_contract_version') == 67
+                and urlsplit(request.get('target', {}).get('url', '')).path.startswith('/Magazine/Info/')):
+        retained = (result.get('diagnostic_excerpt_retained', False) if result is not None
+            else None if state in {'reserved', 'uncertain_outcome'} else False)
+        return {'raw_or_names_or_body_retained': retained, 'raw_or_body_retained': retained,
+                'diagnostic_excerpt_retained': retained, 'raw_response_retained': False,
+                'full_body_retained': False}
+    if request.get('evidence_contract_version') == 61:
+        # This question retains bounded public credit headers, never an original
+        # response. Keep private readback honest about literal names/declarations.
+        retained = (result.get('public_header_declarations_retained', False) if result is not None
+            else None if state in {'reserved', 'uncertain_outcome'} else False)
+        return {'raw_or_names_or_body_retained': retained,
+                'public_header_declarations_retained': retained, 'raw_or_body_retained': False}
     if request.get('evidence_contract_version',1) not in ORIGINAL_EVIDENCE_VERSIONS:
         return {'raw_or_names_or_body_retained':False}
     if result is not None:

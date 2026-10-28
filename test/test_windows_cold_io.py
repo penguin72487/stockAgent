@@ -10,6 +10,38 @@ from stockagent.data_sync import windows_cold_io as native
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+@pytest.mark.parametrize('linux_free,physical_free,required,accepted', [
+    (293 * 1024**3, 30 * 1024**3, 32 * 1024**3, False),
+    (293 * 1024**3, 32 * 1024**3, 32 * 1024**3, True),
+    (30 * 1024**3, 293 * 1024**3, 32 * 1024**3, False),
+])
+def test_workspace_admission_distinguishes_verified_capacity_refusal(
+        tmp_path, monkeypatch, linux_free, physical_free, required, accepted):
+    from stockagent.data_sync import recovery_queue
+    original_read_text = Path.read_text
+    monkeypatch.setattr(Path, 'read_text', lambda path, *a, **kw:
+                        'fixture-microsoft' if str(path) == '/proc/sys/kernel/osrelease'
+                        else original_read_text(path, *a, **kw))
+    monkeypatch.setattr(native.subprocess, 'run', lambda *_a, **_kw: SimpleNamespace(stdout='ext4\n'))
+    monkeypatch.setattr(native.os, 'statvfs', lambda *_: SimpleNamespace(f_bavail=linux_free, f_frsize=1))
+    probes = []
+    def physical(config):
+        probes.append(config)
+        return physical_free
+    monkeypatch.setattr(recovery_queue, 'physical_free_bytes', physical)
+    if accepted:
+        result = native.admit_workspace(tmp_path, required, windows_distribution='fixture')
+        assert result == {'filesystem': 'ext4', 'physical_free_bytes': min(linux_free, physical_free),
+                          'required_bytes': required}
+    else:
+        with pytest.raises(native.WorkspaceCapacityDeferred, match='real physical free space') as caught:
+            native.admit_workspace(tmp_path, required, windows_distribution='fixture')
+        assert isinstance(caught.value, SnapshotError)  # Existing callers remain compatible.
+        assert caught.value.physical_free_bytes == min(linux_free, physical_free)
+        assert caught.value.required_bytes == required
+    assert probes == [{'windows_distribution': 'fixture', 'powershell': native.POWERSHELL}]
+
+
 def test_non_d_read_and_hash_use_exact_regular_bytes(tmp_path):
     path = tmp_path / 'bytes.bin'
     value = bytes(range(256)) * 4097
@@ -66,6 +98,13 @@ def test_d_redirect_rejected_before_native_process_launch(monkeypatch):
 def test_partial_append_needs_exact_sha_before_native_process():
     with pytest.raises(SnapshotError, match='prefix'):
         native.BinaryWriter(Path('/mnt/d/stockagent-cold-primary/incoming/a'), offset=1)
+
+
+@pytest.mark.parametrize('offset,prefix', [(True, 'a'*64), (0, 'g'*64), (0, ''), (-1, 'a'*64)])
+def test_native_resume_identity_rejected_before_process(offset, prefix):
+    with pytest.raises(SnapshotError, match='prefix'):
+        native.BinaryWriter(Path('/mnt/d/stockagent-cold-primary/incoming/a'),
+                            offset=offset, prefix_sha256=prefix)
 
 
 @pytest.mark.parametrize('failure', ['startup-once', 'startup-exhausted', 'created-partial',
@@ -365,9 +404,11 @@ def test_native_batch_requires_one_result_for_every_member(monkeypatch):
     class Process:
         returncode = 0
         stdout = io.BytesIO()
+        stdin = io.BytesIO()
         def communicate(self, *args, **kwargs):return b'{"bytes": 1, "sha256": "a"}\n', None
         def poll(self):return 0
     monkeypatch.setattr(native, '_launch', lambda *a, **k: (Process(), io.BytesIO()))
+    monkeypatch.setattr(native, '_await_batch_ready', lambda *a, **k: None)
     with pytest.raises(SnapshotError, match='omitted'):
         native._batch([{'mode': 'hash', 'expected_bytes': 1}] * 2)
 
@@ -378,7 +419,7 @@ def test_native_batch_retries_only_an_empty_read_only_startup(monkeypatch,failur
     row=json.dumps({'bytes':5,'sha256':'a'*64}).encode()+b'\n'
     class Process:
         def __init__(self,output,code):
-            self.stdout=io.BytesIO();self.output=output;self.returncode=code
+            self.stdout=io.BytesIO();self.stdin=io.BytesIO();self.output=output;self.returncode=code
         def communicate(self,*args,**kwargs):return self.output,None
         def poll(self):return self.returncode
     def launch(*args,**kwargs):
@@ -389,6 +430,7 @@ def test_native_batch_retries_only_an_empty_read_only_startup(monkeypatch,failur
                b'<3>WSL ERROR: UtilAcceptVsock:273: accept4 failed 110')
         return process,io.BytesIO(error if fail else b'')
     monkeypatch.setattr(native,'_launch',launch)
+    monkeypatch.setattr(native, '_await_batch_ready', lambda *a, **k: None)
     monkeypatch.setattr(native.time,'sleep',lambda n:None)
     configs=[{'mode':'copy' if failure=='copy-startup' else 'hash','expected_bytes':5}]*2
     if failure=='startup-once':

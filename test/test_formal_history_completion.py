@@ -153,6 +153,57 @@ def test_preflight_preserves_configured_full_history_scope(factorized_calendar):
     assert train_config.data.panel_start_date == "2014-01-06"
 
 
+def test_preflight_rejects_missing_checkpoint_year_before_inference(factorized_calendar, monkeypatch):
+    cfg, train_config, manifest_path = factorized_calendar
+    train_config.data.panel_start_date = "2026-01-01"
+    train_config.walk_forward = SimpleNamespace(year_boundary_mode="calendar")
+    train_config.training = SimpleNamespace(lookback=32)
+    checkpoint = Path(cfg.config_path).with_name("checkpoint_best.pt")
+    monkeypatch.setattr(discord_bot, "_market_model_checkpoint", lambda _: checkpoint)
+    monkeypatch.setattr(
+        "stockagent.training.runtime.load_checkpoint",
+        lambda _: {"fold_id": 11, "train_years": list(range(2014, 2025)),
+                   "val_years": [2025], "test_years": [2026]},
+    )
+    monkeypatch.setattr(discord_bot, "_formal_history_completed_date", lambda _: None)
+    monkeypatch.setattr(discord_bot.subprocess, "run", lambda *_a, **_kw: pytest.fail("must not start trainer"))
+    status = SimpleNamespace(data=SimpleNamespace(
+        expected_latest_date="2026-10-14", last_data_date="2026-10-14", panel_date=None,
+    ))
+    with pytest.raises(discord_bot.BotUserError, match=r"missing_val_years=\[2025\]"):
+        discord_bot._run_formal_history_backfill(cfg, status)
+
+
+def test_preflight_accepts_saved_checkpoint_years_without_renumbering(factorized_calendar, monkeypatch):
+    cfg, train_config, manifest_path = factorized_calendar
+    train_config.data.panel_start_date = "2014-01-06"
+    train_config.walk_forward = SimpleNamespace(year_boundary_mode="calendar")
+    train_config.training = SimpleNamespace(lookback=32)
+    manifest_path.write_text(json.dumps({"dates": ["2014-01-06", "2025-01-02", "2026-10-13", "2026-10-14"]}))
+    monkeypatch.setattr(discord_bot, "_market_model_checkpoint", lambda _: Path("checkpoint_best.pt"))
+    monkeypatch.setattr(
+        "stockagent.training.runtime.load_checkpoint",
+        lambda _: {"fold_id": 11, "train_years": list(range(2014, 2025)),
+                   "val_years": [2025], "test_years": [2026]},
+    )
+    assert discord_bot._preflight_formal_history_calendar(cfg) is None
+
+
+def test_preflight_rejects_mismatched_requested_fold(factorized_calendar, monkeypatch):
+    cfg, train_config, manifest_path = factorized_calendar
+    train_config.walk_forward = SimpleNamespace(year_boundary_mode="calendar")
+    train_config.training = SimpleNamespace(lookback=32)
+    manifest_path.write_text(json.dumps({"dates": ["2014-01-06", "2025-01-02", "2026-10-13", "2026-10-14"]}))
+    monkeypatch.setattr(discord_bot, "_market_model_checkpoint", lambda _: Path("checkpoint_best.pt"))
+    monkeypatch.setattr(
+        "stockagent.training.runtime.load_checkpoint",
+        lambda _: {"fold_id": 10, "train_years": list(range(2014, 2025)),
+                   "val_years": [2025], "test_years": [2026]},
+    )
+    with pytest.raises(discord_bot.BotUserError, match="requested fold=11 differs from checkpoint fold=10"):
+        discord_bot._preflight_formal_history_calendar(cfg)
+
+
 @pytest.mark.parametrize("dates", [[], [None], [["2026-10-14"]], ["not-a-date"],
                                     ["2026-10-14", "2026-10-13"], ["2026-10-14"] * 2])
 def test_preflight_rejects_invalid_calendar_without_model(factorized_calendar, dates):

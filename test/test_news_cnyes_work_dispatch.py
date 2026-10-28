@@ -27,6 +27,35 @@ def seed(queue, *, count=16):
         queue.add_articles([{'url': f'https://m.cnyes.com/news/id/{100+i}', 'date': '2026-10-09'} for i in range(4)])
 
 
+def test_repeated_candidate_classification_does_not_rewrite_unchanged_indexes(queue):
+    from downloader.news_fulltext_cnyes_work import classify
+
+    mobile = 'https://m.cnyes.com/news/id/123'
+    primary = 'https://news.cnyes.com/news/id/123'
+    with queue.db:
+        queue.add_articles([{'url': mobile}, {'url': primary}])
+        row = queue.db.execute('SELECT id,url,provider FROM articles WHERE url=?', (mobile,)).fetchone()
+        before = queue.db.total_changes
+        assert not classify(queue, row)
+        assert queue.db.total_changes == before
+
+        # The existing body trigger changes the hint, but does not turn this
+        # mobile view into an accepted body or a proven equivalent alias.
+        queue.db.execute('UPDATE articles SET body_sha256=? WHERE url=?', ('a' * 64, primary))
+        before = queue.db.total_changes
+        assert classify(queue, row)
+        assert queue.db.total_changes == before
+        assert queue.db.execute('SELECT body_sha256 FROM articles WHERE url=?', (mobile,)).fetchone()[0] is None
+
+        # An actually stale classification must still be repaired.
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=NULL,cnyes_known_body_candidate=0 WHERE url=?', (mobile,))
+        before = queue.db.total_changes
+        assert classify(queue, row)
+        assert queue.db.total_changes > before
+        restored = queue.db.execute('SELECT cnyes_canonical_candidate_id,cnyes_known_body_candidate FROM articles WHERE url=?', (mobile,)).fetchone()
+        assert restored[0] == canonical_candidate_id(mobile) and restored[1] == 1
+
+
 def test_missing_originals_first_and_candidate_views_keep_bounded_service(queue):
     seed(queue)
     rows = [queue.claim('cnyes', 300) for _ in range(20)]
@@ -211,7 +240,10 @@ def test_request_scope_progress_reads_only_indexed_missing_heads_and_never_mutat
     before = [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')]
     work = progress(queue.db)
     control = {'temporarily_paused_robots_origins': {'https://amp-news.cnyes.com': now + 30},
-               'temporarily_paused_gateway_hosts': {'amp-news.cnyes.com': now + 60}}
+               'temporarily_paused_gateway_hosts': {'amp-news.cnyes.com': now + 60},
+               'unverified_robots_origins': {'https://amp-news.cnyes.com': now + 30},
+               'unverified_gateway_hosts': {'amp-news.cnyes.com': now + 60},
+               'unverified_robots_origins_overflow': False}
     queries = []; changes = queue.db.total_changes
     queue.db.set_trace_callback(queries.append)
     actual = request_scope_progress(queue.db, work, control, now_epoch=now)
@@ -222,6 +254,9 @@ def test_request_scope_progress_reads_only_indexed_missing_heads_and_never_mutat
     assert actual['other_missing_body_urls'] == 2  # mobile plus already in-flight AMP
     from datetime import UTC, datetime
     assert actual['next_source_probe_at_utc'] == datetime.fromtimestamp(now + 60, UTC).isoformat()
+    assert actual['pending_source_rechecks'] == {'contract_version': 1, 'available': True,
+        'unverified_missing_body_urls': 3, 'due_missing_body_urls': 0,
+        'next_probe_at_utc': datetime.fromtimestamp(now + 60, UTC).isoformat()}
     assert not actual['source_recovery_verified'] and 'cnyes.com' not in json.dumps(actual)
     assert queue.db.total_changes == changes
     assert before == [tuple(r) for r in queue.db.execute('SELECT * FROM articles ORDER BY id')]
@@ -259,13 +294,39 @@ def test_request_scope_expired_policy_is_not_a_new_body_or_provider_recovery(que
         queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
     result = request_scope_progress(queue.db, progress(queue.db), {
         'temporarily_paused_robots_origins': {'https://amp-news.cnyes.com': now - 1},
-        'temporarily_paused_gateway_hosts': {}}, now_epoch=now)
+        'temporarily_paused_gateway_hosts': {},
+        'unverified_robots_origins': {'https://amp-news.cnyes.com': now - 1},
+        'unverified_gateway_hosts': {}, 'unverified_robots_origins_overflow': False}, now_epoch=now)
     assert result['available'] and result['source_paused_missing_body_urls'] == 0
     # Registering AMP also discovers the unverified desktop lookup in this
     # same queue. Neither URL has a body; an expired gate accepts neither.
     assert result['active_missing_body_urls'] == result['other_missing_body_urls'] == 2
     assert result['next_source_probe_at_utc'] is None
+    assert result['pending_source_rechecks']['unverified_missing_body_urls'] == 1
+    assert result['pending_source_rechecks']['due_missing_body_urls'] == 1
     assert not result['source_recovery_verified'] and queue.db.execute('SELECT body_sha256 FROM articles').fetchone()[0] is None
+
+
+@pytest.mark.parametrize('patch', [
+    {'unverified_robots_origins': None}, {'unverified_gateway_hosts': None},
+    {'unverified_robots_origins_overflow': True}, {'unverified_robots_origins_overflow': None},
+    {'unverified_robots_origins': {'https://amp-news.cnyes.com': None}},
+    {'unverified_gateway_hosts': {'amp-news.cnyes.com': float('nan')}},
+    {'unverified_robots_origins': {}},
+])
+def test_unreliable_or_inconsistent_recheck_evidence_is_unknown(queue, patch):
+    from downloader.news_fulltext_cnyes_work import progress, request_scope_progress
+    now = time.time()
+    with queue.db:
+        queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
+    control = {'temporarily_paused_robots_origins': {'https://amp-news.cnyes.com': now + 60},
+        'temporarily_paused_gateway_hosts': {},
+        'unverified_robots_origins': {'https://amp-news.cnyes.com': now + 60},
+        'unverified_gateway_hosts': {}, 'unverified_robots_origins_overflow': False, **patch}
+    result = request_scope_progress(queue.db, progress(queue.db), control, now_epoch=now)
+    assert result['available'] and result['source_paused_missing_body_urls'] == 1
+    assert not result['pending_source_rechecks']['available']
+    assert result['pending_source_rechecks']['unverified_missing_body_urls'] is None
 
 
 @pytest.mark.parametrize('gated,paused', [(None, None), ('https://amp-news.cnyes.com', 1),
@@ -274,9 +335,11 @@ def test_owner_status_does_not_price_paused_or_unknown_scope_at_healthy_ingestio
     with queue.db:
         queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
     if gated is not None:
+        deadline = time.time() + 300
         queue.http_capacity_snapshot = lambda: {'providers': {'cnyes': {
-            'temporarily_paused_robots_origins': {gated: time.time() + 300},
-            'temporarily_paused_gateway_hosts': {}}}}
+            'temporarily_paused_robots_origins': {gated: deadline},
+            'temporarily_paused_gateway_hosts': {}, 'unverified_robots_origins': {gated: deadline},
+            'unverified_gateway_hosts': {}, 'unverified_robots_origins_overflow': False}}}
     queue.metrics.started -= 120
     queue.metrics.count('cnyes', 'durably_accepted_new_url_heads', 10)
     snapshot = queue.status(activity='running')
@@ -291,6 +354,33 @@ def test_owner_status_does_not_price_paused_or_unknown_scope_at_healthy_ingestio
     else:
         assert current['remaining_eligible_estimate_seconds'] is None
         assert snapshot['eligible_eta_seconds'] is None
+
+
+def test_owner_status_does_not_price_expired_unverified_origin_at_other_lane_rate(queue):
+    with queue.db:
+        queue.add_articles([{'url': 'https://amp-news.cnyes.com/news/id/1'}])
+    queue.metrics.started -= 120
+    queue.metrics.count('cnyes', 'durably_accepted_new_url_heads', 10)
+    deadline = time.time() - 10
+    control = {'temporarily_paused_robots_origins': {}, 'temporarily_paused_gateway_hosts': {},
+        'unverified_robots_origins': {'https://amp-news.cnyes.com': deadline},
+        'unverified_gateway_hosts': {}, 'unverified_robots_origins_overflow': False}
+    queue.http_capacity_snapshot = lambda: {'providers': {'cnyes': control}}
+    snapshot = queue.status(activity='running')
+    current = snapshot['providers']['cnyes']
+    scope = current['body_work_progress']['request_scope_progress']
+    assert current['observed_owner_articles_per_second'] > 0
+    assert scope['source_paused_missing_body_urls'] == 0
+    assert scope['pending_source_rechecks']['unverified_missing_body_urls'] == 1
+    assert scope['pending_source_rechecks']['due_missing_body_urls'] == 1
+    assert current['remaining_eligible_estimate_seconds'] is None
+    assert snapshot['eligible_eta_seconds'] is None
+
+    # Only a real successful probe clears the HTTP owner's evidence. The
+    # queue consumes that cleared state without imposing a new deadline.
+    control['unverified_robots_origins'] = {}
+    recovered = queue.status(activity='running')['providers']['cnyes']
+    assert recovered['remaining_eligible_estimate_seconds'] > 0
 
 
 def test_bounded_backfill_is_indexed_resumable_and_cancellable(queue, tmp_path):

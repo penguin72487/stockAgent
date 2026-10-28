@@ -1,5 +1,6 @@
 from scripts.verify_public_price_projection import snapshot_contract_digest, verify_transaction_report, verify_official_reference_fields, verify_strategy_report, verify_entry_distances
 from pathlib import Path
+import hashlib
 import re
 import pytest
 
@@ -26,11 +27,13 @@ def test_deployment_and_source_identity_changes_are_not_ignored():
 def test_public_price_frontend_advances_both_immutable_asset_versions():
     root = Path(__file__).resolve().parents[1]
     html = (root / "services/tw_day_trade_dashboard/index.html").read_text()
-    # v10/v100 predate the daily price producer and its shared renderer. Keep
-    # the release floor, not a permanently pinned current frontend version.
-    for asset, minimum in (("detail-components.js", 19), ("app.js", 103)):
-        match = re.search(rf'src="{re.escape(asset)}\?v=(\d+)"', html)
-        assert match is not None and int(match[1]) >= minimum
+    # The renderer retains its monotonic release floor. The app has migrated
+    # from numeric releases to exact content identities: stale hashes must
+    # fail too, not merely pass because a version-shaped token is present.
+    match = re.search(r'src="detail-components\.js\?v=(\d+)"', html)
+    assert match is not None and int(match[1]) >= 19
+    expected = hashlib.sha256((root / "services/tw_day_trade_dashboard/app.js").read_bytes()).hexdigest()[:12]
+    assert f'src="app.js?v={expected}"' in html
 
 
 def test_independent_price_distance_oracle_rejects_wrong_bands_and_hidden_price_leaks():

@@ -11,10 +11,14 @@ from datetime import datetime
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 
 from downloader.artifact_io import atomic_write_json
+from stockagent.live.paper_journal import (
+    journal_write_transaction, managed, open_paper_journal, rebind_cloned_journals,
+)
 
 CONTRACT = "additive_independent_paper_mode_v1"
 LEDGERS = ("signals.jsonl", "fills.jsonl", "orders.jsonl", "events.jsonl", "latency.jsonl")
@@ -23,7 +27,7 @@ ABORTED_ACTIVATION = "aborted_unfunded_paper_addition_activation_v1"
 
 def sha(path: Path, count: int | None = None, *, offset: int = 0) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
+    with open_paper_journal(path) as stream:
         stream.seek(offset)
         remaining = count
         while remaining is None or remaining > 0:
@@ -39,7 +43,8 @@ def sha(path: Path, count: int | None = None, *, offset: int = 0) -> str:
 
 
 def _object(path):
-    value = json.loads(path.read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    value = read_paper_state(path)
     if not isinstance(value, dict):
         raise ValueError(f"expected object: {path}")
     return value
@@ -171,7 +176,7 @@ def inspect_aborted_activation(live: Path, candidate: Path) -> dict:
         if (not source.is_file() or source.stat().st_size < prefix["bytes"]
                 or sha(source, prefix["bytes"]) != prefix["sha256"]):
             raise ValueError(f"aborted activation altered retained bytes: {name}")
-        with source.open("rb") as f:
+        with open_paper_journal(source) as f:
             f.seek(prefix["bytes"])
             tail = f.read()
         count = _check_abort_tail(name, tail, added=added, mode=state["modes"][added])
@@ -199,7 +204,7 @@ def preserve_aborted_activation(live: Path, candidate: Path) -> dict:
     root.mkdir(exist_ok=False)
     atomic_write_json(root / "state.json", proof.pop("state"))
     for name, stream in proof["streams"].items():
-        with (live / name).open("rb") as incoming, (root / name).open("wb") as out:
+        with open_paper_journal(live / name) as incoming, (root / name).open("wb") as out:
             incoming.seek(stream["offset"])
             shutil.copyfileobj(incoming, out, 1024**2)
         if ((root / name).stat().st_size != stream["tail_bytes"]
@@ -273,19 +278,27 @@ def merge_addition(live: Path, new_replay: Path, candidate: Path, *, added_marke
         raise ValueError("additive candidate must be empty")
     shutil.copytree(live, candidate, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("*.lock", ".lock", "*.tmp.*", "quote_broker"))
+    rebind_cloned_journals(live, candidate)
     if abort is not None:
         # Only this isolated copy loses the aborted tail. The original remains
         # unchanged, and the tail is separately archived before promotion.
         for name, proof in source_proofs.items():
-            with (candidate / name).open("r+b") as stream:
+            with journal_write_transaction(candidate / name, operation="replace"), (candidate / name).open("r+b") as stream:
                 stream.truncate(proof["bytes"])
+                if managed(candidate / name):
+                    stream.flush()
+                    os.fsync(stream.fileno())
         marks = candidate / "marks.jsonl"
         pending = candidate / ".retained_marks.tmp"
-        with marks.open("rb") as incoming, pending.open("wb") as out:
-            for line in incoming:
-                if json.loads(line).get("market") != added_market:
-                    out.write(line)
-        pending.replace(marks)
+        with journal_write_transaction(marks, operation="replace"):
+            with open_paper_journal(marks) as incoming, pending.open("wb") as out:
+                for line in incoming:
+                    if json.loads(line).get("market") != added_market:
+                        out.write(line)
+                if managed(marks):
+                    out.flush()
+                    os.fsync(out.fileno())
+            pending.replace(marks)
     evidence = candidate / "addition_evidence"
     evidence.mkdir()
     atomic_write_json(evidence / "prior_state.json", old_state)
@@ -294,6 +307,7 @@ def merge_addition(live: Path, new_replay: Path, candidate: Path, *, added_marke
     # source/price contracts; never relabel old executions as the new policy.
     component = evidence / "new_mode"
     shutil.copytree(new_replay, component, ignore=shutil.ignore_patterns("*.lock", ".lock"))
+    rebind_cloned_journals(new_replay, component)
     appended = {}
     for name in (*LEDGERS, "marks.jsonl"):
         source = new_replay / name
@@ -304,12 +318,15 @@ def merge_addition(live: Path, new_replay: Path, candidate: Path, *, added_marke
             appended[name] = {"offset": target.stat().st_size if target.is_file() else 0,
                               "bytes": source.stat().st_size, "sha256": sha(source)}
         if target.is_file() and target.stat().st_size:
-            with target.open("rb") as f:
+            with open_paper_journal(target) as f:
                 f.seek(-1, 2)
                 if f.read(1) != b"\n":
                     raise ValueError(f"retained JSONL lacks a terminal newline: {name}")
-        with target.open("ab") as out, source.open("rb") as incoming:
+        with journal_write_transaction(target, operation="append"), target.open("ab") as out, open_paper_journal(source) as incoming:
             shutil.copyfileobj(incoming, out, 1024**2)
+            if managed(target):
+                out.flush()
+                os.fsync(out.fileno())
     merged = deepcopy(old_state)
     merged["modes"][added_market] = new_state["modes"][added_market]
     merged["enabled_markets"] = sorted(merged["modes"])

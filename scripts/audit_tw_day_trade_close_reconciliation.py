@@ -26,6 +26,7 @@ from scripts.settle_tw_day_trade_official_close import official_closes
 from stockagent.live.tw_day_trade_simulation import (
     TAIPEI, TERMINAL_CLOSE_UNLIMITED_CONTRACT, _atomic_json,
 )
+from stockagent.live.paper_journal import open_paper_journal
 
 
 def _equal(actual, expected, label):
@@ -37,7 +38,8 @@ def audit(state_dir: Path, before_path: Path, raw_root: Path, day: date):
     started = perf_counter()
     before = json.loads(before_path.read_text())
     old = json.loads(before_path.with_suffix('.state.json').read_text())
-    current = json.loads((state_dir / 'state.json').read_text())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    current = read_paper_state(state_dir / 'state.json')
     if current.get('simulation_only') is not True or current.get('production_order_possible') is not False:
         raise ValueError('not a paper-only ledger')
     if set(old['modes']) != set(current['modes']):
@@ -48,7 +50,7 @@ def audit(state_dir: Path, before_path: Path, raw_root: Path, day: date):
                  for pid, p in mode.get('positions', {}).items() if p.get('signed_shares')}
     if any(old['modes'][market].get('session_date') != str(day) for market, _ in residuals):
         raise ValueError('pre-close inventory is outside the requested session')
-    with (state_dir / 'fills.jsonl').open('rb') as stream:
+    with open_paper_journal(state_dir / 'fills.jsonl') as stream:
         stream.seek(before['inputs']['fills.jsonl']['size_bytes'])
         fills = [json.loads(line) for line in stream if line.strip()]
     if len(fills) != len(residuals):
@@ -118,7 +120,7 @@ def audit(state_dir: Path, before_path: Path, raw_root: Path, day: date):
     # Latest canonical revision per minute wins; do not interpolate gaps.
     rows = {}
     needle = str(day).encode()
-    with (state_dir / 'marks.jsonl').open('rb') as stream:
+    with open_paper_journal(state_dir / 'marks.jsonl') as stream:
         for line in stream:
             if needle not in line:
                 continue

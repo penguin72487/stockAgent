@@ -99,3 +99,7 @@ body{font-variant-numeric:tabular-nums}.public-nav,.jump-nav,main{width:min(1220
 #price-reference-details>summary{cursor:pointer;min-height:44px;padding:10px 0}
 .price-reference-list{grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));max-height:540px;overflow:auto}
 .price-reference-list .daily-reference-details{font-size:12px}
+.published-signal-table{table-layout:fixed;white-space:normal;overflow-wrap:anywhere}
+.published-signal-table th:first-child{width:48%}
+.published-signal-table th:nth-child(2){width:32%}
+.published-signal-table th:last-child{width:20%}

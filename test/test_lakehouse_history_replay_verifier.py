@@ -1,4 +1,8 @@
 import asyncio
+import os
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -6,6 +10,17 @@ import pytest
 
 pytest.importorskip('temporalio', reason='use the locked lakehouse control role')
 from scripts import verify_lakehouse_workflow_history as verifier
+
+
+def test_standalone_history_verifier_resolves_checkout_without_pythonpath(tmp_path):
+    # Exercise the deployed script invocation in an unrelated working directory;
+    # --help must not read configuration, connect to Temporal or control services.
+    script = Path(verifier.__file__).resolve()
+    environment = dict(os.environ, PYTHONPATH='')
+    result = subprocess.run([sys.executable, '-I', str(script), '--help'], cwd=tmp_path,
+        env=environment, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert '--include-dataset-versions' in result.stdout
 
 
 @pytest.mark.parametrize('events', [[], [2], [1, 3], [1, 2, 2], [2, 1]])

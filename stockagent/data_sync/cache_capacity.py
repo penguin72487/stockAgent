@@ -26,6 +26,7 @@ from stockagent.data_sync.desync_snapshots import SnapshotError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = REPO_ROOT / "configs/data_sync/cache_capacity.json"
+ACQUISITION_POLICY_PATH = REPO_ROOT / "configs/data_sync/acquisition_capacity.json"
 PREPARED_POLICY_PATH = REPO_ROOT / "configs/data_sync/prepared_capacity.json"
 MATERIALIZED_ROOT = Path("/srv/stockagent-packed-materialized")
 ARTIFACT_CACHE_ROOT = REPO_ROOT / "artifacts/cache"
@@ -92,6 +93,31 @@ def load_prepared_capacity_policy(path: Path = PREPARED_POLICY_PATH) -> dict:
             or value["maximum_generation_bytes"] > value["family_capacity_bytes"]):
         raise ValueError("invalid prepared capacity policy")
     return value
+
+
+def load_acquisition_verification_reserve(path: Path = ACQUISITION_POLICY_PATH) -> int:
+    """Read the extra acquisition-only floor without changing cache writers."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate acquisition reserve field")
+            result[key] = value
+        return result
+
+    with path.open("rb") as source:
+        raw = source.read(4097)
+    if len(raw) > 4096:
+        raise ValueError("acquisition reserve policy is not bounded")
+    value = json.loads(raw, object_pairs_hook=unique)
+    if (not isinstance(value, dict)
+            or set(value) != {"schema_version", "contract", "minimum_free_bytes"}
+            or type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or value["contract"] != "acquisition_verification_headroom_v1"
+            or type(value["minimum_free_bytes"]) is not int
+            or not 0 < value["minimum_free_bytes"] < 2**63):
+        raise ValueError("invalid acquisition reserve policy")
+    return value["minimum_free_bytes"]
 
 
 def allocated_tree_bytes(root: Path, *, maximum_entries: int,
@@ -169,7 +195,7 @@ def _admit_backing_volume(existing: Path, required_bytes: int) -> dict:
     # A virtual ext4 free count is not proof that its Windows VHDX backing
     # drive can grow. Use the same actual-distro registry/physical-volume
     # measurement as canonical return/recovery, never assume it is C:.
-    from stockagent.data_sync.windows_cold_io import admit_workspace
+    from stockagent.data_sync.windows_cold_io import admit_workspace, WorkspaceCapacityDeferred
     try:
         distribution = os.environ.get("WSL_DISTRO_NAME", "")
         if not distribution:
@@ -194,10 +220,48 @@ def _admit_backing_volume(existing: Path, required_bytes: int) -> dict:
                 raise ValueError("authority runtime identity differs")
             distribution = identity["windows_distribution"]
         return admit_workspace(existing, required_bytes, windows_distribution=distribution)
+    except WorkspaceCapacityDeferred as error:
+        raise CapacityDeferred("physical_backing_reserve",
+                               physical_free_bytes=error.physical_free_bytes,
+                               required_bytes_including_reserve=required_bytes) from error
     except (OSError, ValueError, SnapshotError, subprocess.SubprocessError) as error:
         raise CapacityDeferred("physical_backing_headroom_unconfirmed",
                                required_bytes_including_reserve=required_bytes,
                                error_type=type(error).__name__) from error
+
+
+def acquisition_dispatch_status(root: Path, *, maximum_growth_bytes: int = 0) -> dict:
+    """Read-only dispatch gate using the authority's existing reserve policy.
+
+    This prevents a new acquisition cycle from consuming the control/ledger
+    reserve. It is not a producer's per-write byte reservation or cleanup.
+    No source scan, provider request or payload mutation is performed.
+    """
+    if type(maximum_growth_bytes) is not int or not 0 <= maximum_growth_bytes < 2**63:
+        raise ValueError("dispatch growth estimate must be a nonnegative integer")
+    root = root.absolute()
+    policy = load_capacity_policy()
+    result = {"contract": "acquisition_dispatch_capacity_v1", "path": str(root),
+              "guard_kind": "dispatch_preflight_not_write_reservation", "data_paths_removed": 0}
+    if socket.gethostname() not in policy["nodes"]:
+        return {**result, "state": "not_enrolled"}
+    minimum_free = max(policy["minimum_free_bytes"], load_acquisition_verification_reserve())
+    if minimum_free + maximum_growth_bytes >= 2**63:
+        raise ValueError("dispatch requirement exceeds bounded byte range")
+    if root.resolve(strict=True) != root or not root.is_dir():
+        raise CapacityDeferred("redirected_acquisition_workspace")
+    info = os.statvfs(root)
+    available = info.f_bavail * info.f_frsize
+    required = minimum_free + maximum_growth_bytes
+    result.update(available_bytes=available, required_bytes=required,
+                  minimum_free_bytes=minimum_free)
+    if available < required:
+        return {**result, "state": "deferred", "reason": "filesystem_reserve", "retryable": True}
+    try:
+        backing = _admit_backing_volume(root, required)
+    except CapacityDeferred as error:
+        return {**error.details, **result, "state": "deferred", "retryable": True}
+    return {**result, "state": "admitted", "backing_volume": backing}
 
 
 def _enrolled_capacity(root: Path, family: str, policy: dict) -> int | None:

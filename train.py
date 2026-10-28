@@ -28,6 +28,26 @@ from stockagent.config import external_panel_data_kwargs, load_config
 from stockagent.runtime_env import normalize_cuda_env
 
 
+def _attach_configured_stock_context_futures_panel(panel, config):
+    """Use the same receipt-bound account attachment for every train entry."""
+    if config.trading.tw_futures_account_calendar_contract is None:
+        from stockagent.data.tw_stock_context_futures_portfolio import (
+            attach_configured_stock_context_futures_portfolio,
+        )
+        return attach_configured_stock_context_futures_portfolio(panel, config)
+
+    from stockagent.data.panel import slice_panel_start, slice_panel_end
+    from stockagent.data.tw_futures_account_attachment import attach_configured_futures_account_calendar
+    from stockagent.data.tw_futures_decision_clock import clock_contract_from_manifest
+
+    clock_path = Path(config.trading.tw_futures_portfolio_entry_clock_path)
+    clock = json.loads(clock_path.with_name("manifest.json").read_text())
+    clock_contract_from_manifest(clock, config.trading.tw_futures_portfolio_decision_time)
+    panel = slice_panel_start(panel, clock["start_date"])
+    panel = slice_panel_end(panel, clock["end_date"])
+    return attach_configured_futures_account_calendar(panel, config)
+
+
 # Every subprocess started by the training entrypoint is placed in its own
 # session.  This process remains the one terminal-facing supervisor and owns
 # the exact invocation tree until every rank/compiler/helper has exited. Without
@@ -2099,77 +2119,7 @@ def main() -> None:
                 },
             )
         if str(config.trading.execution_mode) == "tw_stock_context_futures_portfolio":
-            from stockagent.data.tw_stock_context_futures_portfolio import (
-                attach_stock_context_futures_portfolio_daily,
-            )
-
-            panel = attach_stock_context_futures_portfolio_daily(
-                panel,
-                config.trading.tw_futures_portfolio_data_path,
-                fee_per_side_twd_by_group={
-                    "large": config.trading.tw_futures_portfolio_fee_large_twd,
-                    "standard": config.trading.tw_futures_portfolio_fee_standard_twd,
-                    "stock": config.trading.tw_futures_portfolio_fee_stock_twd,
-                    "micro": config.trading.tw_futures_portfolio_fee_micro_twd,
-                },
-                integer_contracts=bool(
-                    config.trading.tw_futures_portfolio_integer_contracts
-                ),
-                current_open_feature=bool(
-                    config.data.tw_futures_current_open_feature
-                ),
-                denomination_context_basis=config.data.tw_futures_denomination_context_basis,
-                futures_slot_count=config.data.tw_futures_portfolio_slot_count,
-                margin_rules_path=(config.trading.tw_futures_portfolio_margin_rules_path
-                                   if config.trading.tw_futures_portfolio_capital_basis == 'initial_margin' else None),
-                valuation_research_contract=config.trading.tw_futures_portfolio_valuation_research_contract,
-                require_prior_capacity=config.data.tw_futures_require_prior_capacity,
-                carry_valuation_max_abs_simple_return=float(
-                    config.data.tw_futures_carry_valuation_max_abs_simple_return
-                ),
-                expiry_settlement_valuation=bool(
-                    config.data.tw_futures_expiry_settlement_valuation
-                ),
-                final_settlement_path=(
-                    config.trading.tw_futures_portfolio_final_settlement_path
-                ),
-                integer_fee_per_contract_per_side_twd=float(
-                    config.trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd
-                ),
-                max_volume_participation=float(
-                    config.trading.max_volume_participation
-                ),
-                benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
-                benchmark_data_path=config.trading.tw_futures_portfolio_benchmark_data_path,
-            )
-            if config.trading.tw_futures_portfolio_holding_policy == "intraday":
-                from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
-                panel = attach_all_futures_intraday(
-                    panel, config.trading.tw_futures_portfolio_minute_data_path,
-                    participation=config.trading.max_volume_participation,
-                )
-            if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
-                from stockagent.data.tw_futures_margin import attach_futures_margin_rules
-                panel = attach_futures_margin_rules(
-                    panel, config.trading.tw_futures_portfolio_margin_rules_path,
-                    broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
-                    liquidation_ratio=config.trading.tw_futures_portfolio_margin_liquidation_ratio,
-                    participation=config.trading.max_volume_participation,
-                    benchmark_mode=config.trading.tw_futures_portfolio_benchmark_mode,
-                    include_margin_amount=config.training.financial_transformer.futures_margin_amount_context,
-                    include_account_policy_observations=config.training.financial_transformer.futures_causal_account_policy,
-                    include_beta_observation=config.training.financial_transformer.futures_beta_notional_cap is not None,
-                    account_policy_lookback=config.training.lookback,
-                )
-            if config.trading.tw_futures_portfolio_decision_time is not None:
-                from stockagent.data.tw_futures_decision_clock import attach_futures_decision_clock
-                panel = attach_futures_decision_clock(
-                    panel, config.trading.tw_futures_portfolio_entry_clock_path,
-                    decision_time=config.trading.tw_futures_portfolio_decision_time,
-                    participation=config.trading.max_volume_participation,
-                    broker_multiplier=config.trading.tw_futures_portfolio_broker_margin_multiplier,
-                    opening_reference_path=config.trading.tw_futures_portfolio_opening_reference_path,
-                )
+            panel = _attach_configured_stock_context_futures_panel(panel, config)
             if (
                 _distributed_rank() == 0
                 and config.data.tw_futures_expiry_settlement_valuation

@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.promote_tw_day_trade_replay import _acquire_engine_lock, _atomic_json
+from stockagent.live.paper_mode_snapshot import expand_paper_state
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_PRICE_GUARD_CONTRACT, TAIPEI, TwDayTradeSimulationEngine,
     entry_price_guard_reason,
@@ -55,7 +56,7 @@ def make_plan(
 ) -> dict[str, Any]:
     state_path = root / "state.json"
     state_bytes = state_path.read_bytes()
-    state = json.loads(state_bytes)
+    state = expand_paper_state(json.loads(state_bytes), root)
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
         raise ValueError("target is not an exclusively paper ledger")
     mode = (state.get("modes") or {}).get(market)
@@ -128,7 +129,10 @@ def make_plan(
 
 
 def _restore_file(path: Path, payload: bytes | None) -> None:
+    from stockagent.live.paper_journal import journal_write_transaction, managed
     if payload is None:
+        if managed(path):
+            raise ValueError("enrolled journals require explicit replacement, not deletion")
         if path.exists():
             path.unlink()
         return
@@ -137,7 +141,8 @@ def _restore_file(path: Path, payload: bytes | None) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
-    os.replace(temporary, path)
+    with journal_write_transaction(path, operation="replace"):
+        os.replace(temporary, path)
 
 
 def apply_plan(root: Path, plan: dict[str, Any], *, recorded_at: datetime) -> dict[str, Any]:
@@ -346,7 +351,8 @@ def apply_plan(root: Path, plan: dict[str, Any], *, recorded_at: datetime) -> di
         except Exception:
             for name, proof in append_before.items():
                 path = root / name
-                with path.open("r+b") as handle:
+                from stockagent.live.paper_journal import journal_write_transaction
+                with journal_write_transaction(path, operation="replace"), path.open("r+b") as handle:
                     handle.truncate(int(proof["size"]))
                     handle.flush()
                     os.fsync(handle.fileno())

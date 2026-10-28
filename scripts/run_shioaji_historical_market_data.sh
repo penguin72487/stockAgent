@@ -26,6 +26,10 @@ last_inventory_refresh=0
 while true; do
   delay="$(history_protected_delay)"
   if (( delay > 0 )); then history_wait "$delay" live_priority_window; continue; fi
+  if ! run_fintech_python "$repo_root/scripts/check_acquisition_capacity.py" --path "$repo_root"; then
+    history_wait 60 verification_storage_headroom
+    continue
+  fi
   delay="$(history_connection_delay)"
   if (( delay > 0 )); then history_wait "$delay" live_connection_reservation; continue; fi
   if ! flock -n 8; then history_wait 60 history_login_slot_busy; continue; fi

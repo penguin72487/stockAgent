@@ -49,7 +49,8 @@ DISCORD_STATUS_PATH = REPO_ROOT / "artifacts/discord_bot/service_status.json"
 
 
 def _object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    payload = read_paper_state(path)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload

@@ -48,6 +48,27 @@ def test_status_copy_preserves_cycles_and_container_subclasses():
     assert result['rows'][1] is result
 
 
+@pytest.mark.parametrize('parent', [str, int, float])
+def test_status_copy_scalar_subclasses_keep_deepcopy_and_shared_memo(parent):
+    calls = []
+
+    class Scalar(parent):
+        def __deepcopy__(self, memo):
+            calls.append(self)
+            copied = type(self)(self)
+            copied.attribute = list(self.attribute)
+            return copied
+
+    value = Scalar('3')
+    value.attribute = ['retained']
+    copied = copy_status_value({'dict': value, 'list': [value], 'nested': {'same': value}})
+    assert calls == [value]
+    assert type(copied['dict']) is Scalar and copied['dict'] is not value
+    assert copied['dict'] is copied['list'][0] is copied['nested']['same']
+    copied['dict'].attribute.append('new')
+    assert value.attribute == ['retained']
+
+
 def test_compact_json_keeps_exact_values_and_legacy_default(tmp_path):
     value = {'原文': '負值 -12.50%\n\u00a0', 'counts': [1, 0, None, False], 'nested': {'clock': 1234.5}}
     legacy, compact = tmp_path / 'legacy.json', tmp_path / 'compact.json'

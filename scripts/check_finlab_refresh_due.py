@@ -8,13 +8,16 @@ evidence falls through to the canonical collector for recovery.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import fcntl
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import stat
 import sys
 
@@ -25,7 +28,7 @@ if str(ROOT) not in sys.path:
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
     INTRADAY_MINIMUM_FREE_GB, TAIPEI, WORKLOAD_CONTRACT_VERSION, quota_cycle_start, utc_time,
 )
-from stockagent.data.finlab_quota_policy import load_policy, quota_admission  # noqa: E402
+from stockagent.data.finlab_quota_policy import catalog_current, load_policy, quota_admission  # noqa: E402
 
 
 def read(path: Path) -> dict:
@@ -36,6 +39,90 @@ def read(path: Path) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def intraday_source_identity(root: Path, *, public_root: Path | None = None) -> str | None:
+    """Bind idle admission to the actual calendar/lifecycle inputs, metadata only.
+
+    Inspect exact file stat identities, including replacements and symlink
+    targets. Never decode Parquet or import the SDK. A public-source correction,
+    new symbol/date, policy or collector change must wake the canonical owner.
+    This is an idle hint; the collector still validates its source and receipts.
+    """
+    public = public_root or root / "data_tw_public"
+    paths = [public / name for name in (
+        "stocks/symbols.csv", "twse_market_index.parquet", "twse_listed_company_basic.parquet",
+        "tpex_basic_company.parquet", "twse_delisted_company.parquet", "tpex_delisted_company.parquet")]
+    try:
+        paths += sorted((entry for entry in (public / "stocks").iterdir()
+                         if entry.name.endswith("_features.parquet")), key=lambda path: path.name)
+        # Earlier sessions are optional for a bounded post-2009 library run.
+        paths += [public / name for name in ("twse_daily_ohlcv.parquet", "tpex_daily_ohlcv.parquet")
+                  if (public / name).exists()]
+        paths += [root / name for name in ("scripts/download_finlab_market_intraday.py",
+            "scripts/check_finlab_refresh_due.py", "stockagent/data/finlab_quota_policy.py")]
+        config = root / "configs/finlab_quota_policy.json"
+        if config.exists():
+            paths.append(config)
+        facts = []
+        for path in paths:
+            link, target = path.lstat(), path.stat()
+            facts.append([str(path), *[(info.st_dev, info.st_ino, info.st_size,
+                                      info.st_mtime_ns, info.st_ctime_ns) for info in (link, target)]])
+        return hashlib.sha256(json.dumps(facts, separators=(",", ":")).encode()).hexdigest()
+    except (OSError, RuntimeError):
+        return None  # Unknown evidence admits recovery rather than suppressing work.
+
+
+def _source_wait(priority: dict, now: datetime) -> bool:
+    pending = priority.get("actionable_known_window_partitions", priority.get("pending_known_window_partitions"))
+    due = priority.get("due_publication_rechecks")
+    next_check = utc_time(priority.get("next_source_check_at_utc"))
+    return (type(pending) is int and pending == 0 and type(due) is int and due == 0
+            and next_check is not None and now < next_check)
+
+
+def actionable_futures_priority(root: Path, *, now: datetime, stock_kind: str | None = None) -> bool | None:
+    """Check the finite intraday intent registry without contacting a provider.
+
+    An attempt already made in this quota cycle has the same retry semantics
+    as the canonical owner. Unknown index state admits recovery, not fake idle.
+    """
+    finlab = root / "data_finlab"
+    index = finlab / "intraday/market_index.sqlite3"
+    if index.is_symlink():
+        return None
+    if not index.exists():
+        return False  # There is no canonical registry to contain an intent.
+    if not index.is_file():
+        return None
+    try:
+        from downloader.provider_priority import finlab_futures_candidates, finlab_stock_candidates
+        with closing(sqlite3.connect(index.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as con:
+            candidates = (finlab_futures_candidates(con, now) if stock_kind is None
+                          else finlab_stock_candidates(con, now, stock_kind))
+        if not candidates:
+            return False
+        from scripts.download_finlab_intraday import (
+            _checked_this_cycle, _partition_paths, _priority_scope_path, _priority_scope_wait, _stored_receipt,
+        )
+        source_identity = None
+        identity_checked = False
+        for key, day in candidates:
+            receipt, attempt = _partition_paths(finlab, key, day)
+            if (_stored_receipt(receipt, finlab, key, day, verify_hash=True) is not None
+                    or _checked_this_cycle(attempt, "attempted_at_utc", now)):
+                continue
+            if stock_kind is not None and _priority_scope_path(finlab, key, day).is_file():
+                if not identity_checked:
+                    source_identity = intraday_source_identity(root)
+                    identity_checked = True
+                if _priority_scope_wait(finlab, key, day, now=now, source_identity=source_identity):
+                    continue
+            return True
+        return False
+    except (OSError, ValueError, sqlite3.Error):
+        return None
 
 
 def research_owner_busy(root: Path) -> bool | None:
@@ -138,18 +225,52 @@ def refresh_due(root: Path, *, now: datetime) -> tuple[bool, str]:
     # keep unknown history incomplete without rediscovering it every minute.
     exhausted = (not minute_first and market.get("state") == "frontiers_scanned; retries_due_next_cycle"
                  and checked and checked >= quota_cycle_start(now))
+    # Futures priorities share the minute owner's quota and resource gates,
+    # but the stock-minute frontier's publication wait does not apply to them.
+    admitted = core.get("minute_residual_allowed", core.get("supplemental_allowed")) is True
+    minute_policy = quota_admission(kind="tw_minute", now=now, policy=policy)
+    if admitted and remaining > minute_policy["effective_reserve_mb"]:
+        futures_due = actionable_futures_priority(root, now=now)
+        if futures_due is None:
+            return True, "futures_priority_unverified_recovery"
+        if futures_due:
+            return True, "futures_priority_due"
+        stock_minute_due = actionable_futures_priority(root, now=now, stock_kind='tw_minute')
+        if stock_minute_due is None:
+            return True, "stock_priority_unverified_recovery"
+        if stock_minute_due:
+            return True, "stock_minute_priority_due"
+        tick_policy = quota_admission(kind='tw_tick', now=now, policy=policy,
+                                      scheduled_reserve_mb=reserve)
+        stock_tick_admitted = (core.get('supplemental_allowed') is True or
+                               type(core.get('actionable_pending')) is int and
+                               core.get('actionable_pending') == 0)
+        if stock_tick_admitted and remaining > tick_policy['effective_reserve_mb']:
+            stock_tick_due = actionable_futures_priority(root, now=now, stock_kind='tw_tick')
+            if stock_tick_due is None:
+                return True, "stock_priority_unverified_recovery"
+            if stock_tick_due:
+                return True, "stock_tick_priority_due"
     minute_wait = False
     if minute_first:
         priority = market.get("minute_priority", {})
         priority = priority if isinstance(priority, dict) else {}
-        next_check = utc_time(priority.get("next_source_check_at_utc"))
-        minute_wait = (priority.get("actionable_known_window_partitions", priority.get("pending_known_window_partitions")) == 0
-                       and priority.get("due_publication_rechecks") == 0
-                       and next_check is not None and now < next_check)
+        minute_wait = _source_wait(priority, now)
         if minute_wait and core.get("supplemental_allowed") is not True:
             return False, "minute_source_wait_tick_general_debt"
-    admitted = core.get("minute_residual_allowed", core.get("supplemental_allowed")) is True
-    minute_policy = quota_admission(kind="tw_minute", now=now, policy=policy)
+    tick_wait = False
+    if (minute_wait and market.get("active_kind") == "tw_tick"
+            and market.get("state") in {"waiting_older_publication", "frontiers_scanned; retries_due_next_cycle"}
+            and checked and quota_cycle_start(now) <= checked <= now
+            and isinstance(market.get("quota_policy"), dict)
+            and market["quota_policy"].get("configuration_fingerprint") == policy.fingerprint
+            and isinstance(market.get("tick_priority"), dict) and _source_wait(market["tick_priority"], now)):
+        identity = intraday_source_identity(root)
+        tick_wait = identity is not None and identity == market.get("dispatch_inputs_sha256")
+        if tick_wait and not catalog_current(read(root / "data_finlab/catalog/discovery.json"), now=now, policy=policy):
+            return True, "catalog_refresh_due"
+    if tick_wait:
+        return False, "intraday_waiting_source_publication"
     if minute_first and admitted and not minute_wait and remaining_work(minute) > 0:
         if remaining > minute_policy["effective_reserve_mb"]:
             return True, "minute_pre_reset_drain" if minute_policy["mode"] == "pre_reset_drain" else "minute_first_residual_capacity"

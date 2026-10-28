@@ -2,6 +2,8 @@ import json
 from datetime import time as datetime_time
 from pathlib import Path
 
+import pytest
+
 from scripts import check_outside_tw_opening_resource_window as opening_window
 from scripts import check_stockagent_time_sync as time_sync
 from scripts import check_tw_day_trade_unattended_health as guardian
@@ -75,6 +77,25 @@ def test_wsl_large_clock_offset_fails_closed_without_repair(monkeypatch) -> None
     assert any("exceeds" in row for row in payload["failures"])
 
 
+def test_wsl_uncertain_clock_does_not_step_the_system(monkeypatch) -> None:
+    monkeypatch.setattr(time_sync, "_is_wsl", lambda: True)
+    monkeypatch.setattr(time_sync, "_chrony_tracking", lambda: {})
+    monkeypatch.setattr(time_sync, "_sample_windows_host_offset", lambda **_kwargs: {
+        "source": "wsl_windows_host_clock", "offset_seconds": 0.7,
+        "round_trip_seconds": 1.0, "uncertainty_seconds": 0.501,
+        "sample_count": 3,
+    })
+    monkeypatch.setattr(time_sync.time, "clock_settime", lambda *_args: pytest.fail(
+        "an uncertain measurement must not step the system clock"
+    ))
+    payload = time_sync.evaluate_time_sync(
+        repair=True, max_offset_ms=500.0, max_repair_offset_seconds=300.0, samples=3,
+    )
+    assert payload["ready"] is False
+    assert payload["repaired"] is False
+    assert any("uncertainty" in row for row in payload["failures"])
+
+
 def test_weekly_guardian_uses_existing_authoritative_units_without_active_restart() -> None:
     guardian = _read("scripts/check_tw_day_trade_unattended_health.py")
     timer = _read(
@@ -86,6 +107,8 @@ def test_weekly_guardian_uses_existing_authoritative_units_without_active_restar
     assert "OnCalendar=Mon..Fri" in time_timer
     assert "stockagent-tw-day-trade-eligibility.service" in guardian
     assert "stockagent-tw-public-0830-check.service" in guardian
+    assert "stockagent-tw-public-calendar-refresh.timer" in guardian
+    assert "stockagent-tw-trading-universe.timer" in guardian
     assert "stockagent-discord-artifact-maintenance.timer" in guardian
     assert "stockagent-tw-day-trade-margin-actions.timer" in guardian
     assert "post_close_artifact_maintenance" in guardian
@@ -127,10 +150,12 @@ def test_paper_executor_is_protected_from_bulk_refresh_oom_pressure() -> None:
     ).read_text(encoding="utf-8")
 
     assert "OOMScoreAdjust=-500" in service
-    assert "MemoryHigh=8G" in service
-    assert "MemoryMax=16G" in service
-    assert "MemorySwapMax=2G" in service
-    assert "TasksMax=2048" in service
+    assert "CPUWeight=10000" in service
+    assert "IOWeight=10000" in service
+    assert "MemoryHigh=infinity" in service
+    assert "MemoryMax=infinity" in service
+    assert "MemorySwapMax=infinity" in service
+    assert "TasksMax=infinity" in service
 
     for name in (
         "stockagent-registered-data-backfill.service.in",
@@ -228,6 +253,72 @@ def test_guardian_rearms_failed_unit_without_restart(monkeypatch) -> None:
         ("enable", "--now", "stockagent-discord-bot.service"),
     ]
     assert all("restart" not in row["command"] for row in actions)
+
+
+def test_user_acquisition_pause_is_strict_and_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "pause.json"
+    assert guardian._acquisition_pause(path) == {"state": "absent", "paused": False}
+    path.write_text(json.dumps({"contract": "stockagent.user_acquisition_pause.v1",
+                                "paused": True, "reason": "storage verification"}))
+    assert guardian._acquisition_pause(path)["state"] == "paused"
+    path.write_text('{"contract":"stockagent.user_acquisition_pause.v1",'
+                    '"paused":true,"paused":false,"reason":"test"}')
+    assert guardian._acquisition_pause(path) == {"state": "invalid", "paused": True}
+    path.unlink()
+    path.symlink_to(tmp_path / "missing-target")
+    assert guardian._acquisition_pause(path) == {"state": "invalid", "paused": True}
+
+
+def test_user_acquisition_pause_blocks_only_named_guardian_starts(monkeypatch) -> None:
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(guardian, "_run_systemctl", lambda *args: commands.append(args) or {
+        "command": ["systemctl", *args], "returncode": 0})
+    observed = time_sync.datetime.now(time_sync.TAIPEI)
+    paused = guardian.PAUSABLE_ACQUISITION_UNITS
+    kwargs = {"repair": True, "action_state": {}, "observed": observed,
+              "cooldown_seconds": 300.0, "paused_units": paused}
+    critical = {
+        "stockagent-tw-public-source-events.service",
+        "stockagent-tw-public-0830-check.service",
+        "stockagent-tw-day-trade-eligibility.service",
+        "stockagent-tw-public-calendar-refresh.timer",
+        "stockagent-tw-trading-universe.timer",
+    }
+    assert critical.isdisjoint(paused)
+    assert guardian._trigger_oneshot("stockagent-registered-data-intraday.service", **kwargs) == []
+    assert guardian._repair_unit("stockagent-openbb-archive.timer", timer=True, **kwargs) == []
+    guardian._repair_unit("stockagent-tw-public-source-events.service", timer=False, **kwargs)
+    guardian._trigger_oneshot("stockagent-tw-public-0830-check.service", **kwargs)
+    guardian._trigger_oneshot("stockagent-tw-day-trade-eligibility.service", **kwargs)
+    guardian._repair_unit("stockagent-discord-bot.service", timer=False, **kwargs)
+    assert commands == [("reset-failed", "stockagent-tw-public-source-events.service"),
+                        ("enable", "--now", "stockagent-tw-public-source-events.service"),
+                        ("start", "--no-block", "stockagent-tw-public-0830-check.service"),
+                        ("start", "--no-block", "stockagent-tw-day-trade-eligibility.service"),
+                        ("reset-failed", "stockagent-discord-bot.service"),
+                        ("enable", "--now", "stockagent-discord-bot.service")]
+
+
+def test_user_acquisition_pause_preserves_pending_resume(monkeypatch) -> None:
+    service, timer = "bulk.service", "bulk.timer"
+    monkeypatch.setattr(guardian, "BEST_EFFORT_MAINTENANCE_UNITS", {service: timer})
+    monkeypatch.setattr(guardian, "_systemctl_show", lambda _unit: {
+        "ActiveState": "inactive", "SubState": "dead"})
+    commands: list[tuple[str, ...]] = []
+    monkeypatch.setattr(guardian, "_run_systemctl", lambda *args: commands.append(args) or {
+        "command": ["systemctl", *args], "returncode": 0})
+    action_state = {f"opening-resource-pause:{service}": {
+        "resume_pending": True, "service_was_active": True, "timer_was_active": True}}
+    common = {"observed": time_sync.datetime(2026, 9, 14, 10, 0, tzinfo=guardian.TAIPEI),
+              "repair": True, "action_state": action_state}
+    result, actions, failures = guardian._protect_opening_resources(
+        **common, paused_units=frozenset({service, timer}))
+    assert not actions and not failures and not commands
+    assert result["units"][service]["resume_pending"] is True
+    assert result["units"][service]["resume_deferred_by_user"] is True
+    guardian._protect_opening_resources(**common)
+    assert commands == [("start", "--no-block", service), ("start", "--no-block", timer)]
+    assert action_state[f"opening-resource-pause:{service}"]["resume_pending"] is False
 
 
 def test_guardian_clears_only_latch_for_receipted_oneshot(monkeypatch) -> None:

@@ -74,6 +74,17 @@ def test_recovery_cannot_bypass_live_session_or_official_publication(owner, bloc
     assert calls == [] and emissions[-1]["model_executed"] is False
 
 
+def test_priority_session_source_recovery_still_requires_verified_official_close(owner):
+    cfg, _path, _state, status, bot, calls, _emissions = owner
+    status.market_open = True
+    bot._completed_session_publication_ready = lambda _: False
+    assert runner._recover_deferred_factorized_source(cfg, allow_market_open=True) is False
+    assert calls == []
+    bot._completed_session_publication_ready = lambda _: True
+    assert runner._recover_deferred_factorized_source(cfg, allow_market_open=True)
+    assert calls == ["canonical_source"]
+
+
 @pytest.mark.parametrize("state_name", ["verified", "already_current", "failed_retryable", "waiting_source"])
 def test_ordinary_cache_pass_does_not_invoke_any_source_command(owner, state_name):
     cfg, path, _state, _status, _bot, calls, emissions = owner

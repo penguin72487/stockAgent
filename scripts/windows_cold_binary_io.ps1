@@ -62,11 +62,12 @@ try {
         if (!$path.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Streaming writes remain in the fixed cold incoming namespace' }
         $offset = [long]$config.offset
         $fileMode = [IO.FileMode]::CreateNew
-        if ($offset -gt 0) { $fileMode = [IO.FileMode]::Open }
+        $resume = $null -ne $config.prefix_sha256
+        if ($resume) { $fileMode = [IO.FileMode]::Open }
         $stream = New-Object IO.FileStream($path, $fileMode, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
         if ($stream.Length -ne $offset) { throw 'Partial size differs; no append permitted' }
         $hash = [Security.Cryptography.SHA256]::Create()
-        if ($offset -gt 0) { $prefix = [Security.Cryptography.SHA256]::Create() }
+        if ($resume) { $prefix = [Security.Cryptography.SHA256]::Create() }
         $total = [long]0
         while ($total -lt $offset) {
             $count = $stream.Read($buffer, 0, [int][Math]::Min([long]$buffer.Length, [long]($offset - $total)))
@@ -77,7 +78,7 @@ try {
         }
         # Hash the same prefix once into the full-file and prefix SHA engines.
         # Python independently read it before launching the exact producer.
-        if ($offset -gt 0) {
+        if ($resume) {
             [void]$prefix.TransformFinalBlock((New-Object byte[] 0), 0, 0)
             $prefixHex = ([BitConverter]::ToString($prefix.Hash)).Replace('-', '').ToLowerInvariant()
             if ($prefixHex -ne [string]$config.prefix_sha256) { throw 'Retained prefix SHA differs; source untouched' }

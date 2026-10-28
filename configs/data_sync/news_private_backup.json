@@ -1,0 +1,17 @@
+{
+  "contract": "stockagent.news_private_backup_policy.v1",
+  "source_root": "data_news",
+  "generation": "versions/20261016T155152Z-890f02f7",
+  "manifest_sha256": "8aa535f89c3605fb530f2e23b1d4f8f22f273f7da2c015e323a7c03101046a54",
+  "private_backup_authorized": true,
+  "public_publish_allowed": false,
+  "automatic_training_injection_allowed": false,
+  "source_licenses_changed": false,
+  "route": "existing_paired_encrypted_Restic_relay",
+  "producer_device_id": "QZTXXEL-YBCBYK7-ZK2ZSMS-DQKVSCE-IFC7MIX-4CWG6LE-KHPDLJI-7DSE6QW",
+  "receiver_device_id": "TLOI2HH-6EZOSBC-H6YMGVW-APQOGFW-P2A7FZT-EKX6IUP-2HMRKS6-LBDHOQM",
+  "repository_id": "c717a3d315e20a5a3314c595e66607fcb7d6646cb73ad4412cc2cccb22abb798",
+  "user_instruction_date": "2026-10-28",
+  "user_instruction": "現行設定禁止整批遠端匯出?為什麼?請好好用最快的速度平行串行同步過去",
+  "scope": "Fixed news research tables, original provenance snapshot chunks and original controls, copied privately to the owner's existing lab203/NAS backup. This explicit private-copy instruction supersedes the former local-only copy default. It does not assert a new publisher license or start collection/training."
+}

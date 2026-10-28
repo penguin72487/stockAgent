@@ -6,9 +6,32 @@ import time
 from types import SimpleNamespace
 
 import pytest
+import polars as pl
 
 from downloader.download_finmind_complement import SourceError
 from scripts import download_tw_futures_intraday_gaps as subject
+
+
+@pytest.mark.parametrize('aliases', [None, '', 'OLD,CDF'])
+def test_existing_source_query_hints_are_optional_and_never_admit_a_fill(tmp_path, aliases):
+    day = date(2022, 5, 26)
+    physical = 'CDF:202206@2022-06-15#generation=0'
+    rows = dict(date=[day], physical_contract=[physical])
+    if aliases is not None:
+        rows['shioaji_roots'] = [aliases]
+    daily = tmp_path / 'daily.parquet'
+    pl.DataFrame(rows).write_parquet(daily)
+    official = tmp_path / 'official'
+    official.mkdir()
+    archive = official / 'Daily_2022_05_26.zip'
+    archive.write_bytes(b'candidate-only-not-a-validated-tape')
+    result = subject.existing_source_candidates(pl.DataFrame({
+        'date': [day], 'physical_contract': [physical]}), daily_path=daily,
+        shioaji_root=tmp_path / 'absent-shioaji', repair_root=tmp_path / 'absent-repairs',
+        official_zip_root=official)
+    assert result.height == 1 and result['deferred_existing'].item()
+    assert json.loads(result['existing_source_candidates'].item()) == [dict(
+        kind='official_zip_candidate_not_validated', path=str(archive))]
 
 
 def setup_admission(monkeypatch, tmp_path, *, maximum=20, workers=4, stop_file=None):

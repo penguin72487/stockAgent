@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry bounded cold consolidation within its daily work window
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+AccuracySec=30
+RandomizedDelaySec=15
+Persistent=true
+Unit=stockagent-cold-tiers.service
+
+[Install]
+WantedBy=timers.target

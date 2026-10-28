@@ -1,0 +1,21 @@
+[Unit]
+Description=Read-only StockAgent fleet capacity and bounded storage census
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/audit_node_storage_roles.py --monitor --watch --output __REPO_ROOT__/artifacts/live/data_monitor/storage_status.json
+Restart=on-failure
+RestartSec=30
+Nice=19
+IOSchedulingClass=idle
+MemoryHigh=384M
+MemoryMax=640M
+TasksMax=32
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

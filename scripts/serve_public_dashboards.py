@@ -91,6 +91,8 @@ from stockagent.live.data_monitor_dashboard import (  # noqa: E402
 )
 from stockagent.live.data_monitor_providers import project_provider_detail  # noqa: E402
 from stockagent.live.tick_inventory import KINDS as TICK_KINDS, MARKETS as TICK_MARKETS, tick_page  # noqa: E402
+from stockagent.live.bar_inventory import GRAINS, SERIES_KINDS, series_page  # noqa: E402
+from stockagent.data_sync.storage_monitor import public_status as storage_public_status, read_snapshot as read_storage_snapshot  # noqa: E402
 from stockagent.live.data_monitor_api_contract import FeaturePageQuery  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
     trusted_feature_preview,
@@ -124,6 +126,11 @@ from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
     committed_paper_read_guard,
     load_service_sync,
 )
+from stockagent.live.tw_day_trade_published_signals import (  # noqa: E402
+    build_published_signal_snapshot,
+)
+from stockagent.live.tw_day_trade_live_snapshot import build_live_paper_snapshot  # noqa: E402
+from stockagent.live.tw_day_trade_live_events import build_live_paper_events  # noqa: E402
 
 
 MAX_UPSTREAM_BYTES: Final[int] = 8 * 1024 * 1024
@@ -202,6 +209,9 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/updates",
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
+        "/tw-day-trade/api/published-signals",
+        "/tw-day-trade/api/live-snapshot",
+        "/tw-day-trade/api/live-events",
         "/tw-day-trade/api/events",
         "/tw-overnight/api/status",
         "/tw-overnight/api/history",
@@ -225,6 +235,8 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/data-monitor/api/details",
         "/data-monitor/api/provider",
         "/data-monitor/api/ticks",
+        "/data-monitor/api/series",
+        "/data-monitor/api/storage",
         "/data-monitor/api/features",
         "/data-monitor/api/features/page",
         "/traffic/api/status",
@@ -260,6 +272,7 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/openbb/api/history",
         "/data-monitor/api/provider",
         "/data-monitor/api/ticks",
+        "/data-monitor/api/series",
         "/data-monitor/api/features/page",
         "/tej/api/features",
         "/tw-overnight/api/status",
@@ -289,6 +302,7 @@ class PreparedResponse:
     etag: str
     gzip_etag: str
     cache_control: str
+    cache_deadline_epoch: float | None = None
 
     @property
     def resident_bytes(self) -> int:
@@ -1105,6 +1119,7 @@ def _prepared(
     *,
     content_type: str,
     cache_control: str,
+    cache_deadline_epoch: float | None = None,
 ) -> PreparedResponse:
     digest = hashlib.sha256(body).hexdigest()
     # A complete 1m chart is ~15 MB before transfer.  Level 3 kept almost
@@ -1120,6 +1135,7 @@ def _prepared(
         etag=f'"sha256-{digest}"',
         gzip_etag=f'"sha256-{hashlib.sha256(compressed).hexdigest()}"',
         cache_control=cache_control,
+        cache_deadline_epoch=cache_deadline_epoch,
     )
 
 
@@ -1888,6 +1904,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
             if stale_grace_seconds is None
             else max(0.0, float(stale_grace_seconds))
         )
+        if response.cache_deadline_epoch is not None:
+            # A cached projection cannot extend its physical observation's
+            # validity, even when the status heartbeat itself is newer.
+            ttl_seconds = min(float(ttl_seconds), max(0.0, response.cache_deadline_epoch - time.time()))
+            stale_grace = 0.0
         with self._cache_lock:
             if cache_key.startswith("news-status:"):
                 # News heartbeats create a new file generation every few
@@ -1996,11 +2017,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cached = self._cache.get(cache_key)
             if cached is not None:
                 cached.last_accessed_at = observed
-                if cached.expires_at > observed:
+                deadline_valid = (cached.response.cache_deadline_epoch is None
+                                  or time.time() <= cached.response.cache_deadline_epoch)
+                if cached.expires_at > observed and deadline_valid:
                     self._cache_observation("fresh_hit")
                     return cached.response
                 key_lock = self._cache_key_locks.setdefault(cache_key, threading.Lock())
-                if refresh_in_background and cached.stale_until > observed:
+                if refresh_in_background and cached.stale_until > observed and deadline_valid:
                     if cache_key not in self._refreshing:
                         self._refreshing.add(cache_key)
                         start_background = True
@@ -2036,7 +2059,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
             with self._cache_lock:
                 observed = time.monotonic()
                 cached = self._cache.get(cache_key)
-                if cached is not None and cached.expires_at > observed:
+                if (cached is not None and cached.expires_at > observed
+                        and (cached.response.cache_deadline_epoch is None
+                             or time.time() <= cached.response.cache_deadline_epoch)):
                     cached.last_accessed_at = observed
                     self._cache_observation("coalesced_hit")
                     return cached.response
@@ -2069,6 +2094,21 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 # policy with record context. Other full-site readers must not
                 # accidentally disclose an unsanitized provider price field.
                 payload = sanitize_member_dashboard_payload(payload)
+            deadline = None
+            if cache_key.startswith('news-status:'):
+                worker = payload.get('worker')
+                disk = worker.get('disk_admission') if isinstance(worker, dict) else None
+                expiry = disk.get('valid_until_utc') if isinstance(disk, dict) else None
+                if expiry is not None:
+                    try:
+                        stamp = datetime.fromisoformat(expiry)
+                        if stamp.utcoffset() is None:
+                            raise ValueError('timezone required')
+                        deadline = stamp.timestamp()
+                        if not math.isfinite(deadline):
+                            raise ValueError('finite deadline required')
+                    except (TypeError, ValueError, OverflowError):
+                        deadline = time.time()  # Invalid deadlines cannot extend a cache entry.
             encoded = (
                 json.dumps(
                     payload,
@@ -2082,6 +2122,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 encoded,
                 content_type="application/json; charset=utf-8",
                 cache_control=cache_control,
+                cache_deadline_epoch=deadline,
             )
             return response
 
@@ -2302,6 +2343,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 raise
         return fallback
 
+    @staticmethod
+    def _status_owner_prefix(prefix: str, revision: Mapping[str, Any]) -> str:
+        # Financial content can remain identical across an executor restart,
+        # while the browser must acknowledge a different engine generation.
+        # Neither a fresh cache hit nor stale fallback may cross that owner.
+        generation = revision.get("engine_generation")
+        return prefix if generation is None else f"{prefix}owner:{generation}:"
+
     def _committed_status_response(
         self, *, revision_reader: Callable[[], PreparedResponse],
         cache_key: Callable[[Mapping[str, Any]], str],
@@ -2335,6 +2384,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 after = _response_json(revision_reader())
                 if after.get("revision_token") != revision.get("revision_token"):
                     raise DashboardSnapshotChanged("dashboard source revision changed during status build")
+                for field in ("engine_generation", "content_revision"):
+                    if field in revision and after.get(field) != revision[field]:
+                        raise DashboardSnapshotChanged("dashboard owner changed during status build")
                 sync["revision_token"] = revision.get("revision_token")
                 sync["history_revision"] = revision.get("history_revision")
                 payload["service_sync"] = sync
@@ -2373,7 +2425,8 @@ class PublicDashboardServer(ThreadingHTTPServer):
         date_scope = normalized_date or (
             f"latest@{display_session}" if display_session else "latest"
         )
-        cache_prefix = f"tw-status:{date_scope}:"
+        date_prefix = f"tw-status:{date_scope}:"
+        cache_prefix = self._status_owner_prefix(date_prefix, revision)
         from stockagent.data.tw_current_trading_universe import receipt_path, TAIPEI
         try:
             registry = receipt_path(datetime.now(TAIPEI).date().isoformat()).stat()
@@ -2405,7 +2458,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         def build_response() -> PreparedResponse:
             return self._committed_status_response(
                 revision_reader=self.tw_revision,
-                cache_key=lambda current: f"{cache_prefix}{current.get('revision_token') or current.get('state_revision') or 'missing'}:registry:{registry_token}",
+                cache_key=lambda current: f"{self._status_owner_prefix(date_prefix, current)}{current.get('revision_token') or current.get('state_revision') or 'missing'}:registry:{registry_token}",
                 builder=build_status,
                 display_session=display_session if not normalized_date else None,
             )
@@ -2625,12 +2678,13 @@ class PublicDashboardServer(ThreadingHTTPServer):
             }
             return payload
 
-        cache_prefix = f"overnight-status:{normalized_date or 'latest'}:"
+        date_prefix = f"overnight-status:{normalized_date or 'latest'}:"
+        cache_prefix = self._status_owner_prefix(date_prefix, revision)
 
         def build_response() -> PreparedResponse:
             return self._committed_status_response(
                 revision_reader=self.overnight_revision,
-                cache_key=lambda current: f"{cache_prefix}{current.get('revision_token') or current.get('state_revision') or 'missing'}",
+                cache_key=lambda current: f"{self._status_owner_prefix(date_prefix, current)}{current.get('revision_token') or current.get('state_revision') or 'missing'}",
                 builder=build)
 
         return self._revision_stale_or_build(
@@ -2842,6 +2896,30 @@ class PublicDashboardServer(ThreadingHTTPServer):
             cache_key=f"data-monitor-ticks:{digest}", ttl_seconds=8.0, cache_control="no-store",
             stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS, builder=build,
         )
+
+    def data_monitor_series(self, **filters) -> PreparedResponse:
+        """Filter producer snapshots only; source databases and data stay private."""
+        def build() -> Mapping[str, Any]:
+            payload = _response_json(self.data_monitor_status())
+            return series_page(payload.get("bar_inventory") or {}, payload.get("tick_inventory") or {}, **filters)
+        digest = hashlib.sha256(json.dumps(filters, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        return self.cached_local_json(cache_key=f"data-monitor-series:{digest}", ttl_seconds=8.,
+            cache_control="no-store", stale_grace_seconds=MONITOR_STATUS_STALE_GRACE_SECONDS, builder=build)
+
+    def data_monitor_storage(self) -> PreparedResponse:
+        """Read a small observer-owned projection; no disk walk or remote calls."""
+        def build() -> Mapping[str, Any]:
+            try:
+                snapshot = read_storage_snapshot(self.repo_root / "artifacts/live/data_monitor/storage_status.json")
+            except (OSError, ValueError):
+                snapshot = {}
+            try:
+                snapshot["efficiency"] = read_storage_snapshot(self.repo_root / "artifacts/live/data_monitor/storage_efficiency.json")
+            except (OSError, ValueError):
+                pass
+            return storage_public_status(snapshot)
+        return self.cached_local_json(cache_key="data-monitor-storage", ttl_seconds=8.,
+            cache_control="no-store", stale_grace_seconds=0., builder=build)
 
     def data_monitor_features(self) -> PreparedResponse:
         """Serve the separately materialized, read-only field inventory."""
@@ -3592,13 +3670,15 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/html; charset=utf-8",
                     "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else "public, max-age=60",
                 )
-            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix in {"provider.js", "ticks.js"}) or (
+            elif suffix == "app.js" or (prefix == "/data-monitor/" and suffix in {"provider.js", "ticks.js", "storage.js"}) or (
                 prefix in {"/tw-day-trade/", "/tw-overnight/"}
                 and suffix
                 in {
                     "presentation.js",
                     "detail-components.js",
                     "chart-renderer.js",
+                    "published-signals.js",
+                    "live-snapshot.js",
                 }
             ):
                 routes[path] = (
@@ -3606,7 +3686,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "text/javascript; charset=utf-8",
                     "no-cache, must-revalidate" if prefix in {"/finlab/", "/finmind/", "/news/", "/tej/"} else IMMUTABLE_ASSET_CACHE_CONTROL,
                 )
-            elif suffix == "styles.css" or (prefix == "/data-monitor/" and suffix == "ticks.css") or (
+            elif suffix == "styles.css" or (prefix == "/data-monitor/" and suffix in {"ticks.css", "storage.css"}) or (
                 prefix == "/traffic/" and suffix == "performance.css"
             ):
                 routes[path] = (
@@ -3716,6 +3796,24 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "detail": detail == "1", "offset": offset, "limit": limit}
         except ValueError as error:
             raise InvalidPublicRequest("invalid Tick inventory query") from error
+
+    @staticmethod
+    def _series_query(raw_query: str) -> dict[str, Any]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=8)
+            allowed = {"provider", "market", "kind", "grain", "q", "detail", "offset", "limit"}
+            if set(query) - allowed or any(len(v) != 1 for v in query.values()):
+                raise ValueError("unsupported or repeated field")
+            grain = query.pop("grain", ["all"])[0]
+            kind = query.pop("kind", ["all"])[0]
+            if grain not in {"all", *GRAINS} or kind not in {"all", *SERIES_KINDS}:
+                raise ValueError("invalid series filters")
+            # The original Tick route remains unchanged and retains its strict
+            # query contract. Share its common validation, not its kind domain.
+            parsed = PublicDashboardHandler._tick_query(urlencode({k: v[0] for k, v in query.items()}))
+            return {**parsed, "grain": grain, "kind": kind}
+        except ValueError as error:
+            raise InvalidPublicRequest("invalid series inventory query") from error
 
     @staticmethod
     def _feature_page_query(raw_query: str) -> "FeaturePageQuery":
@@ -4053,6 +4151,39 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     _response_json(self.server.tw_status(session_date))
                 ),
             )
+        if path == "/tw-day-trade/api/published-signals":
+            # This producer-owned target view is deliberately independent of
+            # the paper commit fence. It never includes orders or fills.
+            today = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+            return self.server.cached_local_json(
+                cache_key=f"tw-published-signals:{today}",
+                ttl_seconds=0.5,
+                cache_control="no-store",
+                stale_grace_seconds=0.0,
+                builder=lambda: build_published_signal_snapshot(repo_root=self.server.repo_root),
+            )
+        if path == "/tw-day-trade/api/live-snapshot":
+            if raw_query:
+                raise InvalidPublicRequest("live snapshot does not accept query fields")
+            return self.server.cached_local_json(
+                cache_key="tw-live-paper-snapshot", ttl_seconds=0.5,
+                cache_control="no-store", stale_grace_seconds=0.0,
+                builder=lambda: build_live_paper_snapshot(
+                    state_dir=self.server.repo_root / "artifacts/live/tw_day_trade_simulation",
+                    quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
+                ),
+            )
+        if path == "/tw-day-trade/api/live-events":
+            if raw_query:
+                raise InvalidPublicRequest("live events do not accept query fields")
+            return self.server.cached_local_json(
+                cache_key="tw-live-paper-events", ttl_seconds=0.5,
+                cache_control="no-store", stale_grace_seconds=0.0,
+                builder=lambda: build_live_paper_events(
+                    state_dir=self.server.repo_root / "artifacts/live/tw_day_trade_simulation",
+                    quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
+                ),
+            )
         if path == "/tw-day-trade/api/signals":
             normalized = self._signal_query(raw_query, allow_hide_zero_targets=True)
             query = parse_qs(normalized, keep_blank_values=True)
@@ -4298,6 +4429,10 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             return self.server.data_monitor_provider(**self._provider_query(raw_query))
         if path == "/data-monitor/api/ticks":
             return self.server.data_monitor_ticks(**self._tick_query(raw_query))
+        if path == "/data-monitor/api/series":
+            return self.server.data_monitor_series(**self._series_query(raw_query))
+        if path == "/data-monitor/api/storage":
+            return self.server.data_monitor_storage()
         if path == "/data-monitor/api/features":
             return self.server.data_monitor_features()
         if path == "/data-monitor/api/features/page":

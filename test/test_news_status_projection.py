@@ -55,13 +55,19 @@ def test_exact_discovery_projection_empty_due_boundary_and_archived_errors(confi
         queue.close()
 
 
-@pytest.mark.parametrize('comparison', ['compare_discovery_summary', 'compare_capacity_copy'])
+@pytest.mark.parametrize('comparison,reference', [('compare_discovery_summary', 'deepcopy'),
+    ('compare_capacity_copy', 'deepcopy'), ('compare_cycle_publication', 'deepcopy'),
+    ('compare_service_transition', 'deepcopy'),
+    ('compare_capacity_copy', 'recursive'), ('compare_bulk_coverage_summary', 'deepcopy')])
 def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows(config, tmp_path, monkeypatch,
-                                                                              comparison):
+                                                                              comparison, reference):
     queue = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
     try:
         with queue.db:
             add_discovery_cases(queue, 100)
+            queue.observe_bulk_coverage('https://publisher.test/api?day=1', 'publisher', 101, 3, 'old-clock')
+            queue.observe_bulk_coverage('https://publisher.test/api?day=2', 'publisher', 23, 1, 'new-clock')
+        before_coverage = [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_api_coverage ORDER BY base_url')]
         if comparison == 'compare_capacity_copy':
             queue.http_capacity_snapshot = lambda: {'providers': {}, 'calibration': {'providers': {
                 'publisher': {'history': [{'new_stored_url_heads': 10**90, 'errors': [0, 3],
@@ -77,7 +83,7 @@ def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows
 
         monkeypatch.setattr(NewsQueue, '__init__', no_owner_or_http)
         monkeypatch.setattr(NewsHTTP, '__init__', no_owner_or_http)
-        result = profile_current_status(tmp_path, queue.registry, 3, **{comparison: True})
+        result = profile_current_status(tmp_path, queue.registry, 3, **{comparison: True}, capacity_copy_reference=reference)
         assert result['accepted']
         assert result['publisher_requests'] == 0
         assert result['source_states_mutated'] is False
@@ -88,11 +94,27 @@ def test_whole_status_benchmark_pins_owner_preserves_publication_and_source_rows
         if comparison == 'compare_capacity_copy':
             assert result['capacity_copy']['all_published_values_preserved']
             assert result['capacity_copy']['profiled_implementation'] == 'summary'
+            assert result['capacity_copy']['reference_implementation'] == reference
+        if comparison == 'compare_cycle_publication':
+            assert result['cycle_publication']['publication_counts'] == {'legacy': [2] * 3, 'summary': [1] * 3}
+            assert result['cycle_publication']['all_final_values_preserved']
+            assert result['cycle_publication']['profiled_implementation'] == 'summary'
+        if comparison == 'compare_service_transition':
+            assert result['contract_version'] == 11
+            assert result['service_transition']['publication_counts'] == {'legacy': [2] * 3, 'summary': [1] * 3}
+            assert result['service_transition']['same_waiting_projection']
+        if comparison == 'compare_bulk_coverage_summary':
+            assert result['contract_version'] == 10
+            assert result['bulk_coverage_verification']['live_transactional_summary_verified']
+            assert result['bulk_coverage_verification']['coverage_scopes'] == 2
+            statements = [item['statement'] for item in result['top_query_execution_times']]
+            assert not any('FROM bulk_api_coverage c LEFT JOIN' in sql for sql in statements)
         assert len(result['top_query_execution_times']) <= 12
         assert sha256_file(tmp_path / 'status.json') == before_status
         assert queue.db.total_changes == changes
         assert list(queue.db.execute('SELECT * FROM queue_settings ORDER BY key')) == before_settings
         assert list(queue.db.execute('SELECT * FROM discovery ORDER BY url')) == before_rows
+        assert [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_api_coverage ORDER BY base_url')] == before_coverage
     finally:
         queue.close()
 
@@ -112,5 +134,35 @@ def test_status_benchmark_rejects_old_owner_or_unbounded_repetitions(config, tmp
         atomic_write_json(tmp_path / 'status.json', status)
         with pytest.raises(ValueError, match='status_database_owner_mismatch'):
             profile_current_status(tmp_path, queue.registry, 3)
+    finally:
+        queue.close()
+
+
+def test_bulk_projection_replay_seeds_only_temporary_legacy_state(config, tmp_path, monkeypatch):
+    queue = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
+    try:
+        with queue.db:
+            queue.observe_bulk_coverage('https://publisher.test/api?day=1', 'publisher', 13, 1, 'clock')
+            for row in queue.db.execute("SELECT name FROM sqlite_master WHERE type='trigger' "
+                                        "AND (name LIKE 'bulk_coverage_summary_%' OR name LIKE 'bulk_split_summary_%')").fetchall():
+                queue.db.execute('DROP TRIGGER '+row[0])
+            queue.db.execute('DROP TABLE bulk_endpoint_metrics')
+            queue.db.execute('DROP INDEX bulk_coverage_endpoint_observed')
+            queue.db.execute("DELETE FROM queue_settings WHERE key='bulk_coverage_summary_version'")
+        queue.status()
+        before = [tuple(row) for row in queue.db.execute('SELECT type,name,sql FROM sqlite_master ORDER BY name')]
+        before_hash = sha256_file(tmp_path / 'status.json')
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError('read-only comparison must not initialize a writer or HTTP')
+
+        monkeypatch.setattr(NewsQueue, '__init__', forbidden)
+        monkeypatch.setattr(NewsHTTP, '__init__', forbidden)
+        result = profile_current_status(tmp_path, queue.registry, 3, compare_bulk_coverage_summary=True)
+        proof = result['bulk_coverage_verification']
+        assert result['accepted'] and proof['seeded_in_temporary_table']
+        assert proof['coverage_scopes'] == 1 and not proof['schema_migrated']
+        assert before == [tuple(row) for row in queue.db.execute('SELECT type,name,sql FROM sqlite_master ORDER BY name')]
+        assert sha256_file(tmp_path / 'status.json') == before_hash
     finally:
         queue.close()

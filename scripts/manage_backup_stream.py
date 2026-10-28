@@ -19,7 +19,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/data_sync/backup_stream.json")
     parser.add_argument("action", choices=("inventory", "cycle", "status", "register-baseline", "capture-auxiliary",
-                                           "publish-recovery-requests"))
+                                           "publish-recovery-requests", "notify-transport", "private-cycle"))
     parser.add_argument("--output", type=Path)
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--wait-for-owner", action="store_true")
@@ -49,6 +49,22 @@ def main() -> None:
         print(json.dumps(BackupStream(config).refresh_auxiliary(wait_for_owner=args.wait_for_owner)))
     elif args.action == "publish-recovery-requests":
         print(json.dumps(BackupStream(config).publish_recovery_requests(wait_for_owner=args.wait_for_owner)))
+    elif args.action == "notify-transport":
+        try:
+            print(json.dumps(BackupStream(config).notify_transport(wait_for_owner=args.wait_for_owner)))
+        except BlockingIOError:
+            print(json.dumps({"state": "existing_source_owner_busy", "operation": "transport_notification",
+                              "NAS_backup_verified": False}))
+            raise SystemExit(75) from None
+    elif args.action == 'private-cycle':
+        try:
+            result = BackupStream(config).private_history_cycle(publish=not args.inspect_only,
+                                                               wait_for_owner=args.wait_for_owner)
+        except BlockingIOError:
+            result = {'state': 'existing_source_owner_busy', 'NAS_backup_verified': False}
+            print(json.dumps(result))
+            raise SystemExit(75) from None
+        print(json.dumps(result, ensure_ascii=False))
     else:
         try:
             result = BackupStream(config).cycle(publish=not args.inspect_only)

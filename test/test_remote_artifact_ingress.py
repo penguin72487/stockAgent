@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import fcntl
 import shlex
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,83 @@ from scripts.ingest_remote_cold_artifacts import (
     eligible_candidates,
 )
 from stockagent.data_sync.desync_snapshots import SnapshotError
+
+
+def test_return_workspace_keeps_native_scratch_compatibility(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ingress, "admit_workspace", lambda path, required: calls.append((path, required)))
+    args = SimpleNamespace(state_root=tmp_path / "state")
+    assert ingress.return_staging_workspace(args, 123) == args.state_root
+    assert calls == [(args.state_root, 123)]
+
+
+@pytest.mark.parametrize("selected", ["/tmp/return", "/srv/stockagent-packed", "/srv/stockagent-packed/.local-state/other"])
+def test_return_workspace_rejects_unenrolled_disk_namespace(tmp_path, monkeypatch, selected):
+    from stockagent.data_sync import cold_primary
+    monkeypatch.setattr(cold_primary, "_check_d_primary_mount",
+                        lambda *_: pytest.fail("unadmitted namespace reached the D guard"))
+    with pytest.raises(SnapshotError, match="enrolled private D"):
+        ingress.return_staging_workspace(SimpleNamespace(state_root=tmp_path, staging_root=Path(selected)), 123)
+
+
+@pytest.mark.parametrize("source,filesystem,accepted", [("D:", "9p", True), ("D:\\", "9p", True),
+    ("C:", "9p", False), ("D:", "ext4", False)])
+def test_return_workspace_checks_real_d_mount_before_payload_admission(tmp_path, monkeypatch, source, filesystem, accepted):
+    from stockagent.data_sync import cold_primary
+
+    scratch = tmp_path / "stage"
+    monkeypatch.setattr(ingress, "RETURN_PAYLOAD_SCRATCH", scratch)
+    guarded = []
+    monkeypatch.setattr(cold_primary, "_check_d_primary_mount", lambda root: guarded.append(root))
+    monkeypatch.setattr(ingress.subprocess, "run", lambda *a, **kw: SimpleNamespace(
+        stdout=json.dumps({"filesystems": [{"source": source, "fstype": filesystem}]})))
+    monkeypatch.setattr(ingress, "admit_workspace", lambda *_: pytest.fail("D payload reached SSD admission"))
+    args = SimpleNamespace(state_root=tmp_path / "state", staging_root=scratch)
+    if accepted:
+        assert ingress.return_staging_workspace(args, 1) == scratch
+        with pytest.raises(SnapshotError, match="capacity"):
+            ingress.return_staging_workspace(args, 2**63)
+    else:
+        with pytest.raises(SnapshotError, match="native D volume"):
+            ingress.return_staging_workspace(args, 1)
+        assert not scratch.exists()
+    assert guarded
+
+
+def test_drvfs_return_clock_projection_keeps_native_and_remote_fences():
+    candidate = RemoteCandidate("markets/run", 2, 123, "a" * 64, 1_792_832_424_696_799_341, ())
+    exact = {"files": 2, "logical_bytes": 123, "newest_mtime_ns": candidate.newest_mtime_ns}
+    projected = {**exact, "newest_mtime_ns": 1_792_832_424_000_000_000}
+    assert ingress.staging_observation_matches(exact, candidate, d_payload_scratch=False)
+    assert ingress.staging_observation_matches(projected, candidate, d_payload_scratch=True)
+    assert not ingress.staging_observation_matches(projected, candidate, d_payload_scratch=False)
+    assert not ingress.staging_observation_matches({**projected, "files": 3}, candidate, d_payload_scratch=True)
+    assert not ingress.staging_observation_matches({**projected, "logical_bytes": 124}, candidate, d_payload_scratch=True)
+    assert not ingress.staging_observation_matches({**projected, "newest_mtime_ns": projected["newest_mtime_ns"] - 1_000_000_000}, candidate, d_payload_scratch=True)
+
+
+def test_cycle_failure_retains_phase_and_private_stderr_without_command(tmp_path):
+    output = tmp_path / "status.json"
+    output.write_text(json.dumps({"state": "cycle-running", "automation_contract": ingress.AUTOMATION_CONTRACT,
+                                  "phase": "discovering-completed-runs"}))
+    args = SimpleNamespace(output=output, state_root=tmp_path, apply=True)
+    result = ingress.cycle_failure(args, subprocess.CalledProcessError(
+        1, ["ssh", "private-command"], stderr="private-error"))
+    assert result["phase"] == "discovering-completed-runs"
+    assert "private-command" not in json.dumps(result)
+    evidence = Path(result["diagnostics"])
+    assert evidence.read_text() == "private-error"
+    assert evidence.stat().st_mode & 0o777 == 0o600
+
+
+def test_unobservable_consumers_allow_only_explicit_preservation_not_default_eligibility():
+    unknown = RemoteCandidate("markets/run", 2, 123, "a" * 64, 1,
+                              (ingress.UNOBSERVABLE_CONSUMERS,))
+    options = dict(include_roots=["markets/run"], stable_hours=0, now_ns=100)
+    assert not ingress.eligible_candidates([unknown], **options)
+    assert ingress.eligible_candidates([unknown], **options, allow_unobservable_copy=True) == [unknown]
+    busy = RemoteCandidate("markets/run", 2, 123, "a" * 64, 1, ("pid=123:cwd:/run",))
+    assert not ingress.eligible_candidates([busy], **options, allow_unobservable_copy=True)
 
 
 def test_recent_preserved_run_waits_without_repeated_decode_or_global_wave_block(tmp_path, monkeypatch):
@@ -42,7 +120,7 @@ def test_recent_preserved_run_waits_without_repeated_decode_or_global_wave_block
     result = ingress.returned_source(args, candidate, resolved, policy)
     assert result["state"] == "waiting-training-hot-retention" and result["deleted"] is False
     assert result["minimum_hot_retention_hours"] == 168
-    assert not (args.state_root / "training-return-waiting-peer.json").exists()
+    assert ingress.waiting_returns(args.state_root, policy) == []
 from stockagent.training.lifecycle import TrainingRunLifecycle
 from test_training_lifecycle import _write_minimal_completed_artifacts
 
@@ -270,7 +348,7 @@ def test_remote_control_failure_preserves_private_diagnostics_without_publishing
     assert evidence.read_text() == "private-unit-secret" and evidence.stat().st_mode & 0o777 == 0o600
 
 
-def test_one_pending_return_blocks_a_new_publication_wave(tmp_path, monkeypatch, capsys):
+def test_one_pending_return_does_not_block_new_preservation(tmp_path, monkeypatch, capsys):
     pending = _candidate("markets/waiting")
     other = _candidate("markets/older")
     wave = {"relative_root": pending.relative_root, "dataset": ingress.automatic_dataset_name(pending.relative_root),
@@ -283,22 +361,55 @@ def test_one_pending_return_blocks_a_new_publication_wave(tmp_path, monkeypatch,
     discovery = []
     def exact_discovery(**kw):
         discovery.append(kw)
-        assert kw["scope"] == "markets" and kw["relative_root"] == pending.relative_root
-        return [pending]
+        assert "relative_root" not in kw
+        return [pending, other] if kw["scope"] == "markets" else []
     monkeypatch.setattr(ingress, "discover_remote_artifacts", exact_discovery)
-    checked = []
-    def preserved(sync_root, spec, candidate, **kwargs):
-        assert kwargs == {"verify_content": False}
-        checked.append(candidate.relative_root)
-        return SimpleNamespace(manifest={"snapshot_id": wave["snapshot_id"]})
-    monkeypatch.setattr(ingress, "_resolved_release", preserved)
-    monkeypatch.setattr(ingress, "returned_source", lambda *a: {"state":"waiting-packed-peer-convergence", "deleted":False})
+    monkeypatch.setattr(ingress, "_resolved_release", lambda *a, **kw: None)
+    monkeypatch.setattr(ingress, "resolve_packed_snapshot_id", lambda *a: SimpleNamespace(
+        manifest_sha256=wave["manifest_sha256"], manifest={"source": {
+            "files":pending.files, "logical_bytes":pending.logical_bytes,
+            "portable_fingerprint_sha256":pending.portable_fingerprint_sha256}}))
+    monkeypatch.setattr(ingress, "returned_source", lambda *a, **kw: {"state":"waiting-packed-peer-convergence", "deleted":False})
     monkeypatch.setattr(ingress, "publish_cold_artifact", lambda *a, **kw: pytest.fail("unconfirmed wave was bypassed"))
     assert ingress.main() == 0
     result = json.loads(capsys.readouterr().out)
-    assert checked == [pending.relative_root] and result["published"] == 0 and result["waiting_return"] == wave
-    assert len(discovery) == 1
+    assert result["published"] == 0 and result["waiting_return"] == wave
+    assert any(row["relative_root"] == other.relative_root and row["action"] == "would-ingest" for row in result["rows"])
+    assert len(discovery) == 2 and result["pending_return_count"] == 1
     assert json.loads(marker.read_text()) == wave
+
+
+def test_bounded_pending_queue_preserves_other_waves_and_legacy(tmp_path):
+    policy = ingress.load_policy(Path("configs/data_sync/training_return.json"))
+    args = SimpleNamespace(state_root=tmp_path, apply=True)
+    def wave(i):
+        root = f"markets/run-{i}"
+        return {"relative_root":root, "dataset":ingress.automatic_dataset_name(root),
+                "snapshot_id":f"fixed-{i}", "manifest_sha256":"a"*64}
+    legacy = tmp_path/"training-return-waiting-peer.json"
+    legacy.write_text(json.dumps(wave(0)))
+    enrolled = ingress._enroll_return(args, wave(1), policy)
+    assert ingress._enroll_return(args, wave(1), policy) == enrolled
+    ingress._clear_return(enrolled, wave(1), policy)
+    assert ingress.waiting_returns(tmp_path, policy) == [wave(0)] and legacy.exists()
+    for i in range(1, ingress.MAX_PENDING_RETURNS):
+        ingress._enroll_return(args, wave(i), policy)
+    with pytest.raises(SnapshotError, match="queue is full"):
+        ingress._enroll_return(args, wave(999), policy)
+    assert len(ingress.waiting_returns(tmp_path, policy)) == ingress.MAX_PENDING_RETURNS
+    with pytest.raises(SnapshotError, match="different exact release"):
+        ingress._enroll_return(args, {**wave(0), "manifest_sha256":"b"*64}, policy)
+
+
+def test_pending_queue_filename_binds_immutable_release(tmp_path):
+    policy = ingress.load_policy(Path("configs/data_sync/training_return.json"))
+    root = "markets/fixed"
+    wave = {"relative_root":root, "dataset":ingress.automatic_dataset_name(root),
+            "snapshot_id":"fixed-release", "manifest_sha256":"a"*64}
+    path = ingress._enroll_return(SimpleNamespace(state_root=tmp_path, apply=True), wave, policy)
+    path.write_text(json.dumps({**wave, "manifest_sha256":"b"*64}))
+    with pytest.raises(SnapshotError, match="identity conflicts"):
+        ingress.waiting_returns(tmp_path, policy)
 
 
 def test_waiting_release_cannot_redirect_the_owner_to_an_unenrolled_scope(tmp_path):
@@ -503,7 +614,7 @@ def test_automatic_source_cleanup_requires_full_current_transport_proof(tmp_path
     result = ingress.returned_source(args, candidate, resolved, policy)
     assert result["deleted"] is False and result["state"] == "waiting-packed-peer-convergence"
     assert not all(result["transport_checks"].values())
-    assert (args.state_root / "training-return-waiting-peer.json").is_file()
+    assert len(ingress.waiting_returns(args.state_root, policy)) == 1
     assert "private-unit-key" not in json.dumps(result)
 
 
@@ -525,7 +636,7 @@ def test_transport_is_rechecked_after_slow_cold_recovery_before_source_cleanup(t
     monkeypatch.setattr(ingress, "remote_retirement", lambda *a, **k: pytest.fail("stale pre-decode convergence authorized unlink"))
     result = ingress.returned_source(args, candidate, resolved, policy)
     assert recovered == [True] and result["cold_recovery_completed"] is True
-    assert result["deleted"] is False and (args.state_root / "training-return-waiting-peer.json").is_file()
+    assert result["deleted"] is False and len(ingress.waiting_returns(args.state_root, policy)) == 1
 
 
 @pytest.mark.parametrize('changed', ['release', 'cold-authority', 'transport'])
@@ -560,7 +671,7 @@ def test_shared_retirement_owner_refreshes_release_authority_and_transport(tmp_p
     assert resilience_calls[0] is False and peer_calls[:2] == [False, False]
     if changed == 'transport':
         assert peer_calls[-1] is True and result['state'] == 'waiting-packed-peer-convergence'
-        assert (args.state_root/'training-return-waiting-peer.json').exists()
+        assert len(ingress.waiting_returns(args.state_root, policy)) == 1
     else:
         assert result['state'] == 'remote-retirement-failed'
     assert not shared_owner_held()

@@ -57,6 +57,7 @@ from stockagent.backtest.return_metrics import (
     clean_log_returns_torch,
 )
 from stockagent.backtest.report import (
+    _aligned_dated_backtest_rows,
     reporting_weight_history,
     compute_metrics,
     generate_annual_report,
@@ -126,6 +127,10 @@ from stockagent.training.day_trade_carry_artifact import (
     PHYSICAL_CARRY_ARCHIVE_SCHEMA,
     carry_artifact_from_payload,
     carry_artifact_payload,
+)
+from stockagent.training.futures_account_bridge import (
+    PreparedFuturesAccountSource, bind_padded_futures_account_loss,
+    verify_futures_account_binding,
 )
 from stockagent.backtest.tw_dual_session_compiled import (
     COMPILED_BLOCK_ROWS as TW_DUAL_SESSION_COMPILED_BLOCK_ROWS,
@@ -2489,6 +2494,10 @@ class _ExecutionRuntime:
     option_day_cost_schedule: OptionDayCostSchedule | None = None
     derivatives_maximum_capital_fraction: float = 0.98
     day_trade_carry_source: PreparedDayTradeCarrySource | None = None
+    # Research-only until the shared dataset/checkpoint/evaluation contracts
+    # admit the same dated account source and its artifact identity.
+    futures_account_source: PreparedFuturesAccountSource | None = None
+    futures_execution_release_fingerprint: str | None = None
     day_trade_training_annual_episodes: bool = False
     day_trade_training_period_contract: Mapping[str, Any] | None = None
     # CPU identity references only; resolved exclusively after a crypto error.
@@ -2593,6 +2602,24 @@ def _build_execution_runtime(
             )
     mode = normalize_execution_mode(config.trading.execution_mode)
     lag = int(config.trading.tw_settlement_lag_sessions)
+    futures_account_source = None
+    futures_execution_release_fingerprint = None
+    daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+    if daily is not None and (
+        getattr(daily, "futures_account_calendar", None) is not None
+        or getattr(daily, "account_only_integer_execution", None) is not None
+    ):
+        if (
+            mode != "tw_stock_context_futures_portfolio"
+            or not config.trading.tw_futures_portfolio_integer_contracts
+        ):
+            raise ValueError(
+                "dated futures account events require the whole-contract futures portfolio executor"
+            )
+        futures_account_source = PreparedFuturesAccountSource.from_daily(
+            daily, panel.dates, prepare_execution=True,
+        )
+        futures_execution_release_fingerprint = futures_account_source.execution_release_fingerprint
     if mode in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES:
         return _ExecutionRuntime(
             mode=mode,
@@ -2615,6 +2642,8 @@ def _build_execution_runtime(
             ),
             lot_sizes=None,
             settlement_lag_sessions=lag,
+            futures_account_source=futures_account_source,
+            futures_execution_release_fingerprint=futures_execution_release_fingerprint,
             futures_initial_capital=(
                 float(config.trading.tw_futures_portfolio_integer_initial_capital)
                 if mode == "tw_stock_context_futures_portfolio"
@@ -3230,12 +3259,34 @@ def _mode_artifact_contract_for_config(
                 deployment_action_source="owned_market_policy_packets_resolved_from_continuously_carried_book_and_nav",
             )
         if config.trading.tw_futures_portfolio_decision_time is not None:
-            from stockagent.data.tw_futures_decision_clock import decision_clock_contract
-            clock = decision_clock_contract(config.trading.tw_futures_portfolio_decision_time)
-            payload.update(decision_clock=f"{clock['decision_time']}_completed_prior_session_features",
-                           execution_clock=f"post_decision_minute_vwap_label_{clock['window_end_minute']}")
-            payload["mode_details"].update(entry_clock=clock,
-                entry_clock_source=config.trading.tw_futures_portfolio_entry_clock_path,
+            from stockagent.data.tw_futures_decision_clock import clock_contract_from_manifest
+            decision_time = config.trading.tw_futures_portfolio_decision_time
+            entry_path = config.trading.tw_futures_portfolio_entry_clock_path
+            manifest_path = None if entry_path is None else Path(entry_path).with_name("manifest.json")
+            clock = {"decision_time": decision_time}
+            metadata_sha256 = None
+            if manifest_path is not None and manifest_path.is_file():
+                manifest_bytes = manifest_path.read_bytes()
+                manifest = json.loads(manifest_bytes)
+                try:
+                    clock = clock_contract_from_manifest(manifest, decision_time)
+                except ValueError as exc:
+                    raise ValueError("futures report entry clock manifest is incomplete or incompatible") from exc
+                metadata_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+                minutes = clock.get("window_minutes", 1)
+                execution_clock = (f"post_decision_minute_vwap_label_{clock['window_end_minute']}"
+                                   if minutes == 1 else
+                                   f"post_decision_{minutes}min_vwap_end_label_{clock['window_end_minute']}")
+            else:
+                # A config-only read without the manifest must not invent a
+                # one-minute window or silently label all-TWD as stock-only.
+                execution_clock = "post_decision_window_vwap_source_metadata_unavailable"
+            payload.update(decision_clock=f"{decision_time}_completed_prior_session_features",
+                           execution_clock=execution_clock)
+            payload["mode_details"].update(entry_clock_reporting_contract_version=2,
+                entry_clock=clock,
+                entry_clock_source=entry_path,
+                entry_clock_manifest_sha256=metadata_sha256,
                 risk_clock="entry_proxy_boundary_and_official_settlement_not_intraday_broker_replay")
             if config.trading.tw_futures_portfolio_opening_reference_path is not None:
                 from stockagent.data.tw_futures_decision_clock import opening_reference_contract
@@ -9820,10 +9871,24 @@ def _save_backtest_artifact(
     compression: str = "none",
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
     persist_futures_account_policy: bool = True,
+    futures_account_context: object | None = None,
 ) -> None:
     if not _distributed_should_write():
         return
+    dated_futures = result.futures_account_ledger
+    if (dated_futures is None) != (futures_account_context is None):
+        raise ValueError("dated futures archive requires both its full ledger and pinned context")
+    if dated_futures is not None:
+        from stockagent.training.futures_account_artifact import (
+            futures_account_ledger_payload, validate_dated_futures_backtest,
+        )
+        dated_futures_payload = futures_account_ledger_payload(dated_futures, futures_account_context)
+        validate_dated_futures_backtest(result, dates, dated_futures)
+    else:
+        dated_futures_payload = None
     if result.day_trade_carry_state is not None or result.minute_nav is not None:
+        if dated_futures is not None:
+            raise ValueError("physical FIFO and dated futures account archives cannot be mixed")
         if day_trade_carry_context is None:
             raise ValueError(
                 "physical FIFO minute history cannot use the legacy NPZ writer: "
@@ -10712,7 +10777,14 @@ def _save_backtest_artifact(
                     integer_short_margin_collateral, dtype=np.float64
                 ),
             )
-    _atomic_numpy_archive_save(output_path, payload, compression=compression)
+    if dated_futures_payload is not None:
+        from stockagent.training.futures_account_artifact_contract import FUTURES_ACCOUNT_ARCHIVE_SCHEMA
+        payload["artifact_schema_version"] = np.asarray(FUTURES_ACCOUNT_ARCHIVE_SCHEMA, dtype=np.int64)
+        payload.update(dated_futures_payload)
+        _atomic_numpy_archive_save(output_path, payload, compression=compression,
+            validate=lambda path: _load_backtest_artifact(path, futures_account_context=futures_account_context))
+    else:
+        _atomic_numpy_archive_save(output_path, payload, compression=compression)
 
 
 def _realized_leverage_backtest(
@@ -10891,11 +10963,54 @@ def _save_best_val_backtest_snapshot(
     row_end: int,
     dates: np.ndarray,
     objective: str,
+    futures_account_context: object | None = None,
 ) -> None:
     if not _distributed_should_write():
         return
     row_start = max(0, int(row_start))
     row_end = max(row_start, int(row_end))
+    dated = val_backtest.futures_account_calendar_result is not None
+    if dated != (futures_account_context is not None):
+        raise ValueError(
+            "dated futures best-validation snapshots require the complete "
+            "account ledger and its pinned source context"
+        )
+    if dated:
+        # Unlike the legacy decision-only snapshot below, a dated futures
+        # snapshot must retain settlement-only rows and the physical account
+        # entering this exact validation slice.  Reuse the canonical artifact
+        # and slicing contracts rather than attributing the events to a
+        # different date or silently dropping them.
+        total_rows = int(val_backtest.strategy_returns.size(0))
+        if not 0 <= row_start < row_end <= total_rows:
+            raise ValueError("dated futures best-validation slice must be nonempty and in range")
+        full = val_backtest.to_numpy(futures_account_context=futures_account_context)
+        result, slice_context = _slice_backtest_rows(
+            full, row_start, row_end, futures_account_context=futures_account_context,
+            return_futures_context=True,
+        )
+        snapshot_dates = np.asarray(dates, dtype="datetime64[D]")
+        if not np.array_equal(snapshot_dates, result.futures_account_ledger.decision_dates):
+            raise ValueError("dated futures best-validation dates differ from the pinned slice")
+        _save_backtest_artifact(
+            _best_val_backtest_path(fold_dir), result, snapshot_dates,
+            compression="compressed", futures_account_context=slice_context,
+        )
+        metadata = {
+            "fold_id": int(fold.fold_id), "epoch": int(epoch), "split": "val",
+            "objective": str(objective), "best_val_loss": float(val_loss),
+            "train_years": [int(year) for year in fold.train_years],
+            "val_years": [int(year) for year in fold.val_years],
+            "test_years": [int(year) for year in fold.test_years],
+            "rows": int(result.strategy_returns.shape[0]),
+            "has_weights_history": bool(result.weights_history.size > 0),
+            "date_start": str(snapshot_dates[0]), "date_end": str(snapshot_dates[-1]),
+            "backtest_npz": str(_best_val_backtest_path(fold_dir).name),
+            "compression": "compressed", "metrics": compute_metrics(result),
+        }
+        with _best_val_snapshot_path(fold_dir).open("w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+        return
     strategy_returns = val_backtest.strategy_returns[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
     benchmark_returns = val_backtest.benchmark_returns[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
     turnovers = val_backtest.turnovers[row_start:row_end].detach().to(device="cpu", dtype=torch.float32).numpy()
@@ -11111,8 +11226,14 @@ def _save_deployment_test_artifacts(
     write_plots: bool = False,
     benchmark_label: str = "Benchmark",
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+    futures_account_context: object | None = None,
 ) -> dict[str, float | int | str]:
     """Persist the non-overlapping deployment view separately from full test."""
+    if (result.futures_account_ledger is None) != (futures_account_context is None):
+        raise ValueError("dated futures deployment requires its full ledger and pinned source context")
+    if (futures_account_context is not None
+            and (symbols is None or tuple(map(str, symbols)) != getattr(futures_account_context, "universe", None))):
+        raise ValueError("dated futures deployment symbols differ from the pinned ordered universe")
     date_values = np.asarray(dates)
     rows = int(date_values.size)
     lengths = {
@@ -11163,6 +11284,7 @@ def _save_deployment_test_artifacts(
         date_values,
         compression=backtest_artifact_compression,
         day_trade_carry_context=day_trade_carry_context,
+        futures_account_context=futures_account_context,
     )
     timing["backtest_npz_s"] = float(time.perf_counter() - stage_start)
     timing["backtest_artifact_compression"] = str(backtest_artifact_compression)
@@ -11337,17 +11459,62 @@ def _save_fold_output_artifacts(
     write_plots: bool = True,
     mark_complete: bool = False,
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+    futures_account_context: object | None = None,
+    deployment_futures_account_context: object | None = None,
     write_model_checkpoint: bool = True,
     source_cache_snapshot: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, float | int | str], dict[str, float | str]]:
     if not _distributed_should_write():
         return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
+    if (test_backtest.futures_account_ledger is None) != (futures_account_context is None):
+        raise ValueError("dated futures fold requires its full test ledger and pinned source context")
+    if (futures_account_context is not None
+            and tuple(map(str, symbols)) != getattr(futures_account_context, "universe", None)):
+        raise ValueError("dated futures fold symbols differ from the pinned ordered universe")
+    deployment_dated = deployment_backtest is not None and deployment_backtest.futures_account_ledger is not None
+    if deployment_dated != (deployment_futures_account_context is not None):
+        raise ValueError("dated futures deployment requires its sliced ledger and pinned source context")
+    if deployment_dated and futures_account_context is None:
+        raise ValueError("dated futures deployment cannot be attached to a legacy fold")
+    if futures_account_context is not None and deployment_backtest is not None and not deployment_dated:
+        raise ValueError("dated futures fold cannot publish a legacy deployment")
+    if deployment_dated:
+        if deployment_dates is None:
+            raise ValueError("dated futures deployment requires its decision dates")
+        from stockagent.training.futures_account_artifact import slice_futures_account_ledger
+
+        owned = len(np.asarray(deployment_dates))
+        expected_ledger, expected_context = slice_futures_account_ledger(
+            test_backtest.futures_account_ledger, futures_account_context, 0, owned,
+        )
+        actual_ledger = deployment_backtest.futures_account_ledger
+        if (deployment_futures_account_context != expected_context
+                or not np.array_equal(np.asarray(deployment_dates, dtype="datetime64[D]"),
+                                      expected_ledger.decision_dates)
+                or any(not np.array_equal(getattr(actual_ledger, name), getattr(expected_ledger, name))
+                       for name in expected_ledger.__dataclass_fields__)):
+            raise ValueError("dated futures deployment differs from its source-pinned test prefix")
+        for name in ("strategy_returns", "benchmark_returns", "turnovers", "weights_history"):
+            if not np.array_equal(getattr(deployment_backtest, name), getattr(test_backtest, name)[:owned]):
+                raise ValueError(f"dated futures deployment {name} differs from its test prefix")
+        test_packet = test_backtest.futures_account_policy_packet
+        deployment_packet = deployment_backtest.futures_account_policy_packet
+        if ((test_packet is None) != (deployment_packet is None)
+                or (test_packet is not None and not np.array_equal(
+                    deployment_packet, np.asarray(test_packet)[:owned]))):
+            raise ValueError("dated futures deployment policy differs from its test prefix")
     fold_dir.mkdir(parents=True, exist_ok=True)
     continuous_surrogate_backtest: BacktestResult | None = None
     trading_config = getattr(config, "trading", None)
     requested_mode = normalize_execution_mode(
         getattr(trading_config, "execution_mode", "naive")
     )
+    if futures_account_context is not None:
+        if requested_mode != "tw_stock_context_futures_portfolio":
+            raise ValueError("dated futures account cannot label a different fold execution mode")
+        # Risk metrics must use the physical account event dates, including
+        # settlement-only days that are absent from the stock decision axis.
+        fold_result.test_metrics = compute_metrics(test_backtest)
     if (requested_mode == "tw_stock_context_futures_portfolio"
             and bool(getattr(getattr(config.training, "financial_transformer", None), "futures_causal_account_policy", False))
             and (deployment_backtest is None
@@ -11513,6 +11680,7 @@ def _save_fold_output_artifacts(
         test_dates,
         compression=compression,
         day_trade_carry_context=day_trade_carry_context,
+        futures_account_context=futures_account_context,
         # Only owned deployment rows need the packet for continuous replay.
         # Avoid saving years of overlapping, reset-account coefficients.
         persist_futures_account_policy=False,
@@ -11633,6 +11801,7 @@ def _save_fold_output_artifacts(
             symbols=symbols,
             backtest_artifact_compression=compression,
             day_trade_carry_context=day_trade_carry_context,
+            futures_account_context=deployment_futures_account_context,
         )
         for key, value in deployment_timing.items():
             save_timing[f"deployment_{key}"] = value
@@ -11809,10 +11978,21 @@ def _save_fold_output_artifacts(
     # dataset/executor fingerprint, but daily modes must no longer omit it.
     from stockagent.training.mode_adapter import write_training_json
 
-    write_training_json(
-        fold_dir / "mode_artifact_contract.json",
-        _mode_artifact_contract_for_config(config),
-    )
+    artifact_contract = _mode_artifact_contract_for_config(config)
+    if futures_account_context is not None:
+        from stockagent.training.futures_account_artifact_contract import (
+            FUTURES_ACCOUNT_ARTIFACT_ABI, FUTURES_ACCOUNT_METRICS_ABI,
+        )
+        details = dict(artifact_contract.get("mode_details", {}))
+        details.update(
+            futures_account_artifact_abi=FUTURES_ACCOUNT_ARTIFACT_ABI,
+            futures_account_metrics_abi=FUTURES_ACCOUNT_METRICS_ABI,
+            futures_account_source_fingerprint=futures_account_context.event_source_fingerprint,
+            futures_execution_release_fingerprint=futures_account_context.execution_release_fingerprint,
+            risk_clock="dated_futures_account_events_and_stock_decisions",
+        )
+        artifact_contract["mode_details"] = details
+    write_training_json(fold_dir / "mode_artifact_contract.json", artifact_contract)
     if source_cache_snapshot is not None:
         # Observability only: never include changing cache counters in source,
         # optimizer or report-semantics fingerprints. No hot-loop disk writes.
@@ -12584,6 +12764,7 @@ def _load_backtest_artifact(
     output_path: Path,
     *,
     day_trade_carry_context: DayTradeCarryArtifactContext | None = None,
+    futures_account_context: object | None = None,
 ) -> tuple[BacktestResult, np.ndarray]:
     with np.load(output_path, allow_pickle=False) as data:
         keys = set(data.files)
@@ -12605,12 +12786,23 @@ def _load_backtest_artifact(
             else 1
         )
         if schema_version == PHYSICAL_CARRY_ARCHIVE_SCHEMA:
-            if day_trade_carry_context is None:
+            if day_trade_carry_context is None or futures_account_context is not None:
                 raise ValueError("physical FIFO load requires the caller's pinned source context")
             return carry_artifact_from_payload(data, day_trade_carry_context)
         if day_trade_carry_context is not None or any(k.startswith("carry_") for k in keys) or "minute_nav" in keys:
             raise ValueError("physical FIFO source context/state cannot use a legacy archive schema")
-        if schema_version < 1 or schema_version > 7:
+        dated_fields_present = any(key.startswith("futures_account_ledger_") for key in keys)
+        from stockagent.training.futures_account_artifact_contract import FUTURES_ACCOUNT_ARCHIVE_SCHEMA
+        if schema_version == FUTURES_ACCOUNT_ARCHIVE_SCHEMA:
+            if futures_account_context is None:
+                raise ValueError("dated futures load requires the caller's pinned source context")
+            from stockagent.training.futures_account_artifact import futures_account_artifact_from_payload
+            dated_futures_ledger = futures_account_artifact_from_payload(data, futures_account_context)
+        else:
+            if dated_fields_present or futures_account_context is not None:
+                raise ValueError("dated futures state cannot use a legacy archive schema")
+            dated_futures_ledger = None
+        if schema_version < 1 or (schema_version > 7 and schema_version != FUTURES_ACCOUNT_ARCHIVE_SCHEMA):
             raise ValueError(
                 f"unsupported backtest artifact schema version {schema_version}"
             )
@@ -12860,6 +13052,7 @@ def _load_backtest_artifact(
             futures_residual_contract_quantities_history=optional("futures_residual_contract_quantities_history", None),
             final_futures_carry_state=optional("final_futures_carry_state", None),
             futures_carry_state_history=optional("futures_carry_state_history", None),
+            futures_account_ledger=dated_futures_ledger,
             default_reason_history=optional("default_reason_history", None),
             futures_margin_audit=optional("futures_margin_audit", None),
             open_weights_history=optional("open_weights_history"),
@@ -13663,6 +13856,9 @@ def _load_backtest_artifact(
                     raise ValueError(
                         f"backtest artifact final {name} disagrees with integer state"
                     )
+    if dated_futures_ledger is not None:
+        from stockagent.training.futures_account_artifact import validate_dated_futures_backtest
+        validate_dated_futures_backtest(result, dates, dated_futures_ledger)
     return result, dates
 
 
@@ -14209,10 +14405,57 @@ def _index_futures_flat_terminal_state_at_row(
     return final_weights, final_alive, final_scale
 
 
+def _materialize_dated_futures_fold_outputs(
+    result: BacktestResultTensor,
+    split: WindowedSplitTensors,
+    rows: int,
+    *,
+    runtime: _ExecutionRuntime,
+    incoming_context: object | None = None,
+) -> tuple[BacktestResult, BacktestResult, object, object]:
+    """Materialize a source-pinned fold and its exact deployment prefix.
+
+    The default represents a fresh fold-local account.  A continuous
+    walk-forward must pass the verified preceding account context explicitly;
+    this helper does not infer or reset a stitched deployment account.
+    """
+    from stockagent.training.futures_account_artifact import bind_futures_account_result_context
+
+    source = runtime.futures_account_source
+    dated = result.futures_account_calendar_result
+    if source is None or dated is None:
+        raise ValueError("dated futures fold requires its source and complete account result")
+    if isinstance(rows, bool) or not isinstance(rows, int) or not 0 < rows <= len(split):
+        raise ValueError("dated futures deployment requires a nonempty owned decision prefix")
+    context = bind_futures_account_result_context(
+        dated, source, split,
+        execution_release_fingerprint=runtime.futures_execution_release_fingerprint,
+        initial_capital=runtime.futures_initial_capital,
+        incoming_context=incoming_context,
+    )
+    full = result.to_numpy(futures_account_context=context)
+    prefix, prefix_context = _slice_backtest_rows(
+        full, 0, rows, preserve_terminal_state=True,
+        futures_account_context=context, return_futures_context=True,
+    )
+    return full, prefix, context, prefix_context
+
+
 def _prefix_backtest_result(
     result: BacktestResult, rows: int, *,
     day_trade_carry_terminal_state: DayTradeCarryState | None = None,
+    futures_account_context: object | None = None,
 ) -> BacktestResult:
+    if result.futures_account_ledger is not None:
+        if futures_account_context is None:
+            raise ValueError("dated futures prefixes require a source-pinned account-calendar slice")
+        return _slice_backtest_rows(
+            result, 0, rows, preserve_terminal_state=True,
+            day_trade_carry_terminal_state=day_trade_carry_terminal_state,
+            futures_account_context=futures_account_context,
+        )
+    if futures_account_context is not None:
+        raise ValueError("dated futures context cannot label a legacy prefix")
     total_rows = int(result.strategy_returns.shape[0])
     rows = max(0, min(int(rows), total_rows))
     if result.day_trade_carry_state is not None or result.minute_nav is not None:
@@ -15134,6 +15377,10 @@ def _combine_datasets_to_windowed(
             raise ValueError("all windowed datasets must use the same lookback")
         if split.execution_mode != first.execution_mode:
             raise ValueError("all windowed datasets must use the same execution_mode")
+        if split.futures_account_source_fingerprint != first.futures_account_source_fingerprint:
+            raise ValueError("all windowed datasets must bind the same dated futures source")
+        if split.futures_execution_release_fingerprint != first.futures_execution_release_fingerprint:
+            raise ValueError("all windowed datasets must bind the same futures execution release")
         valid_indices.append(split.valid_indices)
         lengths.append(len(dataset))
     combined = WindowedSplitTensors(
@@ -15158,6 +15405,8 @@ def _combine_datasets_to_windowed(
         force_exit_mask=first.force_exit_mask,
         symbol_indices=first.symbol_indices,
         execution_mode=first.execution_mode,
+        futures_account_source_fingerprint=first.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=first.futures_execution_release_fingerprint,
         session_advance_mask=first.session_advance_mask,
         session_month_ids=first.session_month_ids,
         commission_rebate_payment_eligible_mask=(
@@ -15176,6 +15425,7 @@ def _combine_datasets_to_windowed(
 
 
 def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -> WindowedSplitTensors:
+    split.assert_futures_execution_unmodified()
     total_rows = len(split)
     if total_rows == 0:
         sample_mask = torch.empty((0,), dtype=torch.bool, device=split.valid_indices.device)
@@ -15202,6 +15452,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             sample_mask=sample_mask,
             symbol_indices=split.symbol_indices,
             execution_mode=split.execution_mode,
+            futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
             session_advance_mask=split.session_advance_mask,
             session_month_ids=split.session_month_ids,
             commission_rebate_payment_eligible_mask=(
@@ -15259,6 +15511,8 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         sample_mask=sample_mask,
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=split.session_advance_mask,
         session_month_ids=split.session_month_ids,
         commission_rebate_payment_eligible_mask=(
@@ -15289,6 +15543,7 @@ def _densify_windowed_training_split_for_panel_slab(
     freezes those all-nontradable rows while the loss excludes them, preserving
     the filtered-dataset semantics and a fixed compiled shape.
     """
+    split.assert_futures_execution_unmodified()
     if len(split) == 0:
         return split
     allowed = np.asarray(date_indices, dtype=np.int64)
@@ -15355,6 +15610,8 @@ def _densify_windowed_training_split_for_panel_slab(
         sample_mask=sample_mask,
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=split.session_advance_mask,
         session_month_ids=split.session_month_ids,
         commission_rebate_payment_eligible_mask=(
@@ -15608,6 +15865,9 @@ def _prepare_windowed_split(
     shared_base: WindowedSplitTensors | None = None,
     name: str | None = None,
 ) -> WindowedSplitTensors:
+    split.assert_futures_execution_unmodified()
+    if shared_base is not None:
+        shared_base.assert_futures_execution_unmodified()
     start = time.perf_counter()
     pin_memory = device.type == "cuda" and non_blocking
     if shared_base is not None and _windowed_base_compatible(split, shared_base):
@@ -15644,6 +15904,8 @@ def _prepare_windowed_split(
             sample_mask=sample_mask,
             symbol_indices=shared_base.symbol_indices,
             execution_mode=split.execution_mode,
+            futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
             session_advance_mask=shared_base.session_advance_mask,
             session_month_ids=shared_base.session_month_ids,
             commission_rebate_payment_eligible_mask=(
@@ -15712,6 +15974,8 @@ def _prepare_windowed_split(
         sample_mask=None if split.sample_mask is None else _prepare_host_tensor(split.sample_mask, pin_memory),
         symbol_indices=None if split.symbol_indices is None else _prepare_host_tensor(split.symbol_indices, pin_memory),
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=_prepare_host_tensor(split.session_advance_mask, pin_memory),
         session_month_ids=_prepare_host_tensor(split.session_month_ids, pin_memory),
         commission_rebate_payment_eligible_mask=_prepare_host_tensor(
@@ -15802,6 +16066,7 @@ def _with_windowed_base(
     split: WindowedSplitTensors,
     base_tensors: tuple[torch.Tensor | None, ...],
 ) -> WindowedSplitTensors:
+    split.assert_futures_execution_unmodified()
     if any(
         tensor is None
         for tensor in (
@@ -15830,6 +16095,8 @@ def _with_windowed_base(
         sample_mask=split.sample_mask,
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=base_tensors[11],
         session_month_ids=base_tensors[22],
         commission_rebate_payment_eligible_mask=base_tensors[23],
@@ -15851,6 +16118,7 @@ def _with_windowed_metadata(
     split: WindowedSplitTensors,
     metadata_tensors: tuple[torch.Tensor, ...],
 ) -> WindowedSplitTensors:
+    split.assert_futures_execution_unmodified()
     return WindowedSplitTensors(
         features=split.features,
         valid_indices=metadata_tensors[0],
@@ -15871,6 +16139,8 @@ def _with_windowed_metadata(
         sample_mask=None if split.sample_mask is None else metadata_tensors[1],
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=split.session_advance_mask,
         session_month_ids=split.session_month_ids,
         commission_rebate_payment_eligible_mask=(
@@ -15970,6 +16240,11 @@ def _maybe_cache_windowed_split_on_device(
 
 
 def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) -> bool:
+    a.assert_futures_execution_unmodified()
+    b.assert_futures_execution_unmodified()
+    if (a.futures_account_source_fingerprint != b.futures_account_source_fingerprint
+            or a.futures_execution_release_fingerprint != b.futures_execution_release_fingerprint):
+        return False
     attrs = (
         "features",
         "future_log_returns",
@@ -16068,6 +16343,8 @@ def _maybe_share_windowed_base_from_cached(
         sample_mask=sample_mask,
         symbol_indices=cached_base.symbol_indices,
         execution_mode=split.execution_mode,
+        futures_account_source_fingerprint=split.futures_account_source_fingerprint,
+        futures_execution_release_fingerprint=split.futures_execution_release_fingerprint,
         session_advance_mask=cached_base.session_advance_mask,
         session_month_ids=cached_base.session_month_ids,
         commission_rebate_payment_eligible_mask=(
@@ -16457,12 +16734,39 @@ def _run_eval_backtest_from_weight_buffers(
     symbol_indices: torch.Tensor | None = None,
     physical_split: WindowedSplitTensors | None = None,
     initial_day_trade_carry_state: DayTradeCarryState | None = None,
+    initial_futures_account_context: object | None = None,
     panel_row_indices: torch.Tensor | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float]]:
     total_rows = int(weights_all.size(0))
     execution_mode = "naive" if execution_runtime is None else execution_runtime.mode
     physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    futures_account_source = None if execution_runtime is None else execution_runtime.futures_account_source
     physical_previous = initial_day_trade_carry_state
+    if physical_split is not None:
+        verify_futures_account_binding(physical_split, futures_account_source)
+    if futures_account_source is not None:
+        if (physical_source is not None or execution_mode != "tw_stock_context_futures_portfolio"
+                or physical_split is None or len(physical_split) != total_rows
+                or any(0 < int(value) < total_rows for value in (reset_at_rows or ()))
+                or (state_advance_mask_all is not None and not bool(torch.all(state_advance_mask_all)))):
+            raise ValueError("dated futures evaluation requires its contiguous unpadded source and no account reset")
+        futures_account_source.verify_identity()
+        futures_account_source.validate_training_split(physical_split)
+        if (getattr(physical_split, "sample_mask", None) is not None
+                and not bool(torch.all(physical_split.sample_mask))):
+            raise ValueError("dated futures evaluation cannot contain padded decision rows")
+        if futures_account_source.decision_execution is not None:
+            if (execution_runtime.futures_execution_release_fingerprint
+                    != futures_account_source.execution_release_fingerprint):
+                raise ValueError("dated futures runtime and prepared decision releases differ")
+            # A caller-provided eval buffer is not proof of the tape actually
+            # consumed. Contiguous split admission above permits a zero-copy
+            # CPU view of the source-pinned data; GPU chunks transfer from this
+            # view on demand, so the recorded release describes the executor.
+            first_row = int(physical_split._valid_indices_cpu[0])
+            overnight_log_returns_all = futures_account_source.decision_execution.narrow(
+                0, first_row, total_rows,
+            )
     if physical_source is not None:
         internal_resets = tuple(
             sorted(
@@ -16499,6 +16803,25 @@ def _run_eval_backtest_from_weight_buffers(
         if execution_mode in {"tw_index_futures_day", "tw_index_derivatives_day"}
         else weights_all.size(1)
     )
+    if initial_futures_account_context is not None:
+        from stockagent.training.futures_account_artifact import _validate_context
+
+        _validate_context(initial_futures_account_context)
+        if futures_account_source is None or execution_runtime is None or physical_split is None or total_rows <= 0:
+            raise ValueError("dated futures incoming account requires its nonempty bound source")
+        incoming = initial_futures_account_context
+        expected_calendar = futures_account_source.prepare_batch(physical_split, 0, total_rows).calendar
+        if (incoming.event_source_fingerprint != futures_account_source.fingerprint
+                or incoming.universe != futures_account_source.universe
+                or incoming.expected_calendar_fingerprint != expected_calendar.fingerprint
+                or incoming.execution_release_fingerprint != execution_runtime.futures_execution_release_fingerprint
+                or incoming.initial_capital != execution_runtime.futures_initial_capital
+                or len(incoming.initial_quantities) != num_symbols):
+            raise ValueError("dated futures incoming account differs from the bound source or execution release")
+        if (any(abs(quantity) > 2**24 for quantity in incoming.initial_quantities)
+                or not np.isfinite(np.float32(incoming.initial_equity_scale))
+                or (incoming.initial_alive and np.float32(incoming.initial_equity_scale) <= 0)):
+            raise ValueError("dated futures incoming state cannot be represented exactly by its executor")
     if total_rows <= 0:
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
         empty_weights = torch.empty((0, num_symbols), device=device, dtype=torch.float32)
@@ -16754,8 +17077,23 @@ def _run_eval_backtest_from_weight_buffers(
     prev_short_sale_collateral: torch.Tensor | None = None
     prev_short_margin_collateral: torch.Tensor | None = None
     prev_long_margin_debt: torch.Tensor | None = None
+    dated_futures_chunks = []
+    if futures_account_source is not None:
+        # Even an event immediately before the first sampled decision requires
+        # an explicit, flat incoming account state for the exact ledger.
+        if initial_futures_account_context is None:
+            prev_weights = torch.zeros((num_symbols,), device=device, dtype=torch.float32)
+            prev_alive = torch.ones((), device=device, dtype=torch.bool)
+            prev_equity_scale = torch.ones((), device=device, dtype=torch.float32)
+        else:
+            prev_weights = torch.tensor(initial_futures_account_context.initial_quantities,
+                                        device=device, dtype=torch.float32)
+            prev_alive = torch.tensor(initial_futures_account_context.initial_alive,
+                                      device=device, dtype=torch.bool)
+            prev_equity_scale = torch.tensor(initial_futures_account_context.initial_equity_scale,
+                                             device=device, dtype=torch.float32)
     for chunk_idx, (start, end, reset_state) in enumerate(backtest_ranges, start=1):
-        if reset_state:
+        if reset_state and not (start == 0 and initial_futures_account_context is not None):
             prev_weights = None
             prev_alive = None
             prev_cash = None
@@ -16769,6 +17107,10 @@ def _run_eval_backtest_from_weight_buffers(
             prev_short_sale_collateral = None
             prev_short_margin_collateral = None
             prev_long_margin_debt = None
+            if futures_account_source is not None:
+                prev_weights = torch.zeros((num_symbols,), device=device, dtype=torch.float32)
+                prev_alive = torch.ones((), device=device, dtype=torch.bool)
+                prev_equity_scale = torch.ones((), device=device, dtype=torch.float32)
         log_chunk_progress = bool(progress_label) and _should_log_eval_chunk(chunk_idx, total_backtest_chunks)
         if log_chunk_progress:
             _progress(f"{progress_label}: backtest chunk {chunk_idx}/{total_backtest_chunks} rows=[{start},{end})")
@@ -16916,7 +17258,7 @@ def _run_eval_backtest_from_weight_buffers(
             buy_mask_chunk,
             sell_mask_chunk,
             bench_chunk,
-            target_rows=backtest_chunk_rows,
+            target_rows=(end - start if futures_account_source is not None else backtest_chunk_rows),
         )
         short_open_mask_chunk = _pad_rows(
             short_open_mask_chunk,
@@ -17077,6 +17419,8 @@ def _run_eval_backtest_from_weight_buffers(
         )
         try:
             with compile_context:
+                futures_batch = (None if futures_account_source is None else
+                    futures_account_source.prepare_batch(physical_split, start, end))
                 backtest_runner = (run_backtest_torch if physical_source is None
                     else bind_physical_carry_backtest(run_backtest_torch,
                         source=physical_source, split=physical_split, start=start, end=end,
@@ -17239,6 +17583,9 @@ def _run_eval_backtest_from_weight_buffers(
                     day_trade_execution_volume_participation=(
                         float(max_volume_participation)
                     ),
+                    futures_account_calendar=(None if futures_batch is None else futures_batch.calendar),
+                    account_only_execution=(None if futures_batch is None else
+                        futures_batch.account_execution.to(device=device, non_blocking=non_blocking)),
                 )
         except FuturesCarryDataError as exc:
             split_row = start + int(exc.evidence['row'])
@@ -17263,6 +17610,10 @@ def _run_eval_backtest_from_weight_buffers(
         timing.backtest_runner_s += time.perf_counter() - backtest_runner_start
 
         backtest_finalize_start = time.perf_counter()
+        if futures_account_source is not None:
+            if backtest_chunk.futures_account_calendar_result is None:
+                raise RuntimeError("dated futures evaluation lost an account-calendar chunk")
+            dated_futures_chunks.append(backtest_chunk.futures_account_calendar_result)
         if physical_source is not None:
             from stockagent.backtest.tw_day_trade_graph import detached_carry_state
             physical_previous = detached_carry_state(backtest_chunk.day_trade_carry_state)
@@ -17460,6 +17811,17 @@ def _run_eval_backtest_from_weight_buffers(
         # not overlap at the allocation peak of a long final-test replay.
         del backtest_runner, backtest_chunk
 
+    dated_futures_result = None
+    if futures_account_source is not None:
+        from stockagent.backtest.tw_futures_account_calendar import merge_futures_account_calendar_results
+        expected_calendar = futures_account_source.prepare_batch(physical_split, 0, total_rows).calendar
+        dated_futures_result = merge_futures_account_calendar_results(dated_futures_chunks, expected_calendar)
+        dated_futures_result = replace(
+            dated_futures_result,
+            event_source_fingerprint=futures_account_source.fingerprint,
+            execution_release_fingerprint=execution_runtime.futures_execution_release_fingerprint,
+        )
+
     backtest = BacktestResultTensor(
         day_trade_carry_state=physical_previous,
         minute_nav=physical_minute_nav,
@@ -17530,13 +17892,27 @@ def _run_eval_backtest_from_weight_buffers(
         final_short_margin_collateral=prev_short_margin_collateral,
         long_margin_debt_history=long_margin_debt_history_out,
         final_long_margin_debt=prev_long_margin_debt,
+        futures_account_calendar_result=dated_futures_result,
     )
     metrics_start = time.perf_counter()
+    metric_strategy = strategy_returns_out
+    metric_benchmark = benchmark_returns_out
+    metric_turnovers = turnovers_out
+    if compute_metrics_summary and dated_futures_result is not None:
+        # A settlement-only node has no TX market session. Carry the last
+        # observed benchmark value without inventing a trade or quote.
+        metric_strategy = dated_futures_result.account_ledger.strategy_returns
+        metric_turnovers = dated_futures_result.account_ledger.turnovers
+        metric_benchmark = torch.zeros_like(metric_strategy)
+        decision_nodes = torch.as_tensor(
+            dated_futures_result.calendar.decision_indices, device=device, dtype=torch.int64,
+        )
+        metric_benchmark[decision_nodes] = benchmark_returns_out
     metrics = (
         _compute_eval_metrics_like_legacy_online(
-            strategy_returns_out,
-            benchmark_returns_out,
-            turnovers_out,
+            metric_strategy,
+            metric_benchmark,
+            metric_turnovers,
             periods_per_year=(365.0 if execution_mode == "crypto_perpetual" else 252.0),
         )
         if compute_metrics_summary
@@ -18058,6 +18434,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
     volume_participation_equity: float = 1_000_000.0,
     execution_runtime: _ExecutionRuntime | None = None,
     initial_day_trade_carry_state: DayTradeCarryState | None = None,
+    initial_futures_account_context: object | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     if split.execution_mode != "naive":
         if execution_runtime is None:
@@ -18074,7 +18451,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
         panel_slab_model.eval()
     total_rows = len(split)
     if total_rows <= 0:
-        if initial_day_trade_carry_state is not None:
+        if initial_day_trade_carry_state is not None or initial_futures_account_context is not None:
             raise ValueError("empty physical evaluation cannot discard an existing account")
         empty_returns = torch.empty((0,), device=device, dtype=torch.float32)
         empty_weights = torch.empty(
@@ -18095,6 +18472,14 @@ def _evaluate_windowed_tensor_batch_decoupled(
     overall_start = time.perf_counter()
     model_chunk_rows = max(1, int(model_chunk_rows))
     backtest_chunk_rows = max(1, int(backtest_chunk_rows))
+    dated_source = None if execution_runtime is None else execution_runtime.futures_account_source
+    use_prepared_futures_execution = bool(
+        dated_source is not None and dated_source.decision_execution is not None
+    )
+    if use_prepared_futures_execution:
+        verify_futures_account_binding(split, dated_source)
+        dated_source.verify_identity()
+        dated_source.validate_training_split(split)
     model_ranges = [(start, min(start + model_chunk_rows, total_rows)) for start in range(0, total_rows, model_chunk_rows)]
     if progress_label:
         _progress(
@@ -18173,13 +18558,19 @@ def _evaluate_windowed_tensor_batch_decoupled(
             timing.batch_prepare_s += batch_prepare_elapsed
 
             h2d_start = time.perf_counter()
+            if use_prepared_futures_execution:
+                # The model sees causal candidate context, not future execution
+                # data. The account evaluator reads the verified tape directly;
+                # do not stage a duplicate full execution buffer on device.
+                batch = dict(batch)
+                batch.pop("overnight_log_returns")
             batch = _move_windowed_batch_to_device(batch, device, non_blocking)
             if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
             elif panel_forward_model is None:
                 x_chunk = batch["x"]
             returns_chunk = batch["future_log_returns"]
-            overnight_returns_chunk = batch["overnight_log_returns"]
+            overnight_returns_chunk = batch.get("overnight_log_returns")
             mask_chunk = batch["tradable_mask"]
             buy_mask_chunk = batch["can_buy_mask"]
             sell_mask_chunk = batch["can_sell_mask"]
@@ -18344,11 +18735,12 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     dtype=weights_chunk.dtype,
                 )
                 returns_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=returns_chunk.dtype)
-                overnight_returns_all = torch.empty(
-                    (total_rows, *tuple(overnight_returns_chunk.shape[1:])),
-                    device=device,
-                    dtype=overnight_returns_chunk.dtype,
-                )
+                if not use_prepared_futures_execution:
+                    overnight_returns_all = torch.empty(
+                        (total_rows, *tuple(overnight_returns_chunk.shape[1:])),
+                        device=device,
+                        dtype=overnight_returns_chunk.dtype,
+                    )
                 mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=mask_chunk.dtype)
                 buy_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=buy_mask_chunk.dtype)
                 sell_mask_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=sell_mask_chunk.dtype)
@@ -18432,9 +18824,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     )
             weights_all[start:end].copy_(weights_chunk[:valid_rows])
             returns_all[start:end].copy_(returns_chunk_padded[:valid_rows])
-            overnight_returns_all[start:end].copy_(
-                overnight_returns_chunk[:valid_rows]
-            )
+            if not use_prepared_futures_execution:
+                overnight_returns_all[start:end].copy_(overnight_returns_chunk[:valid_rows])
             mask_all[start:end].copy_(mask_chunk_padded[:valid_rows])
             buy_mask_all[start:end].copy_(buy_mask_chunk_padded[:valid_rows])
             sell_mask_all[start:end].copy_(sell_mask_chunk_padded[:valid_rows])
@@ -18500,7 +18891,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
         if (
             weights_all is None
             or returns_all is None
-            or overnight_returns_all is None
+            or (overnight_returns_all is None and not use_prepared_futures_execution)
             or mask_all is None
             or buy_mask_all is None
             or sell_mask_all is None
@@ -18562,6 +18953,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
             symbol_indices=split.symbol_indices,
             physical_split=split,
             initial_day_trade_carry_state=initial_day_trade_carry_state,
+            initial_futures_account_context=initial_futures_account_context,
             panel_row_indices=split._valid_indices_cpu,
         )
 
@@ -18618,6 +19010,7 @@ def _evaluate_windowed_tensor_batch(
     max_volume_participation: float = 0.0,
     volume_participation_equity: float = 1_000_000.0,
     execution_runtime: _ExecutionRuntime | None = None,
+    initial_futures_account_context: object | None = None,
 ) -> tuple[BacktestResultTensor, dict[str, float], dict[str, float]]:
     effective_backtest_chunk_rows = int(backtest_chunk_rows) if backtest_chunk_rows is not None else int(chunk_rows)
     return _evaluate_windowed_tensor_batch_decoupled(
@@ -18646,6 +19039,7 @@ def _evaluate_windowed_tensor_batch(
         max_volume_participation=max_volume_participation,
         volume_participation_equity=volume_participation_equity,
         execution_runtime=execution_runtime,
+        initial_futures_account_context=initial_futures_account_context,
     )
 
 def _auto_chunk_rows(
@@ -18770,12 +19164,27 @@ def _slice_backtest_rows(
     *,
     preserve_terminal_state: bool = False,
     day_trade_carry_terminal_state: DayTradeCarryState | None = None,
-) -> BacktestResult:
-    """Copy one chronological row interval without fabricating ledger state."""
+    futures_account_context: object | None = None,
+    return_futures_context: bool = False,
+) -> BacktestResult | tuple[BacktestResult, object]:
+    """Copy an interval and optionally return the matching dated source context."""
 
     total_rows = int(result.strategy_returns.shape[0])
     start = max(0, min(int(row_start), total_rows))
     end = max(start, min(int(row_end), total_rows))
+    dated_futures_ledger = None
+    sliced_futures_context = None
+    if result.futures_account_ledger is not None:
+        if futures_account_context is None:
+            raise ValueError("dated futures slices require a source-pinned account-calendar slice")
+        from stockagent.training.futures_account_artifact import slice_futures_account_ledger
+        dated_futures_ledger, sliced_futures_context = slice_futures_account_ledger(
+            result.futures_account_ledger, futures_account_context, start, end,
+        )
+    elif futures_account_context is not None:
+        raise ValueError("dated futures context cannot label a legacy slice")
+    if return_futures_context and sliced_futures_context is None:
+        raise ValueError("a dated futures slice is required to return its source context")
     keep_terminal = bool(preserve_terminal_state and end == total_rows)
     physical = result.day_trade_carry_state is not None or result.minute_nav is not None
     if day_trade_carry_terminal_state is not None and not physical:
@@ -18818,6 +19227,10 @@ def _slice_backtest_rows(
             slice_final_alive,
             slice_final_equity_scale,
         ) = _index_futures_flat_terminal_state_at_row(result, end)
+    if dated_futures_ledger is not None:
+        slice_final_weights = dated_futures_ledger.final_quantities.copy()
+        slice_final_alive = dated_futures_ledger.final_alive.copy()
+        slice_final_equity_scale = dated_futures_ledger.final_equity_scale.copy()
 
     integer_state = result.final_integer_state if keep_terminal else None
     if integer_state is not None:
@@ -18860,7 +19273,7 @@ def _slice_backtest_rows(
                 ).copy()
             ),
         )
-    return BacktestResult(
+    sliced = BacktestResult(
         strategy_returns=np.asarray(result.strategy_returns[start:end]).copy(),
         benchmark_returns=np.asarray(result.benchmark_returns[start:end]).copy(),
         turnovers=np.asarray(result.turnovers[start:end]).copy(),
@@ -18940,7 +19353,14 @@ def _slice_backtest_rows(
         final_integer_state=integer_state,
         day_trade_carry_state=physical_terminal,
         minute_nav=rows(result.minute_nav),
+        futures_account_ledger=dated_futures_ledger,
     )
+    if dated_futures_ledger is not None:
+        from stockagent.training.futures_account_artifact import validate_dated_futures_backtest
+        validate_dated_futures_backtest(sliced, dated_futures_ledger.decision_dates, dated_futures_ledger)
+    if return_futures_context:
+        return sliced, sliced_futures_context
+    return sliced
 
 
 def _load_deployment_symbols(
@@ -18986,6 +19406,35 @@ def _load_test_symbols(fold_dir: Path) -> list[str]:
     ):
         raise RuntimeError(f"physical test symbol sidecar is not a unique string list: {path}")
     return [str(item) for item in payload]
+
+
+def _load_fresh_dated_futures_test_artifact(
+    fold_dir: Path, *, source: PreparedFuturesAccountSource, initial_capital: float,
+) -> tuple[BacktestResult, np.ndarray]:
+    """Read a reset-state fold test against an independently prepared source.
+
+    Dates inside the archive select a candidate source slice; they do not
+    establish its provenance or incoming account.  Only a fresh flat account
+    is allowed here.  Carried deployment artifacts require the prior ledger.
+    """
+    from stockagent.training.futures_account_artifact import fresh_futures_account_context_for_dates
+
+    if tuple(_load_test_symbols(fold_dir)) != source.universe:
+        raise ValueError("dated futures test symbols differ from the prepared source")
+    path = _backtest_path(fold_dir)
+    with np.load(path, allow_pickle=False) as payload:
+        if "dates" not in payload.files:
+            raise ValueError("dated futures test archive has no decision dates")
+        dates = np.asarray(payload["dates"]).copy()
+    context = fresh_futures_account_context_for_dates(
+        source, dates,
+        execution_release_fingerprint=source.execution_release_fingerprint,
+        initial_capital=initial_capital,
+    )
+    result, validated_dates = _load_backtest_artifact(path, futures_account_context=context)
+    if not np.array_equal(validated_dates, dates):
+        raise ValueError("dated futures test archive dates changed during validation")
+    return result, validated_dates
 
 
 def _try_load_fresh_fold_physical_deployment_segment(
@@ -19060,6 +19509,7 @@ def _stitched_deployment_prefix_results(
     results: Sequence[FoldResult],
     *,
     execution_mode: str,
+    require_contiguous_account: bool = False,
 ) -> list[FoldResult]:
     """Select the earliest available consecutive model-ownership interval.
 
@@ -19072,7 +19522,8 @@ def _stitched_deployment_prefix_results(
     fold_ids = [int(item.fold_id) for item in ordered]
     if len(set(fold_ids)) != len(fold_ids):
         raise RuntimeError("stitched deployment has duplicate fold ownership")
-    if normalize_execution_mode(execution_mode) not in TW_STOCK_EXECUTION_MODES:
+    if (normalize_execution_mode(execution_mode) not in TW_STOCK_EXECUTION_MODES
+            and not require_contiguous_account):
         return ordered
     for index in range(1, len(ordered)):
         if fold_ids[index] != fold_ids[index - 1] + 1:
@@ -19086,6 +19537,7 @@ def _replay_taiwan_stitched_deployment(
     *,
     panel: PanelData,
     config: ExperimentConfig,
+    futures_account_runtime: _ExecutionRuntime | None = None,
 ) -> BacktestResult | None:
     """Replay every owned fold row once through one canonical account.
 
@@ -19137,6 +19589,20 @@ def _replay_taiwan_stitched_deployment(
         and config.trading.tw_day_trade_unlimited_margin_conversion
         else None
     )
+    daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+    has_dated_futures = daily is not None and (
+        getattr(daily, "futures_account_calendar", None) is not None
+        or getattr(daily, "account_only_integer_execution", None) is not None
+    )
+    if futures_account_runtime is not None and not has_dated_futures:
+        raise ValueError("a dated futures runtime cannot label a legacy replay")
+    dated_runtime = (
+        futures_account_runtime or _build_execution_runtime(panel, config, torch.device("cpu"))
+        if has_dated_futures else None
+    )
+    dated_source = None if dated_runtime is None else dated_runtime.futures_account_source
+    if has_dated_futures and dated_source is None:
+        raise RuntimeError("dated futures stitched replay lost its prepared source")
 
     request_parts: list[np.ndarray] = []
     causal_account_policy = bool(
@@ -19146,7 +19612,7 @@ def _replay_taiwan_stitched_deployment(
     date_parts: list[np.ndarray] = []
     fold_segments: list[tuple[Path, int, int]] = []
     replay_results = _stitched_deployment_prefix_results(
-        results, execution_mode=mode
+        results, execution_mode=mode, require_contiguous_account=dated_source is not None,
     )
     replay_fold_ids = {int(item.fold_id) for item in replay_results}
     deferred_fold_ids = sorted(
@@ -19167,7 +19633,7 @@ def _replay_taiwan_stitched_deployment(
         if not artifact_path.exists():
             continue
         local_symbols: list[str] | None = None
-        if physical_source is not None:
+        if physical_source is not None or dated_source is not None:
             local_symbols = _load_test_symbols(fold_dir)
             dates_path = _deployment_dates_path(fold_dir)
             if not dates_path.is_file():
@@ -19184,15 +19650,20 @@ def _replay_taiwan_stitched_deployment(
                 raise RuntimeError(
                     f"invalid physical deployment date sidecar: {dates_path}"
                 ) from exc
-            fold_backtest, fold_dates_raw = _load_backtest_artifact(
-                _backtest_path(fold_dir),
-                day_trade_carry_context=DayTradeCarryArtifactContext(
-                    universe=tuple(local_symbols),
-                    release_id=physical_source.release_id,
-                    initial_capital=float(config.trading.volume_participation_equity),
-                    initial_nav=float(config.trading.volume_participation_equity),
-                ),
-            )
+            if dated_source is not None:
+                fold_backtest, fold_dates_raw = _load_fresh_dated_futures_test_artifact(
+                    fold_dir, source=dated_source, initial_capital=dated_runtime.futures_initial_capital,
+                )
+            else:
+                fold_backtest, fold_dates_raw = _load_backtest_artifact(
+                    _backtest_path(fold_dir),
+                    day_trade_carry_context=DayTradeCarryArtifactContext(
+                        universe=tuple(local_symbols),
+                        release_id=physical_source.release_id,
+                        initial_capital=float(config.trading.volume_participation_equity),
+                        initial_nav=float(config.trading.volume_participation_equity),
+                    ),
+                )
             full_dates = np.asarray(fold_dates_raw, dtype="datetime64[D]")
             if (
                 owned_dates.ndim != 1
@@ -19200,7 +19671,7 @@ def _replay_taiwan_stitched_deployment(
                 or not np.array_equal(owned_dates, full_dates[: owned_dates.size])
             ):
                 raise RuntimeError(
-                    "physical deployment owned dates are not a full-test prefix"
+                    "source-bound deployment owned dates are not a full-test prefix"
                 )
             fold_dates_raw = owned_dates
         else:
@@ -19250,8 +19721,10 @@ def _replay_taiwan_stitched_deployment(
                     config.training.financial_transformer.futures_net_notional_cap,
                     config.training.financial_transformer.futures_beta_notional_cap)
                 packet = fold_backtest.futures_account_policy_packet
+                if packet is not None:
+                    packet = np.asarray(packet)[:rows]
                 if (packet is None
-                        or np.asarray(packet).shape != (rows, expected_width, policy_width)):
+                        or packet.shape != (rows, expected_width, policy_width)):
                     raise RuntimeError(
                         "closed-loop futures deployment requires its owned policy packet; "
                         "reset-account requests cannot substitute for carried-state decisions"
@@ -19310,14 +19783,14 @@ def _replay_taiwan_stitched_deployment(
     ):
         raise RuntimeError("stitched deployment contains dates absent from the panel")
     if (
-        mode in TW_STOCK_EXECUTION_MODES
+        (mode in TW_STOCK_EXECUTION_MODES or dated_source is not None)
         and panel_rows.size > 1
         and np.any(np.diff(panel_rows) != 1)
     ):
         missing = np.flatnonzero(np.diff(panel_rows) != 1)
         raise RuntimeError(
             "stitched Taiwan deployment must contain every exchange session so "
-            "T+2 claim ageing is exact; discontinuities after row indices "
+            "account ageing is exact; discontinuities after row indices "
             f"{missing[:8].tolist()}"
         )
 
@@ -19346,7 +19819,7 @@ def _replay_taiwan_stitched_deployment(
     )
     execution_dataset = CrossSectionalDataset(
         panel,
-        np.arange(panel.num_dates, dtype=np.int64),
+        panel_rows if dated_source is not None else np.arange(panel.num_dates, dtype=np.int64),
         lookback=1,
         allow_empty=True,
         include_volume_notional=(
@@ -19361,6 +19834,7 @@ def _replay_taiwan_stitched_deployment(
         day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
         tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
         tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
+        futures_account_source=dated_source,
     )
 
     def selected(tensor: torch.Tensor) -> np.ndarray:
@@ -19374,7 +19848,7 @@ def _replay_taiwan_stitched_deployment(
             corporate_action_mode=config.trading.tw_corporate_action_mode,
         )
     )
-    runtime = _build_execution_runtime(panel, config, torch.device("cpu"))
+    runtime = dated_runtime or _build_execution_runtime(panel, config, torch.device("cpu"))
     stitched_short_capacity_shares, stitched_short_margin_rate = (
         _active_panel_short_contract_rows(
             panel,
@@ -19392,6 +19866,7 @@ def _replay_taiwan_stitched_deployment(
         stitched_future_returns = np.asarray(panel.returns_1d)[panel_rows]
     physical_segments: list[BacktestResult] = []
     physical_segment_contexts: list[DayTradeCarryArtifactContext] = []
+    stitched_futures_context = None
     if physical_source is not None:
         if runtime.day_trade_carry_source is not physical_source:
             raise RuntimeError("stitched physical source differs from execution runtime")
@@ -19435,6 +19910,44 @@ def _replay_taiwan_stitched_deployment(
                 )
             )
         stitched = _concatenate_physical_carry_segments(physical_segments)
+    elif dated_source is not None:
+        from stockagent.training.futures_account_artifact import bind_futures_account_result_context
+
+        split = dataset_to_windowed_tensors(execution_dataset)
+        if not np.array_equal(split._valid_indices_cpu.numpy(), panel_rows):
+            raise ValueError("dated futures replay must retain every owned decision session")
+        indices = torch.as_tensor(panel_rows, dtype=torch.int64)
+        with torch.inference_mode():
+            stitched_tensor, _ = _run_eval_backtest_from_weight_buffers(
+                torch.as_tensor(full_requests, dtype=torch.float32),
+                execution_dataset.future_log_returns_t[indices],
+                execution_dataset.tradable_mask_t[indices],
+                execution_dataset.can_buy_mask_t[indices],
+                execution_dataset.can_sell_mask_t[indices],
+                execution_dataset.can_short_open_mask_t[indices],
+                execution_dataset.force_short_cover_mask_t[indices],
+                execution_dataset.force_exit_mask_t[indices],
+                execution_dataset.benchmark_t[indices],
+                device=torch.device("cpu"), non_blocking=False,
+                long_only=config.trading.long_only,
+                buy_fee_rate=config.trading.buy_fee_rate,
+                sell_fee_rate=config.trading.sell_fee_rate,
+                max_turnover_ratio=config.trading.max_turnover_ratio,
+                gross_leverage=1.0, min_trade_weight=config.trading.min_trade_weight,
+                backtest_chunk_rows=max(1, int(getattr(config.training, "eval_backtest_chunk_rows", 512))),
+                portfolio_activation=config.trading.portfolio_activation,
+                compute_metrics_summary=False, return_weights_history=True,
+                profile_timing=False, progress_label=None, timing=TimingBreakdown(), reset_at_rows=None,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
+                execution_runtime=runtime, physical_split=split, panel_row_indices=split._valid_indices_cpu,
+            )
+        stitched_futures_context = bind_futures_account_result_context(
+            stitched_tensor.futures_account_calendar_result, dated_source, split,
+            execution_release_fingerprint=runtime.futures_execution_release_fingerprint,
+            initial_capital=runtime.futures_initial_capital,
+        )
+        stitched = stitched_tensor.to_numpy(futures_account_context=stitched_futures_context)
     elif tensor_stitched_replay:
         request_tensor = torch.as_tensor(full_requests, dtype=torch.float32)
         volume_limit_weights = _volume_limit_weights_from_notional(
@@ -19686,6 +20199,7 @@ def _replay_taiwan_stitched_deployment(
                 initial_nav=float(config.trading.volume_participation_equity),
             )
         ),
+        futures_account_context=stitched_futures_context,
     )
     (output_path / "walkforward_deployment_symbols.json").write_text(
         json.dumps(global_symbols, ensure_ascii=False),
@@ -19724,16 +20238,23 @@ def _replay_taiwan_stitched_deployment(
 
     for segment_index, (fold_dir, start, end) in enumerate(fold_segments):
         if physical_source is None:
-            segment = _slice_backtest_rows(
+            sliced = _slice_backtest_rows(
                 stitched,
                 start,
                 end,
                 preserve_terminal_state=segment_index == len(fold_segments) - 1,
+                futures_account_context=stitched_futures_context,
+                return_futures_context=stitched_futures_context is not None,
             )
             segment_context = None
+            if stitched_futures_context is not None:
+                segment, segment_futures_context = sliced
+            else:
+                segment, segment_futures_context = sliced, None
         else:
             segment = physical_segments[segment_index]
             segment_context = physical_segment_contexts[segment_index]
+            segment_futures_context = None
         _save_deployment_test_artifacts(
             fold_dir,
             segment,
@@ -19743,6 +20264,7 @@ def _replay_taiwan_stitched_deployment(
             write_plots=True,
             benchmark_label=_benchmark_plot_label(config),
             day_trade_carry_context=segment_context,
+            futures_account_context=segment_futures_context,
         )
     from downloader.artifact_io import atomic_write_json
 
@@ -19750,8 +20272,9 @@ def _replay_taiwan_stitched_deployment(
         _fold_dir(output_path, item.fold_id): int(item.fold_id)
         for item in replay_results
     }
-    atomic_write_json(output_path / "walkforward_deployment_coverage.json", {
-        "report_contract": "contiguous_completed_fold_prefix_v1",
+    coverage = {
+        "report_contract": ("contiguous_completed_fold_prefix_dated_futures_v1"
+                            if dated_source is not None else "contiguous_completed_fold_prefix_v1"),
         "state": (
             "awaiting_intervening_folds" if deferred_fold_ids
             else "contiguous_available_folds"
@@ -19763,9 +20286,17 @@ def _replay_taiwan_stitched_deployment(
         "rows": int(stitched_dates.size),
         "date_start": str(stitched_dates[0]),
         "date_end": str(stitched_dates[-1]),
-        "session_continuity_required": mode in TW_STOCK_EXECUTION_MODES,
+        "session_continuity_required": mode in TW_STOCK_EXECUTION_MODES or dated_source is not None,
         "fabricated_gap_rows": 0,
-    })
+    }
+    if dated_source is not None:
+        coverage.update({
+            "risk_clock": "dated_futures_account_events_and_stock_decisions",
+            "account_only_event_rows": int(stitched.futures_account_ledger.account_only_mask.sum()),
+            "futures_account_source_fingerprint": dated_source.fingerprint,
+            "futures_execution_release_fingerprint": runtime.futures_execution_release_fingerprint,
+        })
+    atomic_write_json(output_path / "walkforward_deployment_coverage.json", coverage)
     return stitched
 
 
@@ -19800,12 +20331,25 @@ def _refresh_walkforward_artifacts(
         if stale_path.exists():
             stale_path.unlink()
 
+    dated_runtime = None
+    dated_source = None
+    stitched = None
     if panel is not None and config is not None:
-        _replay_taiwan_stitched_deployment(
+        daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
+        if daily is not None and (
+            getattr(daily, "futures_account_calendar", None) is not None
+            or getattr(daily, "account_only_integer_execution", None) is not None
+        ):
+            dated_runtime = _build_execution_runtime(panel, config, torch.device("cpu"))
+            dated_source = dated_runtime.futures_account_source
+            if dated_source is None:
+                raise RuntimeError("dated futures reporting lost its prepared source")
+        stitched = _replay_taiwan_stitched_deployment(
             output_path,
             results,
             panel=panel,
             config=config,
+            futures_account_runtime=dated_runtime,
         )
 
     # Future completed folds remain in reset-state diagnostics, but their
@@ -19817,6 +20361,7 @@ def _refresh_walkforward_artifacts(
             execution_mode=(
                 config.trading.execution_mode if config is not None else "naive"
             ),
+            require_contiguous_account=dated_source is not None,
         )
     }
 
@@ -19855,6 +20400,16 @@ def _refresh_walkforward_artifacts(
         else None
     )
     annual_period_contract = _load_annual_period_contract(output_path)
+    stitched_context = None
+    stitched_cursor = 0
+    if dated_source is not None and stitched is not None:
+        from stockagent.training.futures_account_artifact import fresh_futures_account_context_for_dates
+
+        stitched_context = fresh_futures_account_context_for_dates(
+            dated_source, stitched.futures_account_ledger.decision_dates,
+            execution_release_fingerprint=dated_runtime.futures_execution_release_fingerprint,
+            initial_capital=dated_runtime.futures_initial_capital,
+        )
 
     for result in sorted(results, key=lambda item: item.fold_id):
         fold_dir = _fold_dir(output_path, result.fold_id)
@@ -19862,7 +20417,11 @@ def _refresh_walkforward_artifacts(
         backtest_path = _backtest_path(fold_dir)
         if not backtest_path.exists():
             continue
-        if physical_source is None:
+        if dated_source is not None:
+            fold_backtest, fold_dates = _load_fresh_dated_futures_test_artifact(
+                fold_dir, source=dated_source, initial_capital=dated_runtime.futures_initial_capital,
+            )
+        elif physical_source is None:
             fold_backtest, fold_dates = _load_backtest_artifact(backtest_path)
         else:
             fold_symbols = _load_test_symbols(fold_dir)
@@ -19894,11 +20453,20 @@ def _refresh_walkforward_artifacts(
                 experimental_fold_ids.add(int(result.fold_id))
             seen_first_test_years.add(first_year)
             mask = years == first_year
+            metric_dates, metric_returns, metric_benchmark, metric_turnover = _aligned_dated_backtest_rows(
+                fold_backtest, fold_dates,
+            )
+            metric_years = (
+                period_labels_from_contract(metric_dates, annual_period_contract)
+                if annual_period_contract is not None
+                else np.asarray(metric_dates, dtype="datetime64[Y]").astype(np.int64) + 1970
+            )
+            metric_mask = metric_years == first_year
             all_first_year_fold_ids.append(int(result.fold_id))
-            all_first_year_dates.append(fold_dates[mask])
-            all_first_year_strategy_log.append(np.nan_to_num(fold_backtest.strategy_returns[mask], nan=0.0).astype(np.float64))
-            all_first_year_baseline_log.append(np.nan_to_num(fold_backtest.benchmark_returns[mask], nan=0.0).astype(np.float64))
-            all_first_year_turnovers.append(np.nan_to_num(fold_backtest.turnovers[mask], nan=0.0).astype(np.float64))
+            all_first_year_dates.append(metric_dates[metric_mask])
+            all_first_year_strategy_log.append(np.nan_to_num(metric_returns[metric_mask], nan=0.0).astype(np.float64))
+            all_first_year_baseline_log.append(np.nan_to_num(metric_benchmark[metric_mask], nan=0.0).astype(np.float64))
+            all_first_year_turnovers.append(np.nan_to_num(metric_turnover[metric_mask], nan=0.0).astype(np.float64))
             concentration_weights, weight_label = reporting_weight_history(fold_backtest)
             first_year_weight_labels.add(weight_label)
             all_first_year_weights.append(
@@ -19912,7 +20480,26 @@ def _refresh_walkforward_artifacts(
         # cash, and settlement state continue across fold boundaries.  Never
         # substitute it for the reset-at-fold-start test ledger above.
         if deployment_path.exists() and int(result.fold_id) in deployment_fold_ids:
-            if physical_source is None:
+            if dated_source is not None:
+                if stitched is None or stitched_context is None:
+                    raise RuntimeError("dated futures deployment reporting lost its stitched account")
+                try:
+                    deployment_dates = np.asarray(
+                        json.loads(_deployment_dates_path(fold_dir).read_text(encoding="utf-8")),
+                        dtype="datetime64[D]",
+                    )
+                except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise RuntimeError("dated futures deployment has invalid owned dates") from exc
+                stop = stitched_cursor + len(deployment_dates)
+                if (deployment_dates.ndim != 1 or not len(deployment_dates)
+                        or not np.array_equal(deployment_dates,
+                            stitched.futures_account_ledger.decision_dates[stitched_cursor:stop])):
+                    raise RuntimeError("dated futures deployment dates differ from the stitched account")
+                deployment_backtest = _slice_backtest_rows(
+                    stitched, stitched_cursor, stop, futures_account_context=stitched_context,
+                )
+                stitched_cursor = stop
+            elif physical_source is None:
                 deployment_backtest, deployment_dates = _load_backtest_artifact(
                     deployment_path
                 )
@@ -19934,21 +20521,24 @@ def _refresh_walkforward_artifacts(
                     deployment_backtest.day_trade_carry_state.last_nav.item()
                 )
             if int(deployment_dates.size) > 0:
+                account_dates, account_returns, account_benchmark, account_turnover = _aligned_dated_backtest_rows(
+                    deployment_backtest, deployment_dates,
+                )
                 all_deployment_fold_ids.append(int(result.fold_id))
-                all_deployment_dates.append(deployment_dates)
+                all_deployment_dates.append(account_dates)
                 all_deployment_strategy_log.append(
                     np.nan_to_num(
-                        deployment_backtest.strategy_returns, nan=0.0
+                        account_returns, nan=0.0
                     ).astype(np.float64)
                 )
                 all_deployment_baseline_log.append(
                     np.nan_to_num(
-                        deployment_backtest.benchmark_returns, nan=0.0
+                        account_benchmark, nan=0.0
                     ).astype(np.float64)
                 )
                 all_deployment_turnovers.append(
                     np.nan_to_num(
-                        deployment_backtest.turnovers, nan=0.0
+                        account_turnover, nan=0.0
                     ).astype(np.float64)
                 )
                 deployment_weights, weight_label = reporting_weight_history(deployment_backtest)
@@ -21674,12 +22264,24 @@ def _train_epoch_windowed_tensor(
     if panel_slab_model is not None:
         panel_slab_model.train()
     physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    futures_account_source = None if execution_runtime is None else execution_runtime.futures_account_source
     physical_previous: DayTradeCarryState | None = None
+    verify_futures_account_binding(split, futures_account_source)
     if physical_source is not None and (
         split.execution_mode != "tw_day_trade" or objective != "log_utility"
         or max_volume_participation != 0.5 or not execution_runtime.day_trade_unlimited_margin_conversion
     ):
         raise ValueError("physical training requires the configured chronological 50%-minute carry contract")
+    if futures_account_source is not None:
+        if (physical_source is not None or split.execution_mode != "tw_stock_context_futures_portfolio"
+                or objective != "log_utility" or log_return_weights is not None
+                or not _split_uses_recurrent_futures_equity_scale(split)):
+            raise ValueError("dated futures training requires chronological exact log-utility accounting")
+        futures_account_source.verify_identity()
+        futures_account_source.validate_training_split(split)
+    use_prepared_futures_execution = bool(
+        futures_account_source is not None and futures_account_source.decision_execution is not None
+    )
     total_rows = len(split)
     if total_rows == 0:
         return torch.zeros((), device=device, dtype=torch.float32), TimingBreakdown()
@@ -21821,6 +22423,11 @@ def _train_epoch_windowed_tensor(
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
+        if futures_account_source is not None:
+            batch_loss_fn = bind_padded_futures_account_loss(
+                batch_loss_fn, source=futures_account_source, split=split,
+                start=start, stop=end, device=device, credit_boundary_events=True,
+            )
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
             batch_loss_fn = bind_return_weighted_loss(batch_loss_fn, log_return_weights, start, end - start)
@@ -21877,6 +22484,11 @@ def _train_epoch_windowed_tensor(
 
         h2d_start = time.perf_counter()
         move_start = time.perf_counter()
+        if use_prepared_futures_execution:
+            # The exact loss owns its verified decision tape.  The model uses
+            # causal candidate context and must not stage a second copy.
+            batch = dict(batch)
+            batch.pop("overnight_log_returns", None)
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
         timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
         if batch_x is not None:
@@ -22100,7 +22712,7 @@ def _train_epoch_windowed_tensor(
                         batch_ret,
                         batch_mask,
                         benchmark_returns=batch_bench,
-                        overnight_log_returns=batch["overnight_log_returns"],
+                        overnight_log_returns=batch.get("overnight_log_returns"),
                         can_buy_mask=batch_buy_mask,
                         can_sell_mask=batch_sell_mask,
                         can_short_open_mask=batch["can_short_open_mask"],
@@ -22190,7 +22802,7 @@ def _train_epoch_windowed_tensor(
         should_check_finite = finite_guard is None and (
             False
             if physical_source is not None and optimizer_step_per_trajectory
-            else physical_source is not None
+            else physical_source is not None or futures_account_source is not None
             or optimizer_step_per_trajectory
             or _should_check_finite(
                 step_idx,
@@ -22204,6 +22816,8 @@ def _train_epoch_windowed_tensor(
             timing.finite_check_s += time.perf_counter() - finite_start
             if not loss_is_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures loss; cannot skip an account batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite loss during full-trajectory gradient accumulation"
@@ -22369,6 +22983,8 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures gradient; cannot skip an account batch")
                 if physical_source is not None:
                     raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
@@ -22426,6 +23042,8 @@ def _train_epoch_windowed_tensor(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures gradient; cannot skip an account batch")
                 if physical_source is not None:
                     raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
@@ -22712,13 +23330,28 @@ def _train_epoch_windowed_tensor_ddp(
     rank = _distributed_rank()
     policy_model = model.module if day_trade_annual_episode_sharding else model
     physical_source = None if execution_runtime is None else execution_runtime.day_trade_carry_source
+    futures_account_source = None if execution_runtime is None else execution_runtime.futures_account_source
     physical_previous: DayTradeCarryState | None = None
+    verify_futures_account_binding(split, futures_account_source)
     if physical_source is not None and (
         split.execution_mode != "tw_day_trade" or objective != "log_utility"
         or max_volume_participation != 0.5 or symbol_sharded_ledger
         or not execution_runtime.day_trade_unlimited_margin_conversion
     ):
         raise ValueError("physical DDP requires chronological replicated 50%-minute carry accounting")
+    if futures_account_source is not None:
+        if (physical_source is not None or split.execution_mode != "tw_stock_context_futures_portfolio"
+                or objective != "log_utility" or symbol_sharded_ledger
+                or day_trade_annual_episode_sharding or log_return_weights is not None
+                or return_tape is not None or capture_only or compound_return_adjoint
+                or gradient_only or gradient_transform is not None
+                or not _split_uses_recurrent_futures_equity_scale(split)):
+            raise ValueError("dated futures DDP requires chronological replicated exact log-utility accounting")
+        futures_account_source.verify_identity()
+        futures_account_source.validate_training_split(split)
+    use_prepared_futures_execution = bool(
+        futures_account_source is not None and futures_account_source.decision_execution is not None
+    )
     if world_size <= 1 or not _distributed_is_initialized():
         raise RuntimeError("DDP windowed hotpath requires an initialized distributed process group")
     if day_trade_annual_episode_sharding and world_size != day_trade_annual_episode_world_size:
@@ -22930,6 +23563,11 @@ def _train_epoch_windowed_tensor_ddp(
             reset_calendar_year=execution_runtime.day_trade_training_annual_episodes,
             reset_period_contract=execution_runtime.day_trade_training_period_contract,
             prepared_batch=prepared_physical_batch))
+        if futures_account_source is not None:
+            batch_loss_fn = bind_padded_futures_account_loss(
+                batch_loss_fn, source=futures_account_source, split=split,
+                start=global_start, stop=global_end, device=device, credit_boundary_events=True,
+            )
         if log_return_weights is not None:
             from stockagent.training.exact_policy_step import bind_return_weighted_loss
             batch_loss_fn = bind_return_weighted_loss(
@@ -22982,6 +23620,12 @@ def _train_epoch_windowed_tensor_ddp(
 
         h2d_start = time.perf_counter()
         move_start = time.perf_counter()
+        if use_prepared_futures_execution:
+            # Replicated account loss reads the verified global source slice;
+            # omit this deterministic tape from each local rank's staging and
+            # collective metadata exchange.
+            batch = dict(batch)
+            batch.pop("overnight_log_returns", None)
         batch = _move_windowed_batch_to_device(batch, device, non_blocking)
         if resident_batches is not None and not resident_hit:
             resident_batches.put(split, resident_key, batch)
@@ -23058,6 +23702,9 @@ def _train_epoch_windowed_tensor_ddp(
                         non_blocking=False,
                         prepare_timing=timing,
                     )
+                    if use_prepared_futures_execution:
+                        global_metadata = dict(global_metadata)
+                        global_metadata.pop("overnight_log_returns", None)
                     global_metadata = _move_windowed_batch_to_device(
                         global_metadata,
                         device,
@@ -23284,7 +23931,7 @@ def _train_epoch_windowed_tensor_ddp(
         should_check_finite = finite_guard is None and (
             False
             if physical_source is not None and optimizer_step_per_trajectory
-            else physical_source is not None
+            else physical_source is not None or futures_account_source is not None
             or optimizer_step_per_trajectory
             or _should_check_finite(
                 step_idx,
@@ -23298,6 +23945,8 @@ def _train_epoch_windowed_tensor_ddp(
             timing.finite_check_s += time.perf_counter() - finite_start
             if not loss_is_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures DDP loss; cannot skip an account batch")
                 if optimizer_step_per_trajectory:
                     raise FloatingPointError(
                         "non-finite loss during full-trajectory gradient accumulation"
@@ -23466,6 +24115,8 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures DDP gradient; cannot skip an account batch")
                 if physical_source is not None:
                     raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
@@ -23520,6 +24171,8 @@ def _train_epoch_windowed_tensor_ddp(
                 timing.finite_check_s += time.perf_counter() - finite_start
             if not gradients_are_finite:
                 optimizer.zero_grad(set_to_none=True)
+                if futures_account_source is not None:
+                    raise FloatingPointError("non-finite dated futures DDP gradient; cannot skip an account batch")
                 if physical_source is not None:
                     raise FloatingPointError("non-finite physical training gradient; cannot skip a batch")
                 if optimizer_step_per_trajectory:
@@ -25173,6 +25826,7 @@ def _run_inference_neural_models(
             config.training.lookback,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            futures_account_source=fold_execution_runtime.futures_account_source,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
@@ -25186,6 +25840,7 @@ def _run_inference_neural_models(
             allow_empty=True,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            futures_account_source=fold_execution_runtime.futures_account_source,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
@@ -26358,6 +27013,7 @@ def _run_training_impl(
             config.training.lookback,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
+            futures_account_source=execution_runtime.futures_account_source,
             lookback_context=config.walk_forward.lookback_context,
             short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
             day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
@@ -26551,6 +27207,7 @@ def _run_training_impl(
                 config.training.lookback,
                 include_volume_notional=include_volume_notional,
                 execution_mode=config.trading.execution_mode,
+                futures_account_source=execution_runtime.futures_account_source,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
@@ -26564,6 +27221,7 @@ def _run_training_impl(
                 allow_empty=True,
                 include_volume_notional=include_volume_notional,
                 execution_mode=config.trading.execution_mode,
+                futures_account_source=execution_runtime.futures_account_source,
                 lookback_context=config.walk_forward.lookback_context,
                 short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
                 day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
@@ -26677,19 +27335,26 @@ def _run_training_impl(
         if curve_test_indices.size == 0:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
-        curve_test_ds = CrossSectionalDataset(
-            panel,
-            curve_test_indices,
-            config.training.lookback,
-            allow_empty=True,
-            include_volume_notional=include_volume_notional,
-            execution_mode=config.trading.execution_mode,
-            lookback_context=config.walk_forward.lookback_context,
-            short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
-            day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
-            tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
-            tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
-        )
+        if np.array_equal(curve_test_indices, curve_test_fold_context.fold.test_indices):
+            # The immutable complete split already exists with these exact
+            # dataset options. Reuse its futures/accounting sidecars instead
+            # of rebuilding them just for the same epoch-curve evaluation.
+            curve_test_ds = curve_test_fold_context.test_ds
+        else:
+            curve_test_ds = CrossSectionalDataset(
+                panel,
+                curve_test_indices,
+                config.training.lookback,
+                allow_empty=True,
+                include_volume_notional=include_volume_notional,
+                execution_mode=config.trading.execution_mode,
+                futures_account_source=execution_runtime.futures_account_source,
+                lookback_context=config.walk_forward.lookback_context,
+                short_capacity_limit_enabled=config.trading.tw_short_capacity_limit_enabled,
+                day_trade_unlimited_margin_conversion=config.trading.tw_day_trade_unlimited_margin_conversion,
+                tw_corporate_action_mode=config.trading.tw_corporate_action_mode,
+                tw_commission_rebate_timing=config.trading.tw_commission_rebate_timing,
+            )
         if len(curve_test_ds) == 0 and curve_test_indices.size != curve_test_fold_context.fold.test_indices.size:
             curve_test_indices = curve_test_fold_context.fold.test_indices
             curve_test_years = curve_test_fold_context.fold.test_years
@@ -29022,6 +29687,7 @@ def _run_training_impl(
             val_backtest_epoch: BacktestResultTensor,
             val_row_start: int,
             val_row_end: int,
+            val_futures_account_context: object | None = None,
         ) -> FoldResult | None:
             if not bool(getattr(config.training, "save_best_val_artifacts", False)):
                 return None
@@ -29111,12 +29777,24 @@ def _run_training_impl(
                 )
             else:
                 val_ic = ic_summary(np.asarray([], dtype=np.float32))
-            val_met = _compute_metrics_from_tensors(
-                val_backtest_epoch.strategy_returns[val_row_start:val_row_end],
-                val_backtest_epoch.benchmark_returns[val_row_start:val_row_end],
-                val_backtest_epoch.turnovers[val_row_start:val_row_end],
-                periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
-            )
+            if val_futures_account_context is not None:
+                val_full = val_backtest_epoch.to_numpy(
+                    futures_account_context=val_futures_account_context,
+                )
+                val_slice = _slice_backtest_rows(
+                    val_full, val_row_start, val_row_end,
+                    futures_account_context=val_futures_account_context,
+                )
+                # Account-only settlement dates affect drawdown and risk even
+                # when there was no model decision on those dates.
+                val_met = compute_metrics(val_slice)
+            else:
+                val_met = _compute_metrics_from_tensors(
+                    val_backtest_epoch.strategy_returns[val_row_start:val_row_end],
+                    val_backtest_epoch.benchmark_returns[val_row_start:val_row_end],
+                    val_backtest_epoch.turnovers[val_row_start:val_row_end],
+                    periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+                )
 
             test_symbol_indices = (
                 None
@@ -29152,8 +29830,15 @@ def _run_training_impl(
                 test_symbol_indices,
                 execution_mode=execution_runtime.mode,
             )
-            test_bt = test_bt_t.to_numpy()
             deployment_test_rows = int(context.deployment_test_rows)
+            futures_account_context = deployment_futures_account_context = None
+            if execution_runtime.futures_account_source is not None:
+                (test_bt, deployment_test_bt, futures_account_context,
+                 deployment_futures_account_context) = _materialize_dated_futures_fold_outputs(
+                    test_bt_t, test_windowed, deployment_test_rows, runtime=execution_runtime,
+                )
+            else:
+                test_bt = test_bt_t.to_numpy()
             if execution_runtime.day_trade_carry_source is not None:
                 deployment_test_bt = _replay_physical_carry_split_prefix(
                     test_bt,
@@ -29162,7 +29847,7 @@ def _run_training_impl(
                     runtime=execution_runtime,
                     config=config,
                 )
-            else:
+            elif execution_runtime.futures_account_source is None:
                 deployment_test_bt = _prefix_backtest_result(
                     test_bt, deployment_test_rows
                 )
@@ -29287,6 +29972,8 @@ def _run_training_impl(
                     config=config,
                     initial_nav=float(config.trading.volume_participation_equity),
                 ),
+                futures_account_context=futures_account_context,
+                deployment_futures_account_context=deployment_futures_account_context,
                 source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
             )
             print(
@@ -30031,6 +30718,19 @@ def _run_training_impl(
                                 check_finite=config.training.checkpoint_finite_check,
                             )
                             if bool(getattr(config.training, "save_best_val_artifacts", False)):
+                                val_futures_context = None
+                                if execution_runtime.futures_account_source is not None:
+                                    if val_backtest_epoch is None or combined_val_windowed is None:
+                                        raise ValueError("dated futures validation requires its evaluated source slice")
+                                    from stockagent.training.futures_account_artifact import bind_futures_account_result_context
+
+                                    val_futures_context = bind_futures_account_result_context(
+                                        val_backtest_epoch.futures_account_calendar_result,
+                                        execution_runtime.futures_account_source,
+                                        combined_val_windowed,
+                                        execution_release_fingerprint=execution_runtime.futures_execution_release_fingerprint,
+                                        initial_capital=execution_runtime.futures_initial_capital,
+                                    )
                                 _save_best_val_backtest_snapshot(
                                     fold_dir=context.fold_dir,
                                     fold=context.fold,
@@ -30041,6 +30741,7 @@ def _run_training_impl(
                                     row_end=val_offsets[index + 1],
                                     dates=panel.dates[context.val_ds.valid_indices],
                                     objective=loss_objective,
+                                    futures_account_context=val_futures_context,
                                 )
                                 fold_result = _save_best_val_complete_fold_artifacts(
                                     context=context,
@@ -30049,6 +30750,7 @@ def _run_training_impl(
                                     val_backtest_epoch=val_backtest_epoch,
                                     val_row_start=val_offsets[index],
                                     val_row_end=val_offsets[index + 1],
+                                    val_futures_account_context=val_futures_context,
                                 )
                                 if fold_result is not None:
                                     results_by_fold[context.fold.fold_id] = fold_result
@@ -30582,8 +31284,15 @@ def _run_training_impl(
                     test_symbol_indices,
                     execution_mode=execution_runtime.mode,
                 )
-                test_bt = test_bt_t.to_numpy()
                 deployment_test_rows = int(context.deployment_test_rows)
+                futures_account_context = deployment_futures_account_context = None
+                if execution_runtime.futures_account_source is not None:
+                    (test_bt, deployment_test_bt, futures_account_context,
+                     deployment_futures_account_context) = _materialize_dated_futures_fold_outputs(
+                        test_bt_t, test_windowed, deployment_test_rows, runtime=execution_runtime,
+                    )
+                else:
+                    test_bt = test_bt_t.to_numpy()
                 if execution_runtime.day_trade_carry_source is not None:
                     deployment_test_bt = _replay_physical_carry_split_prefix(
                         test_bt,
@@ -30592,7 +31301,7 @@ def _run_training_impl(
                         runtime=execution_runtime,
                         config=config,
                     )
-                else:
+                elif execution_runtime.futures_account_source is None:
                     deployment_test_bt = _prefix_backtest_result(
                         test_bt, deployment_test_rows
                     )
@@ -30756,6 +31465,8 @@ def _run_training_impl(
                         config=config,
                         initial_nav=float(config.trading.volume_participation_equity),
                     ),
+                    futures_account_context=futures_account_context,
+                    deployment_futures_account_context=deployment_futures_account_context,
                     source_cache_snapshot=_physical_source_cache_snapshot(execution_runtime),
                 )
                 plot_total = float(plot_timing.get("total_s", 0.0))

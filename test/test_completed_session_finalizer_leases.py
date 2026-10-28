@@ -177,6 +177,26 @@ def test_failed_dependency_is_not_accepted_or_hidden_by_reuse(configured, monkey
     assert receipt["steps"][0]["attempt_count"] == 2
 
 
+def test_capacity_deferred_releases_lease_without_repeating_or_claiming_ready(configured, monkeypatch):
+    args, lock_path = configured
+    calls = []
+    monkeypatch.setattr(finalizer, "_derived_state", lambda *a, **k: state("stock_panel"))
+
+    def build(command, **kwargs):
+        calls.append(command[0])
+        return SimpleNamespace(returncode=75)
+
+    monkeypatch.setattr(finalizer.subprocess, "run", build)
+    assert finalizer.main() == 1
+    receipt = json.loads(args.receipt.read_bytes())
+    assert calls == ["stock_panel"]
+    assert receipt["status"] == "failed" and receipt["after"]["current"] is False
+    assert receipt["steps"][0]["attempt_count"] == 1
+    assert receipt["steps"][0]["attempts"][0]["retry_deferred"] == "capacity"
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 def test_missing_publication_never_obtains_a_source_lease_or_calls_a_builder(configured, monkeypatch):
     args, lock_path = configured
     monkeypatch.setattr(finalizer, "_accepted_close_publication", lambda *a, **k: (

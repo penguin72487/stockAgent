@@ -6,6 +6,8 @@ never synced executable code, a training-completion claim, or model activation.
 from __future__ import annotations
 
 import fcntl
+import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import math
@@ -19,7 +21,9 @@ from collections import defaultdict
 
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
 from stockagent.data_sync.artifact_consumers import artifact_service_references
-from stockagent.data_sync.desync_snapshots import SnapshotError, _safe_relative_path, atomic_write_json, sha256_file
+from stockagent.data_sync.desync_snapshots import (
+    SnapshotError, _iter_lstat_bounded, _raise_walk_error, _safe_relative_path, atomic_write_json, sha256_file,
+)
 from stockagent.data_sync.legacy_artifact_archive import (
     LegacyArchiveSpec, _archive_directories, source_plan, MANUAL_VAST_OFFLINE_CAPTURE_CONTRACT,
     reviewed_vast_offline_root,
@@ -281,24 +285,27 @@ def unlink_preserved_file_names(root, rows):
     return reclaimed
 
 
-def metadata_tree(source: Path) -> dict:
+def metadata_tree(source: Path, *, file_workers: int = 1) -> dict:
     """Read-only complete inventory, including shared blocks and empty dirs."""
+    if type(file_workers) is not int or not 1 <= file_workers <= 8:
+        raise ValueError("metadata scan workers must be between 1 and 8")
     source = real(source)
     device = source.stat().st_dev
     rows, inodes = [], {}
-    for parent, dirs, files in os.walk(source, followlinks=False):
-        for name in sorted(dirs + files):
-            path = Path(parent) / name
-            info = path.lstat()
-            kind = "file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "unsupported"
-            rows.append({"path": path.relative_to(source).as_posix(), "kind": kind,
-                         "signature": signature(info), "cross_filesystem": info.st_dev != device})
-            if kind == "file":
-                key = (info.st_dev, info.st_ino)
-                value = inodes.setdefault(key, [info.st_nlink, info.st_blocks * 512, 0])
-                if value[:2] != [info.st_nlink, info.st_blocks * 512]:
-                    raise SnapshotError("source inode mutated during inventory")
-                value[2] += 1
+    pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else contextlib.nullcontext(None)
+    with pool as executor:
+        for parent, dirs, files in os.walk(source, followlinks=False, onerror=_raise_walk_error):
+            paths = (Path(parent) / name for name in sorted(dirs + files))
+            for path, info in _iter_lstat_bounded(paths, executor):
+                kind = "file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "unsupported"
+                rows.append({"path": path.relative_to(source).as_posix(), "kind": kind,
+                             "signature": signature(info), "cross_filesystem": info.st_dev != device})
+                if kind == "file":
+                    key = (info.st_dev, info.st_ino)
+                    value = inodes.setdefault(key, [info.st_nlink, info.st_blocks * 512, 0])
+                    if value[:2] != [info.st_nlink, info.st_blocks * 512]:
+                        raise SnapshotError("source inode mutated during inventory")
+                    value[2] += 1
     rows.sort(key=lambda r: r["path"])
     return {"rows": rows, "logical_bytes": sum(r["signature"][2] for r in rows if r["kind"] == "file"),
             "files": sum(r["kind"] == "file" for r in rows),

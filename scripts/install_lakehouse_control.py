@@ -161,7 +161,6 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/stockagent/temporal
-CPUQuota=150%
 MemoryHigh=6G
 MemoryMax=8G
 TasksMax=256

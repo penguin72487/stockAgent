@@ -1,7 +1,7 @@
 """Causal all-TAIFEX action sidecar for a full cash-stock input panel.
 
 The stock panel remains the model's feature universe.  This module attaches a
-separate fixed 1,936-slot futures axis containing prior-session model context
+separate versioned fixed-slot futures axis containing prior-session model context
 and current/future execution labels.  Keeping the two axes separate prevents
 physical-contract outcomes from being mistaken for stock features.
 """
@@ -56,6 +56,35 @@ TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_DENOMINATION_CONTRACT_VERSION: Final[
 TW_STOCK_CONTEXT_FUTURES_PORTFOLIO_PRIOR_CAPACITY_CONTRACT_VERSION: Final[int] = 8
 TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION: Final[int] = 1
 TX_FRONT_ROLLING_BENCHMARK_MODE: Final[str] = "tx_front_rolling_1x_gross"
+DATED_FUTURES_MEMBERSHIP_CONTRACT: Final[str] = "prior_observed_physical_contract_per_decision_v1"
+
+
+def dated_futures_candidate_mask(
+    prior_source: np.ndarray,
+    same_physical: np.ndarray,
+    reference_available: np.ndarray,
+    valuation_quarantine: np.ndarray,
+    *,
+    prior_capacity: np.ndarray | None = None,
+) -> np.ndarray:
+    """Admit each decision independently, without a period-wide intersection.
+
+    The period union is a reporting denominator, never an input to this mask.
+    Current executable volume is also deliberately absent: that outcome belongs
+    to the executor. A missing candidate never clears an existing inventory.
+    """
+    fields = (prior_source, same_physical, reference_available, valuation_quarantine)
+    if (prior_source.ndim != 2
+            or any(field.shape != prior_source.shape or field.dtype != np.bool_ for field in fields)):
+        raise ValueError("dated candidate membership requires aligned Boolean [T,S] masks")
+    candidate = prior_source & same_physical & reference_available & ~valuation_quarantine
+    if prior_capacity is not None:
+        if prior_capacity.shape != candidate.shape:
+            raise ValueError("dated prior capacity must match candidate [T,S]")
+        candidate &= prior_capacity >= 1.0
+    return candidate
+
+
 TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS: Final[tuple[str, ...]] = (
     *FUTURES_MODEL_FEATURE_COLUMNS,
     "cash_stock_underlying_panel_index",
@@ -159,6 +188,10 @@ class TaiwanStockContextFuturesPortfolioDaily:
     )
     # False at benchmark inception and before source coverage; zero is not proof.
     benchmark_observed_returns_mask: np.ndarray | None = None
+    # Optional executor-only non-stock dates. Their dated tape is never a model
+    # observation and must be consumed by the matching account-calendar ABI.
+    futures_account_calendar: object | None = None
+    account_only_integer_execution: np.ndarray | None = None
 
     def execution_tensor(
         self,
@@ -205,6 +238,67 @@ def _require_dependencies() -> None:
         )
 
 
+def _require_source_calendar_within_stock_horizon(source_path: Path, dates: np.ndarray) -> None:
+    """Reject missing in-horizon account dates, never irrelevant source prefixes.
+
+    Cash-only event nodes must still reach the account ledger, even though they
+    are not stock or futures trading sessions. This check never treats their
+    absence as permission to omit settlement.
+    """
+    schema = pq.read_schema(source_path)
+    has_accounting = "accounting_only_date" in schema.names
+    columns = ["date", *(["accounting_only_date"] if has_accounting else [])]
+    calendar = pl.from_arrow(pq.read_table(source_path, columns=columns, memory_map=True))
+    calendar = calendar.filter(pl.col("date").is_between(
+        date.fromisoformat(str(dates[0])), date.fromisoformat(str(dates[-1]))))
+    if has_accounting:
+        flags = calendar.select("date", "accounting_only_date").unique()
+        if (flags["accounting_only_date"].null_count() or flags["date"].is_duplicated().any()):
+            raise ValueError("futures source has ambiguous accounting-only dates")
+    else:
+        flags = calendar.select("date").unique().with_columns(
+            pl.lit(False).alias("accounting_only_date"))
+    source_dates = flags["date"].to_numpy().astype("datetime64[D]")
+    missing = np.setdiff1d(source_dates, dates)
+    if not missing.size:
+        return
+    missing_flags = flags.filter(pl.col("date").is_in(missing.tolist()))
+    accounting = missing_flags.filter(pl.col("accounting_only_date"))["date"].to_list()
+    market = missing_flags.filter(~pl.col("accounting_only_date"))["date"].to_list()
+    raise ValueError(
+        f"stock context omits {missing.size} in-horizon all-TWD account dates; "
+        f"first={missing[0]} last={missing[-1]}; missing_market_dates={len(market)}, "
+        f"missing_cash_only_accounting_dates={len(accounting)}; cash events cannot be skipped"
+    )
+
+
+def _validate_source_account_calendar(frame, dates: np.ndarray, calendar) -> None:
+    """Keep explicit account-only rows from disappearing at date alignment."""
+    if "accounting_only_date" not in frame.columns:
+        if calendar is not None and np.any(calendar.account_only_mask):
+            raise ValueError("dated futures account events require source accounting-only flags")
+        return
+    flag = frame["accounting_only_date"]
+    if flag.dtype != pl.Boolean or flag.null_count():
+        raise ValueError("futures source accounting-only flags must be complete booleans")
+    if calendar is None:
+        if flag.any():
+            raise ValueError(
+                "futures source has in-horizon account-only events; "
+                "a dated account calendar and event-aware executor are required"
+            )
+        return
+    # A supplied calendar must come from these exact source rows, not merely
+    # have the same length or the same set of stock decision dates.
+    flags = frame.select("date", "accounting_only_date").unique().sort("date")
+    if flags["date"].is_duplicated().any():
+        raise ValueError("futures source has ambiguous accounting-only dates")
+    source_dates = flags["date"].to_numpy().astype("datetime64[D]")
+    if (not np.array_equal(source_dates, dates)
+            or not np.array_equal(flags["accounting_only_date"].to_numpy(), calendar.account_only_mask)):
+        raise ValueError("dated futures account calendar differs from source dates or flags")
+
+
 from stockagent.data.tw_futures_benchmark import (
     load_tx_front_rolling_benchmark, tx_front_benchmark_source_end,
 )
@@ -219,6 +313,7 @@ def attach_stock_context_futures_portfolio_daily(
     current_open_feature: bool = False,
     denomination_context_basis: str = "current_open",
     require_prior_capacity: bool = False,
+    validated_margin_source=None,
     carry_valuation_max_abs_simple_return: float = 0.0,
     expiry_settlement_valuation: bool = False,
     final_settlement_path: str | Path | None = None,
@@ -229,6 +324,7 @@ def attach_stock_context_futures_portfolio_daily(
     futures_slot_count: int = TAIFEX_FUTURES_PORTFOLIO_FIXED_SLOT_COUNT,
     benchmark_mode: str = "legacy_front_holding_return",
     benchmark_data_path: str | Path | None = None,
+    futures_account_calendar=None,
 ) -> PanelData:
     """Attach prior-session futures tokens and current execution facts.
 
@@ -314,8 +410,13 @@ def attach_stock_context_futures_portfolio_daily(
         if (valuation_research and valuation_research_contract != VALUATION_RESEARCH_CONTRACT
                 or not valuation_research and valuation_research_contract is not None):
             raise ValueError("estimated financial values require an explicit matching research valuation opt-in")
-        from stockagent.data.tw_futures_margin_release import MARGIN_MATERIALIZATION_VERSION
-        if (manifest["materialization_version"] != MARGIN_MATERIALIZATION_VERSION
+        from stockagent.data.tw_futures_margin_release import (
+            MARGIN_MATERIALIZATION_VERSION, SUPPORTED_MARGIN_MATERIALIZATION_VERSIONS,
+            PRIOR_EXCHANGE_LIQUIDITY_CONTRACT,
+        )
+        if (manifest["materialization_version"] not in SUPPORTED_MARGIN_MATERIALIZATION_VERSIONS
+                or (manifest["materialization_version"] == MARGIN_MATERIALIZATION_VERSION
+                    and manifest.get("prior_exchange_liquidity_contract") != PRIOR_EXCHANGE_LIQUIDITY_CONTRACT)
                 or manifest.get("status") != "complete"
                 or (not research and manifest.get("point_in_time_verified") is not True)
                 or (research and (manifest.get("point_in_time_verified") is not False
@@ -351,7 +452,8 @@ def attach_stock_context_futures_portfolio_daily(
     terminal_component_terms = terminal_subscription_values = None
     if margin_rules_path is not None:
         from stockagent.data.tw_futures_margin import validate_margin_rule_source, MARGIN_CORPORATE_CONTRACT_VERSION
-        dated_rules, dated_manifest = validate_margin_rule_source(margin_rules_path, source_path)
+        dated_rules, dated_manifest = (validate_margin_rule_source(margin_rules_path, source_path)
+            if validated_margin_source is None else validated_margin_source.read(margin_rules_path, source_path))
         if (dated_manifest.get('valuation_research_contract') != manifest.get('valuation_research_contract')
                 or dated_manifest.get('valuation_research_policy_sha256') != manifest.get('valuation_research_policy_sha256')):
             raise ValueError('daily release and research valuation policy differ')
@@ -379,13 +481,13 @@ def attach_stock_context_futures_portfolio_daily(
         raise ValueError("stock panel dates must be a non-empty finite 1-D axis")
     if np.any(dates[1:] <= dates[:-1]):
         raise ValueError("stock panel dates must be strictly increasing")
+    if futures_account_calendar is not None:
+        from stockagent.data.tw_futures_account_calendar import FuturesAccountCalendar
+        if (not isinstance(futures_account_calendar, FuturesAccountCalendar)
+                or not np.array_equal(futures_account_calendar.dates, dates)):
+            raise ValueError("dual account calendar must match the complete attachment date axis")
     if manifest.get("require_all_source_dates_in_stock_context") is True:
-        calendar = pl.from_arrow(pq.read_table(source_path, columns=["date"], memory_map=True))
-        source_calendar = calendar["date"].unique().to_numpy().astype("datetime64[D]")
-        missing_dates = np.setdiff1d(source_calendar, dates)
-        if missing_dates.size:
-            raise ValueError(f"stock context omits {missing_dates.size} all-TWD futures sessions; "
-                             f"first={missing_dates[0]} last={missing_dates[-1]}")
+        _require_source_calendar_within_stock_horizon(source_path, dates)
     source_columns = [
         "date",
         "product",
@@ -417,6 +519,8 @@ def attach_stock_context_futures_portfolio_daily(
         source_columns.append("previous_settlement")
     if expiry_settlement_valuation:
         source_columns.append("liquidation_reason")
+    if "accounting_only_date" in pq.read_schema(source_path).names:
+        source_columns.append("accounting_only_date")
     table = pq.read_table(
         source_path,
         columns=source_columns,
@@ -432,6 +536,7 @@ def attach_stock_context_futures_portfolio_daily(
     )
     if frame.height == 0:
         raise ValueError("TAIFEX futures portfolio has no rows aligned to stock dates")
+    _validate_source_account_calendar(frame, dates, futures_account_calendar)
 
     source_dates = frame["date"].to_numpy().astype("datetime64[D]")
     date_indices = np.searchsorted(dates, source_dates)
@@ -665,8 +770,13 @@ def attach_stock_context_futures_portfolio_daily(
         neginf=0.0,
         copy=False,
     )
-    next_date_indices = date_indices + 1
-    has_next_stock_session = next_date_indices < dates.size
+    if futures_account_calendar is None:
+        next_date_indices = date_indices + 1
+        has_next_stock_session = next_date_indices < dates.size
+    else:
+        from stockagent.data.tw_futures_account_calendar import next_decision_after_market_rows
+        next_date_indices = next_decision_after_market_rows(futures_account_calendar, date_indices)
+        has_next_stock_session = next_date_indices >= 0
     candidate_features[
         next_date_indices[has_next_stock_session],
         symbol_indices[has_next_stock_session],
@@ -948,6 +1058,14 @@ def attach_stock_context_futures_portfolio_daily(
         ] = model_one_contract_cash.astype(np.float32, copy=False)
         maximum_trade_contracts = whole_contract_trade_capacity(
             integer_frame["previous_volume"].to_numpy(), participation)
+        if futures_account_calendar is not None:
+            account_only_rows = futures_account_calendar.account_only_mask[date_indices]
+            if np.any(account_only_rows & integer_frame["executable"].to_numpy().astype(bool)):
+                raise ValueError("account-only source rows cannot be executable")
+            # Previous-session volume is a real historical fact, not today’s
+            # trading permission. Preserve it in the source while excluding
+            # orders on executor-only account nodes.
+            maximum_trade_contracts = np.where(account_only_rows, 0, maximum_trade_contracts)
         integer_execution = np.full(
             (*shape, len(TW_STOCK_CONTEXT_FUTURES_INTEGER_EXECUTION_CHANNELS)),
             np.nan,
@@ -955,6 +1073,10 @@ def attach_stock_context_futures_portfolio_daily(
         )
         integer_execution[..., 1] = 0.0
         integer_execution[..., 2] = 0.0
+        if futures_account_calendar is not None:
+            # The market is closed for every slot on an account-only node,
+            # including inactive slots whose other fields stay missing.
+            integer_execution[futures_account_calendar.account_only_mask, :, 8] = 0.0
         # Inactive fixed slots receive a unique singleton group so they cannot
         # collide with any active group if a corrupted non-zero action appears.
         integer_execution[..., 9] = np.arange(shape[1], dtype=np.float32)[None, :]
@@ -1037,8 +1159,11 @@ def attach_stock_context_futures_portfolio_daily(
             integer_execution[execution_quarantine, 2] = 0.0
             integer_execution[execution_quarantine, 8] = 0.0
 
-    candidate_mask = candidate_source & same_as_previous & current_open_available
-    candidate_mask &= ~carry_valuation_quarantine
+    candidate_mask = dated_futures_candidate_mask(
+        candidate_source, same_as_previous, current_open_available,
+        carry_valuation_quarantine,
+        prior_capacity=integer_execution[..., 8] if require_prior_capacity else None,
+    )
     if bool((candidate_mask[0]).any()):
         raise RuntimeError("first stock date cannot have prior-session futures context")
     if bool((can_hold & must_liquidate).any()):
@@ -1050,7 +1175,11 @@ def attach_stock_context_futures_portfolio_daily(
         raise ValueError("active TAIFEX rows require finite non-negative fee rates")
 
     if benchmark_mode == TX_FRONT_ROLLING_BENCHMARK_MODE:
-        benchmark_facts = load_tx_front_rolling_benchmark(benchmark_data_path or source_path, dates)
+        benchmark_facts = load_tx_front_rolling_benchmark(
+            benchmark_data_path or source_path, dates,
+            account_only_mask=(None if futures_account_calendar is None
+                               else futures_account_calendar.account_only_mask),
+        )
         benchmark = benchmark_facts["benchmark_log_returns"]
         benchmark_observed = (benchmark_facts["source_covered"]
                               & np.isfinite(benchmark_facts["prior_same_contract_close"]))
@@ -1074,22 +1203,6 @@ def attach_stock_context_futures_portfolio_daily(
             raise ValueError("TAIFEX TX front-month benchmark rows are missing")
     else:
         raise ValueError(f"unsupported futures portfolio benchmark mode: {benchmark_mode}")
-
-    # Apply this action eligibility only after constructing all ledger facts.
-    # Channel 8 is floor(previous same-contract volume * participation), never
-    # current-session volume or eventual realized fill. A zero action must not
-    # erase valuation or liquidation metadata for an existing position.
-    if require_prior_capacity:
-        assert integer_execution is not None
-        candidate_mask &= integer_execution[..., 8] >= 1.0
-
-    # Apply this action eligibility only after constructing all ledger facts.
-    # Channel 8 is floor(previous same-contract volume * participation), never
-    # current-session volume or eventual realized fill. A zero action must not
-    # erase valuation or liquidation metadata for an existing position.
-    if require_prior_capacity:
-        assert integer_execution is not None
-        candidate_mask &= integer_execution[..., 8] >= 1.0
 
     panel.stock_context_futures_portfolio_daily = (
         TaiwanStockContextFuturesPortfolioDaily(
@@ -1144,7 +1257,86 @@ def attach_stock_context_futures_portfolio_daily(
     return panel
 
 
+def attach_configured_stock_context_futures_portfolio(
+    panel: PanelData, config, *, reuse_validated_margin_source: bool = True,
+    futures_account_calendar=None,
+) -> PanelData:
+    """The shared train/infer/audit attachment chain, in authoritative order.
+
+    Auditing this path needs the real date/symbol axes, but never a synthetic
+    price or a second implementation of eligibility, margin or execution.
+    """
+    trading, data, training = config.trading, config.data, config.training
+    if str(trading.execution_mode) != "tw_stock_context_futures_portfolio":
+        raise ValueError("configured futures attachment requires its execution mode")
+    if futures_account_calendar is not None and (
+            trading.tw_futures_portfolio_capital_basis != "initial_margin"
+            or trading.tw_futures_portfolio_holding_policy != "carry"):
+        raise ValueError("dual account calendar requires the exact carrying margin account")
+    validated = None
+    if reuse_validated_margin_source and trading.tw_futures_portfolio_capital_basis == "initial_margin":
+        from stockagent.data.tw_futures_margin import ValidatedMarginSource
+        validated = ValidatedMarginSource.load(trading.tw_futures_portfolio_margin_rules_path,
+            trading.tw_futures_portfolio_data_path)
+    panel = attach_stock_context_futures_portfolio_daily(
+        panel, trading.tw_futures_portfolio_data_path,
+        fee_per_side_twd_by_group={
+            "large": trading.tw_futures_portfolio_fee_large_twd,
+            "standard": trading.tw_futures_portfolio_fee_standard_twd,
+            "stock": trading.tw_futures_portfolio_fee_stock_twd,
+            "micro": trading.tw_futures_portfolio_fee_micro_twd,
+        },
+        integer_contracts=bool(trading.tw_futures_portfolio_integer_contracts),
+        current_open_feature=bool(data.tw_futures_current_open_feature),
+        denomination_context_basis=data.tw_futures_denomination_context_basis,
+        futures_slot_count=data.tw_futures_portfolio_slot_count,
+        margin_rules_path=(trading.tw_futures_portfolio_margin_rules_path
+            if trading.tw_futures_portfolio_capital_basis == "initial_margin" else None),
+        valuation_research_contract=trading.tw_futures_portfolio_valuation_research_contract,
+        require_prior_capacity=data.tw_futures_require_prior_capacity,
+        validated_margin_source=validated,
+        carry_valuation_max_abs_simple_return=float(data.tw_futures_carry_valuation_max_abs_simple_return),
+        expiry_settlement_valuation=bool(data.tw_futures_expiry_settlement_valuation),
+        final_settlement_path=trading.tw_futures_portfolio_final_settlement_path,
+        integer_fee_per_contract_per_side_twd=float(trading.tw_futures_portfolio_integer_fee_per_contract_per_side_twd),
+        max_volume_participation=float(trading.max_volume_participation),
+        benchmark_mode=trading.tw_futures_portfolio_benchmark_mode,
+        benchmark_data_path=trading.tw_futures_portfolio_benchmark_data_path,
+        futures_account_calendar=futures_account_calendar,
+    )
+    if trading.tw_futures_portfolio_holding_policy == "intraday":
+        from stockagent.data.tw_all_futures_intraday import attach_all_futures_intraday
+        panel = attach_all_futures_intraday(panel, trading.tw_futures_portfolio_minute_data_path,
+            participation=trading.max_volume_participation)
+    if trading.tw_futures_portfolio_capital_basis == "initial_margin":
+        from stockagent.data.tw_futures_margin import attach_futures_margin_rules
+        panel = attach_futures_margin_rules(panel, trading.tw_futures_portfolio_margin_rules_path,
+            broker_multiplier=trading.tw_futures_portfolio_broker_margin_multiplier,
+            liquidation_ratio=trading.tw_futures_portfolio_margin_liquidation_ratio,
+            participation=trading.max_volume_participation,
+            benchmark_mode=trading.tw_futures_portfolio_benchmark_mode,
+            include_margin_amount=training.financial_transformer.futures_margin_amount_context,
+            include_account_policy_observations=training.financial_transformer.futures_causal_account_policy,
+            include_beta_observation=training.financial_transformer.futures_beta_notional_cap is not None,
+            include_residual_signals=training.financial_transformer.futures_residual_signal_context,
+            account_policy_lookback=training.lookback, validated_source=validated,
+            futures_account_calendar=futures_account_calendar)
+    if trading.tw_futures_portfolio_decision_time is not None:
+        from stockagent.data.tw_futures_decision_clock import attach_futures_decision_clock
+        panel = attach_futures_decision_clock(panel, trading.tw_futures_portfolio_entry_clock_path,
+            decision_time=trading.tw_futures_portfolio_decision_time,
+            participation=trading.max_volume_participation,
+            broker_multiplier=trading.tw_futures_portfolio_broker_margin_multiplier,
+            opening_reference_path=trading.tw_futures_portfolio_opening_reference_path,
+            capacity_policy=trading.tw_futures_portfolio_entry_capacity_policy,
+            futures_account_calendar=futures_account_calendar)
+    if validated is not None:
+        validated.read(trading.tw_futures_portfolio_margin_rules_path, trading.tw_futures_portfolio_data_path)
+    return panel
+
+
 __all__ = [
+    "DATED_FUTURES_MEMBERSHIP_CONTRACT",
     "TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_FEATURE_COLUMNS",
     "TW_STOCK_CONTEXT_FUTURES_CURRENT_OPEN_MODEL_FEATURE_COLUMNS",
     "TW_STOCK_CONTEXT_FUTURES_DENOMINATION_FEATURE_COLUMNS",
@@ -1163,5 +1355,7 @@ __all__ = [
     "TAIFEX_FUTURES_FINAL_SETTLEMENT_SCHEMA_VERSION",
     "TaiwanStockContextFuturesPortfolioDaily",
     "attach_stock_context_futures_portfolio_daily",
+    "attach_configured_stock_context_futures_portfolio",
+    "dated_futures_candidate_mask",
     "fixed_futures_slot_symbols",
 ]

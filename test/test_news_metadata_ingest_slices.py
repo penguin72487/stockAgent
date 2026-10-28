@@ -8,7 +8,7 @@ import pyarrow as pa
 import pytest
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
-from downloader.news_fulltext import run_service
+from downloader.news_fulltext import _coalesce_inventory_heartbeats, run_service
 from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue
 from test_news_fulltext import config as config, http_fixture, metadata_receipt
@@ -217,6 +217,56 @@ def test_pending_inventory_keeps_idle_service_wake_bounded_and_honors_duration(c
     finally:
         http.close()
         queue.close()
+
+
+def test_coalesced_finmind_inventory_preserves_actual_receipts_and_associations(config, tmp_path, monkeypatch):
+    root = tmp_path / 'finmind'
+    root.mkdir()
+    source = sqlite3.connect(root / 'queue.sqlite3')
+    source.execute('CREATE TABLE tasks(dataset,state,receipt_path,partition)')
+    for index in range(2):
+        directory = root / str(index)
+        directory.mkdir()
+        receipt = metadata_receipt(directory, [
+            {'link': f'https://publisher.test/article/{index}', 'title': f'title{index}', 'date': '2026-10-01'},
+            {'link': 'https://publisher.test/article/shared', 'title': 'shared', 'date': '2026-10-01'},
+        ])
+        metadata = json.loads(receipt.read_text())
+        metadata['parquet_path'] = f'{index}/metadata.parquet'
+        atomic_write_json(receipt, metadata)
+        source.execute('INSERT INTO tasks VALUES (?,?,?,?)', ('TaiwanStockNews', 'complete', f'{index}/source.json', index))
+    source.commit()
+    source.close()
+    clock = [0.0]
+    monkeypatch.setattr('downloader.news_fulltext_metadata_ingest.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('downloader.news_fulltext_queue.utc_now', lambda: '2026-10-14T00:00:00+00:00')
+
+    def run(queue, *, coalesced):
+        statuses = []
+        original = queue.ingest_receipt
+        def receipt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            clock[0] += 20
+            return result
+        monkeypatch.setattr(queue, 'ingest_receipt', receipt)
+        monkeypatch.setattr(queue, 'status', lambda **kwargs: statuses.append(kwargs['activity']))
+        if coalesced:
+            with _coalesce_inventory_heartbeats(queue):
+                outcome = queue.ingest_local_slice(tmp_path / 'finlab', root)
+        else:
+            outcome = queue.ingest_local_slice(tmp_path / 'finlab', root)
+        return outcome, statuses
+
+    with closing(queue_at(tmp_path, config, 'reference')) as reference, \
+            closing(queue_at(tmp_path, config, 'coalesced')) as coalesced:
+        baseline, baseline_statuses = run(reference, coalesced=False)
+        blocked, blocked_statuses = run(coalesced, coalesced=True)
+        assert baseline == blocked == {'imported': 2, 'complete': True}
+        assert baseline_statuses == ['inventorying', 'inventorying'] and blocked_statuses == []
+        assert semantic_tables(reference) == semantic_tables(coalesced)
+        assert coalesced.db.execute('SELECT sum(association_rows) FROM source_links').fetchone()[0] == 4
+        assert coalesced.db.execute('SELECT count(*) FROM receipt_heads').fetchone()[0] == 2
+        assert coalesced.db.execute("SELECT value FROM counters WHERE key='latest_inventory_finmind_receipts_checked'").fetchone()[0] == 2
 
 
 def test_metadata_cache_is_one_bounded_temporary_lease_for_two_receipts(config, tmp_path, monkeypatch):

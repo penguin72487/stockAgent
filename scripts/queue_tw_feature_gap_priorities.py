@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 from downloader.artifact_io import atomic_write_json
 from scripts.prepare_tw_day_trade_feature_catalog import sha256, write_csv
 from stockagent.data.finlab_acquisition_contract import UPSTREAM_CHECK_MODES, safe_stem, utc_time
-from stockagent.data.finlab_gap_priority import CONTRACT, MAX_REQUESTS, pending_gap_requests
+from stockagent.data.finlab_gap_priority import CONTRACT, pending_gap_requests
 
 
 def enqueue(audit: Path, root: Path, *, now: datetime):
@@ -51,8 +51,6 @@ def enqueue(audit: Path, root: Path, *, now: datetime):
         ids = {r['request_id'] for r in old_rows}
         added = [r for r in requests if r['request_id'] not in ids]
         merged = [*old_rows, *added]
-        if len(merged) > MAX_REQUESTS:
-            raise ValueError('priority intent bound exceeded; inspect old evidence first')
         if previous:
             archive = root / 'gap_priority_history' / (sha256(path) + '.json')
             if not archive.exists():
@@ -69,7 +67,7 @@ def enqueue(audit: Path, root: Path, *, now: datetime):
 def report_intents(root: Path, *, now: datetime):
     """Report every finite intent without treating expiry or cache reads as checks."""
     path = root / 'gap_priority_requests.json'
-    # Share the collector's identity, shape, size and evidence validation.
+    # Share the collector's identity, shape and evidence validation.
     pending_gap_requests(root, now=now)
     if not path.exists():
         return {'total_intents': 0, 'states': {}, 'all_provider_gaps_filled': False}, []

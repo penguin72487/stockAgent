@@ -1,6 +1,5 @@
 [Service]
 TimeoutStartSec=30min
-CPUQuota=100%
 MemoryHigh=768M
 MemoryMax=1536M
 SuccessExitStatus=75

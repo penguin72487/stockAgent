@@ -275,12 +275,16 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
                              'scope_contract' in task_columns and meta.get('editable_scope_contract') == 'editable_source_scope_v1' else "")
             columns = {r[1] for r in con.execute("PRAGMA table_info(tables)")}
             work_rows='COALESCE(work_expected_rows,expected_rows)' if 'work_expected_rows' in task_columns else 'expected_rows'
+            from downloader.tej_incremental import summary as incremental_summary
+            incrementals = incremental_summary(con)
+            history_scope = (" AND NOT EXISTS(SELECT 1 FROM tej_incremental_tasks i WHERE i.task_id=tasks.task_id)"
+                             if con.execute("SELECT 1 FROM sqlite_master WHERE name='tej_incremental_tasks'").fetchone() else '')
             # A writer upgrades the catalog only at a safe acquisition boundary.
             # Older live writers remain readable; the monitor never migrates it.
             select = [key if key in columns else 'NULL AS '+key for key in TABLE_COLUMNS]
             tables = [dict(r) for r in con.execute("SELECT " + ",".join(select) + " FROM tables ORDER BY phase,category,name")]
             per_table = {r["table_id"]: dict(r) for r in con.execute("SELECT table_id,COUNT(*) AS fields,SUM(exported_non_null_cells) AS exported_non_null_cells,MIN(first_query_period) AS first_query_period,MAX(last_query_period) AS last_query_period,SUM(phase='P1') AS p1_fields,SUM(phase='P2') AS p2_fields,SUM(phase='P3') AS p3_fields FROM features GROUP BY table_id")}
-            tasks = [dict(r) for r in con.execute("SELECT table_id,kind,state,COUNT(*) AS tasks,SUM("+work_rows+") AS target_rows,SUM(actual_rows) AS exported_rows,SUM(actual_bytes) AS recorded_bytes,SUM(CASE WHEN kind='download' AND state='complete' AND actual_rows=0 THEN 1 ELSE 0 END) AS empty_tasks FROM tasks WHERE state IN ('pending','running','complete','blocked')"+current_scope+" GROUP BY table_id,kind,state")]
+            tasks = [dict(r) for r in con.execute("SELECT table_id,kind,state,COUNT(*) AS tasks,SUM("+work_rows+") AS target_rows,SUM(actual_rows) AS exported_rows,SUM(actual_bytes) AS recorded_bytes,SUM(CASE WHEN kind='download' AND state='complete' AND actual_rows=0 THEN 1 ELSE 0 END) AS empty_tasks FROM tasks WHERE state IN ('pending','running','complete','blocked')"+current_scope+history_scope+" GROUP BY table_id,kind,state")]
             plans={r['table_id']:dict(r) for r in con.execute('SELECT table_id,total_queries,next_query FROM download_plans')} if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_plans'").fetchone() else {}
             value_priorities = {r['table_id']: dict(r) for r in con.execute(
                 'SELECT table_id,priority,rank,value_score,missing_fields,crosscheck_fields,reason FROM acquisition_value_priorities')
@@ -540,6 +544,7 @@ def build_tej_public_status(repo_root: Path, *, now: datetime | None = None) -> 
                          "unmaterialized_queries":sum(p['total_queries']-p['next_query'] for p in plans.values()) if plans else None},
             "legacy_exports": {key:legacy.get(key) for key in ('exported_rows','exported_non_null_cells','recorded_bytes','completed_download_tasks')},
             "scheduler": scheduler,
+            "incremental": incrementals,
             "worker": {"alive": alive, "state": worker.get("state"), "observed_at_utc": worker.get("observed_at_utc"),
                        "kind": worker.get("kind"), "finite_desktop_ownership": True,
                        "batch_mode": worker.get('batch_mode') if worker.get('batch_mode') in {'discover','download','interleaved'} else None,

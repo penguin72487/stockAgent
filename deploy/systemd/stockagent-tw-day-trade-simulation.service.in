@@ -16,20 +16,17 @@ Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_tw_day_trade_services.sh"
 Nice=-5
-CPUWeight=100
-IOWeight=100
+CPUWeight=10000
+IOWeight=10000
 # Preserve the stateful paper execution engine ahead of reproducible bulk
 # refresh/audit workers when the kernel must select an OOM victim.
 OOMScoreAdjust=-500
-# The 2026-09-25 full-history signal request raised this cgroup's observed
-# peak above 5.7 GiB; most private-dashboard anonymous pages were LazyFree and
-# reclaimable, with zero memory.high / OOM events. Re-measure cold concurrent
-# requests before changing the 8G / 16G boundaries or assuming a sub-1G peak.
+# Do not throttle the critical execution and ledger owner with bulk-job limits.
 MemoryAccounting=true
-MemoryHigh=8G
-MemoryMax=16G
-MemorySwapMax=2G
-TasksMax=2048
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
 Restart=always
 RestartSec=1s
 # Historical 09:01 recovery is a bounded request/reply batch.  Individual

@@ -42,6 +42,29 @@ from stockagent.data.tw_security import classify_tw_stock_or_etf
 from polars.testing import assert_frame_equal
 
 
+def test_cli_reports_typed_capacity_deferral_without_claiming_success(monkeypatch, capsys):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    def fail():
+        raise CapacityDeferred("physical_backing_reserve", physical_free_bytes=123)
+
+    monkeypatch.setattr(official_symbol_builder, "main", fail)
+    assert official_symbol_builder._cli() == 75
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["event"] == "official_symbol_build_deferred"
+    assert payload["capacity"]["reason"] == "physical_backing_reserve"
+    assert payload["capacity"]["allocation_admitted"] is False
+
+
+def test_cli_does_not_relabel_noncapacity_errors(monkeypatch):
+    def fail():
+        raise RuntimeError("unexpected builder failure")
+
+    monkeypatch.setattr(official_symbol_builder, "main", fail)
+    with pytest.raises(RuntimeError, match="unexpected builder failure"):
+        official_symbol_builder._cli()
+
+
 def _incremental_frame(count=5):
     return pl.DataFrame({
         "date": [date(2026, 10, 12 + i) for i in range(count)],

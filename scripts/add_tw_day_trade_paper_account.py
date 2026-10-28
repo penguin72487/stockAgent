@@ -40,9 +40,17 @@ from scripts.promote_tw_day_trade_replay import (
 )
 from scripts.rebuild_tw_day_trade_minute_curves import validate_existing_strategy_marks
 from stockagent.live.market_config import load_market_config
+from stockagent.live.paper_journal import (
+    HEADS as JOURNAL_HEADS,
+    journal_write_transaction, open_paper_journal, rebind_cloned_journals,
+)
 from stockagent.live.tw_day_trade_simulation import (
     TwDayTradeSimulationEngine,
     minute_curve_write_lock,
+)
+from stockagent.live.tw_day_trade_service_sync import (
+    SERVICE_SYNC_DURABLE_ACK_FILENAME,
+    committed_paper_read_guard,
 )
 
 LEDGERS = (
@@ -53,7 +61,13 @@ LEDGERS = (
     "events.jsonl",
     "latency.jsonl",
 )
-PROJECTIONS = {"state.json", "status.json", "positions.json", "service_sync.json"}
+PROJECTIONS = {
+    "state.json", "status.json", "positions.json", "service_sync.json",
+    SERVICE_SYNC_DURABLE_ACK_FILENAME,
+}
+# The canonical persistence observer records the new composed commit after
+# publication. Its prior bytes remain evidence, not a replaceable projection.
+APPEND_ONLY_OBSERVATIONS = {"execution_latency.jsonl"}
 # Query IPC and readiness observations have independent writers. They are not
 # financial ledger evidence and must not be relocated as in-flight requests.
 VOLATILE_OBSERVATIONS = {"quote_broker", "preopen_readiness.json"}
@@ -71,7 +85,7 @@ def _account_input_hashes(root: Path) -> dict[str, str]:
 
 def _rows(path):
     if path.exists():
-        with path.open() as stream:
+        with open_paper_journal(path, "r", encoding="utf-8") as stream:
             for line in stream:
                 if line.strip():
                     yield json.loads(line)
@@ -137,7 +151,7 @@ def validate_new_identity(
 def _prefix_hash(path: Path, size: int) -> str:
     digest = hashlib.sha256()
     remaining = size
-    with path.open("rb") as stream:
+    with open_paper_journal(path) as stream:
         while remaining:
             block = stream.read(min(8 * 1024 * 1024, remaining))
             if not block:
@@ -152,7 +166,7 @@ def verify_completed_prefix(path: Path, digest: str, end: str) -> int:
     observed = hashlib.sha256()
     matched = False
     prefix_bytes = 0
-    with path.open("rb") as stream:
+    with open_paper_journal(path) as stream:
         for line in stream:
             if not matched:
                 observed.update(line)
@@ -350,16 +364,17 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
             {"quote_broker"} if Path(directory) == live else set()
         ),
     )
+    immutable_clone_proofs = rebind_cloned_journals(live, merged)
     appended = {}
     for name in LEDGERS:
         source, destination = candidate / name, merged / name
         if not source.exists():
             continue
         count = 0
-        with destination.open("ab") as stream:
+        with journal_write_transaction(destination, operation="append"), destination.open("ab") as stream:
             # Preserve the old prefix, including its whitespace/row ordering.
             if destination.stat().st_size:
-                with destination.open("rb") as check:
+                with open_paper_journal(destination) as check:
                     check.seek(-1, os.SEEK_END)
                     if check.read(1) != b"\n":
                         raise ValueError("live JSONL has an incomplete terminal row")
@@ -399,7 +414,11 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
     engine = TwDayTradeSimulationEngine(merged)
     engine.state = state
     engine._persist(datetime.now(TAIPEI))
-    after = _load_object(merged / "state.json")
+    # The new account has a new commit and durable ACK, not the old source
+    # ACK copied by copytree. Verify the canonical pair before accepting its
+    # replaceable projections; original financial/observation bytes stay fenced.
+    with committed_paper_read_guard(merged):
+        after = _load_object(merged / "state.json")
     for old_market, old_mode in old["modes"].items():
         if old_market == market:
             continue
@@ -409,13 +428,14 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
         if after.get(key) != old.get(key):
             raise ValueError(f"existing shared observation changed: {key}")
     preserved = {}
+    mutable_heads = {f"{JOURNAL_HEADS}/{name}.json" for name in immutable_clone_proofs}
     for relative, digest in before.items():
-        if relative in PROJECTIONS:
+        if relative in PROJECTIONS or relative in mutable_heads:
             continue
         size = (live / relative).stat().st_size
         actual = (
             _prefix_hash(merged / relative, size)
-            if relative in LEDGERS
+            if relative in LEDGERS or relative in APPEND_ONLY_OBSERVATIONS
             else _sha256(merged / relative)
         )
         if actual != digest:
@@ -449,6 +469,7 @@ def compose_account(live: Path, candidate: Path, merged: Path, market: str) -> d
         "preserved_old_files": preserved,
         "old_modes_unchanged": True,
         "old_ledger_prefixes_unchanged": True,
+        "retained_immutable_journal_clones": immutable_clone_proofs,
         "volatile_observations_excluded_from_financial_snapshot": sorted(
             VOLATILE_OBSERVATIONS
         ),

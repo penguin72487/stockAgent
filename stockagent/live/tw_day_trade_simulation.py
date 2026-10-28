@@ -31,7 +31,12 @@ import uuid
 from zoneinfo import ZoneInfo
 
 import numpy as np
-from stockagent.private_json import ledger_bytes
+from stockagent.private_json import ledger_bytes, ledger_lines_bytes
+from stockagent.live.paper_mode_snapshot import (
+    CONTRACT as MODE_SNAPSHOT_CONTRACT, MANIFEST_KEY as MODE_SNAPSHOT_KEY,
+    ModeSnapshotWriter, expand_paper_state, mode_object_generations, read_paper_payload,
+)
+from stockagent.live.paper_journal import append_paper_journal, open_paper_journal
 
 from stockagent.backtest.tw_day_trade_contract import (
     AUCTION_SUBMIT_MINUTE,
@@ -91,6 +96,7 @@ from stockagent.live.tw_day_trade_service_sync import (
     SERVICE_SYNC_DURABLE_ACK_FILENAME,
     SERVICE_SYNC_DURABLE_ACK_CONTRACT,
     SERVICE_SYNC_SCHEMA_VERSION,
+    PAPER_JOURNAL_FILENAMES,
     load_service_sync,
     paper_journal_generations,
     paper_projection_generations,
@@ -117,6 +123,9 @@ CLOSING_AUCTION_TIME: Final[time] = session_time(AUCTION_SUBMIT_MINUTE)
 SESSION_CLOSE: Final[time] = session_time(CLOSE_AUCTION_MINUTE)
 AUCTION_OBSERVATION_DEADLINE: Final[time] = time(13, 35)
 STRICT_INTRADAY_CONTRACT: Final[str] = "flatten_same_day_adverse_limit_exception_only_v1"
+REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT: Final[str] = (
+    "counterfactual_open_origin_then_causal_progressive_revisions_v1"
+)
 ENTRY_FILL_POLICY_CAUSAL_BOOK: Final[str] = "causal_best_quote"
 ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
 ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
@@ -142,12 +151,21 @@ REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE: Final[str] = (
     "retrospective_official_open_signal_at_09_00_observed_minute_price_"
     "50pct_volume_sweep_until_exit_window_nav_counterfactual_v4"
 )
-REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
+LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
     "retrospective_prior_paper_fill_else_09_01_minute_price_"
     "full_target_no_liquidity_claim_v1"
 )
+REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL: Final[str] = (
+    "retrospective_prior_paper_fill_else_09_01_positive_volume_minute_price_"
+    "full_target_no_liquidity_claim_v2"
+)
+REPLAY_FULL_COUNTERFACTUAL_CONTRACTS: Final[frozenset[str]] = frozenset({
+    LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+})
 EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
 ENTRY_PRICE_GUARD_CONTRACT: Final[str] = "strict_inside_original_take_profit_stop_loss_v1"
+EXECUTION_POINTER_OBSERVATION_CONTRACT: Final[str] = "consumer_observed_atomic_pointer_before_quote_v1"
 ENTRY_PRICE_GUARD_REASONS: Final[frozenset[str]] = frozenset({
     "entry_bracket_unavailable", "entry_bracket_invalid",
     "entry_price_at_or_beyond_stop_loss", "entry_price_at_or_beyond_take_profit",
@@ -273,15 +291,15 @@ def _completed_minute_replay_quote(
         mode.get("simulation_replay") is True
         and mode.get("counterfactual_open_replay") is True
         and mode.get("historical_minute_valuation") is True
-        and mode.get("entry_fill_contract") in {
-            REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
-        }
+        and mode.get("entry_fill_contract") in (
+            REPLAY_FULL_COUNTERFACTUAL_CONTRACTS | {REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+        )
         and mode.get("session_date") == now.date().isoformat()
         and quote.get("historical_minute_valuation") is True
         and quote.get("source") == "retained_right_labelled_1m_ohlcv_counterfactual"
         and quote.get("fill_contract") == (
             "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
-            if mode.get("entry_fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            if mode.get("entry_fill_contract") in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
             else "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
         )
         and stamp == now and now.second == 0 and now.microsecond == 0
@@ -881,13 +899,19 @@ def _prepare_entry_plan(
             # a best quote, or an adverse tick.
             minute_kbar_capacity_shares = _minute_kbar_capacity_shares(quote_values, lot_size=spec.lot_size)
             if spec.historical_full_fill_at_0901:
-                # Retrospective scenario only: the minute supplies a price,
-                # never evidence that the requested size could have traded.
-                filled_shares = requested_shares
-                reason = (
-                    "counterfactual_full_target_from_prior_paper_fill"
-                    if prior_fill else "counterfactual_09_01_full_target_no_liquidity_claim"
-                )
+                # A KBar may carry the previous close in a zero-volume minute.
+                # It is a valuation reference, not an observed trade price.
+                # Even this full-target *scenario* requires a positive-volume
+                # print, unless an independently retained paper fill supplies
+                # the causal price. It still makes no claim about executable size.
+                if prior_fill or _finite(quote_values.get("minute_volume_lots")) is not None:
+                    filled_shares = requested_shares
+                    reason = (
+                        "counterfactual_full_target_from_prior_paper_fill"
+                        if prior_fill else "counterfactual_09_01_full_target_no_liquidity_claim"
+                    )
+                else:
+                    status, reason = "blocked", "observed_09_01_minute_liquidity_unavailable"
             else:
                 filled_shares = min(requested_shares, minute_kbar_capacity_shares)
                 reason = "counterfactual_observed_09_01_minute_price_fill"
@@ -1154,22 +1178,9 @@ def _append_jsonl_many(
     if not payloads:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = b"".join(
-        ledger_bytes(payload) + b"\n"
-        for payload in payloads
-    )
-    with minute_curve_write_lock(path.parent) if path.name == "marks.jsonl" else nullcontext():
-        descriptor = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        try:
-            view = memoryview(encoded)
-            while view:
-                written = os.write(descriptor, view)
-                if written <= 0:
-                    raise OSError(f"short append to {path}")
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    encoded = ledger_lines_bytes(payloads)
+    with (minute_curve_write_lock(path.parent) if path.name == "marks.jsonl" else nullcontext()):
+        append_paper_journal(path, encoded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1560,6 +1571,7 @@ class TwDayTradeSimulationEngine:
         *,
         final_settlement_path: str | Path = DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
         publication_clock: Callable[[], datetime] | None = None,
+        immutable_mode_snapshots: bool | None = None,
     ) -> None:
         self._publication_clock = publication_clock
         self.state_dir = Path(state_dir)
@@ -1587,7 +1599,11 @@ class TwDayTradeSimulationEngine:
         self._engine_run_id = uuid.uuid4().hex
         self.last_persist_metrics: dict[str, Any] | None = None
         self._deferred_ledger_rows: dict[Path, list[Mapping[str, Any]]] | None = None
+        self._immutable_mode_snapshots = immutable_mode_snapshots
+        self._mode_snapshot_writer: ModeSnapshotWriter | None = None
         self.state = self._load_state()
+        if self._immutable_mode_snapshots:
+            self._mode_snapshot_writer = ModeSnapshotWriter(self.state_dir)
         stock_benchmarks_migrated = self._migrate_stock_benchmark_contract()
         tx_benchmark_migrated = self._migrate_tx_continuous_benchmark_contract()
         self._reconcile_daily_duplicate_signal_ids()
@@ -1603,7 +1619,9 @@ class TwDayTradeSimulationEngine:
                     mode["engine_status"] = "critical_ledger_state_divergence"
         self._restore_position_artifact_paths()
         if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered:
-            _atomic_json(self.state_path, self.state)
+            checkpoint = (self._mode_snapshot_writer.prepare(self.state)
+                          if self._mode_snapshot_writer is not None else self.state)
+            _atomic_json(self.state_path, checkpoint)
         self._opening_execution_observer = OpeningExecutionObserver(self.state.get("modes", {}))
 
     @staticmethod
@@ -1613,7 +1631,7 @@ class TwDayTradeSimulationEngine:
         found: dict[str, dict[str, Any]] = {}
         if not order_ids or not path.is_file():
             return found
-        with path.open("r", encoding="utf-8") as handle:
+        with open_paper_journal(path, "r", encoding="utf-8") as handle:
             for line in handle:
                 if not any(order_id in line for order_id in order_ids):
                     continue
@@ -1817,7 +1835,7 @@ class TwDayTradeSimulationEngine:
             return
         latest_started: dict[str, tuple[tuple[str, str, int], str, str]] = {}
         latest_registered: dict[str, tuple[tuple[str, str, int], str, str]] = {}
-        with self.events_path.open("r", encoding="utf-8") as handle:
+        with open_paper_journal(self.events_path, "r", encoding="utf-8") as handle:
             for sequence, line in enumerate(handle):
                 try:
                     event = json.loads(line)
@@ -2181,7 +2199,7 @@ class TwDayTradeSimulationEngine:
         latest_event: dict[
             str, tuple[tuple[str, str, int], str, str, str | None]
         ] = {}
-        with self.events_path.open("r", encoding="utf-8") as handle:
+        with open_paper_journal(self.events_path, "r", encoding="utf-8") as handle:
             for sequence, line in enumerate(handle):
                 try:
                     event = json.loads(line)
@@ -2318,9 +2336,13 @@ class TwDayTradeSimulationEngine:
         )
 
     def _load_state(self) -> dict[str, Any]:
-        if self.state_path.is_file():
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict) and int(payload.get("schema_version", 0)) in {
+        if self.state_path.exists() or self.state_path.is_symlink():
+            payload = read_paper_payload(self.state_path)
+            if isinstance(payload, dict):
+                if MODE_SNAPSHOT_KEY in payload and self._immutable_mode_snapshots is None:
+                    self._immutable_mode_snapshots = True
+                payload = expand_paper_state(payload, self.state_dir)
+            if type(payload.get("schema_version")) is int and payload["schema_version"] in {
                 2,
                 3,
                 SIMULATION_SCHEMA_VERSION,
@@ -2330,6 +2352,8 @@ class TwDayTradeSimulationEngine:
                 payload.setdefault("modes", {})
                 payload.setdefault("benchmarks", {})
                 payload.setdefault("minute_liquidity", {})
+                if any(not isinstance(payload[key], dict) for key in ("modes", "benchmarks", "minute_liquidity")):
+                    raise ValueError("invalid canonical paper checkpoint containers; refusing empty reset")
                 if prior_schema < SIMULATION_SCHEMA_VERSION:
                     payload["migrated_from_schema_version"] = prior_schema
                     for mode in payload["modes"].values():
@@ -2353,6 +2377,10 @@ class TwDayTradeSimulationEngine:
                             )
                             mode["legacy_execution_contract"] = True
                 return payload
+            raise ValueError("unsupported canonical paper checkpoint schema; refusing empty reset")
+        if any(path.is_file() and path.stat().st_size for path in (
+                self.state_dir / name for name in PAPER_JOURNAL_FILENAMES)):
+            raise ValueError("missing canonical paper checkpoint with recorded execution journals; explicit recovery required")
         return {
             "schema_version": SIMULATION_SCHEMA_VERSION,
             "simulation_only": True,
@@ -3490,7 +3518,21 @@ class TwDayTradeSimulationEngine:
                 if isinstance(position, Mapping)
                 and str(position.get("entry_fill_policy") or "")
             }
-            if len(committed_policies) == 1:
+            current_revision_follows_replay = (
+                isinstance(mode.get("session_open_replay_origin"), Mapping)
+                and mode["session_open_replay_origin"].get("contract")
+                    == REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT
+                and mode["session_open_replay_origin"].get("fingerprint")
+                    == hashlib.sha256(REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT.encode()).hexdigest()
+                and mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+                and mode.get("simulation_replay") is False
+            )
+            if current_revision_follows_replay:
+                # Open inventory can contain both the counterfactual cohort
+                # and newer causal cohorts. The current signal's policy owns
+                # pending retries; no position may rewrite that policy.
+                pass
+            elif len(committed_policies) == 1:
                 mode["entry_fill_policy"] = committed_policies.pop()
             elif mode.get("counterfactual_0901_price_fill") is True:
                 mode["entry_fill_policy"] = ENTRY_FILL_POLICY_0901_MINUTE_PRICE
@@ -3826,7 +3868,7 @@ class TwDayTradeSimulationEngine:
     def _session_has_fill(self, market: str, session_date: str) -> bool:
         if not self.fills_path.is_file():
             return False
-        with self.fills_path.open("r", encoding="utf-8") as handle:
+        with open_paper_journal(self.fills_path, "r", encoding="utf-8") as handle:
             for line in handle:
                 try:
                     row = json.loads(line)
@@ -4106,7 +4148,18 @@ class TwDayTradeSimulationEngine:
         counterfactual_open_replay: bool = False,
     ) -> str:
         observed = _now_taipei(now)
-        timestamp_precision = "microseconds" if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE else "seconds"
+        # The executor may race the 13:20 cutoff after its caller has read a
+        # valid pointer.  Do not let that late publication replace the day's
+        # actual signal identity or consume a post-close cache as a rejection.
+        # The normal exit/settlement pipeline is independent of this gate.
+        if observed.timetz().replace(tzinfo=None) >= EXIT_LIMIT_TIME:
+            return "ignored_after_entry_cutoff"
+        timestamp_precision = (
+            "microseconds"
+            if (spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+                or (not counterfactual_open_replay and summary.get("execution_pointer_observed_at") is not None))
+            else "seconds"
+        )
         mode = self._mode(spec)
         signal_id = str(summary.get("signal_id") or "").strip()
         if not signal_id:
@@ -4119,13 +4172,55 @@ class TwDayTradeSimulationEngine:
         if signal_id in set(mode.get("processed_signal_ids") or ()):
             return "already_processed"
         from stockagent.live.opening_signal_revision import revision_admission
+        # A late-opening counterfactual is a distinct first cohort. Later
+        # revisions may change its surviving paper inventory, but only with
+        # proven original lineage and a subsequently observed live pointer.
+        revision_mode: Mapping[str, Any] = mode
+        if (spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+                and mode.get("simulation_replay") is True
+                and mode.get("session_date") == observed.date().isoformat()
+                and mode.get("entry_completed_at")):
+            origin = mode.get("session_open_replay_origin")
+            valid_origin = isinstance(origin, Mapping) and (
+                origin.get("contract") == REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT
+                and origin.get("fingerprint") == hashlib.sha256(
+                    REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT.encode()).hexdigest()
+                and origin.get("signal_id") == mode.get("signal_id")
+                and origin.get("session_date") == mode.get("session_date")
+                and mode.get("counterfactual_open_replay") is True
+            )
+            if valid_origin:
+                original = {"signal_id": origin.get("signal_id"),
+                    "day_trade_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+                    "day_trade_signal_update_policy_fingerprint": origin.get("policy_fingerprint"),
+                    "opening_signal_revision": origin.get("revision")}
+                _, origin_error = revision_admission(policy=SIGNAL_UPDATE_PROGRESSIVE,
+                    summary=original, mode={}, session_date=observed.date().isoformat())
+                valid_origin = (not origin_error
+                    and isinstance(origin.get("revision"), Mapping)
+                    and origin["revision"].get("index") == 0)
+            if not valid_origin:
+                mode["pending_signal_id"] = signal_id
+                mode["pending_wait_reason"] = "counterfactual_opening_lineage_not_verified"
+                mode["engine_status"] = "waiting_replay_lineage"
+                self._persist(observed)
+                return "waiting_replay_lineage"
+            revision_mode = {**mode, "day_trade_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+                             "opening_signal_revision": dict(origin["revision"])}
         progressive_revision, revision_error = revision_admission(
-            policy=spec.signal_update_policy, summary=summary, mode=mode,
+            policy=spec.signal_update_policy, summary=summary, mode=revision_mode,
             session_date=observed.date().isoformat())
         if revision_error:
             return self._block_signal(mode, signal_id, revision_error, observed)
-        if progressive_revision and (counterfactual_open_replay or mode.get("simulation_replay")):
+        if progressive_revision and (counterfactual_open_replay or summary.get("simulation_replay")):
             return self._block_signal(mode, signal_id, "live_revision_cannot_rewrite_replay", observed)
+        if (progressive_revision and mode.get("simulation_replay") is True
+                and summary.get("execution_pointer_observed_at") is None):
+            mode["pending_signal_id"] = signal_id
+            mode["pending_wait_reason"] = "live_revision_pointer_observation_required"
+            mode["engine_status"] = "waiting_signal_clock"
+            self._persist(observed)
+            return "waiting_quote"
         if str(summary.get("execution_mode") or "") != "tw_day_trade":
             return self._block_signal(mode, signal_id, "not_tw_day_trade", observed)
         source_signal_at = _parse_timestamp(
@@ -4141,6 +4236,30 @@ class TwDayTradeSimulationEngine:
             return self._block_signal(
                 mode, signal_id, "signal_not_current_session", observed
             )
+        replay_continuation_origin = None
+        original_policy = summary.get("missed_opening_original_signal_update_policy")
+        if counterfactual_open_replay and original_policy is not None:
+            if original_policy != SIGNAL_UPDATE_PROGRESSIVE or summary.get("missed_opening_recovery") is not True:
+                return self._block_signal(mode, signal_id, "invalid_replay_continuation_policy", observed)
+            original = {**summary,
+                "day_trade_signal_update_policy": original_policy,
+                "day_trade_signal_update_policy_fingerprint": summary.get("missed_opening_original_policy_fingerprint"),
+                "opening_signal_revision": summary.get("missed_opening_original_signal_revision")}
+            _, original_error = revision_admission(policy=SIGNAL_UPDATE_PROGRESSIVE,
+                summary=original, mode={}, session_date=observed.date().isoformat())
+            revision = original.get("opening_signal_revision")
+            if original_error or not isinstance(revision, Mapping) or revision.get("index") != 0:
+                return self._block_signal(mode, signal_id, "invalid_replay_continuation_origin", observed)
+            replay_continuation_origin = {
+                "contract": REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT,
+                "fingerprint": hashlib.sha256(REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT.encode()).hexdigest(),
+                "session_date": observed.date().isoformat(), "signal_id": signal_id,
+                "policy_fingerprint": original.get("day_trade_signal_update_policy_fingerprint"),
+                "revision": dict(revision),
+                "replay_basis": summary.get("replay_basis"),
+                "entry_fill_contract": summary.get("entry_fill_contract"),
+                "open_reconstructed_at": observed.isoformat(timespec="seconds"),
+            }
         wall_time = observed.timetz().replace(tzinfo=None)
         if spec.historical_full_fill_at_0901 and not counterfactual_open_replay:
             raise ValueError("historical full-fill scenario is forbidden for live signals")
@@ -4194,8 +4313,42 @@ class TwDayTradeSimulationEngine:
                 return self._block_signal(
                     mode, signal_id, "invalid_signal_ready_timestamp", observed
                 )
+            def wait_for_pointer_clock(reason: str) -> str:
+                # Clock inconsistency is retryable and must not consume the
+                # session's signal or fabricate a causal quote.
+                mode["pending_signal_id"] = signal_id
+                mode["pending_signal_at"] = signal_at.isoformat(timespec="microseconds")
+                mode["pending_wait_reason"] = reason
+                mode["engine_status"] = "waiting_signal_clock"
+                self._persist(observed)
+                return "waiting_quote"
+
             if signal_at > observed:
+                if summary.get("execution_pointer_observed_at") is not None:
+                    return wait_for_pointer_clock("signal_ready_after_observation")
                 return self._block_signal(mode, signal_id, "signal_ready_after_observation", observed)
+            pointer_clock = summary.get("execution_pointer_observed_at")
+            if pointer_clock is not None:
+                pointer_clock_error = None
+                try:
+                    raw_pointer_at = datetime.fromisoformat(str(pointer_clock).replace("Z", "+00:00"))
+                    if raw_pointer_at.utcoffset() is None:
+                        raise ValueError("pointer observation must be timezone-aware")
+                    pointer_at = raw_pointer_at.astimezone(TAIPEI)
+                except (TypeError, ValueError):
+                    pointer_at = None
+                    pointer_clock_error = "invalid_pointer_observation_clock"
+                if pointer_at is not None and (
+                    pointer_at.date() != observed.date() or pointer_at < signal_at or pointer_at > observed
+                ):
+                    pointer_clock_error = "inconsistent_pointer_observation_clock"
+                if pointer_clock_error:
+                    # A backwards clock step or temporarily inconsistent
+                    # source must not consume the day's only signal.
+                    return wait_for_pointer_clock(pointer_clock_error)
+                # This conservative executor-visible time is later than the
+                # model-ready timestamp. All fresh and retry fills must use it.
+                signal_at = pointer_at
         entry_gate = (
             ENTRY_GATE
             if counterfactual_open_replay
@@ -4477,6 +4630,10 @@ class TwDayTradeSimulationEngine:
                 market=spec.market, session_date=observed.date().isoformat(), signal_id=signal_id)
 
         mode["session_date"] = observed.date().isoformat()
+        if replay_continuation_origin is not None:
+            mode["session_open_replay_origin"] = replay_continuation_origin
+        elif not progressive_revision:
+            mode.pop("session_open_replay_origin", None)
         mode.pop("entry_sweep_completed_at", None)
         mode["entry_post_0901_minute_price_fill_count"] = 0
         mode["session_valid"] = True
@@ -4485,8 +4642,27 @@ class TwDayTradeSimulationEngine:
         mode["blocked_reason"] = None
         mode["signal_id"] = signal_id
         mode["signal_at"] = signal_at.isoformat(timespec=timestamp_precision)
+        mode["execution_clock_contract"] = (
+            EXECUTION_POINTER_OBSERVATION_CONTRACT
+            if not counterfactual_open_replay and summary.get("execution_pointer_observed_at") is not None
+            else None
+        )
+        mode["execution_pointer_observed_at"] = (
+            signal_at.isoformat(timespec="microseconds") if mode["execution_clock_contract"] else None
+        )
         mode["day_trade_signal_update_policy"] = spec.signal_update_policy
         mode["opening_signal_revision"] = dict(summary.get("opening_signal_revision") or {})
+        if summary.get("opening_entry_clock_contract"):
+            mode["opening_entry_clock_contract"] = summary.get("opening_entry_clock_contract")
+            mode["initial_opening_signal_id"] = summary.get("initial_opening_signal_id")
+            mode["initial_opening_publication_proof"] = dict(
+                summary.get("initial_opening_publication_proof") or {}
+            )
+        elif not progressive_revision:
+            # Never carry the prior day's proof into a new opening cohort.
+            for key in ("opening_entry_clock_contract", "initial_opening_signal_id",
+                        "initial_opening_publication_proof"):
+                mode.pop(key, None)
         mode["source_signal_at"] = source_signal_at.isoformat(timespec=timestamp_precision)
         mode["counterfactual_open_replay"] = bool(counterfactual_open_replay)
         # A replay has two different clocks: the immutable model decision time
@@ -4513,6 +4689,7 @@ class TwDayTradeSimulationEngine:
         mode["historical_minute_valuation"] = bool(summary.get("historical_minute_valuation", False))
         mode["replay_basis"] = summary.get("replay_basis")
         mode["replay_source"] = summary.get("replay_source")
+        mode["replay_open_evidence_contract"] = summary.get("replay_open_evidence_contract")
         mode["entry_fill_contract"] = summary.get("entry_fill_contract") or (
             "synthetic_observed_session_open_adverse_tick"
             if synthetic_open_fill
@@ -4687,6 +4864,16 @@ class TwDayTradeSimulationEngine:
         mode["signal_inventory_targets"] = ({p["symbol"]:
             p.get("target_signed_shares", int(p["requested_shares"]) * (1 if p["side"] == "long" else -1))
             for p in plans} if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE else {})
+        # These immutable clocks are one registration's inputs, not a new
+        # observation per audit row. Preserve the distinct original timespecs
+        # while avoiding thousands of identical datetime conversions.
+        record_at = observed.isoformat(timespec=timestamp_precision)
+        record_session = observed.date().isoformat()
+        record_signal_at = signal_at.isoformat(timespec=timestamp_precision)
+        record_source_at = source_signal_at.isoformat(timespec=timestamp_precision)
+        record_reconstructed_at = (
+            signal_at.isoformat(timespec="seconds") if counterfactual_open_replay else None
+        )
         for plan in plans:
             row = plan["row"]
             symbol = plan["symbol"]
@@ -4709,7 +4896,7 @@ class TwDayTradeSimulationEngine:
             effective_entry_at = (
                 str(prior_paper_fill_at)
                 if plan.get("prior_paper_fill_reused")
-                else observed.isoformat(timespec=timestamp_precision)
+                else record_at
             )
             offset_ticks = int(spec.price_limit_offset_ticks)
             filled_weight = (
@@ -4721,8 +4908,8 @@ class TwDayTradeSimulationEngine:
                 else 0.0
             )
             signal_record = {
-                "recorded_at": observed.isoformat(timespec=timestamp_precision),
-                "session_date": observed.date().isoformat(),
+                "recorded_at": record_at,
+                "session_date": record_session,
                 "market": spec.market,
                 "signal_source_path": summary.get("summary_path"),
                 "signal_market": spec.signal_market or spec.market,
@@ -4735,13 +4922,13 @@ class TwDayTradeSimulationEngine:
                 "model_input_price_basis": row.get("model_input_price_basis"),
                 "model_input_price_source_date": row.get("model_input_price_source_date"),
                 "model_input_price_is_provisional": bool(row.get("model_input_price_is_provisional")),
-                "signal_at": signal_at.isoformat(timespec=timestamp_precision),
-                "source_signal_at": source_signal_at.isoformat(timespec=timestamp_precision),
-                "open_reconstructed_at": (
-                    signal_at.isoformat(timespec="seconds")
-                    if counterfactual_open_replay
-                    else None
-                ),
+                "signal_at": record_signal_at,
+                "execution_clock_contract": mode.get("execution_clock_contract"),
+                "execution_pointer_observed_at": mode.get("execution_pointer_observed_at"),
+                "session_open_replay_origin_contract": (mode.get("session_open_replay_origin") or {}).get("contract"),
+                "session_open_replay_origin_signal_id": (mode.get("session_open_replay_origin") or {}).get("signal_id"),
+                "source_signal_at": record_source_at,
+                "open_reconstructed_at": record_reconstructed_at,
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -4761,6 +4948,8 @@ class TwDayTradeSimulationEngine:
                 "executable_order_shares": filled_shares,
                 "target_unsubmitted_shares": max(0, requested_shares - filled_shares),
                 "sizing_open_price": sizing_price,
+                "sizing_open_price_source": quote.get("sizing_open_price_source"),
+                "replay_open_evidence_contract": mode.get("replay_open_evidence_contract"),
                 "execution_price": entry_price,
                 "take_profit_price": plan["take_profit_price"],
                 "stop_trigger_price": plan["stop_trigger_price"],
@@ -4787,6 +4976,9 @@ class TwDayTradeSimulationEngine:
                 "quote_source": quote.get("source"),
                 "simulation_replay": bool(mode.get("simulation_replay")),
                 "replay_basis": mode.get("replay_basis"),
+                "opening_entry_clock_contract": mode.get("opening_entry_clock_contract"),
+                "initial_opening_signal_id": mode.get("initial_opening_signal_id"),
+                "initial_opening_publication_proof": mode.get("initial_opening_publication_proof"),
                 "counterfactual_open_replay": bool(counterfactual_open_replay),
                 "entry_fill_policy": plan["entry_fill_policy"],
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
@@ -4875,7 +5067,7 @@ class TwDayTradeSimulationEngine:
             entry_gross_fee = filled_shares * entry_price * entry_rate if filled_shares else 0.0
             entry_rebate = filled_shares * entry_price * rebate_rate if filled_shares else 0.0
             entry_fee = entry_gross_fee - entry_rebate
-            position_id = f"{spec.market}:{observed.date().isoformat()}:{symbol}"
+            position_id = f"{spec.market}:{record_session}:{symbol}"
             if spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE:
                 # One acquisition cohort per immutable decision. A later
                 # addition/reversal must never overwrite earlier realized P&L.
@@ -4885,15 +5077,11 @@ class TwDayTradeSimulationEngine:
                 "position_id": position_id,
                 "market": spec.market,
                 "signal_market": spec.signal_market or spec.market,
-                "session_date": observed.date().isoformat(),
+                "session_date": record_session,
                 "signal_id": signal_id,
-                "signal_at": signal_at.isoformat(timespec=timestamp_precision),
-                "source_signal_at": source_signal_at.isoformat(timespec=timestamp_precision),
-                "open_reconstructed_at": (
-                    signal_at.isoformat(timespec="seconds")
-                    if counterfactual_open_replay
-                    else None
-                ),
+                "signal_at": record_signal_at,
+                "source_signal_at": record_source_at,
+                "open_reconstructed_at": record_reconstructed_at,
                 "symbol": symbol,
                 "name": row.get("name"),
                 "side": side,
@@ -4911,6 +5099,8 @@ class TwDayTradeSimulationEngine:
                 "historical_entry_quote_at": quote.get("historical_source_quote_at"),
                 "entry_price": entry_price,
                 "sizing_open_price": sizing_price,
+                "sizing_open_price_source": quote.get("sizing_open_price_source"),
+                "replay_open_evidence_contract": mode.get("replay_open_evidence_contract"),
                 "entry_fee_twd": entry_fee,
                 "remaining_entry_fee_twd": entry_fee,
                 "entry_gross_fee_and_tax_twd": entry_gross_fee,
@@ -4984,7 +5174,7 @@ class TwDayTradeSimulationEngine:
             )
             order_base = {
                 "recorded_at": effective_entry_at,
-                "session_date": observed.date().isoformat(),
+                "session_date": record_session,
                 "market": spec.market,
                 "signal_market": spec.signal_market or spec.market,
                 "entry_fill_policy": plan["entry_fill_policy"],
@@ -5311,6 +5501,9 @@ class TwDayTradeSimulationEngine:
                     entry_0901_minute_price_fill_count
                 ),
                 simulation_replay=bool(mode.get("simulation_replay")),
+                session_open_replay_origin=(
+                    mode.get("session_open_replay_origin") if counterfactual_open_replay else None
+                ),
                 replay_basis=mode.get("replay_basis"),
                 source_signal_at=source_signal_at.isoformat(timespec="seconds"),
                 open_reconstructed_at=(
@@ -8261,10 +8454,11 @@ class TwDayTradeSimulationEngine:
         self.last_persist_metrics = None
         writes: list[dict[str, Any]] = []
         journal_generations = paper_journal_generations(self.state_dir)
+        object_generations: dict[str, list[int]] = {}
         group_sync_ms = 0.0
 
         def publish(path: Path, payload: Mapping[str, Any]) -> None:
-            nonlocal group_sync_ms
+            nonlocal group_sync_ms, object_generations
             timing: dict[str, Any] = {}
             commit = path == self.service_sync_path
             if path.parent != self.state_dir:
@@ -8272,6 +8466,9 @@ class TwDayTradeSimulationEngine:
             if commit:
                 if paper_journal_generations(self.state_dir) != journal_generations:
                     raise OSError("paper journals changed during commit publication")
+                if (self._mode_snapshot_writer is not None
+                        and mode_object_generations(self.state_dir) != object_generations):
+                    raise OSError("paper mode objects changed during commit publication")
                 group_started = perf_counter()
                 # All prior payloads are individually file-fsynced. One
                 # namespace barrier makes them durable BEFORE publishing the
@@ -8283,6 +8480,9 @@ class TwDayTradeSimulationEngine:
                 _publish_service_sync(path, payload, timings=timing, ack_timings=ack_timing)
                 writes.extend((timing, ack_timing))
             else:
+                if path == self.state_path and self._mode_snapshot_writer is not None:
+                    payload = self._mode_snapshot_writer.prepare(payload)
+                    object_generations = dict(self._mode_snapshot_writer.object_generations)
                 _atomic_json(path, payload, timings=timing, sync_directory=False)
                 writes.append(timing)
 
@@ -8306,7 +8506,7 @@ class TwDayTradeSimulationEngine:
             if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE:
                 mode["inventory_rebalance"] = inventory_rebalance_quantities(mode)
         material_projection = {
-            "contract": "dashboard_material_without_private_order_templates_v2",
+            "contract": "dashboard_material_without_private_execution_maps_v3",
             "enabled_markets": active_markets,
             "configuration_errors": self.state.get("configuration_errors") or {},
             "modes": {
@@ -8323,7 +8523,7 @@ class TwDayTradeSimulationEngine:
                     for key, value in (
                         self.state.get("modes", {}).get(market) or {}
                     ).items()
-                    if key not in {"positions", "processed_signal_ids"}
+                    if key not in {"positions", "processed_signal_ids", "margin_exit_capacity_used"}
                 }
                 for market in active_markets
             },
@@ -8516,6 +8716,10 @@ class TwDayTradeSimulationEngine:
                             "day_trade_signal_update_policy",
                             "configured_signal_update_policy",
                             "opening_signal_revision",
+                            "opening_entry_clock_contract",
+                            "initial_opening_signal_id",
+                            "initial_opening_publication_proof",
+                            "session_open_replay_origin",
                             "inventory_rebalance",
                             "simulation_replay",
                             "entry_price_guard_contract",
@@ -8610,6 +8814,9 @@ class TwDayTradeSimulationEngine:
                 "mode_count": len(mode_rows),
                 "journal_generations": journal_generations,
                 "projection_generations": paper_projection_generations(self.state_dir),
+                **({"state_storage_contract": MODE_SNAPSHOT_CONTRACT,
+                    "mode_object_generations": object_generations}
+                   if self._mode_snapshot_writer is not None else {}),
                 "modes": {
                     str(item.get("market")): {
                         key: item.get(key)
@@ -8624,6 +8831,10 @@ class TwDayTradeSimulationEngine:
                             "day_trade_signal_update_policy",
                             "configured_signal_update_policy",
                             "opening_signal_revision",
+                            "opening_entry_clock_contract",
+                            "initial_opening_signal_id",
+                            "initial_opening_publication_proof",
+                            "session_open_replay_origin",
                             "inventory_rebalance",
                             "simulation_replay",
                             "entry_price_offset_ticks",
@@ -8660,6 +8871,8 @@ class TwDayTradeSimulationEngine:
             "group_directory_fsync_ms": round(group_sync_ms, 3),
             "durability_contract": "file_fsync_group_directory_then_commit_marker_and_ack_v2",
             "files": writes,
+            **({"mode_snapshot": dict(self._mode_snapshot_writer.last_metrics)}
+               if self._mode_snapshot_writer is not None else {}),
         }
         # This observer follows the committed state, not the economic event's
         # 09:01 replay timestamp. It never changes a fill or readiness gate.
@@ -8689,6 +8902,8 @@ __all__ = [
     "ENTRY_FILL_POLICY_0901_MINUTE_PRICE",
     "ENTRY_FILL_POLICY_0901_MINUTE_VWAP",
     "REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL",
+    "LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL",
+    "REPLAY_FULL_COUNTERFACTUAL_CONTRACTS",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK",
     "ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK",
     "ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET",

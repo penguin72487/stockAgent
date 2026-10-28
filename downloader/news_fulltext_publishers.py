@@ -844,6 +844,9 @@ def _cnyes_typed_chart_caption_reference(figure):
     Actual3666458/3748731 retain one chart label p and two exact NBSP p
     nodes. 4427985/4545945/4357680/3989011/4484038/3933212 wrap one typed
     img/figcaption leaf in transparent figures, with optional NBSP captions.
+    6226975/6087701 instead put the real chart label on the outer figure and
+    a single NBSP caption on its typed-image child. Accept exactly that
+    complete two-level shape, not arbitrary nesting or two actual captions.
     Bind the whole DOM, image and original label to the caller's ordered
     current/visible/schema proof. No image request, OCR, chart values, missing
     caption or source publication time is invented. Ordinary direct captions
@@ -893,14 +896,21 @@ def _cnyes_typed_chart_caption_reference(figure):
         return image['src']
 
     leaf = figure
+    outer_label = None
     for depth in range(3):
         nodes = elements(leaf)
         if nodes is None:
             return None
         names = [node.name for node in nodes]
         if names in (['figure'], ['figure', 'figcaption']):
-            if depth == 2 or len(nodes) == 2 and plain(nodes[1]) != '\xa0':
+            if depth == 2:
                 return None
+            if len(nodes) == 2:
+                wrapper_caption = plain(nodes[1])
+                if wrapper_caption != '\xa0':
+                    if depth != 0 or wrapper_caption is None:
+                        return None
+                    outer_label = wrapper_caption
             leaf = nodes[0]
             continue
         break
@@ -924,11 +934,15 @@ def _cnyes_typed_chart_caption_reference(figure):
             return None
     else:
         return None
+    if outer_label is not None:
+        if depth != 1 or names != ['img', 'figcaption'] or label != '\xa0':
+            return None
+        label = outer_label
     src = source_url(image)
     if src is None:
         return None
     if label != '\xa0':
-        if re.fullmatch(r'[^<>\r\n]{1,48}(?:日K線圖|走勢圖)[。]?', re.sub(r'\s+', '', label)) is None:
+        if re.fullmatch(r'[^<>\r\n]{1,48}(?:日K線圖|K線圖|走勢圖)[。]?', re.sub(r'\s+', '', label)) is None:
             return None
         labels.append((label, src))
     return (figure.get_text('\n', strip=True),
@@ -3398,16 +3412,20 @@ def globalvoices_verified_nontext_body(soup, source, *, page_url):
     Excluded third-party image captions stay excluded. Known external widget
     declarations prove only an embedded representation, not its accessibility,
     contents, copyright or historical completeness. No media/script requests.
-    Unknown empty/loading structures remain parser gaps.
+    A literally empty, independently bound native entry is a current empty
+    template. It says nothing about historical deletion or external content.
+    Unknown loading structures remain parser gaps.
     """
     from copy import deepcopy
-    from downloader.news_fulltext_policy import _plain_text_node
+    from downloader.news_fulltext_policy import _plain_text_node, GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION
     from downloader.news_fulltext_public_originals import _visible
 
     identity = _globalvoices_visible_article_identity(soup, source, page_url=page_url)
     if identity is None:
         return None
     entry, _ = identity
+    if GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION and not entry.contents:
+        return 'source_article_empty_template'
     scripts = entry.find_all('script')
     media = entry.find_all(['video', 'audio', 'iframe', 'object', 'embed'])
     images = entry.find_all('img')
@@ -3906,6 +3924,57 @@ def _cmnews_short_table_announcement(scope, body, metadata, *, profile, visible_
 
 
 CMNEWS_CANONICAL_RELATION_QUESTION = 'cmnews_literal_canonical_relation_v1'
+CMNEWS_CANONICAL_ATTRIBUTE_QUESTION = 'cmnews_unicode_canonical_attribute_v1'
+
+
+def cmnews_canonical_attribute_metadata(soup, *, page_url):
+    """Retain a native canonical URI/IRI as a declaration, never a request.
+
+    The older ASCII-route observation remains immutable. A Chinese path is
+    an opaque source attribute here: no percent encoding, normalization,
+    alias equivalence, source permission or automatic HTTP follows from it.
+    """
+    import unicodedata
+    identity = cmnews_identity_metadata(soup, page_url=page_url)
+    verified = (identity['canonical_count'] == 1 and identity['matching_native_scope_count'] == 1
+        and identity['native_slug_matches'] is True and identity['native_UUID_container_matches'] is True
+        and identity['native_title_count'] == 1 and identity['nonempty_native_title_count'] == 1
+        and identity['native_body_container_count'] == 1 and not identity['ambiguous_native_scope'])
+    result = {'contract_version': 1, 'native_scope_verified': bool(verified),
+        'canonical_count': identity['canonical_count'], 'canonical_attribute': None,
+        'raw_or_names_or_body_retained': False, 'article_or_alias_accepted': False,
+        'automatic_requests': 0, 'source_permission_granted': False}
+    if not verified:
+        result['not_retained_reason'] = 'native_scope_not_verified'
+        return result
+    value = soup.find('link', rel='canonical').get('href')
+    if not isinstance(value, str) or not 1 <= len(value) <= 4096:
+        result['not_retained_reason'] = 'missing_or_overlong_attribute'
+        return result
+    result.update(attribute_characters=len(value),
+        attribute_sha256=hashlib.sha256(value.encode('utf-8', errors='surrogatepass')).hexdigest())
+    if value != value.strip() or any(unicodedata.category(c) in {'Cc','Cf','Cs'} for c in value):
+        result['not_retained_reason'] = 'control_or_edge_whitespace'
+        return result
+    try:
+        absolute = urljoin(page_url, value)
+        parts = urlsplit(absolute)
+        if (parts.scheme not in {'http','https'} or not parts.hostname
+                or not re.fullmatch(r'[a-z0-9.-]{1,180}', parts.hostname)
+                or parts.netloc.lower() != parts.hostname or parts.username or parts.password):
+            result['not_retained_reason'] = 'unsupported_HTTP_authority_shape'
+        elif parts.query or parts.fragment:
+            result['not_retained_reason'] = 'query_or_fragment_not_retained'
+        else:
+            result['canonical_attribute'] = {'literal': value, 'absolute': absolute,
+                'literal_sha256': result['attribute_sha256'],
+                'contains_non_ASCII': not value.isascii(), 'contains_path_space': ' ' in parts.path,
+                'relative_reference': not bool(urlsplit(value).scheme),
+                'same_as_requested_url': absolute == page_url,
+                'source_declaration_only': True, 'safe_to_request_assumed': False}
+    except ValueError:
+        result['not_retained_reason'] = 'invalid_URL_structure'
+    return result
 
 
 def cmnews_canonical_relation_metadata(soup, *, page_url):
@@ -4050,7 +4119,13 @@ def cmnews_visible_article(soup, *, page_url):
             return False
 
     if not same_url(canonical.get("href"), expected):
-        raise NewsError("article_identity_not_verified")
+        error = NewsError("article_identity_not_verified")
+        # This declaration comes from the already parsed response. It neither
+        # accepts a CMNews body nor follows the foreign original URL.
+        declaration = cmnews_canonical_attribute_metadata(soup, page_url=page_url)
+        if declaration.get('native_scope_verified') and declaration.get('canonical_attribute'):
+            error.cmnews_original_declaration = declaration
+        raise error
     scopes = [n for n in soup.select(".articleContent[data-article-path]")
               if same_url(n.get("data-article-path"), expected)]
     if len(scopes) != 1:
@@ -4211,36 +4286,32 @@ def cmnews_visible_article(soup, *, page_url):
     return result, scope
 
 
-def moneyweekly_article_identity(soup, *, page_url):
+def moneyweekly_article_identity(soup, *, page_url, source=None):
     """Verified source routes must resolve to the same declared article ID.
 
     Case/Chinese namespace aliases are not permission to strip the original
     query or substitute a guessed permalink. Preserve the request provenance.
     """
-    def article_id(url):
-        if not isinstance(url, str):
-            return None
-        try:
-            parts = urlsplit(url)
-            if (parts.hostname not in {'www.moneyweekly.com.tw', 'moneyweekly.com.tw'}
-                    or parts.scheme not in {'http', 'https'} or parts.username or parts.password
-                    or parts.port not in {None, 80 if parts.scheme == 'http' else 443}
-                    or re.search(r'%(?:2f|5c)', parts.path, re.I)):
-                return None
-        except ValueError:
-            return None
-        match = re.fullmatch(r'/(?:ArticleData/Info|Home/ChangePage)/(?:(?i:article)|理財周刊)/([1-9][0-9]*)/?', unquote(parts.path))
-        return match[1] if match else None
+    from downloader.news_fulltext_moneyweekly import moneyweekly_article_id, moneyweekly_route_version
+    version = moneyweekly_route_version(source) if source is not None else 3
 
     canonical = soup.find('link', rel='canonical')
-    requested_id = article_id(page_url)
-    if not requested_id or canonical is None or article_id(canonical.get('href')) != requested_id:
+    requested_id = moneyweekly_article_id(page_url, version=version)
+    if (not requested_id or canonical is None
+            or moneyweekly_article_id(canonical.get('href'), version=version) != requested_id):
+        raise NewsError('article_identity_not_verified')
+    if urlsplit(page_url).path.startswith('/Magazine/Info/') and (
+            len(soup.select('head > link[rel=canonical]')) != 1 or canonical.get('href') != page_url):
         raise NewsError('article_identity_not_verified')
     headline = soup.find('h1')
     containers = soup.select('.div_Article_Info[itemprop=articleBody]')
     if len(containers) > 1:
         raise NewsError('article_identity_not_verified')
     container = containers[0] if containers else None
+    if container is not None and source is not None:
+        from downloader.news_fulltext_moneyweekly_outcomes import native_paid_preview
+        if native_paid_preview(container, source, page_url=page_url):
+            raise NewsError('paywall_or_login')
     # The public member-only response keeps a valid headline/canonical/byline,
     # but the verified current body contains only this publisher mask. Check
     # it before JSON-LD/body fallback; neither a preview nor hidden schema text
@@ -4275,7 +4346,7 @@ def moneyweekly_verified_short_prose(soup, source, container, *, page_url):
             or source.author_selectors != ('h1 + div > div:nth-child(2)',)
             or source.publication_selectors != ('h1 + div > div:first-child',)):
         return None
-    moneyweekly_article_identity(soup, page_url=page_url)
+    moneyweekly_article_identity(soup, page_url=page_url, source=source)
     headings = soup.select('h1')
     authors = soup.select(source.author_selectors[0])
     clocks = soup.select(source.publication_selectors[0])

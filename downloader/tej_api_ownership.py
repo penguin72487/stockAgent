@@ -296,4 +296,6 @@ def repartition_pending(con, root: Path, row) -> bool:
         con.execute("INSERT OR IGNORE INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,work_expected_rows) "
                     "VALUES(?,?,'download',?,?,?,?,?,?)", (identifier, row["table_id"], row["phase"], row["priority"],
                         json.dumps(compact_request(part, definition), ensure_ascii=False), expected, SOURCE_SCOPE_CONTRACT, expected))
+        from downloader.provider_priority import inherit
+        inherit(con, row['task_id'], [identifier])
     return True

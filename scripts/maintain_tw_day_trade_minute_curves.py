@@ -22,6 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from stockagent.live.paper_journal import open_paper_journal
 from scripts.promote_tw_day_trade_replay import (  # noqa: E402
     MINUTE_CURVE_CONTRACT,
     MINUTE_CURVE_SESSION_POINTS,
@@ -55,7 +56,8 @@ from downloader.download_tw_public_data import (  # noqa: E402
 
 
 def _object(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    payload = read_paper_state(path)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload
@@ -411,7 +413,7 @@ def _inspect_strategy_price_provenance(
     # latest row is what the dashboard projects, so audit that exact row.
     source_by_key: dict[tuple[str, str, int], bool] = {}
     marks_path = state_dir / "marks.jsonl"
-    with marks_path.open(encoding="utf-8") as handle:
+    with open_paper_journal(marks_path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             row = json.loads(line)
             if not isinstance(row, dict):

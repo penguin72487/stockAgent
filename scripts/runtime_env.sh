@@ -5,6 +5,16 @@
 # idempotent and makes the runtime selected by PYTHON_BIN/FINTECH_ENV_PATH the
 # source of truth for CONDA_PREFIX, PATH, and CUDA discovery.
 
+# Remember the checkout when sourced, so a caller may later change directory.
+# The value is private to this shell; module and external Python invocations
+# retain their caller-supplied import environment.
+_stockagent_runtime_source="${BASH_SOURCE[0]}"
+if command -v readlink >/dev/null 2>&1; then
+  _stockagent_runtime_source="$(readlink -f -- "$_stockagent_runtime_source" 2>/dev/null || printf '%s' "$_stockagent_runtime_source")"
+fi
+_STOCKAGENT_RUNTIME_REPO_ROOT="$(cd -- "$(dirname -- "$_stockagent_runtime_source")/.." && pwd -P)"
+unset _stockagent_runtime_source
+
 _runtime_resolve_executable() {
   local candidate="${1:-}"
   [[ -n "$candidate" ]] || return 1
@@ -239,22 +249,44 @@ prepend_fintech_path() {
 
 # Consistent function for interactive commands after sourcing this file:
 #   run_fintech_python -m pytest -q -s test
+_runtime_direct_project_script_pythonpath() {
+  local script="${1:-}" resolved
+  [[ "$script" == *.py ]] || return 1
+  command -v readlink >/dev/null 2>&1 || return 1
+  resolved="$(readlink -f -- "$script" 2>/dev/null)" || return 1
+  [[ -f "$resolved" && "$resolved" == "$_STOCKAGENT_RUNTIME_REPO_ROOT/scripts/"* ]] || return 1
+  # Keep the checkout first even when a caller's path contains another checkout.
+  # Preserve all caller entries and their order; a later copy of the checkout is
+  # harmless and avoids rewriting empty/path-sensitive PYTHONPATH elements.
+  case "${PYTHONPATH:-}:" in
+    "$_STOCKAGENT_RUNTIME_REPO_ROOT:"*) printf '%s' "$PYTHONPATH" ;;
+    *) printf '%s%s' "$_STOCKAGENT_RUNTIME_REPO_ROOT" "${PYTHONPATH:+:$PYTHONPATH}" ;;
+  esac
+}
+
 run_fintech_python() {
-  local selected_python
+  local selected_python project_pythonpath
   activate_fintech_runtime || {
     printf "Unable to resolve a Python runtime; set FINTECH_ENV_PATH or PYTHON_BIN.\n" >&2
     return 2
   }
   selected_python="$(resolve_fintech_python)" || return 2
-  "$selected_python" "$@"
+  if project_pythonpath="$(_runtime_direct_project_script_pythonpath "${1:-}")"; then
+    PYTHONPATH="$project_pythonpath" "$selected_python" "$@"
+  else
+    "$selected_python" "$@"
+  fi
 }
 
 # Supervised daemons use the same discovery/activation as interactive commands,
 # while replacing the shell so systemd observes Python's actual lifetime.
 exec_fintech_python() {
   activate_fintech_runtime || return 2
-  local selected_python
+  local selected_python project_pythonpath
   selected_python="$(resolve_fintech_python)" || return 2
+  if project_pythonpath="$(_runtime_direct_project_script_pythonpath "${1:-}")"; then
+    export PYTHONPATH="$project_pythonpath"
+  fi
   exec "$selected_python" "$@"
 }
 

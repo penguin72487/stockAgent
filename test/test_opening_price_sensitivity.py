@@ -3,7 +3,8 @@ import math
 import pytest
 
 from scripts.analyze_opening_price_sensitivity import (
-    compare_complete_runs, compare_weights, compact_signal_summary, completion_percentiles, signal_analysis,
+    _execution_stage_clocks, compare_complete_runs, compare_weights, compact_signal_summary,
+    completion_percentiles, signal_analysis,
 )
 
 
@@ -87,6 +88,33 @@ def test_incompatible_signal_axes_fail_closed(other):
 def test_summary_cannot_disguise_failed_or_unverified_analysis(report):
     with pytest.raises(ValueError, match="endpoint-verified"):
         compact_signal_summary(report)
+
+
+@pytest.mark.parametrize("measured", [False, True])
+def test_summary_preserves_distinct_complete_stage_clocks_without_filling_legacy_gaps(measured):
+    fields = ("contract", "session_date", "feature_date", "receipt_sha256", "journal_prefix",
+        "runtime_profile", "mounted_code_reference", "source_roots", "opening_reference_policy",
+        "boundary", "full_price_reference_is_late_information_not_available_at_open", "warmups",
+        "network_requests", "production_writes", "broker_fill_claim")
+    report = dict.fromkeys(fields)
+    report.update(status="completed_offline_sensitivity_not_live_acceptance", endpoint_parity={"repeat": True})
+    row = {"label": "0", "after_open_ms": 0, "all_models_elapsed_ms": 10., "markets": []}
+    clocks = {"all_signal_calculations_complete_ms": 2., "all_execution_pointers_published_ms": 2.,
+              "all_execution_verified_ms": 8., "scenario_complete_including_reports_ms": 10.}
+    if measured:
+        row.update(clocks)
+    report["scenarios"] = [row]
+    result = compact_signal_summary(report)["scenarios"][0]
+    assert {key: result[key] for key in clocks} == (clocks if measured else dict.fromkeys(clocks))
+    assert result["all_models_elapsed_ms"] == 10.  # Legacy alias, never inferred as GPU time.
+
+
+@pytest.mark.parametrize("execution_published", [False, True])
+def test_no_execution_or_reused_revision_does_not_claim_a_fast_financial_commit(execution_published):
+    clocks = _execution_stage_clocks(2., 8., execution_published=execution_published)
+    assert clocks["all_execution_pointers_published_ms"] == (2. if execution_published else None)
+    assert clocks["all_execution_verified_ms"] == (8. if execution_published else None)
+    assert clocks["all_execution_commits_ms"] == 8.  # Preserve the historical no-work span, not a commit.
 
 
 def _complete_comparison_run():

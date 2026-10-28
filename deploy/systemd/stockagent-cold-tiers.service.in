@@ -1,0 +1,21 @@
+[Unit]
+Description=Bounded consolidation of newly stable StockAgent cold objects
+ConditionPathIsDirectory=/srv/stockagent-packed
+ConditionPathExists=/etc/stockagent/cold-tiers.json
+After=stockagent-d-cold-mount.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash "__REPO_ROOT__/scripts/run_cold_tiers.sh"
+Environment="PYTHONUNBUFFERED=1"
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+IOSchedulingClass=idle
+MemoryHigh=192M
+MemoryMax=256M
+TimeoutStartSec=600
+

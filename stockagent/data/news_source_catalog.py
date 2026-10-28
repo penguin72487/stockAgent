@@ -145,6 +145,29 @@ def load_source_review_ledger(path: Path) -> dict:
     return {**reviews, **{key: reviews[target] for key, target in aliases.items() if key not in reviews}}
 
 
+def recorded_review_questions(review: dict) -> tuple[list[str], list[str]]:
+    """Validate private follow-up inventory without inferring its completeness.
+
+    Public consumers may project a fixed state, never the strings or evidence.
+    Missing legacy lists are empty here; an empty inventory is not proof that
+    all source, body or authorization work is complete.
+    """
+    scope = review.get('current_scope_review', {})
+    if not isinstance(scope, dict):
+        raise ValueError('invalid recorded source review questions')
+    completed = scope.get('completed_questions', [])
+    remaining = scope.get('remaining_questions', [])
+    for questions in (completed, remaining):
+        if (not isinstance(questions, list) or len(questions) > 64
+                or any(not isinstance(q, str) or not q.strip() or len(q) > 800
+                       or not q.isprintable() for q in questions)
+                or len(set(questions)) != len(questions)):
+            raise ValueError('invalid recorded source review questions')
+    if set(completed) & set(remaining):
+        raise ValueError('invalid recorded source review questions')
+    return completed, remaining
+
+
 def configuration_paths(path: Path) -> tuple[Path, ...]:
     path = path.resolve()
     config = json.loads(path.read_text())
@@ -193,7 +216,7 @@ def source_role(host: str) -> str:
     groups = {
         "redirector": ("news.google.com", "reurl.cc", "bit.ly", "t.co", "goo.gl", "tinyurl.com"),
         "social_or_video": ("facebook.com", "youtube.com", "youtu.be", "instagram.com", "threads.net", "twitter.com", "x.com"),
-        "aggregator": ("msn.com", "yahoo.com", "yahoo.com.tw", "today.line.me", "pchome.com.tw", "hinet.net", "yam.com"),
+        "aggregator": ("msn.com", "yahoo.com", "yahoo.com.tw", "today.line.me", "pchome.com.tw", "hinet.net", "yam.com", "life.tw"),
     }
     host = host.lower().rstrip('.')
     for role, domains in groups.items():

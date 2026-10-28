@@ -52,6 +52,48 @@ def test_wsl_publication_bootstrap_restores_native_reader_with_existing_identity
     assert result.stdout.strip() == str(executable)
 
 
+@pytest.mark.parametrize('mode', ['daily', 'intraday', 'features', 'backfill'])
+@pytest.mark.parametrize('bootstrap_exit,capacity_exit,expected_exit,expected_order', [
+    (0, 0, 0, ['interop', 'capacity', 'credentials', 'credential-audit', 'downloader']),
+    (65, 0, 75, ['interop']),
+    (0, 75, 75, ['interop', 'capacity']),
+    (0, 2, 2, ['interop', 'capacity']),
+])
+def test_registered_refresh_initializes_before_capacity_credentials_and_provider(
+    tmp_path, mode, bootstrap_exit, capacity_exit, expected_exit, expected_order,
+):
+    root = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    entrypoint = scripts / 'run_registered_data_refresh.sh'
+    entrypoint.write_text((root / 'scripts/run_registered_data_refresh.sh').read_text())
+    (scripts / 'runtime_env.sh').write_text(f'''
+ensure_enrolled_wsl_identity() {{
+  [[ "$1" == "$PWD" ]] || return 99
+  printf 'interop\\n' >> work-order
+  return {bootstrap_exit}
+}}
+run_fintech_python() {{
+  if [[ "$1" == "$PWD/scripts/audit_data_credentials.py" ]]; then
+    printf 'credential-audit\\n' >> work-order
+    return 0
+  fi
+  [[ "$1" == "$PWD/scripts/check_acquisition_capacity.py" && "$2" == "--path" && "$3" == "$PWD" ]] || return 98
+  printf 'capacity\\n' >> work-order
+  return {capacity_exit}
+}}
+''')
+    (tmp_path / '.env').write_text("printf 'credentials\\n' >> work-order\n")
+    downloader = tmp_path / 'downloader/run_daily_all_markets.sh'
+    downloader.parent.mkdir()
+    downloader.write_text("#!/usr/bin/env bash\nprintf 'downloader\\n' >> work-order\n")
+    downloader.chmod(0o700)
+    result = subprocess.run(['bash', str(entrypoint), mode], cwd=tmp_path,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == expected_exit, result.stdout + result.stderr
+    assert (tmp_path / 'work-order').read_text().splitlines() == expected_order
+
+
 def test_coda_runner_shell_and_config_attribute_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     runner = repo_root / "coda_runner.sh"

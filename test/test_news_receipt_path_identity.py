@@ -14,6 +14,7 @@ def test_runtime_code_gate_includes_both_recovery_and_out_of_prefix_reader():
     repo = Path(__file__).resolve().parents[1]
     paths = runtime_source_paths(repo)
     assert repo / 'downloader/news_receipt_io.py' in paths
+    assert repo / 'stockagent/data/news_disk_contract.py' in paths
     assert repo / 'downloader/news_fulltext_queue.py' in paths
     assert set(repo.joinpath('downloader').glob('news_fulltext*.py')).issubset(paths)
     assert len(paths) == len(set(paths)) and all(path.is_file() for path in paths)

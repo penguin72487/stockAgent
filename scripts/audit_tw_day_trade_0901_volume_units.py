@@ -14,10 +14,15 @@ from datetime import datetime
 import hashlib
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from stockagent.live.paper_journal import open_paper_journal
 
 TICK_SOURCE = "shioaji:historical_ticks_0900_090059_vwap_right_label_0901"
 DEFAULT_LEDGER = Path("artifacts/live/tw_day_trade_simulation/signals.jsonl")
@@ -80,7 +85,7 @@ def audit(
     legacy_capacity_corrections: list[dict[str, Any]] = []
     seen_signal_keys: set[tuple[str, str, str]] = set()
     ledger_size = ledger_path.stat().st_size
-    with ledger_path.open("rb") as handle:
+    with open_paper_journal(ledger_path) as handle:
         while handle.tell() < ledger_size:
             raw = handle.readline()
             if not raw or not raw.endswith(b"\n"):

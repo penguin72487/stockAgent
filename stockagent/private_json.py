@@ -86,6 +86,16 @@ def dumps(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":")).encode("utf-8")
 
 
+def _plain_string_keys(value: dict) -> bool:
+    """Exact str keys, without a Python generator step for every key.
+
+    Type identities, rather than the type objects themselves, avoid invoking
+    a user-defined metaclass hash/equality while rejecting legacy custom keys.
+    This is the same predicate as all(type(key) is str for key in value).
+    """
+    return set(map(id, map(type, value))).issubset({id(str)})
+
+
 def _plain_finite_json(value: Any, depth: int = 0) -> bool:
     """Exclude native conversions, nonfinite-to-null and custom container rules."""
     # Most ledger fields are scalars. Do not allocate a recursive generator
@@ -105,7 +115,7 @@ def _plain_finite_json(value: Any, depth: int = 0) -> bool:
         if level >= 64:
             return False
         if kind is dict:
-            if not all(type(key) is str for key in current):
+            if not _plain_string_keys(current):
                 return False
             children = current.values()
         elif kind in (list, tuple):
@@ -140,6 +150,27 @@ def ledger_bytes(value: Any) -> bytes:
             pass
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str,
                       separators=(",", ":")).encode("utf-8")
+
+
+def ledger_lines_bytes(values) -> bytes:
+    """Encode a complete private JSONL batch before its writer touches a file.
+
+    Native encode_lines retains the per-record sorted codec, but uses one
+    encoder/buffer rather than allocating bytes and a Python call per row.
+    Guard rows at their ORIGINAL depth; wrapping them in an array would change
+    the legacy depth boundary. Mixed/custom/nonfinite or unsupported native
+    input uses the exact existing individual encoder, including its errors.
+    This helper owns no file, transaction, durability or public-wire contract.
+    """
+    rows = tuple(values)
+    if _native is not None and all(_plain_finite_json(row) for row in rows):
+        try:
+            encoder = _native.json.Encoder(order="sorted")
+            if hasattr(encoder, "encode_lines"):
+                return encoder.encode_lines(rows)
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            pass
+    return b"".join(ledger_bytes(row) + b"\n" for row in rows)
 
 
 def _plain_metadata(value: Any, depth: int = 0) -> bool:

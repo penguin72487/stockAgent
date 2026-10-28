@@ -29,18 +29,17 @@ KillMode=control-group
 # precedence over download/backfill maintenance when the host is contended;
 # application-level guards still defer non-critical bot work at those windows.
 Nice=-5
-CPUWeight=200
-IOWeight=200
+CPUWeight=10000
+IOWeight=10000
 # The Gateway and live command plane must survive best-effort maintenance OOM.
 OOMScoreAdjust=-500
-# Factorized fold11 keeps a 4.84 GiB FP32 base window plus a private opening
-# copy. The measured 7.77 GiB warm owner plus that copy needs about 12.61 GiB;
-# avoid memory.high reclaim stalls without removing the 24 GiB hard boundary.
+# Leave the critical signal owner unrestricted; measurements of memory usage
+# are capacity planning evidence, not a ceiling on the opening path.
 MemoryAccounting=true
-MemoryHigh=16G
-MemoryMax=24G
-MemorySwapMax=4G
-TasksMax=2048
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
 
 [Install]
 WantedBy=multi-user.target

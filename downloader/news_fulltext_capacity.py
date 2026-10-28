@@ -47,6 +47,95 @@ TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION = 3
 COMPLETION_OBSERVATION_CONTRACT_VERSION = 1
 COMPLETION_OBSERVATION_SECONDS = 45
 ACCESS_REFUSAL_RECOVERY_CONTRACT_VERSION = 1
+NOT_MODIFIED_COMPARABILITY_CONTRACT_VERSION = 1
+
+
+def _not_modified_opportunity_mismatch(best, current, workload):
+    """Detect a proven large shift in unchanged responses, not source speed.
+
+    Windows can contain up to 20% of another workload. Bound how many 304s
+    could belong to the selected family instead of assigning all of them to
+    it. If even the optimistic current non-304 fraction is less than half the
+    pessimistic baseline fraction, the new-head rates cannot establish a
+    plateau. Unknown, mixed, failed, or incomplete counters prove no mismatch.
+    This guard never increases pressure or grants source access.
+    """
+    if not isinstance(workload, str) or workload in {'mixed', 'metadata', 'unclassified'} or workload not in WORKLOADS:
+        return False
+
+    def bounds(sample):
+        if not isinstance(sample, dict) or sample.get('workload_family') != workload:
+            return None
+        requests, responses = sample.get('requests'), sample.get('responses')
+        statuses, endpoints = sample.get('http_status_counts'), sample.get('endpoint_completed_request_counts')
+        if (type(requests) is not int or type(responses) is not int or requests <= 0
+                or requests != responses or not isinstance(statuses, dict) or not isinstance(endpoints, dict)
+                or any(not isinstance(key, str) or not key.isdigit() or type(value) is not int or value < 0
+                       for key, value in statuses.items())
+                or any(value and key not in {'200', '304'} for key, value in statuses.items())
+                or any(not isinstance(key, str) or type(value) is not int or value < 0
+                       for key, value in endpoints.items())
+                or sum(statuses.values()) != responses or sum(endpoints.values()) != requests):
+            return None
+        family = sum(value for key, value in endpoints.items() if endpoint_workload(key) == workload)
+        unchanged = statuses.get('304', 0)
+        if family <= 0 or family > responses or unchanged > responses:
+            return None
+        # All non-family results might be 304 (current optimistic bound), or
+        # every 304 might belong to the family (baseline pessimistic bound).
+        minimum_family_304 = max(0, unchanged - (responses - family))
+        maximum_family_304 = min(unchanged, family)
+        return family, minimum_family_304, maximum_family_304
+
+    old, new = bounds(best), bounds(current)
+    if old is None or new is None:
+        return False
+    old_count, _, old_max_304 = old
+    new_count, new_min_304, _ = new
+    return ((new_count - new_min_304) * 2 * old_count
+            < (old_count - old_max_304) * new_count)
+
+
+_PLATEAU_HOLD_REASON = 'additional cadence/slots did not improve durable throughput; verify best observed pipeline candidate'
+_STABLE_PIPELINE_REASON = 'repeated healthy full-pipeline windows; source maximum not established'
+
+
+def _release_mismatched_plateau_hold(item, policy):
+    """Undo only a provably incomparable plateau's search hold on restart.
+
+    Keep the chosen interval, slots, source gates, evidence and best samples.
+    The decision's exact ending window must still be in the bounded history.
+    Future pressure increases require the ordinary healthy-window search.
+    """
+    if ((item.get('state'), item.get('reason')) not in {
+            ('verifying', _PLATEAU_HOLD_REASON),
+            ('stable_pipeline_capacity', _STABLE_PIPELINE_REASON),
+            ('insufficient_useful_data', 'no new durable versions; no higher-rate proof'),
+            ('insufficient_useful_data', 'mixed/metadata requests cannot establish a comparable body-capacity window')}
+            or item.get('refused_interval_seconds') is not None):
+        return False
+    deadline = item.get('next_search_epoch')
+    if type(deadline) not in {int, float} or not math.isfinite(deadline):
+        return False
+    ended = deadline - policy['recheck_seconds']
+    for sample in reversed(item.get('history', [])[-128:]):
+        timestamp = sample.get('ended_at_epoch')
+        if type(timestamp) not in {int, float} or not math.isfinite(timestamp) or abs(timestamp - ended) > 1:
+            continue
+        workload = sample.get('workload_family')
+        if not isinstance(workload, str) or workload not in WORKLOADS:
+            return False
+        best = item.get('best_by_workload', {}).get(workload)
+        best_ended = best.get('ended_at_epoch') if isinstance(best, dict) else None
+        if (sample.get('healthy') is True and isinstance(best, dict) and best.get('healthy') is True
+                and type(best_ended) in {int, float} and math.isfinite(best_ended) and best_ended <= timestamp
+                and _not_modified_opportunity_mismatch(best, sample, workload)):
+            item.update(state='insufficient_useful_data',
+                        reason='known 304 opportunity mismatch; remeasure before comparing capacity',
+                        next_search_epoch=0, plateaus=0, stable_samples=0)
+            return True
+        return False
+    return False
 
 
 def _valid_access_refusal_recovery(value):
@@ -322,6 +411,8 @@ class PublisherCapacity:
             if recovery:
                 state['interval_seconds'] = max(state['interval_seconds'], recovery['interval_seconds'])
                 state['parallelism'] = 1
+            elif http.provider_not_before.get(provider, 0) <= self.epoch():
+                _release_mismatched_plateau_hold(state, self.policy)
             http.set_client_capacity(provider, state["interval_seconds"], state["parallelism"])
             state["interval_seconds"] = http.effective_interval(provider)
         self.tick(force=True)
@@ -341,6 +432,7 @@ class PublisherCapacity:
                       for provider, state in self.states.items()}
                      if for_status else deepcopy(self.states))
         result = {"version": 1, "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION, "fingerprint": self.fingerprint,
+                "not_modified_comparability_contract_version": NOT_MODIFIED_COMPARABILITY_CONTRACT_VERSION,
                 "completion_window_owner_contract_version": 1,
                 "completion_observation_contract_version": COMPLETION_OBSERVATION_CONTRACT_VERSION,
                 "transport_resume_selection_contract_version": TRANSPORT_RESUME_SELECTION_CONTRACT_VERSION,
@@ -683,6 +775,16 @@ class PublisherCapacity:
                 item.update(state="insufficient_useful_data", reason="mixed/metadata requests cannot establish a comparable body-capacity window")
                 continue
             best = item.get("best")
+            if best is not None and _not_modified_opportunity_mismatch(best, sample, workload):
+                # A rolling source returning mostly unchanged responses has
+                # fewer opportunities to create new heads than a historical
+                # backfill. Neither a plateau nor a stable rate follows from
+                # comparing those unequal windows. Keep pressure unchanged;
+                # refusals and transport health were already handled above.
+                item.update(state='insufficient_useful_data',
+                            reason='known 304 opportunity mismatch; remeasure before comparing capacity',
+                            plateaus=0, stable_samples=0)
+                continue
             best_rate = best.get("comparable_new_heads_per_second", best["new_heads_per_second"]) if best else None
             if best is None or sample["comparable_new_heads_per_second"] > best_rate:
                 item["best"] = deepcopy(sample)
@@ -691,7 +793,7 @@ class PublisherCapacity:
                 item["stable_samples"] = item.get("stable_samples", 0) + 1
                 if item["stable_samples"] >= self.policy["stable_windows"]:
                     item.update(state="stable_source_backoff" if item.get("refused_interval_seconds") else "stable_pipeline_capacity",
-                                reason="repeated healthy full-pipeline windows; source maximum not established")
+                                reason=_STABLE_PIPELINE_REASON)
                 continue
             floor = self.http.hard_interval_floor(provider)
             if floor > 0 and effective <= floor + 1e-9:
@@ -708,7 +810,7 @@ class PublisherCapacity:
             if item["plateaus"] >= 2 and underfilled and 1 / effective >= self.policy["probe_through_rps"] - 1e-6:
                 selected = item["best"]
                 self._set(provider, selected["interval_seconds"], selected["parallelism"], "verifying",
-                          "additional cadence/slots did not improve durable throughput; verify best observed pipeline candidate")
+                          _PLATEAU_HOLD_REASON)
                 item["next_search_epoch"] = self.epoch() + self.policy["recheck_seconds"]
             elif underfilled and item["parallelism"] < self.http.maximum_parallelism[provider]:
                 self._set(provider, effective, item["parallelism"] + 1, "ramping", "underfilled cadence; measure one additional response slot")
@@ -720,4 +822,6 @@ class PublisherCapacity:
                     item.update(state="engineering_ceiling_unverified", reason="finite client resource ceiling reached, not a provider limit")
                     item["next_search_epoch"] = self.epoch() + self.policy["recheck_seconds"]
         if changed or force:
-            atomic_write_json(self.path, self.snapshot())
+            # Keep the complete recovery history and durable atomic write;
+            # indentation needlessly expands/serializes this large hot file.
+            atomic_write_json(self.path, self.snapshot(), compact=True)

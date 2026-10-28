@@ -26,6 +26,9 @@ def fixture(root, *, now=NOW):
         'observed_metadata_rows': 10200, 'remaining_pages': remaining, 'progress_ratio': .34,
         'dates_with_changed_source_total': 0, 'phase_complete': False, 'metadata_only': True,
         'body_completion_claimed': False, 'all_history_complete': False,
+        'partial_page_gate': {'contract_version': 1, 'state': 'none_observed', 'failed_pages': 0,
+            'next_probe_at_utc': None, 'recovery_requires_success': True,
+            'scope': 'observed_request_local_failures_only'},
         'forecast': {'contract_version': 1, 'state': 'recent_measured', 'sample_seconds': 300,
             'sample_count': 5, 'verified_pages': sum(bins), 'window_page_counts': bins,
             'pages_per_second': rate, 'fastest_seconds': remaining * 60 / max(bins),
@@ -36,6 +39,9 @@ def fixture(root, *, now=NOW):
             'private_path': '/PRIVATE_PATH', 'raw_response_body': 'PRIVATE_BODY'},
         'url': 'https://private.test/?key=PRIVATE_TOKEN'}
     status['providers']['cnyes']['public_index_progress']['manifest_phase'] = phase
+    status['providers']['cnyes']['public_index_progress']['source_gate'] = {
+        'contract_version': 1, 'state': 'clear', 'next_probe_at_utc': None,
+        'source_recovery_requires_success': True}
     return status, phase
 
 
@@ -71,6 +77,19 @@ def test_inconsistent_phase_is_unknown_but_existing_body_and_list_counts_survive
     assert source['known_urls'] == 6 and source['complete_urls'] == 2
 
 
+def test_unresolved_revision_cannot_render_a_known_phase_denominator(tmp_path):
+    status, phase = fixture(tmp_path)
+    index = status['providers']['cnyes']['public_index_progress']
+    index['dates_reconciling_page_membership'] = 1
+    phase['dates_reconciling_page_membership'] = 1
+    assert cnyes(save(tmp_path, status))['manifest_phase_progress'] is None
+    phase.update(totals_known=False, phase_complete=False, source_reported_total_pages=None,
+                 source_reported_total_metadata_rows=None, remaining_pages=None, progress_ratio=None)
+    result = cnyes(save(tmp_path, status))['manifest_phase_progress']
+    assert result['dates_reconciling_page_membership'] == 1 and not result['totals_known']
+    assert result['forecast']['state'] == 'unknown_denominator'
+
+
 @pytest.mark.parametrize('patch', [
     {'pages_per_second': .2}, {'verified_pages': 19}, {'sample_seconds': 299}, {'sample_count': 4},
     {'window_page_counts': [1, True, 3, 5, 11]}, {'fastest_seconds': 1}, {'middle_seconds': 1},
@@ -95,6 +114,35 @@ def test_nonlive_snapshots_have_counts_not_an_active_forecast(tmp_path, activity
     assert public['forecast']['middle_seconds'] is None
 
 
+def test_provider_wait_suspends_only_its_incomplete_phase_forecast(tmp_path):
+    status, _ = fixture(tmp_path)
+    status['provider_next_attempt_utc']['cnyes'] = (NOW + timedelta(minutes=5)).isoformat()
+    source = cnyes(save(tmp_path, status))
+    phase = source['manifest_phase_progress']
+    assert source['state'] == 'cooldown'
+    assert phase['verified_pages'] == 340 and phase['progress_ratio'] == .34
+    assert phase['forecast']['state'] == 'provider_waiting'
+    assert phase['forecast']['middle_seconds'] is None
+    assert phase['forecast']['middle_finish_at_utc'] is None
+
+    # Another provider's wait must not suppress this source's observation.
+    status['provider_next_attempt_utc'] = {'other': (NOW + timedelta(minutes=5)).isoformat()}
+    assert cnyes(save(tmp_path, status))['manifest_phase_progress']['forecast']['state'] == 'recent_measured'
+    # A deadline in the past permits the normal owner-bound observation check.
+    status['provider_next_attempt_utc']['cnyes'] = (NOW - timedelta(seconds=1)).isoformat()
+    assert cnyes(save(tmp_path, status))['manifest_phase_progress']['forecast']['state'] == 'recent_measured'
+
+
+def test_provider_wait_does_not_hide_proven_phase_completion(tmp_path):
+    status, phase = fixture(tmp_path)
+    status['provider_next_attempt_utc']['cnyes'] = (NOW + timedelta(minutes=5)).isoformat()
+    phase.update(source_reported_total_pages=340, source_reported_total_metadata_rows=10200,
+                 remaining_pages=0, progress_ratio=1., phase_complete=True)
+    public = cnyes(save(tmp_path, status))['manifest_phase_progress']
+    assert public['phase_complete'] and public['forecast']['state'] == 'phase_complete'
+    assert public['body_completion_claimed'] is False and public['all_history_complete'] is False
+
+
 def test_previous_owner_and_stale_snapshots_do_not_supply_rates(tmp_path):
     status, _ = fixture(tmp_path)
     status['owner_id'] = 'c' * 32
@@ -103,11 +151,161 @@ def test_previous_owner_and_stale_snapshots_do_not_supply_rates(tmp_path):
     assert cnyes(save(tmp_path, status))['manifest_phase_progress']['forecast']['state'] == 'inactive'
 
 
+def test_browser_shows_provider_wait_without_an_active_phase_eta(tmp_path, browser):
+    from playwright.sync_api import expect
+    now = datetime.now(UTC) - timedelta(seconds=5)
+    status, _ = fixture(tmp_path, now=now)
+    status['provider_next_attempt_utc']['cnyes'] = (now + timedelta(minutes=5)).isoformat()
+    status['providers']['cnyes']['public_index_progress']['source_gate'] = {
+        'contract_version': 1, 'state': 'waiting',
+        'next_probe_at_utc': (now + timedelta(minutes=2)).isoformat(),
+        'source_recovery_requires_success': True}
+    save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda exc: errors.append(type(exc).__name__))
+    page.on('request', lambda req: remote.append(req.url) if urlsplit(req.url).netloc != origin else None)
+    try:
+        page.goto(f'http://{origin}/news/', wait_until='domcontentloaded', timeout=15000)
+        page.wait_for_function('() => state.latest?.schema_version === 1', timeout=15000)
+        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+        page.locator('#source-search').fill('cnyes')
+        detail = page.locator('[data-news-list-provider="cnyes"]')
+        detail.locator('summary').click(timeout=10000)
+        phase = detail.locator('[data-news-manifest-state]')
+        expect(phase).to_have_attribute('data-news-manifest-state', 'provider_waiting')
+        expect(phase.locator('[data-news-manifest-eta]')).to_contain_text('此來源目前排程等待中')
+        expect(phase.locator('[data-news-manifest-eta]')).to_contain_text('清單端點最早')
+        expect(phase.locator('[data-news-manifest-eta]')).not_to_contain_text('基準預計')
+        expect(phase.locator('[data-news-manifest-progress="pages"]')).to_have_attribute('value', '0.34')
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not errors and not remote
+    finally:
+        page.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_browser_shows_index_recheck_without_an_active_phase_eta(tmp_path, browser):
+    from playwright.sync_api import expect
+    status, _ = fixture(tmp_path, now=datetime.now(UTC) - timedelta(seconds=5))
+    status['providers']['cnyes']['public_index_progress']['source_gate'] = {
+        'contract_version': 1, 'state': 'rechecking', 'next_probe_at_utc': None,
+        'source_recovery_requires_success': True}
+    save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda exc: errors.append(type(exc).__name__))
+    page.on('request', lambda req: remote.append(req.url) if urlsplit(req.url).netloc != origin else None)
+    try:
+        page.goto(f'http://{origin}/news/', wait_until='domcontentloaded', timeout=15000)
+        page.wait_for_function('() => state.latest?.schema_version === 1', timeout=15000)
+        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+        page.locator('#source-search').fill('cnyes')
+        detail = page.locator('[data-news-list-provider="cnyes"]')
+        detail.locator('summary').click(timeout=10000)
+        phase = detail.locator('[data-news-manifest-state]')
+        expect(phase).to_have_attribute('data-news-manifest-state', 'source_rechecking')
+        expect(phase.locator('[data-news-manifest-eta]')).to_contain_text('仍須成功驗證回應')
+        expect(phase.locator('[data-news-manifest-eta]')).not_to_contain_text('基準預計')
+        expect(phase.locator('[data-news-manifest-progress="pages"]')).to_have_attribute('value', '0.34')
+        assert not errors and not remote
+    finally:
+        page.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_browser_shows_final_page_retry_without_claiming_provider_is_down(tmp_path, browser):
+    from playwright.sync_api import expect
+    now = datetime.now(UTC) - timedelta(seconds=5)
+    status, phase = fixture(tmp_path, now=now)
+    phase.update(source_reported_total_pages=341, source_reported_total_metadata_rows=10201,
+                 remaining_pages=1, progress_ratio=340 / 341)
+    phase['last_page_gate'] = {'contract_version': 1, 'state': 'waiting',
+        'next_probe_at_utc': (now + timedelta(minutes=2)).isoformat(), 'recovery_requires_success': True}
+    save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda exc: errors.append(type(exc).__name__))
+    page.on('request', lambda req: remote.append(req.url) if urlsplit(req.url).netloc != origin else None)
+    try:
+        page.goto(f'http://{origin}/news/', wait_until='domcontentloaded', timeout=15000)
+        page.wait_for_function('() => state.latest?.schema_version === 1', timeout=15000)
+        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+        page.locator('#source-search').fill('cnyes')
+        detail = page.locator('[data-news-list-provider="cnyes"]')
+        detail.locator('summary').click(timeout=10000)
+        visible = detail.locator('[data-news-manifest-state]')
+        expect(visible).to_have_attribute('data-news-manifest-state', 'last_page_waiting')
+        expect(visible.locator('[data-news-manifest-eta]')).to_contain_text('最後一頁目前等待重試')
+        expect(visible.locator('[data-news-manifest-eta]')).not_to_contain_text('基準預計')
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not errors and not remote
+    finally:
+        page.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
+def test_browser_shows_partial_page_retry_and_other_pages_continue(tmp_path, browser):
+    from playwright.sync_api import expect
+    now = datetime.now(UTC) - timedelta(seconds=5)
+    status, phase = fixture(tmp_path, now=now)
+    phase['partial_page_gate'].update(state='waiting', failed_pages=2,
+        next_probe_at_utc=(now + timedelta(minutes=2)).isoformat())
+    save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda exc: errors.append(type(exc).__name__))
+    page.on('request', lambda req: remote.append(req.url) if urlsplit(req.url).netloc != origin else None)
+    try:
+        page.goto(f'http://{origin}/news/', wait_until='domcontentloaded', timeout=15000)
+        page.wait_for_function('() => state.latest?.schema_version === 1', timeout=15000)
+        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+        page.locator('#source-search').fill('cnyes')
+        detail = page.locator('[data-news-list-provider="cnyes"]')
+        detail.locator('summary').click(timeout=10000)
+        visible = detail.locator('[data-news-manifest-state]')
+        expect(visible).to_have_attribute('data-news-manifest-state', 'partial_page_waiting')
+        expect(visible.locator('[data-news-manifest-eta]')).to_contain_text('有 2 頁尚未通過來源驗證')
+        expect(visible.locator('[data-news-manifest-eta]')).to_contain_text('其他頁可繼續排程')
+        expect(visible.locator('[data-news-manifest-eta]')).not_to_contain_text('基準預計')
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not errors and not remote
+    finally:
+        page.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+
+
 @pytest.mark.parametrize('width', [1440, 768, 390, 320])
 def test_actual_reader_phase_bars_scenarios_and_native_controls(tmp_path, browser, width):
     from playwright.sync_api import expect
     from scripts.verify_news_dashboard import BODY_PROGRESS_SELECTOR, required_provider_card
-    status, _ = fixture(tmp_path, now=datetime.now(UTC))
+    # Model a recent snapshot rather than one sampled exactly on the server's
+    # wall clock boundary; a small clock correction must not make it future.
+    status, _ = fixture(tmp_path, now=datetime.now(UTC) - timedelta(seconds=5))
     save(tmp_path, status)
     server = _server(tmp_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -159,7 +357,7 @@ def test_browser_status_loss_withdraws_phase_forecast_and_native_retry_restores_
     """Exercise the actual timed refresh, not synthetic payload/DOM edits."""
     from playwright.sync_api import expect
     from downloader.artifact_io import sha256_file
-    status, _ = fixture(tmp_path, now=datetime.now(UTC))
+    status, _ = fixture(tmp_path, now=datetime.now(UTC) - timedelta(seconds=5))
     save(tmp_path, status)
     original_status_sha = sha256_file(tmp_path / 'data_news_fulltext/status.json')
     server = _server(tmp_path)

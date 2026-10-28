@@ -73,8 +73,10 @@ def test_same_session_calendar_end_skips_only_weekends() -> None:
         ("tpex_day_trade_eligibility", True),
     ]
 )
+@pytest.mark.parametrize("closed_announcement", [False, True])
 def test_same_session_plan_uses_verified_holiday_bridge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, dataset: str, strict: bool,
+    closed_announcement: bool,
 ) -> None:
     pl.DataFrame({
         "Name": ["中秋節", "孔子誕辰紀念日/ 教師節"],
@@ -87,9 +89,12 @@ def test_same_session_plan_uses_verified_holiday_bridge(
     )
     spec = downloader.DEFAULT_DATASETS[dataset]
     (tmp_path / f"{dataset}.parquet").touch()
+    counts = {date(2026, 9, 24): 1}
+    if closed_announcement:
+        counts[date(2026, 9, 25)] = 1
     monkeypatch.setattr(
         downloader, "_existing_date_counts",
-        lambda _path: ({date(2026, 9, 24): 1}, []),
+        lambda _path: (counts, []),
     )
     monkeypatch.setattr(
         downloader, "_load_coverage_state",
@@ -130,6 +135,16 @@ def test_same_session_plan_uses_verified_holiday_bridge(
         "2026-09-25", "2026-09-28"
     ]
     assert plan.state["same_session_rule_date"] == "2026-09-29"
+    if strict:
+        assert plan.state["retained_non_session_rule_dates"] == (
+            ["2026-09-25"] if closed_announcement else []
+        )
+        assert plan.state["retained_non_session_rule_contract"] == (
+            "official_rule_announcement_on_verified_closed_session_v1"
+        )
+    if closed_announcement:
+        assert date(2026, 9, 25) in counts  # Raw evidence is not deleted.
+        assert date(2026, 9, 25) not in plan.all_weekdays
 
     direct_code = (
         "import sys; from datetime import date; from pathlib import Path; "
@@ -147,6 +162,47 @@ def test_same_session_plan_uses_verified_holiday_bridge(
         check=True,
     )
     assert direct.stdout.strip() == "2026-09-24"
+
+
+@pytest.mark.parametrize("dataset", ["twse_day_trade_eligibility", "tpex_day_trade_eligibility"])
+@pytest.mark.parametrize("status", ["closed", "unknown", "actual_open", "scheduled_open"])
+def test_only_canonical_closed_decisions_classify_retained_rule_announcements(
+    monkeypatch, tmp_path, dataset, status,
+):
+    from stockagent.live import market_status
+
+    day = date(2026, 10, 23)
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", lambda observed, *, parquet_root:
+        market_status.TwStockDayDecision(status, "fixture canonical decision"))
+    retained = downloader._closed_session_rule_announcements(
+        downloader.DEFAULT_DATASETS[dataset], {day}, tmp_path,
+    )
+    assert retained == ({day} if status == "closed" else set())
+
+
+@pytest.mark.parametrize("dataset", ["twse_daily_ohlcv", "tpex_daily_ohlcv"])
+def test_retained_announcement_exception_never_applies_to_prices(monkeypatch, tmp_path, dataset):
+    from stockagent.live import market_status
+
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", lambda *_a, **_kw:
+        pytest.fail("price calendar mismatch must not use a rule-announcement exception"))
+    assert downloader._closed_session_rule_announcements(
+        downloader.DEFAULT_DATASETS[dataset], {date(2026, 10, 23)}, tmp_path,
+    ) == set()
+
+
+def test_rule_announcement_classifier_supports_direct_downloader_import_outside_repo(tmp_path):
+    code = (
+        "import sys; from pathlib import Path; from datetime import date; "
+        f"sys.path.insert(0, {str(Path(downloader.__file__).resolve().parent)!r}); "
+        "import download_tw_public_data as d; "
+        "print(len(d._closed_session_rule_announcements("
+        "d.DEFAULT_DATASETS['twse_day_trade_eligibility'], {date(2026,10,23)}, "
+        f"Path({str(tmp_path)!r}))))"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": ""}, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == "0"  # No official proof, so it stays unknown.
 
 
 def test_same_session_bridge_fails_closed_without_official_schedule(
@@ -174,6 +230,47 @@ def test_same_session_bridge_rejects_conflicting_official_calendar(
         downloader._calendar_end_before_same_session(
             date(2026, 9, 29), schedule_root=tmp_path
         )
+
+
+def test_same_session_bridge_accepts_verified_historical_emergency_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stockagent.live import market_status
+
+    (tmp_path / market_status.TW_HOLIDAY_SCHEDULE_NAME).touch()
+    decisions = {
+        date(2026, 10, 26): market_status.TwStockDayDecision(
+            "closed", "official TWSE schedule as-of 2026-09-16: holiday"),
+        date(2026, 10, 23): market_status.TwStockDayDecision(
+            "closed", "receipt-verified TWSE TAIEX historical non-session"),
+        date(2026, 10, 22): market_status.TwStockDayDecision(
+            "actual_open", "receipt-verified TWSE TAIEX actual session"),
+    }
+    visited = []
+
+    def decide(day, **kwargs):
+        assert kwargs == {"parquet_root": tmp_path}
+        visited.append(day)
+        return decisions[day]
+
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", decide)
+    assert downloader._calendar_end_before_same_session(
+        date(2026, 10, 27), schedule_root=tmp_path
+    ) == date(2026, 10, 22)
+    assert visited == [date(2026, 10, 26), date(2026, 10, 23), date(2026, 10, 22)]
+
+
+def test_same_session_bridge_rejects_unknown_even_with_schedule_reason_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stockagent.live import market_status
+
+    (tmp_path / market_status.TW_HOLIDAY_SCHEDULE_NAME).touch()
+    monkeypatch.setattr(market_status, "tw_stock_day_decision", lambda *_a, **_k:
+        market_status.TwStockDayDecision(
+            "unknown", "official TWSE schedule as-of 2026-09-16: unresolved evidence"))
+    with pytest.raises(RuntimeError, match="cannot prove.*unresolved evidence"):
+        downloader._calendar_end_before_same_session(date(2026, 10, 27), schedule_root=tmp_path)
 
 
 def test_twse_day_trade_openapi_binds_roc_date_and_schema() -> None:

@@ -136,6 +136,8 @@ def inventory_version_layout(
             current = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
             local_layout = current.get("storage_layout", "legacy_full_generation_v1")
         native_acceptance = None
+        native_rollout = None
+        writer = "news_copy_on_write_parts" if name == "data_news" else "shared_packed_file_and_chunk_cas"
         if local_layout == "news_incremental_parts_v2":
             proof_path = root / "verification.json"
             proof = json.loads(proof_path.read_text(encoding="utf-8")) if proof_path.is_file() else {}
@@ -154,6 +156,30 @@ def inventory_version_layout(
                 "generation": current.get("generation"),
                 "verified_at_utc": proof.get("verified_at_utc") if accepted else None,
                 "payload_reverified_this_inventory": False}
+            native_rollout = "local_news_v2_verified_receipt" if accepted else "local_news_v2_acceptance_pending"
+        if name == "data_cftc_legacy":
+            from stockagent.data_sync.closed_source import BINDING, CONTRACT, local_closed_source_status
+            marker = root / BINDING
+            if marker.exists() or marker.is_symlink():
+                local_layout, writer = CONTRACT, "closed_fixed_release_with_bounded_service_views"
+                try:
+                    status = local_closed_source_status(root)
+                    if status is None:
+                        raise SnapshotError("closed CFTC binding disappeared during inventory")
+                    accepted = status["raw_retirement_complete"]
+                    native_acceptance = {"state": "verified_receipt" if accepted else "acceptance_pending",
+                        "snapshot_id": status["snapshot_id"], "manifest_sha256": status["manifest_sha256"],
+                        "verified_at_utc": status["raw_retired_at_utc"],
+                        "service_files": status["service_files"], "service_bytes": status["service_bytes"],
+                        "raw_files_local": status["raw_files_local"],
+                        "verification_scope": "closed_raw_retirement_receipt_and_current_local_sizes",
+                        "payload_reverified_this_inventory": False}
+                except (SnapshotError, OSError, ValueError) as error:
+                    accepted = False
+                    native_acceptance = {"state": "acceptance_pending", "error_type": type(error).__name__,
+                                         "payload_reverified_this_inventory": False}
+                    errors.append("closed CFTC source metadata is invalid: " + type(error).__name__)
+                native_rollout = "closed_cftc_raw_retired_receipt" if accepted else "closed_cftc_raw_retirement_pending"
         current_heads = [heads[item["dataset"]] for item in bindings if item["dataset"] in heads]
         shared_v2 = any(item.get("schema_version") == CHUNKED_SNAPSHOT_SCHEMA_VERSION
                         and item.get('storage_scope') == 'shared'
@@ -165,8 +191,7 @@ def inventory_version_layout(
                     if item.get("reader_contract") == "packed-v2-chunks"
                     and item.get("file_chunk_bytes") == policy["file_chunk_bytes"]]
         rows.append({"root": name, "exists": root.is_dir(), "path_is_symlink": root.is_symlink(),
-            **spec, "writer_implementation": ("news_copy_on_write_parts" if name == "data_news"
-                                            else "shared_packed_file_and_chunk_cas"),
+            **spec, "writer_implementation": writer,
             "source_and_consumer_entrypoints": descriptions.get(name, {}).get("sources", []),
             "local_training_layout": local_layout,
             "publication_bindings": [{"dataset": item["dataset"], "source": item["source"],
@@ -178,8 +203,7 @@ def inventory_version_layout(
             "configured_v2_publication_branches": enrolled,
             "native_workspace_migrated": native_acceptance is not None and native_acceptance["state"] == "verified_receipt",
             **({"native_acceptance": native_acceptance} if native_acceptance is not None else {}),
-            "rollout_state": ("local_news_v2_verified_receipt" if native_acceptance and native_acceptance["state"] == "verified_receipt"
-                              else "local_news_v2_acceptance_pending" if native_acceptance
+            "rollout_state": (native_rollout if native_rollout is not None
                               else "shared_v2_head_observed" if shared_v2
                               else "host_private_v2_head_observed" if private_v2
                               else "policy_enrolled_head_pending" if enrolled

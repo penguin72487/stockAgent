@@ -62,7 +62,10 @@ class GatewayHostCircuit:
             now = time.time()
             for provider, rows in saved['providers'].items():
                 source = registry.sources.get(provider)
-                if not source or not source.allowed or not isinstance(rows, dict) or len(rows) > MAX_REQUEST_HOSTS_PER_PROVIDER:
+                # Metadata-only sources can still send scoped requests and
+                # need the same persisted negative host evidence on restart.
+                # This never grants access; NewsHTTP rechecks the request scope.
+                if not source or not source.request_enabled or not isinstance(rows, dict) or len(rows) > MAX_REQUEST_HOSTS_PER_PROVIDER:
                     continue
                 for host, row in rows.items():
                     try:
@@ -242,8 +245,16 @@ class GatewayHostCircuit:
         return observation
 
 
-def host_filtered_query(statement, parameters, excluded_hosts, *, excluded_origins=()):
-    """Filter before LIMIT in every article lane; retain its original index.
+def discovery_request_host(url):
+    """Match the HTTP owner's validated host, retaining malformed URLs for diagnosis."""
+    try:
+        return normalize_url(url, include_host_path=True)[1]
+    except NewsError:
+        return None
+
+
+def host_filtered_query(statement, parameters, excluded_hosts, *, excluded_origins=(), discovery_url=False):
+    """Filter before LIMIT in article and discovery lanes; retain their indexes.
 
     No active host pause means byte-identical SQL and no extra lookup. Numbered
     binds support the existing UNION undated lane without duplicated arguments.
@@ -261,9 +272,30 @@ def host_filtered_query(statement, parameters, excluded_hosts, *, excluded_origi
     numbered = re.sub(r'\?(?![0-9])', lambda match: '?' + str(next(number)), statement)
     values, filters = list(parameters), []
     if excluded_hosts:
-        binds = ','.join('?' + str(len(values) + i + 1) for i in range(len(excluded_hosts)))
-        values.extend(excluded_hosts)
-        filters.append('host NOT IN (' + binds + ')')
+        if discovery_url:
+            def bind(value):
+                values.append(value)
+                return '?' + str(len(values))
+            # Most discovery URLs are already canonical. Compare their exact
+            # scheme/authority prefix in SQLite, so a large paused frontier
+            # does not cross the Python boundary once per row. Fallback uses
+            # the HTTP normalizer for uppercase, ports, missing slashes and
+            # IDNA. Only call it when a host might match, or the input has
+            # non-ASCII characters which may encode to a blocked IDNA host.
+            prefixes = [f'instr(url,{bind(scheme + host + "/")})=1'
+                        for host in excluded_hosts for scheme in ('https://', 'http://')]
+            possible = [f'instr(lower(url),{bind(host)})>0' for host in excluded_hosts]
+            matches = ','.join(bind(host) for host in excluded_hosts)
+            canonical = ('((' + ' OR '.join(prefixes) + ') AND length(url)<=8192 '
+                         'AND instr(url,char(10))=0 AND instr(url,char(13))=0 '
+                         'AND instr(url,char(9))=0 AND instr(url,char(92))=0)')
+            filters.append('NOT (' + canonical + ' OR ((' + ' OR '.join(possible)
+                           + " OR url GLOB '*[^ -~]*') AND coalesce(news_discovery_request_host(url),'') IN ("
+                           + matches + ')))')
+        else:
+            binds = ','.join('?' + str(len(values) + i + 1) for i in range(len(excluded_hosts)))
+            values.extend(excluded_hosts)
+            filters.append('host NOT IN (' + binds + ')')
     if excluded_origins:
         checks = ['instr(url,?' + str(len(values) + i + 1) + ')=1' for i in range(len(excluded_origins))]
         values.extend(origin + '/' for origin in excluded_origins)

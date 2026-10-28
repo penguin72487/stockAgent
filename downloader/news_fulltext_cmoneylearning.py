@@ -175,6 +175,81 @@ CMONEY_LEARNING_V6_HTTP_BINDING = (
     'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
     '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
 )
+# Twelve exact native canonical declarations from closed CMNews question54.
+# Preserve all prior scopes and bodies; these are acquisition candidates,
+# not accepted bodies, aliases, site discovery, or historical PIT versions.
+CMONEY_LEARNING_TWELVE_DECLARED_20261026_PATHS = (
+    '/%e5%8b%9e%e9%80%806%e6%80%8e%e9%ba%bc%e6%9f%a5%ef%bc%9f%e6%89%8b%e6%a9%9f%e6%9f%a5%e5%80%8b%e4%ba%ba%e5%b0%88%e6%88%b6%ef%bc%8c%e7%a2%ba%e8%aa%8d%e5%85%ac%e5%8f%b8%e6%8f%90%e7%b9%b3%e8%88%87%e8%87%aa/',
+    '/%e5%8f%b0%e7%81%a3%e6%ad%a3%e5%9c%a8%e8%b5%b0%e5%90%91-k-%e5%9e%8b%e7%a4%be%e6%9c%83%e5%97%8e%ef%bc%9f%e5%be%9e%e6%89%80%e5%be%97%e8%88%87%e8%b3%87%e7%94%a2%e5%b7%ae%e8%b7%9d%ef%bc%8c%e7%9c%8b/',
+    '/%e5%8f%b0%e7%81%a3-cpi-%e9%a0%90%e6%b8%ac-2-%e4%bb%a3%e8%a1%a8%e4%bb%80%e9%ba%bc%ef%bc%9f%e7%9c%8b%e6%87%82%e9%80%9a%e8%86%a8%e8%88%87%e9%80%80%e4%bc%91%e9%87%91%e8%b3%bc%e8%b2%b7%e5%8a%9b/',
+    '/%e5%af%8c%e5%96%ac%e6%bc%b2%e5%81%9c%e9%9d%a0%e4%bb%80%e9%ba%bc%ef%bc%9f%e5%be%9e%e6%bc%b2%e5%83%b9%e8%88%87low-dk2%e5%8d%87%e7%b4%9a%ef%bc%8c%e7%9c%8b%e6%87%82%e7%8d%b2%e5%88%a9%e8%83%bd%e5%90%a6/',
+    '/%e6%b3%95%e5%9c%8b%e6%9a%b4%e5%8b%95%e5%b0%8d%e7%b6%93%e6%bf%9f%e6%9c%89%e4%bd%95%e5%bd%b1%e9%9f%bf%ef%bc%9f%e5%be%9e%e5%95%86%e5%ba%97%e6%90%8d%e5%a4%b1%e7%9c%8b-gdp-%e5%82%b3%e5%b0%8e/',
+    '/%e8%80%81%e8%be%b2%e6%b4%a5%e8%b2%bc%e9%81%b7%e6%88%b6%e7%b1%8d%e6%9c%83%e5%81%9c%e7%99%bc%e5%97%8e%ef%bc%9f%e9%95%b7%e8%bc%a9%e6%90%ac%e5%8e%bb%e8%88%87%e5%ad%90%e5%a5%b3%e5%90%8c%e4%bd%8f%ef%bc%8c/',
+    '/%e8%9e%8d%e8%b3%87%e9%a4%98%e9%a1%8d%e5%b1%85%e9%ab%98%e4%b8%8d%e4%b8%8b%e6%98%af%e6%95%a3%e6%88%b6%e9%80%b2%e5%a0%b4%e5%97%8e%ef%bc%9f%e6%95%b4%e6%88%b6%e6%93%94%e4%bf%9d%e7%b6%ad%e6%8c%81%e7%8e%87/',
+    '/%e8%be%b2%e6%b0%91%e9%80%80%e4%bc%91%e5%84%b2%e9%87%91%e6%af%8f%e6%9c%88%e7%b9%b3%e5%a4%9a%e5%b0%91%ef%bc%9f2026%e6%96%b0%e5%88%b61%e3%80%815%e3%80%8110%e8%a9%a6%e7%ae%97%e8%88%87%e7%94%b3%e8%ab%8b/',
+    '/%e9%81%ba%e7%94%a2%e6%9f%a5%e8%a9%a2%e6%80%8e%e9%ba%bc%e8%be%a6%ef%bc%9f%e5%ad%98%e6%ac%be%e3%80%81%e8%82%a1%e7%a5%a8%e3%80%81%e4%bf%9d%e9%9a%aa%e8%88%87%e6%88%bf%e5%b1%8b%e5%9c%9f%e5%9c%b0%e5%8e%bb/',
+    '/0053%e5%88%86%e5%89%b2%e3%80%81%e4%b8%8d%e9%85%8d%e6%81%af%e6%a1%88%e9%80%9a%e9%81%8e%ef%bc%8c%e6%8c%81%e6%9c%89%e4%ba%ba%e8%a6%81%e6%b3%a8%e6%84%8f%e4%bb%80%e9%ba%bc%ef%bc%9f%e6%99%82%e7%a8%8b/',
+    '/2026%e9%81%ba%e7%94%a2%e7%a8%85%e5%85%8d%e7%a8%85%e9%a1%8d%e5%a4%9a%e5%b0%91%ef%bc%9f1333%e8%90%ac%e5%85%83%e6%80%8e%e9%ba%bc%e6%89%a3%e3%80%81%e5%ad%90%e5%a5%b3%e8%83%bd%e5%90%84%e7%ae%97%e4%b8%80/',
+    '/tesla-roadster-%e6%9c%83%e9%a3%9b%e4%ba%86%ef%bc%81%e7%a9%ba%e4%b8%ad%e7%bf%bb%e8%bd%89%e9%9c%87%e6%92%bc%e4%ba%ae%e7%9b%b8%ef%bc%8c2028%e9%87%8f%e7%94%a2%e8%83%bd%e6%88%90%e7%9c%9f%e5%97%8e%ef%bc%9f/',
+)
+CMONEY_LEARNING_V7_PATHS = CMONEY_LEARNING_V6_PATHS + CMONEY_LEARNING_TWELVE_DECLARED_20261026_PATHS
+CMONEY_LEARNING_V7_PATH_PATTERN = '^(?:' + '|'.join(re.escape(p) for p in CMONEY_LEARNING_V7_PATHS) + ')$'
+CMONEY_LEARNING_V7_AUTH_SCOPE = (
+    'Bounded private personal research of twenty-eight completed originals and exactly twelve additional '
+    'literal originals declared by closed CMNews canonical-attribute observations on 2026-10-26. '
+    'Verified source declarations approve only acquisition scope through the existing collector; actual '
+    'same-response identity, body, credit, clocks, access and durable receipt checks still admit every body. '
+    'No paid/member, third-party rights override, publication, training export, CMNews alias equivalence or '
+    'whole-site scope. Not a reuse license or fair-use verdict; preserve credits, REP and actual refusals.'
+)
+CMONEY_LEARNING_V7_NOTE = (
+    'Reuse twenty-eight completed originals and all497 closed metadata questions. Only the twelve new '
+    'literal canonical originals may enter separately evidenced finite acquisition supplements through '
+    'the resident URL inbox. No recursive discovery, guessed slugs, AI polling, public body, automatic '
+    'training export, CMNews alias equivalence or historical-release guarantee. Ten-second spacing is '
+    'not an official or measured source maximum.'
+)
+CMONEY_LEARNING_V7_HTTP_BINDING = (
+    'a78f470416c9d32f94ea57762220a14527b9ce9956d03eafa82c9605965f5430',
+    '21e2757bc783dd85c4365502ed20ab4315e9f78d1418d5fbd5b40292083b734c',
+    'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
+    '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
+)
+# V8's URL shape is not capture permission. The frozen cohort and immutable,
+# source-bound declaration supplements still decide each eligible URL. This
+# avoids changing the parser/config for every newly observed original slug.
+CMONEY_LEARNING_V8_PATH_PATTERN = r'^/(?:[A-Za-z0-9_-]|%[0-9A-Fa-f]{2}){1,1024}/$'
+CMONEY_LEARNING_V8_AUTH_SCOPE = (
+    'Bounded private personal reading of the retained originals and exact public original URLs '
+    'declared by currently admitted CMNews failure responses or completed native observations. '
+    'Every additional literal URL requires immutable source/head-bound finite acquisition evidence '
+    'and the normal original response, identity, body, author, clock, REP and refusal checks. '
+    'No recursive discovery, guessed slug, paid/member, third-party rights override, publication, '
+    'training export, CMNews alias equivalence or whole-site capture. Not a reuse license or fair-use verdict.'
+)
+CMONEY_LEARNING_V8_NOTE = (
+    'Reuse completed originals and closed questions. Source-declared originals enter only finite '
+    'acquisition supplements through the existing single writer; a matching slug alone never authorizes '
+    'capture. Same-response declarations have a transactional outbox, not another HTTP client. '
+    'Preserve actual source clocks, source refusals and the prior HTTP budget identity. '
+    'Ten-second spacing is not an official or measured source maximum.'
+)
+# Exact reviewed candidate. An unmatched identity keeps its own capacity
+# namespace, never inherits by provider name or resets an existing budget.
+CMONEY_LEARNING_V8_HTTP_BINDING = (
+    'a1201779838e186fa0942730d7789edb9620e9a114e94debdb59fd9db65bba21',
+    '553308cef36b09b2a727da48df76d4d8b607abebea91dc940244e55c0a03ae15',
+    'bf0cc28c179eaed24d24ded96ce76279516fcf07e880a580c94e721e5967fc57',
+    '00e51936c94fc5ed1c7d7a06eb2bac3455ce4cfaaf4240a259fe45f6881bc258',
+)
+
+
+def cmoneylearning_literal_original(url):
+    return (isinstance(url, str) and len(url) <= 4096
+        and url.startswith(CMONEY_LEARNING_ORIGIN)
+        and re.fullmatch(CMONEY_LEARNING_V8_PATH_PATTERN, url[len(CMONEY_LEARNING_ORIGIN):]) is not None)
+
+
 CMONEY_LEARNING_BODY_SELECTOR = ':scope > .articleContent__body > .articleContent__content--main > .articleContent__textContent'
 _EDITOR = '理財內容編輯林序安'
 _PERSON = CMONEY_LEARNING_ORIGIN + '/author/rowan_lin/#person'
@@ -202,9 +277,11 @@ def cmoneylearning_visible_article(soup, *, page_url, adapter_contract_version=1
     """
     paths = {1: CMONEY_LEARNING_PATHS, 2: CMONEY_LEARNING_V2_PATHS,
              3: CMONEY_LEARNING_V3_PATHS, 4: CMONEY_LEARNING_V4_PATHS,
-             5: CMONEY_LEARNING_V5_PATHS, 6: CMONEY_LEARNING_V6_PATHS}.get(adapter_contract_version, ())
-    if (type(adapter_contract_version) is not int
-            or page_url not in {CMONEY_LEARNING_ORIGIN + p for p in paths}):
+             5: CMONEY_LEARNING_V5_PATHS, 6: CMONEY_LEARNING_V6_PATHS,
+             7: CMONEY_LEARNING_V7_PATHS}.get(adapter_contract_version, ())
+    admitted_url = (cmoneylearning_literal_original(page_url) if adapter_contract_version == 8 else
+        page_url in {CMONEY_LEARNING_ORIGIN + p for p in paths})
+    if type(adapter_contract_version) is not int or not admitted_url:
         raise NewsError('article_identity_not_verified')
     canonical = _one(soup, 'head > link[rel=canonical]')
     scope = _one(soup, 'main.site-main article.articleContent')

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -85,6 +86,202 @@ def test_latest_signal_page_reads_all_imported_accounts(fragmented_accounts):
     )
     assert page["total"] == len(active)
     assert {row["market"] for row in page["rows"]} == set(active)
+
+
+@pytest.mark.parametrize("narrow", [False, True])
+@pytest.mark.parametrize("has_book", [False, True])
+def test_fragmented_signal_history_uses_complete_session_projections(
+    fragmented_accounts, monkeypatch, narrow, has_book,
+):
+    root, _, active = fragmented_accounts
+    cache = root / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    rows = [json.loads(line) for line in (root / "signals.jsonl").read_text().splitlines()]
+    # Same-date/same-mode revisions must keep their original append order.
+    for row in rows:
+        row.update({"ask": 101, "bid": 100, "sizing_open_price": 100,
+                    "filled_weight": 0.1, "reason": "paper_fill"})
+        if row.get("signal_id"):
+            row.update(ask=101, bid=100, sizing_open_price=100,
+                       filled_shares=1000, requested_shares=1000, execution_price=101)
+    rows.append({**next(row for row in rows if row.get("signal_id") == active[0]),
+                 "signal_id": "later-revision", "target_weight": -0.2})
+    if not has_book:
+        for row in rows:
+            row.pop("ask", None)
+            row.pop("bid", None)
+    _write_rows(root / "signals.jsonl", rows)
+    before = (root / "signals.jsonl").read_bytes()
+    request = dict(state_dir=root, start_date="2026-09-23", end_date=DAY, limit=100)
+    expected = dashboard.build_dashboard_signal_page(**request, maximum_scan_rows=1000)
+    dashboard._SIGNAL_PAGE_CACHE.clear()
+    dashboard._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+    actual = dashboard.build_dashboard_signal_page(
+        **request, maximum_scan_rows=1, _allow_narrow_projection=False,
+    )
+    assert actual["scan_limit_reached"] is False
+    for key in ("total", "rows", "direction_summary", "opening_execution_audit"):
+        assert actual[key] == expected[key]
+    assert actual["source_rows_scanned"] == len(rows)
+    # Once the immutable per-day shards exist, both readers must reuse them,
+    # even if an imported account split every day into multiple file spans.
+    dashboard._SIGNAL_PAGE_CACHE.clear()
+    dashboard._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+    monkeypatch.setattr(dashboard, "_columnar_ledger_frame",
+                        lambda *_a, **_k: pytest.fail("must reuse complete session shards"))
+    monkeypatch.setattr(dashboard, "_rows_for_sessions",
+                        lambda *_a, **_k: pytest.fail("must not use capped raw history"))
+    reused = dashboard.build_dashboard_signal_page(
+        **request, maximum_scan_rows=1, _allow_narrow_projection=narrow,
+    )
+    assert reused == actual
+    assert (root / "signals.jsonl").read_bytes() == before
+
+
+@pytest.mark.parametrize("change", ["enabled_markets", "committed_repair"])
+def test_range_summary_cache_tracks_the_actual_signal_filter_scope(fragmented_accounts, monkeypatch, change):
+    root, _, active = fragmented_accounts
+    cache = root / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    rows = [json.loads(line) for line in (root / "signals.jsonl").read_text().splitlines()]
+    for row in rows:
+        row.update(filled_shares=0, requested_shares=1000, execution_price=100,
+                   sizing_open_price=100, filled_weight=0, reason="test")
+    _write_rows(root / "signals.jsonl", rows)
+    request = dict(state_dir=root, start_date="2026-09-23", end_date=DAY, limit=100)
+    initial = dashboard.build_dashboard_signal_page(**request)
+    assert dashboard._SIGNAL_RANGE_SUMMARY_CACHE
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text())
+    if change == "enabled_markets":
+        state["enabled_markets"] = active[:1]
+    else:
+        original = active[0]
+        repaired = original + ":minute-repair:approved"
+        state["modes"][original].update(
+            signal_id=repaired, processed_signal_ids=[original, repaired], simulation_replay=True,
+            opening_repair={"contract": "never_filled_original_signal_append_only_minute_repair_v2",
+                            "original_signal_id": original, "simulation_only": True,
+                            "original_weights_preserved": True})
+    state_path.write_text(json.dumps(state))
+    # Neither case changed the signal source, range, capitals or filters passed
+    # as arguments. The effective state-owned filter is nevertheless different.
+    actual = dashboard.build_dashboard_signal_page(**request)
+    dashboard._SIGNAL_PAGE_CACHE.clear()
+    dashboard._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+    independent = dashboard.build_dashboard_signal_page(**request)
+    assert independent["total"] < initial["total"]
+    assert actual == independent
+
+
+@pytest.mark.parametrize("latest", [False, True])
+def test_signal_page_rejects_ctime_only_history_rewrites(fragmented_accounts, monkeypatch, latest):
+    root, _, _ = fragmented_accounts
+    cache = root / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    source = root / "signals.jsonl"
+    request = dict(state_dir=root, start_date=DAY if latest else "2026-09-23", end_date=DAY, limit=100)
+    initial = dashboard.build_dashboard_signal_page(**request)
+    assert all(row["target_weight"] == 0.1 for row in initial["rows"] if row.get("signal_id"))
+    before = source.stat()
+    source.write_bytes(source.read_bytes().replace(b'"target_weight": 0.1', b'"target_weight": 0.2'))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert source.stat().st_ctime_ns != before.st_ctime_ns
+    actual = dashboard.build_dashboard_signal_page(**request)
+    assert all(row["target_weight"] == 0.2 for row in actual["rows"] if row.get("signal_id"))
+    assert actual["direction_summary"]["target"]["long_gross"] == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize("persistent", [False, True])
+@pytest.mark.parametrize("filename", ["orders.jsonl", "fills.jsonl"])
+def test_order_fill_page_rejects_ctime_only_history_rewrites(fragmented_accounts, monkeypatch, persistent, filename):
+    root, _, active = fragmented_accounts
+    if persistent:
+        cache = root / "cache"
+        cache.mkdir()
+        monkeypatch.setenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, str(cache))
+    else:
+        monkeypatch.delenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, raising=False)
+    source = root / filename
+    _write_rows(source, [{"session_date": DAY, "market": active[0], "symbol": "2330",
+                          "recorded_at": f"{DAY}T09:00:00+08:00", "price": 100.0,
+                          "quantity": 1000, "status": "filled"}])
+    request = dict(state_dir=root, session_date=DAY, limit=100)
+    assert dashboard.build_dashboard_event_page(**request)["rows"][0]["price"] == 100.0
+    before = source.stat()
+    source.write_bytes(source.read_bytes().replace(b'"price": 100.0', b'"price": 200.0'))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    page = dashboard.build_dashboard_event_page(**request)
+    assert page["total"] == 1 and page["rows"][0]["price"] == 200.0
+
+
+@pytest.mark.parametrize("filename", ["orders.jsonl", "fills.jsonl"])
+def test_persistent_detail_reuses_verified_append_but_not_rewrite_plus_growth(tmp_path, monkeypatch, filename):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, str(cache))
+    path = tmp_path / filename
+    first_row = {"session_date": DAY, "market": "one", "symbol": "2330", "price": 100.0}
+    _write_rows(path, [first_row])
+    schema = dashboard._EVENT_PAGE_COLUMN_TYPES
+    first_index = dashboard._ledger_session_index(path, recorded_at_fallback=False)
+    first = dashboard._projected_ledger_session_frame(path, index=first_index, session_date=DAY, projected_schema=schema)
+    assert first["price"].to_list() == [100.0]
+    shard = dashboard._detail_session_projection_root(path, schema) / f"{DAY}.parquet"
+    original = dashboard.metadata_signature(shard.stat())
+    with path.open("a") as stream:
+        stream.write(json.dumps({**first_row, "session_date": "2026-09-25"}) + "\n")
+    appended = dashboard._ledger_session_index(path, recorded_at_fallback=False)
+    assert appended.lineage == first_index.lineage
+    assert dashboard._projected_ledger_session_frame(path, index=appended, session_date=DAY, projected_schema=schema)["price"].to_list() == [100.0]
+    assert dashboard.metadata_signature(shard.stat()) == original
+    dashboard._LEDGER_SESSION_INDEX_CACHE.pop((path.resolve(), False), None)
+    cold_index = dashboard._ledger_session_index(path, recorded_at_fallback=False)
+    assert cold_index.lineage == appended.lineage
+    assert dashboard._projected_ledger_session_frame(path, index=cold_index, session_date=DAY, projected_schema=schema)["price"].to_list() == [100.0]
+    assert dashboard.metadata_signature(shard.stat()) == original
+    path.write_bytes(path.read_bytes().replace(b'"price": 100.0', b'"price": 200.0') +
+                     (json.dumps({**first_row, "session_date": "2026-09-28"}) + "\n").encode())
+    changed = dashboard._ledger_session_index(path, recorded_at_fallback=False)
+    assert changed.lineage != appended.lineage
+    assert dashboard._projected_ledger_session_frame(path, index=changed, session_date=DAY, projected_schema=schema)["price"].to_list() == [200.0]
+
+
+def test_detail_projection_rejects_rewrite_during_build(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, str(cache))
+    path = tmp_path / "orders.jsonl"
+    _write_rows(path, [{"session_date": DAY, "price": 100.0}])
+    index = dashboard._ledger_session_index(path, recorded_at_fallback=False)
+    original = dashboard._columnar_ledger_frame
+    def race(*args, **kwargs):
+        result = original(*args, **kwargs)
+        path.write_bytes(path.read_bytes().replace(b'"price": 100.0', b'"price": 200.0'))
+        return result
+    monkeypatch.setattr(dashboard, "_columnar_ledger_frame", race)
+    assert dashboard._projected_ledger_session_frame(path, index=index, session_date=DAY,
+                                                    projected_schema=dashboard._EVENT_PAGE_COLUMN_TYPES) is None
+
+
+@pytest.mark.parametrize("reader", [dashboard._tail_for_session, dashboard._latest_contiguous_session_rows])
+def test_bounded_session_caches_reject_ctime_only_rewrites(tmp_path, reader):
+    source = tmp_path / "signals.jsonl"
+    _write_rows(source, [{"session_date": DAY, "i": 1}])
+
+    def read():
+        if reader is dashboard._tail_for_session:
+            return reader(source, 10, DAY)
+        return reader(source, DAY, 10)
+
+    assert read()[0]["i"] == 1
+    before = source.stat()
+    source.write_bytes(source.read_bytes().replace(b'"i": 1', b'"i": 2'))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert read()[0]["i"] == 2
 
 
 @pytest.mark.parametrize("latest,private_features", [(True, True), (False, True), (True, False)])
@@ -263,3 +460,30 @@ def test_research_carry_presentation_never_weakens_strict_intraday(strict):
     )
     assert issues[0]["code"] == ("intraday_residual_open" if strict else "research_margin_carry")
     assert issues[0]["severity"] == ("error" if strict else "warning")
+
+
+@pytest.mark.parametrize("open_positions", [0, 12])
+def test_latest_no_fill_warning_does_not_erase_prior_positions(open_positions):
+    mode = {"market": "tw_day_trade_unit_mgda", "label": "MGDA",
+            "session_date": DAY, "open_position_count": open_positions,
+            "today_execution_outcome": "no_fill", "entry_unfilled_shares": 88000}
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 11, tzinfo=TAIPEI),
+    )
+    issue = next(row for row in issues if row["code"] == "entry_no_fill")
+    assert issue["severity"] == "error"
+    assert "本次訊號尚無新增成交" in issue["detail"]
+    assert "88,000 股" in issue["detail"]
+    assert ("12 筆先前建立的未平模擬持倉" in issue["detail"]) is bool(open_positions)
+    assert "沒有建立任何成交部位" not in issue["detail"]
+
+
+@pytest.mark.parametrize("source_time,warning", [("09:00:12", False), ("09:01:00", False), ("09:10:03", True)])
+def test_counterfactual_later_signal_is_not_silently_presented_as_causal(source_time, warning):
+    mode = {"market": "tw_day_trade_100m", "label": "100m", "session_date": DAY,
+            "counterfactual_open_replay": True, "signal_at": f"{DAY}T09:01:00+08:00",
+            "source_signal_at": f"{DAY}T{source_time}+08:00"}
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 11, tzinfo=TAIPEI),
+    )
+    assert any(row["code"] == "replay_signal_after_simulated_time" for row in issues) is warning

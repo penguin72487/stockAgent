@@ -118,7 +118,7 @@ def test_complete_benchmark_keeps_values_and_reports_changed_private_bytes(tmp_p
     payload = _payload(tmp_path)
     source = tmp_path / "artifacts/live/data_monitor/record_inventory_cache.json"
     captured_sha = hashlib.sha256(source.read_bytes()).hexdigest()
-    trial_seed = _stdlib(payload)
+    trial_seed = _stdlib({**payload, "feature_revision": "benchmark-publication-required"})
     status = tmp_path / "artifacts/live/data_monitor/public_status.json"
     status.write_text(json.dumps({"sources": []}))
     result = benchmark.benchmark(tmp_path, repeats=1, mode="encode")
@@ -128,6 +128,7 @@ def test_complete_benchmark_keeps_values_and_reports_changed_private_bytes(tmp_p
     assert result["cache_bytes_parity"] is False
     assert len({row["source_stat_calls"] for row in result["trials"]}) == 1
     assert result["production_source_writes"] == 0
+    assert result["publication_forced_by_invalid_prior_feature_revision"] is True
     assert result["captured_source_sha256"] == captured_sha
     assert result["input_sha256"] == hashlib.sha256(trial_seed).hexdigest()
     assert result["input_bytes"] == len(trial_seed)

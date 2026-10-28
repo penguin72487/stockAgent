@@ -15,6 +15,8 @@ import sys
 import threading
 from typing import Collection, Mapping
 
+from stockagent import private_json
+
 _SIGNATURE_CACHE: OrderedDict[Path, tuple[tuple[int, ...], bytes]] = OrderedDict()
 _SIGNATURE_CACHE_LOCK = threading.Lock()
 _MAX_SIGNATURES = 512
@@ -44,7 +46,11 @@ def json_snapshot_metrics() -> dict[str, int]:
                 "resident_charge_bytes": _JSON_RESIDENT_BYTES}
 
 
-def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None):
+def _decode_snapshot_json(text):
+    return private_json.loads(text)
+
+
+def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None, cache: bool = True):
     """Decode only changed sources and return a mutation-isolated JSON value.
 
     Full dev/inode/size/mtime/ctime fences cover append, truncation, in-place
@@ -66,7 +72,7 @@ def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None
             ):
                 return default
             with _JSON_SNAPSHOT_LOCK:
-                cached = _JSON_SNAPSHOTS.get(source)
+                cached = _JSON_SNAPSHOTS.get(source) if cache else None
                 if cached is not None and cached[0] == signature:
                     _JSON_SNAPSHOTS.move_to_end(source)
                     _JSON_COUNTS["hits"] += 1
@@ -92,7 +98,8 @@ def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None
                 finished = metadata_signature(os.fstat(stream.fileno()))
             if max_bytes is not None and len(raw) > max_bytes:
                 return default
-            value = json.loads(raw.decode("utf-8"))
+            text = raw.decode("utf-8")
+            value = _decode_snapshot_json(text)
             with _JSON_SNAPSHOT_LOCK:
                 _JSON_COUNTS["decodes"] += 1
                 _JSON_COUNTS["decoded_bytes"] += len(raw)
@@ -100,6 +107,8 @@ def read_json_snapshot(path: Path, default=None, *, max_bytes: int | None = None
                 with _JSON_SNAPSHOT_LOCK:
                     _JSON_COUNTS["rejected_races"] += 1
                 return default
+            if not cache:
+                return value
             packet = marshal.dumps(value, 4)
             charge = _json_resident_charge(packet)
             if charge <= _JSON_MAX_RESIDENT_BYTES:

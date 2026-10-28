@@ -15,6 +15,11 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+# Preserve acquisition headroom before the desktop owner starts. Its existing
+# per-query guest free-space gate continues to apply during a running session.
+until run_fintech_python "$tej_repo_root/scripts/check_acquisition_capacity.py" --path "$tej_repo_root"; do
+  sleep 60
+done
 tej_python_bin="$(resolve_fintech_python)"
 exec "$tej_python_bin" -m downloader.download_tej_history watch \
   --root "$tej_repo_root/data_tej" \

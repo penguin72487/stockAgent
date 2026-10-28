@@ -92,11 +92,53 @@ def verify(root: Path, expected_identity: str, *, require_ready: bool = True,
             raise ValueError("backup delivery member changed or its content differs")
         return row["relative"], row["bytes"], list(signature(after))
 
+    native_groups, portable = [], []
+    if native_windows_io:
+        from stockagent.data_sync.windows_cold_io import windows_path
+        eligible = []
+        def classify(row):
+            path = regular(root, row["relative"])
+            return row, windows_path(path) is not None and row['bytes'] <= 8 * 1024**3
+        # Classification performs real no-follow path checks. On DrvFS those
+        # metadata reads used to serialize the entire native hash pipeline.
+        # Keep every check and overlap them within the same worker budget.
+        if workers == 1:
+            classified = map(classify, envelope['files'])
+            for row, native in classified:
+                (eligible if native else portable).append(row)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='backup-path') as pool:
+                for row, native in pool.map(classify, envelope['files']):
+                    (eligible if native else portable).append(row)
+        native_groups = [eligible[start:start + 16] for start in range(0, len(eligible), 16)]
+    else:
+        portable = envelope["files"]
+
+    def verify_native_group(rows):
+        # The enrolled adapter hashes all original bytes on Windows and
+        # returns one proof per file. Batch startup/mount checks are bounded;
+        # exact path, physical volume and stable inode checks remain intact.
+        from stockagent.data_sync.windows_cold_io import hash_many
+        paths = [regular(root, row["relative"]) for row in rows]
+        before = [path.stat() for path in paths]
+        hashes = hash_many(paths)
+        result = []
+        signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        for row, path, prior in zip(rows, paths, before):
+            after = path.stat()
+            if (signature(prior) != signature(after) or prior.st_size != row["bytes"]
+                    or hashes[path] != row["sha256"]):
+                raise ValueError("backup delivery member changed or its content differs")
+            result.append((row["relative"], row["bytes"], list(signature(after))))
+        return result
+
     if workers == 1:
-        results = [verify_member(row) for row in envelope["files"]]
+        results = [item for group in native_groups for item in verify_native_group(group)]
+        results.extend(verify_member(row) for row in portable)
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="backup-sha") as pool:
-            results = list(pool.map(verify_member, envelope["files"]))
+            results = [item for group in pool.map(verify_native_group, native_groups) for item in group]
+            results.extend(pool.map(verify_member, portable))
     total = sum(row[1] for row in results)
     signatures = {row[0]: row[2] for row in results} if include_file_signatures else {}
     observed = set()

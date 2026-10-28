@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.live.dashboard_updates import metadata_signature  # noqa: E402
+from stockagent.live.data_monitor_record_store import cache_file, stable_record_cache_bytes  # noqa: E402
 from stockagent.live.data_monitor_dashboard import _MARKET_CATEGORY_LABELS  # noqa: E402
 from stockagent.live.data_monitor_feature_receipt import (  # noqa: E402
     feature_observation_binding,
@@ -40,6 +41,9 @@ from stockagent.live.data_monitor_inventory import (  # noqa: E402
 
 
 def _stable_bytes(path: Path) -> tuple[bytes, os.stat_result]:
+    if path.name == "record_inventory_cache.json" and cache_file(path) != path:
+        before = path.stat()
+        return stable_record_cache_bytes(path), before
     before = path.stat()
     with path.open("rb") as stream:
         opened = os.fstat(stream.fileno())

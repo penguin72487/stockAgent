@@ -253,13 +253,14 @@ def test_failed_symbols_are_retried_without_repeating_source_empty_symbols(tmp_p
     assert receipt["retry_symbols"] == []
 
 
-def _discovery(mode, *, price=50.0):
+def _discovery(mode, *, price=50.0, lower=50.0):
     return runner._missed_opening_quote_symbols(
         spec=SimpleNamespace(initial_capital_twd=10_000_000.0, lot_size=1000),
         rows=[{"symbol": "2330", "target_weight": 0.003, "open_price": price,
                "current_price": 50.0, "tradable": True, "can_buy": True}],
         eligibility={"2330": SimpleNamespace(covered=True, eligible=True, short_open=True)},
         mode=mode, observed=NOW,
+        price_limits={"2330": (55.0, 60.0, lower)} if lower is not None else {},
     )[0]
 
 
@@ -282,7 +283,33 @@ def test_pruning_keeps_inventory_unknown_accounting_and_invalid_nav(extra):
 
 
 def test_pruning_keeps_unknown_official_open_even_when_current_price_is_known():
-    assert _discovery({"initial_capital_twd": 10_000_000.0}, price=None) == {"2330"}
+    assert _discovery({"initial_capital_twd": 10_000_000.0}, price=None, lower=None) == {"2330"}
+
+
+def test_pruning_uses_daily_lower_bound_not_a_later_unproven_open():
+    # The later snapshot says 50, implying only 600 shares, but at the lawful
+    # 20 lower limit the same NAV and weight could buy a whole lot.
+    assert _discovery({"initial_capital_twd": 10_000_000.0}, price=50, lower=20) == {"2330"}
+
+
+@pytest.mark.parametrize("weight", [0.1, -0.1])
+def test_waiting_open_price_enters_recovery_scope_without_bypassing_eligibility(weight):
+    spec = SimpleNamespace(initial_capital_twd=10_000_000.0, lot_size=1000,
+                           signal_update_policy=runner.SIGNAL_UPDATE_PROGRESSIVE)
+    row = {"symbol": "2330", "target_weight": weight, "open_price": None,
+           "current_price": 100.0, "tradable": True, "can_buy": False, "can_sell": False,
+           "opening_price_wait_reason": "awaiting_first_trade_print"}
+    eligible = SimpleNamespace(covered=True, eligible=True, short_open=True)
+    def discover(candidate, evidence):
+        return runner._missed_opening_quote_symbols(
+            spec=spec, rows=[candidate], eligibility={"2330": evidence},
+            mode={"initial_capital_twd": 10_000_000.0}, observed=NOW, price_limits={},
+        )[0]
+    assert discover(row, eligible) == {"2330"}
+    assert discover(row, SimpleNamespace(covered=False, eligible=True, short_open=True)) == set()
+    if weight < 0:
+        assert discover(row, SimpleNamespace(covered=True, eligible=True, short_open=False)) == set()
+    assert discover({**row, "open_price": 100.0, "opening_price_wait_reason": None}, eligible) == set()
 
 
 def test_large_quote_universe_reconciles_before_ttl_without_exceeding_subscription_cap(monkeypatch):
@@ -337,6 +364,274 @@ def test_large_quote_universe_reconciles_before_ttl_without_exceeding_subscripti
     assert runner._stream_rotation_interval_seconds(False) == 1.0
 
 
+def test_position_stream_preempts_recovery_even_during_rotation_dwell(monkeypatch):
+    from stockagent.live import quote_provider as provider
+
+    clock = [100.0]
+    subscribed = set()
+    calls = []
+
+    class API:
+        contracts = SimpleNamespace(get=lambda code: SimpleNamespace(code=code))
+
+        def set_on_quote_stk_v1_callback(self, _callback):
+            pass
+
+        def subscribe(self, contract, **_kwargs):
+            subscribed.add(contract.code)
+            calls.append(("subscribe", contract.code))
+            assert len(subscribed) <= 200
+
+        def unsubscribe(self, contract, **_kwargs):
+            subscribed.remove(contract.code)
+            calls.append(("unsubscribe", contract.code))
+
+    api = API()
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: api)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_API", None)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_SUBSCRIPTIONS", set())
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROWS", {})
+    monkeypatch.setattr(provider, "_load_prepared_tw_price_limits", lambda _day: ({}, None))
+    monkeypatch.setattr(provider.time, "monotonic", lambda: clock[0])
+    symbols = [str(1000 + i) for i in range(366)]
+
+    for _ in range(8):
+        provider.fetch_shioaji_stock_live_quotes(symbols, trading_date=NOW.date())
+    assert len(subscribed) == 200
+    assert provider._SHIOAJI_STREAM_TARGET_READY
+    priority = tuple(symbols[-45:])
+    assert not set(priority) & subscribed
+    calls.clear()
+
+    # Even frozen/dwelling target is preempted; the first bounded batch is all
+    # held symbols, not alphabetically earlier recovery work.
+    first = provider.fetch_shioaji_stock_live_quotes(
+        symbols, trading_date=NOW.date(), allow_rotation=False, priority_symbols=priority
+    )
+    first_adds = [code for action, code in calls if action == "subscribe"]
+    assert len(first_adds) == 25
+    assert set(first_adds) <= set(priority)
+    assert first[priority[0]]["stream_reconciliation_pending"]
+    assert not first[priority[0]]["available"]  # Subscription is not a quote.
+    for _ in range(8):
+        final = provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=priority
+        )
+    assert set(priority) <= subscribed
+    assert not final[priority[0]]["stream_reconciliation_pending"]
+    clock[0] = provider._SHIOAJI_STREAM_ROTATION_AT + .01
+    for _ in range(8):
+        rotated = provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=priority
+        )
+    assert set(priority) <= subscribed
+    assert all(rotated[code]["stream_subscribed"] for code in priority)
+
+
+def test_held_positions_are_separate_from_pending_entries():
+    engine = SimpleNamespace(state={"modes": {
+        "a": {"positions": {"p": {"symbol": "2330", "signed_shares": -1000},
+                            "flat": {"symbol": "2317", "signed_shares": 0}},
+              "pending_entry_orders": {"2454": {"status": "waiting_source", "sizing_pending": True}}},
+        "b": {"positions": {"p": {"symbol": "2330", "signed_shares": 1000}}},
+    }})
+    assert runner._held_symbols(engine) == ("2330",)
+    assert runner._active_symbols(engine)[0] == ["2330", "2454"]
+
+
+def test_quote_fetch_passes_position_priority_to_shared_stream(tmp_path, monkeypatch):
+    seen = []
+
+    def stream(symbols, *, trading_date, priority_symbols):
+        seen.append((symbols, trading_date, priority_symbols))
+        return {symbol: {"available": False} for symbol in symbols}
+
+    monkeypatch.setattr(runner, "fetch_shioaji_stock_live_quotes", stream)
+    result = runner._fetch_quotes(
+        symbols=["1101", "2330"], fallback_by_symbol={}, parquet_root=tmp_path,
+        trading_date=NOW, use_stream=True, priority_symbols=("2330",),
+    )
+    assert seen == [(["1101", "2330"], NOW.date(), ("2330",))]
+    assert result["2330"]["available"] is False
+
+
+@pytest.mark.parametrize("hour,minute,deferred", [
+    (8, 59, False), (9, 0, True), (13, 34, True), (13, 35, False),
+])
+def test_intraday_history_deferral_is_based_on_request_time_not_session_date(hour, minute, deferred):
+    from datetime import date
+    from stockagent.live import quote_provider as provider
+
+    observed = NOW.replace(hour=hour, minute=minute)
+    assert provider._defer_live_0901_history(date(2026, 2, 25), observed=observed) is deferred
+
+
+def test_intraday_recovery_defers_without_login_and_retains_unqueried_evidence(tmp_path, monkeypatch):
+    from stockagent.live import quote_provider as provider
+
+    monkeypatch.setattr(provider, "_defer_live_0901_history", lambda *_a, **_kw: True)
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: pytest.fail("must not log in"))
+    monkeypatch.setattr(runner, "load_local_stock_0901_vwaps", _local_empty)
+    prices, receipt = runner._resolve_missed_opening_prices(tmp_path, NOW, {"2330", "4905"})
+    assert prices == {}
+    assert receipt["provider_policy_deferred"]
+    assert receipt["unqueried_symbols"] == 2
+    assert receipt["attempted_symbols"] == []
+    assert runner._missed_opening_query_pending(prices, receipt, {"2330", "4905"}, NOW)
+
+    # The same receipt can resume after the session instead of treating a
+    # deferred query as a confirmed absence of a real execution price.
+    monkeypatch.setattr(runner, "fetch_shioaji_historical_stock_0901_vwaps", lambda symbols, **_kw: _fetched(symbols))
+    prices, receipt = runner._resolve_missed_opening_prices(
+        tmp_path, NOW.replace(hour=13, minute=35), {"2330", "4905"}
+    )
+    assert set(prices) == {"2330", "4905"}
+    assert not receipt["provider_policy_deferred"]
+
+
+def test_more_held_positions_than_capacity_are_rotated_and_not_misreported(monkeypatch):
+    from stockagent.live import quote_provider as provider
+
+    clock = [100.0]
+    subscribed = set()
+
+    class API:
+        contracts = SimpleNamespace(get=lambda code: SimpleNamespace(code=code))
+        def set_on_quote_stk_v1_callback(self, _callback):
+            pass
+        def subscribe(self, contract, **_kwargs):
+            subscribed.add(contract.code)
+            assert len(subscribed) <= 200
+        def unsubscribe(self, contract, **_kwargs):
+            subscribed.remove(contract.code)
+
+    api = API()
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: api)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_API", None)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_SUBSCRIPTIONS", set())
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROWS", {})
+    monkeypatch.setattr(provider, "_load_prepared_tw_price_limits", lambda _day: ({}, None))
+    monkeypatch.setattr(provider.time, "monotonic", lambda: clock[0])
+    symbols = [str(1000 + i) for i in range(250)]
+    priority = tuple(symbols[:220])
+    for _ in range(8):
+        first = provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=priority
+        )
+    first_subscribed = set(subscribed)
+    assert first_subscribed <= set(priority)
+    assert sum(first[s]["stream_capacity_limited"] for s in priority) == 20
+    clock[0] = provider._SHIOAJI_STREAM_ROTATION_AT + .01
+    for _ in range(8):
+        second = provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=priority
+        )
+    assert first_subscribed | subscribed == set(priority)
+    assert all(second[s]["stream_capacity_limited"] for s in symbols[220:])
+
+
+def test_pending_orders_are_not_starved_by_oversubscribed_held_positions(monkeypatch):
+    from stockagent.live import quote_provider as provider
+
+    clock, subscribed = [100.0], set()
+
+    class API:
+        contracts = SimpleNamespace(get=lambda code: SimpleNamespace(code=code))
+        def set_on_quote_stk_v1_callback(self, _callback):
+            pass
+        def subscribe(self, contract, **_kwargs):
+            subscribed.add(contract.code)
+            assert len(subscribed) <= 200
+        def unsubscribe(self, contract, **_kwargs):
+            subscribed.remove(contract.code)
+
+    monkeypatch.setattr(provider, "_shioaji_stock_api", lambda: API_SINGLETON)
+    API_SINGLETON = API()
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_API", None)
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_SUBSCRIPTIONS", set())
+    monkeypatch.setattr(provider, "_SHIOAJI_STREAM_ROWS", {})
+    monkeypatch.setattr(provider, "_load_prepared_tw_price_limits", lambda _day: ({}, None))
+    monkeypatch.setattr(provider.time, "monotonic", lambda: clock[0])
+    held = tuple(str(1000 + i) for i in range(630))
+    pending = tuple(str(8000 + i) for i in range(25))
+    symbols = list(held + pending)
+
+    # Fully establish an existing all-held target, then admit new work without
+    # waiting for the old dwell window; a subscription is not a fill proof.
+    for _ in range(8):
+        provider.fetch_shioaji_stock_live_quotes(symbols, trading_date=NOW.date(), priority_symbols=held)
+    first = provider.fetch_shioaji_stock_live_quotes(
+        symbols, trading_date=NOW.date(), priority_symbols=held, pending_symbols=pending,
+        allow_rotation=False,
+    )
+    assert len(subscribed & set(pending)) == 20
+    assert sum(first[s]["stream_capacity_limited"] is False for s in held) == 180
+    assert all(not first[s]["available"] for s in pending)
+    for _ in range(8):
+        provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=held, pending_symbols=pending,
+        )
+    first_pending = subscribed & set(pending)
+    clock[0] = provider._SHIOAJI_STREAM_ROTATION_AT + .01
+    for _ in range(8):
+        provider.fetch_shioaji_stock_live_quotes(
+            symbols, trading_date=NOW.date(), priority_symbols=held, pending_symbols=pending,
+        )
+    assert first_pending | (subscribed & set(pending)) == set(pending)
+    assert len(subscribed & set(held)) == 180
+
+
+def test_after_entry_cutoff_only_existing_exposure_preempts_quote_rotation():
+    pending, held = {"2330", "2454"}, {"2330", "2317"}
+    assert runner._stream_pending_priority(pending, held, NOW.replace(hour=13, minute=19).time()) == ("2330", "2454")
+    assert runner._stream_pending_priority(pending, held, NOW.replace(hour=13, minute=20).time()) == ("2330",)
+
+
+@pytest.mark.parametrize("hour,minute,second,allowed", [
+    (9, 0, 59, False), (9, 1, 0, True), (13, 19, 59, True),
+    (13, 20, 0, False), (13, 35, 0, False),
+])
+def test_missed_opening_never_registers_live_inventory_after_exit_cutoff(
+    hour, minute, second, allowed,
+):
+    clock = NOW.replace(hour=hour, minute=minute, second=second).time()
+    assert runner._missed_opening_live_registration_allowed(clock) is allowed
+
+
+def test_replay_uses_only_sourced_same_session_first_print_for_sizing():
+    row = {"symbol": "2330", "session_open_price_0900": 100.0,
+           "session_open_price_source": "shioaji:historical_first_trade_session_open",
+           "tick_volume_units_0901": 3.0,
+           "source_window_start": "2026-10-01T09:00:01+08:00",
+           "source_window_end": "2026-10-01T09:00:59+08:00",
+           "execution_price_0901": 102.0}
+    kwargs = {"session_date": NOW.date(), "symbol": "2330"}
+    assert runner._replay_sizing_open_evidence(None, {}, row, **kwargs) == (100.0, row["session_open_price_source"])
+    # A late signal value cannot override the independently observed first print.
+    assert runner._replay_sizing_open_price(99.0, {}, row, **kwargs) == 100.0
+    for change in ({"tick_volume_units_0901": 0}, {"symbol": "2317"},
+                   {"session_open_price_source": "unverified"},
+                   {"source_window_start": "2026-09-30T09:00:01+08:00"},
+                   {"source_window_end": "2026-10-01T09:02:00+08:00"}):
+        assert runner._replay_sizing_open_price(None, {"last": 102}, {**row, **change}, **kwargs) is None
+
+
+def test_replay_rejects_late_trial_or_unclocked_open_quotes():
+    early = {"symbol": "2330", "open": 100.0, "source": "stream",
+             "quote_at": "2026-10-01T09:00:05+08:00",
+             "book_exchange_at": "2026-10-01T09:00:04+08:00",
+             "simtrade": False, "cumulative_volume_lots": 1}
+    kwargs = {"session_date": NOW.date(), "symbol": "2330"}
+    assert runner._replay_sizing_open_evidence(99.0, early, **kwargs) == (100.0, "stream")
+    for change in ({"quote_at": "2026-10-01T09:19:00+08:00"},
+                   {"book_exchange_at": "2026-10-01T09:02:00+08:00"},
+                   {"simtrade": True}, {"simtrade": None},
+                   {"cumulative_volume_lots": 0}, {"symbol": "2317"},
+                   {"quote_at": None}):
+        assert runner._replay_sizing_open_evidence(99.0, {**early, **change}, **kwargs) == (None, None)
+    assert runner._replay_sizing_open_evidence(99.0, {"open": 100}, **kwargs) == (None, None)
+
+
 def test_history_rate_window_is_shared_across_small_recovery_batches(monkeypatch):
     from collections import deque
     from stockagent.live import quote_provider as provider
@@ -386,6 +681,7 @@ def test_failed_high_priority_symbol_does_not_starve_unqueried_symbols(tmp_path,
     ({"source_settling": True, "unqueried_symbols": 2}, 0.0),
     ({"source_settling": True, "unqueried_symbols": 0}, 5.0),
     ({"stopped_for_traffic": True, "unqueried_symbols": 2}, 60.0),
+    ({"provider_policy_deferred": True, "unqueried_symbols": 2}, 30.0),
     ({"retry_symbols": [], "unqueried_symbols": 0}, 0.0),
 ])
 def test_recovery_retry_cooldown_does_not_delay_independent_fresh_work(
@@ -425,12 +721,24 @@ def test_snapshot_backup_preserves_execution_fields_and_requires_current_source(
     original = {"source": "shioaji_stock_quote_stream", "bid": None, "ask": None,
                 "last": None, "available": False, "simtrade": None, "quote_at": None}
     quotes = {"2330": dict(original)}
-    runner._attach_snapshot_valuation_quotes(quotes, engine=engine, observed=NOW)
+    runner._attach_snapshot_valuation_quotes(quotes, engine=engine, observed=NOW.replace(hour=13, minute=35))
     assert {k:quotes["2330"][k] for k in original} == original
     assert (quotes["2330"].get("valuation_bid") == 99.5) is expected
     if expected:
         assert quotes["2330"]["valuation_quote_source"] == "shioaji:stock_snapshot"
         assert quotes["2330"]["valuation_simtrade"] is (None if trial == -1 else False)
+
+
+@pytest.mark.parametrize("hour,minute", [(9, 0), (9, 5), (13, 34)])
+def test_intraday_missing_marks_never_poll_broker_snapshots(monkeypatch, hour, minute):
+    engine = SimpleNamespace(state={"modes": {"one": {"positions": {"p": {
+        "symbol": "2330", "signed_shares": 1000, "side": "long", "entry_price": 100.0,
+    }}}}})
+    monkeypatch.setattr(runner, "fetch_shioaji_stock_snapshots",
+                        lambda *_a, **_kw: pytest.fail("intraday snapshot polling"))
+    quotes = {"2330": {"available": False}}
+    runner._attach_snapshot_valuation_quotes(quotes, engine=engine, observed=NOW.replace(hour=hour, minute=minute))
+    assert quotes == {"2330": {"available": False}}
 
 
 def test_incomplete_legacy_receipt_does_not_turn_unqueried_prices_into_source_empty(tmp_path, monkeypatch):

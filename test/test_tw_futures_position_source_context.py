@@ -16,6 +16,153 @@ from scripts.build_tw_futures_margin_event_candidates import (
 from downloader.artifact_io import sha256_file
 
 
+@pytest.mark.parametrize('problem', [None, 'after', 'before', 'phase', 'temporary',
+    'scope', 'native_quote', 'native_issue', 'native_effective', 'announcement',
+    'late_index', 'known_at', 'same_bytes', 'source_sha'])
+def test_reused_margin_attachment_requires_independent_exact_dated_event(monkeypatch, problem):
+    from scripts.repair_tw_futures_margin_source_intervals import exclude_reused_margin_attachment_bindings
+    from stockagent.data.tw_futures_margin_preparation import margin_candidate_intervals
+    bad = dict(product='TX', margin_kind='fixed_twd', after=[77000., 59000., 57000.],
+        before=[92000., 71000., 68000.], effective_date='2009-08-24',
+        effective_phase='after_product_regular_close', published_date='2009-07-29',
+        known_at='2009-07-29T23:59:59+08:00', issue_date_bound=False,
+        clock_error='historical attachment issuing date disagrees with index',
+        source_url='https://www.taifex.com.tw/reused.pdf', source_content_sha256='a'*64,
+        temporary_end_evidence='[]', requires_reversion_review=False)
+    peer = dict(bad, source_url='https://www.taifex.com.tw/dated.pdf',
+        source_content_sha256='b'*64, published_date='2009-08-21',
+        known_at='2009-08-21T23:59:59+08:00', issue_date_bound=True, clock_error=None)
+    if problem == 'after': peer['after'] = [78000., 59000., 57000.]
+    if problem == 'before': peer['before'] = [93000., 71000., 68000.]
+    if problem == 'phase': peer['effective_phase'] = 'product_regular_open'
+    if problem == 'temporary': bad['requires_reversion_review'] = True
+    if problem == 'late_index': bad['published_date'] = '2009-08-22'
+    if problem == 'known_at': peer['known_at'] = '2009-08-21T08:00:00+08:00'
+    if problem == 'same_bytes': bad['source_content_sha256'] = 'b'*64
+    originals = deepcopy([bad, peer])
+    native = deepcopy(originals)
+    if problem == 'native_quote': native[0]['after'][0] = 78000.
+    monkeypatch.setattr(builder, 'reextract_retained_margin_text', lambda *a, **k: native)
+    conn = sqlite3.connect(':memory:'); conn.row_factory = sqlite3.Row
+    conn.execute('CREATE TABLE announcements(url TEXT,published_date TEXT,category TEXT)')
+    if problem != 'announcement':
+        conn.execute('INSERT INTO announcements VALUES(?,?,?)',
+                     (peer['source_url'], peer['published_date'], 'margins'))
+    text = ('臺灣期貨交易所新聞稿中華民國98年8月21日。'
+            '公告調整臺股期貨契約(TX)保證金，並自98年8月24日交易時段結束後起實施。')
+    def document(url):
+        row = bad if url == bad['source_url'] else peer
+        own = text
+        if url == bad['source_url']:
+            if problem == 'native_issue': own = own.replace('8月21日', '8月28日')
+            if problem == 'native_effective': own = own.replace('8月24日', '8月25日')
+        return dict(content_sha256='c'*64 if problem == 'source_sha' else row['source_content_sha256'],
+                    text=own)
+    archive = SimpleNamespace(conn=conn, document=document, children=lambda _: [])
+    if problem == 'source_sha':
+        with pytest.raises(ValueError, match='original SHA mismatch'):
+            exclude_reused_margin_attachment_bindings(archive, originals, products={'TX'})
+    else:
+        selected, rejections = exclude_reused_margin_attachment_bindings(
+            archive, originals, products={'MTX'} if problem == 'scope' else {'TX'})
+        if problem is None:
+            assert selected == [peer] and len(rejections) == 1
+            assert rejections[0]['rejected_fact'] == bad
+            assert rejections[0]['corroborating_fact'] == peer
+            assert not margin_candidate_intervals(originals)[0]
+            levels, _ = margin_candidate_intervals(selected)
+            assert len(levels) == 1 and levels[0]['initial'] == 77000.
+            assert levels[0]['known_at'] == peer['known_at']
+            assert levels[0]['source_content_sha256s'] == ['b'*64]
+        else:
+            assert selected == originals and not rejections
+    assert originals == [bad, peer]
+    conn.close()
+
+
+@pytest.mark.parametrize('target_kind', ['fixed_twd', 'fixed_unresolved_currency', 'notional_rate', None])
+def test_fixed_attachment_repair_reuses_unrelated_stock_disposition_context(monkeypatch, tmp_path, target_kind):
+    import scripts.repair_tw_futures_margin_source_intervals as repair
+    import stockagent.data.tw_futures_margin_preparation as margin
+    from downloader.artifact_io import sha256_file
+
+    current = tmp_path / 'current'; current.mkdir()
+    (current / 'manifest.json').write_text('{}')
+    (current / 'dated_margin_ratio_laws.json').write_text('[]')
+    worklist = tmp_path / 'gaps.csv'
+    pl.DataFrame(dict(product=['TX'], contract=['201103'],
+        missing_opening_margin=[True], missing_settlement_margin=[True])).write_csv(worklist)
+    facts = pl.DataFrame([
+        dict(product='TX', margin_kind=target_kind, source_url='',
+             requires_reversion_review=False, visual_review_sha256=None, extraction='native'),
+        dict(product='AAF', margin_kind='notional_rate', source_url='',
+             requires_reversion_review=False, visual_review_sha256=None,
+             extraction='observed_disposition_conditional_restoration')])
+    levels = pl.DataFrame(dict(product=['TX', 'AAF'], effective_date=['2009-08-24'] * 2,
+                               effective_phase=['after_product_regular_close'] * 2))
+    facts.write_parquet(current / 'margin_event_candidates.parquet')
+    unrelated = dict(path='unrelated_stock_restoration.json', sha256='a' * 64,
+                     url='https://www.taifex.com.tw/stock-only', kind='restoration_evidence_manifest')
+    manifest = dict(sources=[unrelated])
+    monkeypatch.setattr(repair, 'read_bound_output', lambda path:
+        (facts if path.name == 'margin_event_candidates.parquet' else levels, manifest))
+
+    class Archive:
+        def __init__(self, *args):
+            self.sources = {}; self.cache = {}; self.conn = SimpleNamespace(close=lambda: None)
+
+        def copy(self, path, expected_sha, *, url, kind):
+            assert sha256_file(path) == expected_sha
+            self.sources[str(path)] = dict(path=str(path), sha256=expected_sha, url=url, kind=kind)
+
+    monkeypatch.setattr(margin, 'RuleArchive', Archive)
+    monkeypatch.setattr(repair, 'bind_retained_margin_sources', lambda *a, **k: [])
+    monkeypatch.setattr(builder, 'repair_missing_margin_source_context', lambda *a, **k: [])
+    monkeypatch.setattr(builder, 'compose_same_notice_margin_clocks', lambda *a, **k: [])
+    monkeypatch.setattr(repair, 'exclude_reused_margin_attachment_bindings',
+                        lambda archive, rows, **kwargs: (rows, []))
+    monkeypatch.setattr(repair, 'margin_candidate_intervals', lambda *a: (levels.to_dicts(), []))
+    monkeypatch.setattr(repair, 'compose_margin_ratio_intervals', lambda rows, laws: (rows, []))
+    out = tmp_path / 'out'
+    args = (current, worklist, out, tmp_path / 'receipt.json')
+    if target_kind not in ('fixed_twd', 'fixed_unresolved_currency'):
+        with pytest.raises(FileNotFoundError, match='unrelated_stock_restoration'):
+            repair.prepare_margin_repairs(*args, archive_root=tmp_path,
+                                          reconcile_reused_attachments=True)
+        return
+    repair.prepare_margin_repairs(*args, archive_root=tmp_path, reconcile_reused_attachments=True)
+    assert pl.read_parquet(out / 'margin_event_candidates.parquet').equals(facts)
+    assert pl.read_parquet(out / 'margin_level_intervals.parquet').equals(levels.sort(
+        'product', 'effective_date', 'effective_phase'))
+    proof = json.loads((out / 'manifest.json').read_text())
+    assert proof['retained_disposition_restorations_reused'] is True
+    assert proof['retained_margin_facts_sha256'] == sha256_file(current / 'margin_event_candidates.parquet')
+    assert not proof['restoration_inputs'] and not proof['changed_products']
+
+
+@pytest.mark.parametrize('label,code,extra,accepted', [
+    ('T X', 'TX', '', True), ('T F', 'TF', '', True),
+    ('T X O', 'TXO', '', False), ('T X', 'TF', '', False),
+    ('T X', None, '', False), ('T X', 'TX', '\nTE 原始保證金', False),
+    ('T\nX', 'TX', '', False), ('T X Q', 'TX', '', False),
+])
+def test_native_spaced_margin_header_needs_literal_same_source_code(label, code, extra, accepted):
+    from stockagent.data.tw_futures_margin_preparation import margin_table_candidates
+    introduction = '' if code is None else f'公告調整期貨契約({code})保證金。\n'
+    text = (introduction + '單位：新臺幣元\n調整後保證金金額 調整前保證金金額\n'
+            + label + '      原始保證金\n金額\n維持保證金\n金額\n結算保證金\n金額\n'
+            '原始保證金\n金額\n維持保證金\n金額\n結算保證金\n金額\n'
+            + extra + '\n保證金 77,000 59,000 57,000 92,000 71,000 68,000\n')
+    rows = margin_table_candidates(text)
+    if not accepted:
+        assert not rows
+        return
+    assert len(rows) == 1 and rows[0]['product'] == code
+    assert rows[0]['after'] == [77000., 59000., 57000.]
+    assert rows[0]['before'] == [92000., 71000., 68000.]
+    assert rows[0]['candidate_only'] is True
+
+
 @pytest.mark.parametrize('edge',['left','right','both','partial','interior','ragged'])
 def test_position_grid_removes_only_completely_empty_edge_columns(edge):
     from stockagent.data.tw_futures_margin_preparation import corporate_position_table_candidates
@@ -170,6 +317,262 @@ def test_inspected_multi_origin_position_units_do_not_create_financial_events(co
     with pytest.raises(ValueError,match='absent'):
         corporate_position_table_candidates(pages,corporate=financial,allow_table_only_members=True,
             group_text='CN1與KIF部位合併計算。')
+
+
+@pytest.mark.parametrize('problem', ['partial_ocr', 'missing_labels', 'contrary_amount',
+    'ambiguous_dividend', 'before_reform', 'adjusted_code', 'missing_dividend'])
+def test_same_code_dividend_derives_exact_cash_without_repairing_ocr_digits(problem):
+    from stockagent.data.tw_futures_margin_preparation import corporate_grid_candidates
+    cells=[['調整生效日','100年7月13日'],['調整契約月份','100年7月及8月到期契約'],
+        ['契約代號','不調整(仍為CAF)'],['約定標的物','不調整(仍為2,000股標的證券)'],
+        ['契約乘數','不調整(仍為2,000)']]
+    text='南亞分派現金股利，每股配發現金股利4.7元。'
+    if problem=='partial_ocr':cells.extend([['買方權益數加項','£9,400元'],['賣方權益數減項','']])
+    if problem=='contrary_amount':cells.extend([['買方權益數加項','新臺幣9,500元'],['賣方權益數減項','新臺幣9,500元']])
+    if problem=='ambiguous_dividend':text+='另每股配發現金股利5元。'
+    if problem=='before_reform':cells[0][1]='100年4月13日'
+    if problem=='adjusted_code':cells[2][1]='CAF調整為CA1'
+    if problem=='missing_dividend':text='現金股利金額字樣無法讀取。'
+    fact=corporate_grid_candidates(cells,text)[0]
+    if problem in ('partial_ocr','missing_labels'):
+        assert fact['equity_credit_long_per_contract']==9400
+        assert fact['equity_debit_short_per_contract']==9400
+        assert fact['cash_equity_pair_agrees'] and fact['has_equity_credit_fields']
+        assert fact['equity_cash_derivation']['per_unit_literal']=='4.7'
+        assert fact['equity_cash_derivation']['contract']=='same_code_cash_dividend_per_unit_v2'
+    else:
+        assert fact['equity_credit_long_per_contract'] is None
+        assert not fact['cash_equity_pair_agrees']
+        assert fact['equity_cash_derivation'] is None
+        if problem not in ('before_reform','adjusted_code'):
+            assert fact['has_equity_credit_fields']
+
+
+def test_one_missing_cash_label_view_cannot_override_same_source_required_conversion():
+    from stockagent.data.tw_futures_margin_preparation import corporate_grid_candidates,corporate_terms_intervals
+    cells=[['調整生效日','100年7月13日'],['調整契約月份','100年7月到期契約'],
+        ['契約代號','不調整(仍為CAF)'],['約定標的物','不調整(仍為2,000股標的證券)'],
+        ['契約乘數','不調整(仍為2,000)']]
+    fact=corporate_grid_candidates(cells,'現金股利公告，金額無法讀取。')[0]
+    fact.update(source_content_sha256='a'*64,source_url='official',
+        issue_date_bound=True,known_at='2011-07-04T23:59:59+08:00')
+    old=dict(fact,has_equity_credit_fields=False)
+    # Even a retained legacy view alone cannot waive the known same-code
+    # post-reform conversion merely because its cash row labels were lost.
+    legacy_terms,_=corporate_terms_intervals([old])
+    assert not legacy_terms
+    terms,issues=corporate_terms_intervals([old,fact])
+    assert not terms
+    assert any('equity_cash_credit_unresolved' in row['reasons'] for row in issues)
+    resolved=corporate_grid_candidates(cells,'每股配發現金股利4.7元。')[0]
+    resolved.update({k:fact[k] for k in ['source_content_sha256','source_url','issue_date_bound','known_at']})
+    terms,_=corporate_terms_intervals([old,fact,resolved])
+    assert len(terms)==1 and terms[0]['equity_cash_credit_twd']==9400
+
+
+@pytest.mark.parametrize('missing_month',[False,True])
+@pytest.mark.parametrize('publication',['single','unique_same_bytes','ambiguous','later_index','after_adjustment'])
+def test_corporate_cash_repair_accepts_integrated_metadata_without_using_it_as_a_document(tmp_path,missing_month,publication):
+    import gzip
+    import hashlib
+    from scripts.repair_tw_futures_margin_source_intervals import prepare_corporate_repairs
+    from stockagent.data.tw_futures_margin_preparation import corporate_text_candidates,corporate_terms_intervals
+    current=tmp_path/'current';current.mkdir()
+    text=('發文日期：中華民國100年7月1日\n每股配發現金股利4.7元。\n'
+        '一、契約調整：調整生效日：100年7月13日\n'
+        '調整契約月份：100年7月到期契約\n(一)期貨調整：\n'
+        '契約代號 不調整(仍為CAF)\n約定標的物 不調整(仍為2,000股標的證券)\n'
+        '契約乘數 不調整(仍為2,000)\n(二)選擇權調整：')
+    raw=current/'original.gz';raw.write_bytes(gzip.compress(text.encode()))
+    content=hashlib.sha256(text.encode()).hexdigest()
+    url='https://official.test/ChineseLegacyName.pdf' if missing_month else 'https://official.test/1303_20110713.pdf'
+    doc=current/'parsed.json';doc.write_text(json.dumps(dict(text=text,format='pdf',
+        content_sha256=content,raw_sha256=sha256_file(raw),source_url=url)))
+    metadata=current/'legal_input.json';metadata.write_text('{"not_an_announcement":true}')
+    fact=corporate_text_candidates(text)[0]
+    fact.update(source_url=url,announcement_url=url,source_content_sha256=content,
+        published_date='2011-07-04',known_at='2011-07-04T23:59:59+08:00',issue_date_bound=True,
+        has_equity_credit_fields=False,cash_equity_pair_agrees=False,
+        equity_credit_long_per_contract=None,equity_debit_short_per_contract=None,
+        equity_cash_derivation=None)
+    if publication in ('later_index','after_adjustment'):
+        fact['published_date']='2011-07-11' if publication=='later_index' else '2011-07-15'
+    if missing_month:fact['contract_months']=[]
+    payload=current/'corporate_event_candidates.parquet'
+    rows=[fact]
+    if publication in ('unique_same_bytes','ambiguous'):
+        rows.append(dict(fact,published_date='2011-06-25' if publication=='unique_same_bytes' else '2011-07-02'))
+    pl.from_dicts(rows,infer_schema_length=None).write_parquet(payload)
+    sources=[dict(path=raw.name,sha256=sha256_file(raw),url=url,kind='raw_gzip'),
+        dict(path=doc.name,sha256=sha256_file(doc),url=url,kind='parsed_v2'),
+        dict(path=metadata.name,sha256=sha256_file(metadata),kind='information_halt_input')]
+    (current/'manifest.json').write_text(json.dumps(dict(outputs={payload.name:dict(sha256=sha256_file(payload))},sources=sources)))
+    work=tmp_path/'work.csv'
+    pl.DataFrame(dict(date=[date(2011,7,13)],product=['CAF'],contract=['' if missing_month else '201107'],
+        missing_adjusted_terms=[True],unresolved_lifetime=[False],lost_inventory_continuation=[False])).write_csv(work)
+    output=tmp_path/'repair'
+    prepare_corporate_repairs(current,work,output,tmp_path/'receipt.json')
+    combined=pl.read_parquet(output/'corporate_event_candidates.parquet')
+    terms,_=corporate_terms_intervals(combined.to_dicts())
+    proof=json.loads((output/'manifest.json').read_text())
+    if publication in ('ambiguous','after_adjustment'):
+        assert not terms
+        assert proof['source_failures'][0]['reason']==('conflicting_retained_publication'
+            if publication=='ambiguous' else 'no_receipt_bound_publication_text')
+    else:
+        assert len(terms)==1 and terms[0]['equity_cash_credit_twd']==9400
+        assert terms[0]['known_at']==('2011-07-11T23:59:59+08:00' if publication=='later_index'
+            else '2011-07-04T23:59:59+08:00')
+        if publication=='later_index':
+            assert any('later_index_before_adjustment_v1' in r for r in
+                combined['publication_clock_evidence'].drop_nulls())
+    assert metadata.name not in proof['source_sha256s']
+    assert sha256_file(metadata)==sources[-1]['sha256']
+
+
+@pytest.mark.parametrize('defect',[None,'wrong_source','tampered_page','partial'])
+def test_corporate_repair_uses_only_complete_same_original_extraction_overrides(tmp_path,monkeypatch,defect):
+    import gzip
+    import hashlib
+    import shutil
+    import stockagent.data.tw_futures_margin_preparation as prep
+    from scripts.repair_tw_futures_margin_source_intervals import prepare_corporate_repairs
+    text=('發文日期：中華民國100年7月1日\n每股配發現金股利4.7元。\n'
+        '一、契約調整：調整生效日：100年7月13日\n調整契約月份：100年7月到期契約\n'
+        '(一)期貨調整：\n契約代號 不調整(仍為CAF)\n約定標的物 不調整(仍為2,000股標的證券)\n'
+        '契約乘數 不調整(仍為2,000)\n(二)選擇權調整：')
+    current=tmp_path/'parent';current.mkdir();url='https://official.test/1303_20110713.pdf'
+    raw=current/'original.gz';raw.write_bytes(gzip.compress(text.encode()))
+    content=hashlib.sha256(text.encode()).hexdigest()
+    doc=dict(text='',format='pdf',content_sha256=content,raw_sha256=sha256_file(raw),source_url=url)
+    parsed=current/'parsed.json';parsed.write_text(json.dumps(doc))
+    fact=prep.corporate_text_candidates(text)[0]
+    fact.update(source_url=url,announcement_url=url,source_content_sha256=content,published_date='2011-07-04',
+        known_at='2011-07-04T23:59:59+08:00',issue_date_bound=False,has_equity_credit_fields=False,
+        cash_equity_pair_agrees=False,equity_credit_long_per_contract=None,equity_debit_short_per_contract=None,
+        equity_cash_derivation=None)
+    payload=current/'corporate_event_candidates.parquet';pl.from_dicts([fact],infer_schema_length=None).write_parquet(payload)
+    (current/'manifest.json').write_text(json.dumps(dict(outputs={payload.name:dict(sha256=sha256_file(payload))},
+        sources=[dict(path=raw.name,sha256=sha256_file(raw),url=url,kind='raw_gzip'),
+                 dict(path=parsed.name,sha256=sha256_file(parsed),url=url,kind='parsed_v2')])))
+    work=tmp_path/'gaps.csv';pl.DataFrame(dict(product=['CAF'],contract=['201107'],date=['2011-07-13'],
+        missing_adjusted_terms=[True],unresolved_lifetime=[False],lost_inventory_continuation=[False])).write_csv(work)
+    review=tmp_path/'ocr';folder=review/'documents'/content;folder.mkdir(parents=True)
+    candidate=folder/'candidate.txt';candidate.write_text(text)
+    page=folder/'page.png';page.write_bytes(b'page-evidence')
+    status='partial' if defect=='partial' else 'complete'
+    proof=dict(url=url,content_sha256='b'*64 if defect=='wrong_source' else content,status=status,
+        pages=[dict(extraction='ocr_candidate')],files=[dict(path=p.name,sha256=sha256_file(p)) for p in [candidate,page]])
+    (folder/'receipt.json').write_text(json.dumps(proof))
+    (review/'manifest.json').write_text(json.dumps(dict(status=status,point_in_time_verified=False,
+        documents=[dict(status=status,content_sha256=content)],failures=[])))
+    if defect=='tampered_page':page.write_bytes(b'changed')
+    class SourceArchive:
+        def __init__(self,root,bundle):
+            self.bundle=bundle;bundle.mkdir(parents=True);self.sources={};self.conn=SimpleNamespace(close=lambda:None)
+        def document(self,u):
+            assert u==url
+            return doc
+        def copy(self,path,digest,*,url,kind):
+            assert sha256_file(path)==digest
+            relative=digest+''.join(path.suffixes);shutil.copy2(path,self.bundle/relative)
+            self.sources[relative]=dict(path=relative,sha256=digest,url=url,kind=kind)
+            return relative
+    monkeypatch.setattr(prep,'RuleArchive',SourceArchive)
+    output=tmp_path/'delta'
+    if defect in ('wrong_source','tampered_page'):
+        with pytest.raises(ValueError):prepare_corporate_repairs(current,work,output,tmp_path/'receipt.json',
+            review_overrides=[review],archive_root=tmp_path/'archive')
+    else:
+        prepare_corporate_repairs(current,work,output,tmp_path/'receipt.json',
+            review_overrides=[review],archive_root=tmp_path/'archive')
+        terms,_=prep.corporate_terms_intervals(pl.read_parquet(output/payload.name).to_dicts())
+        if defect=='partial':assert not terms
+        else:
+            assert len(terms)==1 and terms[0]['equity_cash_credit_twd']==9400
+            receipt=json.loads((output/'manifest.json').read_text())
+            assert receipt['review_override_admissions'][0]['admitted_complete_documents']==1
+            assert any(r['kind']=='page_extraction_receipt' for r in receipt['sources'])
+
+
+@pytest.mark.parametrize('comma_field',['買方權益數加項','賣方權益數減項'])
+def test_unreadable_comma_only_cash_cell_is_not_a_numeric_operand(comma_field):
+    from stockagent.data.tw_futures_margin_preparation import corporate_grid_candidates
+    cells=[['調整生效日','100年7月13日'],['調整契約月份','100年7月到期契約'],
+        ['契約代號','不調整(仍為CAF)'],['約定標的物','不調整(仍為2,000股標的證券)'],
+        ['契約乘數','不調整(仍為2,000)'],[comma_field,'新臺幣,元']]
+    own=corporate_grid_candidates(cells,'每股配發現金股利4.7元。')[0]
+    assert own['cash_equity_pair_agrees']
+    assert own['equity_credit_long_per_contract']==9400
+    assert own['equity_cash_derivation']['source_side_amount_literals']==[[],[]]
+    unresolved=corporate_grid_candidates(cells,'每股配發現金股利,元。')[0]
+    assert unresolved['equity_credit_long_per_contract'] is None
+    assert not unresolved['cash_equity_pair_agrees']
+
+
+@pytest.mark.parametrize('defect',[None,'parent','worklist','source','scope','discarded','inferred'])
+def test_bounded_corporate_amendment_binds_own_worklist_and_retains_accepted_views(tmp_path,defect):
+    from scripts.repair_tw_futures_margin_source_intervals import compose_bounded_corporate_amendments
+    current,delta=tmp_path/'parent',tmp_path/'delta';current.mkdir();delta.mkdir()
+    original=pl.DataFrame(dict(product=['CAF','CBF'],value=[0.,17.]))
+    payload=current/'corporate_event_candidates.parquet';original.write_parquet(payload)
+    source=current/'original.txt';source.write_text('exact original source')
+    parent=dict(outputs={payload.name:dict(sha256=sha256_file(payload))},sources=[dict(
+        path=source.name,sha256=sha256_file(source),url='https://official.test/notice',kind='review_native')])
+    (current/'manifest.json').write_text(json.dumps(parent))
+    work=tmp_path/'gaps.csv'
+    pl.DataFrame(dict(product=['CAF'],contract=['201107'],date=['2011-07-13'],
+        missing_adjusted_terms=[True],unresolved_lifetime=[False],lost_inventory_continuation=[False])).write_csv(work)
+    incoming=pl.concat([original,pl.DataFrame(dict(product=['OUT' if defect=='scope' else 'CAF'],value=[9400.]))])
+    if defect=='discarded':incoming=incoming.filter(pl.col('product')!='CBF')
+    incoming.write_parquet(delta/payload.name)
+    proof=dict(status='bounded_corporate_source_views_prepared',
+        parent_manifest_sha256=sha256_file(current/'manifest.json'),worklist_sha256=sha256_file(work),
+        financial_values_inferred=False,source_sha256s={source.name:sha256_file(source)},
+        outputs={payload.name:dict(sha256=sha256_file(delta/payload.name))},
+        source_failures=[dict(url='unresolved-other-original',reason='retained')])
+    if defect in ('parent','worklist'):proof[defect+'_manifest_sha256' if defect=='parent' else 'worklist_sha256']='0'*64
+    if defect=='inferred':proof['financial_values_inferred']=True
+    (delta/'manifest.json').write_text(json.dumps(proof))
+    if defect=='source':source.write_text('changed')
+    copied=[]
+    archive=SimpleNamespace(copy=lambda path,digest,**kwargs:copied.append((path,digest)))
+    # Keep a previously inspected CBF view; the new CAF diagnosis is additive.
+    accepted=pl.concat([original,pl.DataFrame(dict(product=['CBF'],value=[23.]))])
+    if defect:
+        with pytest.raises(ValueError):
+            compose_bounded_corporate_amendments(current,accepted,[(delta,work)],archive=archive)
+    else:
+        result,evidence=compose_bounded_corporate_amendments(current,accepted,[(delta,work)],archive=archive)
+        assert result.filter(pl.col('product')=='CBF').equals(accepted.filter(pl.col('product')=='CBF'))
+        assert set(result.filter(pl.col('product')=='CAF')['value'])=={0.,9400.}
+        assert evidence[0]['source_failures']==proof['source_failures']
+        assert evidence[0]['added_views']==1 and len(copied)==3
+        empty,unchanged=compose_bounded_corporate_amendments(current,accepted,[],archive=archive)
+        assert empty.equals(accepted) and unchanged==[]
+
+
+def test_corporate_amendment_numeric_promotion_does_not_expand_product_scope(tmp_path):
+    from scripts.repair_tw_futures_margin_source_intervals import compose_bounded_corporate_amendments
+    current,delta=tmp_path/'parent',tmp_path/'delta';current.mkdir();delta.mkdir()
+    original=pl.DataFrame(dict(product=['CAF','CBF'],from_product=['CAF','CBF'],value=[0,17]))
+    payload=current/'corporate_event_candidates.parquet';original.write_parquet(payload)
+    (current/'manifest.json').write_text(json.dumps(dict(outputs={payload.name:dict(sha256=sha256_file(payload))},sources=[])))
+    work=tmp_path/'gaps.csv'
+    pl.DataFrame(dict(product=['CAF'],contract=['201107'],date=['2011-07-13'],
+        missing_adjusted_terms=[True],unresolved_lifetime=[False],lost_inventory_continuation=[False])).write_csv(work)
+    incoming=pl.concat([original.with_columns(pl.col('value').cast(pl.Float64)),
+        pl.DataFrame(dict(product=['CA1'],from_product=['CAF'],value=[9400.]))])
+    incoming.write_parquet(delta/payload.name)
+    (delta/'manifest.json').write_text(json.dumps(dict(status='bounded_corporate_source_views_prepared',
+        parent_manifest_sha256=sha256_file(current/'manifest.json'),worklist_sha256=sha256_file(work),
+        financial_values_inferred=False,source_sha256s={},
+        outputs={payload.name:dict(sha256=sha256_file(delta/payload.name))})))
+    result,evidence=compose_bounded_corporate_amendments(current,original,[(delta,work)],
+        archive=SimpleNamespace(copy=lambda *a,**kw:None))
+    assert evidence[0]['added_views']==1
+    assert result.filter(pl.col('product')=='CBF')['value'].to_list()==[17.]
+    assert result.filter(pl.col('product')=='CA1')['value'].to_list()==[9400.]
 
 
 def test_retained_visual_position_grids_reuse_verified_reader_and_preserve_missing_cash(tmp_path,monkeypatch):
@@ -2687,6 +3090,128 @@ def test_bounded_margin_continuation_rejects_unbound_seed_and_scope(tmp_path, mo
             archive_root=tmp_path/'not_opened',selected_products=['BBF'] if problem=='product_scope' else ['AAF'],
             continue_delta=seed)
     assert not (tmp_path/'output').exists() and sha256_file(seed/'manifest.json')
+
+
+@pytest.mark.parametrize('problem', [None, 'scope', 'source', 'image', 'amount'])
+def test_bounded_code_repair_rebuilds_both_products_without_global_alias(tmp_path, monkeypatch, problem):
+    import scripts.repair_tw_futures_margin_source_intervals as repair
+    import stockagent.data.tw_futures_margin_preparation as preparation
+    from downloader.artifact_io import atomic_write_json
+    current = tmp_path/'current'; current.mkdir()
+    atomic_write_json(current/'manifest.json', {'identity': 'retained'})
+    atomic_write_json(current/'dated_margin_ratio_laws.json', [])
+    def fact(product, digest, day, values):
+        return dict(product=product, source_url='https://www.taifex.com.tw/'+digest+'.pdf',
+            source_content_sha256=digest*64, published_date='2018-08-20',
+            known_at='2018-08-20T23:59:59+08:00', effective_date=day,
+            effective_phase='after_product_regular_close', issue_date_bound=True,
+            margin_kind='fixed_twd', after=values, before=None, requires_reversion_review=False,
+            temporary_end_evidence='[]', visual_review_sha256=None)
+    facts = [fact('OOF','b','2018-08-21',[100.,80.,60.]),
+             fact('OQF','c','2018-08-21',[200.,160.,120.]),
+             fact('OOF','a','2018-08-22',[300.,240.,180.])]
+    levels, _ = preparation.margin_candidate_intervals(facts)
+    def read(path):
+        return (pl.from_dicts(facts) if path.name == 'margin_event_candidates.parquet'
+                else pl.from_dicts(levels)), dict(sources=[])
+    monkeypatch.setattr(repair, 'read_bound_output', read)
+    image = tmp_path/'page.png'; image.write_bytes(b'original-reviewed-table')
+    cell = dict(source_url=facts[-1]['source_url'], content_sha256='a'*64,
+        page=2, page_image=image.name, page_image_sha256=sha256_file(image),
+        ocr_product='OOF' if problem != 'scope' else 'XXF', product='OQF',
+        margin_kind='fixed_twd', after=[300.,240.,180.], before=None)
+    if problem == 'amount': cell['after'] = [301.,240.,180.]
+    if problem == 'image': image.write_bytes(b'changed-image')
+    review = tmp_path/'review.json'
+    atomic_write_json(review, dict(review_kind='source_bound_margin_product_code_cells', cells=[cell]))
+    worklist = tmp_path/'gaps.csv'
+    pl.DataFrame(dict(product=['OOF'], missing_opening_margin=[True],
+        missing_settlement_margin=[True])).write_csv(worklist)
+    class Archive:
+        def __init__(self, *args):
+            self.bundle=args[1]
+            self.sources={}; self.cache={}; self.conn=SimpleNamespace(close=lambda:None)
+        def document(self, url):
+            return dict(content_sha256=('d' if problem == 'source' else 'a')*64, text='')
+        def copy(self, path, digest, *, url, kind):
+            self.sources[str(path)] = dict(path=Path(path).name, sha256=digest, url=url, kind=kind)
+    from pathlib import Path
+    monkeypatch.setattr(preparation, 'RuleArchive', Archive)
+    kwargs=dict(archive_root=tmp_path/'unused', code_reviews=[review])
+    if problem:
+        with pytest.raises(ValueError):
+            repair.prepare_margin_repairs(current,worklist,tmp_path/'output',tmp_path/'receipt.json',**kwargs)
+    else:
+        repair.prepare_margin_repairs(current,worklist,tmp_path/'output',tmp_path/'receipt.json',**kwargs)
+        bound=preparation.align_product_margin_intervals(
+            pl.DataFrame(dict(date=[date(2018,8,23)]*2,product=['OOF','OQF'])),
+            pl.read_parquet(tmp_path/'output/margin_level_intervals.parquet'))
+        assert dict(zip(bound['product'], bound['opening_initial'])) == {'OOF':100.,'OQF':300.}
+        proof=json.loads((tmp_path/'receipt.json').read_text())
+        assert proof['changed_products'] == ['OOF','OQF']
+        assert proof['margin_code_reviews'][0]['sha256'] == sha256_file(review)
+        assert facts[-1]['product']=='OOF'  # The original extraction remains evidence.
+
+
+@pytest.mark.parametrize('year,published,phase', [
+    ('103','2014-01-24','after_product_regular_close'),
+    ('109','2020-01-24','date_only_requires_phase_review'),
+    ('103','2014-02-24','date_only_requires_phase_review'),
+])
+def test_bare_close_requires_own_publication_and_pre_night_session_era(year,published,phase):
+    text=('臺灣期貨交易所新聞稿中華民國'+year+'年1月24日。實施期間為'+year+
+        '年1月27日(春節前最後交易日)收盤後生效，至2月6日交易時段結束後恢復為調整前1月24日之保證金。')
+    result=builder.candidate_notice_clock(text,published)
+    assert result['effective_phase']==phase
+
+
+@pytest.mark.parametrize('problem',[None,'scope','original','corrected','document','image','review','unbound'])
+def test_margin_composer_extends_only_the_exact_reviewed_code_destination(tmp_path,monkeypatch,problem):
+    import scripts.repair_tw_futures_margin_source_intervals as repair
+    from downloader.artifact_io import atomic_write_json
+    current=tmp_path/'current';current.mkdir();delta=tmp_path/'delta';delta.mkdir()
+    atomic_write_json(current/'manifest.json',dict(identity='original'))
+    work=tmp_path/'work.csv'
+    pl.DataFrame(dict(product=['OOF'],missing_opening_margin=[True],missing_settlement_margin=[True])).write_csv(work)
+    url='https://www.taifex.com.tw/cell.pdf'
+    old_fact=dict(product='OOF',source_url=url,source_content_sha256='a'*64,
+        margin_kind='fixed_twd',after=[300.,240.,180.],before=None)
+    new_fact=dict(old_fact,product='OQF')
+    original=pl.from_dicts([dict(old_fact,after=[301.,240.,180.]) if problem=='original' else old_fact])
+    corrected=pl.from_dicts([dict(new_fact,after=[301.,240.,180.]) if problem=='corrected' else new_fact])
+    base=pl.DataFrame(dict(product=['OOF','OQF'],amount=[300.,200.]))
+    incoming=pl.DataFrame(dict(product=['OOF','OQF'],amount=[100.,300.]))
+    image=delta/'page.png';image.write_bytes(b'inspected-original-page')
+    image_sha=sha256_file(image)
+    cell=dict(source_url=url,content_sha256='a'*64,page=2,page_image='page.png',
+        page_image_sha256=image_sha,ocr_product='XXF' if problem=='scope' else 'OOF',product='OQF',
+        margin_kind='fixed_twd',after=[300.,240.,180.],before=None)
+    review=delta/'review.json'
+    atomic_write_json(review,dict(review_kind='source_bound_margin_product_code_cells',cells=[cell]))
+    digest=sha256_file(review)
+    proof=dict(status='bounded_margin_restoration_sources_prepared',
+        parent_manifest_sha256=sha256_file(current/'manifest.json'),worklist_sha256=sha256_file(work),
+        financial_values_inferred=False,changed_products=['OOF','OQF'],outputs={},
+        margin_code_reviews=[] if problem=='unbound' else [dict(sha256=digest)],
+        sources=[dict(path=review.name,sha256=digest,url='',kind='visual_margin_code_review'),
+            dict(path=image.name,sha256=image_sha,url=url,kind='visual_margin_review_page')])
+    if problem=='image':image.write_bytes(b'changed-page')
+    if problem=='review':review.write_text('{}')
+    atomic_write_json(delta/'manifest.json',proof)
+    def read(path):
+        if path.parent==current:
+            return (original if path.name=='margin_event_candidates.parquet' else base),{}
+        return (corrected if path.name=='margin_event_candidates.parquet' else incoming),proof
+    monkeypatch.setattr(repair,'read_bound_output',read)
+    archive=SimpleNamespace(document=lambda url:dict(content_sha256=('b' if problem=='document' else 'a')*64),
+        copy=lambda *args,**kwargs:None)
+    args=(current,original,base,[(delta,work)])
+    if problem:
+        with pytest.raises(ValueError):repair.compose_bounded_margin_amendments(*args,archive=archive)
+    else:
+        _,result,evidence=repair.compose_bounded_margin_amendments(*args,archive=archive)
+        assert result.sort('product').equals(incoming.sort('product'))
+        assert evidence[0]['products']==['OOF','OQF']
 
 
 def grade_regime_case(tmp_path):

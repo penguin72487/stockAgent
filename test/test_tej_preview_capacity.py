@@ -292,6 +292,93 @@ def test_local_descriptor_recovery_does_not_invoke_provider(ready):
         assert con.execute('SELECT state FROM tasks WHERE task_id=?',(task['task_id'],)).fetchone()[0]==SUPERSEDED
 
 
+def incremental_overflow_fixture(registry, monkeypatch):
+    """One completed history slice and one completed incremental slice coexist."""
+    from test_tej_incremental import NOW, SETTINGS
+    import test_tej_key_layout as key_layout
+    from downloader.tej_incremental import refill_wizard, seed_wizard
+
+    root, original = registry
+    config = {**original, 'incremental': SETTINGS, 'auto_preview_capacity_replanning': True}
+    configure_runtime_policy(root, config)
+    configure_preview_planning(root, original)
+    bridge = Key3Bridge()
+    assert run_one(root, bridge) == 'completed_task'
+    assert run_one(root, bridge) == 'completed_task'
+    with closing(connect(root)) as con, con:
+        assert seed_wizard(con, config, NOW) == 1
+        cycle = con.execute('SELECT cycle_id FROM tej_incremental_cycles').fetchone()[0]
+    companies = axes()[0]
+    days = [f'2014/01/{day:02}' for day in range(6, 10)]
+    monkeypatch.setattr(key_layout, 'axes', lambda: (companies, days))
+    assert run_one(root, bridge) == 'completed_task'  # incremental discovery
+    assert run_one(root, bridge) == 'completed_task'  # one native slice
+    with closing(connect(root)) as con, con:
+        refill_wizard(con)
+        task = dict(con.execute("SELECT t.* FROM tasks t JOIN tej_incremental_tasks i ON i.task_id=t.task_id "
+                                "WHERE i.cycle_id=? AND t.kind='download' AND t.state='pending'", (cycle,)).fetchone())
+        con.execute("UPDATE tasks SET state='blocked',last_error_code='source_validation_failed' WHERE task_id=?",
+                    (task['task_id'],))
+    payload, output = overflow(root, task)
+    return root, config, bridge, cycle, task, payload, output, companies, days
+
+
+def test_incremental_overflow_replans_only_its_cycle_and_preserves_completed_history(registry, monkeypatch):
+    from datetime import timedelta
+    from downloader.tej_incremental import seed_wizard
+    from test_tej_incremental import NOW
+
+    root, config, bridge, cycle, task, payload, output, companies, days = incremental_overflow_fixture(registry, monkeypatch)
+    with closing(connect(root)) as con:
+        history = tuple(con.execute('SELECT plan_json,next_query,total_queries FROM download_plans').fetchone())
+        completed = [dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete'")]
+        features = [tuple(r) for r in con.execute('SELECT * FROM features')]
+    receipt_bytes = {root / r['receipt_path']: (root / r['receipt_path']).read_bytes()
+                     for r in completed if r['receipt_path']}
+    original = output.read_bytes()
+    result = replan_capacity(root, task['task_id'], payload, output)
+    assert result['state'] == 'source_capacity_replanned' and result['provider_queries_sent'] == 0
+    assert result['source_rows_adopted'] is False and result['data_query_repeated'] is False
+    audit = json.loads((root / result['audit']).read_text())
+    assert audit['plan_owner'] == 'incremental_cycle' and audit['incremental_cycle'] == cycle
+    assert output.read_bytes() == original and all(path.read_bytes() == data for path, data in receipt_bytes.items())
+    with closing(connect(root)) as con:
+        assert tuple(con.execute('SELECT plan_json,next_query,total_queries FROM download_plans').fetchone()) == history
+        assert [dict(r) for r in con.execute("SELECT * FROM tasks WHERE state='complete'")] == completed
+        assert [tuple(r) for r in con.execute('SELECT * FROM features')] == features
+        current = dict(con.execute('SELECT * FROM tej_incremental_cycles WHERE cycle_id=?', (cycle,)).fetchone())
+        plan = json.loads(current['plan_json'])
+        done = [dict(r) for r in con.execute("SELECT t.* FROM tasks t JOIN tej_incremental_tasks i ON i.task_id=t.task_id "
+                        "WHERE i.cycle_id=? AND t.kind='download' AND t.state='complete'", (cycle,))]
+    assert current['next_query'] == 0 and current['total_queries'] == plan['total_queries']
+    seen = Counter()
+    requests = [task_request(root, r) for r in done] + [next_request(plan, i) for i in range(plan['total_queries'])]
+    for req in requests:
+        seen.update((f, c, d) for f in req['fields'] for c in req['company_labels'] for d in req['date_labels'])
+    assert len(seen) == 59 * len(companies) * len(days) and set(seen.values()) == {1}
+    assert replan_capacity(root, task['task_id'], payload, output)['already_reconciled']
+    for _ in range(plan['total_queries']):
+        assert run_one(root, bridge) == 'completed_task'
+    with closing(connect(root)) as con, con:
+        seed_wizard(con, config, NOW + timedelta(seconds=61))
+        assert con.execute('SELECT state FROM tej_incremental_cycles WHERE cycle_id=?', (cycle,)).fetchone()[0] == 'checked'
+
+
+def test_incremental_overflow_rejects_foreign_cycle_lineage_without_mutation(registry, monkeypatch):
+    root, _, _, cycle, task, payload, output, _, _ = incremental_overflow_fixture(registry, monkeypatch)
+    with closing(connect(root)) as con, con:
+        con.execute('UPDATE tej_incremental_tasks SET cycle_id=? WHERE task_id=?', ('foreign', task['task_id']))
+        before = tuple(con.execute('SELECT plan_json,next_query,total_queries FROM tej_incremental_cycles WHERE cycle_id=?',
+                                   (cycle,)).fetchone())
+    with pytest.raises(ValueError, match='registered cycle and ordinal'):
+        replan_capacity(root, task['task_id'], payload, output)
+    with closing(connect(root)) as con:
+        assert tuple(con.execute('SELECT plan_json,next_query,total_queries FROM tej_incremental_cycles WHERE cycle_id=?',
+                                 (cycle,)).fetchone()) == before
+        assert con.execute('SELECT state FROM tasks WHERE task_id=?', (task['task_id'],)).fetchone()[0] == 'blocked'
+    assert not (root / 'capacity_replanning').exists()
+
+
 def test_operator_existing_preview_readback_replans_without_new_preview(ready):
     root,config,_=ready;task=unresolved(root);payload,output=overflow(root,task)
     class Existing:

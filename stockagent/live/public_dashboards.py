@@ -176,6 +176,21 @@ def _scrub_public_value(
 ) -> Any:
     """Strip private identifiers and unlicensed prices without mutating inputs."""
 
+    options = dict(session_date=session_date, record_kind=record_kind,
+                   record_collections=record_collections, private_prices=private_prices)
+    if quote_source is None:
+        return _scrub_public_value_inner(value, quote_source=None, **options)
+    with quote_source.read_view(value, session_date=session_date) as view:
+        return _scrub_public_value_inner(value, quote_source=view, **options)
+
+
+def _scrub_public_value_inner(
+    value: Any, *, quote_source=None, session_date: str | None = None,
+    record_kind: str | None = None,
+    record_collections: Mapping[str, str] | None = None,
+    private_prices: bool = False,
+) -> Any:
+
     if isinstance(value, Mapping):
         session_date = value.get("session_date") or session_date
         if quote_source is not None:
@@ -205,7 +220,7 @@ def _scrub_public_value(
             # provider's API access or an upstream boolean is not a grant.
             if is_quote_price_field(key):
                 if private_prices:
-                    output[key] = _scrub_public_value(item, private_prices=True)
+                    output[key] = _scrub_public_value_inner(item, private_prices=True)
                     if output[key] is not None:
                         visible[key] = {"source": "本人私人檢視", "price_role": key,
                                         "publication_basis": "owner_private_view"}
@@ -229,7 +244,7 @@ def _scrub_public_value(
                         withheld.append(key)
                         withheld_reasons[key] = quote_policy.withheld_reason(value, key)
                 continue
-            output[key] = _scrub_public_value(
+            output[key] = _scrub_public_value_inner(
                 item, quote_source=None if key == DAILY_QUOTE_FIELD else quote_source,
                 session_date=session_date,
                 record_kind=((record_collections or {}).get(key)
@@ -251,7 +266,7 @@ def _scrub_public_value(
                 output["entry_price_distances"] = distances
         return output
     if isinstance(value, list):
-        return [_scrub_public_value(item, quote_source=quote_source, session_date=session_date,
+        return [_scrub_public_value_inner(item, quote_source=quote_source, session_date=session_date,
                                    record_kind=record_kind, private_prices=private_prices) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
         return None

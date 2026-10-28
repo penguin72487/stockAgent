@@ -7,6 +7,7 @@ are never reconstructed from daily prices or carried valuation rows.
 from __future__ import annotations
 
 import csv
+from collections import Counter
 from datetime import date
 import hashlib
 import json
@@ -117,11 +118,87 @@ def _check_price_bounds(bars: pl.DataFrame, fact: dict, evidence: dict) -> pl.Da
     return bars
 
 
+def _reuse_official_day_evidence(manifest_bytes, requested, output, cache, *, allow_unreported_volume,
+                                 spread_research_policy=None):
+    """Reuse the same parsed source contract, never a changed source or a partial tape."""
+    cache = Path(cache).resolve()
+    proof_path, data_path = cache/'official_evidence_manifest.json', cache/'official_evidence.parquet'
+    if cache == output.resolve():
+        raise ValueError('official evidence reuse requires a distinct immutable parent')
+    proof_bytes = proof_path.read_bytes()
+    proof = json.loads(proof_bytes)
+    policy = 'preserve_unknown_never_zero' if allow_unreported_volume else 'reject'
+    if (proof.get('source') != 'taifex_complete_daily_and_spread_legs_v1'
+            or proof.get('spread_delivery_contract_version') != 2
+            or proof.get('unreported_volume_policy') != policy
+            or proof.get('spread_research_reconciliation') is not None):
+        raise ValueError('official evidence cache uses a different source/volume contract')
+    if sha256_file(data_path) != proof['sha256']:
+        raise ValueError('official evidence cache payload SHA mismatch')
+    years = {str(year) for year in requested['date'].dt.year().unique()}
+    def relevant(item):
+        path = Path(item['path'])
+        return path.parent.name != 'annual' or path.name[:4] in years
+    receipts = [r for r in json.loads(manifest_bytes)['receipts'] if relevant(r)]
+    retained = [r for r in proof['sources'] if relevant(r)]
+    if Counter(r['sha256'] for r in receipts) != Counter(r['sha256'] for r in retained):
+        raise ValueError('official evidence cache source inventory differs; rebuild from originals')
+    sources = []
+    for item in receipts:
+        path = Path(item['path'])
+        if sha256_file(path) != item['sha256']:
+            raise ValueError(f'official raw archive SHA mismatch: {path}')
+        sources.append(dict(path=str(path), sha256=item['sha256']))
+    cached = pl.scan_parquet(data_path)
+    if cached.select(pl.len()).collect().item() != proof['rows']:
+        raise ValueError('official evidence cache row count mismatch')
+    subset = cached.join(requested.lazy(), on=['date','physical_contract'], how='semi').collect()
+    result = requested.join(subset, on=['date','physical_contract'], how='left', validate='1:1')
+    if result['official_reason'].null_count():
+        raise ValueError('official evidence cache does not cover every requested physical day')
+    if result.filter((pl.col('official_source_sha256') != '') &
+                     ~pl.col('official_source_sha256').is_in([r['sha256'] for r in sources])).height:
+        raise ValueError('official evidence cache contains another source owner')
+    if (proof_path.read_bytes() != proof_bytes or sha256_file(data_path) != proof['sha256']
+            or any(sha256_file(Path(r['path'])) != r['sha256'] for r in sources)):
+        raise ValueError('official evidence source or cache changed during reuse')
+    research_proof = None
+    if spread_research_policy is not None:
+        from stockagent.data.tw_futures_spread_reconciliation import reconcile_duplicate_spread
+        result, research_proof = reconcile_duplicate_spread(result, spread_research_policy, sources)
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_parquet(output/'official_evidence.parquet', result)
+    output_proof = dict(
+        source=proof['source'], rows=result.height, spread_delivery_contract_version=2,
+        sha256=sha256_file(output/'official_evidence.parquet'), sources=sources,
+        input_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+        unreported_volume_policy=policy, rule_reference=proof['rule_reference'],
+        reused_verified_evidence=dict(contract='same_originals_complete_evidence_subset_v1',
+            path=str(cache), manifest_sha256=hashlib.sha256(proof_bytes).hexdigest(),
+            sha256=proof['sha256'], original_rows=proof['rows'], selected_rows=result.height))
+    if research_proof is not None:
+        output_proof['spread_research_reconciliation'] = research_proof
+    atomic_write_json(output/'official_evidence_manifest.json', output_proof)
+    return result
+
+
 def official_day_evidence(manifest_path: Path, keys: pl.DataFrame, output: Path, *,
-                          allow_unreported_volume: bool = False) -> pl.DataFrame:
+                          allow_unreported_volume: bool = False,
+                          reuse_verified_cache: Path | None = None,
+                          spread_research_policy: Path | None = None) -> pl.DataFrame:
+    manifest_bytes = manifest_path.read_bytes()
+    if reuse_verified_cache is not None:
+        requested = keys.select(pl.col('date').cast(pl.Date), 'physical_contract').unique().sort(
+            'date', 'physical_contract')
+        if requested.select(pl.any_horizontal(pl.all().is_null()).any()).item():
+            raise ValueError('official evidence cache requires non-null physical days')
+        return _reuse_official_day_evidence(manifest_bytes, requested, output, reuse_verified_cache,
+                                            allow_unreported_volume=allow_unreported_volume,
+                                            spread_research_policy=spread_research_policy)
+    if spread_research_policy is not None:
+        raise ValueError('spread research reconciliation requires the verified original evidence cache')
     needed = {(str(d), c) for d, c in keys.select('date', 'physical_contract').iter_rows()}
     wanted_dates = {d for d, _ in needed}
-    manifest_bytes = manifest_path.read_bytes()
     manifest = json.loads(manifest_bytes)
     records, spreads, days = {}, {}, {}
     # Official files repeat the same date across thousands of contracts. Parse

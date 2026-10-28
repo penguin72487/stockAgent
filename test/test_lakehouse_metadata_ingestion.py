@@ -1,6 +1,8 @@
 """New metadata is streamed without bypassing validation of known values."""
 import hashlib
+import fcntl
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -37,6 +39,66 @@ def test_known_values_still_read_and_validated_without_retaining_payload(capture
     assert incoming == files[10:] and incoming[0] is files[10]
     assert observed == [row['relative'] for row in files]
     assert all('content_utf8' not in row for row in files)
+
+
+def test_parallel_metadata_validation_overlaps_reads_and_keeps_original_order(captured, monkeypatch):
+    c, files = captured
+    known = {(row['relative'], row['sha256']) for row in files[:4]}
+    serial = lakehouse._new_metadata_descriptors(c, files, known)
+    original = lakehouse._metadata_value
+    barrier = threading.Barrier(4, timeout=5)
+    lock = threading.Lock()
+    active = 0
+    peak = 0
+
+    def concurrent(config, row):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        try:
+            if row in files[:4]:
+                barrier.wait()
+            return original(config, row)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(lakehouse, '_metadata_value', concurrent)
+    assert lakehouse._new_metadata_descriptors(c, files, known, workers=4) == serial
+    assert peak == 4
+    assert all('content_utf8' not in row for row in files)
+
+
+@pytest.mark.parametrize('kind', ['wrong_sha', 'wrong_length', 'invalid_utf8'])
+def test_parallel_validation_does_not_skip_corrupt_known_metadata(captured, kind):
+    c, files = captured
+    if kind == 'wrong_sha':
+        files[2]['sha256'] = '0' * 64
+    elif kind == 'wrong_length':
+        files[2]['bytes'] += 1
+    else:
+        raw = b'\xff'
+        (Path(c['cold_root']) / files[2]['relative']).write_bytes(raw)
+        files[2].update(bytes=1, sha256=hashlib.sha256(raw).hexdigest())
+    known = {(row['relative'], row['sha256']) for row in files}
+    with pytest.raises((ValueError, UnicodeDecodeError)):
+        lakehouse._new_metadata_descriptors(c, files, known, workers=4)
+
+
+@pytest.mark.parametrize('workers', [0, -1, 5, True, 1.5])
+def test_metadata_validation_rejects_invalid_worker_count(captured, workers):
+    c, files = captured
+    with pytest.raises(ValueError, match='metadata verification workers'):
+        lakehouse._new_metadata_descriptors(c, files, set(), workers=workers)
+
+
+def test_real_catalog_lock_contention_has_a_distinct_busy_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(lakehouse, 'guard', lambda _config: None)
+    with (tmp_path / 'catalog-owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(lakehouse.CatalogOwnerBusy, match='catalog owner is busy'):
+            lakehouse.register({'state_root': str(tmp_path)})
 
 
 @pytest.mark.parametrize('kind', ['wrong_sha', 'wrong_length', 'invalid_utf8'])

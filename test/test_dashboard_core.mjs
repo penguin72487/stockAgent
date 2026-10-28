@@ -678,6 +678,25 @@ test("performance correlation permits opaque keys and timings, never arbitrary p
   assert.match(metric.correlation.clockBasis, /foreground_double_raf/);
 });
 
+test("painted paper quantities require a complete nonnegative visible triple", () => {
+  const f = revisionPaintFixture();
+  f.observer.applied({...f.row, entryCounts: {entryCountsVisible: true,
+    entryRequestedShares: 1000, entryFilledShares: 1000, entryUnfilledShares: 0}});
+  f.frame(); f.frame();
+  assert.equal(f.records()[0].correlation.entryCountsVisible, true);
+  assert.equal(f.records()[0].correlation.entryFilledShares, 1000);
+  const {core} = loadCore();
+  for (const counts of [
+    {entryCountsVisible: true, entryRequestedShares: 1000, entryFilledShares: -1, entryUnfilledShares: 0},
+    {entryCountsVisible: false, entryRequestedShares: 1000, entryFilledShares: 1000, entryUnfilledShares: 0},
+    {entryCountsVisible: true, entryRequestedShares: 1000, entryFilledShares: 1000},
+  ]) {
+    const metric = core.recordPerformanceMetric({kind: "render", action: "status_revision_paint", correlation: counts});
+    assert.equal("entryCountsVisible" in metric.correlation, false);
+    assert.equal("entryFilledShares" in metric.correlation, false);
+  }
+});
+
 test("API history without Server-Timing does not invent a zero server duration", async () => {
   const {core} = loadCore();
   await core.fetchJson("/api/status");
@@ -729,6 +748,75 @@ test("refresh scheduler coalesces slow ticks without delaying the initial invoca
   tick();
   assert.equal(calls, 2);
   assert.equal(clears, 1);
+});
+
+test("cadenced refresh restarts the minute after manual or overdue-visible refresh", async () => {
+  let clock = 0, nextId = 0, calls = 0;
+  const timers = new Map();
+  const {core, document} = loadCore({globals: {
+    performance: {now: () => clock},
+    setTimeout(fn, ms) { const id = ++nextId; timers.set(id, {fn, at: clock + ms}); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  }});
+  const advance = async (to) => {
+    while (true) {
+      const next = [...timers.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next || next[1].at > to) break;
+      clock = next[1].at;
+      timers.delete(next[0]);
+      next[1].fn();
+      await new Promise(setImmediate);
+    }
+    clock = to;
+  };
+  const scheduler = core.scheduleRefresh(() => { calls++; },
+    {intervalMs: 60000, cadenceFromLastStart: true, refreshOnVisible: "overdue"});
+  await new Promise(setImmediate);
+  assert.equal(calls, 1);
+  document.hidden = true; document.dispatchEvent({type: "visibilitychange"});
+  await advance(59000);
+  document.hidden = false; document.dispatchEvent({type: "visibilitychange"});
+  assert.equal(calls, 1); // a short tab switch is not an extra refresh
+  document.hidden = true; document.dispatchEvent({type: "visibilitychange"});
+  await advance(90000);
+  document.hidden = false; document.dispatchEvent({type: "visibilitychange"});
+  await new Promise(setImmediate);
+  assert.equal(calls, 2); // overdue tab gets the latest immediately
+  await advance(149999);
+  assert.equal(calls, 2); // no old interval firing immediately after return
+  await advance(150000);
+  assert.equal(calls, 3);
+  await advance(160000);
+  await scheduler.run(); // explicit manual refresh resets the next minute
+  assert.equal(calls, 4);
+  await advance(219999);
+  assert.equal(calls, 4);
+  await advance(220000);
+  assert.equal(calls, 5);
+  scheduler.dispose();
+  assert.equal(timers.size, 0);
+});
+
+test("cadenced refresh coalesces an overdue in-flight tick and disposes safely", async () => {
+  let clock = 0, tick, release, calls = 0;
+  const {core} = loadCore({globals: {
+    performance: {now: () => clock}, setTimeout(fn) { tick = fn; return 1; }, clearTimeout() {},
+  }});
+  const scheduler = core.scheduleRefresh(() => {
+    calls++;
+    return new Promise(resolve => { release = resolve; });
+  }, {intervalMs: 60000, cadenceFromLastStart: true, refreshOnVisible: "overdue"});
+  assert.equal(calls, 1);
+  clock = 60000; tick();
+  assert.equal(calls, 1);
+  release();
+  await new Promise(setImmediate);
+  assert.equal(calls, 2);
+  scheduler.dispose();
+  release();
+  await new Promise(setImmediate);
+  tick();
+  assert.equal(calls, 2);
 });
 
 function responsiveFixture(rows = 100, columns = 4) {

@@ -11,6 +11,7 @@ from collections import Counter
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -19,6 +20,7 @@ from urllib.parse import urljoin, urlsplit
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
+from downloader.news_fulltext_policy import CONTRACT_VERSION
 from downloader.news_fulltext_publishers import cnyes_supported_mobile_view
 from downloader.news_fulltext_queue import utc_now
 
@@ -36,10 +38,12 @@ AMP_SQL = ("SELECT a.id,a.url,a.state,a.error_code,a.attempts,a.due,a.last_check
            "AND a.state IN ('pending','retry','retry_cooldown','inflight') ORDER BY a.url LIMIT ?")
 AMP_MAX_ENCODED_BYTES = 64 << 20
 AMP_MAX_DECODED_BYTES = 128 << 20
+AMP_MOBILE_MAX_DECODED_BYTES = 768 << 20
+AMP_MOBILE_MAX_BATCH_DECODED_BYTES = 32 << 20
 AMP_MAX_BATCH_ROWS = 4096
 
 
-def _declared_amp_head(raw, canonical_url, amp_url, *, extraction_method):
+def _declared_amp_head(raw, canonical_url, amp_url, *, extraction_method, document_url=None):
     """Inspect only a native HTML head, never infer aliases from API IDs/text."""
     if extraction_method == 'cnyes_api_content_v1':
         return {'kind': 'api_content_not_reviewed_native_amp_declaration',
@@ -52,16 +56,60 @@ def _declared_amp_head(raw, canonical_url, amp_url, *, extraction_method):
     heads = soup.find_all('head')
     canonical = heads[0].select('link[rel=canonical][href]') if len(heads) == 1 else []
     amp = heads[0].select('link[rel=amphtml][href]') if len(heads) == 1 else []
-    canonical_match = len(canonical) == 1 and urljoin(canonical_url, canonical[0]['href']) == canonical_url
-    amp_match = len(amp) == 1 and urljoin(canonical_url, amp[0]['href']) == amp_url
+    bases = heads[0].select('base[href]') if len(heads) == 1 else []
+    try:
+        base = document_url or canonical_url
+        if bases:
+            base = urljoin(base, bases[0]['href'])
+        canonical_match = len(canonical) == 1 and urljoin(base, canonical[0]['href']) == canonical_url
+        amp_match = len(amp) == 1 and urljoin(base, amp[0]['href']) == amp_url
+    except ValueError:
+        canonical_match = amp_match = False
     match = canonical_match and amp_match
     return {'kind': 'native_head_declares_exact_amp_counterpart' if match else 'native_head_not_exact_counterpart',
             'native_head_inspected': True, 'head_count': len(heads), 'canonical_link_count': len(canonical),
-            'amphtml_link_count': len(amp), 'canonical_matches': canonical_match,
+            'amphtml_link_count': len(amp), 'base_href_count': len(bases), 'canonical_matches': canonical_match,
             'amphtml_matches': amp_match, 'publisher_declared_counterpart': match}
 
 
-def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
+def _amp_rows(db, maximum_rows, *, mobile):
+    rows = [dict(row) for row in db.execute(AMP_SQL, (maximum_rows+1,))]
+    truncated = len(rows) > maximum_rows
+    rows = rows[:maximum_rows]
+    if mobile:
+        for row in rows:
+            match = re.fullmatch(r'https://amp-news[.]cnyes[.]com/news/id/([1-9][0-9]*)', row['url'])
+            target = ('https://m.cnyes.com/news/id/' + match[1]) if match else ''
+            candidate = db.execute(
+                "SELECT id AS candidate_id,url AS candidate_url,state AS candidate_state,"
+                "body_sha256,body_bytes,parquet_path,captured_at_utc FROM articles "
+                "WHERE url=? AND provider='cnyes'", (target,)).fetchone()
+            for key in ('candidate_id', 'candidate_url', 'candidate_state', 'body_sha256', 'body_bytes',
+                        'parquet_path', 'captured_at_utc'):
+                row[key] = candidate[key] if candidate else None
+    return rows, truncated
+
+
+def _stat_stamp(st):
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def _read_stable_bounded(path, limit):
+    """Reject changing artifacts; the file and pathname must still be the observed file."""
+    with path.open('rb') as stream:
+        before = _stat_stamp(os.fstat(stream.fileno()))
+        if before[2] > limit:
+            raise ValueError('amp_candidate_encoded_budget_exceeded')
+        payload = stream.read(before[2]+1)
+        if len(payload) > limit:
+            raise ValueError('amp_candidate_encoded_budget_exceeded')
+        if (len(payload) != before[2] or before != _stat_stamp(os.fstat(stream.fileno()))
+                or before != _stat_stamp(path.stat())):
+            raise ValueError('amp_candidate_artifact_changed_during_read')
+    return payload, before
+
+
+def audit_amp_declarations(root: Path, maximum_rows: int = 256, *, mobile: bool = False) -> dict:
     """Read immutable candidate envelopes once, without parsing accepted prose.
 
     The complete currently queued AMP scope is bounded independently of raw I/O.
@@ -79,52 +127,60 @@ def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
         db.execute('BEGIN')
         owner = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()
         observed = utc_now()
-        rows = [dict(row) for row in db.execute(AMP_SQL, (maximum_rows+1,))]
-        truncated = len(rows) > maximum_rows
-        rows = rows[:maximum_rows]
+        rows, truncated = _amp_rows(db, maximum_rows, mobile=mobile)
         plan = [row['detail'] for row in db.execute('EXPLAIN QUERY PLAN '+AMP_SQL, (maximum_rows+1,))]
         paths = sorted({row['parquet_path'] for row in rows if row['candidate_state'] == 'complete'
                         and row['body_sha256'] and row['parquet_path']})
-        receipts = {path: db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?', (path,)).fetchone()
-                    for path in paths}
+        receipts = {}
+        for path in paths:
+            receipt = db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?', (path,)).fetchone()
+            receipts[path] = receipt[0] if receipt else None
     def selected_hash(values):
         return hashlib.sha256(json.dumps([{k: v.hex() if isinstance(v, bytes) else v for k, v in row.items()}
             for row in values], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     selected_sha = selected_hash(rows)
     counts, findings, grouped = Counter(), [], {}
     for row in rows:
-        record = {'amp_url': row['url'], 'candidate_url': row['candidate_url'],
-                  'candidate_body_sha256': row['body_sha256'], 'publisher_declared_counterpart': False}
         match = re.fullmatch(r'https://amp-news[.]cnyes[.]com/news/id/([1-9][0-9]*)', row['url'])
-        if not match or row['candidate_url'] != 'https://news.cnyes.com/news/id/'+match[1]:
-            record['kind'] = 'no_exact_literal_primary_candidate'
+        record = {'amp_url': row['url'] if match or not mobile else None, 'candidate_url': row['candidate_url'],
+                  'candidate_body_sha256': row['body_sha256'], 'publisher_declared_counterpart': False}
+        if mobile:
+            record['amp_url_sha256'] = hashlib.sha256(row['url'].encode()).hexdigest()
+        candidate_host = 'm.cnyes.com' if mobile else 'news.cnyes.com'
+        if not match or row['candidate_url'] != 'https://'+candidate_host+'/news/id/'+match[1]:
+            record['kind'] = 'no_exact_literal_mobile_candidate' if mobile else 'no_exact_literal_primary_candidate'
         elif not (row['candidate_state'] == 'complete' and row['body_sha256'] and row['parquet_path']):
-            record['kind'] = 'no_complete_primary_candidate'
+            record['kind'] = 'no_complete_mobile_candidate' if mobile else 'no_complete_primary_candidate'
         else:
             grouped.setdefault(row['parquet_path'], []).append((row, record))
             continue
         counts[record['kind']] += 1
         findings.append(record)
     encoded_bytes = decoded_bytes = original_bytes = 0
-    batches = []
+    batches, artifact_stamps = [], {}
     columns = ['article_id', 'body_sha256', 'requested_url', 'final_url', 'source_request_url',
                'response_sha256', 'source_response_article_id', 'raw_response_body', 'extraction_method']
+    if mobile:
+        columns += ['body', 'body_bytes']
     for relative in sorted(grouped):
         if not receipts[relative]:
             raise ValueError('amp_candidate_has_no_committed_receipt')
-        receipt_path = source_path(root, receipts[relative][0])
+        receipt_path = source_path(root, receipts[relative])
         if receipt_path.stat().st_size > 65536:
             raise ValueError('amp_candidate_receipt_exceeds_bound')
-        with receipt_path.open('rb') as stream:
-            receipt_bytes = stream.read(65537)
-        if len(receipt_bytes) > 65536:
-            raise ValueError('amp_candidate_receipt_exceeds_bound')
+        receipt_bytes, receipt_stamp = _read_stable_bounded(receipt_path, 65536)
         receipt = json.loads(receipt_bytes)
+        if mobile and (type(receipt.get('contract_version')) is not int
+                       or receipt.get('contract_version') != CONTRACT_VERSION
+                       or receipt.get('parquet_path') != relative or receipt.get('publish') is not False
+                       or type(receipt.get('rows')) is not int):
+            raise ValueError('amp_candidate_committed_receipt_invalid')
         path = source_path(root, relative)
         if path.stat().st_size > AMP_MAX_ENCODED_BYTES-encoded_bytes:
             raise ValueError('amp_candidate_encoded_budget_exceeded')
-        with path.open('rb') as stream:
-            payload = stream.read(AMP_MAX_ENCODED_BYTES-encoded_bytes+1)
+        payload, parquet_stamp = _read_stable_bounded(path, AMP_MAX_ENCODED_BYTES-encoded_bytes)
+        artifact_stamps[receipts[relative]] = receipt_stamp
+        artifact_stamps[relative] = parquet_stamp
         encoded_bytes += len(payload)
         if encoded_bytes > AMP_MAX_ENCODED_BYTES:
             raise ValueError('amp_candidate_encoded_budget_exceeded')
@@ -132,8 +188,11 @@ def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
         if digest != receipt['sha256']:
             raise ValueError('amp_candidate_committed_parquet_hash_mismatch')
         parquet = pq.ParquetFile(pa.BufferReader(payload))
-        decoded_bytes += sum(parquet.metadata.row_group(i).total_byte_size for i in range(parquet.metadata.num_row_groups))
-        if (parquet.metadata.num_rows > AMP_MAX_BATCH_ROWS or decoded_bytes > AMP_MAX_DECODED_BYTES
+        batch_decoded = sum(parquet.metadata.row_group(i).total_byte_size for i in range(parquet.metadata.num_row_groups))
+        decoded_bytes += batch_decoded
+        if (parquet.metadata.num_rows > AMP_MAX_BATCH_ROWS
+                or decoded_bytes > (AMP_MOBILE_MAX_DECODED_BYTES if mobile else AMP_MAX_DECODED_BYTES)
+                or (mobile and batch_decoded > AMP_MOBILE_MAX_BATCH_DECODED_BYTES)
                 or parquet.metadata.num_rows != receipt['rows']):
             raise ValueError('amp_candidate_decoded_budget_or_rows_invalid')
         batch = parquet.read(columns=columns, use_threads=False).to_pylist()
@@ -148,6 +207,16 @@ def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
             if (not record or record['body_sha256'] != row['body_sha256']
                     or record['requested_url'] != row['candidate_url'] or record['final_url'] != row['candidate_url']):
                 raise ValueError('amp_candidate_head_and_original_identity_mismatch')
+            if mobile:
+                body = record['body']
+                if not isinstance(body, str):
+                    raise ValueError('amp_candidate_committed_body_mismatch')
+                encoded_body = body.encode()
+                if (type(record['body_bytes']) is not int
+                        or record['body_bytes'] != row['body_bytes']
+                        or len(encoded_body) != record['body_bytes']
+                        or hashlib.sha256(encoded_body).hexdigest() != row['body_sha256']):
+                    raise ValueError('amp_candidate_committed_body_mismatch')
             raw_id = record['source_response_article_id']
             raw = envelopes.get(raw_id)
             if not isinstance(raw, bytes):
@@ -157,23 +226,49 @@ def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
                 inspected[raw_id] = hashlib.sha256(raw).hexdigest()
             if inspected[raw_id] != record['response_sha256']:
                 raise ValueError('amp_candidate_original_response_hash_mismatch')
-            finding.update(_declared_amp_head(raw, row['candidate_url'], row['url'],
+            canonical_url = ('https://news.cnyes.com/news/id/'+row['url'].rsplit('/', 1)[-1]
+                             if mobile else row['candidate_url'])
+            finding.update(_declared_amp_head(raw, canonical_url, row['url'],
+                                            document_url=row['candidate_url'],
                                             extraction_method=record['extraction_method']))
-            finding.update(source_request_url=record['source_request_url'], response_sha256=record['response_sha256'],
-                           parquet_path=relative, committed_parquet_sha256=digest)
+            if mobile:
+                source_url = record['source_request_url']
+                finding['source_request_url_sha256'] = (hashlib.sha256(source_url.encode()).hexdigest()
+                                                       if isinstance(source_url, str) else None)
+            else:
+                finding['source_request_url'] = record['source_request_url']
+            finding.update(response_sha256=record['response_sha256'], parquet_path=relative,
+                           committed_parquet_sha256=digest)
             counts[finding['kind']] += 1
             findings.append(finding)
         batches.append({'path': relative, 'sha256': digest, 'rows': len(batch),
                         'selected_candidate_heads': len(grouped[relative]), 'distinct_originals': len(inspected)})
     with closing(sqlite3.connect(f'file:{(root / "queue.sqlite3").resolve()}?mode=ro', uri=True)) as db:
         db.row_factory = sqlite3.Row
-        after = [dict(row) for row in db.execute(AMP_SQL, (maximum_rows+1,))][:maximum_rows]
+        db.execute('BEGIN')
+        after, _ = _amp_rows(db, maximum_rows, mobile=mobile)
+        after_owner = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()
+        after_receipts = {}
+        for path in paths:
+            receipt = db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?', (path,)).fetchone()
+            after_receipts[path] = receipt[0] if receipt else None
+    try:
+        artifacts_unchanged = all(_stat_stamp(source_path(root, relative).stat()) == stamp
+                                  for relative, stamp in artifact_stamps.items())
+    except (OSError, ValueError):
+        artifacts_unchanged = False
+    receipts_unchanged = receipts == after_receipts
+    owner_unchanged = (owner[0] if owner else None) == (after_owner[0] if after_owner else None)
     return {'contract_version': 1, 'observed_at_utc': observed, 'queue_owner_id': owner[0] if owner else None,
-        'inspection_kind': 'retained_primary_native_amp_declarations', 'selected_queued_amp_heads': len(rows),
+        'inspection_kind': ('retained_mobile_native_amp_declarations' if mobile else 'retained_primary_native_amp_declarations'),
+        'selected_queued_amp_heads': len(rows),
         'maximum_rows': maximum_rows, 'sample_limit_reached': truncated,
         'entire_current_queued_amp_scope_selected': not truncated, 'selected_inputs_sha256': selected_sha,
-        'selected_inputs_unchanged': selected_hash(after) == selected_sha,
-        'counts': dict(counts), 'findings': sorted(findings, key=lambda row: row['amp_url']),
+        'selected_inputs_unchanged': (selected_hash(after) == selected_sha and receipts_unchanged
+                                      and artifacts_unchanged and owner_unchanged),
+        'selected_receipts_unchanged': receipts_unchanged, 'selected_artifacts_unchanged': artifacts_unchanged,
+        'queue_owner_unchanged': owner_unchanged,
+        'counts': dict(counts), 'findings': sorted(findings, key=lambda row: row['amp_url'] or row.get('amp_url_sha256', '')),
         'committed_batches': batches, 'query_plan': plan,
         'publisher_requests': 0, 'source_states_mutated': False, 'body_extractors_called': 0,
         'accepted_body_text_retained': False, 'alias_source_equivalence_verified': False, 'aliases_admitted': 0,
@@ -181,6 +276,11 @@ def audit_amp_declarations(root: Path, maximum_rows: int = 256) -> dict:
         'inventory_cost': {'wall_seconds': time.monotonic()-started, 'cpu_seconds': time.process_time()-cpu,
                            'encoded_bytes_read_once': encoded_bytes, 'decoded_byte_bound_used': decoded_bytes,
                            'distinct_original_response_bytes': original_bytes}}
+
+
+def audit_amp_mobile_declarations(root: Path, maximum_rows: int = 256) -> dict:
+    """Check retained mobile originals for declarations concerning queued AMP heads."""
+    return audit_amp_declarations(root, maximum_rows, mobile=True)
 
 
 def audit(root: Path, maximum_rows: int = 512) -> dict:
@@ -238,12 +338,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('configs/news_fulltext.json'))
     parser.add_argument('--maximum-rows', type=int, default=512)
-    parser.add_argument('--amp-declarations', action='store_true',
-                        help='Inspect retained primary candidate declarations for current missing AMP heads; zero HTTP/writes')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--amp-declarations', action='store_true',
+                       help='Inspect retained primary candidate declarations for current missing AMP heads; zero HTTP/writes')
+    modes.add_argument('--amp-mobile-declarations', action='store_true',
+                       help='Inspect retained mobile candidate declarations for current missing AMP heads; zero HTTP/writes')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
     config, registry, repo = load_config(args.config)
-    result = (audit_amp_declarations if args.amp_declarations else audit)(repo / config['root'], args.maximum_rows)
+    audit_fn = (audit_amp_mobile_declarations if args.amp_mobile_declarations else
+                audit_amp_declarations if args.amp_declarations else audit)
+    result = audit_fn(repo / config['root'], args.maximum_rows)
     result['current_source_fingerprint'] = registry.sources['cnyes'].data_fingerprint
     result['configuration_sha256'] = sha256_file(args.config)
     result['implementation_sha256'] = sha256_file(Path(__file__))

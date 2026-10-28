@@ -25,6 +25,52 @@ class _Response:
         return None
 
 
+@pytest.mark.parametrize('raw, expected', [
+    (b'{"state":"idle"}', 'idle'),
+    (b'{"state":"scanning"}', 'scanning'),
+    (b'{"state":"scan-waiting"}', 'scan-waiting'),
+    (b'not-json-private-body', None),
+    (b'[]', None),
+    (b'{}', None),
+    (b'{"state":1}', None),
+    (b'{"state":""}', None),
+    (b'{"state":"private body"}', None),
+    (b'x' * 65537, None),
+])
+def test_scan_state_observation_is_bounded_readonly_and_validated(monkeypatch, raw, expected):
+    monkeypatch.setattr(scan, '_local_scan_endpoint', lambda: ('http://127.0.0.1:8384', 'test-key'))
+    class Response(io.BytesIO):
+        status = 200
+        def read(self, size=-1):
+            assert size == 65537
+            return super().read(size)
+    response = Response(raw)
+    def request(req, *, timeout):
+        assert req.method == 'GET' and timeout == 10
+        assert urllib.parse.urlparse(req.full_url).path == '/rest/db/status'
+        assert urllib.parse.parse_qs(urllib.parse.urlparse(req.full_url).query) == {'folder': [scan.FOLDER_ID]}
+        return response
+    monkeypatch.setattr(scan.urllib.request, 'urlopen', request)
+    if expected:
+        assert scan.scan_folder_state() == expected
+    else:
+        with pytest.raises(SnapshotError) as error:
+            scan.scan_folder_state()
+        assert 'private' not in str(error.value)
+    assert response.closed
+
+
+def test_scan_state_http_failure_closes_body_without_exposing_private_text(monkeypatch):
+    monkeypatch.setattr(scan, '_local_scan_endpoint', lambda: ('http://127.0.0.1:8384', 'test-key'))
+    body = io.BytesIO(b'private server path and authentication details')
+    def unavailable(req, **kwargs):
+        raise urllib.error.HTTPError(req.full_url, 500, 'Internal Server Error', {}, body)
+    monkeypatch.setattr(scan.urllib.request, 'urlopen', unavailable)
+    with pytest.raises(SnapshotError, match='unclassified_http_error') as error:
+        scan.scan_folder_state()
+    assert 'private' not in str(error.value) and body.closed
+
+
 @pytest.fixture
 def queue_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     packed = tmp_path / "packed"

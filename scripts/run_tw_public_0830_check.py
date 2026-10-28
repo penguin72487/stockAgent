@@ -276,16 +276,17 @@ def _derived_refresh_blockers(failures: list[str]) -> list[str]:
     ]
 
 
-def _defer_opening_bulk_step(step: str, observed: datetime) -> bool:
-    """Keep bulk writes/audits from invalidating hot 09:00 model panels.
+def _defer_opening_bulk_step(step: str, observed: datetime, required: bool = False) -> bool:
+    """Defer optional work, never a missing day-trade input or acceptance.
 
-    Current-session entitlement repair is deliberately separate: a missing
-    exact cash receipt must still be allowed to recover before the decision.
-    Full derived builds and strict audits have each taken several minutes on
-    the live dataset.  Do not *start* one at 08:45 and assume the 08:50 guard
-    will stop a task that is already running.  The 09:10 timer resumes these
-    noncritical steps after opening.
+    Required source rebuilding and the strict audit remain coordinated by the
+    existing exclusive-write/shared-read lease; hiding the work until 09:10
+    cannot make an otherwise unready opening runnable.  Current artifacts
+    and accepted audits are still reused before reaching these calls.
     """
+
+    if required:
+        return False
 
     if step not in {
         "refresh_corporate_action_reference",
@@ -1197,7 +1198,7 @@ def main() -> int:
             ):
                 if not current_status["errors"][status_label]:
                     continue
-                if _defer_opening_bulk_step(step_name, datetime.now(TAIPEI)):
+                if _defer_opening_bulk_step(step_name, datetime.now(TAIPEI), required=True):
                     deferred_opening_step = step_name
                     steps.append(
                         {"step": step_name, "status": "deferred_opening_window"}
@@ -1284,7 +1285,7 @@ def main() -> int:
                         }
                     )
                 elif _defer_opening_bulk_step(
-                    "strict_model_safety_audit", datetime.now(TAIPEI)
+                    "strict_model_safety_audit", datetime.now(TAIPEI), required=True
                 ):
                     deferred_opening_step = "strict_model_safety_audit"
                     steps.append(

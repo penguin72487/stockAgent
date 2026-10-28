@@ -47,6 +47,24 @@ from stockagent.models import factorized_input
 _RUNTIME_PROFILE_KEYS = frozenset({"STOCKAGENT_SPARSE_ADJOINT_BACKEND", "STOCKAGENT_SPARSE_ADJOINT_ALGORITHM"})
 
 
+def _isolated_signal_id(*, market: str, observed: datetime, scenario: str) -> str:
+    """Explicit input for independent EMPTY engineering runs, not live IDs.
+
+    Production IDs intentionally contain a random suffix. Financial comparison
+    must not erase them or their order/position references after execution.
+    Supply an identical ID before inference instead, using the already fixed
+    scenario clock/axis. Distinct markets/revisions retain distinct identities.
+    """
+    if (not isinstance(market, str) or not market
+            or not isinstance(scenario, str) or not scenario
+            or observed.tzinfo is None or observed.utcoffset() is None):
+        raise ValueError("isolated signal identity requires market, scenario and aware clock")
+    payload = {"market": market, "scenario": scenario,
+        "observed": observed.astimezone(ZoneInfo("Asia/Taipei")).isoformat(timespec="microseconds")}
+    return "engineering-opening-" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def _reference_row_functions(path: Path, *, nullable_column: bool = False):
     """Load only explicitly selected trusted row-path definitions for ABBA.
 
@@ -278,10 +296,13 @@ def _input_reference_evidence(result) -> dict:
         "rows": rows, "boundary": "model_reference_not_trade_volume_or_execution"}
 
 
-def _preopen_kwargs(kwargs, session):
-    return dict(kwargs, price_source="panel", write=False, ensure_previous_signal=False,
+def _preopen_kwargs(kwargs, session, *, market_config=None):
+    values = dict(kwargs, price_source="panel", write=False, ensure_previous_signal=False,
                 day_trade_signal_update_policy="opening_once_v1",
                 previous_signal_backfill_limit=0, asof_date=f"{session} 08:50:00")
+    # Apply private-warmup transport admission after selecting panel/write=False,
+    # just like the native role; changing those fields after signal_kwargs lost it.
+    return market_config.signal_kwargs(**values) if market_config is not None else values
 
 
 def _receipt_universe(payload):
@@ -677,7 +698,7 @@ def main() -> None:
             )
             step = time.perf_counter()
             try:
-                prepare_kwargs = _preopen_kwargs(kwargs, session) if args.preopen_panel_warmup else kwargs
+                prepare_kwargs = _preopen_kwargs(kwargs, session, market_config=cfg) if args.preopen_panel_warmup else kwargs
                 if args.preopen_quote_priority:
                     prepare_kwargs = dict(prepare_kwargs, preopen_quote_priority=True)
                 result = signal_engine.generate_live_signal(**prepare_kwargs)
@@ -857,7 +878,8 @@ def main() -> None:
             entry_prepare_ms = None
             if args.simulate_entry:
                 prepare_started = time.perf_counter()
-                entry_worker.submit(_prepare_entry_worker, root / f"ledger-{repetition}-{int(use_cached)}", source_rows).result()
+                entry_worker.submit(_prepare_entry_worker, root / f"ledger-{repetition}-{int(use_cached)}",
+                                    source_rows, created_at=clock[0]).result()
                 entry_prepare_ms = (time.perf_counter() - prepare_started) * 1000
             started = time.perf_counter()
             prefetch_pool = None
@@ -877,7 +899,9 @@ def main() -> None:
                 execution_order = (by_future[future] for future in as_completed(by_future))
             for cfg in execution_order:
                 kwargs = dict(kwargs_by_market[cfg.market], write=True,
-                              live_output_dir=root / f"{repetition}-{int(use_cached)}" / cfg.market)
+                              live_output_dir=root / f"{repetition}-{int(use_cached)}" / cfg.market,
+                              signal_id=_isolated_signal_id(market=cfg.market, observed=observed,
+                                                            scenario=f"batch-{repetition}"))
                 if args.defer_reports:
                     kwargs["defer_rich_artifacts"] = True
                 step = time.perf_counter()
@@ -1018,6 +1042,7 @@ def main() -> None:
                    "preopen_priority_previews": priority_previews,
                    "deferred_reports": args.defer_reports, "contracts": contracts,
                    "synthetic_entry_book_fixture": args.simulate_entry,
+                   "isolated_signal_id_contract": "explicit_fixture_signal_id_before_inference_v1",
                    "execution_owner_layout": "independent_model_and_single_ledger_process" if args.simulate_entry else "model_only",
                    "input_scheduling": "parallel_readonly_inputs_serial_model_owner" if args.parallel_inputs or args.compare_prefetch_preparation else "paired_sequential_parallel" if args.compare_input_scheduling else "sequential_inputs",
                    "broker_fill_claim": False,
@@ -1067,6 +1092,9 @@ def _paper_ledger_financial_oracle(engine) -> dict:
     quantities, brackets, costs, P&L and unknowns. No field-name money whitelist
     or aggregate-only oracle may silently drop a future financial field.
     This covers every generated record, not an unobserved full trading session.
+    Reuse parsed journal prefixes only after reading and hashing EVERY old byte
+    again. Inode growth is not an immutability proof; a repaired prefix forces
+    a complete parse. This reduces repeated JSON work, not source verification.
     """
     from stockagent.live.tw_day_trade_service_sync import (
         PAPER_JOURNAL_FILENAMES, committed_paper_read_guard,
@@ -1090,28 +1118,82 @@ def _paper_ledger_financial_oracle(engine) -> dict:
     def state_digest(value):
         return hashlib.sha256(encoded({k: v for k, v in value.items() if k not in excluded})).hexdigest()
 
+    previous = getattr(engine, "_benchmark_financial_journal_cache", {})
+    next_cache, readback_work = {}, {}
+
+    def generation(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def journal_digest(path):
+        digest, raw_digest = hashlib.sha256(), hashlib.sha256()
+        count = physical_lines = prefix_bytes = parsed_records = 0
+        stat = path.stat()
+        cached = previous.get(path.name)
+        reusable = bool(cached is not None and cached["complete_lines"]
+            and cached["generation"][:2] == generation(stat)[:2]
+            and cached["generation"][2] <= stat.st_size)
+        with path.open("rb") as handle:
+            if generation(os.fstat(handle.fileno())) != generation(stat):
+                raise RuntimeError("paper journal changed before financial readback")
+            if reusable:
+                remaining = cached["generation"][2]
+                while remaining:
+                    chunk = handle.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise RuntimeError("paper journal truncated during prefix verification")
+                    raw_digest.update(chunk)
+                    prefix_bytes += len(chunk)
+                    remaining -= len(chunk)
+                reusable = raw_digest.hexdigest() == cached["raw_sha256"]
+                if reusable:
+                    digest = cached["normalized_digest"].copy()
+                    count, physical_lines = cached["records"], cached["physical_lines"]
+                else:
+                    handle.seek(0)
+                    raw_digest = hashlib.sha256()
+            complete_lines = True
+            for line in handle:
+                raw_digest.update(line)
+                physical_lines += 1
+                complete_lines = line.endswith(b"\n")
+                if line.strip():
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("paper journal record is not an object")
+                    digest.update(encoded(row))
+                    count += 1
+                    parsed_records += 1
+                digest.update(b"\n")
+            if generation(os.fstat(handle.fileno())) != generation(stat):
+                raise RuntimeError("paper journal changed during financial readback")
+        if generation(path.stat()) != generation(stat):
+            raise RuntimeError("paper journal replaced during financial readback")
+        next_cache[path.name] = {"generation": generation(stat), "complete_lines": complete_lines,
+            "raw_sha256": raw_digest.hexdigest(), "normalized_digest": digest.copy(),
+            "records": count, "physical_lines": physical_lines}
+        readback_work[path.name] = {"verified_old_prefix_bytes": prefix_bytes,
+            "parsed_records": parsed_records, "verified_prefix_reused": reusable}
+        return {"present": True, "records": count,
+            "physical_lines": physical_lines, "sha256": digest.hexdigest()}
+
     with committed_paper_read_guard(engine.state_dir):
-        persisted = json.loads(engine.state_path.read_bytes())
+        from stockagent.live.paper_mode_snapshot import read_paper_state
+        persisted = read_paper_state(engine.state_path)
         state_sha = state_digest(persisted)
         if state_sha != state_digest(engine.state):
             raise RuntimeError("full persisted financial state differs from the engine")
         journals = {}
         for name in PAPER_JOURNAL_FILENAMES:
             path = engine.state_dir / name
-            digest, count, physical_lines = hashlib.sha256(), 0, 0
             if path.exists():
-                with path.open("rb") as handle:
-                    for line in handle:
-                        physical_lines += 1
-                        if line.strip():
-                            row = json.loads(line)
-                            if not isinstance(row, dict):
-                                raise ValueError("paper journal record is not an object")
-                            digest.update(encoded(row))
-                            count += 1
-                        digest.update(b"\n")
-            journals[name] = {"present": path.exists(), "records": count,
-                "physical_lines": physical_lines, "sha256": digest.hexdigest()}
+                journals[name] = journal_digest(path)
+            else:
+                journals[name] = {"present": False, "records": 0,
+                    "physical_lines": 0, "sha256": hashlib.sha256().hexdigest()}
+    # Publish cache only after the complete commit fence/readback succeeded.
+    # It is private verification state, never part of a persisted paper ledger.
+    engine._benchmark_financial_journal_cache = next_cache
+    engine._benchmark_financial_readback_work = readback_work
     return {"contract": "complete_generated_paper_state_and_six_journals_v1",
         "state_sha256": state_sha, "journals": journals,
         "excluded_state_fields": list(excluded),
@@ -1159,7 +1241,8 @@ def _isolated_paper_entry_probe(engine, spec, result, observed, source_rows, *, 
     oracle_ms = (time.perf_counter() - oracle_started) * 1000
     return {"scope": "isolated_engineering_synthetic_one_lot_books_not_live_fill", "status": status, "fixture_quote_count": len(quotes_by_symbol), "fixture_build_and_real_eligibility_ms": round(fixture_build_ms, 3), "registration_and_ledger_persist_ms": round(register_ms, 3), "entry_fill_outcome": mode.get("entry_fill_outcome"), "filled_shares": mode.get("entry_filled_shares"), "requested_shares": mode.get("entry_requested_shares"), "pending_source_count": mode.get("pending_entry_source_count"), "position_count": len(mode.get("positions") or {}), "state_publication": engine.last_persist_metrics, "profile_path": str(profile_path) if profile_path else None, "production_ledger_modified": False,
         "ledger_financial_oracle": financial_oracle, "post_commit_oracle_ms": round(oracle_ms, 3),
-        "worker_ipc_completion_includes_readback_oracle": True}
+        "worker_ipc_completion_includes_readback_oracle": True,
+        "financial_readback_work": getattr(engine, "_benchmark_financial_readback_work", {})}
 
 
 def _measurement_summary(records) -> dict:
@@ -1229,10 +1312,28 @@ _ENTRY_ENGINE = None
 _ENTRY_SOURCE_ROWS = None
 
 
-def _prepare_entry_worker(path, source_rows):
-    global _ENTRY_ENGINE, _ENTRY_SOURCE_ROWS
+def _new_isolated_entry_engine(path, *, created_at, immutable_mode_snapshots=None):
+    """Create an EMPTY engineering fixture with an explicit initialization clock.
+
+    The production constructor correctly records real wall time. Independent
+    benchmark runs instead supply the same fixture input, BEFORE any financial
+    record exists. Never normalize away persisted decision/creation clocks or
+    open an existing ledger just to make an output comparator pass.
+    """
     from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
-    _ENTRY_ENGINE = TwDayTradeSimulationEngine(path)
+    path = Path(path)
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        raise ValueError("isolated ledger initialization requires an explicit timezone")
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise ValueError("isolated ledger fixture requires an empty destination")
+    engine = TwDayTradeSimulationEngine(path, immutable_mode_snapshots=immutable_mode_snapshots)
+    engine.state["created_at"] = created_at.astimezone(ZoneInfo("Asia/Taipei")).isoformat(timespec="seconds")
+    return engine
+
+
+def _prepare_entry_worker(path, source_rows, *, created_at):
+    global _ENTRY_ENGINE, _ENTRY_SOURCE_ROWS
+    _ENTRY_ENGINE = _new_isolated_entry_engine(path, created_at=created_at)
     _ENTRY_SOURCE_ROWS = source_rows
     return {"state": str(_ENTRY_ENGINE.state_path), "signals": str(_ENTRY_ENGINE.signals_path),
             "orders": str(_ENTRY_ENGINE.orders_path), "fills": str(_ENTRY_ENGINE.fills_path)}

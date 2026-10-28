@@ -193,7 +193,7 @@ def wait_for_next_cycle(root: Path, result: dict[str, Any], seconds: float, *,
             deadline = min(deadline, max(now + timedelta(seconds=1), calendar_next_check(root, now)))
         delay = max(0.0, (deadline - now).total_seconds()) if deadline is not None else 0.0
     else:
-        delay = (seconds if seconds == 0 or result.get('state') in {'rate_limited', 'ip_banned', 'queue_busy'} else
+        delay = (seconds if seconds == 0 or result.get('state') in {'rate_limited', 'ip_banned', 'queue_busy', 'disk_guard'} else
                  next_cycle_delay(root, now, seconds, sources=sources, snapshot_hours=snapshot_hours))
     until = now + timedelta(seconds=delay)
     if opening_wait:

@@ -40,6 +40,12 @@ FINMIND_GROUP_STATUS_CONTRACT = "complete_finmind_group_status_comparison_v1"
 FINMIND_THROUGHPUT_RESERVATION_CONTRACT = "complete_finmind_throughput_reservation_comparison_v1"
 PUBLIC_BUILDER_CONTRACT = "tw_public_complete_builder_exact_parity_v1"
 TAIFEX_PROOF_MEMO_CONTRACT = "taifex_complete_curve_source_proof_memo_comparison_v1"
+WORKFLOW_ROUND_CONTRACTS = {
+    number: f"workflow_speed_round{number}_scoped_acceptance_v1" for number in (6, 7, 8, 9, 10, 11)
+}
+WORKFLOW_ROUND_RECEIPTS = (
+    "optimization_acceptance.json", "optimization_acceptance_readback.json", "source_disposition.json",
+)
 FINMIND_THROUGHPUT_REPORTS = (
     "reservation_control.json", "publication_query_control.json",
     "periodic_query_control.json", "correction_query_control.json",
@@ -94,7 +100,183 @@ def external_benchmark_contract(source: Path) -> str | None:
         return PUBLIC_BUILDER_CONTRACT
     if _taifex_proof_memo_case(source):
         return TAIFEX_PROOF_MEMO_CONTRACT
+    if contract := _workflow_round_contract(source):
+        return contract
     return None
+
+
+def _workflow_round_contract(source: Path) -> str | None:
+    """Only reviewed original round ABIs, bound to an exact case.
+
+    A closed round is separate from its still-running parent optimization.
+    Future rounds require review; a generic verified/complete flag is insufficient.
+    """
+    match = re.fullmatch(r"round(6|7|8|9|10|11)", source.name)
+    suite = re.fullmatch(r"workflow_speed_optimization_([0-9]{8})", source.parent.name)
+    if (match is None or suite is None or len(source.parents) < 3
+            or source.parents[1].name != "benchmarks" or source.parents[2].name != "artifacts"):
+        return None
+    try:
+        datetime.strptime(suite[1], "%Y%m%d")
+    except ValueError:
+        return None
+    return WORKFLOW_ROUND_CONTRACTS[int(match[1])]
+
+
+def _completed_workflow_round8(acceptance: dict, readback: dict, disposition: dict) -> bool:
+    """Round 8 separates optimization, confirmation and instrumentation samples.
+
+    Its original producer sealed all three comparisons and one diagnostic
+    cohort; raw_samples_verified belongs to a different historical receipt ABI.
+    Keep the selected variant as historical metadata, not today's tuning policy.
+    """
+    for family in ("optimization", "confirmation", "instrumentation_comparison"):
+        count = acceptance.get(f"{family}_samples")
+        verified = readback.get(f"{family}_samples_verified")
+        if type(count) is not int or count <= 0 or type(verified) is not int or verified != count:
+            return False
+    if (type(acceptance.get("instrumented_diagnostic_samples")) is not int
+            or acceptance["instrumented_diagnostic_samples"] <= 0
+            or readback.get("diagnostic_counter_coverage_verified") is not True
+            or readback.get("remaining_registry_counts_verified") is not True
+            or any(type(readback.get(key)) is not int or readback[key] <= 0
+                   for key in ("mean_checks", "speed_samples_verified", "summary_groups_verified"))):
+        return False
+    variant, batch = acceptance.get("selected_variant"), acceptance.get("selected_batch_mib")
+    if (not isinstance(variant, str) or not variant.strip()
+            or type(batch) is not int or batch <= 0
+            or type(acceptance.get("performance_candidate_adopted")) is not bool):
+        return False
+    for key in ("selected_variant", "selected_batch_mib", "performance_candidate_adopted"):
+        if any(type(value.get(key)) is not type(acceptance[key]) or value[key] != acceptance[key]
+               for value in (readback, disposition)):
+            return False
+    return True
+
+
+def _workflow_selected_source_matches(acceptance: dict, readback: dict, disposition: dict) -> bool:
+    """Compare the selected historical source; it is not today's tuning policy."""
+    selected = acceptance.get("selected_source")
+    batch = acceptance.get("selected_batch_mib")
+    workers = acceptance.get("selected_read_workers")
+    adopted = acceptance.get("performance_candidate_adopted")
+    if (not isinstance(selected, str) or not selected.strip()
+            or type(batch) is not int or batch <= 0
+            or type(workers) is not int or workers <= 0 or type(adopted) is not bool
+            or disposition.get("selected_source") != selected
+            or type(disposition.get("selected_batch_mib")) is not int
+            or disposition["selected_batch_mib"] != batch
+            or type(disposition.get("performance_candidate_adopted")) is not bool
+            or disposition["performance_candidate_adopted"] != adopted
+            or type(readback.get("performance_candidate_adopted")) is not bool
+            or readback["performance_candidate_adopted"] != adopted):
+        return False
+    return True
+
+
+def _completed_workflow_round9(acceptance: dict, readback: dict, disposition: dict) -> bool:
+    """Validate round 9's original performance and diagnostic readback ABI."""
+    for family in ("performance", "diagnostic"):
+        count = acceptance.get(f"{family}_samples")
+        verified = readback.get(f"{family}_samples_verified")
+        if type(count) is not int or count <= 0 or type(verified) is not int or verified != count:
+            return False
+    operations = readback.get("serialization_operations_verified")
+    if (type(operations) is not int
+            or operations < acceptance["performance_samples"] + acceptance["diagnostic_samples"]
+            or readback.get("remaining_registry_counts_verified") is not True
+            or any(type(readback.get(key)) is not int or readback[key] <= 0
+                   for key in ("mean_checks", "speed_samples_verified", "summary_groups_verified"))):
+        return False
+    return _workflow_selected_source_matches(acceptance, readback, disposition)
+
+
+def _completed_workflow_round10(acceptance: dict, readback: dict, disposition: dict) -> bool:
+    """Validate round 10's separate performance and encoding calibration ABI."""
+    for family in ("performance", "encoding"):
+        count = acceptance.get(f"{family}_samples")
+        verified = readback.get(f"{family}_samples_verified")
+        if type(count) is not int or count <= 0 or type(verified) is not int or verified != count:
+            return False
+    if (type(acceptance.get("encoding_diagnostics")) is not int
+            or acceptance["encoding_diagnostics"] <= 0
+            or type(readback.get("encoding_diagnostic_operations_verified")) is not int
+            or readback["encoding_diagnostic_operations_verified"] <= 0
+            or readback.get("remaining_registry_counts_verified") is not True
+            or any(type(readback.get(key)) is not int or readback[key] <= 0
+                   for key in ("mean_checks", "speed_samples_verified", "summary_groups_verified"))
+            or disposition.get("source_data_deleted") is not False
+            or disposition.get("services_restarted") is not False
+            or type(disposition.get("new_training_jobs")) is not int
+            or disposition["new_training_jobs"] != 0):
+        return False
+    return _workflow_selected_source_matches(acceptance, readback, disposition)
+
+
+def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bool:
+    """Preserve original scoped completion, not current numerical acceptance.
+
+    Full source inventories, D reconstruction and current consumer/quarantine
+    checks remain the retirement owner's responsibility. Historical references
+    to maintained source are not reinterpreted as today's source fingerprint.
+    """
+    contract = _workflow_round_contract(source)
+    if contract is None or set(objects) != set(WORKFLOW_ROUND_RECEIPTS):
+        return False
+    acceptance, readback, disposition = (objects[name] for name in WORKFLOW_ROUND_RECEIPTS)
+    if (acceptance.get("contract") != contract
+            or acceptance.get("state") != "verified_scoped_engineering"
+            or readback.get("state") != "verified"
+            or disposition.get("state") not in {"reviewed", "prepared"}
+            or not isinstance(acceptance.get("scope"), str) or not acceptance["scope"].strip()):
+        return False
+    number = int(source.name[5:])
+    digest_key, count_key, samples_key = (("acceptance_sha256", "evidence_files_verified", "raw_samples_verified")
+        if number == 6 else ("seal_sha256", "sealed_files_verified",
+                            "performance_samples_verified" if number in (9, 10, 11) else
+                            "optimization_samples_verified" if number == 8 else "raw_samples_verified"))
+    if (readback.get(digest_key) != hashlib.sha256(contents[WORKFLOW_ROUND_RECEIPTS[0]]).hexdigest()
+            or type(readback.get(samples_key)) is not int or readback[samples_key] <= 0
+            or type(readback.get("collector_phases_verified")) is not int
+            or readback["collector_phases_verified"] != 13):
+        return False
+    try:
+        start = datetime.fromisoformat(acceptance["observed_at_utc"])
+        end = datetime.fromisoformat(readback["observed_at_utc"])
+        if start.utcoffset() is None or end.utcoffset() is None or end < start:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    boundaries = acceptance if number in (8, 9, 10, 11) else acceptance.get("remaining_boundaries")
+    if (not isinstance(boundaries, dict)
+            or any(boundaries.get(key) is not False or readback.get(key) is not False
+                   for key in ("all_workflows_measured", "hardware_limit_proven"))):
+        return False
+    if number == 8 and not _completed_workflow_round8(acceptance, readback, disposition):
+        return False
+    if number == 9 and not _completed_workflow_round9(acceptance, readback, disposition):
+        return False
+    if number == 10 and not _completed_workflow_round10(acceptance, readback, disposition):
+        return False
+    evidence = acceptance.get("evidence")
+    if (not isinstance(evidence, list) or not 1 <= len(evidence) <= 50000
+            or type(readback.get(count_key)) is not int or readback[count_key] != len(evidence)):
+        return False
+    names = set()
+    for row in evidence:
+        if (not isinstance(row, dict) or set(row) != {"path", "bytes", "sha256"}
+                or not isinstance(row["path"], str) or "\x00" in row["path"]
+                or "\\" in row["path"] or not row["path"]
+                or type(row["bytes"]) is not int or row["bytes"] < 0
+                or not isinstance(row["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is None):
+            return False
+        path = PurePosixPath(row["path"])
+        if (not path.parts or path.is_absolute() or ".." in path.parts or path.as_posix() != row["path"]
+                or row["path"] in names):
+            return False
+        names.add(row["path"])
+    return True
 
 
 def _taifex_proof_memo_case(source: Path) -> bool:
@@ -945,10 +1127,11 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         raise SnapshotError('benchmark evidence source is redirected')
     if original_source is not None:
         contracts = {FINMIND_GROUP_STATUS_CONTRACT, FINMIND_THROUGHPUT_RESERVATION_CONTRACT,
-                     PUBLIC_BUILDER_CONTRACT, TAIFEX_PROOF_MEMO_CONTRACT}
+                     PUBLIC_BUILDER_CONTRACT, TAIFEX_PROOF_MEMO_CONTRACT, *WORKFLOW_ROUND_CONTRACTS.values()}
         if (required_contract not in contracts
                 or original_source.resolve(strict=False) != original_source.absolute()
-                or not (_completion_receipt_paths(original_source) or _taifex_proof_memo_case(original_source))):
+                or not (_completion_receipt_paths(original_source) or _taifex_proof_memo_case(original_source)
+                        or _workflow_round_contract(original_source))):
             raise SnapshotError('retained comparison requires its exact original producer binding')
         if source.name != 'retained-evidence':
             _finmind_group_quarantine_origin(source, original_source)
@@ -960,7 +1143,12 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
                 raise ValueError("duplicate benchmark evidence key")
             value[key] = child
         return value
-    paths = sorted(source.glob("*.json"))
+    producer_source = original_source if original_source is not None else source
+    # These producers include giant JSON measurement payloads. Preserve every
+    # original in the full archive; retain only their three bounded completion
+    # receipts on C. Do not parse or copy a 200 MB manifest as control metadata.
+    paths = ([source / name for name in WORKFLOW_ROUND_RECEIPTS]
+             if _workflow_round_contract(producer_source) else sorted(source.glob("*.json")))
     external = _completion_receipt_paths(
         original_source if original_source is not None and source.name != 'retained-evidence' else source)
     if any(path.name in {p.name for p in paths} for path in external):
@@ -1016,6 +1204,9 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         producer_contract, producer_state = PUBLIC_BUILDER_CONTRACT, "accepted_exact_output"
     elif _completed_taifex_proof_memo(original_source if original_source is not None else source, objects):
         producer_contract, producer_state = TAIFEX_PROOF_MEMO_CONTRACT, "measurement_complete"
+    elif _completed_workflow_round(producer_source, objects, contents):
+        producer_contract = _workflow_round_contract(producer_source)
+        producer_state = "verified_scoped_engineering"
     elif _completed_comparison(fixture, accepted, objects):
         producer_contract, producer_state = fixture['contract'], accepted['state']
     else:

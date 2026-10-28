@@ -9,6 +9,7 @@
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=21">
   <link rel="stylesheet" href="ticks.css?v=1">
+  <link rel="stylesheet" href="storage.css?v=1">
   <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
   <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
@@ -64,8 +65,8 @@
     </section>
 
     <section id="tick-inventory" class="section-block tick-catalog" aria-labelledby="tick-inventory-title">
-      <div class="section-heading"><div><p class="eyebrow">TICK & ORDER BOOK INVENTORY</p><h2 id="tick-inventory-title">逐筆成交與五檔資料清冊</h2></div>
-        <p>台股在前，依市場、來源與商品分列筆數、實際天數及起訖；連續期貨可展開各合約。</p></div>
+      <div class="section-heading"><div><p class="eyebrow">MARKET DATA INVENTORY</p><h2 id="tick-inventory-title">日、分鐘、逐筆與特徵資料清冊</h2></div>
+        <p>台股在前，依市場、來源及頻率分列筆數、實際天數與起訖；原始、衍生及重疊視圖分開標示。</p></div>
     </section>
 
     <section class="section-block finlab-monitor" aria-labelledby="finlab-title">
@@ -141,6 +142,30 @@
         </div>
       </div>
       <p id="acquisition-boundary" class="acquisition-boundary">讀取收據中。</p>
+    </section>
+
+    <section id="storage-inventory" class="section-block storage-observatory" aria-labelledby="storage-inventory-title">
+      <div class="section-heading"><div><p class="eyebrow">FLEET STORAGE</p><h2 id="storage-inventory-title">所有機器的儲存狀況</h2></div>
+        <p>先看容量，再點開蜂巢檢視各類資料；每個磁碟保留獨立量測時間。</p></div>
+      <p id="storage-observed" class="storage-copy" role="status">等待儲存觀測快照。</p>
+      <div id="storage-capacities" class="storage-capacities" aria-label="各機器磁碟容量"></div>
+      <p id="storage-efficiency" class="storage-copy" hidden></p>
+      <p id="storage-tiers" class="storage-copy" hidden></p>
+      <p id="storage-error" class="storage-error" role="status" hidden></p>
+      <div class="storage-explorer" id="storage-explorer" hidden>
+        <div class="storage-explorer-heading"><h3 id="storage-selected-title">資料分類</h3><button id="storage-close" type="button">收起分類</button></div>
+        <p id="storage-classification-state" class="storage-copy"></p>
+        <nav id="storage-breadcrumbs" class="storage-breadcrumbs" aria-label="儲存分類路徑"></nav>
+        <div id="storage-honeycomb" class="storage-honeycomb" aria-label="點選資料分類往下查看"></div>
+        <button id="storage-more" class="storage-more" type="button" hidden>顯示更多分類</button>
+        <p id="storage-direct" class="storage-copy"></p>
+        <details class="storage-tree-details"><summary>展開目錄數值清冊</summary><div id="storage-tree" class="storage-tree"></div></details>
+      </div>
+      <details class="storage-method"><summary>空間計算方式與安全回收</summary>
+        <p>容量每分鐘量測；已登錄專案目錄每六小時以低優先序清點。分類顯示檔案系統回報的配置空間，掃描期間資料仍可能變動；NAS 的檔案配置量不代表伺服器壓縮／去重後占用。蜂巢大小相同，比例由數字與長條表示；每層先顯示最大的 12 個目錄，可繼續展開，超過 128 個的尾端目錄合併計量。</p>
+        <p>WSL 虛擬磁碟包含在 Windows 磁碟內；D 槽掛載別名只登錄一次。各磁碟不加總成一個可能重複的數字。來源、備份及還原副本分開呈現；未知與連線失敗保留上次實測時間。</p>
+        <p>目錄分類不代表可刪除。正式來源、交易帳本及使用中的模型／快取，須通過引用與獨立恢復檢查後才可回收。NAS 的整體使用量包含同磁碟其他使用者，專案分類只清點授權目錄。</p>
+      </details>
     </section>
 
     <section class="section-block" aria-labelledby="groups-title">
@@ -271,10 +296,11 @@
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
   <script src="../dashboard-core.js?v=15" defer></script>
-  <script src="../dashboard-acquisition.js?v=9" defer></script>
+  <script src="../dashboard-acquisition.js?v=11" defer></script>
   <script src="../feature-page-constraints.js?v=1" defer></script>
   <script src="../feature-page-contract.js?v=1" defer></script>
-  <script src="app.js?v=52" defer></script>
-  <script src="ticks.js?v=3" defer></script>
+  <script src="app.js?v=53" defer></script>
+  <script src="ticks.js?v=6" defer></script>
+  <script src="storage.js?v=5" defer></script>
 </body>
 </html>

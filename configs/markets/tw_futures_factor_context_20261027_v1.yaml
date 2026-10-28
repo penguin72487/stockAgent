@@ -1,0 +1,11 @@
+base_config: tw_futures_residual_signals_20261027_v1.yaml
+experiment_name: tw-futures-factor-context-20261027-v1
+training:
+  financial_transformer:
+    futures_residual_signal_context: true
+    futures_joint_market_tokens: 16
+    futures_net_notional_cap: null
+    futures_beta_notional_cap: null
+runner:
+  output_dir: artifacts/markets/tw_futures_factor_context_20261027_v1/twd_equity__factors16_0845
+  resume: false

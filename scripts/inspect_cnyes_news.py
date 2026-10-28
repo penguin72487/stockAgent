@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import hashlib
 import html
 import json
@@ -17,16 +17,21 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
 import time
+import unicodedata
 from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
-from downloader.artifact_io import atomic_write_bytes, atomic_write_json
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from downloader.artifact_io import atomic_write_bytes, atomic_write_json, sha256_file
 from downloader.news_fulltext import fetch_article, load_config
 from downloader.news_fulltext_http import NewsHTTP, ACCESS_DIAGNOSTIC_HEADERS
 from downloader.news_fulltext_policy import NewsError, _objects, _plain_text, _plain_text_node, extract_article, normalize_url
-from downloader.news_fulltext_queue import utc_now
+from downloader.news_fulltext_queue import source_path, utc_now
 
 
 def cnyes_literal_route_hint(url):
@@ -57,6 +62,103 @@ def cnyes_literal_route_hint(url):
     if parts.netloc in {'www.cnyes.com', 'hao.cnyes.com', 'fund.cnyes.com', 'invest.cnyes.com'}:
         return 'other_cnyes_route_unreviewed'
     return 'foreign_origin_unreviewed'
+
+
+def cnyes_corpus_market_head_audit(root: Path, *, notify=None):
+    """Count this builder rule's effects in one pinned, existing corpus.
+
+    Only URL and text-kind columns are read. An accepted manifest is not an
+    independent re-verification of every Parquet byte: stat generations are
+    checked around each read and the manifest is checked again at the end.
+    This does not alter data, request publishers, or infer article equivalence.
+    """
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from stockagent.data.news_dataset_sources import HEADLINE_SCOPE_CONTRACT, headline_metadata_only_reason
+    from stockagent.data.news_dataset_storage import news_part_path
+
+    root = root.resolve()
+    manifest_path = root / 'manifest.json'
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    if manifest.get('state') != 'ready' or manifest.get('contract_version') not in {1, 2}:
+        raise ValueError('news corpus manifest is not a supported ready version')
+    parts = [p for p in manifest['parts'] if p['table_name'] == 'articles']
+    if len({p['path'] for p in parts}) != len(parts):
+        raise ValueError('duplicate article part in news corpus')
+    reasons = defaultdict(int)
+    headline_rows = fulltext_rows = projected_rows = pruned_rows = 0
+    for number, part in enumerate(parts, 1):
+        path = news_part_path(root, manifest, part)
+        before = path.stat()
+        signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        with pq.ParquetFile(path) as parquet:
+            if parquet.metadata.num_rows != part['rows'] or before.st_size != part['bytes']:
+                raise ValueError('news corpus article part size/row mismatch')
+            kind_index = parquet.schema_arrow.get_field_index('text_kind')
+            if kind_index < 0 or parquet.schema_arrow.get_field_index('url') < 0:
+                raise ValueError('news corpus article projection is missing required columns')
+            for group_number in range(parquet.metadata.num_row_groups):
+                group = parquet.metadata.row_group(group_number)
+                stats = group.column(kind_index).statistics
+                # A fulltext-only row group cannot contain the no-body
+                # headlines covered by this rule; skip its URL column.
+                if (stats is not None and stats.has_min_max and stats.null_count == 0
+                        and stats.min == 'fulltext' and stats.max == 'fulltext'):
+                    fulltext_rows += group.num_rows
+                    pruned_rows += group.num_rows
+                    continue
+                for batch in parquet.iter_batches(row_groups=[group_number],
+                                                  columns=['url', 'text_kind'],
+                                                  batch_size=16384, use_threads=False):
+                    kinds = batch.column(batch.schema.get_field_index('text_kind'))
+                    if kinds.null_count:
+                        raise ValueError('news corpus article text kind is missing')
+                    headline = pc.equal(kinds, 'headline')
+                    full = pc.equal(kinds, 'fulltext')
+                    headlines = int(pc.sum(pc.cast(headline, 'int64')).as_py() or 0)
+                    fulltexts = int(pc.sum(pc.cast(full, 'int64')).as_py() or 0)
+                    if headlines + fulltexts != batch.num_rows:
+                        raise ValueError('news corpus article has an unknown text kind')
+                    headline_rows += headlines
+                    fulltext_rows += fulltexts
+                    projected_rows += batch.num_rows
+                    urls = pc.filter(batch.column(batch.schema.get_field_index('url')), headline)
+                    if urls.null_count:
+                        raise ValueError('news corpus headline URL is missing')
+                    candidates = pc.or_(
+                        pc.or_(pc.starts_with(urls, 'https://www.cnyes.com/twstock/'),
+                               pc.starts_with(urls, 'http://www.cnyes.com/twstock/')),
+                        pc.or_(pc.starts_with(urls, 'https://news.google.com/'),
+                               pc.starts_with(urls, 'http://news.google.com/')))
+                    for url in pc.filter(urls, candidates).to_pylist():
+                        if reason := headline_metadata_only_reason(url):
+                            reasons[reason] += 1
+        after = path.stat()
+        if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError('news corpus article part changed during inspection')
+        if notify and (number % 64 == 0 or number == len(parts)):
+            notify(number, len(parts))
+    if (manifest_path.read_bytes() != manifest_bytes
+            or headline_rows + fulltext_rows != manifest['row_counts']['articles']
+            or headline_rows != manifest['source_snapshot']['counts']['headline_articles']):
+        raise ValueError('news corpus manifest changed or row counts disagree')
+    return {
+        'contract_version': 1,
+        'headline_scope_contract': HEADLINE_SCOPE_CONTRACT,
+        'dataset_root': str(root), 'source_root': manifest['source_snapshot']['source_root'],
+        'generation': manifest['generation'],
+        'manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+        'article_parts_examined': len(parts), 'headline_rows_examined': headline_rows,
+        'fulltext_rows': fulltext_rows, 'projected_rows': projected_rows,
+        'fulltext_rows_pruned_by_statistics': pruned_rows,
+        'metadata_only_market_headlines': sum(reasons.values()),
+        'metadata_only_by_reason': dict(sorted(reasons.items())),
+        'scope': 'current corpus manifest headline rows under the new literal URL rule, not live queue or whole source history',
+        'full_part_sha_reverified': False, 'article_identity_inferred': False,
+        'source_or_corpus_writes': 0, 'publisher_requests': 0, 'body_columns_read': 0,
+    }
 
 
 def cnyes_unsupported_path_inventory(db, *, head_limit=4096):
@@ -97,6 +199,297 @@ def cnyes_unsupported_path_inventory(db, *, head_limit=4096):
         'completion_denominator_changed': False, 'publisher_requests': 0,
         'production_queue_writes': 0, 'completed_body_rows_scanned': 0,
         'raw_or_body_payloads_read': 0,
+    }
+
+
+def cnyes_market_route_provenance(db, *, head_limit=4096):
+    """Summarize bounded market-route hints and existing metadata pointers.
+
+    A literal redirect target or a metadata title is not publisher identity,
+    a publication clock, or proof that the destination is or is not an
+    article. Retain every head and pointer; never follow URLs or load bodies.
+    The caller should hold one read transaction for a coherent snapshot.
+    """
+    if type(head_limit) is not int or not 1 <= head_limit <= 4096:
+        raise ValueError('unsupported path head limit must be 1..4096')
+    from stockagent.data.news_source_urls import GOOGLE_LITERAL_URL_CONTRACT
+    rows = db.execute(
+        "SELECT substr(a.url,1,8193),substr(a.title,1,4097),a.body_sha256,"
+        "EXISTS(SELECT 1 FROM source_links s WHERE s.article_id=a.id),"
+        "EXISTS(SELECT 1 FROM original_url_resolutions r INDEXED BY original_url_target "
+        "WHERE r.original_id=a.id AND r.contract_version=? AND r.outcome='literal_original') "
+        "FROM articles a INDEXED BY dispatch WHERE a.provider='cnyes' "
+        "AND a.state='unsupported_article_path' ORDER BY a.due LIMIT ?",
+        (GOOGLE_LITERAL_URL_CONTRACT, head_limit + 1)).fetchall()
+    overflow = len(rows) > head_limit
+    paths, titles, provenance = defaultdict(int), defaultdict(int), defaultdict(int)
+    missing, stored = 0, 0
+    for url, title, body_sha, direct, literal in rows[:head_limit]:
+        if cnyes_literal_route_hint(url) != 'market_endpoint_route_candidate':
+            continue
+        path = urlsplit(url).path
+        if re.fullmatch(r'/twstock/[A-Za-z0-9]+/?', path):
+            shape = 'symbol_overview_path'
+        elif re.fullmatch(r'/twstock/[A-Za-z0-9]+/company(?:/.*)?', path):
+            shape = 'company_path'
+        else:
+            shape = 'other_twstock_path'
+        paths[shape] += 1
+        if not isinstance(title, str) or not title:
+            titles['missing'] += 1
+        elif len(title) > 4096:
+            titles['oversized'] += 1
+        elif '總覽' in title:
+            titles['mentions_overview'] += 1
+        elif '簡介' in title:
+            titles['mentions_profile'] += 1
+        else:
+            titles['other'] += 1
+        provenance['both' if direct and literal else 'metadata_link_only' if direct
+                   else 'literal_pointer_only' if literal else 'neither_recorded'] += 1
+        if body_sha is None:
+            missing += 1
+        else:
+            stored += 1
+    return {
+        'contract_version': 1, 'provider': 'cnyes',
+        'scope': 'bounded_unsupported_heads_with_literal_twstock_route_hint',
+        'head_limit': head_limit, 'heads_examined': min(len(rows), head_limit),
+        'head_limit_reached': overflow,
+        'all_current_unsupported_heads_included': not overflow,
+        'market_route_heads_examined': missing + stored,
+        'missing_body_heads': missing, 'stored_body_heads': stored,
+        'literal_path_shape_counts': dict(sorted(paths.items())),
+        'metadata_title_hint_counts': dict(sorted(titles.items())),
+        'recorded_pointer_kind_counts': dict(sorted(provenance.items())),
+        'pointer_grain': 'URL heads with at least one recorded pointer, not pointer count',
+        'literal_resolution_contract_version': GOOGLE_LITERAL_URL_CONTRACT,
+        'metadata_identity_verified': False, 'article_identity_inferred': False,
+        'source_absence_or_permission_inferred': False, 'completion_denominator_changed': False,
+        'publisher_requests': 0, 'production_queue_writes': 0,
+        'completed_body_rows_scanned': 0, 'raw_or_body_payloads_read': 0,
+    }
+
+
+def _legacy_title_key(value):
+    """Create a matching hint, never an identity or version proof."""
+    if not isinstance(value, str) or len(value) > 4096:
+        return ''
+    value = re.split(r'\s*(?:[-|｜])\s*(?=Anue\s*鉅亨|鉅亨網)', value,
+                     maxsplit=1, flags=re.IGNORECASE)[0]
+    # Historical search metadata sometimes truncates only the publisher label.
+    value = re.sub(r'\s*\|\s*鉅\s*(?:\.{3}|…)\s*$', '', value)
+    prefix, suffix = '公告台股公告', '鉅亨網新聞中心※來源'
+    if value.startswith(prefix) and value.endswith(suffix):
+        value = value[len(prefix):-len(suffix)]
+    value = unicodedata.normalize('NFKC', html.unescape(value)).casefold()
+    return ''.join(character for character in value if not character.isspace())
+
+
+def _legacy_candidate_days(url, metadata_day):
+    """Use both recorded date hints, without assigning either a source clock."""
+    match = re.search(r'/([0-9]{8})/', urlsplit(url).path)
+    raw_days = [metadata_day]
+    if match:
+        raw = match.group(1)
+        raw_days.append(f'{raw[:4]}-{raw[4:6]}-{raw[6:8]}')
+    result = set()
+    for raw in raw_days:
+        try:
+            if not isinstance(raw, str) or not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', raw):
+                continue
+            day = date.fromisoformat(raw)
+            for offset in (-1, 0, 1):
+                try:
+                    result.add((day + timedelta(days=offset)).isoformat())
+                except OverflowError:
+                    pass
+        except ValueError:
+            continue
+    return sorted(result)
+
+
+def _read_verified_missing_titles(db, root, selected):
+    """Read only verified title columns for a bounded set of stored heads."""
+    import pyarrow.parquet as pq
+
+    max_heads, max_encoded, max_decoded = 256, 16 << 20, 8 << 20
+    selected = selected[:max_heads]
+    grouped = defaultdict(list)
+    for row in selected:
+        grouped[row['parquet_path']].append(row)
+    results, errors, encoded, decoded = [], 0, 0, 0
+    for relative, heads in grouped.items():
+        try:
+            receipt_row = db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?', (relative,)).fetchone()
+            if not receipt_row:
+                raise ValueError('missing_receipt')
+            receipt_file = source_path(root, receipt_row[0])
+            if receipt_file.stat().st_size > 65536:
+                raise ValueError('receipt_too_large')
+            receipt = json.loads(receipt_file.read_bytes())
+            path = source_path(root, relative)
+            size = path.stat().st_size
+            if size > max_encoded - encoded:
+                raise ValueError('encoded_budget')
+            encoded += size
+            if sha256_file(path) != receipt['sha256']:
+                raise ValueError('batch_hash')
+            parquet = pq.ParquetFile(path)
+            if parquet.metadata.num_rows > 4096 or parquet.metadata.num_rows != receipt['rows']:
+                raise ValueError('row_count')
+            columns = {'article_id', 'title', 'body_sha256'}
+            if not columns.issubset(set(parquet.schema_arrow.names)):
+                raise ValueError('missing_columns')
+            column_bytes = sum(
+                parquet.metadata.row_group(i).column(j).total_uncompressed_size
+                for i in range(parquet.metadata.num_row_groups)
+                for j in range(parquet.metadata.row_group(i).num_columns)
+                if parquet.metadata.row_group(i).column(j).path_in_schema in columns)
+            if column_bytes > max_decoded - decoded:
+                raise ValueError('decoded_budget')
+            decoded += column_bytes
+            records = parquet.read(columns=sorted(columns), use_threads=False).to_pylist()
+            indexed = {record['article_id']: record for record in records}
+            if len(indexed) != len(records):
+                raise ValueError('duplicate_identity')
+            for head in heads:
+                record = indexed.get(head['article_id'].hex())
+                if not record or record['body_sha256'] != head['declared_body_sha256']:
+                    errors += 1
+                    continue
+                title = record['title']
+                if not isinstance(title, str) or not title or len(title) > 4096:
+                    errors += 1
+                    continue
+                results.append({**head, 'title': title, 'title_source': 'verified_parquet_title'})
+        except (OSError, ValueError, KeyError, TypeError, IndexError, sqlite3.Error):
+            errors += len(heads)
+    return results, {'selected_heads': len(selected), 'verified_titles': len(results),
+                     'unavailable_or_invalid_heads': errors, 'encoded_bytes_read': encoded,
+                     'decoded_column_byte_bound': decoded, 'body_columns_decoded': 0}
+
+
+def cnyes_legacy_reuse_candidates(db, *, head_limit=4096, day_limit=4096, root=None):
+    """Find bounded title/date hints among already stored canonical heads.
+
+    Each dated index range is read once and candidate titles are indexed in
+    memory. This is a private, read-only review list: it never follows a URL,
+    reads a body, queues a request, accepts an alias, or changes a denominator.
+    A match cannot establish same-version identity; capped or missing date
+    ranges and non-complete states are explicitly outside its search scope.
+    """
+    if type(head_limit) is not int or not 1 <= head_limit <= 4096:
+        raise ValueError('unsupported path head limit must be 1..4096')
+    if type(day_limit) is not int or not 1 <= day_limit <= 4096:
+        raise ValueError('candidate day limit must be 1..4096')
+    heads = db.execute(
+        "SELECT url,title,metadata_date_raw,metadata_order_day FROM articles INDEXED BY dispatch "
+        "WHERE provider='cnyes' AND state='unsupported_article_path' AND body_sha256 IS NULL "
+        "ORDER BY due LIMIT ?", (head_limit + 1,)).fetchall()
+    overflow = len(heads) > head_limit
+    legacy = []
+    title_keys = set()
+    days = set()
+    for url, title, metadata_raw, metadata_day in heads[:head_limit]:
+        if cnyes_literal_route_hint(url) != 'legacy_shtml_article_route_candidate':
+            continue
+        title_key = _legacy_title_key(title)
+        candidate_days = _legacy_candidate_days(url, metadata_day)
+        # A short generic title would create misleading, high-collision hints.
+        if len(title_key) < 4:
+            title_key = ''
+        if title_key:
+            title_keys.add(title_key)
+            days.update(candidate_days)
+        legacy.append((url, title, metadata_raw, metadata_day, title_key, candidate_days))
+
+    by_day_and_title = defaultdict(list)
+    capped_days = set()
+    scanned_rows = 0
+    missing_title_heads = []
+    examined_days, unsearched_days = [], []
+    max_days, max_total_rows = 512, 262144
+    for day in sorted(days):
+        if len(examined_days) >= max_days or scanned_rows >= max_total_rows:
+            unsearched_days.append(day)
+            continue
+        examined_days.append(day)
+        current_limit = min(day_limit, max_total_rows - scanned_rows)
+        rows = db.execute(
+            "SELECT url,title,metadata_date_raw,metadata_order_day,body_sha256,id,parquet_path "
+            "FROM articles INDEXED BY dispatch_latest WHERE provider='cnyes' "
+            "AND state='complete' AND metadata_order_day=? LIMIT ?", (day, current_limit + 1)).fetchall()
+        if len(rows) > current_limit:
+            capped_days.add(day)
+        scanned_rows += min(len(rows), current_limit)
+        for url, title, raw, order_day, body_sha, article_id, parquet_path in rows[:current_limit]:
+            if not isinstance(url, str) or not re.fullmatch(r'https://news\.cnyes\.com/news/id/[0-9]+', url):
+                continue
+            if not isinstance(body_sha, str) or not re.fullmatch(r'[0-9a-f]{64}', body_sha):
+                continue
+            title_key = _legacy_title_key(title)
+            if title_key in title_keys:
+                by_day_and_title[day, title_key].append({
+                    'canonical_url': url, 'title': title, 'metadata_date_raw': raw,
+                    'metadata_order_day': order_day, 'declared_body_sha256': body_sha,
+                    'title_source': 'queue_metadata',
+                })
+            elif (root is not None and not title and isinstance(article_id, bytes)
+                  and isinstance(parquet_path, str) and parquet_path):
+                missing_title_heads.append({'canonical_url': url, 'metadata_date_raw': raw,
+                    'metadata_order_day': order_day, 'declared_body_sha256': body_sha,
+                    'article_id': article_id, 'parquet_path': parquet_path})
+
+    fallback = {'selected_heads': 0, 'verified_titles': 0, 'unavailable_or_invalid_heads': 0,
+                'encoded_bytes_read': 0, 'decoded_column_byte_bound': 0, 'body_columns_decoded': 0}
+    if root is not None:
+        recovered, fallback = _read_verified_missing_titles(db, root, missing_title_heads)
+        for candidate in recovered:
+            title_key = _legacy_title_key(candidate['title'])
+            if title_key in title_keys:
+                candidate.pop('article_id')
+                candidate.pop('parquet_path')
+                by_day_and_title[candidate['metadata_order_day'], title_key].append(candidate)
+    fallback.update(requested=root is not None, head_limit=256,
+                    head_limit_reached=len(missing_title_heads) > 256)
+
+    items = []
+    for url, title, metadata_raw, metadata_day, title_key, candidate_days in legacy:
+        parts = urlsplit(url)
+        found = {candidate['canonical_url']: candidate
+                 for day in candidate_days
+                 for candidate in by_day_and_title.get((day, title_key), [])}
+        candidates = [found[key] for key in sorted(found)]
+        items.append({
+            'legacy_url_sha256': hashlib.sha256(url.encode()).hexdigest(),
+            # Query values are intentionally omitted, including tracking or credentials.
+            'legacy_origin_path': f'{parts.scheme}://{parts.netloc}{parts.path}',
+            'legacy_query_present': bool(parts.query),
+            'legacy_title': title, 'legacy_metadata_date_raw': metadata_raw,
+            'legacy_metadata_order_day': metadata_day, 'candidate_days': candidate_days,
+            'title_eligible_for_matching': bool(title_key),
+            'candidate_days_capped': sorted(set(candidate_days) & capped_days),
+            'candidate_days_unsearched': sorted(set(candidate_days) & set(unsearched_days)),
+            'candidate_count': len(candidates), 'candidates': candidates,
+            'same_article_or_version_verified': False,
+            'old_url_body_present': False,
+        })
+    return {
+        'contract_version': 1, 'scope': 'missing_legacy_shtml_heads_vs_complete_canonical_title_and_date_hints',
+        'head_limit': head_limit, 'heads_examined': min(len(heads), head_limit),
+        'head_limit_reached': overflow, 'legacy_heads_examined': len(items),
+        'day_limit': day_limit, 'days_examined': len(examined_days), 'capped_days': sorted(capped_days),
+        'max_days': max_days, 'max_total_candidate_rows': max_total_rows, 'unsearched_days': unsearched_days,
+        'complete_head_rows_examined': scanned_rows,
+        'legacy_heads_with_candidates': sum(item['candidate_count'] > 0 for item in items),
+        'legacy_heads_with_multiple_candidates': sum(item['candidate_count'] > 1 for item in items),
+        'legacy_heads_without_candidates': sum(item['candidate_count'] == 0 for item in items),
+        'candidate_matching_is_identity_proof': False, 'absence_proved': False,
+        'body_integrity_independently_verified': False, 'completion_denominator_changed': False,
+        'missing_title_fallback': fallback,
+        'publisher_requests': 0, 'production_queue_writes': 0, 'raw_or_body_payloads_decoded': 0,
+        'items': items,
     }
 
 
@@ -321,28 +714,69 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probe", action="append", default=[])
     parser.add_argument("--canonical-fetch", action="store_true", help="Probe the actual article entrypoint with its existing queue row; retain its received response, no queue writes")
-    parser.add_argument("--unsupported-paths-only", action="store_true", help="Read only bounded unfinished Cnyes URL syntax; no status/service scan, HTTP or source-content determination")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--unsupported-paths-only", action="store_true", help="Read only bounded unfinished Cnyes URL syntax; no status/service scan, HTTP or source-content determination")
+    modes.add_argument("--legacy-reuse-candidates-only", action="store_true", help="Find bounded title/date hints for missing old URLs among already stored canonical heads; do not accept aliases")
+    modes.add_argument("--market-route-provenance-only", action="store_true", help="Summarize bounded market-route hints and recorded metadata pointers without requests or queue writes")
+    modes.add_argument("--corpus-market-heads-only", action="store_true", help="Count this literal market-route headline rule in one existing corpus; read only URL/text-kind columns")
+    parser.add_argument("--corpus-root", type=Path, default=Path("data_news"))
     parser.add_argument("--unsupported-head-limit", type=int, default=4096, help="Maximum unfinished route heads to inspect (1..4096); overflow is unknown, not complete")
+    parser.add_argument("--legacy-day-limit", type=int, default=4096, help="Maximum completed heads to inspect per candidate date (1..4096)")
     args = parser.parse_args(argv)
     if len(args.probe) > 8:
         parser.error("at most eight explicitly selected probes; no saturation test")
     if not 1 <= args.unsupported_head_limit <= 4096:
         parser.error("unsupported head limit must be 1..4096")
-    if args.unsupported_paths_only and (args.probe or args.canonical_fetch):
-        parser.error("unsupported paths only cannot request publisher probes")
+    if not 1 <= args.legacy_day_limit <= 4096:
+        parser.error("candidate day limit must be 1..4096")
+    if (args.unsupported_paths_only or args.legacy_reuse_candidates_only or args.market_route_provenance_only or args.corpus_market_heads_only) and (args.probe or args.canonical_fetch):
+        parser.error("read-only inventory modes cannot request publisher probes")
+    if args.corpus_market_heads_only:
+        corpus_root = args.corpus_root.resolve()
+        preliminary = json.loads((corpus_root / 'manifest.json').read_bytes())
+        source_root = Path(preliminary['source_snapshot']['source_root']).resolve()
+        output = args.output.resolve()
+        if output.is_relative_to(corpus_root) or output.is_relative_to(source_root):
+            parser.error('corpus audit output must be outside the corpus and collector roots')
+        result = cnyes_corpus_market_head_audit(corpus_root,
+            notify=lambda done, total: print(json.dumps({'parts_examined': done, 'parts_total': total}), flush=True))
+        if output.is_relative_to(Path(result['source_root']).resolve()):
+            parser.error('corpus source root changed during inspection')
+        result['observed_at_utc'] = utc_now()
+        args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write_json(args.output, result)
+        print(json.dumps({'output': str(args.output), 'headline_rows_examined': result['headline_rows_examined'],
+                          'metadata_only_market_headlines': result['metadata_only_market_headlines'],
+                          'publisher_requests': 0}))
+        return 0
     config, registry, repo = load_config(args.config)
     root = repo / config["root"]
     args.output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if args.unsupported_paths_only:
+    if args.unsupported_paths_only or args.legacy_reuse_candidates_only or args.market_route_provenance_only:
         db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
         try:
-            result = cnyes_unsupported_path_inventory(db, head_limit=args.unsupported_head_limit)
+            db.execute('PRAGMA query_only=ON')
+            db.execute('BEGIN')  # One coherent read while the canonical owner runs.
+            if args.legacy_reuse_candidates_only:
+                result = cnyes_legacy_reuse_candidates(db, head_limit=args.unsupported_head_limit,
+                                                       day_limit=args.legacy_day_limit, root=root)
+            elif args.market_route_provenance_only:
+                result = cnyes_market_route_provenance(db, head_limit=args.unsupported_head_limit)
+            else:
+                result = cnyes_unsupported_path_inventory(db, head_limit=args.unsupported_head_limit)
         finally:
             db.close()
         result['observed_at_utc'] = utc_now()
         atomic_write_json(args.output, result)
-        print(json.dumps({'output': str(args.output), 'heads_examined': result['heads_examined'],
-                          'head_limit_reached': result['head_limit_reached'], 'publisher_requests': 0}))
+        summary = {'output': str(args.output), 'heads_examined': result['heads_examined'],
+                   'head_limit_reached': result['head_limit_reached'], 'publisher_requests': 0}
+        if args.legacy_reuse_candidates_only:
+            summary.update(legacy_heads_examined=result['legacy_heads_examined'],
+                           legacy_heads_with_candidates=result['legacy_heads_with_candidates'],
+                           capped_days=len(result['capped_days']))
+        elif args.market_route_provenance_only:
+            summary['market_route_heads_examined'] = result['market_route_heads_examined']
+        print(json.dumps(summary))
         return 0
     status = json.loads((root / "status.json").read_text())
     db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)

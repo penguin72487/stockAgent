@@ -372,6 +372,96 @@ def publication(market_name, elapsed_ms, **overrides):
         "published_from_open_ms": 0, **overrides}
 
 
+def revision_fact(market="mode", elapsed_ms=300, **overrides):
+    start = datetime.fromisoformat("2026-10-14T09:00:01+08:00")
+    return {"event": "opening_signal_revision", "session_date": "2026-10-14", "market": market,
+        "signal_id": market + "-revision", "worker_started_at": start.isoformat(),
+        "artifact_published_at": (start + timedelta(milliseconds=elapsed_ms)).isoformat(),
+        "worker_to_publication_ms": .001,  # Never trust a supplied timing over original clocks.
+        "opening_input_coverage": {"opening_price_active_symbol_count": 100,
+            "opening_price_active_count": 25, "opening_no_print_active_count": 5,
+            "opening_provisional_reference_active_count": 70, "opening_input_resolved_count": 100,
+            "opening_coverage_denominator_contract": "fixture_official_axis"}, **overrides}
+
+
+def test_revision_rows_do_not_corrupt_initial_attempt_or_claim_fresh_complete(tmp_path):
+    from scripts.audit_tw_opening_latency import read_attempts, opening_revision_timings
+    path = tmp_path / "facts.jsonl"
+    path.write_text("\n".join(json.dumps(row) for row in [revision_fact(), publication("mode", 500),
+        revision_fact("other")]))
+    revisions = []
+    attempts, malformed = read_attempts(path, "2026-10-14", revision_rows=revisions)
+    assert not malformed and attempts["mode"]["attempt_count"] == 1
+    assert attempts["mode"]["first"]["status"] == "ready" and "other" not in attempts
+    observed = datetime.fromisoformat("2026-10-14T09:00:03+08:00")
+    result = opening_revision_timings("2026-10-14", revisions, ["mode"], observed_at=observed)
+    mode = result["modes"]["mode"]
+    assert result["state"] == "observed" and result["excluded_rows"] == 1
+    assert mode["revision_count"] == mode["within_1s_count"] == 1 and mode["median_ms"] == 300.
+    assert mode["latest"]["observed_price_coverage_percent"] == 30.
+    assert mode["latest"]["model_input_resolved_percent"] == 100.
+    assert mode["coverage_milestones"][-1]["first"] is None
+    assert not result["one_second_end_to_end_claim"] and not result["broker_fill_claim"]
+
+
+def test_attempt_session_projection_preserves_stdlib_and_malformed_evidence(monkeypatch, tmp_path):
+    from scripts import audit_tw_opening_latency as audit
+
+    path = tmp_path / "attempts.jsonl"
+    target = "2026-10-14"
+    lines = [
+        json.dumps({"session_date": "2026-10-13", "large": list(range(500))}),
+        '{"session_date":"2026-10-13","large":[1,]}',
+        '{"session_date":"2026-10-13","x":NaN}',
+        '4',
+        '{"session_date":"2026-10-13","session_date":"2026-10-14",'
+        '"market":"mode","status":"failed"}',
+        '{"session_date":"2026-10-14","session_date":"2026-10-13",'
+        '"market":"ignored","status":"ready"}',
+        '{"session_date":"2026-10-14","market":"mode","status":"ready","x":NaN}',
+        '{"session_date":"2026-10-14","market":"","status":"ready"}',
+        json.dumps(revision_fact()),
+        '{"session_date":"2026-10-14","market":"mode"}',
+        '{"session_date":"2026-10-13","x":{"a":tru}}',
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    projected_revisions = []
+    projected = audit.read_attempts(path, target, revision_rows=projected_revisions)
+    monkeypatch.setattr(audit, "_ATTEMPT_SESSION_DECODER", None)
+    reference_revisions = []
+    reference = audit.read_attempts(path, target, revision_rows=reference_revisions)
+    # NaN does not compare equal to itself, so compare the retained serialized
+    # complete rows rather than erasing its evidence from the test.
+    assert json.dumps(projected, sort_keys=True) == json.dumps(reference, sort_keys=True)
+    assert projected_revisions == reference_revisions
+    assert projected[1] == 5
+
+
+@pytest.mark.parametrize("bad", [
+    {"worker_started_at": "2026-10-14T09:00:01"},
+    {"artifact_published_at": "2026-10-14T09:00:00+08:00"},
+    {"session_date": "2026-10-15"}, {"signal_id": ""}, {"opening_input_coverage": {}},
+])
+def test_invalid_revision_does_not_earn_latency_or_coverage(bad):
+    from scripts.audit_tw_opening_latency import opening_revision_timings
+    result = opening_revision_timings("2026-10-14", [revision_fact(**bad)], ["mode"],
+        observed_at=datetime.fromisoformat("2026-10-14T09:00:03+08:00"))
+    assert result["state"] == "degraded" and result["invalid_rows"] == 1
+    assert result["modes"]["mode"]["revision_count"] == 0
+
+
+def test_revision_conflicts_and_future_rows_never_earn_a_fast_sample():
+    from scripts.audit_tw_opening_latency import opening_revision_timings
+    observed = datetime.fromisoformat("2026-10-14T09:00:03+08:00")
+    result = opening_revision_timings("2026-10-14", [revision_fact(), revision_fact(elapsed_ms=500),
+        revision_fact(elapsed_ms=3000, signal_id="future")], ["mode", "missing"], observed_at=observed)
+    assert result["state"] == "degraded" and result["revision_count"] == 0
+    assert result["excluded_rows"] == result["invalid_rows"] == 1
+    assert result["modes"]["missing"]["median_ms"] is None
+    with pytest.raises(ValueError, match="aware clock"):
+        opening_revision_timings("2026-10-14", [], ["mode"], observed_at=observed.replace(tzinfo=None))
+
+
 def test_staged_slo_uses_all_mode_original_clocks_not_cached_milliseconds():
     attempts = {"fast": {"attempt_count": 1, "failed_count": 0, "ready": [publication("fast", 250)]},
         "slow": {"attempt_count": 4, "failed_count": 3, "ready": [publication("slow", 30001), publication("slow", 20000)]}}
@@ -492,6 +582,42 @@ def test_daily_late_fills_never_rewrite_the_first_deadline(daily_case):
     assert case.observe(60)["state"] == "missed_or_unverified"
     assert path.read_bytes() == original
     assert len((case.output / "daily.jsonl").read_text().splitlines()) == 3
+
+
+def test_publication_observer_rejects_events_after_its_observation_clock():
+    row = publication("mode", 31000)
+    attempts = {"mode": {"attempt_count": 1, "failed_count": 0, "ready": [row]}}
+    observed = datetime.fromisoformat("2026-10-14T09:00:14+08:00")
+    result = opening_publication_slo("2026-10-14", attempts, ["mode"], observed_at=observed)
+    assert result["published_mode_count"] == 0
+    assert result["modes"]["mode"]["publication_after_observation_count"] == 1
+
+
+def test_daily_long_scan_reports_completion_clock_without_backdating(daily_case, monkeypatch):
+    case = daily_case
+    case.observe(-300)
+    write(case.state / "opening_signal_latency.jsonl", [publication("mode", 31000)])
+    fill_evidence(case, 32)
+    moments = iter(case.gate + timedelta(seconds=value) for value in (11, 32, 43))
+
+    class SimulatedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(moments)
+
+    monkeypatch.setattr(case.audit, "datetime", SimulatedClock)
+    report = case.audit.daily_audit(session_date="2026-10-14", state_dir=case.state,
+        markets_dir=case.output, output_root=case.output)
+    assert report["observation_started_at"] == (case.gate + timedelta(seconds=11)).isoformat()
+    assert report["observed_at"] == (case.gate + timedelta(seconds=43)).isoformat()
+    assessment = next(row for row in report["deadlines"] if row["target_ms"] == 11000)
+    assert assessment["observed_at"] == report["observed_at"]
+    assert assessment["deadline_at"] == (case.gate + timedelta(seconds=11)).isoformat()
+    assert assessment["current_mode_snapshot_observed_at"] == (
+        case.gate + timedelta(seconds=32)).isoformat()
+    assert not assessment["passed"]
+    assert assessment["publication"]["modes"]["mode"]["artifact_published_at"] == (
+        case.gate + timedelta(seconds=31)).isoformat()
 
 
 def test_daily_late_boot_cannot_fabricate_preopen_scope(daily_case):
@@ -781,3 +907,93 @@ def test_completed_partial_source_still_exposes_failed_requests(tmp_path):
     assert group["failed_or_degraded_jobs"] == 0  # Job completion is not full request success.
     assert group["failure_reason_counts"] == {"connection_or_headers_no_http_response": 1}
     assert group["source_duration_percentiles_ms"]["0.99"] == 99.
+
+
+def _browser_end_to_end_fixture():
+    import hashlib
+    from stockagent.live.public_dashboards import public_paper_signal_key
+
+    session = "2026-10-14"
+    gate = datetime.fromisoformat(session + "T09:00:00+08:00")
+    gate_ms = int(gate.timestamp() * 1000)
+    mono = 5_000_000_000_000
+
+    def clock(delta):
+        before = mono + delta * 1_000_000
+        return {"wallUnixMs": gate_ms + delta, "monotonicBeforeNs": str(before),
+                "monotonicAfterNs": str(before + 1000)}
+
+    launch = {"contract": "owned_native_dashboard_browser_probe_v1", "status": "passed",
+        "url": "https://penguin72487.dpdns.org/tw-day-trade/", "simulation_only": True,
+        "broker_orders": False, "ledger_writes": False,
+        "started_at_utc": "2026-10-14T00:58:30+00:00", "finished_at_utc": "2026-10-14T01:16:00+00:00",
+        "scheduled_observation": {"state": "armed", "session_date": session,
+                                  "scheduled_at_taipei": "2026-10-14T08:58:30+08:00"}}
+    publication, progress = {"expected_mode_count": 6, "modes": {}}, []
+    events = [{"contract": "observer_clock_anchor_v1", **clock(-100)}]
+    for index in range(6):
+        market, signal, run = f"mode{index}", f"signal{index}", "engine-1"
+        publication["modes"][market] = {"state": "published", "signal_id": signal,
+            "artifact_published_at": (gate + timedelta(milliseconds=200)).isoformat()}
+        progress.append({"market": market, "signal_id": signal, "session_date": session,
+            "contract": "state_fsync_then_paper_target_progress_v1",
+            "measurement_boundary": "paper_target_quantities_after_state_commit_not_broker_fill",
+            "clock_basis": "engine_publication_clock_not_economic_event",
+            "recorded_at": (gate + timedelta(milliseconds=400)).isoformat(),
+            "state_revision": 7, "engine_run_id": run, "simulation_only": True,
+            "production_order_possible": False, "live_execution_eligible": True,
+            "simulation_replay": False, "entry_fill_policy": "causal_best_quote",
+            "entry_requested_shares": 1000, "entry_filled_shares": 1000,
+            "entry_unfilled_shares": 0, "pending_entry_shares": 0,
+            "pending_entry_source_count": 0, "unsized_entry_target_count": 0,
+            "signal_registration_committed": True, "signal_reason_counts": {},
+            "entry_fill_outcome": "filled"})
+        correlation = {"market": market, "sessionDate": session,
+            "signalKey": public_paper_signal_key({"market": market, "session_date": session, "signal_id": signal}),
+            "engineGeneration": hashlib.sha256(("public_paper_engine_v1:" + run).encode()).hexdigest()[:32],
+            "stateRevision": 8, "viewEvidence": "status_mode_snapshot", "entryCountsVisible": True,
+            "entryRequestedShares": 1000, "entryFilledShares": 1000, "entryUnfilledShares": 0,
+            "clockBasis": "browser_monotonic_foreground_double_raf_opportunity_not_physical_pixel"}
+        events.append({"receivedAtUnixMs": gate_ms + 700, "observerClock": clock(700),
+            "browserRecord": {"route": "/tw-day-trade/", "kind": "render", "action": "status_revision_paint",
+                "eventType": "revision_applied", "observedAt": gate_ms + 650, "correlation": correlation}})
+    events.append({"contract": "observer_clock_anchor_v1", **clock(900)})
+    observed = datetime.fromisoformat(session + "T10:31:00+08:00")
+    return session, publication, progress, launch, events, observed
+
+
+def test_browser_end_to_end_requires_six_matching_visible_fsynced_targets_and_honest_clock():
+    from copy import deepcopy
+    from scripts.audit_tw_opening_latency import opening_browser_end_to_end
+
+    session, publication, progress, launch, events, observed = _browser_end_to_end_fixture()
+    def assess(p=publication, rows=progress, receipt=launch, samples=events):
+        return opening_browser_end_to_end(session, p, rows, receipt, samples, observed_at=observed)
+
+    result = assess()
+    assert result["state"] == "observed"
+    assert result["observed_mode_count"] == 6
+    assert result["all_modes_received_from_open_upper_bound_ms"] == 700
+    assert result["under_one_second_on_local_host_clock"] is True
+    assert result["strict_exchange_clock_one_second_proven"] is None
+    assert result["broker_fill_claim"] is False
+
+    for field, value in (("signalKey", "other"), ("engineGeneration", "other"),
+                         ("stateRevision", 6), ("entryCountsVisible", False),
+                         ("entryFilledShares", 999), ("sessionDate", "2026-10-13")):
+        bad = deepcopy(events)
+        bad[1]["browserRecord"]["correlation"][field] = value
+        assert assess(samples=bad)["state"] == "unverified"
+    bad = deepcopy(progress)
+    bad[0]["simulation_replay"] = True
+    assert assess(rows=bad)["state"] == "unverified"
+    bad = deepcopy(progress)
+    bad[0]["pending_entry_source_count"] = 1
+    assert assess(rows=bad)["state"] == "unverified"
+    bad = deepcopy(launch)
+    bad["status"] = "failed"
+    assert assess(receipt=bad)["state"] == "unverified"
+    bad = deepcopy(events)
+    bad[0]["wallUnixMs"] -= 100
+    assert not assess(samples=bad)["clock"]["stable"]
+    assert assess(samples=events[1:])["under_one_second_on_local_host_clock"] is None

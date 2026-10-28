@@ -15,6 +15,26 @@ def spec(name,rule="quarter",group=None):
     return {"feature":name,"rule":asdict(RULES[rule]),"report_group":group}
 
 
+def test_compact_report_precedence_preserves_raw_rows_bits_and_unselected_floors():
+    from scripts.prepare_tw_day_trade_factorized_panel import causal_report_events
+    long_name="financial_statement/"+"long_concept/"*80
+    definitions=[spec(long_name,group="report"),spec("b",group="report"),spec("daily","daily")]
+    days=[date(2025,1,d) for d in (2,3,6)]
+    events=pl.DataFrame({"date":[days[0],days[0],days[0],days[1],days[1],days[2],days[0]],
+        "symbol":["2330"]*7,"feature":[long_name,"b","daily",long_name,"b",long_name,"unknown"],
+        "period":["2024Q3","2024Q2",None,"2024Q2","2024Q4","2024Q3","2024Q3"],
+        "value":[-0.,99.,float("nan"),98.,None,97.,96.],"source_receipt":["original"]*7})
+    raw=events.clone();current={("9999","unselected"):123}
+    subjects=sorted(set(events["period"].fill_null(events["date"].cast(pl.String))))
+    ranks={subject:index for index,subject in enumerate(subjects)}
+    actual=causal_report_events(events,definitions,period_order=ranks,current_periods=current)
+    expected=raw[[2,0,4]]  # Lexical state key order, then the next published report.
+    assert actual.equals(expected) and events.equals(raw)
+    assert actual["value"].drop_nulls().to_numpy().view(np.uint64).tobytes()==expected["value"].drop_nulls().to_numpy().view(np.uint64).tobytes()
+    assert current[("2330","report")]==ranks["2024Q4"]
+    assert current[("9999","unselected")]==123
+
+
 def test_annual_events_use_release_dates_not_absolute_relative_path_spelling(tmp_path, monkeypatch):
     from scripts.prepare_tw_day_trade_factorized_panel import AnnualObservationEvents
     monkeypatch.chdir(tmp_path)

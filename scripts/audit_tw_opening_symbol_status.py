@@ -33,7 +33,8 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 
 def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
                             cutoffs=(1000, 5000, 10000, 11000, 20000, 30000),
-                            project_headers=True, include_reference_rows=False) -> dict:
+                            project_headers=True, include_reference_rows=False,
+                            observation_horizon_ms: int | None = None) -> dict:
     """One read-only pass: every official symbol, including later recoveries.
 
     Full-market source rejection lists have exact attribution. A failed job
@@ -51,6 +52,9 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
     cutoffs = tuple(sorted(set(cutoffs)))
     if not cutoffs or any(type(value) is not int or value < 0 for value in cutoffs):
         raise ValueError("invalid journal deadlines")
+    if observation_horizon_ms is not None and (
+            type(observation_horizon_ms) is not int or observation_horizon_ms < max(cutoffs)):
+        raise ValueError("observation horizon must include every requested deadline")
     scope = set(symbols)
     gate = datetime.fromisoformat(payload["session_date"] + "T09:00:00+08:00")
     gate_ms = int(gate.timestamp() * 1000)
@@ -61,6 +65,7 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
     first_rows = {}
     latest = {cutoff: {} for cutoff in cutoffs}
     starts, failures, malformed, invalid_events, line_count, legacy_absence = {}, [], [], [], 0, 0
+    outside_horizon = 0
     started = time.perf_counter()
 
     def observe(provider, job, elapsed, symbol, state, proof=None, details=None):
@@ -130,6 +135,13 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
                 elapsed = round((at - gate).total_seconds() * 1000, 3)
                 if not isinstance(provider, str) or not provider:
                     raise ValueError("invalid provider")
+                if observation_horizon_ms is not None and elapsed > observation_horizon_ms:
+                    # Explicitly bounded opening research, not a repaired full
+                    # day. Still hash every retained byte; unreadable headers
+                    # cannot claim to be outside this window. Never change an
+                    # event's clock or use later prices inside the window.
+                    outside_horizon += 1
+                    continue
                 if provider == "merged" or elapsed < 0:
                     continue
                 if event not in {"started", "observations_delta", "provider_snapshot", "finished"}:
@@ -260,6 +272,8 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
         "requested_count": len(symbols), "official_fingerprint": universe["fingerprint"],
         "official_observed_at": universe["observed_at_taipei"],
         "scope_basis": "receipt_official_axis_not_backdated_membership",
+        "observation_horizon_ms": observation_horizon_ms,
+        "outside_observation_horizon_events": outside_horizon,
         "state": "observed" if stable_prefix and not malformed else "degraded",
         "journal_prefix": {"path": str(path), "bytes": read_bytes, "sha256": digest.hexdigest(),
             "same_inode_after_read": stable_prefix, "line_count": line_count, "malformed_lines": malformed,

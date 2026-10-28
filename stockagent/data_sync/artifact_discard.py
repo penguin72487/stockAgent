@@ -27,6 +27,7 @@ from stockagent.data_sync.training_return import shared_inode_references
 
 from stockagent.data_sync.testing_disposition import (
     CONTRACT, DEFAULT_POLICY, load_policy, artifact_roots, discarded_root, manifest_discarded,
+    target_path,
 )
 
 
@@ -193,8 +194,7 @@ def restore_unchanged_discard_quarantine(policy: dict, target: dict, *, state_ro
         if value.get("state") != "quarantined":
             return False
         plan = value["plan"]
-        base = repo_root / "artifacts" if target["base"] == "artifact" else engineering_root
-        source = real(base / target["relative"])
+        source = target_path(policy, target, repo_root=repo_root, engineering_root=engineering_root)
         q = real(Path(value["quarantine"]))
         if (plan["policy_identity_sha256"] != policy["identity_sha256"] or plan["target"] != target
                 or plan["source"] != str(source) or source.exists() or q.parent.parent != state_root
@@ -228,7 +228,9 @@ def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Pat
             m = json.loads(real(p).read_bytes()); meta = m.get("metadata", {})
             relative = meta.get("source_relative_root", meta.get("artifact_relative_root"))
             if isinstance(relative, str):
-                protected = repo_root / "artifacts" / _safe_relative_path(relative, "pinned artifact")
+                relative_path = _safe_relative_path(relative, "pinned artifact")
+                base = repo_root if relative_path.parts[0].startswith("data_") else repo_root / "artifacts"
+                protected = base / relative_path
                 if source == protected or source in protected.parents or protected in source.parents:
                     blockers.append("pinned-release")
     return sorted(set(blockers))
@@ -278,8 +280,7 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
                    apply: bool = False, expected_plan_identity: str | None = None) -> dict:
     if target not in policy["targets"] or type(apply) is not bool:
         raise SnapshotError("testing deletion requires one exact approved target")
-    base = repo_root / "artifacts" if target["base"] == "artifact" else engineering_root
-    source = real(base / target["relative"])
+    source = target_path(policy, target, repo_root=repo_root, engineering_root=engineering_root)
     state_root = real(state_root)
     state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
     if state_root.is_relative_to(source) or source.is_relative_to(state_root):
@@ -296,7 +297,7 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
                     "reclaimed_allocated_bytes": 0}
         observed = _observed(source, target["kind"])
         blockers = _gates(source, observed, repo_root, materialized_root, cold_root)
-        plan = {"contract": CONTRACT, "policy_identity_sha256": policy["identity_sha256"],
+        plan = {"contract": policy["contract"], "policy_identity_sha256": policy["identity_sha256"],
                 "target": target, "source": str(source), "observed": observed, "blockers": blockers}
         plan["identity_sha256"] = identity(plan)
         if not apply:

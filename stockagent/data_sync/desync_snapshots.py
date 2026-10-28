@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import dataclasses
 import datetime as dt
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -15,7 +17,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -308,7 +310,26 @@ def _exclusive_lock(path: Path) -> Iterator[None]:
             fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def scan_tree(root: Path) -> dict[str, Any]:
+def _iter_lstat_bounded(paths, executor):
+    """Observe complete path metadata in order with at most 64 queued calls."""
+    if executor is None:
+        for path in paths:
+            yield path, path.lstat()
+        return
+    iterator = iter(paths)
+    while batch := list(itertools.islice(iterator, 64)):
+        for path, info in zip(batch, executor.map(Path.lstat, batch)):
+            yield path, info
+
+
+def _raise_walk_error(error: OSError) -> None:
+    # An incomplete tree cannot prove either a portable inventory or its
+    # stability. os.walk otherwise silently skips unreadable directories.
+    raise error
+
+
+def scan_tree(root: Path, *, progress: Callable[[dict[str, int]], None] | None = None,
+              file_workers: int = 1) -> dict[str, Any]:
     """Return cheap portable and mutation-detection fingerprints.
 
     The portable fingerprint intentionally excludes timestamps and ownership so
@@ -318,17 +339,20 @@ def scan_tree(root: Path) -> dict[str, Any]:
     hashes remain the content-integrity authority.
     """
 
+    if type(file_workers) is not int or not 1 <= file_workers <= 4:
+        raise ValueError("scan workers must be between 1 and 4")
     root = root.resolve()
     if not root.is_dir():
         raise SnapshotError(f"snapshot source is not a directory: {root}")
     portable = hashlib.sha256()
     stability = hashlib.sha256()
     files = directories = symlinks = logical_bytes = 0
+    last_progress = time.monotonic() if progress is not None else None
 
     def update_entry(
         relative: str, kind: str, info: os.stat_result, extra: str
     ) -> None:
-        nonlocal files, directories, symlinks, logical_bytes
+        nonlocal files, directories, symlinks, logical_bytes, last_progress
         path_bytes = relative.encode("utf-8", errors="surrogateescape")
         extra_bytes = extra.encode("utf-8", errors="surrogateescape")
         portable_size = info.st_size if kind == "F" else 0
@@ -352,34 +376,41 @@ def scan_tree(root: Path) -> dict[str, Any]:
             directories += 1
         elif kind == "L":
             symlinks += 1
+        if progress is not None:
+            now = time.monotonic()
+            if now - last_progress >= 5:
+                progress({'files': files, 'directories': directories, 'symlinks': symlinks,
+                          'logical_bytes': logical_bytes})
+                last_progress = now
 
-    for current, dir_names, file_names in os.walk(
-        root, topdown=True, followlinks=False
-    ):
-        dir_names.sort()
-        file_names.sort()
-        current_path = Path(current)
-        for name in list(dir_names):
-            path = current_path / name
-            info = path.lstat()
-            relative = path.relative_to(root).as_posix()
-            if stat.S_ISLNK(info.st_mode):
-                dir_names.remove(name)
-                update_entry(relative, "L", info, os.readlink(path))
-            elif stat.S_ISDIR(info.st_mode):
-                update_entry(relative, "D", info, "")
-            else:
-                raise SnapshotError(f"unsupported directory entry type: {path}")
-        for name in file_names:
-            path = current_path / name
-            info = path.lstat()
-            relative = path.relative_to(root).as_posix()
-            if stat.S_ISREG(info.st_mode):
-                update_entry(relative, "F", info, "")
-            elif stat.S_ISLNK(info.st_mode):
-                update_entry(relative, "L", info, os.readlink(path))
-            else:
-                raise SnapshotError(f"special files are not snapshot-safe: {path}")
+    # Preserve the original traversal and hash order. Only the metadata calls
+    # within each directory overlap; reductions and progress remain single
+    # threaded. Never reuse a scan across verification passes.
+    pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else contextlib.nullcontext(None)
+    with pool as executor:
+        for current, dir_names, file_names in os.walk(
+            root, topdown=True, followlinks=False, onerror=_raise_walk_error
+        ):
+            dir_names.sort()
+            file_names.sort()
+            current_path = Path(current)
+            for path, info in _iter_lstat_bounded((current_path / name for name in list(dir_names)), executor):
+                relative = path.relative_to(root).as_posix()
+                if stat.S_ISLNK(info.st_mode):
+                    dir_names.remove(path.name)
+                    update_entry(relative, "L", info, os.readlink(path))
+                elif stat.S_ISDIR(info.st_mode):
+                    update_entry(relative, "D", info, "")
+                else:
+                    raise SnapshotError(f"unsupported directory entry type: {path}")
+            for path, info in _iter_lstat_bounded((current_path / name for name in file_names), executor):
+                relative = path.relative_to(root).as_posix()
+                if stat.S_ISREG(info.st_mode):
+                    update_entry(relative, "F", info, "")
+                elif stat.S_ISLNK(info.st_mode):
+                    update_entry(relative, "L", info, os.readlink(path))
+                else:
+                    raise SnapshotError(f"special files are not snapshot-safe: {path}")
 
     return {
         "files": files,

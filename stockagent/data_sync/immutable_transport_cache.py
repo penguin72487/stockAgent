@@ -9,10 +9,16 @@ import fcntl
 import os
 from pathlib import Path
 import stat
+import resource
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from itertools import islice
 
 from downloader.artifact_io import atomic_write_json
 from stockagent.data_sync.backup_transport_cache import process_roots, same_ntfs_signature
-from stockagent.data_sync.immutable_replication import ACK, digest, HASH, inventory, NATIVE_HASH_MIN_BYTES, safe, verify
+from stockagent.data_sync.immutable_replication import (
+    ACK, digest, HASH, NATIVE_HASH_MIN_BYTES, safe, _verified_inventory,
+)
 from stockagent.data_sync.materialized_cache import process_references_many
 from stockagent.data_sync.packed_backup import signature
 from stockagent.runtime_identity import identity_sha256
@@ -58,12 +64,35 @@ def primary_root(c, identity, manifest):
     raise ValueError('only reconstructible cold source/catalog transport is a cache')
 
 
-def validate_sources(c, identity, manifest, recorded=None):
+def _source_read_workers(count):
+    """Overlap small-file waits without consuming the owner's FD reserve."""
+    if count < 32:
+        return 1
+    try:
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and (soft < 64 or soft - len(os.listdir('/proc/self/fd')) < 16):
+            return 1
+    except (OSError, ValueError):
+        return 1
+    return 4
+
+
+def _bounded_source_map(function, values, executor):
+    iterator = iter(values)
+    while batch := list(islice(iterator, 32)):
+        yield from (map(function, batch) if executor is None else executor.map(function, batch))
+
+
+def validate_sources(c, identity, manifest, recorded=None, *, file_workers=None):
     from stockagent.data_sync.windows_cold_io import hash_many, windows_path
     root = primary_root(c, identity, manifest)
     proofs = {}
-    entries = []
-    for relative, row in manifest['files'].items():
+    if file_workers is None:
+        file_workers = _source_read_workers(len(manifest['files']))
+    if type(file_workers) is not int or not 1 <= file_workers <= 4:
+        raise ValueError('source verification workers must be between one and four')
+    def observe(item):
+        relative, row = item
         original = manifest['context'].get('source_object_paths', {}).get(relative, relative)
         if manifest['context'].get('kind') == 'immutable_source_objects':
             from stockagent.data_sync.offhost_backup import object_descriptor
@@ -71,20 +100,25 @@ def validate_sources(c, identity, manifest, recorded=None):
                 raise ValueError('flat transport source mapping differs from its canonical object')
         path = safe(root, original)
         before = signature(path)
-        entries.append((relative, row, path, before))
+        return relative, row, path, before
+    with (ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)) as executor:
+        entries = list(_bounded_source_map(observe, manifest['files'].items(), executor))
     native = list(dict.fromkeys(path for relative, row, path, before in entries
         if not (recorded and relative in recorded)
         and NATIVE_HASH_MIN_BYTES <= row['bytes'] <= 8*1024**3 and windows_path(path) is not None))
     hashes = {}
     for offset in range(0, len(native), 16):
         hashes.update(hash_many(native[offset:offset+16]))
-    for relative, row, path, before in entries:
+    def verify_entry(entry):
+        relative, row, path, before = entry
         if recorded and relative in recorded:
             if not same_ntfs_signature(before, recorded[relative]):
                 raise ValueError('primary source changed since the full SHA recovery gate')
         elif path.stat().st_size != row['bytes'] or (hashes[path] if path in hashes else digest(path)) != row['sha256'] or signature(path) != before:
             raise ValueError('primary source cannot reconstruct its immutable transport bytes')
-        proofs[relative] = list(before)
+        return relative, list(before)
+    with (ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)) as executor:
+        proofs.update(_bounded_source_map(verify_entry, entries, executor))
     return proofs
 
 
@@ -121,12 +155,14 @@ def _retire(c: dict, identity: str, proof: dict, *, apply=False) -> dict:
         sources = validate_sources(c, identity, manifest, prior['primary_signatures'])
         ack = validate_archive_receipt(c, identity, manifest, prior['manifest_bytes_utf8'].encode())
     else:
-        manifest = verify(root)
+        # Reuse this pass's exact full-SHA observation instead of immediately
+        # hashing every member a second time. Source reconstruction, current
+        # per-member generation checks and the apply-time gates stay below.
+        manifest, expected = _verified_inventory(root)
         if manifest['identity_sha256'] != identity:
             raise ValueError('transport manifest differs from NAS proof')
         ack = validate_archive_receipt(c, identity, manifest, (root / 'manifest.json').read_bytes())
         sources = validate_sources(c, identity, manifest)
-        expected = inventory(root)
         prior = {'contract': 'immutable_lake_transport_retirement_v1', 'state': 'prepared',
                  'delivery_identity_sha256': identity, 'nas_acceptance': proof, 'paired_nas_archive_receipt': ack,
                  'manifest_bytes_utf8': (root / 'manifest.json').read_text(),

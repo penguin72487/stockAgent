@@ -152,13 +152,13 @@ def write_report(output: Path, report: dict[str, Any]) -> None:
              '只讀佇列與既有 metadata；沒有額外呼叫 FinMind，沒有改佇列或掃歷史 Parquet。', '',
              '已知佇列無待辦不代表完整商品歷史、來源品質或 PIT 均已核實。', '',
              '## 未完成的可執行／候選工作', '',
-             '| 資料集 | 最早設定搜尋日 | 已取得首日 | 已取得末日 | 已抓筆數 | 已建待辦 | 未建候選 |',
-             '| --- | --- | --- | --- | ---: | ---: | ---: |']
+             '| 資料集 | 最早設定搜尋日 | 已取得首日 | 已取得末日 | 已抓筆數 | 已建待辦 | 未建候選 | 受阻 | 重試耗盡 |',
+             '| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |']
     for row in rows:
-        if any(row.get(key) for key in ('planned_requests', 'blocked_tasks', 'inflight_tasks')):
+        if any(row.get(key) for key in ('planned_requests', 'blocked_tasks', 'inflight_tasks', 'retry_exhausted_tasks')):
             lines.append('| ' + ' | '.join(str(row.get(key)) if row.get(key) is not None else '未知' for key in (
                 'dataset', 'configured_first_date', 'first_observed_date', 'last_observed_date',
-                'rows', 'pending_queued_tasks', 'unseeded_candidates')) + ' |')
+                'rows', 'pending_queued_tasks', 'unseeded_candidates', 'blocked_tasks', 'retry_exhausted_tasks')) + ' |')
     lines += ['', '## 分階段條件估時', '',
               '| 階段 | 排程請求／候選 | 最快完成（UTC） | 中間完成（UTC） | 保守完成（UTC） |',
               '| --- | ---: | --- | --- | --- |']

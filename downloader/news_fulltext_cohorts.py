@@ -24,6 +24,7 @@ READY_STATES = ("pending", "retry", "retry_cooldown", "inflight")
 NONBODY_SCOPE_OUTCOME_CONTRACT_VERSION = 1
 NONBODY_SCOPE_PROGRESS_QUERY_VERSION = 2
 RETAINED_SUPPLEMENT_REPLAY_VERSION = 1
+DECLARED_ACQUISITION_KIND = 'explicit_source_declared_acquisition_supplement'
 RETAINED_SUPPLEMENT_HEAD_FIELDS = (
     "url", "provider", "state", "due", "attempts", "error_code", "lease_owner", "lease_until",
     "body_sha256", "parquet_path", "captured_at_utc", "last_checked_at_utc", "authorization_fingerprint",
@@ -323,8 +324,12 @@ def _validated_supplement_receipt(root, db, header):
     members = [r[0] for r in db.execute("SELECT url FROM finite_supplement_members WHERE provider=? AND scope_sha256=? ORDER BY url",
                                        (header["provider"], header["scope_sha256"]))]
     digest = hashlib.sha256("".join(url + "\n" for url in members).encode()).hexdigest()
-    if (hashlib.sha256(payload).hexdigest() != header["receipt_sha256"] or receipt.get("contract_version") != 1
-            or receipt.get("scope_kind") != "explicit_diagnostic_verified_supplement"
+    retained = (type(receipt.get('contract_version')) is int and receipt['contract_version'] == 1
+                and receipt.get('scope_kind') == 'explicit_diagnostic_verified_supplement')
+    declared = (type(receipt.get('contract_version')) is int and receipt['contract_version'] == 2
+                and receipt.get('scope_kind') == DECLARED_ACQUISITION_KIND
+                and receipt.get('acquisition_scope_only') is True and receipt.get('body_admission') is False)
+    if (hashlib.sha256(payload).hexdigest() != header["receipt_sha256"] or not (retained or declared)
             or receipt.get("provider") != header["provider"] or receipt.get("urls") != members
             or digest != header["scope_sha256"] or len(members) != header["urls"]
             or receipt.get("urls_sha256") != digest or receipt.get("original_cohort_unchanged") is not True
@@ -335,6 +340,131 @@ def _validated_supplement_receipt(root, db, header):
         if sha256_file(source_path(root, evidence["private_source_path"])) != evidence["private_source_sha256"]:
             raise ValueError("finite supplement immutable source digest mismatch")
     return receipt
+
+
+def validate_declared_original(db, registry, url, witness):
+    """Reuse a sealed declaration, without treating it as an original response.
+
+    V7 retains its twelve reviewed declarations; V8 also admits an exact literal
+    URL from unchanged failed-parent metadata or the transactional response
+    outbox. The current source/head and immutable evidence are checked both at
+    submission and by the resident writer before admission.
+    A declaration approves acquisition only; normal HTTP/body checks still run.
+    """
+    from downloader.news_fulltext_cmoneylearning import (
+        CMONEY_LEARNING_ORIGIN, CMONEY_LEARNING_TWELVE_DECLARED_20261026_PATHS,
+        cmoneylearning_literal_original,
+    )
+    from downloader.news_fulltext_policy import normalize_url
+    from downloader.news_fulltext_publishers import CMNEWS_CANONICAL_ATTRIBUTE_QUESTION
+    from downloader.news_fulltext_repairs import _bytes, _clock, _head, _source_contract, _unique
+    import sqlite3
+
+    error = 'invalid_closed_declared_original_witness'
+    if isinstance(witness, dict) and 'kind' in witness:
+        from downloader.news_fulltext_original_declarations import validate_witness
+        return validate_witness(db, registry, url, witness)
+    try:
+        if (not isinstance(witness, dict) or set(witness) != {'request_id', 'job_sha256'}
+                or any(not isinstance(v, str) or not re.fullmatch(r'[0-9a-f]{64}', v) for v in witness.values())
+                or normalize_url(url) != url):
+            raise ValueError(error)
+        source = registry.require(url)
+        if (source.provider != 'cmoneylearning' or not source.allowed
+                or source.embedded_article_layout not in {'cmoneylearning_visible_article_v7', 'cmoneylearning_visible_article_v8'}
+                or source.acquisition_mode != 'finite' or not source.allow_reviewed_supplements):
+            raise ValueError(error)
+        if (source.embedded_article_layout == 'cmoneylearning_visible_article_v7'
+                and url not in {CMONEY_LEARNING_ORIGIN + p for p in CMONEY_LEARNING_TWELVE_DECLARED_20261026_PATHS}
+                or source.embedded_article_layout == 'cmoneylearning_visible_article_v8'
+                and not cmoneylearning_literal_original(url)):
+            raise ValueError(error)
+        row = db.execute('SELECT * FROM native_candidate_jobs WHERE request_id=?', (witness['request_id'],)).fetchone()
+        if (row is None or row['provider'] != 'cmnews' or row['state'] != 'observed'
+                or hashlib.sha256(_bytes(dict(row))).hexdigest() != witness['job_sha256']
+                or any(not isinstance(row[k], str) or not 0 < len(row[k]) <= 131072
+                       for k in ('request_json', 'result_json'))):
+            raise ValueError(error)
+        request, facts = (json.loads(row[k], object_pairs_hook=_unique) for k in ('request_json', 'result_json'))
+        target = request['target']
+        parent = registry.require(target['url'])
+        head = db.execute('SELECT * FROM articles WHERE url=?', (target['url'],)).fetchone()
+        native, attribute = facts['native_identity'], facts['canonical_attribute']
+        literal = attribute['canonical_attribute']
+        if (parent.provider != 'cmnews' or not parent.allowed or head is None or _head(head) != target
+                or request['source'] != _source_contract(db, parent, target['url'])[1]
+                or request['contract_version'] != 54 or request['evidence_contract_version'] != 54
+                or request['candidate_layout'] != 'cmnews_visible_article_v1'
+                or request['candidate_fingerprint'] != parent.data_fingerprint
+                or hashlib.sha256(_bytes(request)).hexdigest() != row['request_id']
+                or facts['question'] != CMNEWS_CANONICAL_ATTRIBUTE_QUESTION
+                or facts['provider'] != 'cmnews' or facts['evidence_contract_version'] != 54
+                or type(facts['status']) is not int or facts['status'] != 200
+                or facts['requested_url'] != target['url'] or facts['final_url'] != target['url']
+                or any(facts.get(k) is not False for k in ('accepted_as_article', 'body_completeness_verified',
+                    'identity_or_alias_accepted', 'raw_or_names_or_body_retained'))
+                or any(type(native.get(k)) is not int or native[k] != expected for k, expected in {
+                    'canonical_count': 1, 'matching_canonical_count': 0, 'matching_native_scope_count': 1,
+                    'native_title_count': 1, 'nonempty_native_title_count': 1, 'native_body_container_count': 1}.items())
+                or native.get('native_slug_matches') is not True
+                or native.get('native_UUID_container_matches') is not True
+                or native.get('ambiguous_native_scope') is not False
+                or attribute.get('native_scope_verified') is not True or attribute.get('canonical_count') != 1
+                or attribute.get('automatic_requests') != 0 or attribute.get('source_permission_granted') is not False
+                or attribute.get('article_or_alias_accepted') is not False
+                or literal.get('literal') != url or literal.get('absolute') != url
+                or literal.get('literal_sha256') != hashlib.sha256(url.encode()).hexdigest()
+                or literal.get('source_declaration_only') is not True
+                or literal.get('relative_reference') is not False
+                or not (_clock(target['last_checked_at_utc']) <= _clock(row['created_at_utc'])
+                    <= _clock(row['reserved_at_utc']) <= _clock(row['completed_at_utc']) <= time.time())):
+            raise ValueError(error)
+        proof = {'contract_version': 1, 'url': url, 'witness': witness, 'native_candidate_job': dict(row),
+                 'parent_head': target, 'acquisition_scope_only': True, 'body_admission': False}
+        return source, _bytes(proof)
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError, sqlite3.OperationalError):
+        raise ValueError(error) from None
+
+
+def approve_declared_original(queue, url, witness):
+    """Add one immutable acquisition membership inside the owner's transaction.
+
+    No independent commit, network request, body replay, failure reset or due
+    reset. The caller's URL/cursor transaction makes interruption idempotent.
+    """
+    from downloader.news_fulltext_queue import utc_now
+    from downloader.news_fulltext_repairs import _bytes
+    source, proof = validate_declared_original(queue.db, queue.registry, url, witness)
+    if not queue.db.execute('SELECT 1 FROM finite_cohorts WHERE provider=?', (source.provider,)).fetchone():
+        raise ValueError('declared_original_requires_frozen_initial_cohort')
+    row = queue.db.execute('SELECT * FROM articles WHERE url=? AND provider=?', (url, source.provider)).fetchone()
+    if row is None:
+        queue.add_articles([{'url': url}])
+        row = queue.db.execute('SELECT * FROM articles WHERE url=? AND provider=?', (url, source.provider)).fetchone()
+    if (row is None or row['state'] != 'waiting_cohort' or row['attempts'] or row['body_sha256']
+            or row['lease_owner'] or row['lease_until'] or row['due'] > time.time()):
+        raise ValueError('declared_original_requires_untouched_waiting_head')
+    if queue.db.execute('SELECT 1 FROM finite_supplement_members WHERE article_id=?', (row['id'],)).fetchone():
+        raise ValueError('declared_original_already_approved')
+    proof_sha = hashlib.sha256(proof).hexdigest()
+    private = 'capture_cohorts/supplement_sources/' + proof_sha + '.json'
+    _persist_immutable_proof(queue.root, private, proof)
+    digest = hashlib.sha256((url + '\n').encode()).hexdigest()
+    receipt = {'contract_version': 2, 'scope_kind': DECLARED_ACQUISITION_KIND, 'provider': source.provider,
+        'urls': [url], 'urls_sha256': digest, 'original_cohort_unchanged': True, 'publish': False,
+        'all_publisher_history_complete': False, 'acquisition_scope_only': True, 'body_admission': False,
+        'approved_at_utc': utc_now(), 'source_evidence': [{'url': url,
+            'source_data_fingerprint_at_approval': source.data_fingerprint,
+            'source_authorization_fingerprint_at_approval': source.authorization_fingerprint,
+            'declared_original_witness': witness, 'private_source_path': private, 'private_source_sha256': proof_sha}]}
+    payload = _bytes(receipt)
+    receipt_sha = hashlib.sha256(payload).hexdigest()
+    relative = f'capture_cohorts/supplements/{source.provider}-{digest}-{receipt_sha}.json'
+    _persist_immutable_proof(queue.root, relative, payload)
+    queue.db.execute('INSERT INTO finite_capture_supplements VALUES (?,?,?,?,?)',
+        (source.provider, digest, 1, relative, receipt_sha))
+    queue.db.execute('INSERT INTO finite_supplement_members VALUES (?,?,?,?)', (source.provider, row['id'], url, digest))
+    queue.db.execute("UPDATE articles SET state='pending' WHERE id=? AND state='waiting_cohort'", (row['id'],))
 
 
 def validate_supplements(root, db):
@@ -489,6 +619,8 @@ def materialize_reviewed_supplements(queue, urls, *, lease_seconds):
         if key not in scopes:
             scopes[key] = _validated_supplement_receipt(queue.root, queue.db, header)
         scope = scopes[key]
+        if scope.get('acquisition_scope_only') is True:
+            raise ValueError('declared acquisition scope has no retained original to replay')
         evidence = next(e for e in scope["source_evidence"] if e["url"] == url)
         if evidence["source_data_fingerprint_at_approval"] != source.data_fingerprint:
             raise ValueError("retained supplement source contract changed")

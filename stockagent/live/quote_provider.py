@@ -55,6 +55,7 @@ _SHIOAJI_STREAM_SUBSCRIPTIONS: set[tuple[str, str]] = set()
 _SHIOAJI_STREAM_ROWS: dict[str, dict[str, dict[str, Any]]] = {}
 _SHIOAJI_STREAM_ROTATION_AT = 0.0
 _SHIOAJI_STREAM_CURSOR = 0
+_SHIOAJI_STREAM_PENDING_CURSOR = 0
 _SHIOAJI_STREAM_TARGET: tuple[str, ...] = ()
 _SHIOAJI_STREAM_TARGET_READY = False
 _SHIOAJI_STOCK_WAKEUP: StockQuoteWakeup | None = None
@@ -906,6 +907,14 @@ def load_local_stock_0901_vwaps(
                 "execution_price_0901_method": price_method,
                 "tick_volume_units_0901": float(volume_shares or 0.0),
                 "observed_volume_unit_0901": "shares",
+                # A missing/invalid quantity is not proof of zero trades.
+                "observed_volume_known_0901": bool(
+                    volume_unit_valid
+                    and _quantity_or_none(
+                        row.get("volume_shares")
+                        if row.get("volume_shares") is not None else row.get("Volume")
+                    ) is not None
+                ),
                 "tick_count_0901": 0,
                 "source_window_start": datetime.combine(
                     trading_date,
@@ -1092,6 +1101,16 @@ def _stock_history_result(method, *, timeout_ms: int, nonblocking: bool, **kwarg
         closed.set()
 
 
+def _defer_live_0901_history(trading_date: date, *, observed: datetime | None = None) -> bool:
+    """Defer bulk history during the session, including older trading dates."""
+    zone = ZoneInfo("Asia/Taipei")
+    now = observed or datetime.now(zone)
+    if now.utcoffset() is None:
+        raise ValueError("an aware observation clock is required")
+    local = now.astimezone(zone)
+    return datetime_time(9, 0) <= local.time().replace(tzinfo=None) < datetime_time(13, 35)
+
+
 def fetch_shioaji_historical_stock_0901_vwaps(
     symbols: list[str],
     *,
@@ -1125,6 +1144,30 @@ def fetch_shioaji_historical_stock_0901_vwaps(
     fetch_started = time.monotonic()
     requested = list(dict.fromkeys(str(symbol).strip() for symbol in symbols))
     requested = [symbol for symbol in requested if symbol]
+    # Historical ticks are limited during the session and replaying hundreds
+    # of symbols can jeopardize the very live feed we are trying to protect.
+    # The caller tries locally receipted minute bars first. Missing remote
+    # evidence remains pending; do not log in or mark an unqueried symbol as
+    # attempted, and let the caller retry after the session.
+    observed = datetime.now(ZoneInfo("Asia/Taipei"))
+    if requested and _defer_live_0901_history(trading_date, observed=observed):
+        return {}, {
+            "source": "shioaji:intraday_bulk_history_deferred",
+            "trading_date": trading_date.isoformat(),
+            "requested_symbols": len(requested),
+            "queried_symbols": 0,
+            "attempted_symbols": [],
+            "failed_symbols": [],
+            "retry_symbols": [],
+            "resolved_symbols": 0,
+            "unqueried_symbols": len(requested),
+            "error_counts": {},
+            "stopped_for_traffic": False,
+            "provider_policy_deferred": True,
+            "deferred_until_taipei": datetime.combine(
+                observed.date(), datetime_time(13, 35), tzinfo=ZoneInfo("Asia/Taipei")
+            ).isoformat(timespec="seconds"),
+        }
     api = _shioaji_stock_api()
     import shioaji as sj
 
@@ -1850,6 +1893,7 @@ def _record_stock_stream_event(kind: str, event: object, *, received: datetime |
 
 def fetch_shioaji_stock_live_quotes(
     symbols: list[str], *, trading_date: date, allow_rotation: bool = True,
+    priority_symbols: tuple[str, ...] = (), pending_symbols: tuple[str, ...] = (),
 ) -> dict[str, dict[str, Any]]:
     """Subscribe once on the existing market-data login, then read pushed state.
 
@@ -1857,9 +1901,12 @@ def fetch_shioaji_stock_live_quotes(
     registers order callbacks, creates another login, polls snapshots, or
     infers non-trial status from missing fields. Subscriptions are reconciled
     against the current execution universe so completed symbols release quota.
+    Existing inventory can be pinned ahead of entry/recovery subscriptions;
+    this is a subscription preference, not proof of a fresh executable quote.
     """
     import shioaji as sj
     global _SHIOAJI_STREAM_API, _SHIOAJI_STREAM_ROTATION_AT, _SHIOAJI_STREAM_CURSOR
+    global _SHIOAJI_STREAM_PENDING_CURSOR
     global _SHIOAJI_STREAM_TARGET, _SHIOAJI_STREAM_TARGET_READY
     api = _shioaji_stock_api()
     with _SHIOAJI_STREAM_LOCK:
@@ -1876,26 +1923,64 @@ def fetch_shioaji_stock_live_quotes(
             _SHIOAJI_STREAM_ROWS.clear()
             _SHIOAJI_STREAM_ROWS.update(retained_opens)
             _SHIOAJI_STREAM_CURSOR = 0
+            _SHIOAJI_STREAM_PENDING_CURSOR = 0
             _SHIOAJI_STREAM_ROTATION_AT = 0.0
             _SHIOAJI_STREAM_TARGET = ()
             _SHIOAJI_STREAM_TARGET_READY = False
             api.set_on_quote_stk_v1_callback(lambda *args: _record_stock_stream_event("quote", args[-1]))
             _SHIOAJI_STREAM_API = api
     requested = sorted(set(map(str, symbols)))
+    requested_set = set(requested)
+    pending = sorted(set(map(str, pending_symbols)) & requested_set)
+    pending_set = set(pending)
+    priority = sorted((set(map(str, priority_symbols)) & requested_set) - pending_set)
+    priority_set = set(priority)
     if len(requested) <= _SHIOAJI_STOCK_STREAM_LIMIT:
-        selected = requested
+        selected = pending + priority + [
+            code for code in requested if code not in priority_set and code not in pending_set
+        ]
         _SHIOAJI_STREAM_CURSOR = 0
+        _SHIOAJI_STREAM_PENDING_CURSOR = 0
     else:
         now = time.monotonic()
+        previous = set(_SHIOAJI_STREAM_TARGET)
+        # Reserve a small, bounded share for outstanding orders even when held
+        # inventory alone exceeds the subscription cap. Otherwise those orders
+        # can never receive a quote. The remaining slots protect held risk;
+        # both oversubscribed classes rotate independently.
+        pending_slots = min(len(pending), max(
+            _SHIOAJI_STOCK_STREAM_LIMIT - len(priority),
+            max(1, _SHIOAJI_STOCK_STREAM_LIMIT // 10) if pending else 0,
+        ))
+        priority_slots = min(len(priority), _SHIOAJI_STOCK_STREAM_LIMIT - pending_slots)
+        pending_satisfied = len(previous & pending_set) == pending_slots
+        priority_satisfied = len(previous & priority_set) == priority_slots
         if (_SHIOAJI_STREAM_TARGET
-                and set(_SHIOAJI_STREAM_TARGET) <= set(requested)
+                and len(previous) == _SHIOAJI_STOCK_STREAM_LIMIT
+                and previous <= requested_set and priority_satisfied and pending_satisfied
                 and (not allow_rotation or not _SHIOAJI_STREAM_TARGET_READY
                      or now < _SHIOAJI_STREAM_ROTATION_AT)):
-            selected = list(_SHIOAJI_STREAM_TARGET)
+            selected = ([code for code in pending if code in previous]
+                        + [code for code in priority if code in previous]
+                        + [code for code in _SHIOAJI_STREAM_TARGET
+                           if code not in priority_set and code not in pending_set])
         else:
-            start = _SHIOAJI_STREAM_CURSOR % len(requested)
-            selected = [requested[(start + idx) % len(requested)] for idx in range(_SHIOAJI_STOCK_STREAM_LIMIT)]
-            _SHIOAJI_STREAM_CURSOR = (start + _SHIOAJI_STOCK_STREAM_LIMIT) % len(requested)
+            pending_start = _SHIOAJI_STREAM_PENDING_CURSOR % len(pending) if pending else 0
+            selected_pending = [pending[(pending_start + idx) % len(pending)]
+                                for idx in range(pending_slots)]
+            if pending:
+                _SHIOAJI_STREAM_PENDING_CURSOR = (pending_start + pending_slots) % len(pending)
+            if len(priority) > priority_slots:
+                pinned, rotation_pool = selected_pending, priority
+            else:
+                pinned = selected_pending + priority
+                rotation_pool = [code for code in requested
+                                 if code not in priority_set and code not in pending_set]
+            count = min(_SHIOAJI_STOCK_STREAM_LIMIT - len(pinned), len(rotation_pool))
+            start = _SHIOAJI_STREAM_CURSOR % len(rotation_pool) if rotation_pool else 0
+            selected = pinned + [rotation_pool[(start + idx) % len(rotation_pool)] for idx in range(count)]
+            if rotation_pool:
+                _SHIOAJI_STREAM_CURSOR = (start + count) % len(rotation_pool)
     if tuple(selected) != _SHIOAJI_STREAM_TARGET:
         _SHIOAJI_STREAM_TARGET = tuple(selected)
         _SHIOAJI_STREAM_TARGET_READY = False
@@ -1910,7 +1995,9 @@ def fetch_shioaji_stock_live_quotes(
             api.unsubscribe(contract, quote_type=kinds[kind])
         _SHIOAJI_STREAM_SUBSCRIPTIONS.discard((code, kind))
     free_slots = max(0, _SHIOAJI_STOCK_STREAM_LIMIT - len(_SHIOAJI_STREAM_SUBSCRIPTIONS))
-    for code, kind in sorted(desired - _SHIOAJI_STREAM_SUBSCRIPTIONS)[:min(_SHIOAJI_STOCK_STREAM_BATCH_LIMIT, free_slots)]:
+    missing_in_priority_order = [(code, "quote") for code in selected
+                                 if (code, "quote") not in _SHIOAJI_STREAM_SUBSCRIPTIONS]
+    for code, kind in missing_in_priority_order[:min(_SHIOAJI_STOCK_STREAM_BATCH_LIMIT, free_slots)]:
         contract = api.contracts.get(code)
         if contract is None:
             continue
@@ -1926,7 +2013,6 @@ def fetch_shioaji_stock_live_quotes(
     limits, _ = _load_prepared_tw_price_limits(trading_date.isoformat())
     quotes = {}
     selected_set = set(selected)
-    requested_set = set(requested)
     with _SHIOAJI_STREAM_LOCK:
         for code in list(_SHIOAJI_STREAM_ROWS):
             if code not in requested_set:

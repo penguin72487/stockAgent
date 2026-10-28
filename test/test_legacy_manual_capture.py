@@ -50,6 +50,22 @@ def test_manual_capture_keeps_a_real_stability_floor(tmp_path):
         source_plan(source, replace(spec, manual_capture_min_stable_hours=0), manual_capture=True)
 
 
+def test_source_plan_preserves_nested_names_and_rejects_directory_symlinks(tmp_path):
+    spec, _, source = fixture(tmp_path)
+    nested = source / "dir" / "子目錄"
+    nested.mkdir(parents=True)
+    child = nested / "值\\x.csv"
+    child.write_text("original", encoding="utf-8")
+    old = time.time_ns() - 86_400_000_000_000
+    os.utime(child, ns=(old, old))
+    assert [row["path"] for row in source_plan(source, spec, manual_capture=True)] == [
+        "a.pt", "b.csv", "dir/子目錄/值\\x.csv"
+    ]
+    (source / "link").symlink_to(nested, target_is_directory=True)
+    with pytest.raises(SnapshotError, match="symlink directory"):
+        source_plan(source, spec, manual_capture=True)
+
+
 def test_rebuildable_staging_recovers_corrupt_receipts_and_payloads(tmp_path):
     spec, artifact_root, source = fixture(tmp_path)
     spec = replace(spec, durable_staging=False)

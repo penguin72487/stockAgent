@@ -1,6 +1,7 @@
 """Fixed pending delivery survives a history-bounded NAS outage continuation."""
 import asyncio
 from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -58,6 +59,7 @@ def test_nas_outage_continuation_keeps_exact_unaccepted_delivery():
         return {'state': 'waiting_nas_archive_acceptance'}
     info = SimpleNamespace(is_continue_as_new_suggested=lambda: False, get_current_history_length=lambda: 5000)
     with patch.object(sw.workflow, 'execute_activity', execute), patch.object(sw.workflow, 'info', lambda: info), \
+         patch.object(sw.workflow, 'patched', lambda _name: True), \
          patch.object(sw.workflow, 'continue_as_new', side_effect=continue_request):
         with pytest.raises(Continued) as continued:
             asyncio.run(sw.StorageLifecycle().run({'last_snapshot': 9}))
@@ -77,3 +79,63 @@ def test_resumed_outage_checks_fixed_delivery_before_registering_new_latest():
         with pytest.raises(Continued):
             asyncio.run(sw.StorageLifecycle().run({'last_snapshot': 9, 'pending_export': fixed}))
     assert len(calls) == 1
+
+
+def test_only_catalog_lock_contention_is_a_normal_wait():
+    with patch.object(sw.activity, 'heartbeat'), patch.object(sw, 'activity_lease', lambda: nullcontext()), \
+         patch.object(sw, 'configuration', lambda: {}), \
+         patch.object(sw, 'register', side_effect=sw.CatalogOwnerBusy('owned')):
+        assert sw.register_versions() == {'state': 'waiting_catalog_owner', 'retry_after_seconds': 15}
+    with patch.object(sw.activity, 'heartbeat'), patch.object(sw, 'activity_lease', lambda: nullcontext()), \
+         patch.object(sw, 'configuration', lambda: {}), \
+         patch.object(sw, 'register', side_effect=BlockingIOError('unrelated I/O')):
+        with pytest.raises(BlockingIOError, match='unrelated I/O'):
+            sw.register_versions()
+
+
+def test_catalog_busy_wait_retries_without_exporting_unaccepted_data():
+    calls, sleeps = [], []
+    async def execute(handler, *args, **options):
+        calls.append((handler, options))
+        if len(calls) == 1:
+            return {'state': 'waiting_catalog_owner', 'retry_after_seconds': 15}
+        raise Continued({'next_activity': handler.__name__})
+    async def sleep(duration):
+        sleeps.append(duration)
+    with patch.object(sw.workflow, 'execute_activity', execute), \
+         patch.object(sw.workflow, 'patched', lambda _name: True), \
+         patch.object(sw.workflow, 'sleep', sleep):
+        with pytest.raises(Continued) as continued:
+            asyncio.run(sw.StorageLifecycle().run({'last_snapshot': 9}))
+    assert continued.value.request == {'next_activity': 'register_versions'}
+    assert [handler for handler, _ in calls] == [sw.register_versions, sw.register_versions]
+    assert sleeps == [timedelta(seconds=15)]
+    assert calls[0][1]['start_to_close_timeout'] == timedelta(hours=24)
+
+
+@pytest.mark.parametrize('patched,expected', [(False, timedelta(minutes=20)), (True, timedelta(hours=24))])
+def test_catalog_timeout_retains_history_compatibility(patched, expected):
+    calls = []
+    async def execute(handler, *args, **options):
+        calls.append((handler, options))
+        raise Continued({})
+    with patch.object(sw.workflow, 'execute_activity', execute), \
+         patch.object(sw.workflow, 'patched', lambda _name: patched):
+        with pytest.raises(Continued):
+            asyncio.run(sw.StorageLifecycle().run({}))
+    assert calls[0][0] == sw.register_versions
+    assert calls[0][1]['start_to_close_timeout'] == expected
+
+
+@pytest.mark.parametrize('patched,expected', [(False, 2), (True, 24)])
+def test_source_replication_timeout_retains_history_compatibility(patched, expected):
+    calls = []
+    async def execute(handler, *args, **options):
+        calls.append((handler, options))
+        raise Continued({})
+    with patch.object(sw.workflow, 'execute_activity', execute), \
+         patch.object(sw.workflow, 'patched', lambda _name: patched):
+        with pytest.raises(Continued):
+            asyncio.run(sw.SourceReplicationLifecycle().run({}))
+    assert calls[0][0] == sw.stage_source_replication
+    assert calls[0][1]['start_to_close_timeout'] == timedelta(hours=expected)

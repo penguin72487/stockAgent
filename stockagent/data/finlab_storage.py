@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import re
+import stat
 import time
 import uuid
 
@@ -27,6 +28,7 @@ from stockagent.data_sync.physical_cache_reuse import _metadata, _real_directory
 
 
 CONTRACT = "finlab_exact_native_history_sharing_v1"
+WORKING_SET_CONTRACT = "finlab_native_working_set_inventory_v1"
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 
 
@@ -59,6 +61,159 @@ def install_history_payload(temporary: Path, destination: Path, digest: str) -> 
     os.chmod(temporary, 0o444, follow_symlinks=False)
     durable_replace(temporary, destination)
     return "new_immutable_native_payload"
+
+
+def _generation(path: Path) -> tuple:
+    info = path.lstat()
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def inventory_working_set(root: Path, receipt_dir: Path, *, wait_owner_seconds: float = 0) -> dict:
+    """Classify flat general-table payloads by exact receipt references.
+
+    Borrow the existing FinLab writer boundary. Read only receipt bytes and
+    filesystem metadata, with no source API, payload hashing or deletion.
+    Historical and unreferenced names remain protected: neither is a recovery
+    proof. Intraday partitions, SDK caches and derived overlays are outside this
+    explicitly bounded inventory.
+    """
+    root = _real_directory(root)
+    receipt_dir = receipt_dir.absolute()
+    if (receipt_dir.resolve() != receipt_dir or receipt_dir == root
+            or root in receipt_dir.parents or receipt_dir in root.parents):
+        raise ValueError("FinLab inventory reports must be outside the source")
+    receipt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    report = {"contract": WORKING_SET_CONTRACT, "root": str(root), "state": "running",
+        "scope": "general_tables_raw_datasets_and_receipts; intraday_sdk_and_overlays_excluded",
+        "source_payload_reads": 0, "source_payload_writes": 0, "provider_API_calls": 0,
+        "deletion_authorized": False, "source_files_deleted": 0,
+        "payload_SHA_reverified": False, "cold_recovery_verified": False,
+        "issues": [], "files": [], "controls": {}, "metadata_bytes_read": 0}
+    directories, generations, references = {}, {}, {}
+    issues = report["issues"]
+
+    def entries(path):
+        _real_directory(path)
+        before = _generation(path)
+        values = sorted(path.iterdir())
+        if _generation(path) != before:
+            raise ValueError("FinLab directory changed during inventory")
+        directories[path] = before
+        return values
+
+    def read_receipt(path, category, *, raw_only=False):
+        before = _generation(path)
+        if not stat.S_ISREG(before[2]) or path.resolve(strict=True) != path:
+            raise ValueError("FinLab receipt is redirected or not regular")
+        report["metadata_bytes_read"] += before[5]
+        if report["metadata_bytes_read"] > 512 * 1024**2 or len(generations) >= 100000:
+            raise ValueError("FinLab receipt inventory exceeds its metadata bound")
+        value, digest = _metadata(path)
+        if _generation(path) != before:
+            raise ValueError("FinLab receipt changed during inventory")
+        generations[path] = before
+        receipt_name = path.relative_to(root).as_posix()
+        report["controls"][receipt_name] = {"sha256": digest, "generation": list(before)}
+        if not isinstance(value.get("dataset"), str) or not value["dataset"]:
+            issues.append({"receipt": receipt_name, "reason": "missing_dataset_identity"})
+        kinds = [("raw_path", "raw_sha256", "raw_bytes", "raw")]
+        if not raw_only:
+            kinds.insert(0, ("parquet_path", "sha256", "parquet_size_bytes", "datasets"))
+        for field, sha_field, size_field, parent in kinds:
+            name = value.get(field)
+            if name is None and field == "raw_path" and not raw_only:
+                continue
+            relative = Path(name) if isinstance(name, str) else None
+            if (relative is None or relative.parent != Path(parent)
+                    or relative.as_posix() != name or ".." in relative.parts):
+                issues.append({"receipt": receipt_name, "field": field, "reason": "invalid_payload_path"})
+                continue
+            reference = references.setdefault(name, {"current_receipts": [], "historical_receipts": [],
+                "expected_sha256": set(), "expected_bytes": set()})
+            reference[category].append(receipt_name)
+            digest = value.get(sha_field)
+            if not isinstance(digest, str) or not HASH.fullmatch(digest):
+                issues.append({"receipt": receipt_name, "field": sha_field, "reason": "invalid_payload_SHA"})
+            else:
+                reference["expected_sha256"].add(digest)
+            size = value.get(size_field)
+            if size is not None:
+                if type(size) is not int or size < 0:
+                    issues.append({"receipt": receipt_name, "field": size_field, "reason": "invalid_payload_size"})
+                else:
+                    reference["expected_bytes"].add(size)
+
+    try:
+        with _sync_owner(root, wait_owner_seconds):
+            controls = {name: entries(root / name) for name in ("receipts", "raw_receipts", "versions")}
+            for parent in ("receipts", "raw_receipts"):
+                for path in controls[parent]:
+                    if path.suffix == ".json":
+                        read_receipt(path, "current_receipts", raw_only=parent == "raw_receipts")
+            for directory in controls["versions"]:
+                for path in entries(directory):
+                    if path.suffix == ".json":
+                        read_receipt(path, "historical_receipts")
+            payloads = {}
+            for parent in ("raw", "datasets"):
+                for path in entries(root / parent):
+                    before = _generation(path)
+                    name = path.relative_to(root).as_posix()
+                    if not stat.S_ISREG(before[2]) or path.resolve(strict=True) != path:
+                        issues.append({"path": name, "reason": "payload_not_unredirected_regular_file"})
+                        continue
+                    info = payload_info(path)
+                    if _generation(path) != before:
+                        raise ValueError("FinLab payload metadata changed during inventory")
+                    generations[path] = before
+                    payloads[name] = info
+            if len(payloads) > 100000:
+                raise ValueError("FinLab general-table inventory exceeds its file bound")
+            for name, reference in references.items():
+                if name not in payloads:
+                    issues.append({"path": name, "reason": "referenced_payload_absent_or_unsafe"})
+                if len(reference["expected_sha256"]) > 1 or len(reference["expected_bytes"]) > 1:
+                    issues.append({"path": name, "reason": "contradictory_receipt_identity"})
+                if name in payloads and reference["expected_bytes"] - {payloads[name]["size"]}:
+                    issues.append({"path": name, "reason": "receipt_size_differs_from_current_file"})
+            for name, info in sorted(payloads.items()):
+                reference = references.get(name, {"current_receipts": [], "historical_receipts": [],
+                    "expected_sha256": set(), "expected_bytes": set()})
+                category = ("current_referenced" if reference["current_receipts"] else
+                            "historical_only" if reference["historical_receipts"] else "unreferenced_preserve")
+                report["files"].append({"path": name, "category": category, **info,
+                    **{key: sorted(value) for key, value in reference.items()}})
+            # Assign a shared inode's allocated bytes to its strongest current
+            # use. A historical alias of an active payload cannot free that inode.
+            categories = ("current_referenced", "historical_only", "unreferenced_preserve")
+            summaries, seen = {}, set()
+            for category in categories:
+                selected = [row for row in report["files"] if row["category"] == category]
+                allocated = 0
+                for row in selected:
+                    key = inode_key(row)
+                    if key not in seen:
+                        seen.add(key)
+                        allocated += row["allocated"]
+                summaries[category] = {"files": len(selected),
+                    "logical_bytes": sum(row["size"] for row in selected),
+                    "unique_allocated_bytes_assigned": allocated}
+            if any(_generation(path) != before for path, before in {**directories, **generations}.items()):
+                raise ValueError("FinLab source generation changed before inventory acceptance")
+            report.update(state="incomplete" if issues else "inventoried", categories=summaries,
+                unique_payload_inodes=len(seen), receipt_files=len(report["controls"]),
+                source_owner_boundary_verified=True, metadata_complete=not issues,
+                total_logical_bytes=sum(row["size"] for row in report["files"]),
+                total_unique_allocated_bytes=sum(row["unique_allocated_bytes_assigned"] for row in summaries.values()))
+    except BlockingIOError:
+        report.update(state="deferred", reason="native_sync_owner_busy", metadata_complete=False)
+    report["observed_at_utc"] = datetime.now(UTC).isoformat()
+    name = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex[:8]
+    path = receipt_dir / (name + ".working-set.json")
+    report["result_path"] = str(path)
+    atomic_write_json(path, report, durable=True)
+    return report
 
 
 def _inventory(root: Path):

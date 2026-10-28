@@ -19,6 +19,7 @@ from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
 )
 from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
+from stockagent.data.tw_futures_margin import FUTURES_RESIDUAL_SIGNAL_COLUMNS
 from stockagent.models.normalization import (
     finite_mask_fill_value,
     masked_cross_sectional_mean_finite,
@@ -69,6 +70,7 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         futures_causal_account_policy: bool = False,
         futures_net_notional_cap: float | None = None,
         futures_beta_notional_cap: float | None = None,
+        futures_residual_signal_context: bool = False,
         futures_opening_reference_feature: bool = False,
         futures_denomination_reference_capital: float = 10_000_000.0,
         **kwargs: Any,
@@ -121,6 +123,9 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
         self.futures_causal_account_policy = bool(futures_causal_account_policy)
         self.futures_net_notional_cap = futures_net_notional_cap
         self.futures_beta_notional_cap = futures_beta_notional_cap
+        self.futures_residual_signal_context = bool(futures_residual_signal_context)
+        if self.futures_residual_signal_context and not self.futures_causal_account_policy:
+            raise ValueError("residual signals require the causal margin account policy")
         if futures_beta_notional_cap is not None and (
             isinstance(futures_beta_notional_cap, bool) or not math.isfinite(futures_beta_notional_cap)
             or futures_beta_notional_cap < 0 or futures_net_notional_cap is not None
@@ -268,6 +273,17 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                       device=self.futures_action_head.weight.device, dtype=self.futures_action_head.weight.dtype)
             if self.futures_opening_reference_feature else None
         )
+        self.futures_residual_signal_encoder = None
+        if self.futures_residual_signal_context:
+            # Preserve the control's initial policy and dropout stream. The
+            # new input learns immediately through a zero linear residual.
+            head_device = self.futures_action_head.weight.device
+            devices = [head_device.index] if head_device.type == "cuda" else []
+            with torch.random.fork_rng(devices=devices):
+                self.futures_residual_signal_encoder = nn.Linear(
+                    len(FUTURES_RESIDUAL_SIGNAL_COLUMNS), self.d_model, bias=False,
+                    device=head_device, dtype=self.futures_action_head.weight.dtype)
+                nn.init.zeros_(self.futures_residual_signal_encoder.weight)
 
     def set_futures_feature_rms_normalizer(
         self,
@@ -333,6 +349,8 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
             margin_features += len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
         if self.futures_beta_notional_cap is not None:
             margin_features += 1
+        if self.futures_residual_signal_context:
+            margin_features += len(FUTURES_RESIDUAL_SIGNAL_COLUMNS)
         if self.futures_opening_reference_feature:
             margin_features += len(OPENING_REFERENCE_FEATURES)
         if features is None or mask is None:
@@ -613,6 +631,14 @@ class CrossSectionalAllFuturesModel(TransformerBasePortfolioModel):
                 current_open_token,
                 torch.zeros_like(current_open_token),
             )
+        if self.futures_residual_signal_encoder is not None:
+            signal_start = (len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + 2 + int(self.futures_margin_amount_context)
+                + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+                + int(self.futures_beta_notional_cap is not None))
+            signals = candidate_features[..., signal_start:signal_start+len(FUTURES_RESIDUAL_SIGNAL_COLUMNS)]
+            signal_token = self.futures_residual_signal_encoder(signals.to(dtype=z_stock.dtype))
+            futures_tokens = futures_tokens + signal_token.masked_fill(~candidate_mask.unsqueeze(-1), 0.)
         if self.futures_opening_reference_encoder is not None:
             reference = candidate_features[..., -len(OPENING_REFERENCE_FEATURES):].to(dtype=z_stock.dtype)
             reference_token = self.futures_opening_reference_encoder(reference)

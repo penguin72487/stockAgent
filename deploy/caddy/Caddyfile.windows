@@ -57,13 +57,11 @@ http://penguin72487.dpdns.org {
 		header_up X-WireGuard-Identity public-anonymous
 		header_up -X-WireGuard-Device
 		header_up -X-WireGuard-Role
-		# There is one upstream, so active ejection cannot fail over and only
-		# amplifies a transient event-loop stall into a synthetic 503.  The
-		# Windows supervisor probes /healthz every five seconds and restarts WSL;
-		# retain passive request failures here for immediate client feedback.
-		fail_duration 2s
-		max_fails 3
-		unhealthy_status 500 502 503 504
+		# A route-level snapshot conflict is not a dead gateway. With one
+		# upstream, active OR passive ejection has no failover target: three
+		# legitimate API 503s must not blank every HTML/static route for 2s.
+		# Leave health ejection disabled; preserve each real error response and
+		# the independent Windows supervisor's /healthz recovery checks.
 		transport http {
 			dial_timeout 2s
 			response_header_timeout 20s

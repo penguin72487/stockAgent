@@ -7,7 +7,7 @@ import pytest
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT, compact_request, connect, stable_id
 from downloader.tej_key_layout import KEY1_CONTRACT
-from downloader.tej_priority import CONTRACT, register_priority_requests
+from downloader.tej_priority import CONTRACT, SOURCE_RECHECK_CONTRACT, register_priority_requests
 from scripts.build_tej_smart_wizard_inventory import table_identity
 
 
@@ -65,6 +65,83 @@ def add_prior(batch, state="complete", request=None, priority=100):
     return task
 
 
+def recheck_batch(batch):
+    """A completed source and a different retained comparison observation."""
+    root, definition, plan, _, _ = batch
+    request = plan["requests"][0]["request"]
+    request["date_labels"] = request["date_labels"][:1]
+    parent = add_prior(batch)
+    raw, parquet = root / "raw/original.json", root / "datasets/original.parquet"
+    raw.write_text('{"reference": "100"}')
+    parquet.parent.mkdir()
+    parquet.write_bytes(b"retained native payload")
+    receipt = root / "receipts/parent.json"
+    atomic_write_json(receipt, dict(task_id=parent, table_id=definition["table_id"],
+        source_values_retained=True, training_auto_injected=False,
+        raw_path=str(raw.relative_to(root)), raw_sha256=sha256_file(raw),
+        parquet_path=str(parquet.relative_to(root)), parquet_sha256=sha256_file(parquet)))
+    with closing(connect(root)) as con, con:
+        con.execute("UPDATE tasks SET receipt_path=? WHERE task_id=?",
+                    (str(receipt.relative_to(root)), parent))
+    independent = root.parent / "official.csv"
+    independent.write_text("observed_price\n10\n")
+    conflict = root.parent / "conflict.json"
+    atomic_write_json(conflict, dict(contract="native_source_value_conflict_v1",
+        table_id=definition["table_id"], company="AA1201112", period="2011-11-17",
+        reason="Native reference conflicts with independently retained legal trades",
+        sources=[dict(path=str(raw), sha256=sha256_file(raw), kind="native_original"),
+                 dict(path=str(independent), sha256=sha256_file(independent), kind="independent_original")]))
+    request["source_recheck"] = dict(contract=SOURCE_RECHECK_CONTRACT,
+        conflict_evidence=dict(path=str(conflict), sha256=sha256_file(conflict)),
+        parent_task_ids=[parent])
+    return parent, receipt, raw, conflict
+
+
+def test_source_conflict_recheck_retains_completed_parent_and_original_bytes(batch):
+    parent, receipt, raw, _ = recheck_batch(batch)
+    pins = {p: sha256_file(p) for p in (receipt, raw)}
+    result = submit(batch)
+    child = result["tasks"][0]
+    assert child["operation"] == "new_source_conflict_recheck"
+    assert child["task_id"] != parent and child["source_recheck_parent_task_ids"] == [parent]
+    with closing(connect(batch[0])) as con:
+        assert con.execute("SELECT state FROM tasks WHERE task_id=?", (parent,)).fetchone()[0] == "complete"
+        assert con.execute("SELECT state FROM tasks WHERE task_id=?", (child["task_id"],)).fetchone()[0] == "pending"
+    assert all(sha256_file(p) == digest for p, digest in pins.items())
+
+
+@pytest.mark.parametrize("defect", ["wrong_cell", "changed_original", "unrelated_native", "missing_parent", "running", "second_recheck"])
+def test_source_conflict_recheck_rejects_unbound_or_repeat_work_atomically(batch, defect):
+    parent, _, raw, conflict = recheck_batch(batch)
+    request = batch[2]["requests"][0]["request"]
+    if defect == "wrong_cell":
+        request["date_labels"] = ["20111118"]
+    elif defect == "changed_original":
+        raw.write_text("changed")
+    elif defect == "unrelated_native":
+        other = raw.with_name("other-original.json")
+        other.write_text(raw.read_text())
+        evidence = json.loads(conflict.read_text())
+        evidence["sources"][0].update(path=str(other), sha256=sha256_file(other))
+        atomic_write_json(conflict, evidence)
+        request["source_recheck"]["conflict_evidence"]["sha256"] = sha256_file(conflict)
+    elif defect == "missing_parent":
+        request["source_recheck"]["parent_task_ids"] = []
+    elif defect == "running":
+        with closing(connect(batch[0])) as con, con:
+            con.execute("UPDATE tasks SET state='running' WHERE task_id=?", (parent,))
+    else:
+        submit(batch)
+        batch[4].unlink()
+        # A second plan cannot get around the retained pending recheck by
+        # changing its evidence identity or declaring a different parent list.
+        request["source_recheck"]["parent_task_ids"] = [parent]
+    with pytest.raises(ValueError):
+        submit(batch)
+    with closing(connect(batch[0])) as con:
+        assert con.execute("SELECT count(*) FROM tasks").fetchone()[0] == (2 if defect == "second_recheck" else 1)
+
+
 def test_live_unrelated_query_is_untouched_and_finite_tasks_precede_original_plan(batch):
     root, _, plan, _, receipt = batch
     unrelated = copy.deepcopy(plan["requests"][0]["request"])
@@ -100,12 +177,90 @@ def test_existing_pending_exact_scope_is_promoted_without_copying_source_task(ba
         assert con.execute("SELECT priority FROM tasks").fetchone()[0] == -20
 
 
+def test_native_minimum_is_validated_before_priority_registration(batch):
+    batch[2]['requests'][0]['request']['max_cells'] = 12
+    with pytest.raises(ValueError, match='bounds'):
+        submit(batch)
+    with closing(connect(batch[0])) as con:
+        assert not con.execute('SELECT 1 FROM tasks').fetchone()
+
+
+def test_minimum_bound_repair_preserves_old_identity_and_every_source_operand(batch):
+    root, _, plan, path, receipt = batch
+    old = copy.deepcopy(plan['requests'][0]['request'])
+    old['max_cells'] = 12
+    task = add_prior(batch, request=old, state='pending', priority=-30)
+    with closing(connect(root)) as con:
+        before = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task,)).fetchone())
+    plan['requests'][0]['request']['max_cells'] = 100
+    atomic_write_json(path, plan)
+    result = register_priority_requests(root, path, receipt, repair_pending_bounds=True)
+    item = result['tasks'][0]
+    assert item['operation'] == 'replace_unattempted_invalid_bound'
+    assert item['previous_task_id'] == task and item['task_id'] != task
+    with closing(connect(root)) as con:
+        retained = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (task,)).fetchone())
+        replacement = dict(con.execute('SELECT * FROM tasks WHERE task_id=?', (item['task_id'],)).fetchone())
+    assert retained == {**before, 'state': 'superseded_priority_capacity_v1'}
+    assert replacement['state'] == 'pending' and replacement['priority'] == -30
+    assert json.loads(replacement['request_json']) == {**json.loads(before['request_json']), 'max_cells': 100}
+    assert result['desktop_actions'] == result['unknown_outcomes_retried'] == 0
+
+
+@pytest.mark.parametrize('fault', ['not_explicit', 'changed_rows', 'attempted', 'receipt', 'running', 'blocked'])
+def test_minimum_bound_repair_never_rewrites_attempted_or_changed_query(batch, fault):
+    root, _, plan, path, receipt = batch
+    old = copy.deepcopy(plan['requests'][0]['request']); old['max_cells'] = 12
+    task = add_prior(batch, request=old, state=fault if fault in ('running', 'blocked') else 'pending')
+    if fault in ('attempted', 'receipt'):
+        field = 'attempted_at_utc' if fault == 'attempted' else 'receipt_path'
+        with closing(connect(root)) as con, con:
+            con.execute(f'UPDATE tasks SET {field}=? WHERE task_id=?', ('retained', task))
+    plan['requests'][0]['request']['max_cells'] = 100
+    if fault == 'changed_rows':
+        plan['requests'][0]['request']['max_rows'] = 99
+    atomic_write_json(path, plan)
+    with pytest.raises(ValueError):
+        register_priority_requests(root, path, receipt, repair_pending_bounds=fault != 'not_explicit')
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+        assert con.execute('SELECT request_json FROM tasks').fetchone()[0] == json.dumps(compact_request(old, batch[1]))
+
+
 def test_partial_pending_overlap_does_not_duplicate_provider_work(batch):
     request = copy.deepcopy(batch[2]["requests"][0]["request"])
     request["date_labels"] = ["20111117"]
     add_prior(batch, "pending", request)
     with pytest.raises(ValueError, match="overlaps"):
         submit(batch)
+
+
+def test_pending_scope_identity_preserves_normalized_dates_and_axis_order(batch):
+    request = copy.deepcopy(batch[2]["requests"][0]["request"])
+    request["date_labels"] = ["2011-11-18", "2011-11-17"]
+    task = add_prior(batch, "pending", request)
+    assert submit(batch)["tasks"][0]["task_id"] == task
+
+
+@pytest.mark.parametrize("state", ["complete", "running", "blocked", "pending"])
+def test_wider_native_rectangle_remains_forbidden_without_cell_expansion(batch, monkeypatch, state):
+    from downloader import tej_priority
+    request = copy.deepcopy(batch[2]["requests"][0]["request"])
+    request["company_labels"].append("BB1201112==>BB December")
+    add_prior(batch, state, request)
+    def no_expansion(_):
+        raise AssertionError("registration must not materialize the Cartesian product")
+    monkeypatch.setattr(tej_priority, "query_keys", no_expansion)
+    with pytest.raises(ValueError, match="overlaps"):
+        submit(batch)
+
+
+def test_same_company_disjoint_dates_do_not_repeat_cells(batch):
+    request = copy.deepcopy(batch[2]["requests"][0]["request"])
+    request["date_labels"] = ["20111117"]
+    add_prior(batch, "complete", request)
+    batch[2]["requests"][0]["request"]["date_labels"] = ["20111118"]
+    assert submit(batch)["tasks"][0]["requested_grid_rows"] == 1
 
 
 @pytest.mark.parametrize("change", [

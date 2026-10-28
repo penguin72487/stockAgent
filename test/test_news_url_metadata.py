@@ -67,6 +67,43 @@ def test_submission_never_opens_http_or_mutates_live_queue(queue, monkeypatch):
     assert not queue.db.execute("SELECT 1 FROM sqlite_master WHERE name='url_metadata_jobs'").fetchall()
 
 
+def test_inbox_progress_reports_unexamined_work_and_reuses_validated_counts(queue, monkeypatch):
+    submit(queue, (URL, URL + '2'))
+    submit(queue, (URL,))  # A second request may repeat an already submitted URL.
+    original_load = intake._load
+    calls = []
+    monkeypatch.setattr(intake, '_load', lambda path: calls.append(path) or original_load(path))
+    before = queue.db.total_changes
+    first = queue.status(publish=False)['url_metadata_inbox']
+    assert first == {'contract_version': 1, 'available': True, 'request_files': 2,
+                     'pending_requests': 2, 'targets_unexamined': 3,
+                     'completed_unarchived': 0, 'invalid_or_unreadable': 0}
+    assert queue.db.total_changes == before and len(calls) == 2
+    assert queue.status(publish=False)['url_metadata_inbox'] == first and len(calls) == 2
+    assert consume(queue, limit=1)['processed'] == 1
+    remaining = queue.status(publish=False)['url_metadata_inbox']
+    assert remaining['targets_unexamined'] == 2
+    while intake.has_pending(queue):
+        consume(queue)
+    done = queue.status(publish=False)['url_metadata_inbox']
+    assert done['request_files'] == done['targets_unexamined'] == 0
+
+
+def test_inbox_progress_distinguishes_unreadable_and_completed_unarchived(queue, monkeypatch):
+    first = submit(queue)
+    path = Path(first['pending_path'])
+    assert intake.inbox_progress(queue)['targets_unexamined'] == 1
+    path.chmod(0o644)  # File identity changed; cached validation must not survive it.
+    broken = intake.inbox_progress(queue)
+    assert broken['invalid_or_unreadable'] == 1 and broken['targets_unexamined'] == 0
+    path.chmod(0o600)
+    monkeypatch.setattr(intake, '_archive', lambda *args: (_ for _ in ()).throw(OSError('full')))
+    assert consume(queue)['processed'] == 1
+    archived = intake.inbox_progress(queue)
+    assert archived['completed_unarchived'] == 1 and archived['pending_requests'] == 0
+    assert archived['targets_unexamined'] == 0 and path.exists()
+
+
 def test_resident_registration_is_durable_and_idempotent(queue):
     result = submit(queue, (URL, URL + '#fragment', URL))
     assert result['submitted_urls'] == 1

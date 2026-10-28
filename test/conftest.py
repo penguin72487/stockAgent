@@ -19,6 +19,17 @@ def isolated_node_role(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(node_roles, "training_only_node", test_role)
 
 
+@pytest.fixture(autouse=True)
+def isolated_news_backing(request, monkeypatch):
+    """Synthetic news queues do not inspect the host's real WSL drive.
+
+    Backing-specific tests inject their own WSL flag and probe explicitly.
+    """
+    if request.path.name.startswith('test_news_') or request.path.name == 'test_cnyes_news_bulk.py':
+        from downloader import news_fulltext_disk
+        monkeypatch.setattr(news_fulltext_disk, 'uses_wsl', lambda: False)
+
+
 @pytest.fixture
 def verified_dashboard_calendar(tmp_path, monkeypatch):
     import stockagent.live.tw_day_trade_dashboard as dashboard

@@ -191,7 +191,10 @@ parent process CPU ns 另保留在各 clock 收據；完整 child 包含該 pare
 其子程序，不能再與分段相加。這些是觀測與驗證成本，沒有量出 nvtop 本身
 的 CPU／GPU 額外負載，也不是新的省電或整體加速對照。
 WSL caller endpoint 仍為 `/run/WSL/355255_interop`，實際仍是 socket，relay
-亦存活；本次未重試先前相同的 Windows console／CIM 逾時查詢。
+亦存活；這是 R157 當時的觀測。本次未重試先前相同的 Windows console／CIM
+逾時查詢。R156–R157 均為舊 boot 的歷史樣本；10/25 已確認 boot 改為
+`53672714-6641-443a-bc05-a53a45f82f3f`，舊 PID、endpoint 與板卡讀值不能當作
+新 boot 的目前狀態。
 R156 與第七次 baseline、R157 與最後一次 candidate 同時存在，並保留此條件；
 未修改 R142 capsule、固定輸入或門檻，也沒有 provider／CUDA compute 工作。
 
@@ -205,3 +208,85 @@ R156 與第七次 baseline、R157 與最後一次 candidate 同時存在，並�
 - [同次整卡 NVML 原始讀值](../artifacts/benchmarks/workflow_speed_optimization_20261021/round157/board.json)
 - [nvtop PID 身分、啟動 ticks 與 FD 獨立讀回](../artifacts/operations/gpu_idle_load_20261025/owner_identity_20261024T180159.json)
 - [R157 全命令、完整時鐘與終態](../artifacts/operations/agent-workflow/runs/workflow-r157-visible-gpu-owner--20261024T175512-fd09b9ff/run.json)
+
+## 10/25 新 boot：驗證工作高峰與退出後對照
+
+R171–R172 在新 boot `53672714-6641-443a-bc05-a53a45f82f3f` 重用同一
+canonical audit、16 項既有測試及 fresh reader，沒有初始化 CUDA 或停止 owner。
+04:12:28–30 UTC 整卡為 **14,378／14,241 MiB**，GPU busy 2%／5%，
+41.40／40.27 W。第一份 176 個可見程序中 174 個成功觀察、2 個在盤點時退出，
+unknown 如實保留；第二份完整 **177／177**。兩份均只有
+`stockagent-code-probe-e5dd5f34ddda46a38dff8f80ac1c774d.service`
+的 PID 175240／start ticks 461135 持有兩個 `/dev/dxg` handles。
+
+該 transient owner 當時 active，InvocationID
+`82037988c387443b87a6b0d3e6dbca56`，RuntimeMax 30 分鐘；這是正在執行的
+獨立驗證工作。FD 不等於逐程序 VRAM byte attribution，沒有把整卡用量全部
+歸給此 PID。後續獨立讀回確認該 PID 不存在、原 unit 已收集為 not-found／
+inactive／MainPID 0；不能把收集後的預設 Result 解讀為其驗收結果。
+
+04:15:19–20 UTC 整卡兩次均回到 **3,110 MiB**；兩份完整 **165／165**
+Linux 盤點都沒有 GPU handles，包含 64 個 managed／101 個 unmanaged，
+unknown=0。這是工作自然退出前後的觀察，沒有新增釋放或省電對照；當時
+GPU busy 9%／9%、51.22／51.08 W，不能把記憶體下降描述成已驗證的功耗下降。
+Windows 的剩餘 allocations 尚未逐程序歸屬，這輪沒有 Windows 查詢。
+
+R171 完整 owner **4.109360 秒 wall／1.886563 秒 reaped-child CPU**，
+R172 **1.642398 秒／1.272753 秒**，兩者皆 succeeded／inactive／MainPID 0。
+這些短觀測與 R164 非受控完整驗收同時存在，R169 的固定速度比較仍等 R164
+結束後才開始。
+
+- [R171 新 boot、精確來源與兩份原始輸出](../artifacts/benchmarks/workflow_speed_optimization_20261021/round171/protocol.json)
+- [R171 完整盤點及原樣保留的 unknown](../artifacts/benchmarks/workflow_speed_optimization_20261021/round171/readback.json)
+- [R171 高峰板卡讀值](../artifacts/benchmarks/workflow_speed_optimization_20261021/round171/board.json)
+- [R172 舊 PID／unit 退出後的獨立觀察](../artifacts/benchmarks/workflow_speed_optimization_20261021/round172/previous_owner_observation.json)
+- [R172 兩份 165／165 完整盤點](../artifacts/benchmarks/workflow_speed_optimization_20261021/round172/readback.json)
+- [R172 退出後 3,110 MiB 原始板卡讀值](../artifacts/benchmarks/workflow_speed_optimization_20261021/round172/board.json)
+
+## 10/25 Windows 端點與 WDDM 補查
+
+新 boot 的 caller 明確端點為 `/run/WSL/51931_interop`，device 63／inode 5136。
+R174 原依賴環境繼承，systemd supervisor 沒有該變數，於任何 Windows 呼叫前
+以 `KeyError: WSL_INTEROP` 拒絕；失敗收據保留。R175 改以明確參數傳入同一
+已核對的 socket，parent environment 不變；沒有搜尋、切換或重試其他端點。
+只在 3 秒的 cmd literal 與 5 秒的 PowerShell literal 都成功後，執行一次
+未改的 canonical WDDM audit。
+
+| 完整呼叫 | wall 秒 | Linux reaped-child CPU 秒 |
+| --- | ---: | ---: |
+| cmd literal | 0.100802 | 0.004168 |
+| PowerShell literal | 1.613030 | 0.003455 |
+| canonical CLI（含 NVML 前後與單次 WDDM） | 14.368171 | 1.050612 |
+| R175 owner | 16.207265 | 1.216536 |
+
+原 WDDM query 自身為 12.835198 秒；Windows 的實際 CPU 不包含在 Linux
+reaped-child CPU，分段與完整 owner 亦不能相加。R175 succeeded／inactive／
+MainPID 0，沒有停止應用、修改設定或初始化 CUDA。
+
+04:25:33–46 UTC 整卡為 3,499／3,497 MiB、GPU busy 9%／9%。44 個完整
+Windows process／adapter rows、44 memory counters、5 engine counters，
+unrecognized=0，process identity unavailable=0。較大的 **WDDM dedicated
+counters** 如下；這些計數不是可相加的實際板卡配置：
+
+| Windows 程序 | dedicated counter bytes |
+| --- | ---: |
+| Sunshine.exe | 1,738,514,432 |
+| dwm.exe | 1,222,545,408 |
+| Arknights.exe | 445,272,064 |
+| ChatGPT.exe | 395,927,552 |
+
+Sunshine 同時回報 3D 3%、兩個 VideoEncode engine 6%／5%，桌面與遊戲亦有
+3D 計數；逐引擎計數不能相加成 NVML busy。這些是當時主機活動，不能歸成
+StockAgent 非交易日模型常駐。主機精確 VRAM reconciliation、計數準確度與
+counter／process 原子身分仍未證實。
+
+R176 新程序核對全部 44 個 process／adapter identities、原 source hashes、
+literal stdout bytes、每個 engine／memory 欄位及 canonical receipt SHA；
+**0.216290 秒完整 child／0.141552 秒 CPU**。它驗證已保留的 parsed receipt，
+沒有原 CIM raw payload，故不宣稱原始 CIM 重新解析已通過。沒有新 Windows
+查詢或任何應用控制。
+
+- [R174 監督環境拒絕的原始收據](../artifacts/operations/agent-workflow/runs/workflow-r174-new-boot-interop-g-20261025T042149-74beb019/run.json)
+- [R175 精確端點、兩個 literal gate 及單次 canonical 結果](../artifacts/benchmarks/workflow_speed_optimization_20261021/round175/completion.json)
+- [Windows 44 筆完整 WDDM 與前後板卡讀值](../artifacts/operations/gpu_idle_load_20261025/windows_current_boot_20261025T042532.json)
+- [R176 每列與 provenance 獨立讀回](../artifacts/benchmarks/workflow_speed_optimization_20261021/round176/readback.json)

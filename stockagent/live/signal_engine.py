@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from copy import deepcopy
 from contextlib import nullcontext
 from concurrent.futures import Future
 import hashlib
@@ -37,7 +38,8 @@ from stockagent.config import (
     DAY_TRADE_OPEN_GAP_FEATURE,
     ExperimentConfig,
     external_panel_data_kwargs,
-    load_config,
+    load_config as _load_config_uncached,
+    load_config_cached as _load_config_cached,
 )
 from stockagent.data.panel import (
     PANEL_CACHE_VERSION,
@@ -188,6 +190,14 @@ _LIVE_PUBLICATION_LOCK = threading.Lock()
 
 LIVE_SIGNAL_WEIGHTS_NAME = "live_signal_weights.parquet"
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+def load_config(path, *, source_signatures=None):
+    """Keep the canonical loader ABI for source-bound preopen preparation."""
+    return (_load_config_uncached(path, source_signatures=source_signatures)
+            if source_signatures is not None else _load_config_cached(path))
+
+
 _LIVE_PANEL_CACHE_MAX_ENTRIES = 3
 _LIVE_PANEL_CACHE: OrderedDict[str, PanelData] = OrderedDict()
 _LIVE_PANEL_CACHE_LOCK = threading.Lock()
@@ -215,15 +225,22 @@ _LIVE_MODEL_INPUT_CACHE_MAX_BYTES = 6 * 1024**3
 _LIVE_MODEL_INPUT_CACHE: OrderedDict[
     str, tuple[weakref.ReferenceType[np.ndarray], np.ndarray]
 ] = OrderedDict()
-_LIVE_MODEL_INPUT_CACHE_LOCK = threading.Lock()
+# Normalized windows share the panel single-flight/eviction owner. Separate
+# locks let simultaneous cold callers allocate the same multi-GiB window.
+_LIVE_MODEL_INPUT_CACHE_LOCK = _LIVE_PANEL_CACHE_LOCK
 _LIVE_DENSE_DEVICE_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 _LIVE_DENSE_DEVICE_CACHE_LOCK = threading.Lock()
 _LIVE_DENSE_DEVICE_CACHE_MAX_BYTES = 1024**3
 OPENING_LAST_TRADE_REFERENCE_CONTRACT = "last_real_completed_trade_no_first_print_model_only_v2"
 _LIVE_LAST_TRADE_REFERENCE_CACHE: OrderedDict = OrderedDict()
+_LIVE_SESSION_RULE_SOURCE_CACHE: OrderedDict = OrderedDict()
 _LIVE_ALIGNED_PANEL_CACHE: OrderedDict[
     tuple[int, str], tuple[PanelData, PanelData]
 ] = OrderedDict()
+# Small, immutable expected manifests only. No panel, model, checkpoint or GPU
+# buffer is pinned here. Financial validation still runs for every request.
+_LIVE_CHECKPOINT_MANIFEST_CACHE: OrderedDict[tuple, bytes] = OrderedDict()
+_LIVE_CHECKPOINT_MANIFEST_CACHE_MAX_BYTES = 16 * 1024**2
 _LIVE_FACTORIZED_PANEL_CACHE: OrderedDict[tuple, tuple] = OrderedDict()
 _LIVE_RAW_TAIL_SOURCE_CACHE: Any = None
 _LIVE_RAW_TAIL_SOURCE_CACHE_LOCK = threading.Lock()
@@ -305,13 +322,27 @@ def _live_raw_tail_source_cache():
         return _LIVE_RAW_TAIL_SOURCE_CACHE
 
 
+def live_panel_cache_epoch() -> int:
+    """Return the process-local invalidation generation for warmup receipts.
+
+    This proves only that a global clear has not happened since warmup; it is
+    not a proof that an individual LRU entry or upstream source still exists.
+    """
+    with _LIVE_PANEL_CACHE_LOCK:
+        return _LIVE_PANEL_CACHE_EPOCH
+
+
 def clear_live_panel_memory_cache() -> None:
     global _LIVE_PANEL_CACHE_EPOCH, _LIVE_CUDA_CACHE_RELEASE_PENDING
     from stockagent.data.factorized_panel import FactorizedDateView
     with _LIVE_PANEL_CACHE_LOCK:
         had_factorized_device_inputs = False
-        for panel in _LIVE_FACTORIZED_PANEL_CACHE.values():
-            features = panel.features
+        for entry in _LIVE_FACTORIZED_PANEL_CACHE.values():
+            # Attachment entries retain (base owner, attached view), unlike
+            # the plain panel cache. Idle eviction must retire the attached
+            # packet owner before dropping either reference.
+            panel = entry[1] if isinstance(entry, tuple) and len(entry) == 2 else entry
+            features = getattr(panel, "features", None)
             source = features.source if isinstance(features, FactorizedDateView) else features
             cache = getattr(source, "_cache", None)
             if cache is not None:
@@ -320,6 +351,8 @@ def clear_live_panel_memory_cache() -> None:
         _LIVE_PANEL_CACHE.clear()
         _LIVE_FACTORIZED_PANEL_CACHE.clear()
         _LIVE_ALIGNED_PANEL_CACHE.clear()
+        _LIVE_CHECKPOINT_MANIFEST_CACHE.clear()
+        _LIVE_SESSION_RULE_SOURCE_CACHE.clear()
     with _LIVE_MODEL_INPUT_CACHE_LOCK:
         _LIVE_MODEL_INPUT_CACHE.clear()
         _LIVE_LAST_TRADE_REFERENCE_CACHE.clear()
@@ -340,7 +373,9 @@ def clear_live_inference_memory_cache() -> None:
     """Clear panel, checkpoint, and GPU-model caches after a deployment change."""
 
     global _LIVE_CUDA_CACHE_RELEASE_PENDING
+    from stockagent.config import clear_config_snapshot_cache
 
+    clear_config_snapshot_cache()
     clear_live_panel_memory_cache()
     with _LIVE_CHECKPOINT_CACHE_LOCK:
         _LIVE_CHECKPOINT_CACHE.clear()
@@ -353,7 +388,8 @@ def _live_inference_cpu_cache_retained() -> bool:
     """Inspect existing references only; never allocate a cache or probe CUDA."""
     with _LIVE_PANEL_CACHE_LOCK:
         if (_LIVE_PANEL_CACHE
-                or _LIVE_FACTORIZED_PANEL_CACHE or _LIVE_ALIGNED_PANEL_CACHE):
+                or _LIVE_FACTORIZED_PANEL_CACHE or _LIVE_ALIGNED_PANEL_CACHE
+                or _LIVE_CHECKPOINT_MANIFEST_CACHE):
             return True
     with _LIVE_CHECKPOINT_CACHE_LOCK:
         if _LIVE_CHECKPOINT_CACHE:
@@ -468,6 +504,73 @@ def _cached_aligned_panel(
         max_entries=_LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES,
     )
     return cached[1], hit
+
+
+def _cached_inference_checkpoint_manifest(
+    panel: PanelData,
+    config: ExperimentConfig,
+    *,
+    checkpoint: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    """Reuse complete schema-4 expected semantics, never a validation result.
+
+    The admitted TW/FinancialTransformer builder consumes configuration,
+    ordered symbol/feature axes and process environment, not current quotes or
+    training-array values. Legacy schemas and other products retain the full
+    canonical builder. Hash every consumed axis on each call: object id, TTL
+    and a previous source receipt are not semantic identities. Source leases,
+    feature admission and checkpoint generation checks remain with their
+    existing owners. This cache holds bytes so no caller can mutate a later
+    request's expected contract. The checkpoint is validated again by callers.
+    """
+    from stockagent.live.completed_inference_cache import configuration_identity
+
+    manifest = checkpoint.get("experiment_manifest")
+    admitted = (
+        isinstance(manifest, dict)
+        and type(manifest.get("schema_version")) is int
+        and manifest["schema_version"] == 4
+        and config.trading.execution_mode == "tw_day_trade"
+        and config.training.model_name == "financial_transformer"
+    )
+    if not admitted:
+        return build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint), False
+    # Retain conservative runtime invalidation, excluding only the canonical
+    # quote-transport receipt root: the schema-4 model-scope builder never
+    # consumes prices/receipts. Progressive/offline revisions change this path
+    # without changing expected model semantics. Source/quote admission stays
+    # with its own owner and every checkpoint is still validated below.
+    # Only a digest is retained; environment values never enter telemetry.
+    identity = (
+        configuration_identity(config),
+        tuple(str(value) for value in panel.symbols),
+        tuple(str(value) for value in panel.feature_names),
+        int(panel.num_symbols),
+        tuple(sorted((name, value) for name, value in os.environ.items()
+                     if name != "STOCKAGENT_TW_OPENING_SNAPSHOT_ROOT")),
+    )
+    # Offline comparisons legitimately replace the canonical builder. A weak
+    # callable identity prevents a warm cache from hiding the control/oracle
+    # path, without retaining its closure or permitting recycled object ids.
+    try:
+        builder_identity = weakref.ref(build_inference_checkpoint_manifest)
+        hash(builder_identity)
+    except TypeError:
+        return build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint), False
+    key = (builder_identity, hashlib.sha256(repr(identity).encode("utf-8")).hexdigest())
+
+    def build(_progress):
+        expected = build_inference_checkpoint_manifest(panel, config, checkpoint=checkpoint)
+        encoded = json.dumps(expected, ensure_ascii=False, separators=(",", ":"),
+                             allow_nan=False).encode("utf-8")
+        return encoded, False, "built"
+
+    encoded, hit, _tier = _shared_live_panel_build(
+        key, build, cache=_LIVE_CHECKPOINT_MANIFEST_CACHE,
+        max_entries=_LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES,
+        cache_byte_budget=_LIVE_CHECKPOINT_MANIFEST_CACHE_MAX_BYTES,
+    )
+    return json.loads(encoded), hit
 
 
 def _model_cache_key(
@@ -630,7 +733,8 @@ def _live_panel_disk_backend_key(
 
 
 def _shared_live_panel_build(key, builder, progress_callback=None, *,
-                             cache=None, max_entries=None):
+                             cache=None, max_entries=None, cache_byte_budget=None,
+                             cache_size=len, cache_valid=None):
     """One immutable panel per source/feature revision, not one per requester.
 
     Joiners relay only actual builder milestones, never a periodic heartbeat.
@@ -653,6 +757,9 @@ def _shared_live_panel_build(key, builder, progress_callback=None, *,
 
     with _LIVE_PANEL_CACHE_LOCK:
         cached = cache.get(key)
+        if cached is not None and cache_valid is not None and not cache_valid(cached):
+            cache.pop(key, None)
+            cached = None
         if cached is not None:
             cache.move_to_end(key)
         flight_key = (_LIVE_PANEL_CACHE_EPOCH, id(cache), key)
@@ -690,10 +797,13 @@ def _shared_live_panel_build(key, builder, progress_callback=None, *,
     try:
         result = builder(progress)
         with _LIVE_PANEL_CACHE_LOCK:
-            if flight_key[0] == _LIVE_PANEL_CACHE_EPOCH:
+            if (flight_key[0] == _LIVE_PANEL_CACHE_EPOCH
+                    and (cache_byte_budget is None or cache_size(result[0]) <= cache_byte_budget)):
                 cache[key] = result[0]
                 cache.move_to_end(key)
-                while len(cache) > max_entries:
+                while (len(cache) > max_entries
+                       or (cache_byte_budget is not None
+                           and sum(map(cache_size, cache.values())) > cache_byte_budget)):
                     cache.popitem(last=False)
         flight.future.set_result(result)
         return result
@@ -731,28 +841,29 @@ def _cached_normalized_model_window(
         from stockagent.data.factorized_panel import FactorizedLiveWindow
         return FactorizedLiveWindow(panel.features, int(panel_idx)-int(lookback)+1,
                                     int(panel_idx)+1)
-    with _LIVE_MODEL_INPUT_CACHE_LOCK:
-        epoch = _LIVE_PANEL_CACHE_EPOCH
-        entry = _LIVE_MODEL_INPUT_CACHE.get(key)
-        if entry is not None:
-            source_ref, cached = entry
-        else:
-            source_ref, cached = None, None
-        if (
-            source_ref is not None
-            and source_ref() is panel.features
-            and cached is not None
-            and tuple(cached.shape) == expected_shape
-        ):
-            _LIVE_MODEL_INPUT_CACHE.move_to_end(key)
-            return cached
-        if entry is not None:
-            _LIVE_MODEL_INPUT_CACHE.pop(key, None)
-        previous_entry = _LIVE_MODEL_INPUT_CACHE.get(
-            f"{id(panel.features)}:{int(panel_idx)-1}:{int(lookback)}")
-        previous = (previous_entry[1] if previous_entry is not None
-                    and previous_entry[0]() is panel.features
-                    and tuple(previous_entry[1].shape) == expected_shape else None)
+    def valid(entry):
+        return entry[0]() is panel.features and tuple(entry[1].shape) == expected_shape
+
+    def build(_report):
+        with _LIVE_MODEL_INPUT_CACHE_LOCK:
+            previous_entry = _LIVE_MODEL_INPUT_CACHE.get(
+                f"{id(panel.features)}:{int(panel_idx)-1}:{int(lookback)}")
+            previous = previous_entry[1] if previous_entry is not None and valid(previous_entry) else None
+        value = _normalize_model_window(panel, panel_idx=int(panel_idx), lookback=int(lookback),
+                                        expected_shape=expected_shape, previous=previous)
+        return (weakref.ref(panel.features), value), False, "normalized"
+
+    entry, _hit, _tier = _shared_live_panel_build(
+        key, build, cache=_LIVE_MODEL_INPUT_CACHE,
+        max_entries=_LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES,
+        cache_byte_budget=_LIVE_MODEL_INPUT_CACHE_MAX_BYTES,
+        cache_size=lambda item: item[1].nbytes, cache_valid=valid,
+    )
+    return entry[1]
+
+
+def _normalize_model_window(panel, *, panel_idx, lookback, expected_shape, previous=None):
+    """One privately owned normalization; no source/model/quote identity changes."""
     start = int(panel_idx) - int(lookback) + 1
     if previous is not None and getattr(panel.features, "_stockagent_factorized_features", False):
         # Consecutive historical windows share lookback-1 immutable rows.
@@ -785,15 +896,6 @@ def _cached_normalized_model_window(
         ).astype(np.float32, copy=False)
     value = np.ascontiguousarray(value, dtype=np.float32)
     value.flags.writeable = False
-    with _LIVE_MODEL_INPUT_CACHE_LOCK:
-        if epoch != _LIVE_PANEL_CACHE_EPOCH:
-            return value
-        _LIVE_MODEL_INPUT_CACHE[key] = (weakref.ref(panel.features), value)
-        _LIVE_MODEL_INPUT_CACHE.move_to_end(key)
-        while (len(_LIVE_MODEL_INPUT_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES
-               or sum(entry[1].nbytes for entry in _LIVE_MODEL_INPUT_CACHE.values())
-               > _LIVE_MODEL_INPUT_CACHE_MAX_BYTES):
-            _LIVE_MODEL_INPUT_CACHE.popitem(last=False)
     return value
 
 
@@ -2600,11 +2702,27 @@ def _last_completed_trade_reference(panel: PanelData, panel_idx: int) -> tuple[n
     dates = panel.dates
     sources = (closes, volumes, alive, dates)
     key = (*map(id, sources), int(panel_idx))
-    with _LIVE_MODEL_INPUT_CACHE_LOCK:
-        entry = _LIVE_LAST_TRADE_REFERENCE_CACHE.get(key)
-        if entry is not None and all(ref() is source for ref, source in zip(entry[0], sources)):
-            _LIVE_LAST_TRADE_REFERENCE_CACHE.move_to_end(key)
-            return entry[1]
+    if not all(isinstance(source, np.ndarray) for source in sources):
+        return _compute_last_completed_trade_reference(panel, panel_idx)
+
+    def valid(entry):
+        return (all(ref() is source for ref, source in zip(entry[0], sources))
+                and all(values.shape == (panel.num_symbols,) for values in entry[1]))
+
+    def build(_report):
+        result = _compute_last_completed_trade_reference(panel, panel_idx)
+        return (tuple(weakref.ref(source) for source in sources), result), False, "last_real_trade"
+
+    entry, _hit, _tier = _shared_live_panel_build(
+        key, build, cache=_LIVE_LAST_TRADE_REFERENCE_CACHE,
+        max_entries=_LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES, cache_valid=valid,
+    )
+    return entry[1]
+
+
+def _compute_last_completed_trade_reference(panel, panel_idx):
+    closes, volumes = panel.close_prices, getattr(panel, "daily_volumes", None)
+    alive, dates = getattr(panel, "alive_mask", None), panel.dates
     size = panel.num_symbols
     prices = np.full(size, np.nan, dtype=np.float64)
     trade_dates = np.full(size, np.datetime64("NaT"), dtype="datetime64[D]")
@@ -2626,14 +2744,7 @@ def _last_completed_trade_reference(panel: PanelData, panel_idx: int) -> tuple[n
             trade_dates[selected] = np.datetime64(dates[row], "D")
             pending[selected] = False
     prices.flags.writeable = trade_dates.flags.writeable = False
-    result = (prices, trade_dates)
-    if all(isinstance(source, np.ndarray) for source in sources):
-        with _LIVE_MODEL_INPUT_CACHE_LOCK:
-            _LIVE_LAST_TRADE_REFERENCE_CACHE[key] = (tuple(weakref.ref(source) for source in sources), result)
-            _LIVE_LAST_TRADE_REFERENCE_CACHE.move_to_end(key)
-            while len(_LIVE_LAST_TRADE_REFERENCE_CACHE) > _LIVE_MODEL_INPUT_CACHE_MAX_ENTRIES:
-                _LIVE_LAST_TRADE_REFERENCE_CACHE.popitem(last=False)
-    return result
+    return prices, trade_dates
 
 
 def _day_trade_live_model_window(
@@ -2708,6 +2819,9 @@ def _day_trade_live_model_window(
             index = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
             if getattr(base, "_stockagent_factorized_live_window", False):
                 base = base.with_last_feature(index, gap)
+            elif defer_dense_overlay and not base.flags.writeable and base.flags.c_contiguous:
+                gap.flags.writeable = False
+                base = DenseOpeningWindow(base, index, gap)
             else:
                 base = base.copy()
                 base[-1, :, index] = gap
@@ -2841,27 +2955,62 @@ def _day_trade_live_model_window(
     return window, feature_cutoff, decision_time, True, observed_open
 
 
+def _session_rule_source_identity(rule_root: str, parquet_root: str) -> tuple:
+    paths = [Path(rule_root) / f"{v}_day_trade_eligibility.parquet" for v in ("twse", "tpex")]
+    paths.append(Path(parquet_root) / "symbols.csv")
+    return tuple((s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                 for path in paths for s in [path.stat()])
+
+
+def _session_day_trade_rule_universe(rule_root, parquet_root, session_date, source_identity):
+    """One accepted source generation, independently projected onto each model axis.
+
+    Six ordered checkpoint universes must not scan the same two Parquets six
+    times. The canonical eligibility loader still owns all membership, venue,
+    short-sale and coverage semantics. No TTL, quote or model output is cached.
+    """
+    from stockagent.live.tw_day_trade_simulation import load_live_eligibility, load_symbol_metadata
+
+    key = (rule_root, parquet_root, session_date, source_identity)
+
+    def build(_report):
+        metadata = load_symbol_metadata(Path(parquet_root))
+        rules, coverage = load_live_eligibility(
+            rule_data_dir=Path(rule_root), parquet_root=Path(parquet_root),
+            symbols=tuple(metadata), trading_date=date.fromisoformat(session_date),
+            require_latest=False,
+        )
+        if not all(bool(item.get("covered")) for item in coverage.values()):
+            raise RuntimeError(f"exact-session model eligibility unavailable: {coverage}")
+        if _session_rule_source_identity(rule_root, parquet_root) != source_identity:
+            raise RuntimeError("exact-session eligibility source changed during preparation")
+        return (rules, coverage), False, "session_rule_source"
+
+    entry, _hit, _tier = _shared_live_panel_build(
+        key, build, cache=_LIVE_SESSION_RULE_SOURCE_CACHE, max_entries=8,
+    )
+    if _session_rule_source_identity(rule_root, parquet_root) != source_identity:
+        raise RuntimeError("exact-session eligibility source changed during preparation")
+    return entry
+
+
 @lru_cache(maxsize=16)
 def _cached_session_day_trade_rules(
     rule_root: str,
     parquet_root: str,
     symbols: tuple[str, ...],
     session_date: str,
-    source_identity: tuple[tuple[int, int, int, int], ...],
+    source_identity: tuple[tuple[int, ...], ...],
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     # File identity is part of the key: source acceptance/replacement must
     # invalidate the hot cache. Failures are never cached by lru_cache.
-    from stockagent.live.tw_day_trade_simulation import load_live_eligibility
-
-    rules, coverage = load_live_eligibility(
-        rule_data_dir=Path(rule_root), parquet_root=Path(parquet_root),
-        symbols=symbols, trading_date=date.fromisoformat(session_date),
-        require_latest=False,
+    rules, coverage = _session_day_trade_rule_universe(
+        rule_root, parquet_root, session_date, source_identity,
     )
-    if not all(bool(item.get("covered")) for item in coverage.values()):
-        raise RuntimeError(f"exact-session model eligibility unavailable: {coverage}")
-    eligible = np.asarray([rules[s].covered and rules[s].eligible for s in symbols], dtype=bool)
-    short = np.asarray([rules[s].short_open for s in symbols], dtype=bool)
+    # An unknown symbol keeps the canonical unknown-venue/false policy. It
+    # must not inherit another model's axis or become eligible by position.
+    eligible = np.asarray([s in rules and rules[s].covered and rules[s].eligible for s in symbols], dtype=bool)
+    short = np.asarray([s in rules and rules[s].short_open for s in symbols], dtype=bool)
     return eligible, short, {"source": "official_exact_session", "coverage": coverage}
 
 
@@ -2891,15 +3040,15 @@ def _day_trade_model_eligibility(
     root = resolve_day_trade_rule_data_dir(
         rule_data_dir, parquet_root=Path(parquet_root), repo_root=Path(__file__).resolve().parents[2],
     )
-    paths = [root / f"{v}_day_trade_eligibility.parquet" for v in ("twse", "tpex")]
-    paths.append(Path(parquet_root) / "symbols.csv")
-    identity = tuple((s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-                     for p in paths for s in [p.stat()])
+    identity = _session_rule_source_identity(str(root), str(parquet_root))
     eligible, short, proof = _cached_session_day_trade_rules(
         str(root.resolve()), str(Path(parquet_root).resolve()), tuple(panel.symbols),
         str(session_date)[:10], identity,
     )
-    return eligible.copy(), short.copy(), dict(proof)
+    # An axis-cache hit does not enter the shared builder; fence that path too.
+    if _session_rule_source_identity(str(root), str(parquet_root)) != identity:
+        raise RuntimeError("exact-session eligibility source changed during projection")
+    return eligible.copy(), short.copy(), deepcopy(proof)
 
 
 def _day_trade_same_session_quote_observed_mask(
@@ -2981,6 +3130,23 @@ def _position_portfolio_contribution(weight: float, price_return: float | None) 
     if raw_return is None or position is None:
         return None
     return position * raw_return
+
+
+def _position_returns_for_finite_price(
+    weight: float, price_return: float | None,
+) -> tuple[float | None, float | None]:
+    """Project both position returns from the already-sanitized price column.
+
+    The caller supplies a Python float weight and a finite Python float (or
+    None) from ``_finite_float_column``. Keep the original scalar operations,
+    including signed zero and the small-position rule; this is not a financial
+    reduction or a new missing-price policy.
+    """
+    if price_return is None or not math.isfinite(weight):
+        return None, None
+    stock_return = (0.0 if abs(weight) < 1e-12 else
+                    price_return if weight > 0.0 else -price_return)
+    return stock_return, weight * price_return
 
 
 def _fmt_md_value(value: Any, *, pct: bool = False, digits: int = 4) -> str:
@@ -4116,6 +4282,7 @@ def generate_live_signal(
     from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
 
     signal_started = time.perf_counter()
+    local_request_started = signal_started
     signal_started_wall_utc = datetime.now(timezone.utc)
     telemetry = _timing_sink if _timing_sink is not None else {}
     telemetry["signal_summary"] = {
@@ -4179,6 +4346,7 @@ def generate_live_signal(
             "1" if bool(config.training.inference_backtest_compile) else "0"
         )
 
+    runtime_prepared = time.perf_counter()
     resolved_output_dir = Path(output_dir if output_dir is not None else config.runner.output_dir)
     resolved_fold_id, checkpoint = _resolve_checkpoint(resolved_output_dir, fold_id, checkpoint_path)
     _emit_progress(progress_callback, label=progress_name, step=2, total=progress_total, message=f"checkpoint fold={resolved_fold_id}")
@@ -4202,6 +4370,7 @@ def generate_live_signal(
     completed_checkpoint_identity = (
         file_identity(checkpoint) if use_completed_session_cache else None)
     checkpoint_payload, checkpoint_cache_key, checkpoint_cache_hit = _cached_checkpoint(checkpoint)
+    checkpoint_prepared = time.perf_counter()
     _emit_progress(
         progress_callback,
         label=progress_name,
@@ -4268,7 +4437,8 @@ def generate_live_signal(
             f"checkpoint fold mismatch: path requests {resolved_fold_id}, payload contains {saved_fold_id}"
         )
     checkpoint_contract_started = time.perf_counter()
-    expected_checkpoint_manifest = build_inference_checkpoint_manifest(
+    panel_prepared = checkpoint_contract_started
+    expected_checkpoint_manifest, checkpoint_contract_cache_hit = _cached_inference_checkpoint_manifest(
         panel, config, checkpoint=checkpoint_payload,
     )
     checkpoint_contract_build_ms = (time.perf_counter() - checkpoint_contract_started) * 1000.0
@@ -4280,6 +4450,7 @@ def generate_live_signal(
         scope="model",
     )
     checkpoint_contract_validate_ms = (time.perf_counter() - checkpoint_validation_started) * 1000.0
+    manifest_prepared = time.perf_counter()
     _emit_progress(progress_callback, label=progress_name, step=5, total=progress_total, message="universe aligned")
     symbol_names = load_symbol_name_map(config.data.parquet_root)
     panel_idx, panel_fallback_notice = _resolve_usable_panel_index(panel, panel_date, config.training.lookback)
@@ -4315,6 +4486,15 @@ def generate_live_signal(
         tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
         opening_reference_policy=reference_policy,
     )
+    request_prepared = time.perf_counter()
+    pre_quote_local_prepare_steps = {
+        "configuration_and_runtime": round((runtime_prepared - local_request_started) * 1000, 3),
+        "checkpoint_resolution_and_load": round((checkpoint_prepared - runtime_prepared) * 1000, 3),
+        "panel_source_and_alignment": round((panel_prepared - checkpoint_prepared) * 1000, 3),
+        "checkpoint_contract": round((manifest_prepared - panel_prepared) * 1000, 3),
+        "symbols_calendar_and_quote_request": round((request_prepared - manifest_prepared) * 1000, 3),
+    }
+    partial_latency["pre_quote_local_prepare_steps_ms"] = pre_quote_local_prepare_steps
     quote_prefetched = bool(
         _prefetched_quote is not None
         and _prefetched_quote.request_key == _live_quote_request_key(quote_request)
@@ -4447,7 +4627,8 @@ def generate_live_signal(
             model_observation=normalized_day_trade_observation,
             opening_reference_policy=reference_policy,
             preopen_quote_priority=preopen_quote_priority,
-            defer_dense_overlay=(day_trade_signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+            defer_dense_overlay=((day_trade_signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+                                  or _prepare_progressive_opening_input)
                                  and runtime_device.type == "cuda"),
         )
         opening_window_ready = time.perf_counter()
@@ -4717,8 +4898,36 @@ def generate_live_signal(
         dtype=bool,
     )
     day_trade_policy_proof: dict[str, Any] | None = None
+    preopen_session_rule_preparation: dict[str, Any] | None = None
     day_trade_short_allowed: np.ndarray | None = None
     if execution_mode == "tw_day_trade":
+        if preopen_quote_priority:
+            # The panel preview still uses its completed-session model mask.
+            # Prepare tomorrow/today's independently accepted source generation
+            # now, rather than reading the same large rule Parquets at 09:00.
+            prepared_at = time.perf_counter()
+            _eligible, _short, rule_proof = _day_trade_model_eligibility(
+                panel, session_date=resolved_asof[:10], parquet_root=config.data.parquet_root,
+                rule_data_dir=day_trade_rule_data_dir,
+            )
+            # Read/verify the official membership and this model's intersection
+            # in advance too. Building a request performs no quote acquisition
+            # and does not substitute its mask for the completed-panel preview.
+            prepared_request = _live_quote_request(
+                config=config, panel=panel, panel_idx=panel_idx, execution_mode=execution_mode,
+                observation="session_open", price_source="tw_mis", prices_csv=None,
+                yahoo_chunk_size=yahoo_chunk_size, tw_latest_quote_cache_seconds=0.,
+                tw_latest_quote_force_refresh=False, opening_reference_policy=reference_policy,
+            )
+            prepared_scope = prepared_request.get("tw_trading_universe") or {}
+            preopen_session_rule_preparation = {
+                "contract": "same_session_rules_prepared_without_changing_panel_preview_v1",
+                "session_date": resolved_asof[:10], "symbol_count": panel.num_symbols,
+                "elapsed_ms": round((time.perf_counter() - prepared_at) * 1000., 3),
+                "proof": rule_proof,
+                "official_scope": {key: prepared_scope.get(key) for key in (
+                    "fingerprint", "session_date", "official_trading_count", "model_official_trading_count")},
+            }
         mask_np, day_trade_short_allowed, day_trade_policy_proof = _day_trade_model_eligibility(
             panel, session_date=panel_date_str[:10], parquet_root=config.data.parquet_root,
             rule_data_dir=day_trade_rule_data_dir,
@@ -4915,6 +5124,7 @@ def generate_live_signal(
     inference_latency_ms = (inference_finished - inference_started) * 1000.0
     partial_latency["model_inference_ms"] = round(inference_latency_ms, 3)
     if getattr(x_np, "_stockagent_factorized_live_window", False):
+        x_np.finish_reconstruction_timing()
         partial_latency["factorized_input_transport"] = dict(x_np.transport_stats)
     elif isinstance(x_np, DenseOpeningWindow):
         partial_latency["dense_input_transport"] = dict(x_np.transport_stats)
@@ -5081,6 +5291,9 @@ def generate_live_signal(
         action = classify_rebalance_action(float(current_weights[idx]), float(target_weights[idx]), delta_weight=delta_weight)
         current_weight = float(current_weights[idx])
         raw_price_return = price_return_column[idx]
+        stock_return, portfolio_contribution = _position_returns_for_finite_price(
+            current_weight, raw_price_return,
+        )
         weights_rows.append(
             {
                 "date": resolved_asof,
@@ -5138,8 +5351,8 @@ def generate_live_signal(
                 "model_input_price_is_provisional": bool(day_trade_provisional_reference_mask[idx])
                 if execution_mode == "tw_day_trade" and day_trade_live_session else None,
                 "price_return": raw_price_return,
-                "stock_return": _position_stock_return(current_weight, raw_price_return),
-                "portfolio_contribution": _position_portfolio_contribution(current_weight, raw_price_return),
+                "stock_return": stock_return,
+                "portfolio_contribution": portfolio_contribution,
                 "tradable": bool(mask_np[idx]),
                 "can_buy": bool(can_buy_np[idx]),
                 "can_sell": bool(can_sell_np[idx]),
@@ -5368,6 +5581,7 @@ def generate_live_signal(
             "model_cache_hit": bool(model_cache_hit),
             "completed_forward_cache": completed_forward_cache,
             "alignment_cache_hit": bool(alignment_cache_hit),
+            "checkpoint_contract_cache_hit": bool(checkpoint_contract_cache_hit),
             "checkpoint_contract_build_ms": round(checkpoint_contract_build_ms, 3),
             "checkpoint_contract_validate_ms": round(checkpoint_contract_validate_ms, 3),
             "quote_prefetched_outside_model_lock": quote_prefetched,
@@ -5379,6 +5593,7 @@ def generate_live_signal(
             "quote_fetch_ms": round(float(quote_latency_ms), 3),
             **prepare_clock_summary,
             "post_quote_prepare_steps_ms": local_prepare_steps,
+            "pre_quote_local_prepare_steps_ms": pre_quote_local_prepare_steps,
             "model_inference_ms": round(float(inference_latency_ms), 3),
             "factorized_input_transport": partial_latency.get("factorized_input_transport"),
             "dense_input_transport": partial_latency.get("dense_input_transport"),
@@ -5525,6 +5740,7 @@ def generate_live_signal(
         result._opening_priority_rows = build_priority_rows(panel, panel_idx, weights_rows,
             _last_completed_trade_reference(panel, panel_idx)[1])
         result.summary["preopen_quote_priority_contract"] = "last_known_trade_panel_preview_not_signal_v1"
+        result.summary["preopen_session_rule_preparation"] = preopen_session_rule_preparation
         result.summary["preopen_priority_config_dependencies"] = [
             {"path": str(path.absolute()), "identity": list(signature[1:])}
             for path, signature in priority_config_sources.items()]

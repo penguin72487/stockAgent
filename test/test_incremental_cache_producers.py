@@ -43,6 +43,7 @@ def test_global_receipt_revision_reuses_session_before_parse_or_serialization(tm
     def unexpected(*args, **kwargs):
         raise AssertionError("unchanged historical session must not be rebuilt or serialized")
     monkeypatch.setattr(physical, "_dense_bars", unexpected)
+    monkeypatch.setattr(physical, "_price_limits", unexpected)
     monkeypatch.setattr(reuse_module.PhysicalSessionReuse, "write", unexpected)
     _, second_path, second = _build(panel, public, minute, tmp_path / "cache")
     name = "session-2020-03-02.npz"
@@ -55,6 +56,289 @@ def test_global_receipt_revision_reuses_session_before_parse_or_serialization(tm
     for key in ("mode_counts", "source_gap_symbol_days", "unresolved_action_gap_symbol_days",
                 "internal_unknown_valuation", "official_no_regular_execution"):
         assert first[key] == second[key]
+
+
+@pytest.mark.parametrize("change", ["opens", "volumes", "twse_receipt"])
+def test_unconsumed_price_limit_dependency_reuses_complete_price_payload(tmp_path, monkeypatch, change):
+    panel, public, minute = _physical_source_inputs(tmp_path)
+    cache = tmp_path / "cache"
+    _, _, first = _build(panel, public, minute, cache)
+    price_root, = cache.glob("physical-price-limits-*")
+    before = {path.name: (path.stat().st_ino, path.read_bytes())
+              for path in price_root.iterdir()}
+    if change == "opens":
+        panel.open_prices = panel.open_prices.copy()
+        panel.open_prices[0, 0] += 1.
+    elif change == "volumes":
+        panel.daily_volumes = panel.daily_volumes.copy()
+        panel.daily_volumes[0, 0] += 1.
+    else:
+        import polars as pl
+        path = public / "twse_daily_ohlcv.parquet"
+        pl.read_parquet(path).with_columns(audit_revision=pl.lit(1)).write_parquet(path)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("limits must reuse unchanged consumed inputs")
+
+    monkeypatch.setattr(physical, "_price_limits", unexpected)
+    _, _, current = _build(panel, public, minute, cache)
+    assert current["source_digest"] != first["source_digest"]
+    assert list(cache.glob("physical-price-limits-*")) == [price_root]
+    assert before == {path.name: (path.stat().st_ino, path.read_bytes())
+                      for path in price_root.iterdir()}
+
+
+@pytest.mark.parametrize("change", ["tpex", "corporate", "closes", "dates", "symbols"])
+def test_consumed_price_limit_dependency_rebuilds_and_matches_full_oracle(tmp_path, monkeypatch, change):
+    panel, public, _ = _physical_source_inputs(tmp_path)
+    dates, symbols = panel.dates.copy(), tuple(panel.symbols)
+    closes = np.asarray(panel.close_prices, dtype=np.float64).copy()
+    cache = tmp_path / "cache"
+
+    def build():
+        receipts = {name: {"sha256": physical._sha256(public / filename)}
+                    for name, filename in (
+                        ("tpex_daily", "tpex_daily_ohlcv.parquet"),
+                        ("corporate_reference", "tw_corporate_action_reference.parquet"))}
+        return physical._load_or_build_price_limit_cache(
+            cache_dir=cache, public_root=public, dates=dates, symbols=symbols, closes=closes,
+            input_digest=physical._price_limit_input_digest(
+                receipts=receipts, dates=dates, symbols=symbols, closes=closes))
+
+    original = build()
+    if change in {"tpex", "corporate"}:
+        import polars as pl
+        path = public / ("tpex_daily_ohlcv.parquet" if change == "tpex"
+                         else "tw_corporate_action_reference.parquet")
+        column = "次日漲停價" if change == "tpex" else "reference_price"
+        value = "56.0" if change == "tpex" else 80.
+        pl.read_parquet(path).with_columns(pl.lit(value).alias(column)).write_parquet(path)
+    elif change == "closes":
+        closes[0, 0] += 20.
+    elif change == "dates":
+        dates[-1] += np.timedelta64(1, "D")
+    else:
+        symbols = symbols[::-1]
+        closes = closes[:, ::-1]
+    expected = physical._price_limits(public_root=public, dates=dates, symbols=symbols, closes=closes)
+    calls = []
+    price_limits = physical._price_limits
+
+    def counted(**kwargs):
+        calls.append(True)
+        return price_limits(**kwargs)
+
+    monkeypatch.setattr(physical, "_price_limits", counted)
+    actual = build()
+    assert calls == [True]
+    assert len(list(cache.glob("physical-price-limits-*/READY.json"))) == 2
+    for result, oracle in zip(actual[:3], expected[:3]):
+        assert result.dtype == oracle.dtype and result.shape == oracle.shape
+        assert result.tobytes() == oracle.tobytes()
+    assert actual[3] == expected[3]
+    if change in {"tpex", "corporate", "closes", "symbols"}:
+        assert any(a.tobytes() != b.tobytes() for a, b in zip(original[:3], actual[:3]))
+    build()
+    assert calls == [True]
+
+
+def test_consumed_input_cache_still_rejects_same_size_payload_corruption(tmp_path, monkeypatch):
+    panel, public, minute = _physical_source_inputs(tmp_path)
+    cache = tmp_path / "cache"
+    _build(panel, public, minute, cache)
+    price_root, = cache.glob("physical-price-limits-*")
+    payload = price_root / "upper.npy"
+    expected = payload.read_bytes()
+    payload.write_bytes(expected[:-1] + bytes([expected[-1] ^ 1]))
+    calls = []
+    price_limits = physical._price_limits
+
+    def counted(**kwargs):
+        calls.append(True)
+        return price_limits(**kwargs)
+
+    monkeypatch.setattr(physical, "_price_limits", counted)
+    _build(panel, public, minute, cache)
+    assert calls == [True] and payload.read_bytes() == expected
+
+
+def test_interrupted_build_resumes_verified_sessions_before_global_commit(tmp_path, monkeypatch):
+    panel, public, minute = _physical_source_inputs(tmp_path)
+    _, _, reference = _build(panel, public, minute, tmp_path / "reference")
+    atomic_npy = physical._atomic_npy
+
+    def interrupt(path, *args, **kwargs):
+        if path.name == "source_gaps.npy":
+            raise KeyboardInterrupt("interrupted after the durable session")
+        return atomic_npy(path, *args, **kwargs)
+
+    monkeypatch.setattr(physical, "_atomic_npy", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _build(panel, public, minute, tmp_path / "resume")
+    root = tmp_path / "resume" / ("physical-" + reference["source_digest"])
+    payload = root / "session-2020-03-02.npz"
+    before = payload.read_bytes()
+    inode = payload.stat().st_ino
+    assert not (root / "READY.json").exists()
+    assert not (root / "manifest.json").exists()
+    monkeypatch.setattr(physical, "_atomic_npy", atomic_npy)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("verified interrupted session must not be parsed or serialized again")
+
+    monkeypatch.setattr(physical, "_dense_bars", unexpected)
+    monkeypatch.setattr(reuse_module.PhysicalSessionReuse, "write", unexpected)
+    _, _, resumed = _build(panel, public, minute, tmp_path / "resume")
+    assert payload.read_bytes() == before and payload.stat().st_ino == inode
+    assert resumed["storage_build"]["resumed_input_sessions"] == 1
+    assert resumed["storage_build"]["written_sessions"] == 0
+    for key in ("files", "session_builds", "mode_counts", "source_gap_symbol_days",
+                "unresolved_action_gap_symbol_days", "internal_unknown_valuation"):
+        assert resumed[key] == reference[key]
+    assert (root / "READY.json").is_file()
+
+
+def _interrupted_session_store(tmp_path):
+    current = tmp_path / ("physical-" + "a" * 64)
+    current.mkdir()
+    store = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    path = current / "session-2020-03-02.npz"
+    member = store.write(path, {"values": np.arange(1024)})
+    build = {"input_key": "b" * 64,
+             "diagnostics": reuse_module.session_diagnostics(
+                 np.array([True]), np.array([False]),
+                 {name: int(name == "minute_symbol_days") for name in reuse_module.COUNT_NAMES})}
+    store.checkpoint(path, member, build)
+    return current, path, store, member, build
+
+
+def test_unrelated_generation_change_reuses_interrupted_session_before_parse(tmp_path, monkeypatch):
+    panel, public, minute = _physical_source_inputs(tmp_path)
+    _, _, reference = _build(panel, public, minute, tmp_path / "reference")
+    atomic_npy = physical._atomic_npy
+
+    def interrupt(path, *args, **kwargs):
+        if path.name == "source_gaps.npy":
+            raise KeyboardInterrupt("durable sessions precede the global commit")
+        return atomic_npy(path, *args, **kwargs)
+
+    monkeypatch.setattr(physical, "_atomic_npy", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _build(panel, public, minute, tmp_path / "cache")
+    donor = tmp_path / "cache" / ("physical-" + reference["source_digest"])
+    payload = donor / "session-2020-03-02.npz"
+    before = payload.read_bytes()
+    journal = (donor / ".session-builds.jsonl").read_bytes()
+    _change_receipt_only(minute)
+    monkeypatch.setattr(physical, "_atomic_npy", atomic_npy)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unchanged interrupted input must not be rebuilt after metadata changes")
+
+    monkeypatch.setattr(physical, "_dense_bars", unexpected)
+    monkeypatch.setattr(physical, "_price_limits", unexpected)
+    monkeypatch.setattr(reuse_module.PhysicalSessionReuse, "write", unexpected)
+    _, current, resumed = _build(panel, public, minute, tmp_path / "cache")
+    assert reference["source_digest"] != resumed["source_digest"]
+    assert os.path.samefile(payload, current.parent / payload.name)
+    assert payload.read_bytes() == before
+    assert (donor / ".session-builds.jsonl").read_bytes() == journal
+    assert not (donor / "READY.json").exists() and not (donor / "manifest.json").exists()
+    assert resumed["files"] == reference["files"]
+    assert resumed["session_builds"] == reference["session_builds"]
+    assert resumed["storage_build"]["reused_checkpoint_sessions"] == 1
+    assert resumed["storage_build"]["resumed_input_sessions"] == 0
+    assert resumed["storage_build"]["written_sessions"] == 0
+
+
+@pytest.mark.parametrize("damage", ["journal", "payload", "writable", "input_key", "generation", "symbols", "busy"])
+def test_incomplete_donor_requires_unchanged_proof_payload_input_and_owner(tmp_path, damage):
+    donor, payload, _, _, build = _interrupted_session_store(tmp_path)
+    current = tmp_path / ("physical-" + "d" * 64)
+    current.mkdir()
+    journal = donor / ".session-builds.jsonl"
+    if damage in {"input_key", "generation", "symbols"}:
+        record = json.loads(journal.read_bytes())
+        if damage == "input_key":
+            record["build"]["input_key"] = "c" * 64
+        elif damage == "generation":
+            record["source_digest"] = "c" * 64
+        else:
+            record["symbols"] = 2
+        journal.write_text(json.dumps(record) + "\n")
+    store = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    if damage == "journal":
+        with journal.open("ab") as stream:
+            stream.write(b"\n")
+    elif damage in {"payload", "writable"}:
+        payload.chmod(0o600)
+        if damage == "payload":
+            raw = payload.read_bytes()
+            payload.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+            payload.chmod(0o400)
+    destination = current / payload.name
+    if damage == "busy":
+        with reuse_module._writer_lock(tmp_path / f".{donor.name}.lock"):
+            assert store.reuse_input(build["input_key"], destination) is None
+    else:
+        assert store.reuse_input(build["input_key"], destination) is None
+    assert not destination.exists()
+    assert not (donor / "READY.json").exists()
+
+
+def test_checkpoint_truncated_tail_does_not_lose_completed_records_or_future_append(tmp_path):
+    current, path, _, member, build = _interrupted_session_store(tmp_path)
+    journal = current / ".session-builds.jsonl"
+    with journal.open("ab") as stream:
+        stream.write(b'{"contract":')
+    resumed = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    assert resumed.reuse_input(build["input_key"], path)["file"] == member
+    other = current / "session-2020-03-03.npz"
+    other_member = resumed.write(other, {"values": np.arange(1024) + 1})
+    other_build = {**build, "input_key": "c" * 64}
+    resumed.checkpoint(other, other_member, other_build)
+    again = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    assert again.reuse_input(build["input_key"], path)["file"] == member
+    assert again.reuse_input(other_build["input_key"], other)["file"] == other_member
+    assert not (current / "READY.json").exists()
+
+
+@pytest.mark.parametrize("damage", ["payload", "writable", "key", "diagnostics", "generation"])
+def test_interrupted_session_proof_rejects_changed_dependencies_or_payload(tmp_path, damage):
+    current, path, _, _, build = _interrupted_session_store(tmp_path)
+    if damage in {"payload", "writable"}:
+        path.chmod(0o600)
+        if damage == "payload":
+            raw = path.read_bytes()
+            path.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+            path.chmod(0o400)
+    else:
+        journal = current / ".session-builds.jsonl"
+        record = json.loads(journal.read_text().strip())
+        if damage == "key":
+            record["build"]["input_key"] = "d" * 64
+        elif damage == "diagnostics":
+            record["build"]["diagnostics"]["gaps"] = "ff"
+        else:
+            record["source_digest"] = "f" * 64
+        journal.write_text(json.dumps(record) + "\n")
+    resumed = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    assert resumed.reuse_input(build["input_key"], path) is None
+
+
+def test_checkpoint_symlink_never_reads_or_overwrites_other_owner(tmp_path):
+    current, path, _, member, build = _interrupted_session_store(tmp_path)
+    journal = current / ".session-builds.jsonl"
+    foreign = tmp_path / "another-owner"
+    foreign.write_bytes(journal.read_bytes())
+    journal.unlink()
+    journal.symlink_to(foreign)
+    before = foreign.read_bytes()
+    resumed = reuse_module.PhysicalSessionReuse(tmp_path, current, 1)
+    assert resumed.reuse_input(build["input_key"], path) is None
+    with pytest.raises((ValueError, OSError)):
+        resumed.checkpoint(path, member, build)
+    assert foreign.read_bytes() == before
 
 
 def test_append_day_builds_only_new_session_and_keeps_exact_historical_payload(tmp_path, monkeypatch):

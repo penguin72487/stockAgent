@@ -70,6 +70,117 @@ def test_underfilled_cadence_measures_slots_then_rolls_back_plateau(config, tmp_
         http.close()
 
 
+def _bulk_304_window(*, requests, unchanged, ended=10000, interval=1, slots=1):
+    return {'healthy': True, 'ended_at_epoch': ended, 'wall_seconds': 10,
+            'workload_family': 'cnyes_bulk', 'requests': requests, 'responses': requests,
+            'http_status_counts': {'200': requests - unchanged, '304': unchanged},
+            'endpoint_completed_request_counts': {'cnyes_headline': requests},
+            'interval_seconds': interval, 'parallelism': slots,
+            'new_heads_per_second': 8, 'comparable_new_heads_per_second': 8}
+
+
+def test_304_opportunity_guard_bounds_non_family_responses():
+    from downloader.news_fulltext_capacity import _not_modified_opportunity_mismatch
+
+    best = _bulk_304_window(requests=91, unchanged=2)
+    recent = _bulk_304_window(requests=45, unchanged=35)
+    assert _not_modified_opportunity_mismatch(best, recent, 'cnyes_bulk')
+    # Give every possible non-family 304 to the other workload: even then
+    # the example still proves the dominant workload received fewer chances.
+    mixed = deepcopy(recent)
+    mixed['endpoint_completed_request_counts'] = {'cnyes_headline': 36, 'article_html': 9}
+    assert _not_modified_opportunity_mismatch(best, mixed, 'cnyes_bulk')
+    unclear = deepcopy(recent)
+    unclear['endpoint_completed_request_counts'] = {'cnyes_headline': 20, 'article_html': 25}
+    assert not _not_modified_opportunity_mismatch(best, unclear, 'cnyes_bulk')
+    same = _bulk_304_window(requests=45, unchanged=1)
+    assert not _not_modified_opportunity_mismatch(best, same, 'cnyes_bulk')
+    for patch in ({'responses': 44}, {'http_status_counts': {'304': 90}},
+                  {'endpoint_completed_request_counts': {}}, {'workload_family': 'article_html'}):
+        assert not _not_modified_opportunity_mismatch(best, {**recent, **patch}, 'cnyes_bulk')
+
+
+def test_unchanged_rolling_pages_do_not_prove_an_acquisition_plateau(config, tmp_path):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=1, maximum=3)
+    try:
+        best = _bulk_304_window(requests=91, unchanged=2, interval=1, slots=1)
+        state = controller.states['publisher']
+        state.update(best=deepcopy(best), best_by_workload={'cnyes_bulk': deepcopy(best)},
+                     workload_family='cnyes_bulk', plateaus=1)
+        controller._set('publisher', 1 / 30, 3, 'ramping', 'test')
+        counts = {'http_requests_started': 45, 'http_responses_received': 45,
+                  'http_terminal_requests': 45, 'http_terminal_responses': 45,
+                  'http_status_200': 10, 'http_status_304': 35,
+                  'http_terminal_status_200': 10, 'http_terminal_status_304': 35,
+                  'endpoint_cnyes_headline_requests': 45,
+                  'http_endpoint_cnyes_headline_terminal_requests': 45,
+                  'durably_accepted_new_url_heads': 4, 'durably_accepted_versions': 45,
+                  'durable_workload_cnyes_bulk_new_heads': 4}
+        for key, value in counts.items():
+            http.metrics.count('publisher', key, value)
+        clock.value += 10
+        controller.tick(force=True)
+        assert (state['state'], state['interval_seconds'], state['parallelism'], state['plateaus']) == (
+            'insufficient_useful_data', 1 / 30, 3, 0)
+        assert state['last_window']['http_status_counts']['304'] == 35
+        assert state['reason'].startswith('known 304 opportunity mismatch')
+        assert controller.snapshot()['not_modified_comparability_contract_version'] == 1
+        # A source refusal still wins over the comparability guard.
+        http.provider_not_before['publisher'] = clock.value + 900
+        http.metrics.count('publisher', 'http_status_429')
+        clock.value += 1
+        controller.tick(force=True)
+        assert state['state'] == 'waiting_source' and state['reason'] == 'http_429'
+    finally:
+        http.close()
+
+
+def test_restart_clears_only_proven_mismatched_plateau_hold(config, tmp_path):
+    http, controller, clock = controller_fixture(config, tmp_path, slots=1, maximum=3)
+    try:
+        from downloader.news_fulltext_capacity import _PLATEAU_HOLD_REASON
+
+        best = _bulk_304_window(requests=91, unchanged=2, ended=clock.value - 60)
+        recent = _bulk_304_window(requests=45, unchanged=35, ended=clock.value - 1,
+                                  interval=1 / 30, slots=3)
+        state = controller.states['publisher']
+        state.update(interval_seconds=1, parallelism=1, state='verifying', reason=_PLATEAU_HOLD_REASON,
+                     next_search_epoch=recent['ended_at_epoch'] + controller.policy['recheck_seconds'],
+                     best=deepcopy(best), best_by_workload={'cnyes_bulk': deepcopy(best)},
+                     history=[deepcopy(best), deepcopy(recent)], plateaus=2, stable_samples=1)
+        atomic_write_json(tmp_path / 'rate_calibration.json', controller.snapshot())
+        resumed = PublisherCapacity(http, config, clock=clock, epoch=clock)
+        restored = resumed.states['publisher']
+        assert (restored['state'], restored['interval_seconds'], restored['parallelism']) == (
+            'insufficient_useful_data', 1, 1)
+        assert restored['next_search_epoch'] == 0 and restored['plateaus'] == 0
+        assert restored['history'] == [best, recent]
+        assert resumed.provider_fingerprints == controller.provider_fingerprints
+        # Unverified evidence and non-plateau/source-refusal holds stay intact.
+        invalid = deepcopy(state)
+        invalid['history'][-1]['http_status_counts'] = {'304': 99}
+        from downloader.news_fulltext_capacity import _release_mismatched_plateau_hold
+        assert not _release_mismatched_plateau_hold(invalid, controller.policy)
+        invalid = deepcopy(state)
+        invalid['reason'] = 'http_access_refusal'
+        assert not _release_mismatched_plateau_hold(invalid, controller.policy)
+        stable = deepcopy(state)
+        stable.update(state='stable_pipeline_capacity',
+                      reason='repeated healthy full-pipeline windows; source maximum not established')
+        assert _release_mismatched_plateau_hold(stable, controller.policy)
+        idle = deepcopy(state)
+        idle.update(state='insufficient_useful_data',
+                    reason='no new durable versions; no higher-rate proof')
+        assert _release_mismatched_plateau_hold(idle, controller.policy)
+        refused = deepcopy(state)
+        refused.update(state='stable_pipeline_capacity',
+                       reason='repeated healthy full-pipeline windows; source maximum not established',
+                       refused_interval_seconds=0.1)
+        assert not _release_mismatched_plateau_hold(refused, controller.policy)
+    finally:
+        http.close()
+
+
 def test_robots_floor_is_not_undone_by_capacity_or_refresh(config, tmp_path):
     http, controller, clock = controller_fixture(config, tmp_path)
     try:

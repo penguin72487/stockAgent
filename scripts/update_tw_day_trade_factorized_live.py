@@ -18,6 +18,21 @@ from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--phase", choices=("preopen", "completed"), required=True)
+    parser.add_argument("--attempts", type=int, default=2)
+    parser.add_argument("--source-wait-seconds", type=float, default=600.0)
+    args = parser.parse_args()
+    if not 1 <= args.attempts <= 4:
+        raise ValueError("attempts must be between one and four")
+    if not 0 <= args.source_wait_seconds <= 1800:
+        raise ValueError("source wait must be between zero and 1800 seconds")
+    return args
+
+
 if __name__ == "__main__":
     from stockagent.data.source_processing_runtime import configure_cpu_source_runtime
     source_profile = configure_cpu_source_runtime()
@@ -25,6 +40,9 @@ if __name__ == "__main__":
     # Set the observed benchmark's scoped profile before the source owner runs.
     import pyarrow as pa
     pa.set_cpu_count(source_profile["effective_threads"])
+    # CLI help/invalid arguments must finish without importing the full
+    # preparation graph (including train/torch), much less launching an owner.
+    _entry_args = _parse_args()
 from scripts.prepare_tw_day_trade_factorized_live import prepare, _next_projection_session
 from downloader.artifact_io import atomic_write_json
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
@@ -219,16 +237,8 @@ def _projection_start_date(config_path: Path, parent_path: Path) -> str:
     return start.isoformat()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", choices=("preopen", "completed"), required=True)
-    parser.add_argument("--attempts", type=int, default=2)
-    parser.add_argument("--source-wait-seconds", type=float, default=600.0)
-    args = parser.parse_args()
-    if not 1 <= args.attempts <= 4:
-        raise ValueError("attempts must be between one and four")
-    if not 0 <= args.source_wait_seconds <= 1800:
-        raise ValueError("source wait must be between zero and 1800 seconds")
+def main(args: argparse.Namespace | None = None):
+    args = args if args is not None else _parse_args()
     config_path = ROOT / "configs/deployments/tw_day_trade_factorized_scale_separated_cash_fold11_candidate_v1.yaml"
     parent_path = ROOT / "artifacts/data_preparation/tw_factorized_fold11_live_parent_20261013/factorized_manifest.json"
     start_date = _projection_start_date(config_path, parent_path)
@@ -266,4 +276,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(_entry_args)

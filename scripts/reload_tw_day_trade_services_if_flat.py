@@ -45,7 +45,8 @@ PROTECTED_SERVICES = (
 
 
 def read_object(path):
-    value = json.loads(path.read_bytes())
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    value = read_paper_state(path)
     if not isinstance(value, dict):
         raise ValueError(f"object receipt required: {path.name}")
     return value
@@ -151,6 +152,36 @@ def terminal_entry_price_rejection(order, mode, *, now):
         return False
 
 
+def terminal_exit_priority_cancellation(order, mode, *, market, symbol, now):
+    """Recognize the engine's settled, cancelled entry without erasing it.
+
+    This status retains its unfilled quantity as audit evidence.  It is not an
+    active order once the same signal/session is flat and the engine has
+    recorded its closing settlement.  Unknown cancellations still block.
+    """
+    if not isinstance(order, dict) or order.get("status") != "cancelled_exit_priority":
+        return False
+    template = order.get("position")
+    remaining = order.get("remaining_shares")
+    if (not isinstance(template, dict) or type(remaining) is not int or remaining < 0
+            or type(order.get("sizing_pending")) is not bool
+            or type(mode.get("pending_entry_shares")) is not int
+            or mode["pending_entry_shares"] != 0
+            or mode.get("engine_status") != "session_flat_after_exit"
+            or template.get("market") != market or template.get("symbol") != symbol
+            or not mode.get("signal_id") or template.get("signal_id") != mode["signal_id"]
+            or not mode.get("session_date") or template.get("session_date") != mode["session_date"]):
+        return False
+    try:
+        settled = datetime.fromisoformat(str(mode.get("closing_auction_settled_at")))
+        local_settled = settled.astimezone(TAIPEI)
+        return (settled.tzinfo is not None and settled <= now
+                and local_settled.date().isoformat() == mode["session_date"]
+                and local_settled.time().replace(tzinfo=None) >= wall_time(13, 30))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
                 code_admission_only=False):
     """Fail closed for unknown/malformed state; do not equate it to flat/idle."""
@@ -185,7 +216,13 @@ def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
     if opening.get("scheduled_delivery_pending") is not False or opening.get("input_stages"):
         raise ValueError("opening inputs/delivery still pending")
     idle_warmup = {"ready", "disabled", "pending"} if discord_only else {"ready", "disabled"}
-    if ((bot.get("startup_inference_warmup") or {}).get("status") not in idle_warmup
+    warmup = bot.get("startup_inference_warmup") or {}
+    # An engine-only cutover preserves this exact idle Discord owner. Its
+    # scheduled cold preparation is not engine work or GPU readiness. Running,
+    # unknown and different-run warmup still block; joint reload keeps its gate.
+    unchanged_cold_bot = bool(engine_only and warmup.get("status") == "pending"
+                              and warmup.get("run_id") == bot["run_id"])
+    if (warmup.get("status") not in idle_warmup and not unchanged_cold_bot
             and not (code_admission_only and code_drift_warmup(bot, enabled))):
         raise ValueError("startup inference warmup is not idle/ready")
     clock = now.astimezone(TAIPEI).time().replace(tzinfo=None)
@@ -207,7 +244,7 @@ def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
             orders = mode.get(field, {})
             if not isinstance(orders, dict):
                 raise ValueError(f"malformed pending orders: {market}")
-            for order in orders.values():
+            for symbol, order in orders.items():
                 # The canonical engine retains filled entries for recovery.
                 # Do not delete them or confuse container length with work.
                 # Explicit completed fills and proven TP/SL rejections are
@@ -218,6 +255,10 @@ def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
                         and order.get("sizing_pending") is False):
                     terminal += 1
                 elif field == "pending_entry_orders" and terminal_entry_price_rejection(order, mode, now=now):
+                    terminal += 1
+                elif (field == "pending_entry_orders"
+                      and terminal_exit_priority_cancellation(order, mode, market=market,
+                                                              symbol=symbol, now=now)):
                     terminal += 1
                 else:
                     pending += 1
@@ -312,6 +353,8 @@ def main() -> int:
                         help="Discord only: accept fresh loaded code/ACK, NOT GPU warmup readiness")
     parser.add_argument("--source-release", type=Path,
                         help="Discord code-only admission: pin this verified read-only source namespace")
+    parser.add_argument("--engine-source-release", type=Path,
+                        help="Engine-only off-session flat reload: pin this verified source; never changes the Discord pin")
     parser.add_argument("--output", type=Path, default=RECEIPT_PATH)
     parser.add_argument("--timeout-seconds", type=float, default=240)
     parser.add_argument("--control-wait-seconds", type=float, default=0,
@@ -321,6 +364,8 @@ def main() -> int:
         parser.error("--code-admission-only requires --discord-only")
     if args.source_release and not (args.discord_only and args.code_admission_only):
         parser.error("--source-release requires --discord-only --code-admission-only")
+    if args.engine_source_release and not args.engine_only:
+        parser.error("--engine-source-release requires --engine-only")
     if not 1 <= args.timeout_seconds <= 600:
         parser.error("timeout-seconds must be between 1 and 600")
     if not 0 <= args.control_wait_seconds <= 120:
@@ -331,10 +376,11 @@ def main() -> int:
     try:
         with control_lease(owner="qualified-paper-service-reload", timeout_seconds=args.control_wait_seconds):
             receipt["control_wait_ms"] = (time.perf_counter() - control_started) * 1000
+            state = read_object(STATE_PATH)
             sync, bot, ack = read_fresh_ack_pair()
             if ack.get("matched") is not True:
                 raise ValueError("native owner pair is not coherently acknowledged")
-            plan = reload_plan(read_object(STATE_PATH), bot, sync,
+            plan = reload_plan(state, bot, sync,
                                now=datetime.now(TAIPEI), discord_only=args.discord_only,
                                engine_only=args.engine_only, code_admission_only=args.code_admission_only)
             protected = tuple(name for name in (SERVICES[0], *PROTECTED_SERVICES)
@@ -346,6 +392,7 @@ def main() -> int:
             from stockagent.live.service_code_release import (
                 configured_release, verify_frozen_source, namespace_identity,
                 frozen_generation, install_drop_in, verify_owner_namespace, DROP_IN,
+                ENGINE_DROP_IN, native_owner_pid,
             )
             # An engine-only reload also compares the unchanged Discord owner
             # against its pinned source, never against development workspace.
@@ -353,6 +400,13 @@ def main() -> int:
             if release_path is not None:
                 release_path = release_path.absolute()
                 receipt["source_release"] = verify_frozen_source(release_path, REPO_ROOT)
+            engine_release = (None if args.discord_only else
+                              args.engine_source_release or configured_release(REPO_ROOT, role="engine"))
+            if engine_release is not None:
+                engine_release = engine_release.absolute()
+                receipt["engine_source_release"] = verify_frozen_source(engine_release, REPO_ROOT)
+                if not args.engine_only:
+                    raise ValueError("pinned engine reload requires the independent --engine-only workflow")
             if args.apply:
                 selected_before = {name: owner(name) for name in plan["services"]}
                 from scripts.audit_tw_day_trade_restart import inventory, prefix_sha256, verify_prefix
@@ -372,9 +426,18 @@ def main() -> int:
                     def code_unchanged():
                         return (implementation_identity() == code
                                 and file_identity(REPO_ROOT / "services/discord_bot/bot.py") == entrypoint)
-                engine_code = [file_identity(REPO_ROOT / name) for name in (
-                    "scripts/run_tw_day_trade_simulation.py", "stockagent/live/quote_provider.py",
-                    "stockagent/live/tw_day_trade_simulation.py")]
+                if engine_release is not None:
+                    engine_namespace = namespace_identity(engine_release, REPO_ROOT, role="engine")
+                    engine_code = engine_namespace["engine_code"]
+                    engine_generation = frozen_generation(engine_release)
+                else:
+                    engine_code = [file_identity(REPO_ROOT / name) for name in (
+                        "scripts/run_tw_day_trade_simulation.py", "stockagent/live/quote_provider.py",
+                        "stockagent/live/tw_day_trade_simulation.py")]
+                def engine_code_unchanged():
+                    if engine_release is not None:
+                        return frozen_generation(engine_release) == engine_generation
+                    return all(file_identity(row["path"]) == row for row in engine_code)
                 expected_code = identity_digest({"code": code})
                 source_admission_required = not (
                     args.discord_only and args.code_admission_only and release_path is not None)
@@ -392,14 +455,17 @@ def main() -> int:
                     # Reject an active source writer before reading large
                     # ledger prefixes. Keep the canonical control -> source
                     # lock order and all independent post-reload readbacks.
+                    from stockagent.live.paper_journal import FILENAMES
+                    journals = FILENAMES if engine_release is not None else ("events.jsonl", "orders.jsonl", "fills.jsonl")
                     inputs = {name: {"size_bytes": (STATE_PATH.parent / name).stat().st_size}
-                              for name in ("events.jsonl", "orders.jsonl", "fills.jsonl")}
+                              for name in journals}
                     for name, value in inputs.items():
                         value["sha256"] = prefix_sha256(STATE_PATH.parent / name, value["size_bytes"])
+                    current_state = read_object(STATE_PATH)
                     current_sync, current_bot, ack = read_fresh_ack_pair()
                     if ack.get("matched") is not True:
                         raise ValueError("native owner pair changed before reload")
-                    plan = reload_plan(read_object(STATE_PATH), current_bot, current_sync,
+                    plan = reload_plan(current_state, current_bot, current_sync,
                                        now=datetime.now(TAIPEI), discord_only=args.discord_only,
                                        engine_only=args.engine_only, code_admission_only=args.code_admission_only)
                     if (code_drift_warmup(current_bot, plan["signal_ids"])
@@ -413,7 +479,7 @@ def main() -> int:
                         raise ValueError("unchanged Discord code admission differs; engine-only reload cannot adopt it")
                     before_inventory = inventory(read_object(STATE_PATH))
                     if (not code_unchanged()
-                            or any(file_identity(row["path"]) != row for row in engine_code)
+                            or not engine_code_unchanged()
                             or before != {name: owner(name) for name in protected}
                             or selected_before != {name: owner(name) for name in plan["services"]}):
                         raise RuntimeError("qualified code or owner changed before reload")
@@ -427,6 +493,12 @@ def main() -> int:
                         atomic_write_json(args.output, receipt)
                         receipt["parsed_unit_code_configuration"] = install_drop_in(release_path, REPO_ROOT)
                         receipt["code_drop_in_installed"] = True
+                    if engine_release is not None:
+                        receipt["previous_engine_code_drop_in"] = ENGINE_DROP_IN.read_text() if ENGINE_DROP_IN.exists() else None
+                        atomic_write_json(args.output, receipt)
+                        receipt["parsed_engine_unit_code_configuration"] = install_drop_in(
+                            engine_release, REPO_ROOT, role="engine")
+                        receipt["engine_code_drop_in_installed"] = True
                     receipt["restart_requested"] = True
                     atomic_write_json(args.output, receipt)
                     for service in plan["services"]:
@@ -437,7 +509,7 @@ def main() -> int:
                     # generation. Report the race immediately, retain this
                     # invocation and never enter an automatic restart loop.
                     if (not code_unchanged()
-                            or any(file_identity(row["path"]) != row for row in engine_code)):
+                            or not engine_code_unchanged()):
                         raise RuntimeError("qualified code changed during startup; wait for a stable generation before retrying reload")
                     try:
                         sync, bot, ack = read_service_ack_pair(SYNC_PATH, BOT_STATUS, timeout_seconds=1.)
@@ -458,7 +530,7 @@ def main() -> int:
                     time.sleep(.5)
                 after = {name: owner(name) for name in protected}
                 if (before != after or not code_unchanged()
-                        or any(file_identity(row["path"]) != row for row in engine_code)):
+                        or not engine_code_unchanged()):
                     raise RuntimeError("protected owner or qualified code changed during reload")
                 selected_after = {name: owner(name) for name in plan["services"]}
                 if any(value.get("ActiveState") != "active" or value.get("MainPID") in {None, "0"}
@@ -470,23 +542,27 @@ def main() -> int:
                 # Prefix verification may legitimately outlive heartbeat TTL.
                 # Re-observe the original coherent pair; never re-date the old
                 # snapshot or restart again just because readback was slow.
-                sync, bot, ack = read_service_ack_pair(SYNC_PATH, BOT_STATUS, timeout_seconds=5.)
+                sync, bot, ack = read_fresh_ack_pair()
                 if (ack.get("matched") is not True or not native_ready(
                         bot, sync, plan, now=datetime.now(TAIPEI), expected_code=expected_code,
                         expected_entrypoint=entrypoint["sha256"])
                         or selected_after != {name: owner(name) for name in plan["services"]}
                         or before != {name: owner(name) for name in protected}
                         or not code_unchanged()
-                        or any(file_identity(row["path"]) != row for row in engine_code)):
+                        or not engine_code_unchanged()):
                     raise RuntimeError("native readiness, code or owner changed during final readback")
                 if not args.discord_only and inventory(read_object(STATE_PATH)) != before_inventory:
                     raise RuntimeError("engine reload changed persisted inventory, signals or accounting")
                 if release_path is not None:
                     receipt["native_code_namespace"] = verify_owner_namespace(
                         release_path, REPO_ROOT, int(bot["run_id"].split("-", 1)[0]))
+                if engine_release is not None:
+                    receipt["native_engine_code_namespace"] = verify_owner_namespace(
+                        engine_release, REPO_ROOT, native_owner_pid(REPO_ROOT, role="engine"), role="engine")
                 receipt.update(status="accepted_code_admission_only" if args.code_admission_only else "accepted",
                                acceptance_scope="loaded_code_gateway_ack_not_gpu_readiness"
-                               if args.code_admission_only else "native_warmup_code_gateway_ack",
+                               if args.code_admission_only else "engine_restart_inventory_code_gateway_ack_not_gpu_readiness"
+                               if args.engine_only else "native_warmup_code_gateway_ack",
                                # Evidence describes the requested check, not a
                                # second liveness check on snapshots retained
                                # across potentially slow prefix verification.

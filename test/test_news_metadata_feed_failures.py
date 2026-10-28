@@ -4,11 +4,12 @@ from datetime import datetime, timedelta, timezone
 import json
 import sqlite3
 import threading
+import time
 
 import pytest
 
 from downloader import news_fulltext_metadata_feeds as feeds
-from downloader.news_fulltext import accept_discovery, fail_discovery, run_cycle
+from downloader.news_fulltext import accept_discovery, fail_discovery, fetch_discovery, run_cycle
 from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_policy import NewsError
 from test_news_metadata_feed_scope import config, setup, task, xml
@@ -180,6 +181,108 @@ def test_normal_worker_only_existing_requests_queue_writer_and_zero_bodies(confi
         assert not (tmp_path/'metadata_feeds').exists()
     finally:
         http.close();q.close()
+
+
+def test_deferred_feed_resumes_after_real_gate_without_false_failure_observation(config, tmp_path):
+    url = feeds.LTN_FEEDS[0]
+    routes = {'https://news.ltn.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              url: FakeResponse(xml(), headers={'Content-Type': 'application/rss+xml'})}
+    q, http, session = setup(config, tmp_path, routes)
+    try:
+        with q.db:
+            q.db.execute("UPDATE discovery SET attempts=5,last_checked_at_utc='2026-01-01T00:00:00+00:00' "
+                         "WHERE url=?", (url,))
+        original = task(q)
+        http.defer('ltn', .3)
+        with pytest.raises(NewsError) as caught:
+            fetch_discovery(http, original)
+        assert caught.value.code == 'provider_cooldown' and caught.value.request_deferred
+        assert not session.calls
+        fail_discovery(q, original, caught.value)
+        deferred = task(q)
+        assert deferred['attempts'] == 5
+        assert deferred['last_checked_at_utc'] == original['last_checked_at_utc']
+        assert not observations(q)
+        remaining = max(0, deferred['due'] - time.time())
+        time.sleep(remaining + .02)
+        assert deferred['due'] <= time.time()
+        result = fetch_discovery(http, task(q))
+        assert accept_discovery(q, task(q), *result) == 0
+        completed = task(q)
+        assert completed['attempts'] == 0 and completed['error_code'] is None
+        assert completed['last_checked_at_utc'] > original['last_checked_at_utc']
+        assert [call[0] for call in session.calls] == ['https://news.ltn.com.tw/robots.txt', url]
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 1
+        assert q.db.execute('SELECT count(*) FROM articles WHERE body_sha256 IS NOT NULL').fetchone()[0] == 0
+    finally:
+        http.close(); q.close()
+
+
+def test_owner_cycle_recovers_from_a_gate_opened_after_dispatch(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as news
+
+    url = feeds.LTN_FEEDS[0]
+    config['providers'][0]['metadata_feed_policy']['urls'] = [url]
+    routes = {'https://news.ltn.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              url: FakeResponse(xml(), headers={'Content-Type': 'application/rss+xml'})}
+    q, http, session = setup(config, tmp_path, routes)
+    original_fetch = news.fetch_discovery
+    calls = []
+    def racing_gate(client, current):
+        calls.append(current['url'])
+        if len(calls) == 1:
+            client.defer('ltn', .3)
+        return original_fetch(client, current)
+    monkeypatch.setattr(news, 'fetch_discovery', racing_gate)
+    try:
+        with q.db:
+            q.db.execute('UPDATE discovery SET attempts=5 WHERE url=?', (url,))
+        run_cycle(q, http, config, max_articles=1, max_discovery_requests=1, provider_ids={'ltn'})
+        deferred = task(q)
+        assert calls == [url] and not session.calls
+        assert deferred['attempts'] == 5 and deferred['last_checked_at_utc'] is None
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 0
+        time.sleep(max(0, deferred['due'] - time.time()) + .02)
+        run_cycle(q, http, config, max_articles=1, max_discovery_requests=1, provider_ids={'ltn'})
+        assert calls == [url, url]
+        assert [call[0] for call in session.calls] == ['https://news.ltn.com.tw/robots.txt', url]
+        assert task(q)['attempts'] == 0 and task(q)['error_code'] is None
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 1
+        assert q.db.execute('SELECT count(*) FROM articles WHERE body_sha256 IS NOT NULL').fetchone()[0] == 0
+    finally:
+        http.close(); q.close()
+
+
+def test_resident_owner_wakes_and_recovers_after_deferred_discovery(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as news
+
+    url = feeds.LTN_FEEDS[0]
+    config['providers'][0]['metadata_feed_policy']['urls'] = [url]
+    routes = {'https://news.ltn.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              url: FakeResponse(xml(), headers={'Content-Type': 'application/rss+xml'})}
+    q, http, session = setup(config, tmp_path, routes)
+    original_fetch, original_accept = news.fetch_discovery, news.accept_discovery
+    calls = []
+    def racing_gate(client, current):
+        calls.append(current['url'])
+        if len(calls) == 1:
+            client.defer('ltn', .3)
+        return original_fetch(client, current)
+    def stop_after_accepted(*args):
+        result = original_accept(*args)
+        http.stop.set()
+        return result
+    monkeypatch.setattr(news, 'fetch_discovery', racing_gate)
+    monkeypatch.setattr(news, 'accept_discovery', stop_after_accepted)
+    try:
+        news.run_service(q, http, config, max_articles=1, max_discovery_requests=1, duration_seconds=8)
+        assert calls == [url, url]
+        assert [call[0] for call in session.calls] == ['https://news.ltn.com.tw/robots.txt', url]
+        assert task(q)['attempts'] == 0 and task(q)['error_code'] is None
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 1
+        assert q.db.execute('SELECT count(*) FROM articles WHERE body_sha256 IS NOT NULL').fetchone()[0] == 0
+    finally:
+        http.close(); q.close()
 
 
 def test_healthy_parser_does_not_add_failure_context_or_witness(config,tmp_path):

@@ -43,6 +43,27 @@ def test_addition_keeps_exact_accounts_and_old_bytes(staged):
     assert not promoter._cutover_blockers(old, target, {"retained", "added"}, added_markets={"added"})
 
 
+def test_addition_rebinds_enrolled_clones_and_preserves_full_retained_history(staged):
+    from stockagent.live import paper_journal
+    old, new, _ = staged
+    snapshots = {}
+    for root in (old, new):
+        for name in paper_journal.FILENAMES:
+            path = root / name
+            if path.exists():
+                snapshots[(root, name)] = path.read_bytes()
+                paper_journal.publish_snapshot(path, operation="seed")
+    target = old.parent / "managed-candidate"
+    addition.merge_addition(old, new, target, added_market="added")
+    proof = addition.validate_addition(target, expected_markets={"retained", "added"})
+    assert proof["old_signal_pins_and_executions_unchanged"]
+    for name in paper_journal.FILENAMES:
+        if (old / name).exists():
+            with paper_journal.open_paper_journal(target / name) as stream:
+                assert stream.read() == snapshots[(old, name)] + snapshots[(new, name)]
+            assert (old / name).read_bytes() == snapshots[(old, name)]
+
+
 @pytest.mark.parametrize("which", ("old_prefix", "new_tail", "extra_tail", "account", "escape"))
 def test_addition_rejects_every_mutation_boundary(staged, which):
     _, _, target = staged

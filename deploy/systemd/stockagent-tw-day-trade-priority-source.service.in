@@ -1,0 +1,23 @@
+[Unit]
+Description=Priority recovery for the shared TW day-trade session source
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=oneshot
+Slice=system.slice
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_ROOT@
+Environment="HOME=@SERVICE_HOME@"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --preopen-source-only
+# The supervisor allows needed input recovery through the opening, but stops
+# its entire producer process group before the 13:20 exit/flattening phase.
+# The existing artifact worker lock and Factorized prepare lock remain owners.
+TimeoutStartSec=3h
+KillMode=control-group
+Nice=-5
+CPUWeight=10000
+IOWeight=10000
+OOMScoreAdjust=-500

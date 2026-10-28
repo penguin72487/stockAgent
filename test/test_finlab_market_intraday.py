@@ -19,6 +19,518 @@ from scripts.download_finlab_intraday import _partition_paths
 from stockagent.data.finlab_acquisition_contract import intraday_progress
 
 
+@pytest.mark.parametrize('general_allowed,sdk_supported', [(False, True), (True, True), (False, False)])
+def test_futures_priority_runs_under_existing_minute_owner_gates(tmp_path, monkeypatch, general_allowed, sdk_supported):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    root.mkdir()
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir()
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key, day = 'tw_futures_minute:I5F_201611', date(2016, 11, 8)
+    request = {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'source verification',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}
+    register(root, request, now=now)
+    calls = []
+
+    def fetch(output, dataset, partition, *, now, force_download=False):
+        calls.append((dataset, partition, force_download))
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'minute_residual_allowed': general_allowed, 'supplemental_allowed': general_allowed})
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (1000, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: sdk_supported)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=1, reserve_mb=50, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_minute')
+    if general_allowed:
+        assert calls == [(key, day, False)]
+        assert result['futures_priority_attempts'] == result['futures_priority_successes'] == 1
+        with sqlite3.connect(db) as con:
+            assert con.execute("SELECT status FROM partitions WHERE kind='tw_futures_minute'").fetchone()[0] == 'verified_no_trade'
+    else:
+        assert calls == []
+        assert result['state'] == 'waiting_required_general_data'
+        assert result['futures_priority_attempts'] == 0
+        assert result['futures_priority_sdk_unsupported'] is (not sdk_supported)
+
+
+@pytest.mark.parametrize('registered', [False, True])
+def test_finite_priority_pass_never_scans_unregistered_history(tmp_path, monkeypatch, registered):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    cursor = root / 'intraday/minute_cursor.json'
+    market_status = root / 'intraday/market_status.json'
+    history_metrics = root / 'intraday/batch_metrics.json'
+    atomic_write_json(cursor, {'old_frontier': 'preserve'})
+    atomic_write_json(market_status, {'scope': 'full_market', 'state': 'paused'})
+    atomic_write_json(history_metrics, {'contract_version': 1, 'batches': [{'scope': 'full_market'}]})
+    before_cursor, before_status = cursor.read_bytes(), market_status.read_bytes()
+    before_metrics = history_metrics.read_bytes()
+    now = datetime.now(UTC)
+    key, day = 'tw_futures_minute:I5F_201611', date(2016, 11, 8)
+    if registered:
+        register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'verify exact futures partition',
+            'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+            'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+            'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    calls = []
+
+    def fetch(output, dataset, partition, *, now, force_download=False):
+        calls.append((dataset, partition))
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'minute_residual_allowed': True, 'supplemental_allowed': True})
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (1000, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: True)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=64, reserve_mb=50, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_minute',
+        finite_priority_only=True)
+    assert calls == ([(key, day)] if registered else [])
+    assert result['state'] == 'finite_priority_pass_complete'
+    assert result['selection_scope'] == 'finite_registered_priority'
+    assert result['futures_priority_attempts'] == int(registered)
+    assert cursor.read_bytes() == before_cursor
+    assert market_status.read_bytes() == before_status
+    assert history_metrics.read_bytes() == before_metrics
+    assert json.loads((root / 'intraday/priority_status_tw_minute.json').read_text()) == result
+
+
+@pytest.mark.parametrize('boundary', ['daytrade', 'expired', 'physical_capacity'])
+def test_finite_priority_stops_at_handoff_expiry_and_backing_reserve(tmp_path, monkeypatch, boundary):
+    from types import SimpleNamespace
+    from downloader.artifact_io import atomic_write_json
+    from downloader import provider_priority
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_gap_priority
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key = 'tw_futures_minute:I5F_201611'
+    dates = [date(2016, 11, 8), date(2016, 11, 9)]
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'verify exact futures partitions',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()} for day in dates]}, now=now)
+    calls = []
+    clock = [100.0]
+    real_time = module.time
+    monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: clock[0], time=real_time.time))
+
+    def fetch(output, dataset, partition, *, now, force_download=False):
+        calls.append((dataset, partition))
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        clock[0] += 61
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'minute_residual_allowed': True, 'supplemental_allowed': True})
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (1000, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: True)
+    if boundary == 'daytrade':
+        monkeypatch.setattr(finlab_gap_priority, 'pending_daytrade_priority', lambda *a, **kw: True)
+    elif boundary == 'expired':
+        candidates = iter([[(key, dates[0])], []])
+        monkeypatch.setattr(provider_priority, 'finlab_futures_candidates', lambda *a, **kw: next(candidates))
+    else:
+        monkeypatch.setattr(module, 'check_dispatch', lambda *a, **kw: 75)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=64, reserve_mb=50, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_minute',
+        finite_priority_only=True)
+    if boundary == 'physical_capacity':
+        assert calls == [(key, dates[0])]
+        assert result['state'] == 'capacity_deferred'
+    else:
+        assert not calls
+        assert result['state'] == ('priority_handoff' if boundary == 'daytrade' else 'finite_priority_pass_complete')
+
+
+@pytest.mark.parametrize('catalog_outcome', ['fresh', 'failure', 'handoff'])
+def test_finite_priority_refreshes_stale_catalog_only_with_account_work_due(
+        tmp_path, monkeypatch, capsys, catalog_outcome):
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_gap_priority
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    discovery = root / 'catalog/discovery.json'
+    discovery.parent.mkdir()
+    discovery.write_text('{"observed_at_utc":"old-source-evidence"}')
+    now = datetime.now(UTC)
+    key, day = 'tw_futures_minute:I5F_201611', date(2016, 11, 8)
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'verify exact futures partition',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    calls = []
+
+    def catalog():
+        calls.append('discovery')
+        if catalog_outcome == 'failure':
+            raise RuntimeError('private account secret')
+        return ['price:close']
+
+    def admission(*args, **kwargs):
+        if json.loads(discovery.read_text()).get('observed_at_utc') == 'old-source-evidence':
+            return {'state': 'discovery_unverified'}
+        return {'state': 'general_work_pending', 'minute_residual_allowed': False,
+                'supplemental_allowed': False, 'actionable_pending': 1}
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', admission)
+    monkeypatch.setattr(module, 'provider_catalog', catalog)
+    monkeypatch.setattr(module, 'load_catalog', lambda: {'datasets': [{'key': 'price:close'}]})
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: True)
+    monkeypatch.setattr(finlab_gap_priority, 'pending_daytrade_priority',
+                        lambda *a, **kw: catalog_outcome == 'handoff')
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=64, reserve_mb=50, minimum_free_gb=0, now=now, kind='tw_minute',
+        fetch=lambda *a, **kw: pytest.fail('formal due work must retain priority'), finite_priority_only=True)
+    if catalog_outcome == 'fresh':
+        assert calls == ['discovery']
+        assert json.loads(discovery.read_text())['keys'] == ['price:close']
+        assert result['state'] == 'waiting_required_general_data'
+        assert result['catalog_refresh'] == 'observed'
+    else:
+        assert json.loads(discovery.read_text())['observed_at_utc'] == 'old-source-evidence'
+        assert calls == ([] if catalog_outcome == 'handoff' else ['discovery'])
+        assert result['state'] == ('priority_handoff' if catalog_outcome == 'handoff' else 'priority_catalog_unavailable')
+        assert 'private account secret' not in capsys.readouterr().out
+    assert result['futures_priority_attempts'] == 0
+
+
+@pytest.mark.parametrize('ordinary,quota,priority_guard,expected,state', [
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 2500, 0, 2, 'finite_priority_pass_complete'),
+    ({'state': 'deferred', 'reason': 'filesystem_reserve',
+      'available_bytes': 40, 'required_bytes': 64}, 2500, 0, 2, 'finite_priority_pass_complete'),
+    ({'state': 'admitted'}, 2500, 0, 0, 'waiting_required_general_data'),
+    ({'state': 'deferred', 'reason': 'physical_backing_headroom_unconfirmed'}, 2500, 0, 0, 'waiting_required_general_data'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 65, 'required_bytes_including_reserve': 64}, 2500, 0, 0, 'waiting_required_general_data'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 1999, 0, 0, 'quota_margin_reached'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 2500, 75, 0, 'capacity_deferred'),
+])
+def test_explicit_capacity_deferred_minute_is_bounded_and_retains_other_guards(
+        tmp_path, monkeypatch, ordinary, quota, priority_guard, expected, state):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key = 'tw_futures_minute:I5F_201611'
+    days = [date(2016, 11, 8), date(2016, 11, 9)]
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'test exact source checks',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()} for day in days]}, now=now)
+    calls = []
+    quota_checks = []
+
+    def fetch(output, dataset, partition, *, now, force_download=False):
+        calls.append(partition)
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'state': 'general_work_pending', 'minute_residual_allowed': False,
+         'supplemental_allowed': False, 'actionable_pending': 9, 'scheduled_reserve_mb': 500})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _: ordinary)
+    capacity_guards = []
+    monkeypatch.setattr(module, 'check_dispatch', lambda *a, **kw: capacity_guards.append(kw) or priority_guard)
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: quota_checks.append(True) or (quota, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: True)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=4, reserve_mb=0, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_minute',
+        finite_priority_only=True, capacity_deferred_priority=True)
+    assert len(calls) == expected
+    assert result['state'] == state
+    assert result['general_acquisition_admission']['actionable_pending'] == 9
+    assert result['general_acquisition_admission']['minute_residual_allowed'] is False
+    if expected or state == 'quota_margin_reached':
+        assert result['quota_policy']['effective_reserve_mb'] >= 2000
+    if expected:
+        assert len(quota_checks) >= expected
+        assert sum(g.get('additional_priority_headroom_bytes') == 24 * 1024**3
+                   for g in capacity_guards) >= expected
+
+
+def test_capacity_deferred_exception_rechecks_due_dispatch_before_each_partition(tmp_path, monkeypatch):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key = 'tw_futures_minute:I5F_201611'
+    days = [date(2016, 11, 8), date(2016, 11, 9)]
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'test exact source checks',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()} for day in days]}, now=now)
+    capacity = iter([{'state': 'deferred', 'reason': 'physical_backing_reserve',
+                      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64},
+                     {'state': 'admitted'}])
+    calls = []
+
+    def fetch(output, dataset, partition, *, now, force_download=False):
+        calls.append(partition)
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'state': 'general_work_pending', 'minute_residual_allowed': False,
+         'supplemental_allowed': False, 'actionable_pending': 9})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _: next(capacity))
+    monkeypatch.setattr(module, 'check_dispatch', lambda *a, **kw: 0)
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (2500, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition', lambda key: True)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=4, reserve_mb=0, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_minute',
+        finite_priority_only=True, capacity_deferred_priority=True)
+    assert len(calls) == 1
+    assert result['state'] == 'waiting_required_general_data'
+
+
+@pytest.mark.parametrize('kind,finite,limit', [('tw_tick', True, 4), ('tw_tick', True, 2),
+                                               ('tw_tick', False, 1), ('tw_minute', False, 4),
+                                               ('tw_minute', True, 5)])
+def test_capacity_deferred_exception_rejects_unbounded_scope(kind, finite, limit):
+    from scripts import download_finlab_market_intraday as module
+
+    with pytest.raises(ValueError, match='at most four serial'):
+        module.sync_market(Path('unused'), Path('unused'), start=date(2026, 1, 1), end=date(2026, 1, 2),
+            limit=limit, reserve_mb=0, minimum_free_gb=0, now=datetime.now(UTC), kind=kind,
+            finite_priority_only=finite, capacity_deferred_priority=True)
+
+
+@pytest.mark.parametrize('ordinary,quota,priority_guard,handoff,expected,state', [
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 2500, 0, False, 1, 'finite_priority_pass_complete'),
+    ({'state': 'deferred', 'reason': 'filesystem_reserve',
+      'available_bytes': 40, 'required_bytes': 64}, 2500, 0, False, 1, 'finite_priority_pass_complete'),
+    ({'state': 'admitted'}, 2500, 0, False, 0, 'waiting_required_minutes'),
+    ({'state': 'deferred', 'reason': 'physical_backing_headroom_unconfirmed'}, 2500, 0, False, 0, 'waiting_required_minutes'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 1999, 0, False, 0, 'quota_margin_reached'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 2500, 75, False, 0, 'capacity_deferred'),
+    ({'state': 'deferred', 'reason': 'physical_backing_reserve',
+      'physical_free_bytes': 40, 'required_bytes_including_reserve': 64}, 2500, 0, True, 0, 'priority_handoff'),
+])
+def test_explicit_capacity_deferred_single_tick_preserves_other_guards(
+        tmp_path, monkeypatch, ordinary, quota, priority_guard, handoff, expected, state):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_gap_priority
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key, day = 'tw_tick:2330', date(2026, 8, 19)
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'verify one stock fixing',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    calls, capacity_guards = [], []
+
+    def fetch(output, dataset, partition, *, now):
+        calls.append((dataset, partition))
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'state': 'general_work_pending', 'minute_residual_allowed': False,
+         'supplemental_allowed': False, 'actionable_pending': 9, 'scheduled_reserve_mb': 500})
+    monkeypatch.setattr(module, '_minute_admission', lambda *a, **kw: {'tick_residual_allowed': False})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _: ordinary)
+    monkeypatch.setattr(module, 'check_dispatch', lambda *a, **kw: capacity_guards.append(kw) or priority_guard)
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (quota, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(finlab_gap_priority, 'pending_daytrade_priority', lambda *a, **kw: handoff)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=1, reserve_mb=0, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_tick',
+        enforce_minute_priority=True, finite_priority_only=True, capacity_deferred_priority=True)
+    assert calls == ([(key, day)] if expected else [])
+    assert result['state'] == state
+    assert result['stock_priority_attempts'] == result['stock_priority_successes'] == expected
+    if expected:
+        assert result['quota_policy']['effective_reserve_mb'] >= 2000
+        assert any(g.get('additional_priority_headroom_bytes') == 24 * 1024**3 for g in capacity_guards)
+
+
+@pytest.mark.parametrize('admission,minutes_clear,quota,expected', [
+    ({'supplemental_allowed': True, 'minute_residual_allowed': True, 'actionable_pending': 0}, True, 1000, 1),
+    ({'supplemental_allowed': False, 'minute_residual_allowed': True, 'actionable_pending': 0}, True, 1000, 1),
+    ({'supplemental_allowed': False, 'minute_residual_allowed': False, 'actionable_pending': 1}, True, 1000, 0),
+    ({'supplemental_allowed': False, 'minute_residual_allowed': True, 'actionable_pending': 0}, False, 1000, 0),
+    ({'supplemental_allowed': False, 'minute_residual_allowed': True, 'actionable_pending': 0}, True, 10, 0),
+])
+def test_stock_tick_priority_uses_existing_owner_and_admission(tmp_path, monkeypatch, admission, minutes_clear, quota, expected):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key, day = 'tw_tick:2330', date(2026, 8, 19)
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'verify exact stock price path',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    calls = []
+
+    def fetch(output, dataset, partition, *, now):
+        calls.append((dataset, partition))
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw: admission)
+    monkeypatch.setattr(module, '_minute_admission', lambda *a, **kw: {'tick_residual_allowed': minutes_clear})
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (quota, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=1, reserve_mb=50, minimum_free_gb=0, now=now, fetch=fetch, kind='tw_tick',
+        enforce_minute_priority=True)
+    assert calls == ([(key, day)] if expected else [])
+    assert result['stock_priority_attempts'] == result['stock_priority_successes'] == expected
+    if expected:
+        with sqlite3.connect(db) as con:
+            assert con.execute("SELECT status FROM partitions WHERE kind='tw_tick' AND symbol='2330'").fetchone()[0] == 'verified_no_trade'
+
+
+@pytest.mark.parametrize('day,scope_written', [(date(2026, 8, 19), True), (date(2026, 8, 18), False)])
+def test_stock_priority_scope_does_not_create_provider_evidence_or_suppress_outside_range(
+        tmp_path, monkeypatch, day, scope_written):
+    from downloader.provider_priority import CONTRACT, inspect, register
+    from scripts import check_finlab_refresh_due as dispatch
+    from scripts import download_finlab_market_intraday as module
+    from scripts.download_finlab_intraday import _priority_scope_path
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key = 'tw_tick:NOTEXIST'
+    receipt = register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'test local eligibility',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, 'intraday_source_identity', lambda *a, **kw: 'known-source')
+    monkeypatch.setattr(dispatch, 'intraday_source_identity', lambda *a, **kw: 'known-source')
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'supplemental_allowed': False, 'minute_residual_allowed': False, 'actionable_pending': 1})
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: pytest.fail('scope must not query provider quota'))
+    module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=1, reserve_mb=50, minimum_free_gb=0, now=now, kind='tw_tick')
+    scope_path = _priority_scope_path(root, key, day)
+    provider_receipt, provider_attempt = _partition_paths(root, key, day)
+    assert scope_path.exists() is scope_written
+    assert not provider_receipt.exists() and not provider_attempt.exists()
+    status = inspect(root, receipt['request_id'], now=datetime.now(UTC))['items'][0]
+    if scope_written:
+        assert status['state'] == 'waiting_local_scope'
+        assert status['local_scope_reason'] == 'symbol_not_in_universe'
+        scope = json.loads(scope_path.read_text())
+        assert scope['provider_calls'] == 0 and scope['source_no_trade_claim'] is False
+    else:
+        assert status['state'] == 'pending_existing_owner'
+
+
 def test_cached_and_ineligible_candidates_never_call_account_quota(tmp_path):
     public = tmp_path / "public"
     public.mkdir()

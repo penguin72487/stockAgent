@@ -12,6 +12,29 @@ from scripts.benchmark_opening_signal_pipeline import (
 )
 
 
+def test_isolated_signal_identity_is_an_explicit_clocked_input():
+    from datetime import datetime, timedelta, timezone
+    from scripts.benchmark_opening_signal_pipeline import _isolated_signal_id
+    at = datetime(2026, 10, 22, 9, tzinfo=timezone(timedelta(hours=8)))
+    first = _isolated_signal_id(market="mode", observed=at, scenario="0")
+    assert first == _isolated_signal_id(market="mode", observed=at.astimezone(timezone.utc), scenario="0")
+    assert first != _isolated_signal_id(market="other", observed=at, scenario="0")
+    assert first != _isolated_signal_id(market="mode", observed=at, scenario="1")
+    assert first != _isolated_signal_id(market="mode", observed=at + timedelta(microseconds=1), scenario="0")
+    assert len({_isolated_signal_id(market=f"mode-{mode}", observed=at, scenario=str(revision))
+                for mode in range(6) for revision in range(7)}) == 42
+    assert first.startswith("engineering-opening-") and "/" not in first
+
+
+@pytest.mark.parametrize("market,scenario,aware", [("", "0", True), ("mode", "", True), ("mode", "0", False)])
+def test_isolated_signal_identity_rejects_missing_fixture_inputs(market, scenario, aware):
+    from datetime import datetime, timezone
+    from scripts.benchmark_opening_signal_pipeline import _isolated_signal_id
+    with pytest.raises(ValueError, match="identity requires"):
+        _isolated_signal_id(market=market, scenario=scenario,
+            observed=datetime(2026, 10, 22, tzinfo=timezone.utc if aware else None))
+
+
 def test_row_reference_executes_only_frozen_definitions_with_shared_canonical_globals(tmp_path, monkeypatch):
     import hashlib
     from scripts import benchmark_opening_signal_pipeline as benchmark
@@ -127,6 +150,17 @@ def test_preopen_preparation_never_consumes_opening_quotes_or_writes():
     assert kwargs["asof_date"] == "2026-10-22 08:50:00"
     assert kwargs["checkpoint"] == "same" and kwargs["panel_date"] == "2026-10-21"
     assert original["write"] is True and original["price_source"] == "tw"
+
+
+def test_preopen_preparation_uses_canonical_private_transport_admission():
+    from stockagent.live.market_config import LiveMarketConfig, SIGNAL_UPDATE_PROGRESSIVE
+    cfg = LiveMarketConfig(market="fixture", label="fixture", config_path="fixture.yaml",
+        day_trade_simulation_enabled=True, day_trade_signal_update_policy=SIGNAL_UPDATE_PROGRESSIVE)
+    original = cfg.signal_kwargs(price_source="tw_mis", write=False)
+    assert "_prepare_progressive_opening_input" not in original
+    warm = _preopen_kwargs(original, "2026-10-22", market_config=cfg)
+    assert warm["_prepare_progressive_opening_input"] is True
+    assert not warm["write"] and warm["price_source"] == "panel"
 
 
 def test_historical_receipt_registry_reuses_full_validation_at_original_clock(monkeypatch):
@@ -378,14 +412,14 @@ def test_publication_clock_does_not_invent_a_missing_prefetch_origin():
 @pytest.mark.parametrize("damage", [None, "unpersisted_state", "future_financial_field", "fill_fee", "invalid_journal"])
 def test_complete_ledger_oracle_reads_all_generated_values_and_only_normalizes_own_root(tmp_path, damage):
     from datetime import datetime
-    from scripts.benchmark_opening_signal_pipeline import _paper_ledger_financial_oracle
+    from scripts.benchmark_opening_signal_pipeline import _paper_ledger_financial_oracle, _new_isolated_entry_engine
     from stockagent.live import tw_day_trade_simulation as simulation
     from stockagent.live.tw_day_trade_service_sync import PAPER_JOURNAL_FILENAMES
     now = datetime.fromisoformat("2026-10-22T09:00:00+08:00")
     engines, proofs = [], []
     for name in ("one", "two"):
         root = tmp_path / name
-        engine = simulation.TwDayTradeSimulationEngine(root / "ledger")
+        engine = _new_isolated_entry_engine(root / "ledger", created_at=now)
         engine.state["modes"]["fixture"] = {"market": "fixture", "future_financial_field": -0.,
             "positions": {"p": {"signed_shares": 1000, "entry_price": 40., "entry_fee": 28.5}},
             "source_path": str(root / "signals/source.json"),
@@ -416,6 +450,125 @@ def test_complete_ledger_oracle_reads_all_generated_values_and_only_normalizes_o
         changed._persist(now)
         with pytest.raises(ValueError):
             _paper_ledger_financial_oracle(changed)
+
+
+def test_isolated_fixture_initial_clock_is_explicit_and_never_normalized_away(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from scripts.benchmark_opening_signal_pipeline import _new_isolated_entry_engine, _paper_ledger_financial_oracle
+    from stockagent.live import tw_day_trade_simulation as simulation
+    fixture_clock = datetime.fromisoformat("2026-10-22T08:50:00+08:00")
+    proofs = []
+    for index in range(2):
+        monkeypatch.setattr(simulation, "_iso", lambda *_: f"2026-10-25T12:00:0{index}+08:00")
+        engine = _new_isolated_entry_engine(tmp_path / str(index) / "ledger", created_at=fixture_clock)
+        assert engine.state["created_at"] == fixture_clock.isoformat(timespec="seconds")
+        engine._persist(fixture_clock)
+        proofs.append(_paper_ledger_financial_oracle(engine))
+    assert proofs[0] == proofs[1]
+    engine.state["created_at"] = (fixture_clock + timedelta(seconds=1)).isoformat(timespec="seconds")
+    engine._persist(fixture_clock)
+    assert _paper_ledger_financial_oracle(engine)["state_sha256"] != proofs[0]["state_sha256"]
+
+
+@pytest.mark.parametrize("existing", ["state", "journal", "file"])
+def test_isolated_fixture_refuses_any_existing_ledger_content(tmp_path, existing):
+    from datetime import datetime
+    from scripts.benchmark_opening_signal_pipeline import _new_isolated_entry_engine
+    destination = tmp_path / "ledger"
+    if existing == "file":
+        destination.write_text("existing")
+        target = destination
+    else:
+        destination.mkdir()
+        target = destination / ("state.json" if existing == "state" else "fills.jsonl")
+        target.write_text("existing")
+    with pytest.raises(ValueError, match="empty destination"):
+        _new_isolated_entry_engine(destination, created_at=datetime.fromisoformat("2026-10-22T08:50:00+08:00"))
+    assert target.read_text() == "existing"
+
+
+def test_isolated_fixture_refuses_unknown_timezone(tmp_path):
+    from datetime import datetime
+    from scripts.benchmark_opening_signal_pipeline import _new_isolated_entry_engine
+    with pytest.raises(ValueError, match="explicit timezone"):
+        _new_isolated_entry_engine(tmp_path / "ledger", created_at=datetime(2026, 10, 22, 8, 50))
+
+
+@pytest.mark.parametrize("change", ["unchanged", "append", "rewrite_and_append", "truncate",
+                                   "replace", "missing", "unterminated", "blank_lines", "empty"])
+def test_financial_oracle_prefix_reuse_matches_fresh_full_readback(tmp_path, change):
+    from datetime import datetime
+    from scripts.benchmark_opening_signal_pipeline import _paper_ledger_financial_oracle
+    from stockagent.live import tw_day_trade_simulation as simulation
+    from stockagent.live.tw_day_trade_service_sync import PAPER_JOURNAL_FILENAMES
+    now = datetime.fromisoformat("2026-10-22T09:00:00+08:00")
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path / "run/ledger")
+    for name in PAPER_JOURNAL_FILENAMES:
+        simulation._append_jsonl_many(engine.state_dir / name, [{"fee": 1.}, {"fee": 2.}])
+    if change == "unterminated":
+        engine.fills_path.write_bytes(b'{"fee":1.0}')
+    elif change == "blank_lines":
+        engine.fills_path.write_bytes(b'\n{"fee":1.0}\n \n')
+    elif change == "empty":
+        engine.fills_path.write_bytes(b"")
+    engine._persist(now)
+    original = _paper_ledger_financial_oracle(engine)
+    if change == "append" or change == "blank_lines" or change == "empty":
+        simulation._append_jsonl(engine.fills_path, {"fee": 3.})
+    elif change == "rewrite_and_append":
+        raw = engine.fills_path.read_bytes().replace(b'1.0', b'9.0')
+        engine.fills_path.write_bytes(raw + b'{"fee":3.0}\n')
+    elif change == "truncate":
+        engine.fills_path.write_bytes(b'{"fee":3.0}\n')
+    elif change == "replace":
+        replacement = engine.state_dir / "replacement.jsonl"
+        replacement.write_bytes(engine.fills_path.read_bytes())
+        replacement.replace(engine.fills_path)
+    elif change == "missing":
+        engine.fills_path.unlink()
+    elif change == "unterminated":
+        with engine.fills_path.open("ab") as stream:
+            stream.write(b'\n{"fee":3.0}\n')
+    engine._persist(now)
+    incremental = _paper_ledger_financial_oracle(engine)
+    work = engine._benchmark_financial_readback_work.copy()
+    del engine._benchmark_financial_journal_cache
+    assert _paper_ledger_financial_oracle(engine) == incremental
+    if change == "unchanged":
+        # A second persist advances the real state revision. Only unchanged
+        # journals should match; never normalize a financial decision clock.
+        assert incremental["journals"] == original["journals"]
+        assert incremental["state_sha256"] != original["state_sha256"]
+        assert all(item["parsed_records"] == 0 and item["verified_prefix_reused"]
+                   and item["verified_old_prefix_bytes"] > 0 for item in work.values())
+    elif change in {"append", "blank_lines", "empty"}:
+        assert work["fills.jsonl"]["parsed_records"] == 1
+        assert work["fills.jsonl"]["verified_prefix_reused"]
+    elif change in {"rewrite_and_append", "truncate", "replace", "unterminated"}:
+        assert work["fills.jsonl"]["parsed_records"] == incremental["journals"]["fills.jsonl"]["records"]
+        assert not work["fills.jsonl"]["verified_prefix_reused"]
+
+
+@pytest.mark.parametrize("damage", ["corrupt_prefix_with_growth", "non_object", "unpersisted_state"])
+def test_financial_oracle_does_not_publish_partial_cache_after_failed_readback(tmp_path, damage):
+    from datetime import datetime
+    from scripts.benchmark_opening_signal_pipeline import _paper_ledger_financial_oracle
+    from stockagent.live import tw_day_trade_simulation as simulation
+    now = datetime.fromisoformat("2026-10-22T09:00:00+08:00")
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path / "run/ledger")
+    simulation._append_jsonl(engine.fills_path, {"fee": 1.})
+    engine._persist(now)
+    _paper_ledger_financial_oracle(engine)
+    before = engine._benchmark_financial_journal_cache
+    if damage == "unpersisted_state":
+        engine.state["future_financial_field"] = 1e-12
+    else:
+        engine.fills_path.write_bytes(b'{bad-prefix}\n{"fee":2.0}\n'
+                                     if damage == "corrupt_prefix_with_growth" else b'[]\n')
+        engine._persist(now)
+    with pytest.raises((ValueError, RuntimeError)):
+        _paper_ledger_financial_oracle(engine)
+    assert engine._benchmark_financial_journal_cache is before
 
 
 def _sample(variant, published, complete, **cache_flags):

@@ -23,6 +23,27 @@ def test_preclose_raw_range_must_be_refetched_after_all_futures_close(tmp_path: 
     )
 
 
+def test_later_checkpoint_rechecks_early_snapshot_only_once(tmp_path: Path) -> None:
+    target = tmp_path / "2026-09-01_2026-09-17_all.csv"
+    target.write_bytes(b"early postclose source")
+    early = datetime(2026, 9, 17, 16, 31, tzinfo=daily.TAIPEI)
+    os.utime(target, (early.timestamp(), early.timestamp()))
+    assert not daily._needs_postclose_refresh(
+        target, date(2026, 9, 17), now=datetime(2026, 9, 17, 18, 29, tzinfo=daily.TAIPEI)
+    )
+    assert daily._needs_postclose_refresh(
+        target, date(2026, 9, 17), now=datetime(2026, 9, 17, 18, 30, tzinfo=daily.TAIPEI)
+    )
+    assert not daily._needs_postclose_refresh(
+        target, date(2026, 9, 16), now=datetime(2026, 9, 17, 18, 30, tzinfo=daily.TAIPEI)
+    )
+    late = datetime(2026, 9, 17, 18, 31, tzinfo=daily.TAIPEI)
+    os.utime(target, (late.timestamp(), late.timestamp()))
+    assert not daily._needs_postclose_refresh(
+        target, date(2026, 9, 17), now=datetime(2026, 9, 17, 19, 0, tzinfo=daily.TAIPEI)
+    )
+
+
 def test_postclose_refresh_preserves_changed_early_raw_bytes(
     tmp_path: Path, monkeypatch,
 ) -> None:
@@ -89,3 +110,27 @@ def test_postclose_refresh_rejects_lost_index_session_on_retained_date(
     with pytest.raises(RuntimeError, match="loses previously observed index day sessions"):
         daily._refresh_postclose_range({}, target, attempts=1, request_interval=0.0)
     assert target.read_bytes() == early
+
+
+def test_postclose_refresh_rejects_lost_physical_contract_and_retains_reply(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    target = tmp_path / "raw" / "ranges" / "2026-09-01_2026-09-17_all.csv"
+    target.parent.mkdir(parents=True)
+    header = "交易日期,契約,到期月份(週別),交易時段,成交量,收盤價,結算價\n"
+    retained = "2026/09/17,TX,202609,一般,1,100,100\n"
+    early = (header + retained + "2026/09/17,PK1,202612,一般,1,200,200\n").encode("cp950")
+    regressed = (header + retained).encode("cp950")
+    target.write_bytes(early)
+
+    def fake_download(_payload, destination, **_kwargs):
+        destination.write_bytes(regressed)
+        return destination
+
+    monkeypatch.setattr(daily, "_download", fake_download)
+    with pytest.raises(RuntimeError, match="loses previously observed physical contract/session rows"):
+        daily._refresh_postclose_range({}, target, attempts=1, request_interval=0.0)
+    assert target.read_bytes() == early
+    rejected = (tmp_path / "raw" / "quarantined"
+                / f"{target.stem}.{hashlib.sha256(regressed).hexdigest()}.raw")
+    assert rejected.read_bytes() == regressed

@@ -84,6 +84,10 @@ def test_six_mode_commits_reach_full_page_without_navigation(tmp_path, monkeypat
         })""")
         diagnostic["fresh_http_status"] = page.request.get(
             f"http://127.0.0.1:{server.server_port}/tw-day-trade/api/status").json()
+        diagnostic["gateway_revision"] = json.loads(server.tw_revision().body)
+        with server._cache_lock:
+            diagnostic["gateway_status_cache_keys"] = [key for key in server._cache if key.startswith("tw-status:")]
+            diagnostic["gateway_active_builds"] = dict(server._revision_active)
         (tmp_path / "progressive-six-mode-failure.json").write_text(
             json.dumps(diagnostic, ensure_ascii=False, indent=2), encoding="utf-8")
         page.screenshot(path=str(tmp_path / "progressive-six-mode-failure.png"), full_page=True)
@@ -93,7 +97,8 @@ def test_six_mode_commits_reach_full_page_without_navigation(tmp_path, monkeypat
         with playwright.sync_playwright() as pw:
             browser = pw.chromium.launch(**browser_profile_launch_options("cpu-2d"))
             try:
-                page = browser.new_page(viewport={"width": 2560, "height": 2160})
+                # Match the scheduled observer's disclosed 2K desktop viewport.
+                page = browser.new_page(viewport={"width": 2560, "height": 1440})
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.on("request", lambda request: status_requests.append(request.url)
                         if "/tw-day-trade/api/status" in request.url else None)
@@ -136,7 +141,8 @@ def test_six_mode_commits_reach_full_page_without_navigation(tmp_path, monkeypat
                     }""", expected)
                     wait_page(page, """expected => Object.entries(expected).every(([market,key]) =>
                         window.fixturePaints.some(metric => metric.correlation?.market === market
-                            && metric.correlation?.signalKey === key))""", expected)
+                            && metric.correlation?.signalKey === key
+                            && metric.correlation?.entryCountsVisible === true))""", expected)
                     painted = time.perf_counter()
                     samples.append({"revision": index, "target_weight": weight,
                         "six_mode_register_and_persist_ms": (committed - started) * 1000,

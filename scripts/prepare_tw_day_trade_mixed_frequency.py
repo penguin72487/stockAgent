@@ -10,6 +10,7 @@ import argparse
 from collections import Counter
 from datetime import date, datetime, UTC, timedelta
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -32,7 +33,14 @@ from stockagent.data.tw_public_release_schedule import align_observation_frame, 
 from stockagent.training.dataset import execution_feature_lag
 
 
-def verify_sources(root: Path) -> dict:
+def verify_sources(root: Path, *, release_read_cache: bool = False) -> dict:
+    """Verify every source byte; optionally release clean pages after hashing.
+
+    The opt-in is for immutable preparation snapshots whose sequential integrity
+    pass otherwise occupies the host's working-set budget. This is per-file
+    kernel advice, never deletion or a substitute for measured memory admission.
+    Filesystem content, hashes and the returned source contract are unchanged.
+    """
     manifest = json.loads((root / "source_manifest.json").read_text())
     if (manifest.get("contract") != CONTRACT or manifest.get("source_only") is not True
             or manifest.get("private_delivery_authorized") is not True
@@ -40,8 +48,27 @@ def verify_sources(root: Path) -> dict:
         raise ValueError("source contract/private use mismatch")
     for relative, proof in manifest["files"].items():
         path = root / relative
+        before = path.stat() if release_read_cache else None
         if not path.resolve().is_relative_to(root.resolve()) or sha256(path) != proof["sha256"]:
             raise ValueError(f"source hash mismatch: {relative}")
+        if release_read_cache:
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if identity(path.stat()) != identity(before):
+                raise ValueError(f"source changed during verification: {relative}")
+            # Advisory failure affects cache residency, not verified bytes.
+            # Mapped/dirty pages may remain resident. Readiness is measured
+            # separately by the existing cgroup and process-RSS owner.
+            descriptor = None
+            try:
+                descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                if identity(os.fstat(descriptor)) != identity(before):
+                    raise ValueError(f"source replaced after verification: {relative}")
+                os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
     from stockagent.data.tw_public_cross_source_fill import verify_staged_source_repairs,verify_staged_snapshot_retention
     verify_staged_source_repairs(root, manifest)
     verify_staged_snapshot_retention(root,manifest)

@@ -123,6 +123,8 @@ class WindowedSplitTensors:
     sample_mask: torch.Tensor | None = None
     symbol_indices: torch.Tensor | None = None
     execution_mode: str = "naive"
+    futures_account_source_fingerprint: str | None = None
+    futures_execution_release_fingerprint: str | None = None
     session_advance_mask: torch.Tensor | None = None
     session_month_ids: torch.Tensor | None = None
     commission_rebate_payment_eligible_mask: torch.Tensor | None = None
@@ -142,10 +144,24 @@ class WindowedSplitTensors:
     _first_valid_index: int = field(init=False, repr=False)
     _contiguous_prefix_len: int = field(init=False, repr=False)
     _default_sample_mask: torch.Tensor = field(init=False, repr=False)
+    _futures_execution_tensor_version: int | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         self.lookback = int(self.lookback)
         self.execution_mode = normalize_execution_mode(self.execution_mode)
+        fingerprint = self.futures_account_source_fingerprint
+        if fingerprint is not None and (
+            self.execution_mode != "tw_stock_context_futures_portfolio"
+            or not isinstance(fingerprint, str) or len(fingerprint) != 64
+            or any(c not in "0123456789abcdef" for c in fingerprint)
+        ):
+            raise ValueError("dated futures split requires a valid event-source fingerprint")
+        release = self.futures_execution_release_fingerprint
+        if release is not None and (
+            fingerprint is None or not isinstance(release, str) or len(release) != 64
+            or any(c not in "0123456789abcdef" for c in release)
+        ):
+            raise ValueError("dated futures split requires a valid execution release fingerprint")
         self._feature_lag = execution_feature_lag(self.execution_mode)
         if self.lookback < 1:
             raise ValueError("lookback must be >= 1")
@@ -262,6 +278,10 @@ class WindowedSplitTensors:
                 f"shape [T,versioned slots,C] with C in {(4, 11, *MARGIN_EXECUTION_WIDTHS)}, "
                 "or intraday [T,versioned slots,2,63]"
             )
+        if release is not None:
+            if torch.is_inference(self.overnight_log_returns):
+                raise ValueError("dated futures split requires version-tracked decision execution")
+            self._futures_execution_tensor_version = self.overnight_log_returns._version
         if self.execution_mode == "tw_index_derivatives_day":
             expected_rows = int(self.features.size(0))
             derivative_return_shape = tuple(self.overnight_log_returns.shape)
@@ -329,6 +349,7 @@ class WindowedSplitTensors:
             from stockagent.data.tw_futures_margin import (
                 MARGIN_FEATURE_COLUMNS,
                 MARGIN_AMOUNT_FEATURE_COLUMNS,
+                FUTURES_RESIDUAL_SIGNAL_COLUMNS,
             )
             from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_OBSERVATION_COLUMNS
             from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
@@ -361,6 +382,18 @@ class WindowedSplitTensors:
                 + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS) + 1
                 + len(OPENING_REFERENCE_FEATURES),
             }
+            # Residual signals follow the causal account observations and the
+            # optional beta. Opening-reference fields remain the final suffix.
+            causal_width = (
+                len(TW_STOCK_CONTEXT_FUTURES_MODEL_FEATURE_COLUMNS)
+                + len(MARGIN_AMOUNT_FEATURE_COLUMNS)
+                + len(FUTURES_ACCOUNT_OBSERVATION_COLUMNS)
+            )
+            valid_context_widths.update(
+                causal_width + len(FUTURES_RESIDUAL_SIGNAL_COLUMNS) + beta + opening
+                for beta in (0, 1)
+                for opening in (0, len(OPENING_REFERENCE_FEATURES))
+            )
             if (
                 self.derivative_candidate_features is None
                 or self.derivative_candidate_features.dim() != 3
@@ -1024,15 +1057,26 @@ class WindowedSplitTensors:
     def num_symbols(self) -> int:
         return int(self.features.size(1))
 
+    def assert_futures_execution_unmodified(self) -> None:
+        if (self.futures_execution_release_fingerprint is not None
+                and self._futures_execution_tensor_version != self.overnight_log_returns._version):
+            raise ValueError("dated futures split decision execution was modified")
+
+    def _execution_on_device(self, device: torch.device, non_blocking: bool) -> torch.Tensor:
+        # A tensor created in inference_mode has no mutation counter. Keep the
+        # dated tape versioned even when a split is cached during evaluation.
+        if self.futures_execution_release_fingerprint is not None:
+            with torch.inference_mode(False):
+                return self.overnight_log_returns.to(device=device, non_blocking=non_blocking)
+        return self.overnight_log_returns.to(device=device, non_blocking=non_blocking)
+
     def to_device_cache(self, device: torch.device, non_blocking: bool = True) -> "WindowedSplitTensors":
+        self.assert_futures_execution_unmodified()
         return WindowedSplitTensors(
             features=self.features.to(device=device, non_blocking=non_blocking),
             valid_indices=self.valid_indices.to(device=device, non_blocking=non_blocking),
             future_log_returns=self.future_log_returns.to(device=device, non_blocking=non_blocking),
-            overnight_log_returns=self.overnight_log_returns.to(
-                device=device,
-                non_blocking=non_blocking,
-            ),
+            overnight_log_returns=self._execution_on_device(device, non_blocking),
             derivative_candidate_features=(
                 None
                 if self.derivative_candidate_features is None
@@ -1080,6 +1124,8 @@ class WindowedSplitTensors:
                 None if self.symbol_indices is None else self.symbol_indices.to(device=device, non_blocking=non_blocking)
             ),
             execution_mode=self.execution_mode,
+            futures_account_source_fingerprint=self.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=self.futures_execution_release_fingerprint,
             session_advance_mask=self.session_advance_mask.to(device=device, non_blocking=non_blocking),
             session_month_ids=self.session_month_ids.to(
                 device=device, non_blocking=non_blocking
@@ -1128,11 +1174,13 @@ class WindowedSplitTensors:
         )
 
     def pin_memory(self) -> "WindowedSplitTensors":
+        self.assert_futures_execution_unmodified()
         def _pin(tensor: torch.Tensor) -> torch.Tensor:
             if tensor.device.type != "cpu" or tensor.is_pinned():
                 return tensor
             try:
-                return tensor.pin_memory()
+                with torch.inference_mode(False):
+                    return tensor.pin_memory()
             except torch.AcceleratorError as exc:
                 if "out of memory" not in str(exc).lower():
                     raise
@@ -1171,6 +1219,8 @@ class WindowedSplitTensors:
             sample_mask=None if self.sample_mask is None else _pin(self.sample_mask),
             symbol_indices=None if self.symbol_indices is None else _pin(self.symbol_indices),
             execution_mode=self.execution_mode,
+            futures_account_source_fingerprint=self.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=self.futures_execution_release_fingerprint,
             session_advance_mask=_pin(self.session_advance_mask),
             session_month_ids=_pin(self.session_month_ids),
             commission_rebate_payment_eligible_mask=_pin(
@@ -1207,6 +1257,7 @@ class WindowedSplitTensors:
         )
 
     def subset_symbols(self, symbol_indices: torch.Tensor) -> "WindowedSplitTensors":
+        self.assert_futures_execution_unmodified()
         source_device = self.features.device
         local_indices = symbol_indices.to(device=source_device, dtype=torch.long)
         if local_indices.dim() != 1:
@@ -1223,7 +1274,9 @@ class WindowedSplitTensors:
             future_log_returns=self.future_log_returns.index_select(1, local_indices),
             overnight_log_returns=(
                 self.overnight_log_returns
-                if self.execution_mode == "tw_index_derivatives_day"
+                if self.execution_mode in {
+                    "tw_index_derivatives_day", "tw_index_futures_day", "tw_stock_context_futures_portfolio",
+                }
                 else self.overnight_log_returns.index_select(1, local_indices)
             ),
             derivative_candidate_features=self.derivative_candidate_features,
@@ -1257,6 +1310,8 @@ class WindowedSplitTensors:
             sample_mask=self.sample_mask,
             symbol_indices=original_indices,
             execution_mode=self.execution_mode,
+            futures_account_source_fingerprint=self.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=self.futures_execution_release_fingerprint,
             session_advance_mask=self.session_advance_mask,
             session_month_ids=self.session_month_ids,
             commission_rebate_payment_eligible_mask=(
@@ -1299,6 +1354,7 @@ class WindowedSplitTensors:
         )
 
     def pad_symbols(self, target_symbols: int, *, pad_symbol_index: int | None = None) -> "WindowedSplitTensors":
+        self.assert_futures_execution_unmodified()
         target_symbols = int(target_symbols)
         current_symbols = int(self.features.size(1))
         if target_symbols < current_symbols:
@@ -1335,7 +1391,9 @@ class WindowedSplitTensors:
             future_log_returns=_pad_symbol_dim(self.future_log_returns, 0.0),
             overnight_log_returns=(
                 self.overnight_log_returns
-                if self.execution_mode == "tw_index_derivatives_day"
+                if self.execution_mode in {
+                    "tw_index_derivatives_day", "tw_index_futures_day", "tw_stock_context_futures_portfolio",
+                }
                 else _pad_symbol_dim(self.overnight_log_returns, 0.0)
             ),
             derivative_candidate_features=self.derivative_candidate_features,
@@ -1365,6 +1423,8 @@ class WindowedSplitTensors:
             sample_mask=self.sample_mask,
             symbol_indices=padded_symbol_indices,
             execution_mode=self.execution_mode,
+            futures_account_source_fingerprint=self.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=self.futures_execution_release_fingerprint,
             session_advance_mask=self.session_advance_mask,
             session_month_ids=self.session_month_ids,
             commission_rebate_payment_eligible_mask=(
@@ -1405,6 +1465,7 @@ class WindowedSplitTensors:
         )
 
     def clamp_symbol_indices(self, max_symbols: int) -> "WindowedSplitTensors":
+        self.assert_futures_execution_unmodified()
         if self.symbol_indices is None:
             return self
         max_symbols = int(max_symbols)
@@ -1436,6 +1497,8 @@ class WindowedSplitTensors:
             sample_mask=self.sample_mask,
             symbol_indices=clamped_indices,
             execution_mode=self.execution_mode,
+            futures_account_source_fingerprint=self.futures_account_source_fingerprint,
+            futures_execution_release_fingerprint=self.futures_execution_release_fingerprint,
             session_advance_mask=self.session_advance_mask,
             session_month_ids=self.session_month_ids,
             commission_rebate_payment_eligible_mask=(
@@ -2619,6 +2682,11 @@ class WindowedSplitTensors:
 
 
 def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplitTensors:
+    source = getattr(dataset, "_futures_account_source", None)
+    if source is not None:
+        source.verify_identity()
+        if dataset.overnight_log_returns_t is not source.decision_execution:
+            raise ValueError("dated futures dataset decision tape differs from its prepared source")
     return WindowedSplitTensors(
         features=dataset.features_t,
         valid_indices=torch.as_tensor(dataset.valid_indices, dtype=torch.long),
@@ -2640,6 +2708,8 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         force_short_cover_mask=dataset.force_short_cover_mask_t,
         force_exit_mask=dataset.force_exit_mask_t,
         execution_mode=dataset.execution_mode,
+        futures_account_source_fingerprint=getattr(dataset, "futures_account_source_fingerprint", None),
+        futures_execution_release_fingerprint=getattr(dataset, "futures_execution_release_fingerprint", None),
         session_advance_mask=dataset.session_advance_mask_t,
         session_month_ids=dataset.session_month_ids_t,
         commission_rebate_payment_eligible_mask=(

@@ -377,6 +377,12 @@ def _load_catalog(path: Path, include_families: bool = False) -> list[dict[str, 
             if (type(count) is not int or not 1 <= count <= MAX_FILE_CHUNK_BYTES
                     or raw.get("reader_contract") != "packed-v2-chunks"):
                 raise SnapshotError("chunk publication requires bounded bytes and explicit packed-v2-chunks readers")
+        if "closed_source_contract" in raw:
+            from stockagent.data_sync.closed_source import validate_catalog
+            validate_catalog(raw)
+        if 'retained_source_contract' in raw:
+            from stockagent.data_sync.retained_source import validate_catalog
+            validate_catalog(raw)
         is_family = index >= len(datasets)
         if is_family != ("publication_family" in raw):
             raise SnapshotError("catalog publication families must be separate from concrete source datasets")
@@ -551,6 +557,7 @@ def _status(
     *,
     sync_root: Path | None = None,
     held_native_lock_fds: tuple[int, ...] = (),
+    closed_storage: dict | None = None,
 ) -> dict[str, Any]:
     source = _source_path(entry)
     blockers = _blockers(entry, commands)
@@ -576,6 +583,21 @@ def _status(
     selection_error = None
     selected = entry.get("included_root_files")
     requires_key = "publication_family" in entry and "completed_forward_key" not in entry
+    closed_error = None
+    if ("closed_source_contract" in entry and closed_storage is None
+            and ((source / "state/closed-source.json").exists()
+                 or (source / "state/closed-source.json").is_symlink())):
+        try:
+            from stockagent.data_sync.closed_source import (
+                configured_cache_root, resolve_closed_source, validate_catalog,
+            )
+            validate_catalog(entry)
+            if sync_root is None:
+                raise SnapshotError("closed source status requires its cold authority")
+            cache = configured_cache_root(sync_root, DEFAULT_RETENTION_CONFIG, repo_root=REPO_ROOT)
+            closed_storage = resolve_closed_source(source, sync_root, cache, hash_files=False)[1]
+        except (OSError, ValueError, SnapshotError) as error:
+            closed_error = str(error)
     names = None
     if "included_root_files" in entry:
         try:
@@ -600,6 +622,7 @@ def _status(
         and not blockers
         and freshness_error is None
         and selection_error is None
+        and closed_error is None
         and non_regression,
         "active_blockers": blockers,
         **({"coordinated_writer_waiters": waiters} if waiters else {}),
@@ -609,6 +632,8 @@ def _status(
         "freshness_error": freshness_error,
         **({"freshness_retryable": True} if freshness_retryable else {}),
         "note": entry["note"],
+        **({"source_storage": closed_storage} if closed_storage is not None else {}),
+        **({"closed_source_error": closed_error} if closed_error is not None else {}),
         **({"publication_family": entry["publication_family"],
             "requires_explicit_completed_forward_key": requires_key}
            if "publication_family" in entry else {}),
@@ -649,6 +674,16 @@ def _publish_entry(
         entry, inherited_fd=getattr(args, "source_lock_fd", None),
         **({"wait_seconds": 0} if getattr(args, "all_ready", False) else {}),
     ) as source_owners:
+        closed = None
+        if "closed_source_contract" in entry:
+            from stockagent.data_sync.closed_source import (
+                configured_cache_root, require_unbound_originals, resolve_closed_source, validate_catalog,
+            )
+            validate_catalog(entry)
+            cache = configured_cache_root(sync_root, args.retention_config, repo_root=REPO_ROOT)
+            closed = resolve_closed_source(_source_path(entry), sync_root, cache)
+            if closed is None:
+                require_unbound_originals(_source_path(entry))
         # A standalone producer may let this canonical publisher acquire the
         # original owner instead of passing an inherited descriptor. Deferred
         # notification still requires both a real held source lock and the
@@ -659,9 +694,15 @@ def _publish_entry(
                 and not source_owners["native_lock_fds"]):
             raise SnapshotError("single deferred publication requires a held catalog/native source lock")
         status = _status(entry, _running_commands(), sync_root=sync_root,
-                         held_native_lock_fds=source_owners["native_lock_fds"])
+                         held_native_lock_fds=source_owners["native_lock_fds"],
+                         closed_storage=closed[1] if closed is not None else None)
         if not status["publish_ready"]:
             return status, None
+        if closed is not None:
+            # C may retain only service views. Publishing this partial tree as
+            # another complete source release would silently discard the raw.
+            status["fixed_closed_release_reused"] = True
+            return status, closed[0]
         from stockagent.data_sync.parquet_publication import ParquetPublicationSnapshot
         parquet_proof = ParquetPublicationSnapshot(_source_path(entry),
             dataset=entry["dataset"],
@@ -1078,7 +1119,11 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     **({"new_sync_objects": 0, "new_sync_bytes": 0, "changed_files": 0,
                         "reused_files": resolved.manifest["source"]["files"]}
-                       if status.get("fixed_pin", {}).get("reused") is True else {}),
+                       if (status.get("fixed_pin", {}).get("reused") is True
+                           or status.get("fixed_closed_release_reused") is True) else {}),
+                    **({"fixed_closed_release_reused": True,
+                        "source_storage": status["source_storage"]}
+                       if status.get("fixed_closed_release_reused") is True else {}),
                 }
             )
             checkpoint_batch("running")

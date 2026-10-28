@@ -9,6 +9,56 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_parallel_metadata_tree_preserves_rows_links_and_fingerprint(tmp_path):
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+
+    root = tmp_path / 'archive'
+    (root / 'nested' / 'empty').mkdir(parents=True)
+    for index in range(140):
+        (root / 'nested' / f'{index:04d}').write_bytes(str(index).encode())
+    os.link(root / 'nested' / '0000', root / 'hardlink')
+    (root / 'symbolic').symlink_to('nested/0001')
+    serial = metadata_tree(root)
+    assert metadata_tree(root, file_workers=4) == serial
+    assert metadata_tree(root, file_workers=8) == serial
+    assert any(row['kind'] == 'unsupported' for row in serial['rows'])
+    assert serial['reclaimable_allocated_file_bytes'] == serial['allocated_unique_file_bytes']
+    original = root / 'nested' / '0001'
+    before = original.stat()
+    original.write_bytes(b'x')
+    os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns))
+    assert metadata_tree(root, file_workers=4)['fingerprint'] != serial['fingerprint']
+    assert metadata_tree(root, file_workers=4) == metadata_tree(root)
+    assert metadata_tree(root, file_workers=8) == metadata_tree(root)
+
+
+def test_metadata_tree_rejects_unreadable_subdirectory(tmp_path, monkeypatch):
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+
+    root = tmp_path / 'archive'
+    blocked = root / 'blocked'
+    blocked.mkdir(parents=True)
+    original_scandir = os.scandir
+
+    def denied(path):
+        if Path(path) == blocked:
+            raise PermissionError('injected unreadable subtree')
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, 'scandir', denied)
+    for workers in (1, 4, 8):
+        with pytest.raises(PermissionError, match='unreadable subtree'):
+            metadata_tree(root, file_workers=workers)
+
+
+@pytest.mark.parametrize('workers', [0, 9, True, 1.5])
+def test_metadata_tree_rejects_unbounded_or_non_integer_workers(tmp_path, workers):
+    from stockagent.data_sync.remote_legacy_return import metadata_tree
+
+    with pytest.raises(ValueError, match='metadata scan workers'):
+        metadata_tree(tmp_path, file_workers=workers)
+
+
 def test_private_control_carries_packed_reader_with_archive_code():
     """A compute checkout may lack the authority's new packed-reader API."""
     import subprocess
@@ -17,13 +67,25 @@ def test_private_control_carries_packed_reader_with_archive_code():
 
     program = '''
 import stockagent.data_sync.packed_snapshots as old_reader
+import stockagent.data_sync.desync_snapshots as old_scanner
+old_error = old_scanner.SnapshotError
+del old_scanner._iter_lstat_bounded
+del old_scanner._raise_walk_error
+old_scanner.scan_tree = lambda root: None
 del old_reader._verified_packed_inventory
 '''
     program += private_control_prefix()
     program += '''
 from stockagent.data_sync.legacy_artifact_archive import _verified_packed_inventory
 from stockagent.data_sync.packed_snapshots import _verified_packed_inventory as reader
+from stockagent.data_sync.desync_snapshots import scan_tree, SnapshotError
+import tempfile
+from pathlib import Path
 assert _verified_packed_inventory is reader
+assert SnapshotError is old_error
+with tempfile.TemporaryDirectory() as dirname:
+    Path(dirname, 'one').write_text('x')
+    assert scan_tree(Path(dirname), file_workers=4)['files'] == 1
 '''
     result = subprocess.run([sys.executable, '-'], input=program, text=True,
                             capture_output=True, timeout=60)

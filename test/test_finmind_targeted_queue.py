@@ -117,6 +117,8 @@ def test_run_once_dispatches_only_selected_tasks_with_canonical_receipts(tmp_pat
     monkeypatch.setattr(sponsor, "backfill_budget", lambda *_a, **_kw: {"allowed": True})
     monkeypatch.setattr(sponsor, "protected_stock_opening", lambda *_a: False)
     monkeypatch.setattr(sponsor.shutil, "disk_usage", lambda *_a: SimpleNamespace(free=100 * 1024**3))
+    monkeypatch.setattr(sponsor, "AcquisitionCapacitySampler", lambda _root: SimpleNamespace(
+        initial_sample=lambda: {"state": "admitted"}, sample=lambda: {"state": "admitted"}))
     calls = []
     monkeypatch.setattr(sponsor, "_fetch_rows", lambda *_a, **_kw: calls.append(_a[-1]) or [])
     with sponsor._db(tmp_path / "queue.sqlite3") as conn:

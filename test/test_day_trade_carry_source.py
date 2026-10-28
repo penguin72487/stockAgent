@@ -29,6 +29,31 @@ def _write_parquet(path, payload):
     pl.DataFrame(payload).write_parquet(path)
 
 
+@pytest.mark.parametrize("repeats", [1, 2, 300])
+def test_dense_minutes_keep_values_and_reject_first_duplicate_slot(tmp_path, repeats):
+    from stockagent.data.tw_day_trade_carry_source import _dense_bars
+
+    # The first duplicate in input order is not the first slot in symbol order.
+    rows = [{"symbol": symbol, "minutes_from_open": minute, "Open": price,
+             "High": price, "Low": price, "Close": price, "Amount": price * 2000.,
+             "volume_shares": 2000.}
+            for symbol, minute, price in (("a", 1, 50.), ("b", 270, 100.))
+            for _ in range(repeats)]
+    # Nonmembers and minutes outside the admitted session cannot create duplicates.
+    rows += [{**rows[0], "symbol": "outside"}, {**rows[0], "minutes_from_open": 0}] * 2
+    path = tmp_path / "minutes.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    if repeats > 1:
+        with pytest.raises(ValueError, match="symbol=b minute=270"):
+            _dense_bars(path, ("b", "a"))
+    else:
+        dense, totals = _dense_bars(path, ("b", "a"))
+        np.testing.assert_array_equal(dense[0, 269], [100.] * 5 + [2000.])
+        np.testing.assert_array_equal(dense[1, 0], [50.] * 5 + [2000.])
+        assert np.isnan(dense[0, :269, :5]).all() and not dense[0, :269, 5].any()
+        np.testing.assert_array_equal(totals, [2000., 2000.])
+
+
 def _write_action_receipts(public, rows):
     reference = public / "tw_corporate_action_reference.parquet"
     reference.with_suffix(".summary.json").write_text("{}", encoding="utf-8")

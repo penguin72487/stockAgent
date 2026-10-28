@@ -78,6 +78,32 @@ def test_minute_timestamp_day_and_alignment_must_match_the_partition():
         _validate_frame(frame, "tw_minute:2330", date(2026, 6, 1))
 
 
+def test_futures_minute_partition_retains_overnight_trade_date_and_native_scope(tmp_path):
+    day = date(2026, 6, 1)
+    frame = pd.DataFrame({
+        'stock_id': ['TX_202606', 'TX_202606'], 'trade_date': ['2026-06-01', '2026-06-01'],
+        'timestamp': pd.to_datetime(['2026-05-29T15:00:00+08:00', '2026-06-01T08:45:00+08:00']),
+        'session': ['after_hours', 'regular'], 'open': [100., 101.], 'high': [100., 101.],
+        'low': [100., 101.], 'close': [100., 101.], 'volume': [2, 1],
+    })
+    frame.attrs['volume_scope'] = 'outright_only'
+    with patch('finlab.data.get', return_value=frame):
+        receipt = fetch_partition(tmp_path, 'tw_futures_minute:TX_202606', day,
+                                  now=datetime(2026, 9, 25, tzinfo=UTC), force_download=False)
+    assert receipt['rows'] == 2
+    assert receipt['source_grain'] == 'futures_contract_month_trade_day_left_labelled_minute'
+    assert receipt['raw_volume_unit'] == 'contracts'
+    assert receipt['canonical_volume_unit'] == 'contracts_not_independently_reconciled'
+    assert receipt['volume_scope'] == 'outright_only'
+    frame.attrs['volume_scope'] = 'all_trades'
+    with pytest.raises(ValueError, match='outright-only'):
+        _validate_frame(frame, 'tw_futures_minute:TX_202606', day)
+    frame.attrs['volume_scope'] = 'outright_only'
+    frame.loc[0, 'session'] = 'regular'
+    with pytest.raises(ValueError, match='trade-date session'):
+        _validate_frame(frame, 'tw_futures_minute:TX_202606', day)
+
+
 def test_tick_same_timestamp_keeps_both_provider_rows():
     day = date(2026, 6, 1)
     frame = _tick_frame()

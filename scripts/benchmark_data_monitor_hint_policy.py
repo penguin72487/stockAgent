@@ -27,9 +27,19 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from stockagent.live import data_monitor_inventory as inventory  # noqa: E402
+from stockagent.live.data_monitor_record_store import cache_file, stable_record_cache_bytes  # noqa: E402
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"non-finite inventory JSON: {value}")
 
 
 def _frozen_cache(path: Path) -> tuple[bytes, dict]:
+    if cache_file(path) != path:
+        body = stable_record_cache_bytes(path)
+        cache = json.loads(body, parse_constant=_reject_nonfinite)
+        # Reuse the original complete shape validation below.
+        return _validate_frozen_cache(body, cache)
     before = inventory._file_identity(path.stat())
     with path.open("rb") as stream:
         if inventory._file_identity(os.fstat(stream.fileno())) != before:
@@ -40,10 +50,11 @@ def _frozen_cache(path: Path) -> tuple[bytes, dict]:
     if inventory._file_identity(path.stat()) != before:
         raise ValueError("cache changed after read")
 
-    def reject_nonfinite(value: str) -> None:
-        raise ValueError(f"non-finite inventory JSON: {value}")
+    cache = json.loads(body, parse_constant=_reject_nonfinite)
+    return _validate_frozen_cache(body, cache)
 
-    cache = json.loads(body, parse_constant=reject_nonfinite)
+
+def _validate_frozen_cache(body, cache):
     if (
         not isinstance(cache, dict) or cache.get("version") != inventory.INVENTORY_VERSION
         or not isinstance(cache.get("files"), dict)

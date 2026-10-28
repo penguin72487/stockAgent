@@ -291,17 +291,27 @@ run_fintech_python scripts/benchmark_dashboard_latency.py \
 
 ### 2026-09-09 即時通知與關鍵畫面
 
-- 當沖及共用隔日沖前端透過同源 `api/updates` SSE 接收唯讀 revision。
+- 2026-10-28 起，當沖頁依使用者要求改為進頁即讀取、其後每分鐘讀取最新可取得版本；
+  隱藏分頁暫停，回到已超過一分鐘的分頁立即讀取，手動更新與篩選不受此限制。
+  訊號、持倉及最近紀錄顯示各自版本與來源時間；讀取失敗保留前次成功內容並標示失敗，
+  不把模擬成交稱為券商成交。這只改顯示節奏，不更動當沖引擎與帳本。隔日沖前端仍透過
+  同源 `api/updates` SSE 接收唯讀 revision。
   公開服務僅監看既有 receipt：Linux inotify 察覺原子替換後喚醒所有讀者，
   不呼叫交易引擎、不送單、不下載，也不重啟其他服務。
+- 本次 2026-10-28 驗收：當沖公網瀏覽器首載各請求一次訊號、已確認持倉、最近事件與
+  status；以瀏覽器虛擬時鐘前進一分鐘後各增加一次，手動更新各再增加一次，沒有當沖
+  SSE／revision 輪詢。中止兩個讀取請求可見失敗提示且保留前次訊號與持倉。另測手機
+  首屏及隔日沖 SSE；79 項相關 Node 測試、13 項 Python 靜態／閘道測試通過。
+  測試時網站健康仍為 degraded，這項驗收不等於開盤或成交成功。
 - 全服務最多 64 條更新連線、一個檔案 watcher；每 topic 僅保存最新 generation，
   不累積逐客戶事件佇列。慢客戶寫入逾時 5 秒；15 秒心跳，隱藏分頁關閉串流。
   缺 inotify 時改用 250 ms 檔案檢查；串流失敗時前端每秒輪詢，正常時每 15 秒對帳。
-- 通知不是資料本身。引擎 revision 改變，以及該 revision 的公開 status 快取完成，
+- 隔日沖的通知不是資料本身。引擎 revision 改變，以及該 revision 的公開 status 快取完成，
   都會通知。前端以「已套用 status」而非「已收到通知」判斷進度，避免
   stale-while-rebuild 回傳舊畫面後就吞掉新版。來源缺口與等待狀態仍原樣顯示。
 - history/signals/positions/events 快取鍵含內容 revision；前端分鐘快取也包含
-  已套用 revision，不能為等待 45/55 秒 TTL 而漏顯新訊號或新分鐘。
+  已套用 revision。當沖每次分鐘讀取都核對最新 revision，不因舊 TTL 隱藏已取得的新版本；
+  隔日沖仍以通知與對帳更新。
 - 訊號請求先送出，分鐘歷史隨即獨立載入；兩者不互相 await。次要明細等主畫面
   後才載入。日期改變時過期 status 回應不得覆寫新篩選。
 - 分鐘欄位只解碼一次；未變更曲線不重建 SVG，共用時間座標每分鐘只計算一次。
@@ -537,13 +547,16 @@ FinMind 的每分鐘背景快照、公開欄位投影與 renderer 必須共同�
 
 `/news/` 沿用 FinMind CSS、共用導覽和 `dashboard-acquisition.js` 的摘要／原生
 折疊資訊層級；首頁與各面板導覽都有入口。`/news/api/status` 只讀 canonical
-`data_news_fulltext/status.json` 與來源設定，投影 `schema_version=1` 的 allowlist DTO。
+`data_news_fulltext/status.json`、來源設定及審查清冊，投影 `schema_version=1` 的 allowlist DTO。
 不開 SQLite writer、不掃正文／Parquet、不呼叫新聞、FinLab 或 FinMind API；
 正文、HTML、金鑰、授權文件、文章 URL、私人路徑與自由格式錯誤不公開。
 
 - 全域分子是實存正文唯一網址，分母是已清點唯一網址。股票關聯 metadata 列、
   正文版本及 complete 狀態分開；這不是全網／所有歷史完整率。全來源清冊不截成
   Top K，前端每頁 24 個，保留搜尋、分類、排序及最後一頁。
+- 來源審查後續問題只投影 `open`、`none_recorded` 或 `unknown` 和來源鍵數；
+  別名可能重複，未知或未列問題不等於來源已完成。不公開問題文字，不將狀態當作
+  抓取授權。清冊無法驗證時關閉該篩選並回到全部，原下載佇列不受影響。
 - 原始 UTF-8 正文大小、owner HTTP 回應 bytes 與壓縮磁碟容量不同；總下載量未知。
   流量是目前 owner 累計，不冒充 FinMind 的滾動一小時數字。
   client 配置間隔／並行與實測請求間隔分開，未確認的官方總配額、餘額及重置時間

@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 import pickle
 import re
+import stat as stat_module
 import sys
 import tempfile
 import threading
@@ -86,6 +87,8 @@ from stockagent.live.tw_day_trade_service_sync import (
     paper_journal_generations,
     read_json_object,
 )
+from stockagent.live.paper_mode_snapshot import MANIFEST_KEY, expand_paper_state
+from stockagent.live.paper_journal import managed as _managed_journal, open_paper_journal, snapshot_of
 
 
 DASHBOARD_SCHEMA_VERSION: Final[int] = 5
@@ -116,7 +119,15 @@ CHART_RANGE_SECONDS: Final[dict[str, int | None]] = {
     "1y": 365 * 24 * 60 * 60,
     "all": None,
 }
-_LINE_COUNT_CACHE: dict[Path, tuple[int, int, int, int, int]] = {}
+@dataclass(frozen=True)
+class _LedgerLineCount:
+    generation: tuple[int, ...]
+    count: int
+    prefix_sha256: str | None
+    journal_head: str | None
+
+
+_LINE_COUNT_CACHE: dict[Path, _LedgerLineCount] = {}
 _LINE_COUNT_LOCK = threading.Lock()
 _TAIL_CACHE: dict[
     tuple[Any, ...], tuple[tuple[int, ...], list[dict[str, Any]]]
@@ -128,6 +139,10 @@ _OPENING_FAILED_ATTEMPT_FIELDS: Final[tuple[str, ...]] = (
     "error_type", "error_code", "error_message", "failure_stage",
     "opening_input_coverage",
 )
+_OPENING_TAIL_PROJECTION_CONTRACT: Final[str] = "opening_failure_fields_v1:" + hashlib.sha256(
+    json.dumps(_OPENING_FAILED_ATTEMPT_FIELDS).encode()
+).hexdigest()
+_TAIL_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024**2
 _OPENING_FAILURE_DECODER = (
     _ProjectionDecoder(_projection_struct(
         "_OpeningFailedAttempt",
@@ -147,13 +162,13 @@ class _CompleteSessionRows:
 
 _SESSION_TAIL_CACHE: dict[
     tuple[Path, int | None, str, bool],
-    tuple[int, int, int, int, list[dict[str, Any]]] | _CompleteSessionRows,
+    tuple[int, int, int, int, int, list[dict[str, Any]]] | _CompleteSessionRows,
 ] = {}
 _SESSION_TAIL_CACHE_LOCK = threading.Lock()
 _SESSION_FACTS_CACHE_MAX_ITEM_BYTES: Final[int] = 8 * 1024 * 1024
 _SESSION_FACTS_CACHE_MAX_BYTES: Final[int] = 32 * 1024 * 1024
 _LATEST_SESSION_BLOCK_CACHE: dict[
-    tuple[Path, int, str, bool], tuple[int, int, int, int, list[dict[str, Any]]]
+    tuple[Path, int, str, bool], tuple[int, int, int, int, int, list[dict[str, Any]]]
 ] = {}
 _LATEST_SESSION_BLOCK_CACHE_LOCK = threading.Lock()
 _SIGNAL_FEATURE_SUMMARY_CACHE: dict[
@@ -259,7 +274,7 @@ _MAX_LEDGER_LINE_BYTES: Final[int] = 8 * 1024 * 1024
 _COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
 _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
 _COLUMNAR_LEDGER_WRITE_BUFFER_BYTES: Final[int] = 8 * 1024 * 1024
-_DETAIL_SESSION_PROJECTION_VERSION: Final[int] = 1
+_DETAIL_SESSION_PROJECTION_VERSION: Final[int] = 2
 _DETAIL_SESSION_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024 * 1024
 _HISTORY_MARK_COLUMN_TYPES: Final[dict[str, str]] = {
     "session_date": "string", "market": "string", "benchmark_id": "string",
@@ -323,6 +338,14 @@ _SIGNAL_PAGE_NARROW_COLUMNS: Final[tuple[str, ...]] = (
     "execution_price", "requested_shares", "reason", "status",
     "__projection_row",
 )
+# Quote-side columns can legitimately be absent from an entire historical
+# projection. The canonical summary treats them as unknown, not zero prices;
+# it must not discard a complete shard and fall back to a truncated raw tail.
+_SIGNAL_PAGE_REQUIRED_COLUMNS: Final[frozenset[str]] = frozenset({
+    "execution_price", "filled_shares", "filled_weight", "market", "reason",
+    "requested_shares", "session_date", "signal_id", "sizing_open_price",
+    "status", "symbol", "target_weight",
+})
 _EVENT_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "commission_rebate_accrued_twd": "float",
     "depth_assumption": "string",
@@ -374,6 +397,7 @@ class _LedgerSessionIndex:
     # A runtime-only observation for complete-session readers. Legacy disk
     # indices have no ctime proof; this does not invent one across restarts.
     facts_signature: tuple[int, int, int, int, int] | None = None
+    journal_head: str | None = None
 
 
 _LEDGER_SESSION_INDEX_CACHE: dict[tuple[Path, bool], _LedgerSessionIndex] = {}
@@ -462,6 +486,8 @@ def _load_persistent_ledger_index(
             changed_ns=(int(payload["changed_ns"]) if payload.get("changed_ns") is not None else None),
             lineage=(str(payload["lineage"]) if re.fullmatch(r"[0-9a-f]{32}", str(payload.get("lineage")))
                      else uuid.uuid4().hex),
+            journal_head=(str(payload["journal_head"]) if re.fullmatch(
+                r"[0-9a-f]{64}", str(payload.get("journal_head"))) else None),
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -490,6 +516,7 @@ def _persist_ledger_index(
         "prefix_sha256": index.prefix_sha256,
         "changed_ns": index.changed_ns,
         "lineage": index.lineage,
+        "journal_head": index.journal_head,
         "spans": {
             session_date: [[start, end] for start, end in ranges]
             for session_date, ranges in index.spans.items()
@@ -579,7 +606,7 @@ class _PositionHistoryEntry:
 
 @dataclass(frozen=True, slots=True)
 class _PositionHistoryIndex:
-    source_signature: tuple[tuple[str, int, int, int, int], ...]
+    source_signature: tuple[tuple[str, int, int, int, int, int], ...]
     sources: tuple[Path, ...]
     entries: tuple[_PositionHistoryEntry, ...]
     per_source_entries: tuple[tuple[_PositionHistoryEntry, ...], ...]
@@ -587,7 +614,7 @@ class _PositionHistoryIndex:
 
 _POSITION_HISTORY_INDEX_CACHE: dict[Path, _PositionHistoryIndex] = {}
 _POSITION_HISTORY_INDEX_LOCK = threading.Lock()
-_POSITION_HISTORY_INDEX_SCHEMA_VERSION: Final[int] = 2
+_POSITION_HISTORY_INDEX_SCHEMA_VERSION: Final[int] = 3
 
 
 @lru_cache(maxsize=32)
@@ -795,13 +822,17 @@ def _object(path: Path, *, use_cache: bool = True) -> dict[str, Any]:
             if cached is not None and cached[0] == signature:
                 return dict(cached[2])
     # Bind bytes to the open descriptor, not a new pathname after replacement.
-    with path.open("rb") as stream:
+    with open_paper_journal(path, "rb") as stream:
         opened = metadata_signature(os.fstat(stream.fileno()))
         raw = stream.read()
         finished = metadata_signature(os.fstat(stream.fileno()))
     payload = private_json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root is not an object: {path}")
+    if MANIFEST_KEY in payload:
+        # Never cache a decoded manifest by its parent inode alone: child
+        # corruption must fail even when state.json itself did not change.
+        return expand_paper_state(payload, path.parent, use_cache=use_cache)
     if (
         use_cache
         and signature == opened == finished == metadata_signature(path.stat())
@@ -1263,14 +1294,15 @@ def _overlay_signal_page_rows(
 class _VerifiedTailRows(list):
     """Projected rows plus bounded physical-line provenance for append reuse."""
 
-    __slots__ = ("line_slots", "source_size", "prefix_sha256", "terminated")
+    __slots__ = ("line_slots", "source_size", "prefix_sha256", "terminated", "journal_head")
 
-    def __init__(self, slots, size, digest, terminated):
+    def __init__(self, slots, size, digest, terminated, journal_head=None):
         super().__init__(row for _, row in slots if row is not None)
         self.line_slots = tuple(slots)
         self.source_size = size
-        self.prefix_sha256 = digest.hexdigest()
+        self.prefix_sha256 = digest.hexdigest() if digest is not None else None
         self.terminated = terminated
+        self.journal_head = journal_head
 
 
 def _jsonl_tail_start(handle, size_bytes: int, maximum_rows: int, *, minimum_offset: int = 0) -> int:
@@ -1328,9 +1360,10 @@ def _read_jsonl_tail(
     the observed size. Projection happens before a decoded row is retained.
     """
     result: list[dict[str, Any]] = []
-    with path.open("rb") as handle:
+    with open_paper_journal(path, "rb") as handle:
         start = _jsonl_tail_start(handle, size_bytes, maximum_rows)
-        digest = _hash_jsonl_prefix(handle, start) if verified_append else None
+        snapshot = snapshot_of(handle)
+        digest = _hash_jsonl_prefix(handle, start) if verified_append and snapshot is None else None
         slots = []
         terminated = True
         handle.seek(start)
@@ -1353,24 +1386,24 @@ def _read_jsonl_tail(
             if verified_append:
                 slots.append((offset, row))
         if verified_append:
-            return _VerifiedTailRows(slots, size_bytes, digest, terminated)
+            return _VerifiedTailRows(slots, size_bytes, digest, terminated,
+                                     snapshot.head["sha256"] if snapshot is not None else None)
     return result
 
 
 def _read_verified_jsonl_append(path, maximum_rows, signature, cached, row_projection, row_decoder):
     """Validate ALL old bytes before reusing a single previously decoded row.
 
-    This deliberately retains O(source bytes) hashing and source stat fences.
-    Only JSON decoding/projection is incremental; an inode/size-only shortcut
-    could hide a same-inode rewrite during growth. Ordinary small tails do not
-    opt into this extra verification cost.
+    Legacy files retain complete-prefix hashing. An enrolled immutable stream
+    may instead prove exact byte ancestry from its content-addressed parent;
+    inode/size growth alone never authorizes skipping rewrite detection.
     """
     previous_signature, previous = cached
     if (not isinstance(previous, _VerifiedTailRows)
             or previous_signature[:2] != signature[:2]
             or signature[2] <= previous.source_size):
         return None
-    with path.open("rb") as handle:
+    with open_paper_journal(path, "rb") as handle:
         if _tail_file_signature(os.fstat(handle.fileno())) != signature:
             return None
         decode_start = previous.source_size
@@ -1385,9 +1418,15 @@ def _read_verified_jsonl_append(path, maximum_rows, signature, cached, row_proje
                 # No old physical line survives. Decode only the new last N
                 # lines, ignoring corrupt older lines exactly as a cold read.
                 return None
-        digest = _hash_jsonl_prefix(handle, previous.source_size)
-        if digest.hexdigest() != previous.prefix_sha256:
-            return None
+        snapshot = snapshot_of(handle)
+        if snapshot is not None and snapshot.extends(previous.journal_head, previous.source_size):
+            digest = None
+        else:
+            if previous.prefix_sha256 is None:
+                return None
+            digest = _hash_jsonl_prefix(handle, previous.source_size)
+            if digest.hexdigest() != previous.prefix_sha256:
+                return None
         # A valid unterminated object may acquire more bytes or split CRLF.
         # Remove and re-read it. Blank/nonobject rows still occupy deque slots.
         slots = deque(((offset, row) for offset, row in previous.line_slots
@@ -1399,12 +1438,86 @@ def _read_verified_jsonl_append(path, maximum_rows, signature, cached, row_proje
             line = handle.readline(signature[2] - offset)
             if not line:
                 break
-            digest.update(line[max(0, previous.source_size - offset):])
+            if digest is not None:
+                digest.update(line[max(0, previous.source_size - offset):])
             terminated = line.endswith(b"\n")
             payload = (row_decoder(line) if row_decoder else json.loads(line.decode("utf-8"))) if line.strip() else None
             row = (row_projection(payload) if row_projection else payload) if isinstance(payload, dict) else None
             slots.append((offset, row))
-        return _VerifiedTailRows(slots, signature[2], digest, terminated)
+        return _VerifiedTailRows(slots, signature[2], digest, terminated,
+                                 snapshot.head["sha256"] if snapshot is not None else None)
+
+
+def _opening_tail_projection_path(path: Path, maximum_rows: int) -> Path | None:
+    cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+    if not cache_root or not Path(cache_root).is_dir():
+        return None
+    identity = [str(path.resolve()), maximum_rows, _OPENING_TAIL_PROJECTION_CONTRACT]
+    digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    return Path(cache_root) / f"opening-tail-projection-v1-{digest}.json"
+
+
+def _load_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: int):
+    """Restore only a byte-generation-bound derived tail, never source truth.
+
+    A changed raw prefix still goes through the existing complete SHA check in
+    the append reader. Replacements/ctime-only rewrites cannot become hits.
+    Cache damage is a miss; damage in the authoritative JSONL still raises.
+    """
+    try:
+        fd = os.open(cache_path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat_module.S_ISREG(before.st_mode) or before.st_size > _TAIL_PROJECTION_MAX_BYTES:
+                return None
+            body = handle.read(_TAIL_PROJECTION_MAX_BYTES + 1)
+            if _tail_file_signature(before) != _tail_file_signature(os.fstat(handle.fileno())):
+                return None
+        if _tail_file_signature(before) != _tail_file_signature(cache_path.lstat()):
+            return None
+        envelope = private_json.loads(body)
+        value = envelope["payload"]
+        if (envelope["sha256"] != hashlib.sha256(private_json.ledger_bytes(value)).hexdigest()
+                or value["contract"] != _OPENING_TAIL_PROJECTION_CONTRACT
+                or value["source"] != str(path.resolve()) or value["maximum_rows"] != maximum_rows):
+            return None
+        generation, slots = value["generation"], value["line_slots"]
+        prefix = value["prefix_sha256"]
+        if (not isinstance(generation, list) or len(generation) != 5
+                or any(type(item) is not int or item < 0 for item in generation)
+                or not isinstance(prefix, str) or re.fullmatch(r"[0-9a-f]{64}", prefix) is None
+                or type(value["terminated"]) is not bool
+                or not isinstance(slots, list) or len(slots) > maximum_rows):
+            return None
+        previous_offset = -1
+        for slot in slots:
+            if (not isinstance(slot, list) or len(slot) != 2
+                    or type(slot[0]) is not int or not previous_offset < slot[0] < generation[2]
+                    or slot[1] is not None and not isinstance(slot[1], dict)):
+                return None
+            previous_offset = slot[0]
+        restored = _VerifiedTailRows(slots, generation[2], None, value["terminated"])
+        restored.prefix_sha256 = prefix
+        return tuple(generation), restored
+    except (OSError, KeyError, TypeError, ValueError, RecursionError, OverflowError):
+        return None
+
+
+def _store_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: int,
+                                   signature: tuple[int, ...], rows: list) -> None:
+    if not isinstance(rows, _VerifiedTailRows) or rows.journal_head is not None:
+        return
+    try:
+        value = {"contract": _OPENING_TAIL_PROJECTION_CONTRACT, "source": str(path.resolve()),
+                 "maximum_rows": maximum_rows, "generation": list(signature),
+                 "prefix_sha256": rows.prefix_sha256, "terminated": rows.terminated,
+                 "line_slots": rows.line_slots}
+        digest = hashlib.sha256(private_json.ledger_bytes(value)).hexdigest()
+        encoded = private_json.ledger_bytes({"sha256": digest, "payload": value})
+        if len(encoded) <= _TAIL_PROJECTION_MAX_BYTES:
+            _atomic_private_bytes(cache_path, encoded)
+    except (OSError, TypeError, ValueError, RecursionError, OverflowError):
+        pass  # An optional derived cache cannot invalidate a valid source read.
 
 
 def _tail(
@@ -1425,8 +1538,19 @@ def _tail(
         signature = _tail_file_signature(stat)
         with _TAIL_CACHE_LOCK:
             cached = _TAIL_CACHE.get(cache_key)
-            if cached and cached[0] == signature:
-                return list(cached[1])
+        projection_path = (
+            _opening_tail_projection_path(path, maximum_rows)
+            if verified_append and row_projection is None
+            and row_decoder is _decode_opening_latency_row else None
+        )
+        if cached is None and projection_path is not None:
+            cached = _load_opening_tail_projection(projection_path, path, maximum_rows)
+        if cached and cached[0] == signature and _tail_file_signature(path.stat()) == signature:
+            with _TAIL_CACHE_LOCK:
+                if cache_key not in _TAIL_CACHE and len(_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
+                    _TAIL_CACHE.pop(next(iter(_TAIL_CACHE)))
+                _TAIL_CACHE[cache_key] = cached
+            return list(cached[1])
         result = (_read_verified_jsonl_append(path, maximum_rows, signature, cached, row_projection, row_decoder)
                   if verified_append and cached else None)
         if result is None:
@@ -1438,6 +1562,8 @@ def _tail(
                 if cache_key not in _TAIL_CACHE and len(_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
                     _TAIL_CACHE.pop(next(iter(_TAIL_CACHE)))
                 _TAIL_CACHE[cache_key] = (signature, result)
+            if projection_path is not None:
+                _store_opening_tail_projection(projection_path, path, maximum_rows, signature, result)
         return list(result)
 
 
@@ -1581,24 +1707,28 @@ def _ledger_session_index(
                 scanned_offset = 0
                 spans = {}
 
-            with source.open("rb") as handle:
+            with open_paper_journal(source, "rb") as handle:
                 if metadata_signature(os.fstat(handle.fileno())) != metadata_signature(stat):
                     continue
-                prefix_digest = hashlib.sha256()
+                snapshot = snapshot_of(handle)
+                prefix_digest = hashlib.sha256() if snapshot is None else None
                 if can_extend and cached is not None:
-                    remaining = scanned_offset
-                    while remaining:
-                        chunk = handle.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            raise OSError(f"dashboard ledger prefix was truncated: {source}")
-                        prefix_digest.update(chunk)
-                        remaining -= len(chunk)
-                    if prefix_digest.hexdigest() != cached.prefix_sha256:
+                    immutable_extension = (snapshot is not None and snapshot.extends(
+                        cached.journal_head, cached.observed_size))
+                    if not immutable_extension and prefix_digest is not None:
+                        remaining = scanned_offset
+                        while remaining:
+                            chunk = handle.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise OSError(f"dashboard ledger prefix was truncated: {source}")
+                            prefix_digest.update(chunk)
+                            remaining -= len(chunk)
+                    if not immutable_extension and (prefix_digest is None or prefix_digest.hexdigest() != cached.prefix_sha256):
                         # Same inode + larger size can also be a repair and an
                         # append. Reindex/re-digest rather than resurrecting
                         # unchanged-span session shards from the old lineage.
                         can_extend, scanned_offset, spans = False, 0, {}
-                        prefix_digest = hashlib.sha256()
+                        prefix_digest = hashlib.sha256() if snapshot is None else None
                 handle.seek(scanned_offset)
                 cursor = scanned_offset
                 while cursor < stat.st_size:
@@ -1617,7 +1747,8 @@ def _ledger_session_index(
                         raise ValueError(
                             f"dashboard ledger line is too large: {source}"
                         )
-                    prefix_digest.update(line)
+                    if prefix_digest is not None:
+                        prefix_digest.update(line)
                     if not line.strip():
                         scanned_offset = cursor
                         continue
@@ -1647,7 +1778,8 @@ def _ledger_session_index(
                 modified_ns=stat.st_mtime_ns,
                 scanned_offset=scanned_offset,
                 spans=spans,
-                prefix_sha256=prefix_digest.hexdigest(),
+                prefix_sha256=prefix_digest.hexdigest() if prefix_digest is not None else None,
+                journal_head=snapshot.head["sha256"] if snapshot is not None else None,
                 changed_ns=stat.st_ctime_ns,
                 lineage=cached.lineage if can_extend and cached is not None else uuid.uuid4().hex,
                 facts_signature=observed_signature,
@@ -1723,7 +1855,7 @@ def _rows_for_sessions(
     # their full scan and validation path below.
     if maximum_rows is not None:
         newest_first: list[tuple[str, dict[str, Any]]] = []
-        with source.open("rb") as handle:
+        with open_paper_journal(source, "rb") as handle:
             for start, end, indexed_date in reversed(selected_spans):
                 handle.seek(end - 1)
                 if handle.read(1) != b"\n":
@@ -1770,7 +1902,7 @@ def _rows_for_sessions(
     retained: deque[tuple[str, dict[str, Any]]] | list[tuple[str, dict[str, Any]]] = (
         deque(maxlen=maximum_rows) if maximum_rows is not None else []
     )
-    with source.open("rb") as handle:
+    with open_paper_journal(source, "rb") as handle:
         for start, end, indexed_date in selected_spans:
             handle.seek(start)
             while handle.tell() < end:
@@ -1825,7 +1957,7 @@ def _write_recent_ledger_lines(
             pending.clear()
             pending_bytes = 0
 
-    with Path(source).open("rb") as handle:
+    with open_paper_journal(Path(source), "rb") as handle:
         for start, end, _indexed_date in reversed(selected_spans):
             handle.seek(end - 1)
             if handle.read(1) != b"\n":
@@ -1956,7 +2088,7 @@ def _columnar_ledger_frame(
                 frame = read_frame(source)
             else:
                 chunks: list[bytes] = []
-                with Path(source).open("rb") as handle:
+                with open_paper_journal(Path(source), "rb") as handle:
                     for start, end, _ in selected_spans:
                         handle.seek(start)
                         chunk = handle.read(end - start)
@@ -1990,7 +2122,7 @@ def _detail_session_projection_root(
         separators=(",", ":"),
     ).encode("utf-8")
     digest = hashlib.sha256(contract).hexdigest()
-    return Path(cache_name) / f"detail-session-projection-v1-{digest}"
+    return Path(cache_name) / f"detail-session-projection-v{_DETAIL_SESSION_PROJECTION_VERSION}-{digest}"
 
 
 def _validated_projected_ledger_session_file(
@@ -2008,8 +2140,8 @@ def _validated_projected_ledger_session_file(
         return None
     try:
         stat = source.stat()
-        if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != (
-            index.device, index.inode, index.observed_size, index.modified_ns
+        if metadata_signature(stat) != (
+            index.device, index.inode, index.observed_size, index.modified_ns, index.changed_ns
         ):
             return None
         receipt_path = root / f"{session_date}.json"
@@ -2023,6 +2155,7 @@ def _validated_projected_ledger_session_file(
             and receipt.get("schema_version") == _DETAIL_SESSION_PROJECTION_VERSION
             and receipt.get("source") == str(source.resolve())
             and receipt.get("source_identity") == [index.device, index.inode]
+            and receipt.get("source_lineage") == index.lineage
             and receipt.get("spans") == [list(span) for span in spans]
             and isinstance(receipt.get("source_observed_size"), int)
             and (
@@ -2030,6 +2163,7 @@ def _validated_projected_ledger_session_file(
                 or (
                     stat.st_size == receipt["source_observed_size"]
                     and stat.st_mtime_ns == receipt.get("source_modified_ns")
+                    and stat.st_ctime_ns == receipt.get("source_changed_ns")
                 )
             )
             and 0 < shard_stat.st_size <= _DETAIL_SESSION_PROJECTION_MAX_BYTES
@@ -2048,7 +2182,7 @@ def _validated_projected_ledger_session_file(
             current.st_mtime_ns, current.st_ctime_ns,
         ) != signature or hashlib.sha256(encoded).hexdigest() != receipt.get(
             "parquet_sha256"
-        ):
+        ) or metadata_signature(source.stat()) != metadata_signature(stat):
             return None
         return parquet_path, encoded, receipt["rows"], signature
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
@@ -2079,8 +2213,8 @@ def _projected_ledger_session_frame(
         stat = source.stat()
     except OSError:
         return None
-    if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != (
-        index.device, index.inode, index.observed_size, index.modified_ns
+    if metadata_signature(stat) != (
+        index.device, index.inode, index.observed_size, index.modified_ns, index.changed_ns
     ):
         return None
     try:
@@ -2118,6 +2252,7 @@ def _projected_ledger_session_frame(
         if (
             updated is None
             or (updated.device, updated.inode) != (index.device, index.inode)
+            or updated.lineage != index.lineage
             or updated.spans.get(session_date) != spans
         ):
             return None
@@ -2133,6 +2268,8 @@ def _projected_ledger_session_frame(
             "source_identity": [index.device, index.inode],
             "source_observed_size": index.observed_size,
             "source_modified_ns": index.modified_ns,
+            "source_changed_ns": index.changed_ns,
+            "source_lineage": index.lineage,
             "spans": [list(span) for span in spans],
             "parquet_sha256": hashlib.sha256(encoded).hexdigest(),
             "rows": frame.height,
@@ -2173,8 +2310,6 @@ def _narrow_signal_page_projection(
             spans = index.spans.get(day, ())
             if not spans:
                 continue
-            if len(spans) != 1:
-                return None
             validated = _validated_projected_ledger_session_file(
                 source,
                 index=index,
@@ -2208,12 +2343,7 @@ def _narrow_signal_page_projection(
             for column in ("signal_id", "reason", "status")
             if column in frame.columns
         )
-        required = {
-            "ask", "bid", "execution_price", "filled_shares", "filled_weight",
-            "market", "reason", "requested_shares", "session_date", "signal_id",
-            "sizing_open_price", "status", "symbol", "target_weight",
-        }
-        if not required.issubset(frame.columns) or frame.height != expected_rows or not all(
+        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns) or frame.height != expected_rows or not all(
             _projected_file_signature(path) == signature
             for path, signature in paths.values()
         ):
@@ -2363,14 +2493,14 @@ def _bounded_parquet_history_rows(
     *,
     session_dates: list[str] | tuple[str, ...],
     maximum_rows: int,
-) -> tuple[list[dict[str, Any]], int, tuple[int, int, int, int] | None]:
+) -> tuple[list[dict[str, Any]], int, tuple[int, int, int, int, int] | None]:
     """Read a bounded newest slice from an immutable historical detail table."""
 
     source = Path(path)
     if not source.is_file() or not session_dates or maximum_rows <= 0:
         return [], 0, None
     stat = source.stat()
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    signature = metadata_signature(stat)
     try:
         import polars as pl
     except ImportError as exc:  # pragma: no cover - production runtime requires Polars
@@ -2388,12 +2518,7 @@ def _bounded_parquet_history_rows(
         .collect()
     )
     final_stat = source.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) != signature:
+    if metadata_signature(final_stat) != signature:
         raise OSError(f"historical dashboard table changed while reading: {source}")
     return frame.to_dicts(), total, signature
 
@@ -2503,11 +2628,11 @@ def _tail_for_session(
         str(session_date),
         bool(recorded_at_fallback),
     )
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    signature = metadata_signature(stat)
     with _SESSION_TAIL_CACHE_LOCK:
         cached = _SESSION_TAIL_CACHE.get(cache_key)
-        if cached and cached[:4] == signature:
-            return list(cached[4])
+        if cached and cached[:5] == signature:
+            return list(cached[5])
 
     index_cache_key = (path.resolve(), bool(recorded_at_fallback))
     persistent_index_path = _persistent_ledger_index_path(
@@ -2527,12 +2652,7 @@ def _tail_for_session(
             ).get(session_date, ())
         )
         final_stat = path.stat()
-        if (
-            final_stat.st_dev,
-            final_stat.st_ino,
-            final_stat.st_size,
-            final_stat.st_mtime_ns,
-        ) == signature:
+        if metadata_signature(final_stat) == signature:
             with _SESSION_TAIL_CACHE_LOCK:
                 if len(_SESSION_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
                     _SESSION_TAIL_CACHE.pop(next(iter(_SESSION_TAIL_CACHE)))
@@ -2540,7 +2660,7 @@ def _tail_for_session(
         return indexed
 
     newest_first: list[dict[str, Any]] = []
-    with path.open("rb") as handle:
+    with open_paper_journal(path, "rb") as handle:
         cursor = handle.seek(0, 2)
         remainder = b""
         while cursor > 0 and len(newest_first) < maximum_rows:
@@ -2579,12 +2699,7 @@ def _tail_for_session(
                     newest_first.append(payload)
     result = list(reversed(newest_first))
     final_stat = path.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) == signature:
+    if metadata_signature(final_stat) == signature:
         with _SESSION_TAIL_CACHE_LOCK:
             if len(_SESSION_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
                 _SESSION_TAIL_CACHE.pop(next(iter(_SESSION_TAIL_CACHE)))
@@ -2616,23 +2731,18 @@ def _latest_contiguous_session_rows(
         str(session_date),
         bool(recorded_at_fallback),
     )
-    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    signature = metadata_signature(stat)
     with _LATEST_SESSION_BLOCK_CACHE_LOCK:
         cached = _LATEST_SESSION_BLOCK_CACHE.get(cache_key)
-        if cached and cached[:4] == signature:
-            return list(cached[4])
+        if cached and cached[:5] == signature:
+            return list(cached[5])
 
     result = list(_rows_for_sessions(
         path, [session_date], maximum_rows,
         recorded_at_fallback=recorded_at_fallback,
     ).get(session_date, ()))
     final_stat = path.stat()
-    if (
-        final_stat.st_dev,
-        final_stat.st_ino,
-        final_stat.st_size,
-        final_stat.st_mtime_ns,
-    ) == signature:
+    if metadata_signature(final_stat) == signature:
         with _LATEST_SESSION_BLOCK_CACHE_LOCK:
             if len(_LATEST_SESSION_BLOCK_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
                 _LATEST_SESSION_BLOCK_CACHE.pop(next(iter(_LATEST_SESSION_BLOCK_CACHE)))
@@ -3112,86 +3222,77 @@ def _opening_signal_latency_summary(
 
 def _line_count(path: Path) -> int:
     if not path.is_file():
+        if _managed_journal(path):
+            with open_paper_journal(path):
+                pass  # An enrolled missing/nonregular projection must raise, never count as empty.
         return 0
-    stat = path.stat()
+    observed = path.stat()
+    generation = _tail_file_signature(observed)
     key = path.resolve()
     with _LINE_COUNT_LOCK:
+        cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
+        persistent_path = None
+        if cache_root and Path(cache_root).is_dir():
+            digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+            persistent_path = Path(cache_root) / f"ledger-line-count-v2-{digest}.json"
         cached = _LINE_COUNT_CACHE.get(key)
-        if cached is None:
-            cache_root = str(
-                os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or ""
-            ).strip()
-            persistent_path = None
-            if cache_root and Path(cache_root).is_dir():
-                digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
-                persistent_path = (
-                    Path(cache_root) / f"ledger-line-count-v1-{digest}.json"
-                )
-                try:
-                    payload = json.loads(persistent_path.read_bytes())
-                    if (
-                        not isinstance(payload, Mapping)
-                        or int(payload.get("schema_version") or 0) != 1
-                    ):
-                        raise ValueError("unsupported persistent line-count cache")
-                    candidate = (
-                        int(payload.get("device")),
-                        int(payload.get("inode")),
-                        int(payload.get("size")),
-                        int(payload.get("modified_ns")),
-                        int(payload.get("count")),
-                    )
-                    if (
-                        str(payload.get("source") or "") == str(key)
-                        and (candidate[0], candidate[1]) == (stat.st_dev, stat.st_ino)
-                        and 0 <= candidate[2] <= stat.st_size
-                        and 0 <= candidate[4]
-                        and not (
-                            candidate[2] == stat.st_size
-                            and candidate[3] != stat.st_mtime_ns
-                        )
-                    ):
-                        cached = candidate
-                        _LINE_COUNT_CACHE[key] = candidate
-                except (OSError, TypeError, ValueError, json.JSONDecodeError):
-                    pass
-        else:
-            persistent_path = None
-        same_append_only_file = bool(
-            cached
-            and cached[0] == stat.st_dev
-            and cached[1] == stat.st_ino
-            and stat.st_size >= cached[2]
-            and not (stat.st_size == cached[2] and stat.st_mtime_ns != cached[3])
-        )
-        start = cached[2] if same_append_only_file and cached else 0
-        count = cached[4] if same_append_only_file and cached else 0
-        with path.open("rb") as handle:
+        if cached is None and persistent_path is not None:
+            try:
+                payload = json.loads(persistent_path.read_bytes())
+                captured = payload["generation"]
+                count = payload["count"]
+                prefix, head = payload.get("prefix_sha256"), payload.get("journal_head")
+                valid_hash = lambda value: (isinstance(value, str) and len(value) == 64
+                    and all(char in "0123456789abcdef" for char in value))
+                if (payload.get("schema_version") != 2 or payload.get("source") != str(key)
+                        or not isinstance(captured, list) or len(captured) != 5
+                        or any(type(value) is not int for value in captured)
+                        or type(count) is not int or not 0 <= count <= captured[2]
+                        or not (valid_hash(prefix) and head is None or valid_hash(head) and prefix is None)):
+                    raise ValueError("invalid proof-bound persistent line count")
+                cached = _LedgerLineCount(tuple(captured), count, prefix, head)
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        with open_paper_journal(path, "rb") as handle:
+            if _tail_file_signature(os.fstat(handle.fileno())) != generation:
+                raise OSError("line-count source changed before read")
+            snapshot = snapshot_of(handle)
+            digest = hashlib.sha256() if snapshot is None else None
+            start, count = 0, 0
+            if cached is not None:
+                if (cached.generation == generation
+                        and ((snapshot is None and cached.journal_head is None)
+                             or (snapshot is not None and cached.journal_head == snapshot.head["sha256"]))):
+                    if (_tail_file_signature(os.fstat(handle.fileno())) != generation
+                            or _tail_file_signature(path.stat()) != generation):
+                        raise OSError("line-count source changed during cache admission")
+                    _LINE_COUNT_CACHE[key] = cached
+                    return cached.count
+                if cached.generation[:2] == generation[:2] and cached.generation[2] <= generation[2]:
+                    if snapshot is not None and snapshot.extends(cached.journal_head, cached.generation[2]):
+                        start, count = cached.generation[2], cached.count
+                    elif snapshot is None and cached.prefix_sha256 is not None:
+                        prefix = _hash_jsonl_prefix(handle, cached.generation[2])
+                        if prefix.hexdigest() == cached.prefix_sha256:
+                            start, count, digest = cached.generation[2], cached.count, prefix
+            # A growing same-inode legacy file may also have rewritten old
+            # lines. Only a full-prefix hash or immutable ancestor proves reuse.
             handle.seek(start)
-            remaining = stat.st_size - start
+            remaining = generation[2] - start
             while remaining > 0:
                 chunk = handle.read(min(1 << 20, remaining))
                 if not chunk:
-                    break
+                    raise OSError("line-count source truncated while reading")
                 count += chunk.count(b"\n")
+                if digest is not None:
+                    digest.update(chunk)
                 remaining -= len(chunk)
-        result = (
-            stat.st_dev,
-            stat.st_ino,
-            stat.st_size,
-            stat.st_mtime_ns,
-            count,
-        )
+            if (_tail_file_signature(os.fstat(handle.fileno())) != generation
+                    or _tail_file_signature(path.stat()) != generation):
+                raise OSError("line-count source changed during read")
+            result = _LedgerLineCount(generation, count, digest.hexdigest() if digest is not None else None,
+                                      snapshot.head["sha256"] if snapshot is not None else None)
         _LINE_COUNT_CACHE[key] = result
-        if persistent_path is None:
-            cache_root = str(
-                os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or ""
-            ).strip()
-            if cache_root and Path(cache_root).is_dir():
-                digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
-                persistent_path = (
-                    Path(cache_root) / f"ledger-line-count-v1-{digest}.json"
-                )
         if persistent_path is not None:
             temporary = persistent_path.with_name(
                 f".{persistent_path.name}.{os.getpid()}.tmp"
@@ -3200,13 +3301,12 @@ def _line_count(path: Path) -> int:
                 temporary.write_text(
                     json.dumps(
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "source": str(key),
-                            "device": result[0],
-                            "inode": result[1],
-                            "size": result[2],
-                            "modified_ns": result[3],
-                            "count": result[4],
+                            "generation": list(result.generation),
+                            "count": result.count,
+                            "prefix_sha256": result.prefix_sha256,
+                            "journal_head": result.journal_head,
                         },
                         separators=(",", ":"),
                     )
@@ -3469,7 +3569,7 @@ def _digest_ledger_sessions(
     output: dict[str, str] = {}
     metadata: dict[str, dict[str, Any]] = {}
     source = Path(path)
-    with source.open("rb") as handle:
+    with open_paper_journal(source, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if (opened.st_dev, opened.st_ino) != (index.device, index.inode):
             raise OSError(f"dashboard ledger changed before session digest: {source}")
@@ -5203,6 +5303,24 @@ def _operational_issues(
                 observed_at=mode.get("signal_at"),
             )
         open_position_count = int(mode.get("open_position_count") or 0)
+        if mode.get("counterfactual_open_replay"):
+            try:
+                source_at = _timestamp(mode.get("source_signal_at"))
+                replay_at = _timestamp(mode.get("signal_at"))
+            except (TypeError, ValueError, OverflowError):
+                source_at = replay_at = None
+            if source_at is not None and replay_at is not None and source_at > replay_at:
+                add(
+                    severity="error", scope="replay", market=market,
+                    code="replay_signal_after_simulated_time",
+                    title=f"{label} 回放訊號晚於模擬時間",
+                    detail=(
+                        f"訊號資料時間為 {source_at.astimezone(TAIPEI).isoformat(timespec='seconds')}，"
+                        f"帳本模擬時間為 {replay_at.astimezone(TAIPEI).isoformat(timespec='seconds')}；"
+                        "不能視為當時已取得的訊號或即時成交，需重新核對來源並驗收回放。"
+                    ),
+                    observed_at=mode.get("source_signal_at"),
+                )
         try:
             mode_session_date = datetime_date.fromisoformat(
                 str(mode.get("session_date") or observed_taipei.date().isoformat())
@@ -5257,18 +5375,24 @@ def _operational_issues(
             )
         outcome = str(mode.get("today_execution_outcome") or "")
         if outcome in {"no_fill", "partial", "blocked"}:
+            remaining = int(mode.get("entry_unfilled_shares") or 0)
+            remaining_text = f"，尚有 {remaining:,} 股未成交" if remaining else ""
+            existing_text = (
+                f"；另有 {open_position_count} 筆先前建立的未平模擬持倉"
+                if open_position_count else "；目前沒有未平模擬持倉"
+            )
             add(
                 severity="error" if outcome in {"no_fill", "blocked"} else "warning",
                 scope="entry_fill",
                 market=market,
                 code=f"entry_{outcome}",
-                title=f"{label} 未完整成交",
+                title=f"{label} 本次訊號未完整成交",
                 detail=(
-                    "訊號流程已處理，但沒有建立任何成交部位。"
+                    f"本次訊號尚無新增成交{remaining_text}{existing_text}。"
                     if outcome == "no_fill"
-                    else "訊號流程已處理，但僅有部分目標股數建立部位。"
+                    else f"本次訊號僅有部分目標股數成交{remaining_text}{existing_text}。"
                     if outcome == "partial"
-                    else "訊號流程遭安全守門阻擋，沒有成交。"
+                    else f"本次訊號遭安全守門阻擋{existing_text}。"
                 ),
                 observed_at=mode.get("today_execution_recorded_at"),
             )
@@ -5513,7 +5637,7 @@ def _select_session_range(
 def _all_json_objects(path: Path):
     if not path.is_file():
         return
-    with path.open("r", encoding="utf-8") as handle:
+    with open_paper_journal(path, "r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
@@ -6151,7 +6275,7 @@ def build_dashboard_history_snapshot(
             # columnar memory cap. Decode the same complete chart projection
             # natively, without allocating unused source fields or dict.get
             # calls for every value. Legacy documents use the shared fallback.
-            with path.open("r", encoding="utf-8") as handle:
+            with open_paper_journal(path, "r", encoding="utf-8") as handle:
                 while lines := handle.readlines(4 * 1024 * 1024):
                     for values in private_json.projected_object_rows(lines, projected_ledger_fields):
                         add_values(series_type, False, values)
@@ -7331,14 +7455,14 @@ def _persistent_position_history_index_path(root: Path) -> Path | None:
 
 def _position_history_source_signature(
     root: Path,
-) -> tuple[tuple[Path, tuple[str, int, int, int, int]], ...]:
+) -> tuple[tuple[Path, tuple[str, int, int, int, int, int]], ...]:
     prefix = str(root) + os.sep
     sources = sorted(
         path
         for directory in ("position_history", OVERNIGHT_POSITION_HISTORY_DIRNAME)
         for path in (Path(root) / directory).glob("*/*.json")
     )
-    output: list[tuple[Path, tuple[str, int, int, int, int]]] = []
+    output: list[tuple[Path, tuple[str, int, int, int, int, int]]] = []
     for path in sources:
         absolute = str(path)
         if not absolute.startswith(prefix):
@@ -7347,13 +7471,7 @@ def _position_history_source_signature(
         output.append(
             (
                 path,
-                (
-                    absolute[len(prefix):],
-                    stat.st_dev,
-                    stat.st_ino,
-                    stat.st_size,
-                    stat.st_mtime_ns,
-                ),
+                (absolute[len(prefix):], *metadata_signature(stat)),
             )
         )
     return tuple(output)
@@ -7632,6 +7750,7 @@ def _historical_position_count(root: Path) -> int:
                 and int(cached.get("inode") or -1) == stat.st_ino
                 and int(cached.get("size") or -1) == stat.st_size
                 and int(cached.get("modified_ns") or -1) == stat.st_mtime_ns
+                and int(cached.get("changed_ns") or -1) == stat.st_ctime_ns
                 and int(cached.get("count") or -1) >= 0
             )
         except (TypeError, ValueError):
@@ -7646,6 +7765,7 @@ def _historical_position_count(root: Path) -> int:
             "inode": stat.st_ino,
             "size": stat.st_size,
             "modified_ns": stat.st_mtime_ns,
+            "changed_ns": stat.st_ctime_ns,
             "count": count,
         }
         total += count
@@ -9135,12 +9255,7 @@ def build_dashboard_signal_page(
     formal_signal_path = root / OVERNIGHT_SIGNAL_HISTORY_FILENAME
     try:
         formal_signal_stat = formal_signal_path.stat()
-        formal_signal_signature = (
-            formal_signal_stat.st_dev,
-            formal_signal_stat.st_ino,
-            formal_signal_stat.st_size,
-            formal_signal_stat.st_mtime_ns,
-        )
+        formal_signal_signature = metadata_signature(formal_signal_stat)
     except FileNotFoundError:
         formal_signal_signature = None
     formal_signal_record_count = 0
@@ -9157,6 +9272,7 @@ def build_dashboard_signal_page(
         signal_stat.st_ino,
         signal_stat.st_size,
         signal_stat.st_mtime_ns,
+        signal_stat.st_ctime_ns,
         formal_signal_signature,
         tuple(selected_session_dates),
         normalized_mode,
@@ -9285,8 +9401,11 @@ def build_dashboard_signal_page(
                 spans = signal_index.spans.get(selected_date, ())
                 if not spans:
                     continue
-                if len(spans) != 1:
-                    break
+                # A historical account import can split the same session
+                # into several append spans. The session reader preserves
+                # their exact order. Signal selection/summary keys include
+                # the date, so cross-date interleaving is irrelevant here
+                # (unlike the equal-timestamp event stream below).
                 frame = _projected_ledger_session_frame(
                     signal_path,
                     index=signal_index,
@@ -9322,6 +9441,7 @@ def build_dashboard_signal_page(
                 signal_index.inode,
                 signal_index.observed_size,
                 signal_index.modified_ns,
+                signal_index.changed_ns,
             )
             if signal_index is not None
             else None,
@@ -9342,12 +9462,7 @@ def build_dashboard_signal_page(
             )
             if columnar is not None and columnar[1].estimated_size() <= 64 << 20:
                 final_signal_stat = signal_path.stat()
-                if signal_index is not None and (
-                    final_signal_stat.st_dev,
-                    final_signal_stat.st_ino,
-                    final_signal_stat.st_size,
-                    final_signal_stat.st_mtime_ns,
-                ) == frame_cache_key[1]:
+                if signal_index is not None and metadata_signature(final_signal_stat) == frame_cache_key[1]:
                     with _SIGNAL_LEDGER_FRAME_CACHE_LOCK:
                         if len(_SIGNAL_LEDGER_FRAME_CACHE) >= 2:
                             _SIGNAL_LEDGER_FRAME_CACHE.pop(
@@ -9356,32 +9471,10 @@ def build_dashboard_signal_page(
                         _SIGNAL_LEDGER_FRAME_CACHE[frame_cache_key] = columnar
         if columnar is not None:
             polars_module, candidate_frame = columnar
-            required_columns = {
-                "ask",
-                "bid",
-                "execution_price",
-                "filled_shares",
-                "filled_weight",
-                "market",
-                "reason",
-                "requested_shares",
-                "session_date",
-                "signal_id",
-                "sizing_open_price",
-                "status",
-                "symbol",
-                "target_weight",
-            }
-            if required_columns.issubset(candidate_frame.columns):
+            if _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(candidate_frame.columns):
                 signal_frame = candidate_frame
         if signal_frame is not None:
-            required_columns = {
-                "ask", "bid", "execution_price", "filled_shares",
-                "filled_weight", "market", "reason", "requested_shares",
-                "session_date", "signal_id", "sizing_open_price", "status",
-                "symbol", "target_weight",
-            }
-            if not required_columns.issubset(signal_frame.columns):
+            if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(signal_frame.columns):
                 signal_frame = None
                 signal_projection_complete = False
         if signal_frame is None:
@@ -9610,6 +9703,8 @@ def build_dashboard_signal_page(
             normalized_symbol,
             normalized_status,
             int(maximum_scan_rows),
+            tuple(sorted(enabled_markets)) if enabled_markets is not None else None,
+            tuple(sorted(superseded_signals)),
             tuple(sorted(capitals.items())),
         )
         with _SIGNAL_RANGE_SUMMARY_CACHE_LOCK:
@@ -9773,12 +9868,9 @@ def build_dashboard_signal_page(
             source_page, narrow_projection_paths, narrow_full_schema
         )
         current_stat = signal_path.stat()
-        if complete_page is None or (
-            current_stat.st_dev, current_stat.st_ino,
-            current_stat.st_size, current_stat.st_mtime_ns,
-        ) != (
+        if complete_page is None or metadata_signature(current_stat) != (
             signal_index.device, signal_index.inode,
-            signal_index.observed_size, signal_index.modified_ns,
+            signal_index.observed_size, signal_index.modified_ns, signal_index.changed_ns,
         ):
             # A derived shard changed between validation and page assembly.
             # Rebuild through the original complete-history route, never
@@ -10050,12 +10142,12 @@ def build_dashboard_event_page(
     normalized_mode = str(mode or "").strip()
     normalized_symbol = str(symbol or "").strip().casefold()
 
-    def source_signature(filename: str) -> tuple[int, int, int, int] | None:
+    def source_signature(filename: str) -> tuple[int, int, int, int, int] | None:
         try:
             stat = (root / filename).stat()
         except FileNotFoundError:
             return None
-        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        return metadata_signature(stat)
 
     cache_key = (
         root.resolve(),

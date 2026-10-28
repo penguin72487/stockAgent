@@ -33,7 +33,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from stockagent.live.tw_day_trade_simulation import (
     TAIPEI,
-    REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+    LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     position_net_liquidation_pnl,
     minute_curve_write_lock,
 )
@@ -65,7 +65,8 @@ def _sha256(path: Path) -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    payload = read_paper_state(path)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return payload
@@ -176,6 +177,7 @@ def missing_accepted_endpoints(
 
 
 def _atomic_text(path: Path, text: str) -> None:
+    from stockagent.live.paper_journal import journal_write_transaction
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -183,7 +185,8 @@ def _atomic_text(path: Path, text: str) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
+        with journal_write_transaction(path, operation="replace"):
+            os.replace(temporary, path)
     finally:
         try:
             os.unlink(temporary)
@@ -1526,7 +1529,7 @@ class _ImmutableMinuteInventory:
         self.full_0901_price_entries = frozenset(
             event["position_id"] for event in self.events
             if event.get("purpose") == "entry"
-            and event.get("fill_contract") == REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
+            and event.get("fill_contract") == LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL
             and event.get("fill_at") == f"{event.get('session_date')}T09:01:00+08:00"
             and event.get("simulation_only") is True
             and event.get("simulation_replay") is True

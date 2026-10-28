@@ -2,7 +2,9 @@
 Description=Observe enrolled training recovery state every 30 seconds
 
 [Timer]
-OnBootSec=45s
+# WSL can restart userspace while its shared kernel remains up. Start this
+# owner after each timer activation, including such warm reboots.
+OnActiveSec=45s
 OnUnitInactiveSec=30s
 AccuracySec=1s
 Persistent=true

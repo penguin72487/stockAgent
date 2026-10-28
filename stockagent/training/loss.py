@@ -1299,6 +1299,8 @@ def risk_aware_loss(
     futures_minute_saturation_recovery: bool = False,
     futures_minute_recovery_objective: str = "residual_notional",
     crypto_announced_exit_unlimited_volume: bool = False,
+    futures_account_calendar: object | None = None,
+    account_only_execution: Tensor | None = None,
 ) -> Tensor:
     """Risk-aware loss with configurable objective, including excess-CVaR-drawdown."""
     normalize_start = _loss_timer_start()
@@ -1323,6 +1325,12 @@ def risk_aware_loss(
     )
     tradable = tradable_mask.to(dtype=torch.bool, device=weights.device)
     objective_norm = objective.strip().lower()
+    if getattr(futures_account_calendar, "training_trailing_event_credit", False):
+        if (mode != "tw_stock_context_futures_portfolio" or objective_norm != "log_utility"
+                or log_return_weights is not None or log_utility_risk_aversion
+                or log_utility_downside_aversion or log_utility_benchmark_shortfall_aversion
+                or (aux_outputs or {}).get("_capture_daily_log_returns", False)):
+            raise ValueError("boundary-event credit requires unweighted additive log utility")
     if log_return_weights is not None and (
         objective_norm != "log_utility" or not (
             mode == "tw_stock_context_futures_portfolio"
@@ -1913,6 +1921,8 @@ def risk_aware_loss(
         ),
         futures_minute_saturation_recovery=futures_minute_saturation_recovery,
         futures_minute_recovery_objective=futures_minute_recovery_objective,
+        futures_account_calendar=futures_account_calendar,
+        account_only_execution=account_only_execution,
         # The exact carrying account does not use turnover to advance state.
         # Its only supported objective is log utility, whose turnover branch
         # is mathematically absent when gamma_turnover is zero.  Validation,

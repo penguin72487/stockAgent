@@ -162,6 +162,61 @@ def test_options_preserve_side_rows_and_pair_matched_quantity() -> None:
     assert frame["event_ts"].dtype.time_zone == "Asia/Taipei"
 
 
+def test_options_parse_multiple_products_with_dated_distinct_sessions() -> None:
+    source = io.StringIO(
+        "成交日期,商品代號,履約價格,到期月份(週別),買賣權別,成交時間,成交價格,成交數量(B or S),開盤集合競價\n"
+        "20260805,TGO,16200,202612,C,172500,553,1,\n"
+        "20260805,TGO,16200,202612,C,172500,553,1,\n"
+        "20260806,TGO,16200,202612,P,161500,7,2,\n"
+        "20260806,TGO,16200,202612,P,161500,7,2,\n"
+        "20260806,CCO,60,202609,P,090000,1.99,2,\n"
+        "20260806,CCO,60,202609,P,090000,1.99,2,\n"
+        "20260806,TXO,44000,202608W1,C,090000,123,2,\n"
+    )
+    frame = MODULE._parse_options_rows(
+        source, trading_date=date(2026, 8, 6), source_file="source.zip",
+        source_sha256="a" * 64, products=("TGO", "CCO"),
+        session_windows={"TGO": ((525, 975), (1045, 300)), "CCO": ((525, 825), None)},
+    )
+    assert frame.height == 6
+    assert frame["product"].to_list() == ["TGO", "TGO", "CCO", "CCO", "TGO", "TGO"]
+    assert frame["session"].to_list() == ["night", "night", "day", "day", "day", "day"]
+    assert frame.group_by("product").agg(
+        MODULE.pl.col("matched_quantity_equivalent").sum()
+    ).sort("product")["matched_quantity_equivalent"].to_list() == [2.0, 3.0]
+
+
+def test_options_require_valid_non_overlapping_dated_sessions() -> None:
+    source_row = "20260806,CCO,60,202609,P,160000,1.99,2,\n"
+    def parse(products, windows):
+        return MODULE._parse_options_rows(
+            io.StringIO(source_row), trading_date=date(2026, 8, 6),
+            source_file="source.zip", source_sha256="a" * 64,
+            products=products, session_windows=windows,
+        )
+    with pytest.raises(ValueError, match="require dated"):
+        parse(("CCO",), None)
+    with pytest.raises(ValueError, match="must match"):
+        parse(("CCO",), {"TGO": ((525, 975), (1045, 300))})
+    with pytest.raises(ValueError, match="overlapping"):
+        parse(("CCO",), {"CCO": ((525, 975), (900, 300))})
+    with pytest.raises(ValueError, match="outside dated"):
+        parse(("CCO",), {"CCO": ((525, 825), None)})
+
+
+def test_options_pair_side_quantities_within_each_product() -> None:
+    source = io.StringIO(
+        "20260806,CCO,60,202609,P,090000,1,1,\n"
+        "20260806,TGO,60,202609,P,090000,1,1,\n"
+    )
+    with pytest.raises(ValueError, match="unpaired B-or-S"):
+        MODULE._parse_options_rows(
+            source, trading_date=date(2026, 8, 6), source_file="source.zip",
+            source_sha256="a" * 64, products=("CCO", "TGO"),
+            session_windows={"CCO": ((525, 825), None), "TGO": ((525, 975), (1045, 300))},
+        )
+
+
 def test_futures_convert_b_plus_s_quantity_to_matched_contracts() -> None:
     source = io.StringIO(
         "成交日期,商品代號,到期月份(週別),成交時間,成交價格,成交數量(B+S),近月價格,遠月價格,開盤集合競價\n"

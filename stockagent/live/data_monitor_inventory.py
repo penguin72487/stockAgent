@@ -13,12 +13,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
 import re
+import sqlite3
 import stat
 import struct
 import time
@@ -27,6 +29,9 @@ from uuid import uuid4
 
 from stockagent import private_json
 from stockagent.live.data_monitor_record_codec import encode_record_cache
+from stockagent.live.data_monitor_record_store import (
+    SharedSchema, cache_file, read_record_cache, record_store_needs_migration, write_record_delta,
+)
 
 
 # Footer/cache row semantics remain v10 for already-running read-only readers.
@@ -75,6 +80,8 @@ class InventorySnapshot:
     previous_cache_signature: list[int] | None = None
     cache_signature: list[int] | None = None
     changed_dataset_ids: frozenset[str] | None = None
+    verified_features: _VerifiedFeatures | None = None
+    unchanged_selection: dict[str, str] | None = None
 
     def check_root(self, root: Path) -> None:
         if self.root.resolve() != root.resolve():
@@ -106,7 +113,7 @@ class _SourceObservation:
         self.datasets[dataset] = digest
 
     def observe(self, dataset: str, path: Path, source_stat: os.stat_result | None, *,
-                entry: Mapping[str, Any] | None) -> None:
+                entry: Mapping[str, Any] | None) -> list[int] | None:
         digest = self.datasets[dataset]
         digest.update(b"F" + os.fsencode(path) + b"\0")
         if source_stat is None:
@@ -121,6 +128,13 @@ class _SourceObservation:
                     self.matches_cache = False
             if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or entry.get("file_identity") != identity:
                 self.matches_cache = False
+            # Ordinary identity is a pure projection of this SAME stat result.
+            # Let the adjacent cache guard use it without allocating it twice.
+            # Partition identity also rechecks member files; keep that second
+            # independent check, including resolve_source and source.verify.
+            if len(identity) == 5:
+                return identity
+        return None
 
     def root(self) -> str:
         digest = hashlib.blake2b(digest_size=16)
@@ -148,14 +162,26 @@ def _feature_paths(directory: Path, *, files_only: bool = False) -> list[Path]:
 
     try:
         with os.scandir(directory) as entries:
-            names = sorted(
+            names = [
                 entry.name for entry in entries
                 if entry.name.endswith(("_features.parquet", "_features.parquet" + _PARTITION_SUFFIX))
                 and (not files_only or entry.is_file())
-            )
+            ]
     except OSError:
         return []
-    return _logical_sources(directory / name for name in names)
+    return _flat_logical_sources(directory, names)
+
+
+def _flat_logical_sources(directory: Path, names) -> list[Path]:
+    # All entries have the same parent. Resolve legacy/manifest aliases and
+    # sort their filenames before allocating Path objects; a second full
+    # Path.parts sort and str(Path) conversion add no membership information.
+    chosen = {}
+    for name in names:
+        logical = name.removesuffix(_PARTITION_SUFFIX)
+        if logical not in chosen or name.endswith(_PARTITION_SUFFIX):
+            chosen[logical] = name
+    return [directory / name for name in sorted(chosen.values())]
 
 
 def _logical_sources(paths):
@@ -174,6 +200,23 @@ def _pattern_sources(root, pattern):
         path = root / pattern
         return _logical_sources(candidate for candidate in (path, Path(str(path) + _PARTITION_SUFFIX))
                                 if candidate.is_file())
+    parent = Path(pattern).parent
+    if not Path(pattern).is_absolute() and not any(marker in str(parent) for marker in ("*", "?", "[")):
+        # Flat patterns need no recursive glob or per-match Path.stat().
+        # DirEntry retains the filesystem's file-type information; symlinks
+        # still follow their target, exactly as Path.is_file() does below.
+        directory = root / parent
+        matches = re.compile(fnmatch.translate(Path(pattern).name + "*")).match
+        try:
+            with os.scandir(directory) as entries:
+                names = [entry.name for entry in entries
+                         if entry.name.endswith((".parquet", ".parquet" + _PARTITION_SUFFIX))
+                         and matches(entry.name) and entry.is_file()]
+        except OSError:
+            # Keep the original glob/error behavior on unusual filesystems.
+            pass
+        else:
+            return _flat_logical_sources(directory, names)
     # One directory traversal, not one legacy scan plus another manifest scan.
     # Exact suffix filtering excludes temp files, summaries and parts directories.
     return _logical_sources(path for path in root.glob(pattern + "*")
@@ -295,10 +338,15 @@ PHYSICAL_FAMILIES: dict[str, tuple[str, str, str, bool]] = {
 }
 
 
-def _read_json(path: Path) -> Any:
+def _read_json(path: Path, *, compact_schemas=False, immutable_stats=False) -> Any:
     try:
+        if path.name == "record_inventory_cache.json":
+            # This canonical build treats cached footer values as read-only;
+            # identical v3 stats can share their decoded vectors in this frame.
+            return read_record_cache(path, share_stats=True, compact_schemas=compact_schemas,
+                                     immutable_stats=immutable_stats)
         return private_json.loads(path.read_bytes())
-    except (OSError, ValueError, UnicodeError):
+    except (OSError, ValueError, UnicodeError, sqlite3.Error):
         return None
 
 
@@ -322,6 +370,17 @@ def _cache_signature(path: Path, *, trusted_index: bool = False) -> list[int] | 
         return None
     if trusted_index and (metadata.st_uid != os.getuid() or metadata.st_mode & 0o022):
         return None
+    if path.name == "record_inventory_cache.json":
+        try:
+            target = cache_file(path)
+            if target != path:
+                metadata = target.lstat()
+                if not stat.S_ISREG(metadata.st_mode):
+                    return None
+                if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+                    return None
+        except (OSError, ValueError, UnicodeError):
+            return None
     return _file_identity(metadata)
 
 
@@ -579,6 +638,11 @@ def _read_quick_index(
         snapshot.previous_cache_signature = cache_signature
         snapshot.cache_signature = cache_signature
         snapshot.changed_dataset_ids = frozenset()
+        snapshot.unchanged_selection = {
+            'fingerprint': fingerprint,
+            'source_observation_root': payload['source_observation_root'],
+            'feature_revision': payload['feature_revision'],
+        }
     return {
         "datasets": dict(payload["datasets"]),
         "refreshed_files": 0,
@@ -669,13 +733,16 @@ def _write_quick_index(
             pass
 
 
-def _entry_matches_stat(entry: Mapping[str, Any], stat: os.stat_result, *, path=None) -> bool:
+def _entry_matches_stat(entry: Mapping[str, Any], stat: os.stat_result, *, path=None,
+                        observed_identity=None) -> bool:
     return (
         entry.get("size") == stat.st_size
         and entry.get("mtime_ns") == stat.st_mtime_ns
         and (
             "file_identity" not in entry
-            or entry["file_identity"] == (_source_file_identity(path, stat) if path is not None else _file_identity(stat))
+            or entry["file_identity"] == (
+                observed_identity if observed_identity is not None
+                else _source_file_identity(path, stat) if path is not None else _file_identity(stat))
         )
     )
 
@@ -767,21 +834,28 @@ def _legacy_parquet_footer_stats(path: Path) -> dict[str, Any] | None:
         metadata = parquet.metadata
         fields = [(field.name, str(field.type)) for field in parquet.schema_arrow]
         columns = [name for name, _ in fields]
-        flat_schema = all(
-            metadata.row_group(group_index).num_columns == len(fields)
-            for group_index in range(metadata.num_row_groups)
-        )
+        # A row-group wrapper and its row count belong to the decoded footer,
+        # not to each column. Keep the original early mismatch behavior while
+        # avoiding their repeated C/Python materialization for wide tables.
+        groups = []
+        flat_schema = True
+        for group_index in range(metadata.num_row_groups):
+            group = metadata.row_group(group_index)
+            if group.num_columns != len(fields):
+                flat_schema = False
+                break
+            groups.append((group, group.num_rows))
         non_null: list[int | None] = []
         for column_index in range(len(fields)):
             known = flat_schema
             count = 0
-            for group_index in range(metadata.num_row_groups) if flat_schema else ():
-                group = metadata.row_group(group_index)
+            for group, group_rows in groups if flat_schema else ():
                 stat = group.column(column_index).statistics
-                if stat is None or stat.null_count is None:
+                null_count = stat.null_count if stat is not None else None
+                if null_count is None:
                     known = False
                     break
-                count += group.num_rows - stat.null_count
+                count += group_rows - null_count
             non_null.append(count if known else None)
         schema_id = hashlib.sha256(
             json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -794,9 +868,8 @@ def _legacy_parquet_footer_stats(path: Path) -> dict[str, Any] | None:
         lows: list[str] = []
         highs: list[str] = []
         complete_bounds = metadata.num_row_groups > 0
-        for index in range(metadata.num_row_groups):
-            group = metadata.row_group(index)
-            if group.num_rows == 0:
+        for group, group_rows in groups:
+            if group_rows == 0:
                 continue
             stat = group.column(column_index).statistics
             low = _date_text(stat.min, column=date_column) if stat is not None and stat.has_min_max else None
@@ -888,7 +961,8 @@ def _selected_files(root: Path) -> dict[str, list[Path]]:
 
 
 def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
-               observation: _SourceObservation | None = None, dataset: str = "") -> dict[str, Any]:
+               observation: _SourceObservation | None = None, dataset: str = "",
+               refresh_entry=None) -> dict[str, Any]:
     total = len(paths)
     inspected = 0
     invalid = 0
@@ -909,9 +983,12 @@ def _aggregate(paths: list[Path], cache: Mapping[str, Any], *,
             if observation is not None:
                 observation.observe(dataset, path, None, entry=entry)
             continue
-        if observation is not None:
-            observation.observe(dataset, path, stat, entry=entry)
-        if not _entry_matches_stat(entry, stat, path=path):
+        if refresh_entry is not None and not _entry_matches_stat(entry, stat, path=path):
+            entry, stat = refresh_entry(path, stat, entry)
+        observed_identity = observation.observe(dataset, path, stat, entry=entry) if observation is not None else None
+        if entry is None or stat is None:
+            continue
+        if not _entry_matches_stat(entry, stat, path=path, observed_identity=observed_identity):
             continue
         if entry.get("error") == "invalid_parquet":
             invalid += 1
@@ -980,12 +1057,41 @@ def _combine(parts: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _read_footer_entry(path, source_stat, schemas, refreshed_schemas):
+    """Bind fresh footer values to the same five-part source identity."""
+    source_identity = _source_file_identity(path, source_stat)
+    stats = parquet_footer_stats(path)
+    try:
+        after_stat = path.stat()
+    except OSError:
+        return None, None
+    if source_identity != _source_file_identity(path, after_stat):
+        return None, None
+    if stats is None:
+        return {"size": source_stat.st_size, "mtime_ns": source_stat.st_mtime_ns,
+                "file_identity": source_identity, "error": "invalid_parquet"}, after_stat
+    fields = stats.pop("fields")
+    schema_id = stats["schema_id"]
+    if schema_id not in refreshed_schemas:
+        normalized = [list(field) for field in fields]
+        previous_schema = schemas.get(schema_id)
+        refreshed_schemas[schema_id] = previous_schema if previous_schema == normalized else normalized
+    schemas[schema_id] = refreshed_schemas[schema_id]
+    return {"size": source_stat.st_size, "mtime_ns": source_stat.st_mtime_ns,
+            "file_identity": source_identity, "stats": stats}, after_stat
+
+
 def _build_record_inventory_unlocked(
     repo_root: Path, *, refresh: bool = False, max_refresh_files: int = DEFAULT_REFRESH_FILES,
     snapshot: InventorySnapshot | None = None,
     fast_index_miss: bool = False,
     preselected: dict[str, list[Path]] | None = None,
     quick_index_probe_ms: float = 0.0,
+    incremental_store: bool = False,
+    incremental_metadata: bool = False,
+    incremental_stats: bool = False,
+    incremental_schemas: bool = False,
+    capture_features: bool = False,
 ) -> dict[str, Any]:
     """Read inventory; optionally refresh at most ``max_refresh_files`` footers."""
 
@@ -995,7 +1101,7 @@ def _build_record_inventory_unlocked(
     if snapshot is not None:
         snapshot.check_root(root)
     previous_cache_signature = _cache_signature(cache_path)
-    payload = _read_json(cache_path)
+    payload = _read_json(cache_path, compact_schemas=True, immutable_stats=refresh)
     if _cache_signature(cache_path) != previous_cache_signature:
         previous_cache_signature = None
     cache_decode_ms = round((time.perf_counter() - stage_start) * 1_000, 3)
@@ -1005,6 +1111,8 @@ def _build_record_inventory_unlocked(
         snapshot.previous_cache_signature = previous_cache_signature
         snapshot.cache_signature = previous_cache_signature
         snapshot.changed_dataset_ids = None
+        snapshot.verified_features = None
+        snapshot.unchanged_selection = None
     if not refresh and isinstance(payload, _RUNTIME_MAPPING_TYPES) and payload.get("version") == INVENTORY_VERSION:
         datasets = payload.get("datasets")
         files = payload.get("files")
@@ -1054,6 +1162,7 @@ def _build_record_inventory_unlocked(
     unavailable_during_refresh = False
     all_entries_unchanged = True
     previous_files = payload.get("files", {}) if isinstance(payload, _RUNTIME_MAPPING_TYPES) else {}
+    refreshed_schemas: dict[str, list[list[str]]] = {}
     feature_inputs_changed = (
         not isinstance(payload, _RUNTIME_MAPPING_TYPES)
         or payload.get("version") != INVENTORY_VERSION
@@ -1097,33 +1206,14 @@ def _build_record_inventory_unlocked(
                     break
                 refreshed += 1
             all_entries_unchanged = False
-            source_identity = _source_file_identity(path, stat)
-            stats = parquet_footer_stats(path)
-            try:
-                after_stat = path.stat()
-            except OSError:
-                unavailable_during_refresh = True
-                cache.pop(key, None)
-                feature_inputs_changed = True
-                continue
-            if source_identity != _source_file_identity(path, after_stat):
+            updated, _ = _read_footer_entry(path, stat, schemas, refreshed_schemas)
+            if updated is None:
                 # The footer may belong to an old inode or an in-flight write.
                 # Keep this file unverified and retry the next supervised run.
                 unavailable_during_refresh = True
                 cache.pop(key, None)
                 feature_inputs_changed = True
                 continue
-            if stats is not None:
-                fields = stats.pop("fields")
-                # JSON decodes pairs as lists. Keep the in-memory writer in
-                # that same canonical representation: tuple/list inequality
-                # must not invalidate every other owner of an unchanged schema.
-                schemas[stats["schema_id"]] = [list(field) for field in fields]
-                updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                           "file_identity": source_identity, "stats": stats}
-            else:
-                updated = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns,
-                           "file_identity": source_identity, "error": "invalid_parquet"}
             if not isinstance(entry, _RUNTIME_MAPPING_TYPES) or (
                 entry.get("stats"), entry.get("error")
             ) != (updated.get("stats"), updated.get("error")):
@@ -1183,10 +1273,41 @@ def _build_record_inventory_unlocked(
     signature_scan_ms = round((time.perf_counter() - stage_start) * 1_000, 3)
     stage_start = time.perf_counter()
     observation = _SourceObservation()
+    feature_observation = _SourceObservation()
+    feature_datasets = []
+    feature_verification_ms = 0.0
+    aggregated_paths: set[str] = set()
+    def reconcile_entry(path, source_stat, entry):
+        nonlocal refreshed, feature_inputs_changed, unavailable_during_refresh
+        key = str(path)
+        # One physical file may belong to multiple owners. Once an owner has
+        # consumed it, a later alias cannot replace that frame's cached entry
+        # and leave the earlier aggregate bound to a different footer.
+        if refreshed >= max_refresh_files or key in aggregated_paths:
+            return entry, source_stat
+        refreshed += 1
+        updated, after_stat = _read_footer_entry(path, source_stat, schemas, refreshed_schemas)
+        feature_inputs_changed = True
+        if updated is None:
+            unavailable_during_refresh = True
+            cache.pop(key, None)
+        else:
+            cache[key] = updated
+            if key not in recently_refreshed:
+                recently_refreshed.append(key)
+        return updated, after_stat
     output = {}
     for name, paths in selected.items():
         observation.start(name)
-        output[name] = _aggregate(paths, cache, observation=observation, dataset=name)
+        output[name] = _aggregate(paths, cache, observation=observation, dataset=name,
+                                  refresh_entry=reconcile_entry if capture_features and refresh else None)
+        if capture_features and snapshot is not None:
+            verified_at = time.perf_counter()
+            feature_observation.start(name)
+            feature_datasets.append(_scan_feature_dataset(name, paths, cache, schemas, output, feature_observation))
+            feature_verification_ms += (time.perf_counter() - verified_at) * 1_000
+        aggregated_paths.update(str(path) for path in paths)
+    feature_verified_at_utc = datetime.now(UTC).isoformat() if feature_datasets else None
     source_observation_root = observation.root()
     if not recently_refreshed and isinstance(payload, _RUNTIME_MAPPING_TYPES):
         previous_recent = payload.get("recently_refreshed_files")
@@ -1246,21 +1367,48 @@ def _build_record_inventory_unlocked(
     current_payload["feature_revision"] = feature_revision
     cache_encoding_observation = None
     cache_encode_ms = cache_write_ms = 0.0
+    cache_payload_reused = False
     if refresh:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
-        try:
-            cache_encoding_observation = {}
-            encode_started = time.perf_counter()
-            encoded = encode_record_cache(current_payload, observation=cache_encoding_observation)
-            cache_encode_ms = round((time.perf_counter() - encode_started) * 1_000, 3)
-            write_started = time.perf_counter()
-            temporary.write_bytes(encoded)
-            del encoded
-            os.replace(temporary, cache_path)
-            cache_write_ms = round((time.perf_counter() - write_started) * 1_000, 3)
-        finally:
-            temporary.unlink(missing_ok=True)
+        # A missing/stale optional index can force the complete source scan
+        # even when the resulting cache has not changed. Preserve its inode
+        # and bytes after that proof, repairing only the quick index. This
+        # is not a TTL, a source-stat exemption or a different cache format.
+        cache_payload_reused = (
+            not feature_inputs_changed
+            and not (incremental_store and record_store_needs_migration(
+                cache_path, len(cache), partitioned_metadata=incremental_metadata, factored_stats=incremental_stats,
+                interned_schemas=incremental_schemas))
+            and previous_cache_signature is not None
+            and current_payload == payload
+            and _cache_signature(cache_path) == previous_cache_signature
+        )
+        if not cache_payload_reused:
+            cache_encoding_observation = write_record_delta(
+                cache_path, current_payload, payload,
+                expected_signature=previous_cache_signature, enable=incremental_store,
+                partitioned_metadata=incremental_metadata,
+                factored_stats=incremental_stats,
+                interned_schemas=incremental_schemas,
+            )
+            if cache_encoding_observation is not None:
+                # Transaction publication includes encoding only changed rows;
+                # the full-cache encoder is not executed on this backend.
+                cache_write_ms = cache_encoding_observation["publication_ms"]
+            else:
+                temporary = cache_path.with_name(f"{cache_path.name}.tmp.{uuid4().hex}")
+                try:
+                    cache_encoding_observation = {}
+                    encode_started = time.perf_counter()
+                    encoded = encode_record_cache(current_payload, observation=cache_encoding_observation)
+                    cache_encode_ms = round((time.perf_counter() - encode_started) * 1_000, 3)
+                    write_started = time.perf_counter()
+                    temporary.write_bytes(encoded)
+                    del encoded
+                    os.replace(temporary, cache_path)
+                    cache_write_ms = round((time.perf_counter() - write_started) * 1_000, 3)
+                finally:
+                    temporary.unlink(missing_ok=True)
         _write_quick_index(
             cache_path, selected, cache, output, feature_revision, source_observation_root,
             source_observation_matches_cache=observation.matches_cache,
@@ -1272,6 +1420,13 @@ def _build_record_inventory_unlocked(
         snapshot.changed_dataset_ids = (
             frozenset(changed_dataset_ids) if changed_dataset_ids is not None else None
         )
+        if (feature_datasets and observation.matches_cache and feature_observation.matches_cache
+                and feature_observation.root() == source_observation_root):
+            snapshot.verified_features = _VerifiedFeatures(
+                current_payload, selected, snapshot.cache_signature, feature_revision,
+                source_observation_root, True, tuple(feature_datasets),
+                feature_verified_at_utc, round(feature_verification_ms, 3),
+            )
     return {
         "datasets": output,
         "refreshed_files": refreshed,
@@ -1283,6 +1438,7 @@ def _build_record_inventory_unlocked(
         "source_observation_matches_cache": observation.matches_cache,
         "fast_index_hit": False,
         "changed_dataset_ids": changed_dataset_ids,
+        "cache_payload_reused": cache_payload_reused,
         "cache_encoding_observation": cache_encoding_observation,
         "timing_ms": {
             "quick_index_probe": quick_index_probe_ms,
@@ -1305,13 +1461,23 @@ def _runtime_validation_observation(result: dict[str, Any]) -> dict[str, Any]:
 def build_record_inventory(
     repo_root: Path, *, refresh: bool = False, max_refresh_files: int = DEFAULT_REFRESH_FILES,
     snapshot: InventorySnapshot | None = None,
+    incremental_store: bool = False,
+    incremental_metadata: bool = False,
+    incremental_stats: bool = False,
+    incremental_schemas: bool = False,
+    capture_features: bool = False,
 ) -> dict[str, Any]:
     with _partition_snapshot_scope():
         return _build_record_inventory(repo_root, refresh=refresh,
-                                       max_refresh_files=max_refresh_files, snapshot=snapshot)
+                                       max_refresh_files=max_refresh_files, snapshot=snapshot,
+                                       incremental_store=incremental_store, incremental_metadata=incremental_metadata,
+                                       incremental_stats=incremental_stats, incremental_schemas=incremental_schemas,
+                                       capture_features=capture_features)
 
 
-def _build_record_inventory(repo_root, *, refresh, max_refresh_files, snapshot):
+def _build_record_inventory(repo_root, *, refresh, max_refresh_files, snapshot, incremental_store=False,
+                            incremental_metadata=False, incremental_stats=False, incremental_schemas=False,
+                            capture_features=False):
     """Read the inventory, serializing refreshes across snapshot processes."""
 
     if not refresh:
@@ -1335,12 +1501,21 @@ def _build_record_inventory(repo_root, *, refresh, max_refresh_files, snapshot):
             preflight_observation["wall_ms"] = round((time.perf_counter() - probe_started) * 1_000, 3)
             if quick is not None:
                 quick["preflight_observation"] = preflight_observation
-                return _runtime_validation_observation(quick)
+                if not (incremental_store and record_store_needs_migration(
+                        Path(repo_root) / "artifacts/live/data_monitor/record_inventory_cache.json",
+                        quick["cached_files"], partitioned_metadata=incremental_metadata, factored_stats=incremental_stats,
+                        interned_schemas=incremental_schemas)):
+                    return _runtime_validation_observation(quick)
             result = _build_record_inventory_unlocked(
                 repo_root, refresh=True, max_refresh_files=max_refresh_files,
                 snapshot=snapshot, fast_index_miss=True,
                 preselected=discovered_on_miss[0] if discovered_on_miss else None,
                 quick_index_probe_ms=preflight_observation["wall_ms"],
+                incremental_store=incremental_store,
+                incremental_metadata=incremental_metadata,
+                incremental_stats=incremental_stats,
+                incremental_schemas=incremental_schemas,
+                capture_features=capture_features,
             )
             result["preflight_observation"] = preflight_observation
             return _runtime_validation_observation(result)
@@ -1423,6 +1598,57 @@ class FeatureDataset:
         return rows
 
 
+@dataclass(frozen=True)
+class _VerifiedFeatures:
+    """Inputs accepted by the canonical fresh scan, before public formatting.
+
+    This is the same finite observation as a normal FeatureInventoryScan; it
+    is not a claim that a mutable source remains unchanged until publication.
+    The owner's frame is read-only after record publication. A replaced frame,
+    selection or cache generation cannot consume these verified inputs.
+    """
+
+    payload: Mapping[str, Any]
+    selected: dict[str, list[Path]]
+    cache_signature: list[int] | None
+    feature_revision: str
+    source_root: str
+    matches_cache: bool
+    datasets: tuple[FeatureDataset, ...]
+    verified_at_utc: str
+    verification_ms: float
+
+
+def _scan_feature_dataset(dataset, paths, cache, schemas, datasets, observation):
+    by_schema: dict[str, list[Mapping[str, Any]]] = {}
+    valid_files = 0
+    for path in paths:
+        entry = cache.get(str(path))
+        if not isinstance(entry, _RUNTIME_MAPPING_TYPES):
+            observation.observe(dataset, path, None, entry=None)
+            continue
+        try:
+            source_stat = path.stat()
+        except OSError:
+            observation.observe(dataset, path, None, entry=entry)
+            continue
+        observed_identity = observation.observe(dataset, path, source_stat, entry=entry)
+        if not _entry_matches_stat(entry, source_stat, path=path, observed_identity=observed_identity):
+            continue
+        info = entry.get("stats")
+        if not isinstance(info, _RUNTIME_MAPPING_TYPES):
+            continue
+        fields = schemas.get(info.get("schema_id"))
+        non_null = info.get("non_null")
+        if not isinstance(fields, (list, SharedSchema)) or not isinstance(non_null, _COUNT_VECTOR_TYPE) or len(fields) != len(non_null):
+            continue
+        valid_files += 1
+        by_schema.setdefault(info["schema_id"], []).append(info)
+    dataset_info = datasets.get(dataset, {}) if isinstance(datasets, _RUNTIME_MAPPING_TYPES) else {}
+    return FeatureDataset(dataset, len(paths), valid_files, observation.dataset_root(dataset),
+                          by_schema, schemas, dataset_info if isinstance(dataset_info, _RUNTIME_MAPPING_TYPES) else {})
+
+
 class FeatureInventoryScan:
     """One complete canonical identity scan with independently lazy owner rows.
 
@@ -1442,7 +1668,7 @@ class FeatureInventoryScan:
         else:
             cache_path = root / "artifacts/live/data_monitor/record_inventory_cache.json"
             signature = _cache_signature(cache_path)
-            payload = _read_json(cache_path)
+            payload = _read_json(cache_path, compact_schemas=True)
             if snapshot is not None and (
                 signature != snapshot.cache_signature
                 or signature != _cache_signature(cache_path)
@@ -1461,6 +1687,15 @@ class FeatureInventoryScan:
             raise ValueError("invalid_inventory")
         self.selected = (snapshot.selected if snapshot is not None and snapshot.selected is not None
                          else _selected_files(root))
+        self.prepared = snapshot.verified_features if snapshot is not None else None
+        if self.prepared is not None and (
+            self.prepared.payload is not payload or self.prepared.selected is not self.selected
+            or self.prepared.cache_signature != snapshot.cache_signature
+            or self.prepared.feature_revision != payload.get("feature_revision")
+            or self.prepared.source_root != payload.get("source_observation_root")
+            or self.prepared.matches_cache is not True
+        ):
+            raise SourceRevisionChanged("verified feature frame no longer matches the record generation")
         self.observation = _SourceObservation()
         self.files_with_schema = 0
         self.finished = False
@@ -1478,40 +1713,20 @@ class FeatureInventoryScan:
         if self._iterated:
             raise ValueError("feature inventory scan is single-use")
         self._iterated = True
+        if self.prepared is not None:
+            self.timing_ms["verify_file_signatures"] = self.prepared.verification_ms
+            for dataset in self.prepared.datasets:
+                self.files_with_schema += dataset.valid_files
+                yield dataset
+            self.finished = True
+            return
         for dataset, paths in self.selected.items():
             self.observation.start(dataset)
             started = time.perf_counter()
-            by_schema: dict[str, list[Mapping[str, Any]]] = {}
-            valid_files = 0
-            for path in paths:
-                entry = self.cache.get(str(path))
-                if not isinstance(entry, _RUNTIME_MAPPING_TYPES):
-                    self.observation.observe(dataset, path, None, entry=None)
-                    continue
-                try:
-                    source_stat = path.stat()
-                except OSError:
-                    self.observation.observe(dataset, path, None, entry=entry)
-                    continue
-                self.observation.observe(dataset, path, source_stat, entry=entry)
-                if not _entry_matches_stat(entry, source_stat, path=path):
-                    continue
-                info = entry.get("stats")
-                if not isinstance(info, _RUNTIME_MAPPING_TYPES):
-                    continue
-                fields = self.schemas.get(info.get("schema_id"))
-                non_null = info.get("non_null")
-                if not isinstance(fields, list) or not isinstance(non_null, _COUNT_VECTOR_TYPE) or len(fields) != len(non_null):
-                    continue
-                valid_files += 1
-                self.files_with_schema += 1
-                by_schema.setdefault(info["schema_id"], []).append(info)
+            verified = _scan_feature_dataset(dataset, paths, self.cache, self.schemas, self.datasets, self.observation)
+            self.files_with_schema += verified.valid_files
             self.timing_ms["verify_file_signatures"] += (time.perf_counter() - started) * 1_000
-            dataset_info = self.datasets.get(dataset, {}) if isinstance(self.datasets, _RUNTIME_MAPPING_TYPES) else {}
-            yield FeatureDataset(
-                dataset, len(paths), valid_files, self.observation.dataset_root(dataset),
-                by_schema, self.schemas, dataset_info if isinstance(dataset_info, _RUNTIME_MAPPING_TYPES) else {},
-            )
+            yield verified
         self.finished = True
 
     def summary(self, *, datasets_with_schema: int) -> dict[str, Any]:
@@ -1524,8 +1739,8 @@ class FeatureInventoryScan:
             "datasets_with_schema": datasets_with_schema,
             "files_total": files_total,
             "files_with_schema": self.files_with_schema,
-            "source_observation_root": self.observation.root(),
-            "source_observation_matches_cache": self.observation.matches_cache,
+            "source_observation_root": self.prepared.source_root if self.prepared is not None else self.observation.root(),
+            "source_observation_matches_cache": self.prepared.matches_cache if self.prepared is not None else self.observation.matches_cache,
             "state": "complete" if files_total and self.files_with_schema == files_total else "empty" if not files_total else "partial",
             "basis": "Parquet schema 與 row-group null_count；不代表歷史完整、發布時間或訓練可用性。",
         }

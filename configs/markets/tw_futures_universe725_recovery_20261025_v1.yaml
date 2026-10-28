@@ -1,0 +1,23 @@
+# Recovered historical contracts; dated availability and original source gaps remain visible.
+base_config: tw_futures_dated_membership_20261025_v1.yaml
+experiment_name: tw-futures-universe725-recovery-20261025-v1
+data:
+  # Earlier retained contract lives are causal context; target ownership starts in 2011.
+  panel_start_date: '2010-01-04'
+  factorized_feature_manifest: data_tw_index_futures/training_prepared/tw_futures_universe725_recovery_20261025_v1/stock_context2010_v46/features/factorized_manifest.json
+  tw_public_feature_path: data_tw_index_futures/training_prepared/tw_futures_universe725_recovery_20261025_v1/stock_context2010_v46/features/execution_rules.parquet
+  panel_cache_root: data_tw_index_futures/training_cache/universe725_recovery_20261025_v1/base_panel
+  tw_futures_require_prior_capacity: false
+trading:
+  tw_futures_portfolio_valuation_research_contract: frozen_contract_value_research_v1
+  tw_futures_portfolio_data_path: data_tw_index_futures/training_prepared/tw_futures_universe725_20261025_v2/financial_research_equity_v218/release/daily/continuous_daily.parquet
+  tw_futures_portfolio_margin_rules_path: data_tw_index_futures/training_prepared/tw_futures_universe725_20261025_v2/financial_research_equity_v218/release/rules/rules.parquet
+  tw_futures_portfolio_entry_capacity_policy: previous_session
+  tw_futures_portfolio_entry_clock_path: data_tw_index_futures/training_prepared/tw_futures_universe725_recovery_20261025_v1/source_v218/twd_equity/clocks/0845/entries.parquet
+  tw_futures_portfolio_opening_reference_path: data_tw_index_futures/training_prepared/tw_futures_universe725_recovery_20261025_v1/source_v218/twd_equity/clocks/0845/opening_reference.parquet
+walk_forward:
+  expected_first_year: 2010
+  split_start_year: 2011
+runner:
+  output_dir: artifacts/markets/tw_futures_universe725_recovery_20261025_v1/twd_equity__recovered_previous_0845_30m
+  resume: false

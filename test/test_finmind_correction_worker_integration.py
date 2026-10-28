@@ -139,7 +139,11 @@ def test_complement_worker_correction_empty_history_keeps_last_good_head_and_sho
     monkeypatch.setattr(complement.shutil, 'disk_usage', lambda *args: SimpleNamespace(free=complement.MIN_FREE_BYTES + 1))
     monkeypatch.setattr(complement, 'backfill_budget', lambda *args, **kwargs: {'allowed': True})
     monkeypatch.setattr(complement, '_request', lambda *args, **kwargs: [])
-    complement.run_once(root, max_requests=1, datasets=(task.dataset,))
+    # This is a mocked correction workflow, not a physical-capacity test. Keep
+    # it independent of the host's current acquisition reserve.
+    admitted = SimpleNamespace(root=root.absolute(), initial_sample=lambda: {'state': 'admitted'},
+                               sample=lambda: {'state': 'admitted'})
+    complement.run_once(root, max_requests=1, datasets=(task.dataset,), capacity_sampler=admitted)
     assert (root / old['receipt_path']).read_bytes() == old_bytes
     with complement._db(root / 'queue.sqlite3') as conn:
         row = conn.execute('SELECT state,rows,error_code,next_attempt_at_utc FROM tasks').fetchone()

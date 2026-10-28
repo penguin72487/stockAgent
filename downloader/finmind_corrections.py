@@ -17,6 +17,9 @@ import sqlite3
 from typing import Any
 from uuid import uuid4
 
+import polars as pl
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, TAIPEI
@@ -300,7 +303,7 @@ def _post_notice_proven(receipt: dict[str, Any], request: dict[str, Any], owner:
                         task: dict[str, Any], fetched: datetime) -> bool:
     if request.get('watermark_basis') not in {
         'first_detection_of_new_or_edited_notice', 'first_detection_same_day_baseline',
-        'baseline_same_day_detection_not_pit',
+        'baseline_same_day_detection_not_pit', 'source_conflict_detection',
     }:
         return True
     marker = receipt.get('finmind_corrections', {})
@@ -332,7 +335,7 @@ def _parquet_verified(path_text: str, signature: tuple[int, ...], digest: str, r
 
 def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
                       owner: str, receipt: dict[str, Any]) -> dict[str, Any] | None:
-    """Hash and Parquet-footer check only an affected receipt; never scan rows."""
+    """Verify an affected receipt and any explicitly requested source keys."""
     try:
         fetched = _stamp(receipt.get('fetched_at_utc'))
         if (receipt.get('status') != 'complete' or receipt.get('dataset') != task['dataset']
@@ -373,6 +376,85 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
                 or not re.fullmatch(r'[a-f0-9]{64}', str(receipt.get('sha256', '')))
                 or not _parquet_verified(str(path), signature, receipt['sha256'], rows)):
             return None
+        expected = request.get('expected_source_products')
+        if expected is not None:
+            # A nonempty day file alone is not enough to resolve an official
+            # product conflict. Check the native option IDs, preserving all
+            # original rows; this does not prove individual contract coverage.
+            if (not isinstance(expected, list) or not expected
+                    or any(not isinstance(value, str) or not value for value in expected)):
+                return None
+            column = pq.read_table(path, columns=['option_id']).column('option_id')
+            found = {str(value).strip() for value in pc.unique(column).to_pylist() if value is not None}
+            if not set(expected).issubset(found):
+                return None
+            evidence['verified_expected_products'] = len(expected)
+        expected_positive = request.get('expected_source_positive_volume_products')
+        if expected_positive is not None:
+            if (task['dataset'] != 'TaiwanOptionDaily' or not isinstance(expected_positive, list)
+                    or not expected_positive or any(not isinstance(x, str) or not x for x in expected_positive)):
+                return None
+            positive = (pl.scan_parquet(path).filter(pl.col('volume') > 0)
+                        .select(pl.col('option_id').drop_nulls().unique()).collect(engine='streaming'))
+            if not set(expected_positive).issubset({str(x).strip() for x in positive['option_id'].to_list()}):
+                return None
+            evidence['verified_positive_volume_products'] = len(expected_positive)
+        if request.get('preserve_original_daily_contract_keys') is True:
+            if task['dataset'] != 'TaiwanOptionDaily':
+                return None
+            prior = _local_path(root, request['original_parquet_path'])
+            prior_before = prior.stat()
+            prior_sig = (prior_before.st_dev, prior_before.st_ino, prior_before.st_size,
+                         prior_before.st_mtime_ns, prior_before.st_ctime_ns)
+            if prior_before.st_size > MAX_PROOF_BYTES or _sha(prior) != request['original_parquet_sha256']:
+                return None
+            names = ['option_id', 'contract_date', 'strike_price', 'call_put', 'trading_session']
+            old = pl.scan_parquet(prior).select(names).unique().collect(engine='streaming')
+            new = pl.scan_parquet(path).select(names).unique().collect(engine='streaming')
+            after_prior = prior.stat()
+            if (old.join(new, on=names, how='anti', nulls_equal=True).height
+                    or prior_sig != (after_prior.st_dev, after_prior.st_ino, after_prior.st_size,
+                                     after_prior.st_mtime_ns, after_prior.st_ctime_ns)):
+                return None
+            evidence['verified_prior_daily_contract_keys'] = old.height
+        expected_contracts = request.get('expected_source_contracts')
+        if expected_contracts is not None:
+            # Identity-level proof only, with the original float32 strike ABI.
+            # The previous source remains separately content-addressed; require
+            # every prior key as well as the audited missing keys in the new
+            # object so a superficially fixed response cannot lose old keys.
+            if (not isinstance(expected_contracts, list) or not 0 < len(expected_contracts) <= 50000
+                    or any(not isinstance(key, list) or len(key) != 4 for key in expected_contracts)):
+                return None
+            names = ['option_id', 'contract_date', 'ExercisePrice', 'PutCall']
+            def distinct_keys(source: Path):
+                return (pl.scan_parquet(source).select(
+                    pl.col('option_id').str.strip_chars().str.to_uppercase(),
+                    pl.col('contract_date').str.strip_chars().str.to_uppercase(),
+                    pl.col('ExercisePrice').cast(pl.Float32),
+                    pl.col('PutCall').str.strip_chars().str.to_uppercase(),
+                ).unique().collect(engine='streaming'))
+
+            prior = _local_path(root, request['original_parquet_path'])
+            prior_before = prior.stat()
+            prior_signature = (prior_before.st_dev, prior_before.st_ino, prior_before.st_size,
+                               prior_before.st_mtime_ns, prior_before.st_ctime_ns)
+            if (_sha(prior) != request['original_parquet_sha256'] or prior_before.st_size > MAX_PROOF_BYTES):
+                return None
+            prior_keys = distinct_keys(prior)
+            current_keys = distinct_keys(path)
+            wanted = pl.DataFrame(expected_contracts, schema={
+                'option_id': pl.String, 'contract_date': pl.String,
+                'ExercisePrice': pl.Float32, 'PutCall': pl.String,
+            }, orient='row').unique()
+            prior_after = prior.stat()
+            if (wanted.join(current_keys, on=names, how='anti').height
+                    or prior_keys.join(current_keys, on=names, how='anti', nulls_equal=True).height
+                    or prior_signature != (prior_after.st_dev, prior_after.st_ino, prior_after.st_size,
+                                           prior_after.st_mtime_ns, prior_after.st_ctime_ns)):
+                return None
+            evidence.update(verified_expected_contract_keys=wanted.height,
+                            verified_prior_contract_keys=prior_keys.height)
         after = path.stat()
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
@@ -390,7 +472,7 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
         evidence.update(parquet_path=receipt['parquet_path'], parquet_sha256=receipt['sha256'],
                         parquet_size_bytes=receipt['parquet_size_bytes'])
         return evidence
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, pa.ArrowException, pl.exceptions.PolarsError):
         return None
 
 
@@ -421,6 +503,19 @@ def _matching_tasks(connection: sqlite3.Connection, request: dict[str, Any], now
     History, year, month and two-day ranges still use their original Python
     bounds. Do not materialize millions of impossible day tasks per notice.
     """
+    exact = request.get('exact_source_conflict_key')
+    if exact is not None:
+        expected_kind = {'TaiwanOptionTick': 'id_day', 'TaiwanOptionDaily': 'day'}.get(request['dataset'])
+        if (not isinstance(exact, dict) or set(exact) != {'dataset', 'data_id', 'partition', 'kind'}
+                or exact != {'dataset': request['dataset'], 'data_id': '',
+                             'partition': request['start_date'], 'kind': expected_kind}
+                or expected_kind is None
+                or request['start_date'] != request['end_date']):
+            raise ValueError('invalid exact source-conflict task')
+        cursor = connection.execute('SELECT * FROM tasks WHERE dataset=? AND data_id=? AND partition=? AND kind=?',
+                                    (exact['dataset'], exact['data_id'], exact['partition'], exact['kind']))
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor]
     query = 'SELECT * FROM tasks WHERE dataset=?'
     arguments = [request['dataset']]
     if request.get('scope_kind') == 'snapshot':
@@ -445,8 +540,91 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
                              now: datetime, *, max_receipts: int = 128) -> dict[str, Any]:
     """Mark existing overlapping tasks due; repeated calls discover late seeds."""
     plan, digest = _load_plan(root, owner)
+    summary = _apply_worker_plan(connection, root, owner, now, plan, digest, max_receipts=max_receipts)
+    if owner == 'sponsor':
+        from downloader.finmind_option_daily_conflicts import load_daily_option_conflicts
+
+        try:
+            conflicts = load_daily_option_conflicts(root, now)
+            if conflicts:
+                conflict_plan, conflict_digest = conflicts
+                summary['daily_option_source_conflicts'] = _apply_worker_plan(
+                    connection, root, owner, now, conflict_plan, conflict_digest, max_receipts=max_receipts)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            summary['daily_option_source_conflicts'] = {'state': 'rejected', 'reason': str(exc)[:256]}
+    if owner == 'complement':
+        from downloader.finmind_source_conflict_rechecks import (
+            CONTRACT_BATCHES, PRODUCT_BATCHES, RECENT_BATCHES, load_option_conflicts,
+            load_option_contract_conflicts, load_option_product_conflicts, load_recent_option_conflicts,
+        )
+
+        try:
+            conflicts = load_option_conflicts(root, now)
+            if conflicts:
+                conflict_plan, conflict_digest = conflicts
+                summary['source_conflicts'] = _apply_worker_plan(
+                    connection, root, owner, now, conflict_plan, conflict_digest, max_receipts=max_receipts)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            # Reject only the untrusted sidecar. An invalid research request
+            # must not disable the canonical owner's ordinary queue.
+            summary['source_conflicts'] = {'state': 'rejected', 'reason': str(exc)[:256]}
+        batch_paths = sorted((root / PRODUCT_BATCHES).glob('*.json'))
+        if len(batch_paths) > 16:
+            summary['source_product_conflicts'] = [{'state': 'rejected', 'reason': 'too many batches'}]
+        else:
+            results = []
+            for path in batch_paths:
+                try:
+                    loaded = load_option_product_conflicts(root, now, sidecar=path)
+                    if loaded:
+                        product_plan, product_digest = loaded
+                        results.append(_apply_worker_plan(connection, root, owner, now,
+                                                          product_plan, product_digest, max_receipts=max_receipts))
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                    results.append({'state': 'rejected', 'reason': str(exc)[:256], 'batch': path.name})
+            if results:
+                summary['source_product_conflicts'] = results
+        contract_paths = sorted((root / CONTRACT_BATCHES).glob('*.json'))
+        if len(contract_paths) > 16:
+            summary['source_contract_conflicts'] = [{'state': 'rejected', 'reason': 'too many batches'}]
+        else:
+            results = []
+            for path in contract_paths:
+                try:
+                    loaded = load_option_contract_conflicts(root, now, sidecar=path)
+                    if loaded:
+                        contract_plan, contract_digest = loaded
+                        results.append(_apply_worker_plan(connection, root, owner, now,
+                                                          contract_plan, contract_digest, max_receipts=max_receipts))
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                    results.append({'state': 'rejected', 'reason': str(exc)[:256], 'batch': path.name})
+            if results:
+                summary['source_contract_conflicts'] = results
+        recent_paths = sorted((root / RECENT_BATCHES).glob('*.json'))
+        if len(recent_paths) > 16:
+            summary['source_recent_tick_conflicts'] = [{'state': 'rejected', 'reason': 'too many batches'}]
+        else:
+            results = []
+            for path in recent_paths:
+                try:
+                    loaded = load_recent_option_conflicts(root, now, sidecar=path)
+                    if loaded:
+                        recent_plan, recent_digest = loaded
+                        results.append(_apply_worker_plan(connection, root, owner, now,
+                                                          recent_plan, recent_digest, max_receipts=max_receipts))
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+                    results.append({'state': 'rejected', 'reason': str(exc)[:256], 'batch': path.name})
+            if results:
+                summary['source_recent_tick_conflicts'] = results
+    return summary
+
+
+def _apply_worker_plan(connection: sqlite3.Connection, root: Path, owner: str,
+                       now: datetime, plan: dict[str, Any], digest: str,
+                       *, max_receipts: int) -> dict[str, Any]:
     summary = {'plan_id': plan['plan_id'], 'applied': 0, 'already_refreshed': 0, 'deferred': 0,
-               'unchanged': 0, 'unmatched_requests': 0, 'owner_skipped': 0}
+               'unchanged': 0, 'unmatched_requests': 0, 'owner_skipped': 0,
+               'source_evidence_changed': 0}
     checked = 0
     with queue_transaction(connection):
         _schema(connection)
@@ -470,6 +648,32 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
                 if old and old[1] in {'queued', 'repaired', 'already_refreshed', 'observed_empty_unverified', 'calendar_excluded_unverified'} and not retry_excluded:
                     summary['unchanged'] += 1
                     continue
+                if request.get('exact_source_conflict_key') is not None and not old:
+                    # Reopen only the precise original object for which the
+                    # official daily archive and original receipt were audited.
+                    try:
+                        receipt_path = _local_path(root, task.get('receipt_path'))
+                        original_state = request.get('expected_original_task_state', 'observed_empty')
+                        same_source_inflight = False
+                        if task['state'] == 'pending':
+                            inflight = connection.execute(
+                                "SELECT request_json FROM finmind_correction_tasks WHERE owner=? AND dataset=? "
+                                "AND data_id=? AND partition=? AND state='queued'",
+                                (owner, task['dataset'], task['data_id'], task['partition'])).fetchall()
+                            for (payload,) in inflight:
+                                prior_request = json.loads(payload)
+                                if (prior_request.get('exact_source_conflict_key') == request['exact_source_conflict_key']
+                                        and prior_request.get('original_receipt_sha256') == request['original_receipt_sha256']
+                                        and prior_request.get('expected_original_task_state', 'observed_empty') == original_state):
+                                    same_source_inflight = True
+                                    break
+                        if ((task['state'] != original_state and not same_source_inflight)
+                                or _sha(receipt_path) != request['original_receipt_sha256']):
+                            summary['source_evidence_changed'] += 1
+                            continue
+                    except (OSError, ValueError):
+                        summary['source_evidence_changed'] += 1
+                        continue
                 state, evidence = 'deferred', None
                 if _stamp(request['required_after_utc']) <= now and not _deferred(task, now, empty_authorized=empty_authorized):
                     receipt = _read_receipt(root, task)

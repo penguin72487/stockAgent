@@ -2457,9 +2457,10 @@ def _calendar_end_before_same_session(
 ) -> date:
     """Return the last verified open session before a same-session rule request.
 
-    Weekends need no external evidence. A forward weekday closure must be
-    proved by the provenance-checked TWSE holiday schedule; an absent or
-    conflicting schedule cannot silently turn a missing report into a holiday.
+    Weekends need no external evidence. A weekday closure must be proved by
+    the canonical official calendar, including receipt-verified historical
+    TAIEX closures. An absent or conflicting schedule cannot silently turn a
+    missing report into a holiday.
     The no-root form preserves the weekday-only helper for callers that are
     not preparing a canonical same-session download.
     """
@@ -2476,7 +2477,7 @@ def _calendar_end_before_same_session(
         sys.path.insert(0, repo_root)
     from stockagent.live.market_status import (
         TW_HOLIDAY_SCHEDULE_NAME,
-        verified_tw_stock_session_day,
+        tw_stock_day_decision,
     )
 
     if not (schedule_root / TW_HOLIDAY_SCHEDULE_NAME).is_file():
@@ -2486,19 +2487,45 @@ def _calendar_end_before_same_session(
         )
 
     while True:
-        is_open, reason = verified_tw_stock_session_day(
+        decision = tw_stock_day_decision(
             candidate, parquet_root=schedule_root
         )
-        if is_open:
+        if decision.is_session:
             return candidate
-        if not reason.startswith("official TWSE schedule as-of "):
+        # The canonical owner also proves past closures with the fully
+        # receipt-verified TAIEX calendar (including emergency closures).
+        # Consume its structured decision, not one renderer's reason prefix.
+        if decision.status != "closed":
             raise RuntimeError(
                 "cannot prove the pre-session closure from official TWSE "
-                f"schedule: {candidate.isoformat()}: {reason}"
+                f"schedule: {candidate.isoformat()}: {decision.reason}"
             )
         candidate -= timedelta(days=1)
         while candidate.weekday() >= 5:
             candidate -= timedelta(days=1)
+
+
+_DAY_TRADE_RULE_DATASETS = frozenset({"twse_day_trade_eligibility", "tpex_day_trade_eligibility"})
+
+
+def _closed_session_rule_announcements(
+    spec: DatasetSpec, days: set[date], output_dir: Path,
+) -> set[date]:
+    """Retain official rule announcements for subsequently cancelled sessions.
+
+    Rule publication is not a price observation or proof of trading. These
+    dates remain outside expected/covered execution sessions; unknown dates
+    and every price/report dataset retain the strict calendar rejection.
+    """
+    if spec.name not in _DAY_TRADE_RULE_DATASETS:
+        return set()
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from stockagent.live.market_status import tw_stock_day_decision
+
+    return {day for day in days
+            if tw_stock_day_decision(day, parquet_root=output_dir).status == "closed"}
 
 
 def _plan_historical_download(
@@ -2510,10 +2537,7 @@ def _plan_historical_download(
     start, end = _historical_bounds(spec, args)
     same_session_text = str(getattr(args, "same_session_rule_date", None) or "").strip()
     same_session_day: date | None = None
-    if same_session_text and spec.name in {
-        "twse_day_trade_eligibility",
-        "tpex_day_trade_eligibility",
-    }:
+    if same_session_text and spec.name in _DAY_TRADE_RULE_DATASETS:
         same_session_day = _parse_date(same_session_text)
         if not start <= same_session_day <= end:
             raise ValueError(
@@ -2636,6 +2660,22 @@ def _plan_historical_download(
     if _requires_strict_session_calendar(spec, args):
         existing_in_range = {day for day in counts if start <= day <= end}
         calendar_disagreement = existing_in_range - all_weekdays
+        retained_announcements = _closed_session_rule_announcements(
+            spec, calendar_disagreement, output_dir,
+        )
+        if spec.name in _DAY_TRADE_RULE_DATASETS:
+            state["retained_non_session_rule_contract"] = (
+                "official_rule_announcement_on_verified_closed_session_v1"
+            )
+            state["retained_non_session_rule_dates"] = [
+                day.isoformat() for day in sorted(retained_announcements)
+            ]
+            state["retained_non_session_rule_scope"] = {
+                "start": start.isoformat(), "end": end.isoformat(),
+            }
+            # Do not add them to all_weekdays or let them discharge an actual
+            # session's coverage obligation. The raw baseline is not deleted.
+            calendar_disagreement -= retained_announcements
         if calendar_disagreement:
             examples = ", ".join(
                 day.isoformat() for day in sorted(calendar_disagreement)[:5]

@@ -215,6 +215,37 @@ def test_full_market_clock_rejection_is_diagnostic_not_a_repaired_observation(
     assert path.read_bytes() == original, "do not repair clocks or rewrite source evidence"
 
 
+def test_opening_only_horizon_excludes_late_events_not_bad_evidence(tmp_path):
+    receipt, official = fixtures()
+    late = {"session_date": receipt["session_date"], "provider": "finmind_snapshot",
+        "event": "provider_snapshot", "observed_at_taipei": "2026-10-22T09:30:00+08:00",
+        "coverage": {"contract": "finmind_unfiltered_market_snapshot_coverage_v1",
+            "received_at_taipei": "2026-10-22T09:30:00.900+08:00",
+            "validated_at_taipei": "2026-10-22T09:30:00.100+08:00",
+            "valid_open_symbols": ["OPEN"], "rejected_symbols": {}}}
+    path = tmp_path / "journal.jsonl"
+    raw = (json.dumps(late) + "\n").encode()
+    path.write_bytes(raw)
+    full = audit.journal_symbol_timeline(path, receipt, official, cutoffs=(1000,))
+    bounded = audit.journal_symbol_timeline(path, receipt, official, cutoffs=(1000,),
+        observation_horizon_ms=1000, include_reference_rows=True)
+    assert full["state"] == "degraded"
+    assert bounded["state"] == "observed"
+    assert bounded["outside_observation_horizon_events"] == 1
+    assert bounded["observation_horizon_ms"] == 1000
+    assert bounded["journal_prefix"]["sha256"] == full["journal_prefix"]["sha256"]
+    assert bounded["milestones"][0]["counts"] == {"unknown": len(receipt["requested_symbols"])}
+    assert not any(row["first_valid_by_provider_ms"] for row in bounded["symbols"])
+    assert audit.journal_reference_receipt(receipt, bounded, 1000)["rows"]["OPEN"]["open_prices"] is None
+    with pytest.raises(ValueError, match="horizon"):
+        audit.journal_symbol_timeline(path, receipt, official, cutoffs=(11000,), observation_horizon_ms=1000)
+    # An unreadable header cannot be claimed to be a later out-of-scope event.
+    path.write_bytes(raw + b"{broken\n")
+    broken = audit.journal_symbol_timeline(path, receipt, official, cutoffs=(1000,), observation_horizon_ms=1000)
+    assert broken["state"] == "degraded"
+    assert broken["journal_prefix"]["malformed_lines"] == [2]
+
+
 def test_rejection_diagnostics_distinguish_partial_line_without_exposing_payload(tmp_path):
     receipt, official = fixtures()
     path = tmp_path / "journal.jsonl"

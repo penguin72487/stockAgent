@@ -18,6 +18,18 @@ from stockagent.data_sync.packed_snapshots import initialize_packed_layout, reso
 from dataclasses import replace
 
 
+def test_binding_parallelism_only_for_exact_enrolled_d_stage():
+    from stockagent.data_sync.legacy_artifact_archive import D_BENCHMARK_STAGE_ROOT
+
+    spec = LegacyArchiveSpec('legacy-test', 'benchmarks/example', 7, D_BENCHMARK_STAGE_ROOT)
+    archive = D_BENCHMARK_STAGE_ROOT / spec.dataset / 'archive'
+    assert retirement._archive_binding_workers(spec, archive) == 8
+    assert retirement._archive_binding_workers(spec, archive.parent / 'other') == 1
+    assert retirement._archive_binding_workers(replace(spec, stage_root=Path('/tmp/other')), archive) == 1
+    quarantine = D_BENCHMARK_STAGE_ROOT / f'.{spec.dataset}.pruning-{os.getpid()}' / 'archive'
+    assert retirement._archive_binding_workers(spec, quarantine) == 8
+
+
 def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     repo_root = tmp_path / "repo"
     artifact_root = repo_root / "artifacts"
@@ -269,6 +281,93 @@ def test_final_scan_gate_cannot_extend_full_proof_or_hide_generation_changes(tmp
     state = json.loads(retirement._state_path(options['state_root'], spec.dataset).read_text())
     assert state['state'] == 'retiring' and not source.exists() and not hot.exists()
     assert (Path(state['quarantine'])/'source/checkpoint.pt').is_file()
+
+
+@pytest.mark.parametrize('late_change', [None, 'source', 'pin', 'process', 'expired'])
+def test_owned_resume_wait_releases_common_owner_without_repeating_full_bytes(
+        tmp_path, monkeypatch, late_change):
+    import fcntl
+    import stockagent.data_sync.artifact_retirement as common
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    original = (source / 'checkpoint.pt').read_bytes()
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    final_gate = retirement._assert_unlink_gates
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', lambda *a, **kw:
+                        (_ for _ in ()).throw(SnapshotError('controlled interruption')))
+    with pytest.raises(SnapshotError, match='controlled interruption'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                          owned_verified_plan=plan, **options)
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', final_gate)
+    state_path = retirement._state_path(options['state_root'], spec.dataset)
+    quarantine = Path(json.loads(state_path.read_bytes())['quarantine'])
+    current = {'healthy': False}
+
+    def probe():
+        checks = dict(folder_idle=current['healthy'], need_bytes_zero=True, need_items_zero=True,
+                      need_deletes_zero=True, errors_zero=True, pull_errors_zero=True,
+                      watch_error_empty=True, folder_errors_empty=True, system_errors_empty=True)
+        return {'ok': all(checks.values()), 'local_checks': checks,
+                'checked_at': datetime.now(timezone.utc).isoformat(), 'peers': []}
+
+    options['peer_probe'] = probe
+    monkeypatch.setattr(retirement.time, 'sleep', lambda seconds:
+                        pytest.fail('owned resume must wait outside the common mutation owner'))
+    # A healthy scan cannot discard the completed byte audit. It remains an
+    # explicit blocker and cannot itself authorize any unlink.
+    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+    assert resumed['blockers'] == ['cold-peer-not-converged']
+    verified_at = resumed['full_verification']['verified_at_epoch']
+    before_state = state_path.read_bytes()
+    with pytest.raises(retirement.LegacyQuarantineTransportPending):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+            owned_verified_plan=resumed, defer_quarantine_transport=True, **options)
+    assert state_path.read_bytes() == before_state
+    assert (quarantine / 'source/checkpoint.pt').read_bytes() == original
+
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    waits = []
+
+    def wait(cfg, seconds):
+        with cleanup.COMMON_OWNER.open('a') as other_owner:
+            fcntl.flock(other_owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waits.append(seconds)
+        # First successful preflight races with a new scan at apply. The
+        # second wait must happen outside both common and dataset locks.
+        if len(waits) > 1:
+            current['healthy'] = True
+            if late_change == 'source':
+                path = quarantine / 'source/checkpoint.pt'
+                path.write_bytes(b'X' * len(original))
+            elif late_change == 'pin':
+                monkeypatch.setattr(common, '_pinned_snapshot_ids', lambda *a: {plan['snapshot_id']})
+            elif late_change == 'process':
+                monkeypatch.setattr(common, 'artifact_process_references', lambda *a: ['new-open-fd'])
+            elif late_change == 'expired':
+                monkeypatch.setattr(cleanup.time, 'time', lambda: verified_at + 1501)
+        return {'ok': True}
+
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
+    monkeypatch.setattr(retirement, 'verify_archive_directory', lambda *a, **kw:
+                        pytest.fail('do not repeat full byte decoding under the mutation owner'))
+    if late_change in {'source', 'pin', 'process'}:
+        with pytest.raises(SnapshotError):
+            cleanup.retire_after_convergence(spec, None, tmp_path / 'receipt', resumed, options)
+    else:
+        result = cleanup.retire_after_convergence(spec, None, tmp_path / 'receipt', resumed, options)
+        if late_change == 'expired':
+            assert result is None
+        else:
+            assert result['deleted'] and result['resumed_quarantine']
+            assert result['manifest_sha256'] == plan['manifest_sha256']
+    assert waits and len(waits) == 2
+    assert resumed['full_verification']['verified_at_epoch'] == verified_at
+    if late_change:
+        assert quarantine.exists() and state_path.read_bytes() == before_state
+    else:
+        assert not quarantine.exists() and not source.exists() and not hot.exists()
 
 
 @pytest.mark.parametrize('failure', [None, 'source-bytes', 'mirror', 'cold', 'unknown',

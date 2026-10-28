@@ -7,10 +7,11 @@ After=stockagent-d-cold-mount.service stockagent-backup-transport-mount.service
 Type=oneshot
 WorkingDirectory=__REPO_ROOT__
 ExecStart=/bin/bash __REPO_ROOT__/scripts/run_lakehouse_control.sh python scripts/retire_lake_transport_cache.py
-TimeoutStartSec=10min
+# One exact large small-file wave may exceed ten minutes on DrvFs. Preserve
+# its durable journal and let the full recovery/retirement transaction finish.
+TimeoutStartSec=2h
 SuccessExitStatus=75
 UMask=0077
-CPUQuota=50%
 MemoryMax=256M
 Nice=19
 IOSchedulingClass=best-effort

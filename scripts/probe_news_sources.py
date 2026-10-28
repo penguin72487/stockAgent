@@ -35,6 +35,7 @@ from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_policy import BASTILLE_LAYOUT_VERSIONS, ETTODAY_LAYOUT_VERSIONS, MAX_LAYOUT_VERSIONS, NewsError, PolicyRegistry, _objects, _plain_text_node, extract_article
 from downloader.news_fulltext_setn import INEWS_LAYOUT_VERSIONS
 from downloader.news_fulltext_bastillepost import BASTILLE_RESIDENT_EVIDENCE_VERSIONS
+from downloader.news_fulltext_document_metadata import public_document_identity_shape, public_original_link_shape
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_candidates import (
     compare_native_candidate, ettoday_candidate_source, extraction_failure_location,
@@ -466,127 +467,6 @@ def globalvoices_public_identity_shape(soup, source, *, page_url):
         },
         'body_text_exported': False, 'raw_response_retained': False,
         'article_durably_accepted': False, 'automatic_profile_requests': 0}
-
-
-def public_original_link_shape(soup):
-    """Inspect literal original-link declarations, without routing or prose.
-
-    Ordinary publisher anchors need not carry rel=cite/via. Explicit labels
-    are discovery witnesses only: neither their target nor article equivalence
-    is verified here. Reuse this DOM and bound both traversal and output.
-    """
-    labels = {'原文', '原文連結', '閱讀原文', '查看原文', '看原文', '完整原文',
-              '原始文章', '原始新聞', 'originalarticle', 'readoriginal'}
-    nodes = soup.find_all(['a', 'link'], href=True, limit=513)
-    candidates, matched = [], 0
-    for node in nodes[:512]:
-        relations = sorted(set(node.get('rel', ())) & {'cite', 'via'})
-        pieces, length = [], 0
-        for text in node.stripped_strings:
-            length += len(text)
-            if length > 128:
-                break
-            pieces.append(text)
-        label_matches = length <= 128 and re.sub(r'\s+', '', ''.join(pieces)).casefold() in labels
-        if not relations and not label_matches:
-            continue
-        href = node.get('href')
-        if (not isinstance(href, str) or not 0 < len(href) <= 2048
-                or any(ord(char) <= 32 or ord(char) == 127 for char in href)):
-            continue
-        try:
-            parts = urlsplit(href)
-            if (parts.scheme not in {'http', 'https'} or not parts.hostname
-                    or parts.username is not None or parts.password is not None):
-                continue
-            parts.port  # Reject malformed ports without issuing a request.
-        except ValueError:
-            continue
-        matched += 1
-        if len(candidates) < 8:
-            candidates.append({'href': href, 'node': node.name,
-                'relations': relations, 'explicit_original_label': label_matches})
-    return {'contract_version': 1, 'candidates': candidates,
-        'nodes_examined': min(len(nodes), 512), 'node_limit_reached': len(nodes) > 512,
-        'candidate_limit_reached': matched > 8,
-        'sampling_limits': {'link_nodes': 512, 'candidates': 8, 'label_characters': 128,
-                            'href_characters': 2048},
-        'scope': 'literal_absolute_HTTP_link_declarations_only_not_original_identity',
-        'relative_links_resolved': False, 'body_text_exported': False,
-        'automatic_requests': 0, 'original_source_alias_admitted': False}
-
-
-def public_document_identity_shape(soup):
-    """Bounded native identity declarations; no prose or identity admission.
-
-    Reuse the diagnostic's parsed DOM. Entity projections explicitly discard
-    descriptions/articleBody, including nested values; raw clock strings stay
-    declarations rather than verified historical publication timestamps.
-    """
-    def scalar(value):
-        if isinstance(value, str):
-            if len(value) <= 2048:
-                return value
-            return {'value_omitted': True, 'characters': len(value),
-                    'sha256': hashlib.sha256(value.encode()).hexdigest()}
-        return value if value is None or type(value) in {bool, int} else {'type': type(value).__name__}
-
-    def entity(value, depth=0):
-        if depth > 2:
-            return {'nested_value_omitted': True, 'type': type(value).__name__}
-        if isinstance(value, list):
-            return [entity(item, depth + 1) for item in value[:8]]
-        if isinstance(value, dict):
-            return {key: scalar(value[key]) for key in ('@type', '@id', 'name', 'url') if key in value}
-        return scalar(value)
-
-    metas = []
-    permitted = {'og:url', 'og:title', 'og:site_name', 'article:published_time',
-                 'article:modified_time', 'author'}
-    for node in soup.find_all('meta'):
-        field = node.get('property') or node.get('name')
-        if field in permitted:
-            metas.append({'field': field, 'value': scalar(node.get('content'))})
-            if len(metas) == 16:
-                break
-    articles, errors, examined = [], [], 0
-    for node in islice(soup.find_all('script', type='application/ld+json'), 8):
-        if examined >= 256 or len(articles) >= 8:
-            break
-        try:
-            stack = [(json.loads(node.get_text()), 0)]
-        except (ValueError, TypeError, RecursionError):
-            errors.append('invalid_jsonld')
-            continue
-        while stack and examined < 256 and len(articles) < 8:
-            value, depth = stack.pop()
-            examined += 1
-            if depth > 8:
-                continue
-            if isinstance(value, list):
-                stack.extend((child, depth + 1) for child in reversed(value[:256]))
-            elif isinstance(value, dict):
-                kinds = value.get('@type')
-                kinds = kinds if isinstance(kinds, list) else [kinds]
-                if any(kind in ('Article', 'NewsArticle', 'BlogPosting') for kind in kinds):
-                    articles.append({key: entity(value[key]) for key in (
-                        '@type', '@id', 'url', 'mainEntityOfPage', 'headline', 'author',
-                        'publisher', 'datePublished', 'dateModified', 'isBasedOn',
-                        'isAccessibleForFree') if key in value})
-                if '@graph' in value:
-                    stack.append((value['@graph'], depth + 1))
-    return {'contract_version': 2,
-        'html_title': scalar(soup.title.get_text(' ', strip=True)) if soup.title else None,
-        'canonical_links': [scalar(node.get('href'))
-                            for node in islice(soup.select('link[rel~=canonical][href]'), 8)],
-        'head_metadata': metas, 'declared_articles': articles, 'jsonld_errors': errors,
-        'jsonld_nodes_examined': examined,
-        'original_link_declarations': public_original_link_shape(soup),
-        'metadata_sampling_limits': {'head_fields': 16, 'canonical_links': 8,
-            'jsonld_scripts': 8, 'jsonld_nodes': 256, 'jsonld_depth': 8, 'articles': 8,
-            'entity_list_items': 8, 'scalar_characters': 2048},
-        'raw_or_body_retained': False, 'article_identity_verified': False,
-        'original_source_alias_admitted': False, 'historical_publication_verified': False}
 
 
 def probe_provider(http, urls, *, retain=False, output_root=None, candidate_source=None, metadata_only=False):
@@ -1109,8 +989,8 @@ def main(argv=None):
     parser.add_argument('--maximum-failure-probes', type=int, default=4)
     parser.add_argument('--enqueue-candidate', action='store_true',
         help='Submit one reviewed finite candidate to the resident owner; do not stop it or issue HTTP here')
-    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2, 6, 7, 8, 9, 10, 11, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45), default=1,
-        help='Resident finite evidence: v1 candidate; v2 Videoland credit/clock; v6 Watchmedia legacy credit; v7 Pocket non-School boundary; v8 Bastille written boundary; v9 private native short original; v10 Bastille resource/body relationships; v11 private Bastille two-container original; v24 current iNEWS editor/credit shapes; v25 private printed-credit original after completed v24; v26 private named-header editor original after completed v24; v27 current ETtoday editor/identity/credit relations, metadata only; v28 private WWW leading-credit original after completed v27; v29 private inline-credit original after completed v28 scope refusal; v30 private visible reporter/Person/clock original after completed v29 scope refusal, with bounded refusal-stage facts')
+    parser.add_argument('--candidate-evidence-contract', type=int, choices=(1, 2, 6, 7, 8, 9, 10, 11, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 51, 52), default=1,
+        help='Resident finite evidence: v1 candidate; v2 Videoland credit/clock; v6 Watchmedia legacy credit; v7 Pocket non-School boundary; v8 Bastille written boundary; v9 private native short original; v10 Bastille resource/body relationships; v11 private Bastille two-container original; v24 current iNEWS editor/credit shapes; v25 private printed-credit original after completed v24; v26 private named-header editor original after completed v24; v27 current ETtoday editor/identity/credit relations, metadata only; v28 private WWW leading-credit original after completed v27; v29 private inline-credit original after completed v28 scope refusal; v30 private visible reporter/Person/clock original after completed v29 scope refusal, with bounded refusal-stage facts; v51 separate ETtoday author/publisher predicate metadata after closed v33, no original or body retention')
     parser.add_argument('--failure-code', choices=FAILURE_PROBE_CODES, default='body_not_found',
                         help='Explicit observed missing-article failure; validation diagnosis is metadata-only')
     parser.add_argument("--output", type=Path, required=True)
@@ -1122,7 +1002,7 @@ def main(argv=None):
                         help='Read-only exact-head preflight; reject saved, leased, denied, undated or not-yet-due selections')
     parser.add_argument('--candidate-embedded-layout', choices=[
         *[name for name, version in MAX_LAYOUT_VERSIONS.items() if version >= 4],
-        'ettoday_visible_article_v39', 'videoland_visible_article_v4', 'watchmedia_visible_article_v3', 'pocket_visible_article_v12',
+        'ettoday_visible_article_v39', 'ettoday_visible_article_v40', 'videoland_visible_article_v4', 'watchmedia_visible_article_v3', 'pocket_visible_article_v12',
         'gvm_public_native_article_v2', 'gvm_public_native_article_v3', 'gvm_public_native_article_v4', 'gvm_public_native_article_v8', 'gvm_public_native_article_v9', 'gvm_public_native_article_v10',
         'contentplatform_native_article_v2', 'contentplatform_native_article_v3',
         *INEWS_LAYOUT_VERSIONS,
@@ -1192,7 +1072,7 @@ def main(argv=None):
             not args.enqueue_candidate or args.candidate_evidence_contract not in {34, 35}
             or args.candidate_embedded_layout != 'gvm_public_native_article_v2'):
         parser.error('reviewed_GVM_current_resident_boundary_evidence_required')
-    if args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33} and (
+    if args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33, 51, 52} and (
             not args.enqueue_candidate or args.candidate_embedded_layout != 'ettoday_visible_article_v39'):
         parser.error('reviewed_ETtoday_current_resident_boundary_evidence_required')
     if args.candidate_evidence_contract in {38, 39} and (
@@ -1267,7 +1147,7 @@ def main(argv=None):
             parser.error('one_current_reviewed_validation_failure_metadata_only_candidate_required')
         factory = (videoland_candidate_source if candidate_provider == 'videoland'
             else native_candidate_source if candidate_provider in {'watchmedia', 'pocket', 'bastillepost', 'setn_inews_scope', 'gvm', 'contentplatform'}
-                or candidate_provider == 'ettoday' and args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33}
+                or candidate_provider == 'ettoday' and args.candidate_evidence_contract in {27, 28, 29, 30, 31, 32, 33, 51, 52}
             else ettoday_candidate_source if candidate_provider == 'ettoday' else max_candidate_source)
         candidate = factory(config, registry, repo, args.candidate_embedded_layout)
     failure_grant = None

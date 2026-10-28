@@ -115,8 +115,9 @@ def _compact_benchmark_mark(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _sha256(path: Path) -> str:
+    from stockagent.live.paper_journal import open_paper_journal
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -984,7 +985,8 @@ def main() -> None:
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
     state_path = state_dir / "state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    state = read_paper_state(state_path)
     replay_receipt_path = state_dir / "rebuild_receipt.json"
     replay_receipt = json.loads(replay_receipt_path.read_text(encoding="utf-8"))
     replay_session_dates = [

@@ -73,6 +73,16 @@ NTFS hash／copy 門檻與批次的實測範圍見 `docs/nas_send_verify_paralle
 | lab203 | `lab203-lake-relay.timer`／`lab203-lake-relay.service` | 固定 immutable NAS archive adapter，原 NAS mount／owner 鎖，獨立還原後 ACK |
 | Vast | Syncthing／Supervisor、同名 data-cache GC／storage-pressure cron | index-only edge；沒有 systemd 的節點從 Supervisor／cron 查，不另裝一份 timer |
 
+Penguin 的 `stockagent-d-cold-scan-retry.service` 可用 `--backup-transport`
+同時補送已登錄 NAS 批次通知，沿用 `BackupStream.notify_transport` 與原
+backup owner／ledger，不必等待完整 catalog／容量盤點。先驗證原配對資料夾；
+正在掃描或狀態無法確認時，不讀寫 backup ledger、不追加 scan。每次網路請求
+最多 30 秒，原通知交易仍保留 publication recovery、owner 重取及原子 rebase；
+單次請求上限不是整個交易的硬期限。owner 忙碌、請求逾時均保留原待辦，
+兩個資料夾的錯誤分開記錄。這不是額外備份 owner，也不代表 NAS ACK 已取得。
+未加此參數的 CLI 維持單一 cold-store scan 行為；實測與部署驗收見
+`docs/storage_roles_and_tiers_2026-10-25.md`。
+
 用本機 unit／drop-in 和 runtime receipt 確認目前 schedule，runbook 的五分鐘或其他
 間隔是部署紀錄。大型工作可能占用數個週期，不是固定完成 ETA。
 核對某個正式 service 的精確狀態與最近退出碼：
@@ -132,6 +142,19 @@ lab203 Receive Only `/srv/lab203-backup/ingress`。反向回傳是 lab203 Send O
    全檔 SHA 通過才發機器 ACK。週期 `check --read-data` 按現場政策執行，查獨立收據。
 3. 來源核對 ACK 身分並增加覆蓋；新 DB logical state 的 recovery request 由原
    queue／post-hook 處理。只有檔案 ACK 不代表 packed／PG 語義驗收通過。
+
+2026-10-28 已依使用者指令，把 retained 私人冷庫加入同一 backup owner：
+`configs/data_sync/backup_stream.json` 的 `private_history_backup` 明列個人
+NAS 備份範圍。使用 `bash scripts/run_backup_stream.sh private-cycle`，受監督
+補傳可加 `--wait-for-owner`，等待核心鎖交接，避免 30 秒輪詢錯過短暫讓鎖。
+來源固定清冊與進度分別在原 state 的 `private-catalog.json`／
+`private-status.json`；不讀取數 GiB 的公開 catalog 來刷新私人狀態。
+同一 owner 內先完整盤點容量，後續封閉波次保守累加所有控制檔及 payload；
+失敗、重新取得 owner 或下一輪都重新盤點，每波仍量測實體剩餘容量。
+原 private marker、`publish: false`、來源權利及刪除 gate 不變。
+`scripts/audit_node_storage_roles.py --nas-source-scope --output NEW.json` 只清點
+已登錄來源與 cold heads；來源最新增量、artifacts、code／SQL 及實際還原
+各走原 owner，不能用「無漏列 data root」宣稱整個專案已備份。
 
 auxiliary 的 `include_documentation: true` 也會把 Git-visible 公開
 `.agents/skills` 完整放入 `code/working-tree.zip`，包含 SKILL、UI、references

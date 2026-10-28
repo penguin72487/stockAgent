@@ -132,11 +132,24 @@ def request_scope_progress_check(checked):
     assert checked['body_work_progress']['active_missing_body_urls'] == total
     assert checked['displayed_request_scope_counts'] == [paused, other]
     assert checked['request_scope_note_present']
-    if paused:
+    rechecks = scope.get('pending_source_rechecks')
+    unresolved = rechecks.get('unverified_missing_body_urls') if rechecks and rechecks.get('available') else None
+    if unresolved is not None:
+        due = rechecks['due_missing_body_urls']
+        assert all(type(value) is int and value >= 0 for value in (unresolved, due))
+        assert due <= unresolved <= total
+        if unresolved:
+            assert checked['displayed_pending_source_rechecks'] == unresolved
+            assert checked['pending_source_recheck_note_present']
+    if paused or unresolved:
         assert checked['conditional_eta_seconds'] is None and checked['conditional_finish_at_utc'] is None
         assert checked['conditional_eta_unavailable_reason'] == 'source_request_scope_paused'
+    elif unresolved is None and total:
+        assert checked['conditional_eta_seconds'] is None and checked['conditional_finish_at_utc'] is None
+        assert checked['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
     return {'accepted': True, 'active_missing_body_urls': total,
             'source_paused_missing_body_urls': paused, 'other_missing_body_urls': other,
+            'unverified_missing_body_urls': unresolved,
             'source_recovery_verified': False}
 
 
@@ -398,6 +411,11 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                             displayed_request_scope_counts: ['[data-news-scope-paused]', '[data-news-scope-other]']
                                 .map(selector => Number(card.querySelector(selector)?.textContent.replaceAll(',', ''))),
                             request_scope_note_present: !!card.querySelector('[data-news-request-scope]'),
+                            displayed_pending_source_rechecks: (() => {
+                                const node = card.querySelector('[data-news-scope-recheck-pending]');
+                                return node ? Number(node.textContent.replaceAll(',', '')) : null;
+                            })(),
+                            pending_source_recheck_note_present: card.textContent.includes('到期不代表來源已恢復'),
                             completion_forecast: source.completion_forecast,
                             conditional_eta_seconds: source.conditional_eta_seconds ?? null,
                             conditional_finish_at_utc: source.conditional_finish_at_utc ?? null,

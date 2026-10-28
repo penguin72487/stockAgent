@@ -35,6 +35,56 @@ def _fixture(tmp_path: Path) -> tuple[LegacyArchiveSpec, Path, Path]:
     return spec, artifact_root, source
 
 
+def test_encoded_tree_census_is_complete_with_bounded_parallel_metadata(tmp_path, monkeypatch):
+    root = tmp_path / 'archive'
+    (root / 'nested').mkdir(parents=True)
+    for index in range(140):
+        (root / 'nested' / str(index)).write_text(str(index))
+    expected = {p.relative_to(root).as_posix() for p in root.rglob('*') if p.is_file()}
+    assert archive_module._archive_encoded_census(root, file_workers=1) == expected
+    assert archive_module._archive_encoded_census(root, file_workers=4) == expected
+    assert archive_module._archive_encoded_census(root, file_workers=8) == expected
+    (root / 'unexpected-link').symlink_to(root / 'nested', target_is_directory=True)
+    with pytest.raises(SnapshotError, match='unsupported entry'):
+        archive_module._archive_encoded_census(root, file_workers=8)
+    (root / 'unexpected-link').unlink()
+    original_scandir = os.scandir
+    def denied(path):
+        if Path(path) == root / 'nested':
+            raise PermissionError('unreadable archive')
+        return original_scandir(path)
+    monkeypatch.setattr(os, 'scandir', denied)
+    with pytest.raises(PermissionError, match='unreadable archive'):
+        archive_module._archive_encoded_census(root, file_workers=4)
+
+
+def test_encoded_tree_census_progress_is_observation_not_acceptance(tmp_path):
+    root = tmp_path / 'archive'
+    root.mkdir()
+    (root / 'a').write_bytes(b'a')
+    (root / 'b').write_bytes(b'b')
+    events = []
+    observed = archive_module._archive_encoded_census(
+        root, file_workers=1, progress=events.append, expected_items=1)
+    assert observed == {'a', 'b'}
+    assert events[0]['completed_items'] == 0 and events[0]['total_items'] == 1
+    assert events[-1]['completed_items'] == 2 and events[-1]['total_items'] is None
+    assert all(event['stage'] == 'scan-encoded-tree' and event['metadata_only']
+               and not event['acceptance_proof'] for event in events)
+
+
+@pytest.mark.parametrize(('soft_limit', 'expected'), [
+    (archive_module.resource.RLIM_INFINITY, 256),
+    (1024, 252),
+    (128, 28),
+    (16, 2),
+])
+def test_parallel_archive_directory_budget_preserves_fd_headroom(monkeypatch, soft_limit, expected):
+    monkeypatch.setattr(archive_module.resource, 'getrlimit', lambda _which: (soft_limit, soft_limit))
+    assert archive_module._archive_directory_budget(4) == expected
+    assert archive_module._archive_directory_budget(1) == 64
+
+
 def test_legacy_archive_roundtrip_is_non_deployable_and_exact(tmp_path: Path) -> None:
     spec, artifact_root, source = _fixture(tmp_path)
     archive = spec.stage_root / spec.dataset / "archive"
@@ -61,10 +111,228 @@ def test_legacy_archive_roundtrip_is_non_deployable_and_exact(tmp_path: Path) ->
         restore_archive(spec, sync_root, destination, materialized_root=tmp_path / "restore-cache")
 
 
+@pytest.mark.parametrize('manual_capture', [False, True])
+def test_publication_uses_the_admitted_verifier_for_both_source_fences(tmp_path, monkeypatch, manual_capture):
+    spec, artifact_root, source = _fixture(tmp_path)
+    if manual_capture:
+        spec = replace(spec, manual_capture_min_stable_hours=12)
+    # Stand in for the enrolled D scratch without accessing the real drive.
+    monkeypatch.setattr(archive_module, '_d_stage_file_workers', lambda *_: 4)
+    verifier = archive_module.verify_archive_directory
+    fences = []
+    def record_fence(*args, **kwargs):
+        fences.append(kwargs.get('file_workers', 1))
+        return verifier(*args, **kwargs)
+    monkeypatch.setattr(archive_module, 'verify_archive_directory', record_fence)
+    release = publish_archive(spec, artifact_root, tmp_path / 'packed', repo_root=tmp_path,
+                              manual_capture=manual_capture)
+    assert fences == ([4, 4] if manual_capture else [1, 1])
+    assert release['source_files'] == 2
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'legacy incomplete checkpoint'
+
+
+def test_parallel_publication_rejects_source_change_after_cold_commit(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    spec = replace(spec, manual_capture_min_stable_hours=12)
+    monkeypatch.setattr(archive_module, '_d_stage_file_workers', lambda *_: 4)
+    publish = archive_module.publish_packed_snapshot
+    def mutate_after_commit(*args, **kwargs):
+        resolved = publish(*args, **kwargs)
+        (source / 'fold_01/checkpoint_best.pt').write_bytes(b'changed after commit')
+        return resolved
+    monkeypatch.setattr(archive_module, 'publish_packed_snapshot', mutate_after_commit)
+    with pytest.raises(SnapshotError, match='changed|stable|signature|mismatch'):
+        publish_archive(spec, artifact_root, tmp_path / 'packed', repo_root=tmp_path,
+                        manual_capture=True)
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'changed after commit'
+
+
+def test_parallel_archive_verification_keeps_full_proof_and_rejects_corruption(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    manifest = prepare_archive(spec, artifact_root)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    census_workers = []
+    census = archive_module._archive_encoded_census
+    def record_census(*args, **kwargs):
+        census_workers.append(kwargs['file_workers'])
+        return census(*args, **kwargs)
+    monkeypatch.setattr(archive_module, '_archive_encoded_census', record_census)
+    serial = verify_archive_directory(archive, source, spec=spec, file_workers=1)
+    # The real four-worker path is reserved for the exact enrolled D stage;
+    # use a private test stage to exercise its semantics without touching D.
+    monkeypatch.setattr(archive_module, '_d_stage_file_workers', lambda *_: 4)
+    parallel = verify_archive_directory(archive, source, spec=spec, file_workers=4)
+    assert parallel == serial
+    assert census_workers == [1, 8]
+    encoded = archive / manifest['files'][0]['encoded_path']
+    encoded.write_bytes(encoded.read_bytes() + b'corruption')
+    with pytest.raises(SnapshotError, match='encoded file differs'):
+        verify_archive_directory(archive, source, spec=spec, file_workers=4)
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'legacy incomplete checkpoint'
+
+
+@pytest.mark.parametrize('change', ['manifest', 'encoded', 'directory', 'root'])
+def test_archive_verification_rejects_named_generation_change_after_full_hash(tmp_path, monkeypatch, change):
+    spec, artifact_root, source = _fixture(tmp_path)
+    prepare_archive(spec, artifact_root)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    full_hash = archive_module._encoded_original_hashes
+    changed = False
+
+    def hash_then_change(path, codec):
+        nonlocal changed
+        proof = full_hash(path, codec)
+        if not changed:
+            changed = True
+            if change == 'manifest':
+                manifest = archive / 'legacy_archive_manifest.json'
+                manifest.write_bytes(b'\n' + manifest.read_bytes())
+            elif change == 'encoded':
+                replacement = path.with_name(path.name + '.replacement')
+                replacement.write_bytes(path.read_bytes())
+                replacement.replace(path)
+            else:
+                directory = path.parent if change == 'directory' else archive
+                moved = tmp_path / 'preserved-original-directory'
+                directory.rename(moved)
+                directory.symlink_to(moved, target_is_directory=True)
+        return proof
+
+    monkeypatch.setattr(archive_module, '_encoded_original_hashes', hash_then_change)
+    reason = {'manifest': 'manifest changed', 'encoded': 'encoded file changed',
+              'directory': 'directory changed|encoded tree', 'root': 'directory changed'}[change]
+    with pytest.raises(SnapshotError, match=reason):
+        verify_archive_directory(archive, source)
+    assert changed
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'legacy incomplete checkpoint'
+
+
+def test_archive_verification_does_not_follow_a_redirected_encoding_parent(tmp_path):
+    spec, artifact_root, source = _fixture(tmp_path)
+    manifest = prepare_archive(spec, artifact_root)
+    archive = spec.stage_root / spec.dataset / 'archive'
+    parent = (archive / manifest['files'][0]['encoded_path']).parent
+    moved = tmp_path / 'preserved-encodings'
+    parent.rename(moved)
+    parent.symlink_to(moved, target_is_directory=True)
+    with pytest.raises((SnapshotError, OSError)):
+        verify_archive_directory(archive, source)
+    assert (source / 'fold_01/checkpoint_best.pt').exists()
+
+
+@pytest.mark.parametrize('mode', ['reference', 'candidate'])
+def test_verifier_comparison_keeps_full_publish_recovery_and_restore(tmp_path, mode):
+    from types import SimpleNamespace
+    from scripts import benchmark_legacy_archive_workflow as benchmark
+    spec, root, source = _fixture(tmp_path)
+    implementation = archive_module.verify_archive_directory
+    calls = []
+    def reference(*args, **kwargs):
+        calls.append(True)
+        return implementation(*args, **kwargs)
+    expected = {p.relative_to(source).as_posix(): {
+        'sha256': benchmark.sha256_file(p), 'size': p.stat().st_size,
+        'mode': p.stat().st_mode & 0o7777, 'mtime_ns': p.stat().st_mtime_ns,
+    } for p in source.rglob('*') if p.is_file()}
+    result = benchmark.complete_trial(spec, root, tmp_path/'cold', tmp_path/'restored',
+        tmp_path/'materialized', expected, verifier_mode=mode,
+        verifier_reference=SimpleNamespace(verify_archive_directory=reference))
+    assert result['all_original_sha_mode_mtime_verified'] and result['cold_verified']
+    assert result['files'] == 2
+    assert (len(calls) >= 4) is (mode == 'reference')
+    assert archive_module.verify_archive_directory is implementation
+
+
+@pytest.mark.parametrize('mode', ['reference', 'candidate'])
+def test_materialized_comparison_retains_full_owner_publish_recovery_restore_and_readback(tmp_path, mode):
+    from types import SimpleNamespace
+    from scripts import benchmark_legacy_archive_workflow as benchmark
+    import stockagent.data_sync.packed_snapshots as packed
+    spec, root, source = _fixture(tmp_path)
+    implementation = packed._verify_materialized
+    calls = []
+
+    def reference(*args, **kwargs):
+        calls.append(True)
+        return implementation(*args, **kwargs)
+
+    expected = {p.relative_to(source).as_posix(): {
+        'sha256': benchmark.sha256_file(p), 'size': p.stat().st_size,
+        'mode': p.stat().st_mode & 0o7777, 'mtime_ns': p.stat().st_mtime_ns,
+    } for p in source.rglob('*') if p.is_file()}
+    result = benchmark.complete_trial(spec, root, tmp_path / 'cold', tmp_path / 'restored',
+        tmp_path / 'materialized', expected, materialized_mode=mode,
+        materialized_reference=SimpleNamespace(_verify_materialized=reference))
+    assert result['all_original_sha_mode_mtime_verified'] and result['cold_verified']
+    assert result['files'] == 2
+    assert bool(calls) is (mode == 'reference')
+    assert packed._verify_materialized is implementation
+    assert archive_module._verify_materialized is implementation
+
+
+@pytest.mark.parametrize('other', ['--single-pass-decode', '--verifier-reference',
+                                 '--materialized-verifier-reference', '--encoding-on-d'])
+def test_staging_benchmark_requires_an_isolated_comparison(tmp_path, monkeypatch, other):
+    from scripts import benchmark_legacy_archive_workflow as benchmark
+    argv = ['benchmark', '--source', str(tmp_path), '--file', 'raw', '--compare-staging',
+            '--output', str(tmp_path / 'proof.json'), other]
+    if other.endswith('reference'):
+        argv.append(str(tmp_path / 'old.py'))
+    monkeypatch.setattr(benchmark.sys, 'argv', argv)
+    monkeypatch.setattr(benchmark, '_check_d_primary_mount',
+                        lambda _: pytest.fail('invalid comparison reached real storage'))
+    with pytest.raises(SystemExit) as error:
+        benchmark.main()
+    assert error.value.code == 2
+
+
+def test_staging_comparison_keeps_both_full_roundtrips_and_removes_only_trial_scratch(tmp_path, monkeypatch):
+    import tempfile
+    from scripts import benchmark_legacy_archive_workflow as benchmark
+    _spec, _root, source = _fixture(tmp_path)
+    output = tmp_path / 'proof.json'
+    native_parent, d_parent = tmp_path / 'native', tmp_path / 'd'
+    native_parent.mkdir()
+    d_parent.mkdir()
+    original_mkdtemp, original_usage = tempfile.mkdtemp, benchmark.shutil.disk_usage
+
+    def isolated_temp(*, prefix, dir):
+        parent = native_parent if str(dir) == '/var/lib' else d_parent
+        return original_mkdtemp(prefix=prefix, dir=parent)
+
+    def capacity(path):
+        if str(path) == '/srv/stockagent-d-volume':
+            return type(original_usage(tmp_path))(256 * 1024**3, 0, 256 * 1024**3)
+        return original_usage(path)
+
+    argv = ['benchmark', '--source', str(source), '--rounds', '1', '--compare-staging', '--output', str(output)]
+    for path in sorted(source.rglob('*')):
+        if path.is_file():
+            argv.extend(['--file', path.relative_to(source).as_posix()])
+    monkeypatch.setattr(benchmark.sys, 'argv', argv)
+    monkeypatch.setattr(benchmark.tempfile, 'mkdtemp', isolated_temp)
+    monkeypatch.setattr(benchmark.shutil, 'disk_usage', capacity)
+    monkeypatch.setattr(benchmark, '_check_d_primary_mount', lambda _: None)
+    monkeypatch.setattr(benchmark, 'admit_workspace', lambda *_: None)
+    monkeypatch.setattr(benchmark, 'observe_node', lambda *_: {'scope': 'native-fixture-semantics-only'})
+    benchmark.main()
+    proof = json.loads(output.read_bytes())
+    assert proof['comparison'] == 'encoding-stage-native-ssd-vs-D-v1'
+    assert [(row['profile'], row['encoding_on_d']) for row in proof['runs']] == [
+        ('d-stage', True), ('native-ssd-stage', False)]
+    for row in proof['runs']:
+        assert row['all_original_sha_mode_mtime_verified'] and row['cold_verified']
+        assert row['files'] == 2 and row['owned_native_trial_scratch_removed'] and row['owned_d_scratch_removed']
+        assert row['complete_workflow_including_all_trial_scratch_retirement_seconds'] >= row['complete_workflow_including_d_scratch_retirement_seconds']
+    assert not list(native_parent.iterdir()) and not list(d_parent.iterdir())
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'legacy incomplete checkpoint'
+
+
 def test_real_publisher_holds_owner_only_for_canonical_commit(tmp_path, monkeypatch):
     spec, artifact_root, source = _fixture(tmp_path)
     prepare_archive(spec, artifact_root)
     events = []
+    progress_events = []
     held = False
     verify_original = archive_module.verify_archive_directory
     publish_original = archive_module.publish_packed_snapshot
@@ -101,11 +369,13 @@ def test_real_publisher_holds_owner_only_for_canonical_commit(tmp_path, monkeypa
     monkeypatch.setattr(archive_module, "publish_packed_snapshot", publish)
     monkeypatch.setattr(archive_module, "verify_packed_snapshot", verify_packed)
     result = publish_archive(spec, artifact_root, tmp_path / "packed", repo_root=tmp_path,
-                             publication_owner=owner)
+                             publication_owner=owner, publication_progress=progress_events.append)
     assert events == ["verify-originals", "acquire", "publish", "release",
                       "verify-cold", "verify-originals"]
     assert not held
     assert result["source_files"] == 2
+    assert progress_events and all(event['acceptance'] is False for event in progress_events)
+    assert any(event['stage'] == 'packing_changed_small_files' for event in progress_events)
     assert (source / "fold_01/checkpoint_best.pt").read_bytes() == b"legacy incomplete checkpoint"
 
 
@@ -272,6 +542,47 @@ def test_explicit_verification_workspace_recovers_when_default_tmp_is_too_small(
     assert (source / "fold_01/checkpoint_best.pt").exists()
 
 
+def test_default_verification_scratch_checks_physical_backing_before_allocating(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import stockagent.data_sync.training_return as training_return
+
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / "packed"
+    publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    # Simulate ext4 regardless of whether pytest's fixture lives on tmpfs.
+    monkeypatch.setattr(archive_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(archive_module, "_verification_filesystem", lambda path: "ext4")
+    monkeypatch.setattr(archive_module.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(free=1024 * 1024**3))
+    observed = []
+    def reject(path, required):
+        observed.append((path, required))
+        raise SnapshotError("physical backing volume lacks capacity")
+    monkeypatch.setattr(training_return, "admit_workspace", reject)
+    monkeypatch.setattr(archive_module.tempfile, "mkdtemp",
+                        lambda *a, **kw: pytest.fail("scratch allocated before physical admission"))
+    with pytest.raises(SnapshotError, match="physical backing volume lacks capacity"):
+        archive_module.verify_cold_archive(spec, packed)
+    assert len(observed) == 1 and observed[0][1] > 32 * 1024**3
+    assert (source / "fold_01/checkpoint_best.pt").exists()
+
+
+def test_default_tmpfs_remains_available_without_claiming_disk_backing(tmp_path, monkeypatch):
+    import stockagent.data_sync.training_return as training_return
+
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / "packed"
+    publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    monkeypatch.setattr(archive_module, "_verification_filesystem", lambda path: "tmpfs")
+    monkeypatch.setattr(training_return, "admit_workspace",
+                        lambda *a: pytest.fail("tmpfs is not an ext4 workspace"))
+    proof = archive_module.verify_cold_archive(spec, packed)
+    assert proof["cold_verified"] and proof["decoded_originals_verified"]
+    assert proof["verification_workspace"]["filesystem"] == "tmpfs"
+    assert proof["verification_workspace"]["physical_backing_verified"] is False
+    assert (source / "fold_01/checkpoint_best.pt").exists()
+
+
 def test_explicit_verification_workspace_preserves_failed_reconstruction(tmp_path, monkeypatch):
     import stockagent.data_sync.training_return as training_return
     spec, artifact_root, source = _fixture(tmp_path)
@@ -333,7 +644,52 @@ def test_existing_encoding_recovery_checks_cold_and_originals_without_second_tre
     assert proof["files"] == 2
     assert {row["recovery_step"] for row in events} == {
         "independent-cold-reconstruction", "decode-originals"}
+    phases = [(row['recovery_step'], row['stage']) for row in events]
+    pre_hash = ('independent-cold-reconstruction', 'verify-materialized-files')
+    pre_tree = ('independent-cold-reconstruction', 'verify-materialized-tree')
+    decode = ('decode-originals', 'decode-originals')
+    census = ('decode-originals', 'scan-encoded-tree')
+    post_hash = ('decode-originals', 'verify-materialized-post-decode-files')
+    post_tree = ('decode-originals', 'verify-materialized-post-decode-tree')
+    assert phases.index(pre_hash) < phases.index(pre_tree) < phases.index(decode) < phases.index(census) < phases.index(post_hash) < phases.index(post_tree)
+    fixed = resolve_latest_packed(packed, spec.dataset).manifest['source']
+    census_events = [row for row in events if (row['recovery_step'], row['stage']) == census]
+    assert census_events[-1]['completed_items'] == census_events[-1]['total_items'] == fixed['files']
+    assert census_events[-1]['metadata_only'] and not census_events[-1]['acceptance_proof']
+    for name in (pre_hash, post_hash):
+        hashes = [row for row in events if (row['recovery_step'], row['stage']) == name]
+        assert hashes[0]['completed_items'] == 0
+        assert hashes[-1]['completed_items'] == hashes[-1]['total_items'] == fixed['files']
+        assert hashes[-1]['completed_bytes'] == hashes[-1]['total_bytes'] == fixed['logical_bytes']
+    for name in (pre_tree, post_tree):
+        trees = [row for row in events if (row['recovery_step'], row['stage']) == name]
+        assert trees[0]['completed_items'] == 0 and not trees[0]['fingerprint_matched']
+        assert trees[-1]['fingerprint_matched'] and not trees[-1]['acceptance_proof']
     assert encoding.is_dir() and source.is_dir()
+
+
+def test_post_decode_changed_encoding_reports_partial_failure_without_retirement(tmp_path, monkeypatch):
+    spec, artifact_root, source = _fixture(tmp_path)
+    packed = tmp_path / 'packed'
+    publish_archive(spec, artifact_root, packed, repo_root=tmp_path)
+    encoding = spec.stage_root / spec.dataset / 'archive'
+    payload = next((encoding / 'payload').rglob('*.raw'))
+    original_decode = archive_module.verify_archive_directory
+
+    def decode_then_change(*args, **kwargs):
+        proof = original_decode(*args, **kwargs)
+        raw = payload.read_bytes()
+        payload.write_bytes(bytes([raw[0] ^ 1]) + raw[1:])
+        return proof
+
+    monkeypatch.setattr(archive_module, 'verify_archive_directory', decode_then_change)
+    events = []
+    with pytest.raises(SnapshotError, match='checksum mismatch'):
+        archive_module.verify_cold_archive(spec, packed, reuse_encoded_archive=encoding, progress=events.append)
+    assert any(e['stage'] == 'verify-materialized-tree' and e['fingerprint_matched'] for e in events)
+    assert any(e['stage'] == 'verify-materialized-post-decode-files' for e in events)
+    assert not any(e['stage'] == 'verify-materialized-post-decode-tree' for e in events)
+    assert source.is_dir() and encoding.is_dir()
 
 
 @pytest.mark.parametrize("damage", ["cold", "encoding", "changed_during_decode", "foreign_path"])

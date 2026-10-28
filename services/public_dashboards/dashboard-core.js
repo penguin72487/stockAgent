@@ -125,6 +125,12 @@
       if (["sse", "poll", "initial_or_unmatched"].includes(correlation.trigger)) safe.trigger = correlation.trigger;
       if (["status_mode_snapshot", "detail_signal_identity_only"].includes(correlation.viewEvidence)) safe.viewEvidence = correlation.viewEvidence;
       if (["initial", "revision_change"].includes(correlation.updatePhase)) safe.updatePhase = correlation.updatePhase;
+      const countKeys = ["entryRequestedShares", "entryFilledShares", "entryUnfilledShares"];
+      if (correlation.entryCountsVisible === true
+          && countKeys.every(key => Number.isSafeInteger(correlation[key]) && correlation[key] >= 0)) {
+        safe.entryCountsVisible = true;
+        for (const key of countKeys) safe[key] = correlation[key];
+      }
       safe.clockBasis = "browser_monotonic_foreground_double_raf_opportunity_not_physical_pixel";
       metric.correlation = Object.freeze(safe);
     }
@@ -265,7 +271,7 @@
         notices.set(key, {at: now(), trigger: trigger === "poll" ? "poll" : "sse"});
         trim(notices, 16);
       },
-      applied({revision, action, market, sessionDate, signalKey, viewEvidence = "status_mode_snapshot", updatePhase = "revision_change", stillCurrent = () => true}) {
+      applied({revision, action, market, sessionDate, signalKey, viewEvidence = "status_mode_snapshot", updatePhase = "revision_change", entryCounts = null, stillCurrent = () => true}) {
         const key = identity(revision);
         if (!key || global.document?.hidden || typeof global.requestAnimationFrame !== "function"
             || !/^[a-f0-9]{32}$/.test(signalKey || "")) return false;
@@ -284,7 +290,7 @@
             noticeToApplyMs: notice ? appliedAt - notice.at : null,
             correlation: {market, sessionDate, signalKey, viewEvidence, updatePhase, revisionToken: revision.revision_token,
               engineGeneration: revision.engine_generation, stateRevision: revision.state_revision,
-              trigger: notice?.trigger || "initial_or_unmatched"}});
+              trigger: notice?.trigger || "initial_or_unmatched", ...(entryCounts || {})}});
         }));
         return true;
       },
@@ -989,10 +995,23 @@
       throw new RangeError("intervalMs must be at least 250 milliseconds");
     }
     let disposed = false, pending = null, inFlight = false, visibleRefreshQueued = false;
+    let timer = null, lastStartedAt = null;
+    const cadenceFromLastStart = options.cadenceFromLastStart === true;
+    const scheduleNext = () => {
+      if (timer !== null) global.clearTimeout(timer);
+      timer = global.setTimeout(() => {
+        timer = null;
+        if (disposed || (options.pauseWhenHidden !== false && global.document?.hidden)) return;
+        if (inFlight) visibleRefreshQueued = true;
+        else run();
+      }, intervalMs);
+    };
     const run = () => {
       if (disposed || (options.pauseWhenHidden !== false && global.document?.hidden)) return;
       if (inFlight) return pending;
       inFlight = true;
+      lastStartedAt = now();
+      if (cadenceFromLastStart) scheduleNext();
       let result;
       try { result = callback(); }
       catch (error) { result = Promise.reject(error); }
@@ -1008,20 +1027,24 @@
     };
     const visibilityHandler = () => {
       if (!global.document.hidden && options.refreshOnVisible !== false) {
+        if (options.refreshOnVisible === "overdue" && lastStartedAt !== null
+            && now() - lastStartedAt < intervalMs) return;
         if (inFlight) visibleRefreshQueued = true;
         else run();
       }
     };
-    const timer = global.setInterval(run, intervalMs);
+    if (!cadenceFromLastStart) timer = global.setInterval(run, intervalMs);
     global.document?.addEventListener("visibilitychange", visibilityHandler);
     if (options.immediate !== false) run();
+    if (cadenceFromLastStart && timer === null) scheduleNext();
     return Object.freeze({
       run,
       dispose() {
         if (disposed) return;
         disposed = true;
         visibleRefreshQueued = false;
-        global.clearInterval(timer);
+        if (cadenceFromLastStart) global.clearTimeout(timer);
+        else global.clearInterval(timer);
         global.document?.removeEventListener("visibilitychange", visibilityHandler);
       },
     });

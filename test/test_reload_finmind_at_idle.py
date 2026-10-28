@@ -29,6 +29,60 @@ def test_preparation_stack_is_not_an_idle_flag_or_live_batch():
     assert not reload.preparation_stack(foreign)
 
 
+@pytest.mark.parametrize('provider_query', [False, True])
+def test_product_query_adoption_requires_pinned_passing_semantics_not_a_speed_claim(tmp_path, provider_query):
+    import xml.etree.ElementTree as ET
+    required = [
+        'test_exact_verification_shape_is_not_hidden_by_dataset_delegation',
+        'test_due_refresh_precedes_the_source_check_and_scope_is_exact',
+        'test_source_check_does_not_reopen_terminal_empty_or_running_key',
+        'test_registered_verification_retains_cooldown',
+        'test_changed_plan_cannot_authorize_a_new_query',
+        'test_changed_source_pin_rejects_registration_without_task_mutation',
+        'test_finite_source_priority_preempts_due_foreign_history_without_changing_tasks',
+        'test_finite_priority_obeys_real_release_quota_and_future_reservations',
+        'test_canonical_owner_executes_one_exact_check_before_accepted_renewal',
+    ]
+    if provider_query:
+        required += [
+            'test_finmind_exact_priority_is_idempotent_finite_and_preserves_due_refreshes',
+            'test_finite_read_yields_only_foreign_history_reservations_and_respects_dated_releases',
+            'test_unknown_batch_is_rejected_atomically',
+            'test_request_registry_never_reopens_completed_or_unknown_tasks',
+            'test_api_native_split_retains_finite_priority_and_parent_receipt',
+            'test_sponsor_priority_uses_native_release_and_dependency_predicate',
+        ]
+    suite = ET.Element('testsuite')
+    for name in required + [f'other_control_{i}' for i in range(9)]:
+        ET.SubElement(suite, 'testcase', name=name)
+    path = tmp_path / 'semantic.xml'
+    def write():
+        ET.ElementTree(suite).write(path)
+        return reload.file_sha(path)
+    proof = dict(measurement_contract=reload.PRODUCT_VERIFICATION_ACCEPTANCE,
+        state='finite_product_query_semantics_accepted', source_only_no_training_injection=True,
+        exact_output_parity=True, provider_calls=0, production_queue_mutations=0, source_writes=0,
+        semantic_junit_path=str(path), semantic_junit_sha256=write())
+    if provider_query:
+        proof.update(measurement_contract=reload.PROVIDER_QUERY_ACCEPTANCE,
+                     state='provider_priority_semantics_accepted')
+    # The production pytest document wraps suites; accept that exact format.
+    wrapper = ET.Element('testsuites'); wrapper.append(suite)
+    ET.ElementTree(wrapper).write(path); proof['semantic_junit_sha256'] = reload.file_sha(path)
+    assert reload.accepted_local_measurement(proof)
+    for key, bad in [('source_only_no_training_injection',False), ('provider_calls',1),
+                     ('production_queue_mutations',1), ('semantic_junit_sha256','0'*64)]:
+        assert not reload.accepted_local_measurement({**proof,key:bad})
+    for tag in ('failure','error','skipped'):
+        child = ET.SubElement(suite[0],tag)
+        proof['semantic_junit_sha256'] = write()
+        assert not reload.accepted_local_measurement(proof)
+        suite[0].remove(child)
+    suite[0].set('name','missing_required_control')
+    proof['semantic_junit_sha256'] = write()
+    assert not reload.accepted_local_measurement(proof)
+
+
 def test_store_fence_adoption_requires_full_exact_store_trials_and_unchanged_final_files():
     proof = {'measurement_contract': reload.STORE_MEASUREMENT,
              'state': 'accepted_bounded_store_replay',
@@ -181,7 +235,51 @@ def test_failed_freeze_is_still_thawed(tmp_path, monkeypatch):
     assert calls == ['freeze', 'thaw']
 
 
-def test_frozen_termination_pins_process_and_queues_signal_before_thaw(tmp_path, monkeypatch):
+@pytest.mark.parametrize('owner', ['complement', 'sponsor'])
+def test_reserve_boundary_requires_frozen_waiter_and_zero_claims(tmp_path, monkeypatch, owner):
+    import sqlite3
+    stack = [{'thread_name': 'MainThread', 'frames': [
+        {'name': 'wait_for_next_cycle', 'filename': '/repo/downloader/finmind_runtime.py'},
+        {'name': 'main', 'filename': f'/repo/downloader/download_finmind_{owner}.py'}]}]
+    assert reload.reserve_wait_stack(stack, owner)
+    assert not reload.reserve_wait_stack(stack, 'free')
+    assert not reload.reserve_wait_stack(stack + [
+        {'thread_name': 'fetch', 'frames': [{'name': '_fetch'}]}], owner)
+    assert not reload.reserve_wait_stack(preparation_threads(), owner)
+    stamp = datetime.now(UTC).isoformat()
+    status = {'state': 'incremental_reserve', 'observed_at_utc': stamp, 'active_task': None}
+    (tmp_path / 'status.json').write_text(json.dumps(status))
+    with sqlite3.connect(tmp_path / 'queue.sqlite3') as conn:
+        conn.execute('CREATE TABLE tasks(state)')
+        conn.execute('CREATE TABLE finmind_object_prefetch_claims(id)')
+    calls = []
+    monkeypatch.setattr(reload, '_preparation_pid', lambda *_: 123)
+    monkeypatch.setattr(reload, '_stacks', lambda _: stack)
+    monkeypatch.setattr(reload, 'identity', lambda _: {'InvocationID': 'one'})
+    monkeypatch.setattr(reload, 'idle_heartbeat', lambda *_: {'state': 'waiting'})
+    monkeypatch.setattr(reload.subprocess, 'run', lambda args, **kw: calls.append(args))
+    unit = f'stockagent-finmind-{owner}.service'
+    with reload.reserve_boundary(tmp_path, {'InvocationID': 'one'}, owner) as proof:
+        assert proof['mode'] == 'frozen_drained_reserve' and proof['unit'] == unit
+        assert not any(proof['claims'].values())
+        assert [args[1] for args in calls] == ['freeze']
+    assert calls[-1] == ['systemctl', 'thaw', unit]
+    for failure in ('task', 'object', 'changed-generation', 'stale-heartbeat'):
+        with sqlite3.connect(tmp_path / 'queue.sqlite3') as conn:
+            conn.execute('DELETE FROM tasks'); conn.execute('DELETE FROM finmind_object_prefetch_claims')
+            if failure == 'task': conn.execute("INSERT INTO tasks VALUES ('inflight')")
+            if failure == 'object': conn.execute('INSERT INTO finmind_object_prefetch_claims VALUES (1)')
+        monkeypatch.setattr(reload, 'identity', lambda _: {'InvocationID': 'other' if failure == 'changed-generation' else 'one'})
+        monkeypatch.setattr(reload, 'idle_heartbeat', lambda *_: {'state': 'unavailable' if failure == 'stale-heartbeat' else 'waiting'})
+        calls.clear()
+        with reload.reserve_boundary(tmp_path, {'InvocationID': 'one'}, owner) as proof:
+            assert proof is None
+        assert [args[1] for args in calls] == ['freeze', 'thaw']
+
+
+@pytest.mark.parametrize('mode,unit', [('frozen_drained_preparation', reload.UNIT),
+                                      ('frozen_drained_reserve', 'stockagent-finmind-sponsor.service')])
+def test_frozen_termination_pins_process_and_queues_signal_before_thaw(tmp_path, monkeypatch, mode, unit):
     import signal
     calls = []
     monkeypatch.setattr(reload, '_pidfd_open', lambda pid: calls.append(('pin', pid)) or 99)
@@ -189,7 +287,7 @@ def test_frozen_termination_pins_process_and_queues_signal_before_thaw(tmp_path,
     monkeypatch.setattr(reload, '_pidfd_signal', lambda fd, sig: calls.append(('signal', fd, sig)))
     monkeypatch.setattr(reload.subprocess, 'run', lambda args, **kw: calls.append(('systemctl', args[1])))
     monkeypatch.setattr(Path, 'read_text', lambda *_a, **_kw: 'SigIgn:\t0\nSigCgt:\t2\n')
-    proof = {'mode': 'frozen_drained_preparation', 'pid': 123, 'claims': {'object': 0, 'year': 0}}
+    proof = {'mode': mode, 'unit': unit, 'pid': 123, 'claims': {'object': 0, 'year': 0}}
     reload.terminate_frozen_preparation(proof)
     assert calls == [('pin', 123), ('signal', 99, signal.SIGTERM), ('close', 99), ('systemctl', 'thaw')]
     monkeypatch.setattr(Path, 'read_text', lambda *_a, **_kw: 'SigIgn:\t0\nSigCgt:\t4000\n')

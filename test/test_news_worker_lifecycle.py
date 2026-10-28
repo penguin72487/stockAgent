@@ -199,6 +199,145 @@ def test_dead_or_closed_owner_cannot_leave_fresh_running_snapshot(tmp_path, monk
     assert result['acquisition']['eligible_eta_seconds'] is None
 
 
+@pytest.mark.parametrize('reason', ['dead', 'closed', 'failed'])
+def test_proven_stopped_owner_overrides_expired_snapshot_for_enabled_sources(tmp_path, monkeypatch, reason):
+    old, lifecycle = seed(tmp_path)
+    old.update(owner_id='b' * 32, activity='running', updated_at_utc=datetime.now(UTC).isoformat())
+    _save(tmp_path, old)
+    lifecycle.snapshot_written()
+    if reason == 'dead':
+        monkeypatch.setattr('stockagent.data.news_worker_lifecycle.process_owner_alive', lambda *a, **k: False)
+    else:
+        lifecycle.finish(failed=reason == 'failed')
+    result = build_news_public_status(tmp_path, now=datetime.now(UTC) + timedelta(seconds=181))
+    cnyes = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    unregistered = next(row for row in result['providers'] if row['id'] == 'unregistered:example.org')
+    assert result['health'] == result['worker']['activity'] == cnyes['state'] == 'stopped'
+    assert result['provider_state_owner_lifecycle_contract_version'] == 1
+    assert not result['worker']['fresh']
+    assert cnyes['conditional_eta_seconds'] is None
+    assert result['acquisition']['stored_body_articles'] == 2
+    assert unregistered['state'] == 'not_enabled'
+
+
+def test_proven_stopped_reload_wait_does_not_turn_into_stale_or_running(tmp_path):
+    old, lifecycle = seed(tmp_path)
+    old.update(owner_id='b' * 32, activity='configuration_reload_requested',
+               updated_at_utc=datetime.now(UTC).isoformat())
+    _save(tmp_path, old)
+    lifecycle.snapshot_written()
+    lifecycle.finish()
+    result = build_news_public_status(tmp_path, now=datetime.now(UTC) + timedelta(seconds=181))
+    assert result['health'] == 'waiting_restart'
+    assert next(row for row in result['providers'] if row['id'] == 'cnyes')['state'] == 'waiting_restart'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+
+
+def test_stale_snapshot_without_matching_owner_evidence_stays_stale(tmp_path):
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=181))
+    status['activity'] = 'stopped'
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path)
+    assert not result['worker']['lifecycle']['available']
+    assert result['health'] == 'stale'
+    assert next(row for row in result['providers'] if row['id'] == 'cnyes')['state'] == 'stale'
+
+
+@pytest.mark.parametrize('mode,width', [('stopped', 1280), ('stopped', 390), ('stale', 1280), ('running', 1280)])
+def test_metadata_feed_card_distinguishes_stopped_stale_and_running(tmp_path, browser, mode, width):
+    from playwright.sync_api import expect
+    from scripts.verify_news_dashboard import required_provider_card
+    from test_news_dashboard import _metadata_feed_snapshot, _server
+
+    now = datetime.now(UTC)
+    status = _metadata_feed_snapshot(tmp_path)
+    status.update(owner_id='b' * 32, activity='running',
+                  updated_at_utc=(now - timedelta(seconds=181) if mode != 'running' else now).isoformat())
+    status['providers']['ltn']['metadata_feed_progress'].update(
+        last_check_at_utc=(now - timedelta(minutes=5)).isoformat(),
+        next_check_at_utc=(now - timedelta(seconds=1)).isoformat())
+    if mode == 'stopped':
+        status['provider_next_attempt_utc']['ltn'] = (now + timedelta(minutes=30)).isoformat()
+    observed = datetime.fromisoformat(status['updated_at_utc'])
+    probe = observed + timedelta(seconds=30 if mode != 'running' else -1)
+    status['providers']['cnyes']['body_work_progress'] = {
+        'contract_version': 1, 'active_missing_body_urls': 4,
+        'existing_primary_body_candidates': 3, 'no_known_primary_body_urls': 1,
+        'candidate_views_accepted_by_hint': False, 'candidate_body_equivalence_verified': False,
+        'request_scope_progress': {'contract_version': 1, 'available': True,
+            'active_missing_body_urls': 4, 'source_paused_missing_body_urls': 2,
+            'other_missing_body_urls': 2, 'policy_paused_missing_body_urls': 2,
+            'gateway_paused_missing_body_urls': 0, 'source_recovery_verified': False,
+            'next_source_probe_at_utc': probe.isoformat(),
+            'pending_source_rechecks': {'contract_version': 1, 'available': True,
+                'unverified_missing_body_urls': 2, 'due_missing_body_urls': 2 if mode == 'running' else 0,
+                'next_probe_at_utc': probe.isoformat()}}}
+    _save(tmp_path, status)
+    lifecycle = None
+    if mode != 'stale':
+        lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+        lifecycle.started('b' * 32)
+        lifecycle.snapshot_written()
+        if mode == 'stopped':
+            lifecycle.finish()
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': width, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+    try:
+        page.goto(base + '/news/', wait_until='domcontentloaded', timeout=15000)
+        # Poll the rendered state rather than evaluating a string inside the
+        # page: its CSP correctly disallows unsafe-eval, and Playwright's
+        # wait_for_function can otherwise race with CSP enforcement.
+        health_label = {'stopped': '下載器已停止', 'stale': '觀測已過期', 'running': '正在抓取'}[mode]
+        expect(page.locator('#news-health')).to_contain_text(health_label, timeout=10000)
+        assert not errors, errors
+        page.locator('a[href="#acq-catalog"]').click(timeout=10000)
+        page.locator('#source-search').fill('ltn')
+        card = required_provider_card(page, 'ltn')
+        feed = card.locator('[data-news-metadata-feed]')
+        expect(feed).to_have_count(1)
+        if mode == 'stopped':
+            expect(card).to_contain_text('下載器已停止')
+            expect(feed).to_contain_text('下載器顯示已停止，恢復服務後才會繼續')
+            expect(feed).to_contain_text('上次記錄排程 已到期，不表示已經執行')
+            expect(card).to_contain_text('上次記錄來源冷卻最早截止')
+            expect(card).to_contain_text('不表示到時已執行')
+            # A still-running older API may expose stale source states despite
+            # already reporting the verified stopped owner globally.
+            page.evaluate("state.latest.providers.filter(s => s.enabled).forEach(s => s.state = 'stale'); renderSources(state.latest)")
+            expect(card).to_contain_text('下載器已停止')
+        elif mode == 'stale':
+            expect(card).to_contain_text('觀測已過期')
+            expect(feed).to_contain_text('目前階段無有效追新執行觀測')
+            assert '下載器顯示已停止' not in feed.inner_text()
+        else:
+            expect(card).to_contain_text('RSS 資訊追新，非全文')
+            expect(feed).to_contain_text('下一次 已到期，等待排程')
+        if mode != 'running':
+            assert '下一次 已到期，等待排程' not in feed.inner_text()
+        page.locator('#source-search').fill('cnyes')
+        scope = required_provider_card(page, 'cnyes').locator('[data-news-request-scope]')
+        expect(scope).to_have_count(1)
+        if mode == 'running':
+            expect(scope).to_contain_text('已到期，等待排程')
+        else:
+            expect(scope).to_contain_text('上次記錄已到期，實際執行情況待確認')
+            expect(scope).to_contain_text('目前是否執行待確認')
+            assert '已到期，等待排程' not in scope.inner_text()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        assert not errors and not remote
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+        if lifecycle is not None and mode == 'running':
+            lifecycle.finish()
+
+
 def test_first_same_owner_snapshot_enables_only_its_current_rates(tmp_path):
     old, lifecycle = seed(tmp_path)
     lifecycle.snapshot_written()

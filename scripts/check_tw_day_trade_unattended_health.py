@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +51,8 @@ REQUIRED_TIMERS = (
     "stockagent-time-sync-check.timer",
     "stockagent-tw-day-trade-eligibility.timer",
     "stockagent-tw-public-publication-sweep.timer",
+    "stockagent-tw-public-calendar-refresh.timer",
+    "stockagent-tw-trading-universe.timer",
     "stockagent-tw-public-0830-check.timer",
     "stockagent-tw-day-trade-preopen-gate.timer",
     "stockagent-discord-artifact-maintenance.timer",
@@ -72,6 +75,14 @@ BEST_EFFORT_MAINTENANCE_UNITS = {
     ),
 }
 BEST_EFFORT_MAINTENANCE_SERVICES = tuple(BEST_EFFORT_MAINTENANCE_UNITS)
+# Operator-owned control, distinct from the guardian's repair journal.  Its
+# writer takes the same control lease as this guardian before changing it.
+ACQUISITION_PAUSE_PATH = Path("/var/lib/stockagent/acquisition-control/user-pause.json")
+# A bulk acquisition pause NEVER applies to live day-trade source owners,
+# eligibility, calendar, universe, publication or pre-open acceptance.
+PAUSABLE_ACQUISITION_UNITS = frozenset(
+    unit for pair in BEST_EFFORT_MAINTENANCE_UNITS.items() for unit in pair
+)
 OPENING_RESOURCE_GUARD_START = datetime_time(8, 20)
 OPENING_RESOURCE_GUARD_END = datetime_time(9, 10)
 CAUSAL_LIVE_ENTRY_FILL_POLICIES = frozenset(
@@ -169,6 +180,50 @@ def _json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _acquisition_pause(path: Path | None = None) -> dict[str, Any]:
+    """Read a local explicit pause; unreadable or malformed controls fail closed.
+
+    This only suppresses starts of the allowlisted acquisition units.  It does
+    not imply that in-flight work has stopped or that source data is ready.
+    """
+    path = path or ACQUISITION_PAUSE_PATH
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return {"state": "absent", "paused": False}
+    except OSError:
+        return {"state": "invalid", "paused": True}
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or info.st_mode & 0o022):
+                raise ValueError("unsafe acquisition pause control")
+            raw = handle.read(4097)
+        if len(raw) > 4096:
+            raise ValueError("acquisition pause control exceeds bound")
+
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate acquisition pause key")
+                result[key] = value
+            return result
+
+        value = json.loads(raw, object_pairs_hook=unique)
+        if (not isinstance(value, dict) or set(value) != {"contract", "paused", "reason"}
+                or value["contract"] != "stockagent.user_acquisition_pause.v1"
+                or type(value["paused"]) is not bool
+                or not isinstance(value["reason"], str)
+                or not 0 < len(value["reason"]) <= 120):
+            raise ValueError("invalid acquisition pause control")
+        return {"state": "paused" if value["paused"] else "released",
+                "paused": value["paused"], "reason": value["reason"]}
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return {"state": "invalid", "paused": True}
+
+
 def _parse_time(value: Any) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -212,6 +267,56 @@ def _classify_session_signals(
         ):
             noncausal_recovery_markets.append(market)
     return missing_markets, noncausal_recovery_markets
+
+
+def _signal_observation(
+    *, session_state: str, session_date: str, wall: datetime_time,
+    modes: dict[str, Any], deadline_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep registration, durable paper-fill latency and browser paint distinct."""
+    is_session = session_state == "open"
+    assessed = is_session and wall >= datetime_time(9, 0, 15)
+    missing, noncausal = _classify_session_signals(modes, session_date=session_date) if is_session else ([], [])
+    receipt_observed = _parse_time(deadline_receipt.get("observed_at"))
+    if receipt_observed is not None:
+        receipt_observed = receipt_observed.astimezone(TAIPEI)
+    expected = deadline_receipt.get("expected_markets")
+    receipt_ok = bool(
+        is_session and deadline_receipt.get("contract") == "daily_opening_original_clock_deadline_v1"
+        and deadline_receipt.get("session_date") == session_date
+        and deadline_receipt.get("target_ms") == 1000
+        and deadline_receipt.get("scope_matches_preopen") is True
+        and deadline_receipt.get("evidence_errors") == []
+        and isinstance(expected, list) and all(isinstance(name, str) for name in expected)
+        and len(expected) == len(EXPECTED_MARKETS) and set(expected) == set(EXPECTED_MARKETS)
+        and receipt_observed is not None and receipt_observed.date().isoformat() == session_date
+        and datetime_time(9, 0, 1) <= receipt_observed.time().replace(tzinfo=None) <= wall
+        and deadline_receipt.get("simulation_only") is True
+        and deadline_receipt.get("broker_fill_claim") is False
+        and type(deadline_receipt.get("passed")) is bool
+        and deadline_receipt.get("state") in {"passed", "missed_or_unverified"}
+        and (deadline_receipt.get("state") == "passed") == deadline_receipt["passed"]
+    )
+    deadline_state = deadline_receipt["state"] if receipt_ok else "unverified"
+    return {
+        "session_date": session_date,
+        "state": ("not_applicable" if session_state == "closed" else
+                  "calendar_unverified" if not is_session else
+                  "waiting_for_open" if wall < datetime_time(9, 0) else
+                  "observing" if not assessed else "assessed"),
+        "ready": (not missing and not noncausal) if assessed else None,
+        "committed": (not missing) if is_session else None,
+        "registration_measurement_boundary": "signal_registration_not_full_fill_or_browser_paint",
+        "live_sla_met": deadline_receipt["passed"] if receipt_ok else None,
+        "live_sla_evidence": {
+            "state": deadline_state,
+            "target_ms": 1000,
+            "measurement_boundary": "native_durable_signal_and_full_paper_targets_not_browser_paint_or_broker_fill",
+        },
+        "missing_markets": missing,
+        "noncausal_recovery_markets": noncausal,
+        "modes": modes,
+    }
 
 
 def _systemctl_show(unit: str) -> dict[str, str]:
@@ -338,8 +443,9 @@ def _repair_unit(
     action_state: dict[str, Any],
     observed: datetime,
     cooldown_seconds: float,
+    paused_units: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
-    if not repair:
+    if not repair or unit in paused_units:
         return []
     key = f"enable-start:{unit}"
     if not _cooldown_ready(
@@ -372,8 +478,9 @@ def _trigger_oneshot(
     action_state: dict[str, Any],
     observed: datetime,
     cooldown_seconds: float,
+    paused_units: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
-    if not repair:
+    if not repair or unit in paused_units:
         return []
     key = f"start:{unit}"
     if not _cooldown_ready(
@@ -423,6 +530,7 @@ def _protect_opening_resources(
     action_state: dict[str, Any],
     action_path: Path | None = None,
     session_open: bool | None = None,
+    paused_units: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     """Pause only resumable bulk jobs across the opening critical path."""
 
@@ -526,6 +634,7 @@ def _protect_opening_resources(
             if repair:
                 requested = []
                 succeeded = True
+                deferred_by_user = False
                 # Resume the interrupted work before its scheduler.  Starting
                 # the timer first can race OnUnitInactiveSec and double-trigger.
                 for unit, was_active, row in (
@@ -540,7 +649,12 @@ def _protect_opening_resources(
                         timer_row,
                     ),
                 ):
-                    if not was_active or is_running(row):
+                    if not was_active:
+                        continue
+                    if unit in paused_units:
+                        deferred_by_user = True
+                        continue
+                    if is_running(row):
                         continue
                     result = _run_systemctl("start", "--no-block", unit)
                     result.update(
@@ -552,7 +666,7 @@ def _protect_opening_resources(
                     actions.append(result)
                     requested.append(unit)
                     succeeded = succeeded and result.get("returncode") == 0
-                if succeeded:
+                if succeeded and not deferred_by_user:
                     action_state[key] = {
                         **pause,
                         "resumed_at_taipei": observed.isoformat(timespec="seconds"),
@@ -561,7 +675,7 @@ def _protect_opening_resources(
                     }
                     persist_action_state()
                     pending = False
-                else:
+                elif not succeeded:
                     persist_action_state()
                     failures.append(
                         f"failed to resume opening competitor: {service_unit}"
@@ -575,6 +689,9 @@ def _protect_opening_resources(
             "timer_active_state": timer_row.get("ActiveState"),
             "timer_sub_state": timer_row.get("SubState"),
             "resume_pending": pending,
+            "resume_deferred_by_user": bool(
+                pending and (service_unit in paused_units or timer_unit in paused_units)
+            ),
         }
     return (
         {
@@ -692,6 +809,10 @@ def main() -> int:
         actions: list[dict[str, Any]] = []
         failures: list[str] = []
         warnings: list[str] = []
+        acquisition_pause = _acquisition_pause()
+        paused_units = PAUSABLE_ACQUISITION_UNITS if acquisition_pause["paused"] else frozenset()
+        if acquisition_pause["state"] == "invalid":
+            warnings.append("bulk acquisition pause control is invalid; bulk resume is deferred")
         if not control["acquired"]:
             warnings.append("planned paper-service maintenance is active; unattended repair deferred")
         try:
@@ -717,6 +838,7 @@ def main() -> int:
                 action_state=action_state,
                 action_path=action_path,
                 session_open=session_state != "closed",
+                paused_units=paused_units,
             )
         )
         actions.extend(resource_actions)
@@ -746,6 +868,7 @@ def main() -> int:
                         action_state=action_state,
                         observed=observed,
                         cooldown_seconds=float(args.action_cooldown_seconds),
+                        paused_units=paused_units,
                     )
                 )
 
@@ -791,6 +914,7 @@ def main() -> int:
                         action_state=action_state,
                         observed=observed,
                         cooldown_seconds=float(args.action_cooldown_seconds),
+                        paused_units=paused_units,
                     )
                 )
 
@@ -839,6 +963,7 @@ def main() -> int:
                         action_state=action_state,
                         observed=observed,
                         cooldown_seconds=float(args.action_cooldown_seconds),
+                        paused_units=paused_units,
                     )
                 )
 
@@ -864,6 +989,7 @@ def main() -> int:
                         action_state=action_state,
                         observed=observed,
                         cooldown_seconds=float(args.action_cooldown_seconds),
+                        paused_units=paused_units,
                     )
                 )
 
@@ -937,23 +1063,26 @@ def main() -> int:
             # the independent opening execution engine disconnected.
             warnings.append("post-close Discord artifact maintenance is not ready")
 
+        deadline_receipt = _json(
+            REPO_ROOT / "artifacts/live/tw_day_trade_simulation/opening_audits"
+            / session_date / "first_assessment_1000ms.json"
+        )
+        signal_observation = _signal_observation(
+            session_state=session_state, session_date=session_date, wall=wall,
+            modes=modes, deadline_receipt=deadline_receipt,
+        )
+        missing_signals = signal_observation["missing_markets"]
+        noncausal_recovery_markets = signal_observation["noncausal_recovery_markets"]
         if session_open and wall >= datetime_time(9, 0, 15):
-            missing_signals, noncausal_recovery_markets = (
-                _classify_session_signals(modes, session_date=session_date)
-            )
             if missing_signals:
                 failures.append(
                     "current-session signal commit missing: " + ",".join(missing_signals)
                 )
             if noncausal_recovery_markets:
                 failures.append(
-                    "09:00 causal live execution SLA missed; current-session "
-                    "signals recovered by non-live replay: "
+                    "current-session signals recovered by non-live replay: "
                     + ",".join(noncausal_recovery_markets)
                 )
-        else:
-            missing_signals = []
-            noncausal_recovery_markets = []
 
         if session_open and wall >= datetime_time(13, 30):
             open_markets = [
@@ -1038,6 +1167,7 @@ def main() -> int:
             "actions": actions,
             "components": {
                 "planned_maintenance": control,
+                "acquisition_pause": acquisition_pause,
                 "time_sync": time_health,
                 "opening_resource_guard": opening_resource_guard,
                 "services": services,
@@ -1083,16 +1213,7 @@ def main() -> int:
                     "ready": not maintenance_degraded,
                     **maintenance,
                 },
-                "session_signals": {
-                    "ready": not missing_signals and not noncausal_recovery_markets,
-                    "committed": not missing_signals,
-                    "live_sla_met": (
-                        not missing_signals and not noncausal_recovery_markets
-                    ),
-                    "missing_markets": missing_signals,
-                    "noncausal_recovery_markets": noncausal_recovery_markets,
-                    "modes": modes,
-                },
+                "session_signals": signal_observation,
                 "post_close_flat": {
                     "ready": not open_markets,
                     "open_markets": open_markets,

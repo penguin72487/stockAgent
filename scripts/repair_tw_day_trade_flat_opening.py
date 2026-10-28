@@ -41,6 +41,7 @@ from stockagent.live.quote_provider import (
 )
 from stockagent.live.day_trade_maintenance import control_lease
 from stockagent.live.market_status import short_file_fingerprint
+from stockagent.live.paper_journal import journal_write_transaction, open_paper_journal, rebind_cloned_journals
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     SIMULATION_SCHEMA_VERSION, TwDayTradeSimulationEngine, _append_jsonl_many,
@@ -70,7 +71,8 @@ POSITION_ECONOMIC_KEYS = (
 
 
 def _object(path: Path) -> dict:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    from stockagent.live.paper_mode_snapshot import read_paper_state
+    value = read_paper_state(path)
     if not isinstance(value, dict):
         raise ValueError(f"expected JSON object: {path}")
     return value
@@ -119,7 +121,7 @@ def _handoff_gap_minutes(path: Path, manifest: dict) -> list[datetime]:
     cutoff = datetime.fromisoformat(manifest["current_capture"]["completed_through"])
     applied = datetime.fromisoformat(manifest["applied_at"])
     first_live = None
-    with path.open("rb") as handle:
+    with open_paper_journal(path) as handle:
         handle.seek(manifest["journal_prefix_bytes"]["marks.jsonl"])
         for line in handle:
             if not line.endswith(b"\n"):
@@ -483,7 +485,9 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
 
 def _curve_proof(path: Path, market: str, sessions: list[dict]) -> list[dict]:
     points = {str(item["day"]): {} for item in sessions}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    with open_paper_journal(path, "r", encoding="utf-8") as stream:
+        lines = stream.read().splitlines()
+    for line in lines:
         row = json.loads(line)
         stamp = str(row.get("minute") or "")
         if row.get("market") == market and stamp[:10] in points:
@@ -732,9 +736,10 @@ def recover_interrupted(args) -> dict:
                 raise RuntimeError("insufficient disk for a recoverable isolated ledger copy")
             shutil.copytree(args.live_dir, candidate, ignore=lambda _dir, names: {
                 name for name in names if name.endswith(".lock") or name.endswith(".tmp")})
+            rebind_cloned_journals(args.live_dir, candidate)
             for name, proof in baseline["journals"].items():
                 # This is a new isolated projection, never a live source file.
-                with (candidate / name).open("r+b") as handle:
+                with journal_write_transaction(candidate / name, operation="replace"), (candidate / name).open("r+b") as handle:
                     handle.truncate(original["journal_prefix_bytes"][name])
                     handle.flush()
                     os.fsync(handle.fileno())
@@ -824,7 +829,8 @@ def bridge_marks(args) -> dict:
     for minute in minutes:
         engine._mark_mode(args.market, minute, _historical_minute_valuation_quotes(
             engine.state["modes"][args.market], bars, observed=minute), append_history=True)
-    bridged = [json.loads(line) for line in engine.marks_path.read_text().splitlines()]
+    with open_paper_journal(engine.marks_path, "r", encoding="utf-8") as stream:
+        bridged = [json.loads(line) for line in stream.read().splitlines()]
     if len(bridged) != len(minutes):
         raise RuntimeError("handoff bridge did not produce every requested minute")
     if _inventory_anchor(_object(args.live_dir / "state.json")["modes"][args.market]) != _inventory_anchor(baseline):

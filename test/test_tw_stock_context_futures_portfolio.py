@@ -42,8 +42,10 @@ from stockagent.data.tw_stock_context_futures_portfolio import (
     TW_STOCK_CONTEXT_FUTURES_PRIOR_MARKET_FEATURE_COLUMNS,
     TaiwanStockContextFuturesPortfolioDaily,
     attach_stock_context_futures_portfolio_daily,
+    dated_futures_candidate_mask,
     fixed_futures_slot_symbols,
     load_tx_front_rolling_benchmark,
+    _require_source_calendar_within_stock_horizon,
 )
 from stockagent.models.cross_sectional_all_futures import (
     CrossSectionalAllFuturesModel,
@@ -58,6 +60,34 @@ from stockagent.training.trainer import (
     _split_recurrent_symbol_count,
     _split_uses_recurrent_futures_equity_scale,
 )
+
+
+def test_dated_membership_keeps_late_early_and_reappearing_contracts():
+    # A ends early, B lists late, C returns after an unavailable decision.
+    # None has to be eligible throughout this period or throughout a lookback.
+    known = np.array([
+        [0, 0, 0], [1, 0, 1], [1, 0, 1], [0, 0, 0],
+        [0, 1, 1], [0, 1, 1], [0, 1, 0], [0, 1, 1],
+    ], dtype=bool)
+    same = np.ones_like(known)
+    reference = np.ones_like(known)
+    quarantine = np.zeros_like(known)
+    capacity = np.full(known.shape, 2.)
+    candidate = dated_futures_candidate_mask(known, same, reference, quarantine, prior_capacity=capacity)
+    np.testing.assert_array_equal(candidate, known)
+    assert candidate.any(axis=0).all() and not candidate.all(axis=0).any()
+    assert candidate[4, 2] and candidate[7, 2]
+    # Changes at later decisions cannot alter any earlier policy membership.
+    known[6:] = ~known[6:]
+    reference[6:] = False
+    changed = dated_futures_candidate_mask(known, same, reference, quarantine, prior_capacity=capacity)
+    np.testing.assert_array_equal(candidate[:6], changed[:6])
+    # Admission remains local when a real account rule temporarily blocks entry.
+    capacity[2, 0] = 0
+    quarantine[5, 1] = True
+    final = dated_futures_candidate_mask(known, same, np.ones_like(known), quarantine, prior_capacity=capacity)
+    assert not final[2, 0] and final[1, 0]
+    assert not final[5, 1] and final[4, 1]
 
 
 def test_tx_front_roll_uses_new_contract_own_previous_close(tmp_path: Path) -> None:
@@ -84,6 +114,20 @@ def test_tx_front_roll_uses_new_contract_own_previous_close(tmp_path: Path) -> N
     )
     assert payload["front_month_roll_mask"].tolist() == [False, False, True]
     assert payload["prior_same_contract_close"][-1] == 121.0
+    expanded_dates = np.asarray(["2026-01-02", "2026-01-03", "2026-01-05", "2026-01-06"],
+                                dtype="datetime64[D]")
+    expanded = load_tx_front_rolling_benchmark(
+        path, expanded_dates, account_only_mask=np.asarray([False, True, False, False]),
+    )
+    np.testing.assert_allclose(expanded["benchmark_log_returns"][[0, 2, 3]],
+                               payload["benchmark_log_returns"])
+    assert expanded["benchmark_log_returns"][1] == 0
+    assert not expanded["source_covered"][1]
+    assert np.isnan(expanded["front_month_close"][1])
+    with pytest.raises(ValueError, match="market session on an account-only date"):
+        load_tx_front_rolling_benchmark(
+            path, expanded_dates, account_only_mask=np.asarray([False, False, True, False]),
+        )
     with pytest.raises(ValueError, match="source ends"):
         load_tx_front_rolling_benchmark(
             path, np.append(dates, np.datetime64("2026-01-07"))
@@ -239,6 +283,47 @@ def test_attach_uses_only_prior_futures_features_and_separate_action_axis(
     assert not daily.executable_mask[1, 0]
     assert daily.candidate_mask[1, 0]
     assert daily.must_liquidate_mask[2, 0]
+
+    from stockagent.data.tw_futures_account_calendar import build_futures_account_calendar
+    dual_calendar = build_futures_account_calendar(
+        [session_dates[0], session_dates[2]], session_dates, [False, True, False],
+    )
+    original_table = pq.read_table(data_path)
+    pq.write_table(original_table.append_column(
+        "accounting_only_date", pa.array([False, True, False])), data_path)
+    manifest["outputs"]["continuous_daily"]["sha256"] = _sha256(data_path)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    # The ordinary entry point must reject these rows even if the manifest did
+    # not opt into a source-calendar guard and the stock axis includes them.
+    with pytest.raises(ValueError, match="account-only events"):
+        attach_stock_context_futures_portfolio_daily(
+            _stock_panel(), data_path,
+            fee_per_side_twd_by_group={"large": 60.0, "standard": 24.0, "stock": 40.0, "micro": 16.0},
+            integer_contracts=True, max_volume_participation=0.5,
+        )
+    dual_panel = attach_stock_context_futures_portfolio_daily(
+        _stock_panel(), data_path,
+        fee_per_side_twd_by_group={"large": 60.0, "standard": 24.0, "stock": 40.0, "micro": 16.0},
+        integer_contracts=True, integer_fee_per_contract_per_side_twd=40.0,
+        max_volume_participation=0.5, futures_account_calendar=dual_calendar,
+    )
+    dual_daily = dual_panel.stock_context_futures_portfolio_daily
+    # Only the real preceding market observation reaches the next decision;
+    # a settlement-only row is never treated as a new model observation.
+    assert dual_daily.candidate_features[2, 0, settlement_feature] == pytest.approx(1.0)
+    assert dual_daily.candidate_mask[2, 0]
+    assert not dual_daily.candidate_mask[1, 0]
+    wrong_calendar = build_futures_account_calendar(session_dates, session_dates, [False, False, False])
+    with pytest.raises(ValueError, match="calendar differs from source dates or flags"):
+        attach_stock_context_futures_portfolio_daily(
+            _stock_panel(), data_path,
+            fee_per_side_twd_by_group={"large": 60.0, "standard": 24.0, "stock": 40.0, "micro": 16.0},
+            integer_contracts=True, max_volume_participation=0.5, futures_account_calendar=wrong_calendar,
+        )
+
+    pq.write_table(original_table, data_path)
+    manifest["outputs"]["continuous_daily"]["sha256"] = _sha256(data_path)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     legacy_panel = attach_stock_context_futures_portfolio_daily(
         _stock_panel(),
@@ -1525,6 +1610,26 @@ def test_wide_futures_action_layout_invalidates_model_and_resume_fingerprints(sl
         with pytest.raises(RuntimeError,match='fingerprint mismatch'):
             validate_checkpoint_manifest({'experiment_manifest':legacy},manifest,
                 checkpoint_path=Path('legacy-1936.pt'),scope=scope)
+
+
+def test_source_calendar_ignores_outside_horizon_but_never_omits_cash_events(tmp_path):
+    path = tmp_path / 'daily.parquet'
+    pq.write_table(pa.table({
+        'date': pa.array([date(2010, 1, 4), date(2011, 1, 3), date(2011, 1, 4),
+                          date(2011, 1, 5), date(2012, 1, 3)]),
+        'accounting_only_date': [False, False, True, False, False],
+    }), path)
+    full = np.asarray(['2011-01-03', '2011-01-04', '2011-01-05'], dtype='datetime64[D]')
+    _require_source_calendar_within_stock_horizon(path, full)
+    with pytest.raises(ValueError, match='missing_market_dates=0, missing_cash_only_accounting_dates=1'):
+        _require_source_calendar_within_stock_horizon(path, full[[0, 2]])
+    with pytest.raises(ValueError, match='missing_market_dates=1, missing_cash_only_accounting_dates=1'):
+        _require_source_calendar_within_stock_horizon(path,
+            np.asarray(['2011-01-03', '2011-01-06'], dtype='datetime64[D]'))
+    pq.write_table(pa.table({'date': pa.array([date(2011, 1, 3), date(2011, 1, 3)]),
+                             'accounting_only_date': [False, True]}), path)
+    with pytest.raises(ValueError, match='ambiguous accounting-only'):
+        _require_source_calendar_within_stock_horizon(path, full)
 
 
 def test_integer_0900_carry_config_is_fresh_full_feature_contract() -> None:

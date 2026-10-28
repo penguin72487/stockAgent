@@ -61,6 +61,22 @@
   "auto_month_period_replanning": true,
   "auto_preview_capacity_replanning": true,
   "raw_source_publish": false,
+  "finite_query_after_incremental_attempts": 4,
+  "incremental": {
+    "contract": "tej_separate_incremental_plans_v1",
+    "enabled": true,
+    "check_hour_taipei": 19,
+    "api_snapshot_days": 7,
+    "overlap_days": {
+      "daily": 3,
+      "weekly": 8,
+      "monthly": 35,
+      "quarterly": 120,
+      "yearly": 370,
+      "event": 35,
+      "default": 3
+    }
+  },
   "date_axis": "requested_smart_wizard_grid_not_native_observation_dates",
   "quota": {
     "smart_wizard_requests_per_second": null,

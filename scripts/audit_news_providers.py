@@ -28,9 +28,49 @@ from stockagent.data.news_source_catalog import adapter_summary
 
 ENDPOINT_INVENTORY_CONTRACT_VERSION = 2
 FULL_FRONTIER_SCAN_CONTRACT_VERSION = 1
+INVENTORY_SCOPE_CONTRACT_VERSION = 1
+LITERAL_TARGET_COVERAGE_CONTRACT_VERSION = 1
 
 
-def endpoint_inventory(registry, *, status=None, owner_matches=False):
+def _provider_scope(providers):
+    if providers is None:
+        return None
+    if (not isinstance(providers, (list, tuple)) or not providers
+            or any(not isinstance(p, str) or not p or p != p.strip() for p in providers)):
+        raise ValueError('provider selection must be a nonempty list of source keys')
+    return tuple(sorted(set(providers)))
+
+
+def _literal_target_coverage(db, original_metadata, resolution_version):
+    """Deduplicate selected incoming links in the same read snapshot.
+
+    An alias association is not a distinct target, body or upstream-publisher
+    identity. Keep this optional, potentially large join out of heartbeats and
+    ordinary full inventories. Target existence comes from current article
+    heads, never the historical target_queued hint.
+    """
+    hosts = [row['host'] for row in original_metadata.get('hosts', [])]
+    counts = dict(alias_associations=0, distinct_target_urls=0,
+                  queued_target_urls=0, stored_body_target_urls=0)
+    if hosts:
+        placeholders = ','.join('?' for _ in hosts)
+        counts = dict(db.execute(
+            'SELECT count(*) AS alias_associations,count(DISTINCT r.original_id) AS distinct_target_urls,'
+            'count(DISTINCT CASE WHEN a.id IS NOT NULL THEN r.original_id END) AS queued_target_urls,'
+            'count(DISTINCT CASE WHEN a.body_sha256 IS NOT NULL THEN r.original_id END) AS stored_body_target_urls '
+            'FROM original_url_resolutions r LEFT JOIN articles a ON a.id=r.original_id '
+            'WHERE r.contract_version=? AND r.original_host IN (' + placeholders + ')',
+            (resolution_version, *hosts)).fetchone())
+    if counts['alias_associations'] != original_metadata.get('literal_metadata_links', 0):
+        raise ValueError('selected literal target coverage does not reconcile with host summary')
+    return {'contract_version': LITERAL_TARGET_COVERAGE_CONTRACT_VERSION, **counts,
+            'unqueued_target_urls': counts['distinct_target_urls'] - counts['queued_target_urls'],
+            'grain': 'distinct literal target URL IDs, not alias incidences or accepted body identities',
+            'direction': 'local redirect metadata to literal target; not target to its upstream publisher',
+            'metadata_identity_verified': False, 'capture_access_granted': False}
+
+
+def endpoint_inventory(registry, *, status=None, owner_matches=False, providers=None):
     """Describe every registered capability without reading the URL frontier.
 
     The independent public list has metadata, not category-API bodies or its
@@ -41,6 +81,8 @@ def endpoint_inventory(registry, *, status=None, owner_matches=False):
     controls = (status.get('http_capacity') or {}).get('providers', {}) if owner_matches else {}
     result, seen = [], set()
     for provider, source in registry.sources.items():
+        if providers is not None and provider not in providers:
+            continue
         counters = status.get('performance', {}).get('providers', {}).get(provider, {}).get('counts', {}) if owner_matches else {}
         groups = (
             ('cnyes_news', source.cnyes_apis), ('wordpress_posts', source.wordpress_apis),
@@ -90,10 +132,13 @@ def endpoint_inventory(registry, *, status=None, owner_matches=False):
     return result
 
 
-def inventory_endpoints_only(config_path: Path) -> dict:
+def inventory_endpoints_only(config_path: Path, *, providers=None) -> dict:
     """O(configured endpoints), not O(millions of article/alias rows)."""
     started = time.perf_counter()
+    selected = _provider_scope(providers)
     config, registry, repo = load_config(config_path)
+    if selected is not None and set(selected) - registry.sources.keys():
+        raise ValueError('endpoint selection contains an unregistered source key')
     root = repo / config['root']
     with sqlite3.connect(f'file:{root / "queue.sqlite3"}?mode=ro', uri=True) as db:
         owner_row = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()
@@ -105,32 +150,48 @@ def inventory_endpoints_only(config_path: Path) -> dict:
     matches = owner is not None and status.get('owner_id') == owner
     return {'endpoint_inventory_contract_version': ENDPOINT_INVENTORY_CONTRACT_VERSION,
         'inventory_scope': 'registered_endpoint_capabilities_only', 'observed_at_utc': utc_now(),
+        'inventory_scope_contract_version': INVENTORY_SCOPE_CONTRACT_VERSION,
+        'selected_source_keys': list(selected) if selected is not None else None,
+        'all_known_source_keys_included': False,
         'queue_owner_id': owner, 'status_owner_matches': matches,
         'metric_observed_at_utc': status.get('performance', {}).get('snapshot_at_utc') if matches else None,
         'config_sha256': sha256_file(config_path), 'provider_inventory_included': False,
-        'endpoints': endpoint_inventory(registry, status=status, owner_matches=matches),
+        'endpoints': endpoint_inventory(registry, status=status, owner_matches=matches, providers=selected),
         'publisher_requests': 0, 'production_queue_writes': False,
         'body_count_or_history_coverage_claimed': False, 'all_history_complete': False,
         'inventory_cost': {'wall_seconds': time.perf_counter() - started,
                            'scope': 'one owner-key read and configured endpoint descriptors; no article-frontier scan'}}
 
 
-def inventory(config_path: Path) -> dict:
+def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False) -> dict:
     wall_started, cpu_started = time.perf_counter(), time.process_time()
+    selected = _provider_scope(providers)
+    if type(resolve_link_coverage) is not bool or (resolve_link_coverage and selected is None):
+        raise ValueError('literal target coverage requires an explicit provider selection')
+    predicate = 'provider IN (' + ','.join('?' for _ in selected) + ')' if selected is not None else None
+    parameters = selected or ()
+    frontier = 'FROM articles WHERE ' + predicate if predicate else 'FROM articles NOT INDEXED'
     config, registry, repo = load_config(config_path)
     root = repo / config["root"]
     db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
     try:
+        db.execute('PRAGMA query_only=ON')
         db.execute("BEGIN")
         owner = db.execute("SELECT value FROM queue_settings WHERE key='current_owner_id'").fetchone()[0]
         result = {"observed_at_utc": utc_now(), "queue_owner_id": owner,
-                  "full_frontier_scan_contract_version": FULL_FRONTIER_SCAN_CONTRACT_VERSION,
+                  "inventory_scope_contract_version": INVENTORY_SCOPE_CONTRACT_VERSION,
+                  "inventory_scope": 'selected_source_keys' if selected is not None else 'all_known_source_keys',
+                  "selected_source_keys": list(selected) if selected is not None else None,
+                  "all_known_source_keys_included": selected is None,
+                  "full_frontier_scan_contract_version": FULL_FRONTIER_SCAN_CONTRACT_VERSION if selected is None else None,
+                  "literal_target_coverage_requested": resolve_link_coverage,
                   "inventory_implementation_sha256": sha256_file(Path(__file__)),
                   "config_sha256": sha256_file(config_path), "providers": {},
                   "metadata_date_basis": "local sorting dates, not verified publisher clocks or historical completeness",
                   "article_grain": "normalized source URL; stock associations and body revisions are separate",
                   "unregistered_source_grain": "hostname keys; may include redirectors, duplicate publisher subdomains and aggregators, not unique publishers",
+                  "publisher_requests": 0, "production_queue_writes": False,
                   "official_rate_limit_verified": False, "all_history_complete": False}
         try:
             status = json.loads((root / "status.json").read_text())
@@ -140,15 +201,14 @@ def inventory(config_path: Path) -> dict:
         controls = (status.get("http_capacity") or {}).get("providers", {}) if result["status_owner_matches"] else {}
         # One full frontier aggregation, not a repeated full scan for each
         # metric. Provider/host groups retain the original inventory grain.
-        # Both full-frontier aggregates must read table fields for every
-        # applicable row. Walking the dispatch index first adds scattered
-        # table lookups; use a sequential table scan for these audits only.
+        # Full inventories read every applicable row sequentially. A selected
+        # inventory instead uses provider indexes, leaving other heads alone.
         for row in db.execute("SELECT provider,host,count(*) AS articles,sum(body_sha256 IS NOT NULL) AS stored_bodies,"
                               "min(nullif(metadata_order_day,'')) AS earliest_metadata_day,"
                               "max(nullif(metadata_order_day,'')) AS latest_metadata_day,max(captured_at_utc) AS latest_body_capture_utc,"
                               "sum(state IN ('retry','retry_cooldown') AND body_sha256 IS NOT NULL) AS stored_body_rechecks,"
                               "sum(state IN ('pending','retry','retry_cooldown','inflight') AND body_sha256 IS NULL) AS missing_body_work "
-                              "FROM articles NOT INDEXED GROUP BY provider,host"):
+                              + frontier + " GROUP BY provider,host", parameters):
             item = result["providers"].setdefault(row["provider"], {"hosts": [], "states": {}, "errors": []})
             item["hosts"].append({"host": row["host"], "articles": row["articles"]})
             item["known_urls"] = item.get("known_urls", 0) + row["articles"]
@@ -158,20 +218,39 @@ def inventory(config_path: Path) -> dict:
                 values = [v for v in (item.get(key), row[key]) if v is not None]
                 item[key] = (min(values) if key == "earliest_metadata_day" else max(values)) if values else None
         for provider in registry.sources:
-            result["providers"].setdefault(provider, {"hosts": [], "states": {}, "errors": []})
+            if selected is None or provider in selected:
+                result["providers"].setdefault(provider, {"hosts": [], "states": {}, "errors": []})
         original_sources = original_source_inventory(db, registry)
+        if selected is not None:
+            original_sources['sources'] = {p: v for p, v in original_sources['sources'].items() if p in selected}
+            if original_sources['available']:
+                original_sources.update(source_keys=len(original_sources['sources']),
+                    literal_metadata_links=sum(v['literal_metadata_links'] for v in original_sources['sources'].values()),
+                    original_hosts=sum(len(v['hosts']) for v in original_sources['sources'].values()))
         result['original_source_inventory'] = {key: value for key, value in original_sources.items() if key != 'sources'}
         for provider, evidence in original_sources['sources'].items():
             item = result['providers'].setdefault(provider, {'hosts': [], 'states': {}, 'errors': []})
             item['original_metadata'] = evidence
-        for row in db.execute("SELECT provider,state,articles FROM state_metrics WHERE articles>0"):
+        if selected is not None and set(selected) - result['providers'].keys():
+            raise ValueError('provider selection contains an unknown source key')
+        if resolve_link_coverage:
+            if not original_sources['available']:
+                raise ValueError('literal target coverage requires a reconciled original-source summary')
+            for item in result['providers'].values():
+                evidence = item.setdefault('original_metadata', {'literal_metadata_links': 0, 'hosts': []})
+                evidence['target_url_coverage'] = _literal_target_coverage(
+                    db, evidence, original_sources['resolution_contract_version'])
+        for row in db.execute("SELECT provider,state,articles FROM state_metrics WHERE articles>0"
+                              + (' AND ' + predicate if predicate else ''), parameters):
             result["providers"][row["provider"]]["states"][row["state"]] = row["articles"]
         for row in db.execute("SELECT provider,state,error_code,body_sha256 IS NOT NULL AS has_stored_body,count(*) AS articles "
-                              "FROM articles NOT INDEXED WHERE error_code IS NOT NULL GROUP BY provider,state,error_code,has_stored_body"):
+                              + frontier + (' AND' if predicate else ' WHERE')
+                              + " error_code IS NOT NULL GROUP BY provider,state,error_code,has_stored_body", parameters):
             result["providers"][row["provider"]]["errors"].append(dict(row))
         discoveries = {}
         for row in db.execute("SELECT provider,kind,count(*) AS jobs,sum(error_code IS NOT NULL) AS errors,"
-                              "sum(superseded_by_windows_json IS NOT NULL) AS superseded FROM discovery GROUP BY provider,kind"):
+                              "sum(superseded_by_windows_json IS NOT NULL) AS superseded FROM discovery"
+                              + (' WHERE ' + predicate if predicate else '') + " GROUP BY provider,kind", parameters):
             discoveries.setdefault(row["provider"], []).append(dict(row))
         entries = {p["id"]: p for p in config["providers"]}
         for provider, item in result["providers"].items():
@@ -185,6 +264,8 @@ def inventory(config_path: Path) -> dict:
                         name=source.name if source else provider,
                         client_interval_seconds=source.interval_seconds if source else None,
                         parallelism=source.parallelism if source else 0,
+                        source_data_fingerprint=source.data_fingerprint if source else None,
+                        source_authorization_fingerprint=source.authorization_fingerprint if source else None,
                         authorization=source.authorization if source else {"kind": "unreviewed"},
                         note=entries.get(provider, {}).get("note", "Local metadata only; source and article rights/access unreviewed"))
             if source and source.acquisition_mode == "finite" and db.execute("SELECT 1 FROM sqlite_master WHERE name='finite_cohorts'").fetchone():
@@ -209,7 +290,9 @@ def inventory(config_path: Path) -> dict:
                 "SELECT url,state,error_code,attempts FROM articles WHERE provider=? AND error_code IS NOT NULL "
                 "AND body_sha256 IS NULL AND state NOT IN ('awaiting_authorization') LIMIT 8", (provider,))] if has_failure_samples else []
         result["inventory_totals"] = {
-            "configured_providers": len(registry.sources), "configured_enabled": sum(s.allowed for s in registry.sources.values()),
+            "configured_providers": sum(p['configured'] for p in result['providers'].values()),
+            "configured_enabled": sum(p['enabled'] for p in result['providers'].values()),
+            "configured_providers_overall": len(registry.sources),
             "unregistered_source_keys": sum(not p["configured"] for p in result["providers"].values()),
             "known_urls": sum(p.get("known_urls", 0) for p in result["providers"].values()),
             "stored_bodies": sum(p.get("stored_bodies", 0) for p in result["providers"].values()),
@@ -217,11 +300,14 @@ def inventory(config_path: Path) -> dict:
             "metadata_only_source_keys": sum(bool(p.get('original_metadata')) and not p['known_urls']
                                               for p in result['providers'].values()),
         }
-        result["status"] = status
+        result["status"] = status if selected is None else {
+            'owner_id': status.get('owner_id'), 'updated_at_utc': status.get('updated_at_utc'),
+            'providers': {p: v for p, v in status.get('providers', {}).items() if p in selected},
+            'scope': 'selected provider runtime context only; no global acquisition totals'}
         # Endpoint capability is distinct from discovered URL/page coverage.
         # Article path patterns are namespaces, never invented endpoint URLs.
         result['endpoint_inventory_contract_version'] = ENDPOINT_INVENTORY_CONTRACT_VERSION
-        result['endpoints'] = endpoint_inventory(registry, status=status, owner_matches=result['status_owner_matches'])
+        result['endpoints'] = endpoint_inventory(registry, status=status, owner_matches=result['status_owner_matches'], providers=selected)
         result["inventory_cost"] = {"wall_seconds": time.perf_counter() - wall_started,
                                     "cpu_seconds": time.process_time() - cpu_started,
                                     "scope": "single pinned read-only inventory; no publisher calls"}
@@ -236,9 +322,15 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument('--endpoints-only', action='store_true',
                         help='Refresh registered endpoint capabilities without scanning the article/alias frontier')
+    parser.add_argument('--provider', action='append',
+                        help='Only these exact configured or locally observed source keys; repeat for multiple sources')
+    parser.add_argument('--resolve-link-coverage', action='store_true',
+                        help='Deduplicate incoming literal targets for selected providers; no publisher requests')
     args = parser.parse_args(argv)
+    if args.resolve_link_coverage and (not args.provider or args.endpoints_only):
+        parser.error('--resolve-link-coverage requires --provider and a provider inventory')
     if args.endpoints_only:
-        result = inventory_endpoints_only(args.config)
+        result = inventory_endpoints_only(args.config, providers=args.provider)
         args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         atomic_write_json(args.output, result)
         buffer = io.StringIO(newline='')
@@ -250,13 +342,14 @@ def main(argv=None):
         print(json.dumps({'output': str(args.output), 'endpoints': len(result['endpoints']),
                           'scope': result['inventory_scope'], 'publisher_requests': 0}))
         return 0
-    result = inventory(args.config)
+    result = inventory(args.config, providers=args.provider, resolve_link_coverage=args.resolve_link_coverage)
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(args.output, result)
     fields = ["provider", "name", "configured", "enabled", "acquisition_mode", "known_urls", "stored_bodies", "stored_body_rechecks",
               "missing_body_work", "earliest_metadata_day", "latest_metadata_day", "latest_body_capture_utc",
               "source_role", "adapter", "adapter_registered", "adapter_verified", "adapter_acceptance", "next_action",
-              "literal_metadata_links", "original_hosts_json",
+              "literal_metadata_links", "original_hosts_json", "literal_target_coverage_json",
+              "inventory_scope", "all_known_source_keys_included",
               "client_interval_seconds", "parallelism", "authorization_kind", "source_evidence_url", "hosts_json",
               "states_json", "errors_json", "note"]
     buffer = io.StringIO(newline="")
@@ -266,6 +359,9 @@ def main(argv=None):
         writer.writerow({**{k: item.get(k) for k in fields if k in item}, "provider": provider,
                          "literal_metadata_links": item.get('original_metadata', {}).get('literal_metadata_links'),
                          "original_hosts_json": json.dumps(item.get('original_metadata', {}).get('hosts'), ensure_ascii=False),
+                         "literal_target_coverage_json": json.dumps(item.get('original_metadata', {}).get('target_url_coverage'), ensure_ascii=False),
+                         "inventory_scope": result['inventory_scope'],
+                         "all_known_source_keys_included": result['all_known_source_keys_included'],
                          "authorization_kind": item["authorization"].get("kind"),
                          "source_evidence_url": item["authorization"].get("evidence_url", ""),
                          **{k + "_json": json.dumps(item[k], ensure_ascii=False) for k in ("hosts", "states", "errors")}})

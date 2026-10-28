@@ -16,11 +16,11 @@ from stockagent.data.news_source_catalog import load_news_configuration
 from test_news_fulltext import FakeResponse, article_html, config, http_fixture
 
 
-@pytest.mark.parametrize('provider,evidence,layout', [
-    ('moneyweekly', 'https://www.moneyweekly.com.tw/ArticleData/Info/%E7%BD%AE%E5%BA%95%E6%96%87%E7%AB%A0/7', ''),
-    ('nownews', 'https://www.nownews.com/copyright', 'nownews_visible_article_v1'),
+@pytest.mark.parametrize('provider,evidence,layout,reviewed_on', [
+    ('moneyweekly', 'https://www.moneyweekly.com.tw/ArticleData/Info/%E7%BD%AE%E5%BA%95%E6%96%87%E7%AB%A0/7', '', '2026-10-24'),
+    ('nownews', 'https://www.nownews.com/copyright', 'nownews_visible_article_v1', '2026-10-14'),
 ])
-def test_explicit_personal_known_url_policy_keeps_original_content_boundaries(provider, evidence, layout):
+def test_explicit_personal_known_url_policy_keeps_original_content_boundaries(provider, evidence, layout, reviewed_on):
     path = Path(os.environ.get('STOCKAGENT_NEWS_SCOPE_CONFIG', 'configs/news_fulltext.json'))
     cfg, registry, _ = load_config(path)
     source = registry.sources[provider]
@@ -30,7 +30,7 @@ def test_explicit_personal_known_url_policy_keeps_original_content_boundaries(pr
     assert source.allowed and source.acquisition_mode == 'continuous'
     assert source.authorization['kind'] == 'personal_research'
     assert source.authorization['evidence_url'] == evidence
-    assert source.authorization['reviewed_on'] == '2026-10-14'
+    assert source.authorization['reviewed_on'] == reviewed_on
     assert entry['private_known_url_scope'] == 'personal_noncommercial_originals_v1'
     assert 'locally known public original' in source.authorization['scope']
     assert 'third-party' in source.authorization['scope']
@@ -41,7 +41,7 @@ def test_explicit_personal_known_url_policy_keeps_original_content_boundaries(pr
                     source.index_pages, source.incremental_index_pages, source.fulltext_feeds))
     assert source.interval_seconds >= 2 and source.parallelism == 1
     if provider == 'moneyweekly':
-        assert source.permitted_author_names == ('理周投研部', '洪崇晏')
+        assert source.permitted_author_names == ('理周投研部', '洪崇晏', '林庭頡')
         assert source.selectors == ('.div_Article_Info[itemprop=articleBody]',)
     else:
         assert source.require_configured_container

@@ -67,7 +67,7 @@
   "original_url_resolution_slice_seconds": 0.04,
   "original_url_resolution_interval_seconds": 0.25,
   "lease_seconds": 300,
-  "min_free_disk_bytes": 26843545600,
+  "min_free_disk_bytes": 68719476736,
   "batch_articles": 64,
   "batch_text_bytes": 4194304,
   "batch_raw_response_bytes": 16777216,

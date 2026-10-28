@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.artifact_io import atomic_write_text  # noqa: E402
+from stockagent.live.data_monitor_record_store import read_record_cache  # noqa: E402
 
 
 SOURCES = (
@@ -237,7 +238,7 @@ def main() -> int:
     args = parser.parse_args()
     root = args.repo_root.resolve()
     cache_path = root / "artifacts/live/data_monitor/record_inventory_cache.json"
-    cache_payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache_payload = read_record_cache(cache_path)
     symbols, fields, summary = build_audit(root, cache_payload)
     output_dir = args.output_dir if args.output_dir.is_absolute() else root / args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)

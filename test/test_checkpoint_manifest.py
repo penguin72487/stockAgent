@@ -1548,6 +1548,23 @@ def test_model_scope_manifest_does_not_construct_unused_training_contracts(monke
                                   checkpoint_path=Path("current.pt"), scope="model")
 
 
+def test_model_scope_does_not_allocate_unused_full_history_execution_masks(monkeypatch):
+    import stockagent.training.checkpoint_contract as contract
+    panel, config = _panel(), _config()
+    panel.can_short_open_open_mask = None
+    panel.force_short_cover_mask = None
+    panel.force_exit_mask = None
+    full = _checkpoint_manifest(panel, config, include_data_content=False)
+    expected = build_inference_checkpoint_manifest(panel, config, checkpoint={"experiment_manifest": full})
+    def unexpected(*args, **kwargs):
+        raise AssertionError("schema-4 model-only verification does not consume execution masks")
+    monkeypatch.setattr(contract.np, "zeros_like", unexpected)
+    actual = build_inference_checkpoint_manifest(panel, config, checkpoint={"experiment_manifest": full})
+    assert actual == expected
+    _validate_checkpoint_manifest({"experiment_manifest": full}, actual,
+                                  checkpoint_path=Path("current.pt"), scope="model")
+
+
 @pytest.mark.parametrize("schema", [None, 1, 2, 3, 5, "invalid"])
 def test_model_scope_manifest_legacy_or_unknown_schemas_keep_complete_builder(schema):
     panel, config = _panel(), _config()
